@@ -1483,6 +1483,50 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task", "steer it"]);
 	});
 
+	test("Disconnect answers only once a steer the run sent has its receipt written", async () => {
+		const h = await launch();
+		const { call, snapshot, session, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-with-slow-receipt");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "steer it", deliverAs: "steer" }, "steer-slow-receipt");
+		control.finishTurn("first answer");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		// The steer's final receipt is slow to be written.
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			if (id === "steer-slow-receipt" && changes.disposition === "cancelled") {
+				entered.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await entered.promise;
+		expect(await Promise.race([disconnecting.then(() => "answered"), Bun.sleep(200).then(() => "waiting")])).toBe(
+			"waiting",
+		);
+		release.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		// Final the moment Disconnect answers.
+		expect(active(await snapshot())).toEqual([]);
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({ id: "steer-slow-receipt", disposition: "cancelled" }),
+		);
+		expect(await running).toBeNull();
+	});
+
 	test("Disconnect waits for an input still in its hook and hands it back before releasing the writer", async () => {
 		const holdKey = "__gjcDesktopDisconnectHookHold";
 		const enteredKey = "__gjcDesktopDisconnectHookEntered";

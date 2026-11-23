@@ -472,8 +472,6 @@ interface TrackedQueuedInput {
 	dto: DesktopQueuedInput;
 	submission: QueuedInputSubmission;
 	deliveryId: string;
-	/** Settles once this input's final receipt is written. */
-	settled?: Promise<void>;
 }
 /** A queued input's search for its own user turn, which the SDK does not identify (see `#claimUserTurn`). */
 interface UserTurnClaimant {
@@ -547,6 +545,11 @@ interface LiveSession extends SessionCandidate {
 	revisions?: PromptRevisions;
 	/** User turns already attributed to one input; a turn is evidence for at most one. */
 	claimedUserTurns: WeakSet<AgentMessage>;
+	/**
+	 * Queued inputs whose final receipt is still being written. An input leaves `queued` before its
+	 * receipt is written, so a release waits on these, not on `queued`.
+	 */
+	settling: Set<Promise<void>>;
 	/** The exclusive request in flight; settles after its receipt and final view are written. */
 	exclusiveDone?: Promise<void>;
 }
@@ -1594,6 +1597,7 @@ export class DesktopHost {
 			queued: new Map(),
 			scopeOwners: new Map(),
 			claimedUserTurns: new WeakSet(),
+			settling: new Set(),
 		};
 		this.#live.set(live.metadata.id, live);
 		// A read-only stand-in shown while a reopen failed is no longer needed.
@@ -2852,9 +2856,7 @@ export class DesktopHost {
 			if (stopped.sdk.isStreaming) await within(stopped.sdk.waitForIdle());
 			// The Stop's sweep, and the queued branch's own check after it, handed back what no run took.
 			// Let the inputs the run took settle from this session's transcript before it is disposed.
-			await bounded(Promise.allSettled([...live.queued.values()].map(tracked => tracked.settled)), budget).catch(
-				() => {},
-			);
+			await bounded(Promise.allSettled([...stopped.settling]), budget).catch(() => {});
 			const current = this.#live.get(metadata.id);
 			if (current && (current.busy || current.sdk.isStreaming || current.operator?.isBusy()))
 				throw new Error(STILL_STOPPING);
@@ -3926,7 +3928,7 @@ export class DesktopHost {
 						},
 					),
 				);
-				tracked.settled = submission.terminal.then(
+				const settled = submission.terminal.then(
 					async outcome => {
 						await queuedPersisted;
 						unsubscribeTerminal();
@@ -3986,7 +3988,10 @@ export class DesktopHost {
 						});
 					},
 				);
-				this.#observeDelivery(tracked.settled);
+				live.settling.add(settled);
+				const settledDone = () => live.settling.delete(settled);
+				void settled.then(settledDone, settledDone);
+				this.#observeDelivery(settled);
 				// A Stop that arrived after this input may have swept the queue while the SDK was still
 				// admitting it, before it was added above; the plain abort keeps a follow-up queued for
 				// the next turn. Hand it back as the sweep would have. The write is issued before the
