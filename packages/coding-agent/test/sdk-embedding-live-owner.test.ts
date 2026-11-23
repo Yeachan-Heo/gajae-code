@@ -2,9 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { registerDirectSession } from "../src/main";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
-import { findEmbeddedLiveOwner } from "../src/sdk/embedding";
+import { createEmbeddedAgentSession, findEmbeddedLiveOwner } from "../src/sdk/embedding";
 import type { SessionLifecycleClient } from "../src/sdk/lifecycle/service";
+import { SessionManager } from "../src/session/session-manager";
 import {
 	cleanupFixtureRoots,
 	createFixtureBrokerEnvironment,
@@ -97,4 +99,74 @@ test("a real broker accepts the exact lookup and answers none for a transcript n
 	brokerRoots.push(createFixtureRootCleanup(root, dir, started.lease));
 	// `unknown` here would mean the broker refused the request shape, actor or target.
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "none" });
+}, 60_000);
+
+/** An agent directory and project for a real fixture broker; the broker is started on demand. */
+async function brokerWorkspace() {
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-embedding-owner-live-")));
+	cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
+	const dir = path.join(root, "agent");
+	const cwd = path.join(root, "project");
+	const env = createFixtureBrokerEnvironment(root, dir);
+	await Promise.all([dir, cwd, env.TMPDIR!, env.XDG_CONFIG_HOME!].map(item => fs.mkdir(item, { recursive: true })));
+	return {
+		dir,
+		cwd,
+		startBroker: async () => {
+			const started = await withFixtureBrokerEnvironment(() =>
+				startFixtureBrokerWithLeaseForTest({ agentDir: dir, env }),
+			);
+			brokerRoots.push(createFixtureRootCleanup(root, dir, started.lease));
+		},
+	};
+}
+
+/** A transcript in the shared store, as the terminal and the app both create them. */
+async function sharedTranscript(cwd: string, dir: string) {
+	const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, dir));
+	manager.appendMessage({ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 });
+	await manager.ensureOnDisk();
+	await manager.flush();
+	cleanups.push(() => manager.close().catch(() => {}));
+	return manager;
+}
+
+test("a terminal session's registration is reported live by a real broker, and nothing without one", async () => {
+	const { dir, cwd, startBroker } = await brokerWorkspace();
+	const manager = await sharedTranscript(cwd, dir);
+	const sessionId = manager.getSessionId();
+	// What every CLI run with a durable transcript does at startup, whatever its mode or SDK hosting.
+	// Its process-exit cleanup is not this test's to install.
+	await registerDirectSession(manager, dir, undefined, { registerPostmortem: () => () => {} });
+	// The registration is on disk, but only a running broker reports it.
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId })).toEqual({
+		kind: "unknown",
+		reason: "broker_absent",
+	});
+	await startBroker();
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
+}, 60_000);
+
+test("a transcript an embedding holds open is not reported live, so the embedding never steps aside for itself", async () => {
+	const { dir, cwd, startBroker } = await brokerWorkspace();
+	await startBroker();
+	const manager = await sharedTranscript(cwd, dir);
+	// The desktop app's own writer: an embedded session with SDK and notification hosting off.
+	const embedded = await createEmbeddedAgentSession({
+		cwd,
+		agentDir: dir,
+		storage: { managed: true, manager },
+		hasUI: true,
+		notificationHostModeSupported: false,
+		sdkHostModeSupported: false,
+	});
+	cleanups.push(async () => {
+		await embedded.session.dispose();
+		await embedded.releaseResources();
+	});
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId: manager.getSessionId(), timeoutMs: 10_000 })).toEqual(
+		{
+			kind: "none",
+		},
+	);
 }, 60_000);
