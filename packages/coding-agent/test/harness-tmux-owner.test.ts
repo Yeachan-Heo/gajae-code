@@ -16,6 +16,7 @@ const trackedTemp = trackTempDirs();
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const sessionId = "tmux-owner-test";
+const realTmux = process.platform === "win32" ? null : Bun.which("tmux");
 
 let root: string;
 let workspace: string;
@@ -30,6 +31,8 @@ async function createUnverifiableTmux(): Promise<{ command: string; log: string 
 		command,
 		`#!/usr/bin/env bash
 	echo "$@" >> ${JSON.stringify(log)}
+	[ "${"$"}{1:-}" = "-u" ] || exit 9
+	shift
 	[ "${"$"}{1:-}" = "-L" ] || exit 9
 	[ "${"$"}#" -ge 3 ] || exit 9
 	case "${"$"}2" in ""|default) exit 9 ;; esac
@@ -61,6 +64,8 @@ async function createScopedHarnessSeam(): Promise<{
 		tmuxCommand,
 		`#!/usr/bin/env bash
 	printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+	[ "${"$"}{1:-}" = "-u" ] || exit 9
+	shift
 	[ "${"$"}{1:-}" = "-L" ] || exit 9
 	[ "${"$"}#" -ge 3 ] || exit 9
 	socket="${"$"}2"
@@ -119,7 +124,7 @@ async function createScopedHarnessSeam(): Promise<{
 		  mkdir -p "$lifecycle"
 		  printf '%s\n' '{"schema_version":1,"generation":"replacement-generation","session_id":"tmux-owner-test","published_at":"2026-01-01T00:00:00.000Z"}' > "$lifecycle/generation.json"
 		fi
-		bun -e 'const request = JSON.parse(process.argv[1]); const created = Bun.spawnSync(request.tmux_argv, { stdout: "pipe", stderr: "pipe" }); if (created.exitCode !== 0) process.exit(created.exitCode ?? 1); if (process.env.GJC_HARNESS_TEST_BOOTSTRAP_RECEIPT !== undefined) { console.log(process.env.GJC_HARNESS_TEST_BOOTSTRAP_RECEIPT); process.exit(0); } const argv = request.tmux_argv; const socket = argv[argv.indexOf("-L") + 1]; const sessionName = argv[argv.indexOf("-s") + 1]; const proof = Bun.spawnSync([argv[0], "-L", socket, "display-message", "-p", "#{pid}"], { stdout: "pipe", stderr: "pipe" }); const serverPid = Number(proof.stdout.toString().trim()); const nativeSessionId = created.stdout.toString().trim(); if (!Number.isSafeInteger(serverPid) || serverPid <= 0 || !/^\\$\\d+$/.test(nativeSessionId)) process.exit(1); console.log(JSON.stringify({ schema_version: 1, ok: true, code: "bootstrapped", native_session_id: nativeSessionId, server_pid: serverPid, server_start_time: process.env.GJC_HARNESS_TEST_SERVER_START_TIME ?? "1", session_name: sessionName }));' -- "$request" || exit $?
+		bun -e 'const request = JSON.parse(process.argv[1]); const created = Bun.spawnSync(request.tmux_argv, { stdout: "pipe", stderr: "pipe" }); if (created.exitCode !== 0) process.exit(created.exitCode ?? 1); if (process.env.GJC_HARNESS_TEST_BOOTSTRAP_RECEIPT !== undefined) { console.log(process.env.GJC_HARNESS_TEST_BOOTSTRAP_RECEIPT); process.exit(0); } const argv = request.tmux_argv; const socket = argv[argv.indexOf("-L") + 1]; const sessionName = argv[argv.indexOf("-s") + 1]; const proof = Bun.spawnSync([...argv.slice(0, argv.indexOf("new-session")), "display-message", "-p", "#{pid}"], { stdout: "pipe", stderr: "pipe" }); const serverPid = Number(proof.stdout.toString().trim()); const nativeSessionId = created.stdout.toString().trim(); if (!Number.isSafeInteger(serverPid) || serverPid <= 0 || !/^\\$\\d+$/.test(nativeSessionId)) process.exit(1); console.log(JSON.stringify({ schema_version: 1, ok: true, code: "bootstrapped", native_session_id: nativeSessionId, server_pid: serverPid, server_start_time: process.env.GJC_HARNESS_TEST_SERVER_START_TIME ?? "1", session_name: sessionName }));' -- "$request" || exit $?
 		`,
 	);
 	await chmod(path.join(bin, "systemd-run"), 0o755);
@@ -168,7 +173,7 @@ async function runHarness(
 
 const OWNER_EXIT_TIMEOUT_MS = 5_000;
 
-async function retireLiveFixtureOwner(): Promise<void> {
+async function retireLiveFixtureOwner(env: NodeJS.ProcessEnv = {}): Promise<void> {
 	let owner = await resolveOwner(root, sessionId);
 	if (!owner.live) return;
 	const proc = Bun.spawn(["bun", cliEntry, "harness", "retire", "--session", sessionId], {
@@ -178,6 +183,7 @@ async function retireLiveFixtureOwner(): Promise<void> {
 			GJC_HARNESS_STATE_ROOT: root,
 			GJC_HARNESS_TEST_ASSUME_LINUX_OWNER_ISOLATION: "1",
 			TMUX: "",
+			...env,
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -343,10 +349,10 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 		expect(routedCalls).not.toHaveLength(0);
 		const socket = routedCalls.map(call => call.match(/(?:^|\s)-L\s+(\S+)/)?.[1]).find(Boolean);
 		expect(socket).toMatch(/^gjc-owner-[0-9a-f]{48}$/);
-		expect(routedCalls.filter(call => !call.startsWith(`-L ${socket} `))).toEqual([]);
-		expect(calls).toContain(`-L ${socket} display-message -p #{pid}`);
+		expect(routedCalls.filter(call => !call.startsWith(`-u -L ${socket} `))).toEqual([]);
+		expect(calls).toContain(`-u -L ${socket} display-message -p #{pid}`);
 		expect(
-			calls.some(call => call.startsWith(`-L ${socket} new-session -d -s gajae_code_harness_tmux-owner-test`)),
+			calls.some(call => call.startsWith(`-u -L ${socket} new-session -d -s gajae_code_harness_tmux-owner-test`)),
 		).toBe(true);
 		expect((result.state as Record<string, unknown>).ownerLive).toBe(true);
 	});
@@ -503,5 +509,65 @@ describe("HarnessCommand tmux-resident owner startup", () => {
 		// `verified` derives from the child's authoritative exit promise (recycle-proof), proving
 		// the exact spawned owner was reaped within the bounded grace before the parent returned.
 		expect(reaped.verified).toBe(true);
+	}, 60_000);
+});
+
+/**
+ * A detached harness start inherits its launcher's locale. A launchd job, cron, or
+ * service manager provides none, so a tmux client started there without `-u` rewrites
+ * the tab separator in `#{session_id}\t#{session_name}` to `_`.
+ */
+describe.skipIf(!realTmux)("HarnessCommand tmux-resident owner from a non-UTF-8 launcher", () => {
+	let tmuxTmpdir: string;
+	// tmux treats any set `TMUX`, even an empty one, as a UTF-8 client, so it must be unset.
+	const privateEnv = (): NodeJS.ProcessEnv => ({
+		TMUX: undefined,
+		TMUX_TMPDIR: tmuxTmpdir,
+		// The fixture's TMPDIR is too long for the owner's Unix control socket.
+		GJC_HARNESS_SOCKET_DIR: path.join(tmuxTmpdir, "s"),
+	});
+
+	beforeEach(async () => {
+		// tmux socket paths are bounded by sun_path; keep the private socket directory short.
+		tmuxTmpdir = await trackedTemp.mkdtemp(path.join("/tmp", "gjc-htmux-"));
+	});
+
+	afterEach(async () => {
+		await retireLiveFixtureOwner(privateEnv());
+		const socketDir = path.join(tmuxTmpdir, `tmux-${process.getuid?.() ?? 0}`);
+		for (const socket of await readdir(socketDir).catch(() => [])) {
+			// Only servers inside this fixture's socket directory are removed.
+			Bun.spawnSync([realTmux!, "-L", socket, "kill-server"], {
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { TMUX_TMPDIR: tmuxTmpdir },
+			});
+		}
+		await rm(tmuxTmpdir, { recursive: true, force: true });
+	});
+
+	it("proves the private owner session binding with a real tmux server", async () => {
+		const localeless = { LANG: "C", LC_ALL: "C", LC_CTYPE: "C", ...privateEnv() };
+		const result = await runHarness(realTmux!, 0, {
+			...localeless,
+			GJC_HARNESS_TEST_CALLER_CGROUP: "/\n",
+			GJC_HARNESS_TEST_SERVER_CGROUP: "/gjc-owner-test.scope\n",
+			GJC_HARNESS_TEST_SERVER_START_TIME: "1",
+		});
+		const evidence = result.evidence as Record<string, unknown>;
+		expect(evidence.ownerFallbackReason).toBeUndefined();
+		expect(evidence.ownerRuntime).toBe("tmux");
+		expect((result.state as Record<string, unknown>).ownerLive).toBe(true);
+
+		// The fixture really is a non-UTF-8 client: a plain tmux client in this
+		// environment reports the binding reply's tab separator as `_`.
+		const socketDir = path.join(tmuxTmpdir, `tmux-${process.getuid?.() ?? 0}`);
+		const [socket] = (await readdir(socketDir)).filter(name => name.startsWith("gjc-owner-"));
+		expect(socket).toMatch(/^gjc-owner-[0-9a-f]{48}$/);
+		const plain = Bun.spawnSync(
+			[realTmux!, "-L", socket!, "display-message", "-p", "-t", "gajae_code_harness_tmux-owner-test", "a\tb"],
+			{ stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "", ...localeless } },
+		);
+		expect(plain.stdout.toString()).toBe("a_b\n");
 	}, 60_000);
 });
