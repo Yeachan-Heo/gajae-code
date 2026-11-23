@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createEmbeddedAgentSession, isEmbeddedSameDirectory } from "../src/sdk/embedding";
+import { pathIdentityKey } from "@gajae-code/utils";
+import { createEmbeddedAgentSession } from "../src/sdk/embedding";
 import { SessionManager } from "../src/session/session-manager";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -102,11 +103,52 @@ test.skipIf(process.platform !== "darwin")(
 	},
 );
 
-test("the shared directory test accepts spellings of one directory and nothing else", async () => {
+test("the shared directory identity accepts spellings of one directory and nothing else", async () => {
+	// Embeddings that list transcripts for a project compare `pathIdentityKey` the way the factory does.
 	const { project, linked, other } = await workspace();
-	expect(await isEmbeddedSameDirectory(linked, project)).toBe(true);
-	expect(await isEmbeddedSameDirectory(`${project}/`, project)).toBe(true);
-	expect(await isEmbeddedSameDirectory(other, project)).toBe(false);
-	expect(await isEmbeddedSameDirectory(path.join(project, "missing"), path.join(project, "missing"))).toBe(true);
-	expect(await isEmbeddedSameDirectory(path.join(project, "missing"), project)).toBe(false);
+	const same = (left: string, right: string) => pathIdentityKey(left) === pathIdentityKey(right);
+	expect(same(linked, project)).toBe(true);
+	expect(same(`${project}/`, project)).toBe(true);
+	expect(same(other, project)).toBe(false);
+	expect(same(path.join(project, "missing"), path.join(project, "missing"))).toBe(true);
+	expect(same(path.join(project, "missing"), project)).toBe(false);
+	// Other spellings of the same directory.
+	expect(same(`${project}//`, project)).toBe(true);
+	expect(same(`${project}/.`, project)).toBe(true);
+	expect(same(`${linked}/`, project)).toBe(true);
+	expect(same(path.relative(process.cwd(), linked), project)).toBe(true);
+	// A missing directory matches only its own spelling, even under a symlinked parent.
+	expect(same(`${path.join(project, "missing")}/`, path.join(project, "missing"))).toBe(true);
+	expect(same(path.join(linked, "missing"), path.join(project, "missing"))).toBe(false);
 });
+
+test("a case-insensitive volume treats differently cased spellings as one directory", async () => {
+	const { project, linked } = await workspace();
+	const upper = path.join(path.dirname(project), path.basename(project).toUpperCase());
+	const insensitive = await fs.stat(upper).then(
+		() => true,
+		() => false,
+	);
+	// On a case-sensitive volume the upper-case spelling does not exist, so it is a different path.
+	expect(pathIdentityKey(upper) === pathIdentityKey(project)).toBe(insensitive);
+	expect(
+		pathIdentityKey(path.join(path.dirname(linked), path.basename(linked).toUpperCase())) ===
+			pathIdentityKey(project),
+	).toBe(insensitive);
+});
+
+test.skipIf(process.platform !== "darwin")(
+	"the /var and /tmp spellings of a /private directory are one directory",
+	async () => {
+		for (const base of [os.tmpdir(), "/tmp"]) {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(base, "gjc-embedding-identity-")));
+			cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
+			expect(root.startsWith("/private/")).toBe(true);
+			const short = root.slice("/private".length);
+			expect(pathIdentityKey(short)).toBe(pathIdentityKey(root));
+			expect(pathIdentityKey(`${short}/`)).toBe(pathIdentityKey(root));
+			// A missing child keeps the spelling it was given, so the two spellings stay distinct.
+			expect(pathIdentityKey(path.join(short, "missing"))).not.toBe(pathIdentityKey(path.join(root, "missing")));
+		}
+	},
+);

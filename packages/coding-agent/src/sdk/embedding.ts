@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { postmortem } from "@gajae-code/utils";
+import { pathIdentityKey, postmortem } from "@gajae-code/utils";
 import { releaseSettingsScope } from "../capability";
 import { isSessionCredentialPinBlocking } from "../config/model-profile-activation";
 import { createRegistrySelectorIndex, ModelRegistry, registrySelectorResolvesToModel } from "../config/model-registry";
@@ -184,21 +184,6 @@ export function validateEmbeddedConfigPatch(patch: Record<string, unknown>): Arr
 	return validateSettingPatch(patch);
 }
 
-/**
- * Whether two spellings name the same directory: the project check `createEmbeddedAgentSession`
- * applies to a transcript's recorded directory. Each side is resolved through its symlinks, so a
- * terminal's `/var/...` or `/tmp/...` on macOS, or a symlinked project folder, matches the real
- * path; one that cannot be resolved (missing, unreadable) is compared as written, so it never
- * matches a different directory by accident. An embedding that lists transcripts for a project
- * should admit exactly the ones this accepts.
- */
-export async function isEmbeddedSameDirectory(left: string, right: string): Promise<boolean> {
-	if (path.resolve(left) === path.resolve(right)) return true;
-	const resolve = (value: string) => fs.realpath(value).catch(() => path.resolve(value));
-	const [a, b] = await Promise.all([resolve(left), resolve(right)]);
-	return a === b;
-}
-
 /** Admit either an explicit local writer or the canonical verified managed/shared-session writer. */
 export async function createEmbeddedAgentSession(
 	options: EmbeddedAgentSessionOptions,
@@ -221,7 +206,7 @@ export async function createEmbeddedAgentSession(
 	try {
 		// The same directory, not the same spelling: a transcript a terminal wrote through a symlinked
 		// path (macOS `/var` for `/private/var`, a linked project folder) belongs to the project too.
-		if (!(await isEmbeddedSameDirectory(manager.getCwd(), options.cwd)))
+		if (pathIdentityKey(manager.getCwd()) !== pathIdentityKey(options.cwd))
 			throw new Error("Session project does not match catalog");
 		// Factory injection does not bypass the managed local:// migration barrier.
 		await initializeLocalRoot({

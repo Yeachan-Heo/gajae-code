@@ -462,8 +462,9 @@ is given ("Session project does not match catalog"). It compares directories, no
 a terminal on macOS records `/var/...` or `/tmp/...` for a project under `/private`, and a
 terminal started from a symlinked folder records that folder, and both open for the real path.
 An embedding that lists transcripts for a project (`listEmbeddedProjectSessions`) should admit
-exactly those `await isEmbeddedSameDirectory(recordedCwd, projectPath)` accepts, the same test
-the factory applies, so a listed transcript always opens.
+exactly those for which `pathIdentityKey(recordedCwd) === pathIdentityKey(projectPath)` holds
+(`pathIdentityKey` is exported by `@gajae-code/utils`). That is the same test the factory applies,
+so a listed transcript always opens.
 
 Before opening a writer for a transcript another surface may hold, an embedding can call
 `await findEmbeddedLiveOwner({ agentDir, sessionId })`. It asks the agent directory's running

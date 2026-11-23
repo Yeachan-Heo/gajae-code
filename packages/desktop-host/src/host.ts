@@ -35,7 +35,6 @@ import {
 	type InputEventResult,
 	isEmbeddedAncestor,
 	isEmbeddedAppendRefused,
-	isEmbeddedSameDirectory,
 	type JobObservationSnapshot,
 	type lifecycle,
 	listEmbeddedProjectSessions,
@@ -53,7 +52,7 @@ import {
 	type SlashCommandRuntime,
 	validateEmbeddedConfigPatch,
 } from "@gajae-code/coding-agent/sdk";
-import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getSessionsDir, pathIdentityKey, setAgentDir } from "@gajae-code/utils";
 import { createDesktopActivityController, type DesktopActivityController } from "./activity-controls";
 import type {
 	DesktopActivityAcknowledgement,
@@ -1582,7 +1581,7 @@ export class DesktopHost {
 	/** Records the workspace a session's recorded directory resolves to, when that is this project. */
 	async #noteDirectory(cwd: string, project: DesktopProject): Promise<void> {
 		if (cwd === project.path || this.#directories.has(cwd)) return;
-		if (await isEmbeddedSameDirectory(cwd, project.path)) this.#directories.set(cwd, project.path);
+		if (pathIdentityKey(cwd) === pathIdentityKey(project.path)) this.#directories.set(cwd, project.path);
 	}
 	/** Whether a session's recorded directory is this workspace's directory, whatever its spelling. */
 	#inProject(project: DesktopProject, cwd: string): boolean {
@@ -1636,7 +1635,7 @@ export class DesktopHost {
 			const listed = managed.find(session => session.id === metadata.id);
 			// As in discovery: the header must name this exact workspace directory, by the same test
 			// the SDK applies when it opens the transcript.
-			const inProject = !!listed?.cwd && (await isEmbeddedSameDirectory(listed.cwd, project.path));
+			const inProject = !!listed?.cwd && pathIdentityKey(listed.cwd) === pathIdentityKey(project.path);
 			file = listed && inProject ? await this.#sharedStorePath(listed.path) : undefined;
 			// Listed for this workspace, but outside the shared store: the terminal resumes it.
 			outside = !!listed && inProject && !file;
@@ -4697,6 +4696,17 @@ export class DesktopHost {
 		const outside = new Set<SavedSession>();
 		const creationTimes = new Map<string, number>();
 		const ids = new Set(this.#catalog.sessions.map(session => session.id));
+		// One synchronous realpath per distinct recorded directory, not per session.
+		const projectKey = pathIdentityKey(project.path);
+		const directoryKeys = new Map<string, string>();
+		const inProject = (cwd: string): boolean => {
+			let key = directoryKeys.get(cwd);
+			if (key === undefined) {
+				key = pathIdentityKey(cwd);
+				directoryKeys.set(cwd, key);
+			}
+			return key === projectKey;
+		};
 		const catalogRow = (session: (typeof sessions)[number]) =>
 			this.#catalog.sessions.find(
 				item =>
@@ -4717,7 +4727,7 @@ export class DesktopHost {
 			// Managed inventories can include legacy and project-local candidates. Header
 			// scope must still name this exact directory, never a parent or sibling project, by the
 			// same test the SDK applies when it opens the transcript.
-			if (!(await isEmbeddedSameDirectory(session.cwd, project.path))) continue;
+			if (!inProject(session.cwd)) continue;
 			const existing = catalogRow(session);
 			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
 			if (existing?.managed && existing.projectId === project.id && existing.id === session.id) {
