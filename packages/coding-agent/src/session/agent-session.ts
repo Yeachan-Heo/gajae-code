@@ -20979,12 +20979,25 @@ export class AgentSession {
 			return;
 		}
 
-		// Set the initial goal state
-		this.setGoalModeState({ enabled: mode === "goal", mode: "active", goal: savedGoal });
+		// Set the initial goal state, preserving terminal states for completed/dropped goals
+		if (savedGoal.status === "complete") {
+			// A completed goal must be disabled and in exiting mode
+			this.setGoalModeState({ enabled: false, mode: "exiting", reason: "completed", goal: savedGoal });
+		} else if (savedGoal.status === "dropped") {
+			// A dropped goal should not be restored as active
+			return;
+		} else if (savedGoal.status === "paused") {
+			// A paused goal is disabled but remains in active mode
+			this.setGoalModeState({ enabled: false, mode: "active", goal: savedGoal });
+		} else {
+			// An active goal is enabled in active mode (or mode_change persisted it as "goal")
+			this.setGoalModeState({ enabled: true, mode: "active", goal: savedGoal });
+		}
 
 		// Call onThreadResumed to set up the accounting baseline, just like the
 		// interactive goal-mode-controller does (see goal-mode-controller.ts:298).
 		// This ensures token accounting is properly initialized for active goals.
+		// For terminal goals (complete/dropped), this call is benign and maintains consistency.
 		// onThreadResumed already commits the state; do not reapply a stale paused
 		// state if the goal was resumed via operateGoal() while this restore was pending.
 		await this.#goalRuntime.onThreadResumed();
