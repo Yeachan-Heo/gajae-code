@@ -475,10 +475,15 @@ cannot be cut short, so on a slow system the answer can come that much later. Th
 check, or any process while no broker runs, is not seen, so keep relying on the store's
 compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop. A turn the session
 starts by itself, for example when background work it owns completes, is preceded by no
-embedding request, so no check can run before it writes. The store applies the same refusal
-to every writer of a managed transcript: a terminal that appends from a position older than
-the embedding's last write is refused too (`managed_append_identity_mismatch`), so neither
-side's append branches or overwrites the other's; the refused writer reopens to continue.
+embedding request, so no check can run before it writes. The refusal covers the plain append
+path, which the embedding and a non-interactive CLI run (`gjc -p`) use: an append from a
+position older than the file's newest entry is refused (`managed_append_identity_mismatch`),
+and that writer reopens to continue. An interactive terminal appends through
+`appendMessageSharingSession` instead, which is not refused for a stale position: it commits
+its entry as a child of its own position, a sibling of what the embedding wrote since. The
+embedding's next append is then refused, a reopen lands on the terminal's entry (now the
+newest), and the embedding's turns from that window stay in the transcript on the other
+branch, where a view at the tail no longer shows them.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
