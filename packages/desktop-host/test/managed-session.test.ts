@@ -5,7 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort } from "@gajae-code/ai/core";
-import * as sdk from "@gajae-code/coding-agent/sdk";
 import {
 	listManagedSessionCandidates,
 	type Q10Model,
@@ -15,11 +14,9 @@ import {
 	router as sdkRouter,
 } from "@gajae-code/coding-agent/sdk";
 import { createSdkWebSocketTransport } from "@gajae-code/coding-agent/sdk/host/websocket-transport";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DeliveryJournal } from "../src/delivery-journal";
-import { DesktopHost } from "../src/host";
 import { ManagedSession } from "../src/managed-session";
-import type { DesktopFrame, DesktopMessage, DesktopRequest, DesktopSession } from "../src/protocol";
+import type { DesktopMessage } from "../src/protocol";
 import {
 	createDesktopManagedEndpointAuthority,
 	createDesktopManagedModelQueries,
@@ -554,104 +551,6 @@ test("managed answer copy checks router object equality even while the captured 
 	expect(await h.adapter.copyText("answer", generation)).toBe("original owner answer");
 	expect(h.controls).toEqual([]);
 });
-
-for (const retirement of ["close", "reopen"] as const) {
-	test(`managed answer copy host fences project ${retirement} and retired managed map after reading`, async () => {
-		const h = await fixture({ pagedTranscript: true });
-		h.entries.push({ id: "answer", role: "assistant", body: "answer from owner", stopReason: "stop" });
-		const environment = { ...process.env };
-		const previousAgentDir = getAgentDir();
-		process.env.GJC_DESKTOP_ISOLATED = "1";
-		const createEmbedded = sdk.createEmbeddedAgentSession;
-		vi.spyOn(sdk, "createEmbeddedAgentSession").mockImplementation(async options => {
-			const owner = await createEmbedded(options);
-			const refresh = owner.refreshModels.bind(owner);
-			vi.spyOn(owner, "refreshModels").mockImplementation(() => refresh("offline"));
-			return owner;
-		});
-		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "list").mockImplementation(input =>
-			h.lifecycle.list(input),
-		);
-		vi.spyOn(sdkLifecycle.AgentDirSessionLifecycleService.prototype, "resume").mockImplementation(input =>
-			h.lifecycle.resume(input),
-		);
-		await Bun.write(
-			path.join(h.directory, "catalog.json"),
-			JSON.stringify({
-				version: 1,
-				projects: [{ id: h.projectId, name: "Fixture project", path: h.cwd }],
-				sessions: [{ id: h.id, projectId: h.projectId, title: "Managed owner", starred: false, managed: true }],
-			}),
-		);
-		const frames: DesktopFrame[] = [];
-		const host = new DesktopHost({ dataDir: h.directory, emit: frame => frames.push(frame) });
-		const release = Promise.withResolvers<void>();
-		cleanups.push(async () => {
-			release.resolve();
-			try {
-				await host.close();
-			} finally {
-				for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];
-				Object.assign(process.env, environment);
-				setAgentDir(previousAgentDir);
-			}
-		});
-		const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown>): Promise<T> => {
-			const id = crypto.randomUUID();
-			await host.handle({ id, method, params });
-			const response = frames.find(frame => frame.type === "response" && frame.id === id);
-			if (response?.type !== "response") throw new Error("Missing host response");
-			if (!response.ok) throw new Error(response.error);
-			return response.result as T;
-		};
-		const selected = await call<DesktopSession>("session.select", { sessionId: h.id });
-		const descriptor = selected.messages.find(message => message.role === "assistant")?.copy;
-		if (!descriptor) throw new Error("Missing host managed copy descriptor");
-		const read = Promise.withResolvers<void>();
-		const originalCopy = ManagedSession.prototype.copyText;
-		const copy = vi.spyOn(ManagedSession.prototype, "copyText").mockImplementationOnce(async function (
-			this: ManagedSession,
-			entryId,
-			generation,
-		) {
-			const text = await originalCopy.call(this, entryId, generation);
-			read.resolve();
-			await release.promise;
-			return text;
-		});
-		const reading = call("message.copyText", { sessionId: h.id, ...descriptor });
-		const outcome = reading.then(
-			value => ({ value, error: undefined }),
-			(error: unknown) => ({ value: undefined, error }),
-		);
-		try {
-			await Promise.race([
-				read.promise,
-				reading.then(() => {
-					throw new Error("Copy completed before the retirement barrier");
-				}),
-			]);
-			await call("project.close", { projectId: h.projectId });
-			if (retirement === "reopen") {
-				await call("project.open", { path: h.cwd });
-				const reopened = await call<DesktopSession>("session.select", { sessionId: h.id });
-				expect(reopened.messages.find(message => message.role === "assistant")?.copy?.sessionGeneration).not.toBe(
-					descriptor.sessionGeneration,
-				);
-			}
-			release.resolve();
-			const result = await outcome;
-			expect(result.value).toBeUndefined();
-			expect(result.error).toBeInstanceOf(Error);
-			expect((result.error as Error).message).toContain("SDK owner changed");
-		} finally {
-			release.resolve();
-			copy.mockRestore();
-		}
-		expect(h.controls).toEqual([]);
-		expect(await Bun.file(h.file).text()).toBe(h.transcript);
-	});
-}
 
 test("refuses a missing exact saved reference before resume and a replaced owner before any input", async () => {
 	const missing = await fixture({ open: false, missingSavedSession: true });

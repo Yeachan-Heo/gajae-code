@@ -686,6 +686,37 @@ const LIVE_OWNER_ACTOR = { id: "embedding", namespace: "embedding-live-owner" };
 const LIVE_OWNER_TIMEOUT_MS = 1_000;
 
 /**
+ * The agent directory's running broker as a lifecycle client: one connection per request, no
+ * reconnects, each bounded by what is left of the caller's deadline. Undefined when no broker
+ * runs; reading the discovery file never starts, restarts or recovers one.
+ */
+async function runningBrokerClient(
+	agentDir: string,
+	timeoutMs: number,
+	remaining: () => number,
+): Promise<SessionLifecycleClient | undefined> {
+	const discovery: BrokerDiscovery | null = await readBrokerDiscovery(agentDir);
+	if (!discovery) return undefined;
+	const { url, token } = discovery;
+	return {
+		global: async (operation, request, options) => {
+			const connection = await SdkClient.connect(url, token, {
+				timeoutMs: remaining(),
+				reconnectAttempts: 0,
+			});
+			try {
+				return await connection.global(operation, request, {
+					...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+					timeoutMs: Math.min(options.timeoutMs ?? timeoutMs, remaining()),
+				});
+			} finally {
+				await connection.close().catch(() => {});
+			}
+		},
+	};
+}
+
+/**
  * Ask the running SDK broker whether a live process holds `sessionId` open: any CLI run with a
  * durable transcript (it registers in the session index at startup, whatever its mode or SDK
  * hosting) or an owner the broker started. An embedding's own session, with SDK hosting off, is
@@ -711,27 +742,8 @@ export async function findEmbeddedLiveOwner(input: {
 	const deadline = Date.now() + timeoutMs;
 	const remaining = () => Math.max(1, deadline - Date.now());
 	const lookup = (async (): Promise<EmbeddedLiveOwner> => {
-		let client = input.client;
-		if (!client) {
-			const discovery: BrokerDiscovery | null = await readBrokerDiscovery(input.agentDir);
-			if (!discovery) return { kind: "unknown", reason: "broker_absent" };
-			const { url, token } = discovery;
-			client = {
-				global: async (operation, request, options) => {
-					const connection = await SdkClient.connect(url, token, {
-						timeoutMs: remaining(),
-						reconnectAttempts: 0,
-					});
-					try {
-						return await connection.global(operation, request, {
-							timeoutMs: Math.min(options.timeoutMs ?? timeoutMs, remaining()),
-						});
-					} finally {
-						await connection.close().catch(() => {});
-					}
-				},
-			};
-		}
+		const client = input.client ?? (await runningBrokerClient(input.agentDir, timeoutMs, remaining));
+		if (!client) return { kind: "unknown", reason: "broker_absent" };
 		const listed = await new SessionLifecycleService(client).list({
 			actor: LIVE_OWNER_ACTOR,
 			capability: "session.list",
@@ -744,6 +756,59 @@ export async function findEmbeddedLiveOwner(input: {
 			: { kind: "none" };
 	})().catch(() => unavailable);
 	return Promise.race([lookup, Bun.sleep(timeoutMs).then(() => unavailable)]);
+}
+
+/**
+ * What became of an idle-only close request. `not_closed` carries the error code the broker or
+ * the connection answered with: `busy` (the owner has work in progress), `close_refused` (the
+ * process was not started by the broker, for example a terminal), `not_found` (nothing is
+ * registered for the session), `timeout`, and so on. `unknown` means no answer was had at all:
+ * no broker is running (`broker_absent`), or the request outlived `timeoutMs` (`broker_unavailable`).
+ */
+export type EmbeddedIdleOwnerClose =
+	| { kind: "closed" }
+	| { kind: "not_closed"; code: string }
+	| { kind: "unknown"; reason: "broker_absent" | "broker_unavailable" };
+
+const IDLE_CLOSE_ACTOR = { id: "embedding", namespace: "embedding-idle-close" };
+const IDLE_CLOSE_TIMEOUT_MS = 3_000;
+
+/**
+ * Ask the running SDK broker to close the owner process it started for `sessionId`, only if that
+ * owner is idle. For an embedding that used to reach a transcript through a broker-started owner
+ * and now opens it itself: the leftover owner keeps `findEmbeddedLiveOwner` answering `live` with
+ * nobody using it. The broker refuses instead of acting when the owner has any work in progress
+ * (`busy`), and never signals or closes a process it did not start, such as a terminal
+ * (`close_refused`). Bounded like `findEmbeddedLiveOwner`: it never starts, restarts or recovers a
+ * broker, makes one `session.close` request with a single connection and no reconnects, and
+ * answers `unknown` instead of waiting past `timeoutMs` (default 3 s). Only `closed` is an
+ * answer about the owner; after anything else, ask `findEmbeddedLiveOwner` again.
+ * `client` replaces the agent directory's broker connection (tests, custom transports).
+ */
+export async function closeEmbeddedIdleOwner(input: {
+	agentDir: string;
+	sessionId: string;
+	timeoutMs?: number;
+	client?: SessionLifecycleClient;
+}): Promise<EmbeddedIdleOwnerClose> {
+	const timeoutMs = input.timeoutMs ?? IDLE_CLOSE_TIMEOUT_MS;
+	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
+	const deadline = Date.now() + timeoutMs;
+	const remaining = () => Math.max(1, deadline - Date.now());
+	const request = (async (): Promise<EmbeddedIdleOwnerClose> => {
+		const client = input.client ?? (await runningBrokerClient(input.agentDir, timeoutMs, remaining));
+		if (!client) return { kind: "unknown", reason: "broker_absent" };
+		const closed = await new SessionLifecycleService(client).close({
+			actor: IDLE_CLOSE_ACTOR,
+			capability: "session.close",
+			// A fresh key per request: a retry after `busy` must reach the owner, not replay the refusal.
+			requestKey: `embedding-idle-close:${crypto.randomUUID()}`,
+			target: { sessionId: input.sessionId, ifIdle: true },
+			timeoutMs: remaining(),
+		});
+		return closed.ok ? { kind: "closed" } : { kind: "not_closed", code: closed.error.code };
+	})().catch(() => unavailable);
+	return Promise.race([request, Bun.sleep(timeoutMs).then(() => unavailable)]);
 }
 
 /** The embedding must first release its writer and remove the durable catalog reference. */

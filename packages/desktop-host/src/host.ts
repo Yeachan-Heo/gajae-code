@@ -13,6 +13,7 @@ import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	captureSessionView,
+	closeEmbeddedIdleOwner,
 	createAgentSession,
 	createEmbeddedAgentSession,
 	createSdkComposerObservation,
@@ -46,7 +47,6 @@ import {
 	type SdkComposerObservation,
 	type SdkPreferenceOutcome,
 	SdkRevisionError,
-	type SdkSessionInfo,
 	type SdkSessionView,
 	type SettingCatalogItem,
 	Settings,
@@ -72,7 +72,7 @@ import {
 	DesktopGatePresentationError,
 	type DesktopGatePresenter,
 } from "./gate-presentation";
-import { ManagedSession } from "./managed-session";
+import type { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
 	type AnchoredNotice,
@@ -125,7 +125,7 @@ import type {
 	DesktopSnapshot,
 } from "./protocol";
 import { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./protocol";
-import { projectDesktopSessionInfo, readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
+import { readDesktopPullRequest, readDesktopSessionInfo } from "./session-info";
 import { projectGoal, projectTodos } from "./session-state";
 import { createDesktopStreamRedactor } from "./stream-redactor";
 import { projectToolCatalog } from "./tool-catalog";
@@ -392,10 +392,24 @@ interface SavedSession {
 	 */
 	viewTail?: string | null;
 	createdAt?: number;
-	/** Read-only SDK inventory reference, not authority to open a shared transcript. */
+	/**
+	 * A row an earlier build saved as a bare reference to a terminal conversation: no transcript
+	 * path, so nothing can be read or opened until the store's listing places it (`#place`).
+	 */
 	managed?: true;
+	/**
+	 * An earlier build reached this conversation through an owner process the SDK broker started,
+	 * which may still be running idle. Kept until an owner check answers that nobody has it open.
+	 */
+	leftoverOwner?: true;
 	/** The user released the app's writer (Disconnect); it stays read-only until Connect. */
 	disconnected?: true;
+}
+/** What one listing of a workspace's conversations found. */
+interface Discovery {
+	discovered: SavedSession[];
+	placed: Map<SavedSession, string>;
+	creationTimes: Map<string, number>;
 }
 interface Catalog {
 	version: 1;
@@ -444,6 +458,13 @@ class SteppedAside extends Error {
 		this.name = "SteppedAside";
 	}
 }
+/** A row saved by an earlier build whose transcript the shared store does not list (any more). */
+const UNPLACED =
+	"The app cannot open this conversation: its transcript is not in the shared conversation store. It may have been deleted or moved in the terminal. You can remove it from this list.";
+/** The store's listing failed, so the app cannot tell whether such a row's transcript still exists. */
+const UNPLACED_UNCHECKED = "The app could not look up this conversation's transcript just now. Try again in a moment.";
+/** How long an idle owner left by an earlier build gets to close before the app answers anyway. */
+const LEFTOVER_CLOSE_TIMEOUT_MS = 3_000;
 /** A terminal has the conversation open, but the app still holds it because its background work runs. */
 const ELSEWHERE_BACKGROUND =
 	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs and does not start what you send; when that work finishes, the app may still add its result and a reply. To leave it to the terminal now, stop or cancel that work in the Session work panel, or Disconnect.";
@@ -660,7 +681,6 @@ export class DesktopHost {
 	/** Publication tokens survive live-map removal without retaining disposed SDK owners. */
 	#viewOwners = new WeakMap<SavedSession, symbol>();
 	#managed = new Map<string, ManagedSession>();
-	#managedControlEpoch = 0;
 	#managedOpening = new Map<string, Promise<ManagedSession>>();
 	#managedProjectEpochs = new Map<string, number>();
 	/** Unpublished SDK ownership, retained until publication or proven disposal. */
@@ -875,6 +895,11 @@ export class DesktopHost {
 				if (item.disconnected !== undefined) {
 					if (item.disconnected !== true || session.managed) throw new Error("Invalid session connection");
 					session.disconnected = true;
+				}
+				if (item.leftoverOwner !== undefined) {
+					if (item.leftoverOwner !== true || !session.file || !session.sessionId)
+						throw new Error("Invalid session owner note");
+					session.leftoverOwner = true;
 				}
 				return session;
 			});
@@ -1234,7 +1259,7 @@ export class DesktopHost {
 			...projectGoal(live?.sdk, text => this.#redact(text)),
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
-			// Rows another surface owns through the SDK carry no connection of the app's own.
+			// A row not placed in the shared store yet has no transcript to connect to.
 			...(metadata.managed ? {} : { connection: { state: this.#connection(metadata) } }),
 		};
 	}
@@ -1263,13 +1288,34 @@ export class DesktopHost {
 	}
 	/** The broker's answer for this row's transcript, without changing what the row shows. */
 	async #ownerAnswer(metadata: SavedSession): Promise<EmbeddedLiveOwner> {
-		if (!metadata.sessionId || !metadata.file) return { kind: "none" };
-		return findEmbeddedLiveOwner({
+		const sessionId = metadata.sessionId;
+		if (!sessionId || !metadata.file) return { kind: "none" };
+		const ask = () =>
+			findEmbeddedLiveOwner({
+				agentDir: this.agentDir,
+				sessionId,
+				timeoutMs: OWNER_CHECK_TIMEOUT_MS,
+				...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
+			});
+		const answer = await ask();
+		if (!metadata.leftoverOwner) return answer;
+		// Nobody has it open: the note has done its job. It leaves the catalog with the next save.
+		if (answer.kind === "none") delete metadata.leftoverOwner;
+		if (answer.kind !== "live") return answer;
+		// An earlier build opened this conversation through an owner the broker started, and that
+		// owner may be what still holds it. Ask the broker to close it if it is idle: the broker
+		// refuses a busy owner and never touches a process it did not start, such as a terminal.
+		// The note stays until a check answers `none`, so a refused attempt is made again later.
+		const closed = await closeEmbeddedIdleOwner({
 			agentDir: this.agentDir,
-			sessionId: metadata.sessionId,
-			timeoutMs: OWNER_CHECK_TIMEOUT_MS,
+			sessionId,
+			timeoutMs: LEFTOVER_CLOSE_TIMEOUT_MS,
 			...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
 		});
+		if (closed.kind !== "closed") return answer;
+		const after = await ask();
+		if (after.kind === "none") delete metadata.leftoverOwner;
+		return after;
 	}
 	snapshot(): DesktopSnapshot {
 		return {
@@ -1341,12 +1387,10 @@ export class DesktopHost {
 		return metadata;
 	}
 	async #open(metadata: SavedSession, manager?: SessionManager): Promise<LiveSession> {
-		// A discovered terminal conversation stays attach-only: inventory membership is not
-		// a writer lease, so only an SDK-owned lifecycle may admit that writer. A conversation
-		// this host created in the same store opens the way the terminal opens its own
-		// transcripts, with no exclusivity the terminal itself does not provide.
-		if (metadata.managed)
-			throw new Error("This terminal conversation requires SDK ownership admission before desktop resume.");
+		// Every conversation in the shared store, whichever surface created it, opens the way the
+		// terminal opens its own transcripts, with no exclusivity the terminal itself does not
+		// provide; listing one grants nothing. A row not placed in the store yet has nothing to open.
+		if (metadata.managed) throw new Error(UNPLACED);
 		// Every path that would open the app's own writer passes here; reads of a released
 		// conversation are answered from its transcript before they reach it.
 		if (!this.#writable(metadata)) throw this.#notWritable(metadata);
@@ -1461,31 +1505,40 @@ export class DesktopHost {
 			throw error;
 		}
 	}
-	/** Only a successful inventory that no longer lists the transcript proves it is gone. */
-	async #discoveredTranscriptGone(metadata: SavedSession): Promise<boolean> {
+	/**
+	 * Gives a row an earlier build saved without a transcript path its place in the shared store,
+	 * if the store lists that transcript for this workspace now. `unlisted`: it is gone, or lies
+	 * outside the store. `unavailable`: the listing failed, which proves nothing.
+	 */
+	async #place(metadata: SavedSession): Promise<"placed" | "unlisted" | "unavailable"> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
-		if (!project || this.#managedOpening.has(metadata.id)) return false;
+		if (!project) return "unlisted";
+		let file: string | undefined;
 		try {
-			const { managed, local } = await listEmbeddedProjectSessions({
+			const { managed } = await listEmbeddedProjectSessions({
 				cwd: project.path,
 				agentDir: this.agentDir,
 				directory: path.join(this.dataDir, "sessions", project.id),
 			});
-			return ![...managed, ...local].some(session => session.id === metadata.id);
+			const listed = managed.find(session => session.id === metadata.id);
+			// As in discovery: the header must name this exact workspace directory.
+			const cwd = listed?.cwd ? await fs.realpath(listed.cwd).catch(() => undefined) : undefined;
+			file = listed && cwd === project.path ? await this.#sharedStorePath(listed.path) : undefined;
 		} catch {
-			return false;
+			return "unavailable";
 		}
-	}
-	/** Detach any stale SDK attachment, then forget the reference; its transcript is already gone. */
-	async #forgetDiscovered(metadata: SavedSession): Promise<null> {
-		const attachment = this.#managed.get(metadata.id);
-		if (attachment) {
-			this.#managed.delete(metadata.id);
-			await attachment.close();
+		// Another request, or a workspace refresh, placed or removed it while the listing ran.
+		if (!metadata.managed) return "placed";
+		if (!file || !this.#catalog.sessions.includes(metadata)) return "unlisted";
+		const undo = this.#applyPlacement(metadata, file);
+		try {
+			await this.#save();
+		} catch (error) {
+			undo();
+			throw error;
 		}
-		// An inventory can come back empty without failing, so absence is not proof enough to
-		// release the identity: a transcript that is truly gone never lists again anyway.
-		return this.#forgetMissingSession(metadata, false);
+		this.#publishSnapshot();
+		return "placed";
 	}
 	/** Remove the unowned catalog reference durably, then clean SDK-owned sidecars/artifacts. */
 	async #forgetMissingSession(metadata: SavedSession, release = true): Promise<null> {
@@ -2895,7 +2948,6 @@ export class DesktopHost {
 	 * stopped through Stop, whose receipts classify each input as usual.
 	 */
 	async #disconnect(metadata: SavedSession, confirm: boolean, arrival: number): Promise<DesktopDisconnectResult> {
-		if (metadata.managed) throw new Error("Disconnect this conversation in the terminal that owns it.");
 		// One release at a time: a Disconnect already releasing this conversation finishes first.
 		for (let pending = this.#disconnecting.get(metadata.id); pending; pending = this.#disconnecting.get(metadata.id))
 			await pending.catch(() => {});
@@ -3007,7 +3059,6 @@ export class DesktopHost {
 	}
 	/** Take the conversation back through the normal open path, which lands on any newer tail. */
 	async #connect(metadata: SavedSession): Promise<DesktopSession> {
-		if (metadata.managed) return this.#dto(metadata);
 		// Check again once the app has finished stepping aside (or opening), if it still is.
 		const pending = this.#opening.get(metadata.id);
 		if (pending) await pending.catch(() => {});
@@ -3339,12 +3390,16 @@ export class DesktopHost {
 		if (typeof params.sessionId === "string") {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) {
-				// The terminal may already have deleted a discovered conversation's transcript. That
-				// row can never open again, so deleting it only forgets the reference. A transcript
-				// the SDK still lists stays under its own control surface.
-				if (method === "session.delete" && (await this.#discoveredTranscriptGone(metadata)))
-					return this.#forgetDiscovered(metadata);
-				return this.#dispatchManaged(request, this.#metadata(params));
+				// A row an earlier build saved without a transcript path. Once the store's listing
+				// places it, it goes on below as an ordinary row. Until then nothing can read or open
+				// it, and deleting it only forgets the reference: the app never held that transcript.
+				const placement = await this.#place(this.#metadata(params));
+				if (placement === "unlisted" && method === "session.delete")
+					// An inventory can come back empty without failing, so absence is not proof enough
+					// to release the identity: a transcript that is truly gone never lists again anyway.
+					return this.#forgetMissingSession(metadata, false);
+				if (placement === "unavailable") throw new Error(UNPLACED_UNCHECKED);
+				if (placement === "unlisted") throw new Error(UNPLACED);
 			}
 		}
 		if (method === "auth.providers") {
@@ -3579,11 +3634,11 @@ export class DesktopHost {
 			return this.#command(this.#metadata(params), requiredString(params, "text"), request.id, arrival);
 		if (method === "history.get") {
 			const target = this.#metadata(params);
-			if (!target.managed && !this.#writable(target)) return this.#dispatchReadOnly(request, target);
+			if (!this.#writable(target)) return this.#dispatchReadOnly(request, target);
 			const live = await this.#open(target).catch(error => {
-				if (!target.managed && !this.#writable(target)) return undefined;
+				if (!this.#writable(target)) return undefined;
 				// A conversation the app could not reopen is shown from its transcript; so is its history.
-				if (!target.managed && this.#readOnly.has(target.id) && !this.#live.has(target.id)) return undefined;
+				if (this.#readOnly.has(target.id) && !this.#live.has(target.id)) return undefined;
 				throw error;
 			});
 			if (!live) return this.#dispatchReadOnly(request, target);
@@ -4441,159 +4496,6 @@ export class DesktopHost {
 		};
 	}
 
-	async #openManaged(metadata: SavedSession): Promise<ManagedSession> {
-		const existing = this.#managed.get(metadata.id);
-		if (existing?.isAttached) return existing;
-		const pending = this.#managedOpening.get(metadata.id);
-		if (pending) return pending;
-		if (existing) this.#managed.delete(metadata.id);
-		const project = this.#catalog.projects.find(item => item.id === metadata.projectId)!;
-		const projectEpoch = this.#managedProjectEpochs.get(project.id) ?? 0;
-		const cwd = project.path;
-		const session = new ManagedSession({
-			agentDir: this.agentDir,
-			cwd: project.path,
-			id: metadata.id,
-			projectId: metadata.projectId,
-			title: metadata.title,
-			starred: metadata.starred,
-			nextControlGeneration: () => {
-				if (this.#managedControlEpoch >= Number.MAX_SAFE_INTEGER)
-					throw new Error("Desktop control generation exhausted");
-				return ++this.#managedControlEpoch;
-			},
-			redact: text => this.#redact(text),
-			delivery: (id, changes) => this.#delivery(id, changes),
-			turnEnded: this.#endedTurns.has(metadata.id),
-			onTurnEnded: () => this.#endedTurns.add(metadata.id),
-			onTaskCompleted: (turnId, desktopEpoch) => {
-				if (
-					!this.#closed &&
-					this.#managed.get(metadata.id) === session &&
-					this.#catalog.sessions.includes(metadata) &&
-					this.#catalog.projects.includes(project) &&
-					project.id === metadata.projectId &&
-					!project.closed &&
-					project.path === cwd &&
-					(this.#managedProjectEpochs.get(project.id) ?? 0) === projectEpoch &&
-					session.controlGeneration === desktopEpoch &&
-					typeof turnId === "string" &&
-					turnId.trim()
-				)
-					this.#taskCompleted(metadata.id, ["managed", desktopEpoch, turnId]);
-			},
-			onChange: () => {
-				if (this.#managed.get(metadata.id) === session && !this.#closed && !project.closed)
-					this.#emit({ type: "session", session: session.dto() });
-			},
-		});
-		const opening = (async () => {
-			try {
-				await existing?.close();
-				await session.open();
-				if (this.#closed || project.closed || (this.#managedProjectEpochs.get(project.id) ?? 0) !== projectEpoch)
-					throw new Error("Workspace closed while connecting to SDK owner");
-				this.#managed.set(metadata.id, session);
-				return session;
-			} catch (error) {
-				await session.close();
-				throw error;
-			}
-		})();
-		this.#managedOpening.set(metadata.id, opening);
-		try {
-			return await opening;
-		} finally {
-			if (this.#managedOpening.get(metadata.id) === opening) this.#managedOpening.delete(metadata.id);
-		}
-	}
-
-	async #dispatchManaged(request: DesktopRequest, metadata: SavedSession): Promise<unknown> {
-		const { method, params } = request;
-		const supported = [
-			"session.select",
-			"history.get",
-			"prompt",
-			"abort",
-			"models.list",
-			"model.set",
-			"thinking.set",
-			"session.info",
-		];
-		if (!supported.includes(method))
-			throw new Error(`The SDK owner does not support desktop ${method}. Use its original control surface.`);
-		const query =
-			method === "session.select" ||
-			method === "history.get" ||
-			method === "models.list" ||
-			method === "session.info";
-		// A write must not resume/reconnect an owner on behalf of an old rendered
-		// intent. Only reads may establish or synchronize the current attachment.
-		const session = query ? await this.#openManaged(metadata) : this.#managed.get(metadata.id);
-		if (
-			!session ||
-			(!query &&
-				(!Number.isSafeInteger(params.sessionGeneration) || params.sessionGeneration !== session.controlGeneration))
-		)
-			throw new Error("SDK owner changed before control dispatch. Select the conversation again.");
-		switch (method) {
-			case "session.info": {
-				if (Object.keys(params).some(key => key !== "sessionId"))
-					throw new Error("Invalid session read parameters");
-				const generation = session.controlGeneration;
-				const info = await session.query("session.info");
-				if (
-					this.#closed ||
-					this.#managed.get(metadata.id) !== session ||
-					!session.isAttached ||
-					session.controlGeneration !== generation
-				)
-					throw new Error("SDK owner changed. Select the conversation again.");
-				return projectDesktopSessionInfo(info as SdkSessionInfo, {
-					catalogSessionId: metadata.id,
-					redact: text => this.#redact(text),
-				});
-			}
-			case "session.select":
-				await session.refresh();
-				this.#publishSnapshot();
-				return session.dto();
-			case "history.get": {
-				const offset = params.offset ?? 0;
-				const limit = params.limit ?? HISTORY_PAGE_LIMIT;
-				if (
-					typeof offset !== "number" ||
-					!Number.isInteger(offset) ||
-					offset < 0 ||
-					typeof limit !== "number" ||
-					!Number.isInteger(limit) ||
-					limit < 1 ||
-					limit > HISTORY_PAGE_LIMIT
-				)
-					throw new Error("Invalid history page");
-				await session.refresh();
-				return session.history(offset, limit);
-			}
-			case "prompt": {
-				if (params.editEntryId !== undefined)
-					throw new Error("Prompt editing is unavailable for this SDK connection.");
-				const input = prepareDesktopAttachmentInput(request);
-				if (input.images.length) throw new Error("Image submission is unavailable for this SDK connection");
-				await session.prompt(request.id, input.text, params.deliverAs);
-				return null;
-			}
-			case "abort":
-				return session.control("turn.abort");
-			case "models.list":
-				await session.refresh();
-				return session.models();
-			case "model.set":
-				return session.setModel(requiredString(params, "modelId", 500), params.thinkingLevel);
-			case "thinking.set":
-				return session.setThinking(params.level);
-		}
-	}
-
 	/**
 	 * Hides a workspace's live conversations after its durable close. Teardown failures are
 	 * reported rather than rethrown: the close itself already succeeded and must not be undone
@@ -4680,9 +4582,24 @@ export class DesktopHost {
 	}
 
 	/** Read-only SDK inventory: no recovery, transcript copies, or eager live sessions. */
-	async #discoverProjectSessions(
-		project: DesktopProject,
-	): Promise<{ discovered: SavedSession[]; creationTimes: Map<string, number> }> {
+	/**
+	 * A listed transcript's path relative to the shared store's root, or undefined when it lies
+	 * outside it (a project-local `.gjc` transcript) or cannot be resolved. Only a transcript
+	 * inside the root can be a row: the app reads, opens and deletes rows through that root.
+	 */
+	async #sharedStorePath(listed: string): Promise<string | undefined> {
+		const resolved = await fs.realpath(listed).catch(() => undefined);
+		if (!resolved || !this.#managedSessionsRoot) return undefined;
+		const relative = path.relative(this.#managedSessionsRoot, resolved);
+		return relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : undefined;
+	}
+	/**
+	 * A conversation another surface (the terminal) created is an ordinary shared-store row, the
+	 * same kind the app creates: listing it grants nothing, and opening it takes the same path,
+	 * owner check included. `placed` are rows an earlier build saved without a transcript path
+	 * that this listing can now give one.
+	 */
+	async #discoverProjectSessions(project: DesktopProject): Promise<Discovery> {
 		const { managed, local: desktop } = await listEmbeddedProjectSessions({
 			cwd: project.path,
 			agentDir: this.agentDir,
@@ -4690,6 +4607,7 @@ export class DesktopHost {
 		});
 		const sessions = [...managed, ...desktop];
 		const discovered: SavedSession[] = [];
+		const placed = new Map<SavedSession, string>();
 		const creationTimes = new Map<string, number>();
 		const ids = new Set(this.#catalog.sessions.map(session => session.id));
 		const catalogRow = (session: (typeof sessions)[number]) =>
@@ -4715,6 +4633,10 @@ export class DesktopHost {
 			if (cwd !== project.path) continue;
 			const existing = catalogRow(session);
 			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
+			if (existing?.managed && existing.projectId === project.id && existing.id === session.id) {
+				const file = desktop.includes(session) ? undefined : await this.#sharedStorePath(session.path);
+				if (file) placed.set(existing, file);
+			}
 			if (
 				existing ||
 				desktop.includes(session) ||
@@ -4727,17 +4649,38 @@ export class DesktopHost {
 				lineage.has(path.resolve(session.path))
 			)
 				continue;
+			// A transcript outside the shared store's root cannot be a row; the terminal resumes it.
+			const file = await this.#sharedStorePath(session.path);
+			if (!file) continue;
 			ids.add(session.id);
 			discovered.push({
 				id: session.id,
 				projectId: project.id,
 				title: (session.title || session.firstMessage.trim() || "Untitled session").slice(0, 200),
 				starred: session.starred,
-				managed: true,
+				file,
+				scope: "managed",
+				sessionId: session.id,
 				createdAt,
 			});
 		}
-		return { discovered, creationTimes };
+		return { discovered, placed, creationTimes };
+	}
+	/** Gives a row an earlier build saved without a transcript path its place in the shared store. */
+	#applyPlacement(session: SavedSession, file: string): () => void {
+		delete session.managed;
+		session.file = file;
+		session.scope = "managed";
+		session.sessionId = session.id;
+		// That build opened such rows through an owner the broker started; it may still be running.
+		session.leftoverOwner = true;
+		return () => {
+			session.managed = true;
+			delete session.file;
+			delete session.scope;
+			delete session.sessionId;
+			delete session.leftoverOwner;
+		};
 	}
 
 	/** Restores or refreshes a workspace under the same fence used by close. */
@@ -4863,8 +4806,9 @@ export class DesktopHost {
 		if (this.#closed) return false;
 		const undo = this.#mergeDiscovered(project, discovery);
 		if (!undo) return false;
-		// Creation-time corrections alone are saved with the next catalog write; a new row needs its own.
-		if (!discovery.discovered.length) return true;
+		// Creation-time corrections alone are saved with the next catalog write; a new or placed row
+		// needs its own.
+		if (!discovery.discovered.length && !discovery.placed.size) return true;
 		try {
 			await this.#save();
 		} catch (error) {
@@ -4877,8 +4821,12 @@ export class DesktopHost {
 	/** Applies one discovery to the catalog and returns its undo, or undefined when nothing changed. */
 	#mergeDiscovered(
 		project: DesktopProject,
-		{ discovered, creationTimes }: { discovered: SavedSession[]; creationTimes: Map<string, number> },
+		{ discovered, placed, creationTimes }: Discovery,
 	): (() => void) | undefined {
+		// A row may have been placed (or removed) while the listing ran.
+		const placements = [...placed]
+			.filter(([session]) => session.managed && this.#catalog.sessions.includes(session))
+			.map(([session, file]) => this.#applyPlacement(session, file));
 		const previousCreationTimes = new Map<SavedSession, number | undefined>();
 		for (const session of this.#catalog.sessions) {
 			const createdAt = creationTimes.get(session.id);
@@ -4898,8 +4846,9 @@ export class DesktopHost {
 			if (index === -1) this.#catalog.sessions.push(session);
 			else this.#catalog.sessions.splice(index, 0, session);
 		}
-		if (!discovered.length && !previousCreationTimes.size) return undefined;
+		if (!discovered.length && !previousCreationTimes.size && !placements.length) return undefined;
 		return () => {
+			for (const undo of placements) undo();
 			for (const [session, createdAt] of previousCreationTimes) {
 				if (createdAt === undefined) delete session.createdAt;
 				else session.createdAt = createdAt;

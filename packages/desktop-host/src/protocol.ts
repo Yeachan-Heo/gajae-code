@@ -238,12 +238,15 @@ export interface DesktopSession {
 	/** Last failed prompt turn for this conversation; administrative refusals answer their request instead. */
 	error?: string;
 	errorOwner?: string;
-	/** Whether the app writes this conversation itself. Absent on another surface's SDK-owned rows. */
+	/**
+	 * Whether the app writes this conversation itself. Absent only on a row an earlier build saved
+	 * without a transcript path, until the shared store's listing places it.
+	 */
 	connection?: DesktopSessionConnection;
 }
 
 /**
- * Who writes a conversation the app created. `connected`: the app opens its own writer when the
+ * Who writes a conversation, whichever surface created it. `connected`: the app opens its own writer when the
  * conversation is used. `disconnected`: the user released it (`session.disconnect`) so another
  * surface, such as the terminal, can continue it; it survives restarts, its history is read from
  * the transcript and nothing can be sent until `session.connect`. `elsewhere`: another gjc

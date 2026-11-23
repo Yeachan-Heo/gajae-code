@@ -485,6 +485,22 @@ embedding's next append is then refused, a reopen lands on the terminal's entry 
 newest), and the embedding's turns from that window stay in the transcript on the other
 branch, where a view at the tail no longer shows them.
 
+An embedding that used to reach a transcript through the broker (a lifecycle `session.resume`,
+which starts an owner process that outlives the embedding's connection) and now opens it
+itself finds that leftover owner reported as `live` with nobody using it.
+`await closeEmbeddedIdleOwner({ agentDir, sessionId })` asks the running broker for an
+idle-fenced `session.close` of that session and answers `{ kind: "closed" }`,
+`{ kind: "not_closed", code }` or `{ kind: "unknown", reason }`. The owner itself decides: with
+a turn, queued input, a shell command, background jobs or any session transition in progress it
+answers `busy` and nothing happens. The broker sends that request only to a process it started
+itself and never falls back to a signal for an idle-fenced close, so a terminal that has the
+transcript open is refused (`close_refused`, or `invalid_input` when it registered no SDK
+endpoint) and keeps running. Like the lookup, the helper never starts, restarts or recovers a
+broker, uses a single connection with no reconnects, and stops waiting at `timeoutMs` (default
+3 s). Only `closed` says anything about the owner; after any other answer, ask
+`findEmbeddedLiveOwner` again. Use it only for sessions the embedding itself once resumed
+through the broker: an idle owner that another client started would be closed as well.
+
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
 `releaseResources()` joins actual session disposal before closing the embedding's

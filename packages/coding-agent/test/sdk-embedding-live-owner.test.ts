@@ -5,7 +5,8 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { registerDirectSession } from "../src/main";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
-import { createEmbeddedAgentSession, findEmbeddedLiveOwner } from "../src/sdk/embedding";
+import { closeEmbeddedIdleOwner, createEmbeddedAgentSession, findEmbeddedLiveOwner } from "../src/sdk/embedding";
+import { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 import type { SessionLifecycleClient } from "../src/sdk/lifecycle/service";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -190,3 +191,123 @@ test("a transcript an embedding holds open is not reported live, so the embeddin
 		},
 	);
 }, 60_000);
+
+test("an idle-only close with no broker running answers at once and starts nothing", async () => {
+	const dir = await agentDir();
+	const started = Date.now();
+	expect(await closeEmbeddedIdleOwner({ agentDir: dir, sessionId })).toEqual({
+		kind: "unknown",
+		reason: "broker_absent",
+	});
+	expect(Date.now() - started).toBeLessThan(500);
+	expect(await Bun.file(path.join(dir, "sdk", "broker.json")).exists()).toBe(false);
+});
+
+test("an idle-only close is one idle-fenced request, and reports the broker's own answer", async () => {
+	const dir = await agentDir();
+	const seen: Array<{ operation: string; input: Record<string, unknown>; key?: string }> = [];
+	const answering = (answer: unknown): SessionLifecycleClient => ({
+		global: async (operation, input, options) => {
+			seen.push({ operation, input, key: options.idempotencyKey });
+			return answer;
+		},
+	});
+	expect(
+		await closeEmbeddedIdleOwner({
+			agentDir: dir,
+			sessionId,
+			client: answering({ ok: true, result: { sessionId } }),
+		}),
+	).toEqual({ kind: "closed" });
+	// Never a plain close: the owner decides, and only when it has nothing in progress.
+	expect(seen.map(({ operation, input }) => ({ operation, input }))).toEqual([
+		{ operation: "session.close", input: { sessionId, ifIdle: true } },
+	]);
+	for (const code of ["busy", "close_refused", "not_found"])
+		expect(
+			await closeEmbeddedIdleOwner({
+				agentDir: dir,
+				sessionId,
+				client: answering({ ok: false, error: { code, message: "refused" } }),
+			}),
+		).toEqual({ kind: "not_closed", code });
+	// A retry after a refusal is a new request, never a replay of the refusal.
+	expect(new Set(seen.map(request => request.key)).size).toBe(seen.length);
+	expect(seen.every(request => typeof request.key === "string" && request.key.length > 0)).toBe(true);
+});
+
+test("an idle-only close that fails or gets no answer in time is reported as not closed or unknown", async () => {
+	const dir = await agentDir();
+	const failing: SessionLifecycleClient = {
+		global: async () => {
+			throw new Error("connection refused");
+		},
+	};
+	expect((await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, client: failing })).kind).toBe("not_closed");
+	const silent: SessionLifecycleClient = { global: () => Promise.withResolvers<unknown>().promise };
+	const started = Date.now();
+	expect(await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, client: silent, timeoutMs: 50 })).toEqual({
+		kind: "unknown",
+		reason: "broker_unavailable",
+	});
+	expect(Date.now() - started).toBeLessThan(1000);
+});
+
+test("a real broker refuses to idle-close a terminal's session, which stays live", async () => {
+	const { dir, cwd, startBroker } = await brokerWorkspace();
+	const manager = await sharedTranscript(cwd, dir);
+	const sessionId = manager.getSessionId();
+	await registerDirectSession(manager, dir, undefined, { registerPostmortem: () => () => {} });
+	await startBroker();
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
+	// The broker did not start this process, so it neither closes nor signals it. (A terminal
+	// registered without an SDK endpoint has nothing a close could even be sent to; one with an
+	// endpoint is refused as `close_refused`.)
+	const refused = await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 });
+	expect(refused.kind).toBe("not_closed");
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
+	// Nothing registered for a session: a definite answer too, and nothing is started for it.
+	expect(
+		await closeEmbeddedIdleOwner({
+			agentDir: dir,
+			sessionId: "1b0f8a52-6a8f-4a59-9d1c-1f3c2d4e5f60",
+			timeoutMs: 10_000,
+		}),
+	).toEqual({ kind: "not_closed", code: "not_found" });
+}, 60_000);
+
+test("a real broker closes the idle owner it started, and nobody holds the transcript afterwards", async () => {
+	const { dir, cwd, startBroker } = await brokerWorkspace();
+	await startBroker();
+	const manager = await sharedTranscript(cwd, dir);
+	const sessionId = manager.getSessionId();
+	await manager.close();
+	// What an embedding did before it opened shared transcripts itself: resume through the broker,
+	// which starts an owner process that outlives the embedding's own connection.
+	const lifecycle = new AgentDirSessionLifecycleService(dir);
+	const actor = { id: "embedding", namespace: "embedding-owner-test" };
+	const listed = await lifecycle.list({
+		actor,
+		capability: "session.list",
+		target: { cwd, resolveSessionId: sessionId },
+	});
+	if (!listed.ok || "rows" in listed.result || !listed.result.savedSession)
+		throw new Error("The fixture broker did not list the saved transcript");
+	const saved = listed.result.savedSession;
+	const resumed = await lifecycle.resume({
+		actor,
+		capability: "session.resume",
+		requestKey: crypto.randomUUID(),
+		target: {
+			sessionId,
+			cwd,
+			stateRoot: path.join(cwd, ".gjc", "state"),
+			sessionPath: saved.path,
+			sessionIdentity: saved.identity,
+		},
+	});
+	expect(resumed.ok).toBe(true);
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
+	expect(await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, timeoutMs: 30_000 })).toEqual({ kind: "closed" });
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "none" });
+}, 120_000);
