@@ -1584,6 +1584,8 @@ export class DesktopHost {
 			claimedUserTurns: new WeakSet(),
 		};
 		this.#live.set(live.metadata.id, live);
+		// A read-only stand-in shown while a reopen failed is no longer needed.
+		this.#readOnly.delete(live.metadata.id);
 		this.#viewOwners.set(live.metadata, live.viewOwnerToken);
 		this.#attachGatePresenter(live);
 		this.#attachOperatorController(live);
@@ -3061,7 +3063,17 @@ export class DesktopHost {
 			} catch (error) {
 				console.error(`Desktop could not fully release a stale conversation copy: ${String(error)}`);
 			}
-			return this.#load(metadata);
+			try {
+				return await this.#load(metadata);
+			} catch (error) {
+				// The copy is gone and no new one opened (for example, a newer surface wrote an entry this
+				// build cannot open). Show the transcript read from the file, so the conversation is never
+				// blank; it stays writable, so the next select or prompt tries to open it again.
+				await this.#loadReadOnly(metadata).catch(() => {});
+				if (!this.#closed && this.#catalog.sessions.includes(metadata))
+					this.#emit({ type: "session", session: this.#dto(metadata) });
+				throw error;
+			}
 		})();
 		this.#opening.set(metadata.id, reopened);
 		const release = () => {

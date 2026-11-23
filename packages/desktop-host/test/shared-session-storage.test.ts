@@ -829,6 +829,35 @@ test("a refused write whose reload cannot reopen says so, and selecting again re
 	await h.close();
 });
 
+test("a reload that cannot reopen still shows the conversation, and selecting again retries", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	const file = stale.sessionFile!;
+	const before = await Bun.file(file).text();
+	// A newer terminal appended an entry this build cannot open (a writer refuses the file), though
+	// the conversation in it can still be read.
+	const tail = h.sdk().sessionManager.getEntries().at(-1)!.id;
+	await fs.appendFile(
+		file,
+		`${JSON.stringify({ type: "future_entry_kind", id: "0f0f0f0f", parentId: tail, timestamp: new Date().toISOString() })}\n`,
+	);
+	await expect(h.call("session.select", { sessionId })).rejects.toThrow();
+	await stale.awaitDisposeCompletion();
+	// The transcript stays on screen, read from the file, rather than an empty conversation.
+	expect(h.snapshot().sessions[0]?.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	// Once the file can be opened again, selecting reopens a writer.
+	await Bun.write(file, before);
+	const reopened = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(h.sdk()).not.toBe(stale);
+	expect(reopened.connection).toEqual({ state: "connected" });
+	expect(reopened.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	await h.call("prompt", { sessionId, text: "after the retry" });
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "completed" });
+	await h.close();
+});
+
 test("a refused write hands back queued input it can never send, then reloads", async () => {
 	let hold = false;
 	const entered = Promise.withResolvers<void>();
