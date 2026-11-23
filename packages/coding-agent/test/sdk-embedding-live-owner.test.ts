@@ -260,11 +260,11 @@ test("a real broker refuses to idle-close a terminal's session, which stays live
 	await registerDirectSession(manager, dir, undefined, { registerPostmortem: () => () => {} });
 	await startBroker();
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
-	// The broker did not start this process, so it neither closes nor signals it. (A terminal
-	// registered without an SDK endpoint has nothing a close could even be sent to; one with an
-	// endpoint is refused as `close_refused`.)
+	// The broker did not start this process, so it neither closes nor signals it. A direct
+	// registration has no SDK endpoint (generation 0), which the broker's endpoint lookup rejects
+	// as invalid input before anything is sent; one with an endpoint is refused as `close_refused`.
 	const refused = await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 });
-	expect(refused.kind).toBe("not_closed");
+	expect(refused).toEqual({ kind: "not_closed", code: "invalid_input" });
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
 	// Nothing registered for a session: a definite answer too, and nothing is started for it.
 	expect(
