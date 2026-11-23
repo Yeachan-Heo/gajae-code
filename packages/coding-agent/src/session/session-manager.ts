@@ -11479,6 +11479,9 @@ export class SessionManager {
 
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
 	async dropSession(sessionPath: string): Promise<void> {
+		// The own-session check below compares unresolved paths, so an aliased spelling of
+		// the snapshot's source would slip past it; a snapshot drops no session at all.
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		const requestedPath = path.resolve(sessionPath);
 		const managedRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
 		try {
@@ -25427,16 +25430,16 @@ export class SessionManager {
 	 * and `prepareFork`, `saveDraft` and `consumeDraft`, `saveArtifact`,
 	 * `allocateArtifactPath`, `copyArtifactsForFork`, `adoptArtifactManager`,
 	 * `stageAdoptedArtifactManagerForTransition`, `putBlob`,
-	 * `stageDefaultModelSelection`, `moveTo`, `discardUncommittedSession`,
-	 * `deleteSessionVerified`, `restoreState`, and `restoreRollbackState`; and, for
-	 * this session only, `dropSession` and `setSessionStarredForPicker`.
+	 * `stageDefaultModelSelection`, `moveTo`, `dropSession` (for any path),
+	 * `discardUncommittedSession`, `deleteSessionVerified`, `restoreState`, and
+	 * `restoreRollbackState`; and, for this session only, `setSessionStarredForPicker`.
 	 * `getArtifactManager` and `ensureArtifactManager` return null, so no caller gets
 	 * a manager that can write the source artifact directory; `getArtifactPath` still
 	 * resolves artifact paths. Shared-session appends (`*SharingSession`) are rejected
 	 * because a snapshot is never a managed destination.
 	 *
-	 * Not refused, by design: `dropSession` and `setSessionStarredForPicker` on a
-	 * different session path still act, as a session picker needs;
+	 * Not refused, by design: `setSessionStarredForPicker` on a different session
+	 * (compared by canonical path) still acts, as a session picker needs;
 	 * `appendMessageDurably` returns a failure outcome without writing; reads, `flush`,
 	 * `close`, and `createMemoryGuardCheckpoint` (which writes only under the caller's
 	 * checkpoint root) still work. Callers only read from it and then `close()` it.

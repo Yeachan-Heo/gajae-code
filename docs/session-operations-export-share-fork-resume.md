@@ -70,7 +70,7 @@ Flow in `main.ts`:
 
 1. Handled early (before interactive/session startup).
 2. Calls `exportFromFile(inputPath, outputPath?)`.
-3. `SessionManager.openReadOnlySnapshot(inputPath)` loads a detached, read-only snapshot, then HTML is generated and written. The snapshot throws `read_only_snapshot` from transcript appends and edits, rename, star, branch, rewrite, new or switched sessions, enabling session memory, fork, draft save and consume, artifact writes, blob writes, `moveTo`, uncommitted-session discard, verified delete, deleting or starring this session, and state restore. `getArtifactManager` and `ensureArtifactManager` return null on a snapshot. Shared-session appends are rejected because a snapshot is never a managed destination. `appendMessageDurably` returns a failure outcome instead of throwing, and writes nothing. Deleting or starring a different session through the picker methods still works.
+3. `SessionManager.openReadOnlySnapshot(inputPath)` loads a detached, read-only snapshot, then HTML is generated and written. The snapshot throws `read_only_snapshot` from transcript appends and edits, rename, star, branch, rewrite, new or switched sessions, enabling session memory, fork, draft save and consume, artifact writes, blob writes, `moveTo`, dropping any session, uncommitted-session discard, verified delete, starring this session, and state restore. `getArtifactManager` and `ensureArtifactManager` return null on a snapshot. Shared-session appends are rejected because a snapshot is never a managed destination. `appendMessageDurably` returns a failure outcome instead of throwing, and writes nothing. Starring a different session through the picker method still works.
 4. Process prints `Exported to: ...` and exits.
 
 Behavior details:

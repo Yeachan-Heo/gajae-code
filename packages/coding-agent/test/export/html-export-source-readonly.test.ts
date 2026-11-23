@@ -369,6 +369,9 @@ describe("read-only session snapshot", () => {
 		fs.writeFileSync(siblingFile, jsonl([header("readonly-sibling")]), { mode: 0o600 });
 		const moveTarget = makeTempDir("move-target");
 		const adoptDir = makeTempDir("adopt");
+		const aliasLink = path.join(makeTempDir("alias"), "source-link");
+		fs.symlinkSync(sourceDir, aliasLink, "dir");
+		const aliasedSessionFile = path.join(aliasLink, path.basename(sessionFile));
 		const savedArtifact = path.join(sessionFile.slice(0, -".jsonl".length), "7.bash.log");
 		fs.writeFileSync(savedArtifact, "saved artifact", { mode: 0o600 });
 		const forkTarget = path.join(makeTempDir("fork-target"), "fork.jsonl");
@@ -430,8 +433,20 @@ describe("read-only session snapshot", () => {
 				if (manager) await manager.removeNamedBestEffort("draft.txt");
 				else throw new Error("read_only_snapshot");
 			},
-			// Last: without the guard it moves the source transcript away.
+			dropSession: snapshot => snapshot.dropSession(sessionFile),
+			dropSessionOther: snapshot => snapshot.dropSession(siblingFile),
+			// Near last: without the guard it moves the source transcript away.
 			moveTo: snapshot => snapshot.moveTo(moveTarget),
+			// Last: opened and dropped through a directory symlink, so the stored canonical path
+			// and the requested path differ; without the guard this deletes the source.
+			dropSessionViaDirectoryAlias: async () => {
+				const aliased = await SessionManager.openReadOnlySnapshot(aliasedSessionFile);
+				try {
+					await aliased.dropSession(aliasedSessionFile);
+				} finally {
+					await aliased.close();
+				}
+			},
 		};
 		const before = snapshotTree(sourceDir);
 		const outcomes: Record<string, { refusal: string | undefined; sourceUnchanged: boolean }> = {};
