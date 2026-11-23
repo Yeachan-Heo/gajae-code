@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	bindManagedCandidateDigest,
 	listManagedCandidates,
 	type ManagedCandidate,
 	type ManagedScope,
@@ -173,7 +174,8 @@ function makeFixture(): Fixture {
 function candidateFor(scope: ManagedScope, transcriptPath: string): ManagedCandidate {
 	const listing = listManagedCandidates(scope);
 	if (listing.kind !== "complete") throw new Error(`fixture_candidate_listing_failed:${listing.kind}`);
-	const candidate = listing.owned.find(item => item.path === transcriptPath);
+	const listed = listing.owned.find(item => item.path === transcriptPath);
+	const candidate = listed && bindManagedCandidateDigest(listed);
 	if (!candidate) throw new Error("fixture_candidate_missing");
 	return candidate;
 }

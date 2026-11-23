@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import {
+	bindManagedCandidateDigest,
 	cleanupAuthorityMatches,
 	listManagedCandidates,
 	resolveManagedScope,
@@ -116,7 +117,8 @@ async function restartedLegacy(interrupted: Awaited<ReturnType<typeof interrupte
 	if (resolved.kind !== "resolved") throw new Error(resolved.message);
 	const restarted = listManagedCandidates(resolved.scope);
 	if (restarted.kind !== "complete") throw new Error("Could not list restarted candidates");
-	const legacy = restarted.owned.find(candidate => candidate.provenance === "legacy");
+	const listed = restarted.owned.find(candidate => candidate.provenance === "legacy");
+	const legacy = listed && bindManagedCandidateDigest(listed);
 	if (!legacy) throw new Error("Missing restarted legacy candidate");
 	return { scope: resolved.scope, legacy };
 }
@@ -448,7 +450,8 @@ describe("managed session Windows durability", () => {
 		if (resolved.kind !== "resolved") throw new Error(resolved.message);
 		const restarted = listManagedCandidates(resolved.scope);
 		if (restarted.kind !== "complete") throw new Error("Could not list restarted candidates");
-		const legacy = restarted.owned.find(candidate => candidate.provenance === "legacy");
+		const listed = restarted.owned.find(candidate => candidate.provenance === "legacy");
+		const legacy = listed && bindManagedCandidateDigest(listed);
 		if (!legacy) throw new Error("Missing restarted legacy candidate");
 		expect(() => restorePreparedArtifactRoot(resolved.scope, legacy)).not.toThrow();
 		expect((await fs.stat(interrupted.artifacts)).isDirectory()).toBe(true);
@@ -539,7 +542,8 @@ describe("managed session Windows durability", () => {
 		if (resolved.kind !== "resolved") throw new Error(resolved.message);
 		const restarted = listManagedCandidates(resolved.scope);
 		if (restarted.kind !== "complete") throw new Error("Could not list restarted candidates");
-		const legacy = restarted.owned.find(candidate => candidate.provenance === "legacy");
+		const listed = restarted.owned.find(candidate => candidate.provenance === "legacy");
+		const legacy = listed && bindManagedCandidateDigest(listed);
 		if (!legacy) throw new Error("Missing restarted legacy candidate");
 		expect(() => restorePreparedArtifactRoot(resolved.scope, legacy)).toThrow("durability_failed");
 	});

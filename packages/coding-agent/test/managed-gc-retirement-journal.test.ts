@@ -13,6 +13,7 @@ import {
 	type ManagedFileIdentity,
 } from "../src/sdk/session-readonly/inspection";
 import {
+	bindManagedCandidateDigest,
 	cleanupAuthorityMatches,
 	computeManagedScopeDigest,
 	listManagedCandidates,
@@ -264,7 +265,8 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 			const fixture = makeFixture();
 			const listed = listManagedCandidates(fixture.scope);
 			if (listed.kind !== "complete") throw new Error(listed.message);
-			const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+			const listedCandidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+			const candidate = listedCandidate && bindManagedCandidateDigest(listedCandidate);
 			if (!candidate) throw new Error("owner_candidate_missing");
 			const tombstone = path.join(
 				fixture.scope.directoryPath,
@@ -299,7 +301,8 @@ describe("owner-aware data cannot bypass live consumer authority", () => {
 		const fixture = makeFixture();
 		const listed = listManagedCandidates(fixture.scope);
 		if (listed.kind !== "complete") throw new Error(listed.message);
-		const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		const listedCandidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		const candidate = listedCandidate && bindManagedCandidateDigest(listedCandidate);
 		if (!candidate) throw new Error("owner_candidate_missing");
 		const store = openScopeStore(fixture.scope);
 		const name = `${"a".repeat(64)}.json`;
@@ -481,7 +484,8 @@ describe("retired tombstone listing visibility", () => {
 		const fixture = makeFixture();
 		const listed = listManagedCandidates(fixture.scope);
 		if (listed.kind !== "complete") throw new Error(listed.message);
-		const candidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		const listedCandidate = listed.owned.find(value => value.path === fixture.transcriptPath);
+		const candidate = listedCandidate && bindManagedCandidateDigest(listedCandidate);
 		if (!candidate) throw new Error("owner_candidate_missing");
 		const isListed = () => {
 			const current = listManagedCandidates(fixture.scope);

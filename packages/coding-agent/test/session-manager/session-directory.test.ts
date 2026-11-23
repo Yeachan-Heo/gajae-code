@@ -15,6 +15,7 @@ import {
 	validateNativeSecurityResult,
 } from "../../src/sdk/session-readonly/inspection";
 import {
+	bindManagedCandidateDigest,
 	listManagedCandidates,
 	MANAGED_SESSION_BINDING_FILE,
 	type ManagedScopeResolution,
@@ -2202,7 +2203,47 @@ describe("managed session write protocol", () => {
 			migrated: true,
 		});
 	});
-	it("bounds foreign transcript capture while fully recapturing owned candidates", async () => {
+	it("refuses to open or delete a listed candidate whose file was swapped after listing", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		const sourcePath = path.join(legacy, "swapped.jsonl");
+		const original = transcript("swapped", cwd, "a".repeat(512));
+		const replacement = transcript("swapped", cwd, "b".repeat(512));
+		expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
+		const swaps: Array<(listed: { path: string; identity: { mtimeMs: number } }) => Promise<void>> = [
+			// Same inode, same size, different bytes, mtime restored.
+			async listed => {
+				await fs.writeFile(listed.path, replacement);
+				const mtime = new Date(listed.identity.mtimeMs);
+				await fs.utimes(listed.path, mtime, mtime);
+			},
+			// Different inode with the same size and the same bytes.
+			async listed => {
+				const staged = `${listed.path}.staged`;
+				await fs.writeFile(staged, original);
+				await fs.rename(staged, listed.path);
+			},
+		];
+		for (const swap of swaps) {
+			for (const action of ["open", "delete"] as const) {
+				await fs.writeFile(sourcePath, original);
+				const listed = listManagedCandidates(scope);
+				if (listed.kind !== "complete") throw new Error("Missing candidates");
+				const candidate = listed.owned.find(value => value.path === sourcePath);
+				if (!candidate) throw new Error("Missing swapped candidate");
+				await swap(candidate);
+				const before = await fs.readFile(sourcePath);
+				const result =
+					action === "open"
+						? await openManagedCandidateForWrite(scope, candidate)
+						: await deleteManagedSessionCandidate(scope, candidate);
+				expect(result).toMatchObject({ kind: "error", code: "source_changed" });
+				expect(await fs.readFile(sourcePath)).toEqual(before);
+			}
+		}
+	});
+	it("reads only the header of foreign and owned candidates while listing", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const foreignCwd = path.join(path.dirname(cwd), "foreign-workspace");
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -2268,7 +2309,8 @@ describe("managed session write protocol", () => {
 			owned: [expect.objectContaining({ sessionId: "large-owned" })],
 		});
 		expect(capturedBySize.get(foreignSize)).toBe(headerCaptureBytes);
-		expect(capturedBySize.get(ownedSize)).toBe(headerCaptureBytes + ownedSize);
+		// An owned candidate is listed by its stat identity; its digest is bound when it is opened.
+		expect(capturedBySize.get(ownedSize)).toBe(headerCaptureBytes);
 	});
 	it("filters colliding legacy absolute directory entries by their transcript workspace identity", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-collision-"));
@@ -2306,8 +2348,10 @@ describe("managed session write protocol", () => {
 
 		const listed = listManagedCandidates(scope);
 		if (listed.kind !== "complete") throw new Error("Missing candidates");
-		const stuckCandidate = listed.owned.find(candidate => candidate.sessionId === "stuck-target");
-		const okCandidate = listed.owned.find(candidate => candidate.sessionId === "ok-target");
+		const stuckListed = listed.owned.find(candidate => candidate.sessionId === "stuck-target");
+		const okListed = listed.owned.find(candidate => candidate.sessionId === "ok-target");
+		const stuckCandidate = stuckListed && bindManagedCandidateDigest(stuckListed);
+		const okCandidate = okListed && bindManagedCandidateDigest(okListed);
 		if (!stuckCandidate || !okCandidate) throw new Error("Missing candidates");
 
 		const exactUnlink = native.exactUnlink;

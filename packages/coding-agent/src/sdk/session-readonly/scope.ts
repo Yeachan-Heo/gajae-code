@@ -10,11 +10,13 @@ import type { ManagedFileSnapshot } from "./inspection";
 import {
 	captureManagedFileNoFollow,
 	captureManagedFilePrefixNoFollow,
+	identity as fileIdentity,
 	inspectManagedFileNoFollow,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	MANAGED_ARTIFACT_MAX_FILES,
 	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
 	MANAGED_SESSION_READ_RANGE_MAX_BYTES,
+	sameIdentity,
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "./inspection";
@@ -84,20 +86,30 @@ export type ManagedScopeResolution =
 			cause?: { readonly classification: string; readonly diagnostic?: string };
 	  };
 
-export interface ManagedCandidate {
+/**
+ * A candidate as a listing sees it: its header and no-follow stat identity,
+ * without a content digest. Bind a digest with {@link bindManagedCandidateDigest}
+ * before trusting the candidate's bytes.
+ */
+export interface ListedManagedCandidate {
 	sessionId: string;
 	path: string;
 	cwd: string;
 	provenance: "v2" | "legacy";
-	identity: ResumeSessionIdentity;
+	identity: Omit<ResumeSessionIdentity, "sha256">;
 	migrationState: "native_v2" | "legacy_unmigrated" | "migrated_v2";
+}
+
+/** A candidate whose content digest was taken from the same file object as its stat identity. */
+export interface ManagedCandidate extends ListedManagedCandidate {
+	identity: ResumeSessionIdentity;
 }
 
 export type ManagedCandidateListing =
 	| {
 			kind: "complete";
 			scope: ManagedScope;
-			owned: readonly ManagedCandidate[];
+			owned: readonly ListedManagedCandidate[];
 			foreignCount: number;
 			invalid: readonly { code: string; sessionId?: string }[];
 	  }
@@ -513,7 +525,7 @@ type CandidatePreflight =
 			diagnosticSessionId?: string;
 	  };
 
-function safeManagedCandidateSessionId(value: unknown): string | undefined {
+export function safeManagedCandidateSessionId(value: unknown): string | undefined {
 	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) ? value : undefined;
 }
 
@@ -559,18 +571,88 @@ function preflightCandidate(filePath: string, scope: ManagedScope): CandidatePre
 	}
 }
 
-function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: CandidatePreflight): boolean {
-	return (
-		preflight.kind === "capture" &&
-		candidate.sessionId === preflight.sessionId &&
-		candidate.cwd === preflight.cwd &&
-		candidate.identity.dev === preflight.identity.dev &&
-		candidate.identity.ino === preflight.identity.ino &&
-		candidate.identity.nlink === preflight.identity.nlink &&
-		candidate.identity.size === preflight.identity.size &&
-		candidate.identity.mtimeNs === preflight.identity.mtimeNs &&
-		candidate.identity.ctimeNs === preflight.identity.ctimeNs
-	);
+/**
+ * Lists a preflighted candidate by its no-follow stat identity. The pathname must
+ * still name the file object the header was read from; the transcript is not
+ * read past the header and no content digest is taken.
+ */
+function listedCandidate(
+	filePath: string,
+	provenance: "v2" | "legacy",
+	preflight: Extract<CandidatePreflight, { kind: "capture" }>,
+): ListedManagedCandidate | { code: string } {
+	const cwdIdentity = identityFor(preflight.cwd);
+	if (!cwdIdentity.ok) return { code: nativeIdentityDiagnosticCode(cwdIdentity.code) };
+	try {
+		const named = fs.lstatSync(filePath, { bigint: true });
+		const statIdentity = {
+			dev: preflight.identity.dev,
+			ino: preflight.identity.ino,
+			nlink: preflight.identity.nlink,
+			size: preflight.identity.size,
+			mtimeNs: preflight.identity.mtimeNs,
+			ctimeNs: preflight.identity.ctimeNs,
+		};
+		if (
+			!named.isFile() ||
+			named.isSymbolicLink() ||
+			!sameIdentity(fileIdentity(named), { ...statIdentity, sha256: "" })
+		)
+			return { code: "source_changed" };
+		return {
+			sessionId: preflight.sessionId,
+			path: filePath,
+			cwd: preflight.cwd,
+			provenance,
+			migrationState: provenance === "v2" ? "native_v2" : "legacy_unmigrated",
+			identity: {
+				canonicalPath: path.resolve(filePath),
+				sessionId: preflight.sessionId,
+				...statIdentity,
+				mtimeMs: Number(named.mtimeMs),
+			},
+		};
+	} catch (error) {
+		return { code: (error as Error).message === "source_changed" ? "source_changed" : "unreadable_candidate" };
+	}
+}
+
+/**
+ * Hashes a listed candidate and returns it with that digest only when the hashed
+ * file object still has the listed header and stat identity. Returns `undefined`
+ * when the file changed or can no longer be read, so a caller fails closed.
+ */
+export function bindManagedCandidateDigest(candidate: ListedManagedCandidate): ManagedCandidate | undefined {
+	const inspected = inspectCandidate(candidate.path, candidate.provenance);
+	if ("code" in inspected) return undefined;
+	const listed = candidate.identity;
+	const current = inspected.identity;
+	if (
+		inspected.sessionId !== candidate.sessionId ||
+		inspected.cwd !== candidate.cwd ||
+		current.canonicalPath !== listed.canonicalPath ||
+		current.dev !== listed.dev ||
+		current.ino !== listed.ino ||
+		current.nlink !== listed.nlink ||
+		current.size !== listed.size ||
+		current.mtimeMs !== listed.mtimeMs ||
+		current.mtimeNs !== listed.mtimeNs ||
+		current.ctimeNs !== listed.ctimeNs
+	)
+		return undefined;
+	return { ...candidate, identity: { ...listed, sha256: current.sha256 } };
+}
+
+/**
+ * Returns a candidate that already carries a digest as is, and binds one to a
+ * listed candidate. A carried digest is checked against the file by the
+ * operation that consumes the candidate, as it was before listings stopped
+ * hashing.
+ */
+export function withContentDigest(candidate: ListedManagedCandidate): ManagedCandidate | undefined {
+	return typeof (candidate.identity as Partial<ResumeSessionIdentity>).sha256 === "string"
+		? (candidate as ManagedCandidate)
+		: bindManagedCandidateDigest(candidate);
 }
 
 export function inspectCandidate(
@@ -638,7 +720,7 @@ function discoveredLegacyDirectoryNames(scope: ManagedScope): readonly string[] 
 	return [...known, ...discovered];
 }
 
-type CandidateInspection = ManagedCandidate | { code: string; sessionId?: string } | { foreign: true };
+type CandidateInspection = ListedManagedCandidate | { code: string; sessionId?: string } | { foreign: true };
 
 function listDirectoryCandidates(
 	directory: string,
@@ -669,20 +751,13 @@ function listDirectoryCandidates(
 			ManagedSessionScopeTestHooks.afterCandidatePreflight?.({
 				...(preflight.diagnosticSessionId === undefined ? {} : { sessionId: preflight.diagnosticSessionId }),
 			});
-			const candidate = inspectCandidate(filePath, provenance);
+			const candidate = listedCandidate(filePath, provenance, preflight);
 			if ("code" in candidate)
 				return {
-					...candidate,
-					...(candidate.sessionId === undefined && preflight.diagnosticSessionId !== undefined
-						? { sessionId: preflight.diagnosticSessionId }
-						: {}),
+					code: candidate.code,
+					...(preflight.diagnosticSessionId === undefined ? {} : { sessionId: preflight.diagnosticSessionId }),
 				};
-			return matchesPreflightIdentity(candidate, preflight)
-				? candidate
-				: {
-						code: "source_changed",
-						...(preflight.diagnosticSessionId === undefined ? {} : { sessionId: preflight.diagnosticSessionId }),
-					};
+			return candidate;
 		});
 }
 
@@ -698,7 +773,7 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		}
 		if (!root.isDirectory() || root.isSymbolicLink())
 			return { kind: "error", code: "unsafe_root", message: "The sessions root is unsafe." };
-		const owned: ManagedCandidate[] = [];
+		const owned: ListedManagedCandidate[] = [];
 		const invalid: { code: string; sessionId?: string }[] = [];
 		let foreignCount = 0;
 		const directories: Array<{ path: string; provenance: "v2" | "legacy" }> = [
@@ -745,25 +820,59 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				}
 			}
 		}
-		const retired = owned.length > 0 ? retiredTargetKeys(scope) : new Set<string>();
-		const visible = owned.filter(candidate => !isRetiredIn(retired, candidate));
+		// Only a tombstone or a committed receipt makes a listing decision depend on a
+		// content digest, so only candidates whose stat identity one of them names are
+		// hashed. Whoever opens any other candidate binds its digest at open time.
+		const digests = new Map<ListedManagedCandidate, ManagedCandidate | undefined>();
+		const digested = (candidate: ListedManagedCandidate): ManagedCandidate | undefined => {
+			if (!digests.has(candidate)) digests.set(candidate, bindManagedCandidateDigest(candidate));
+			return digests.get(candidate);
+		};
+		const retired: RetiredTargets = owned.length > 0 ? retiredTargetKeys(scope) : new Map();
+		const visible = owned.filter(candidate => {
+			if (!mayBeRetiredIn(retired, candidate)) return true;
+			const bound = digested(candidate);
+			return bound !== undefined && !isRetiredIn(retired, bound);
+		});
 		// A committed receipt is keyed by its legacy source alone and names exactly one
 		// destination path, and `receiptMatches` rejects every other destination. Read
 		// each source's receipt once instead of once per (source, v2 destination) pair.
-		const receiptDestinations = new Map<ManagedCandidate, string>();
+		const receipts = new Map<ListedManagedCandidate, { source: ManagedCandidate; destinationPath: string }>();
 		const hasV2 = visible.some(candidate => candidate.provenance === "v2");
+		const receiptSources = hasV2 ? committedReceiptSources(scope) : new Set<string>();
 		for (const source of hasV2 ? visible : []) {
-			if (source.provenance !== "legacy") continue;
-			const destinationPath = receiptDestinationPath(receiptPathFor(scope, source));
-			if (destinationPath !== undefined) receiptDestinations.set(source, destinationPath);
+			if (source.provenance !== "legacy" || !receiptSources.has(receiptSourceKey(source))) continue;
+			const bound = digested(source);
+			if (!bound) continue;
+			const destinationPath = receiptDestinationPath(receiptPathFor(scope, bound));
+			if (destinationPath !== undefined) receipts.set(source, { source: bound, destinationPath });
 		}
-		const migratedTo = (source: ManagedCandidate, destination: ManagedCandidate): boolean =>
-			source.provenance === "legacy" &&
-			destination.provenance === "v2" &&
-			receiptDestinations.get(source) === destination.path &&
-			receiptMatches(receiptPathFor(scope, source), source, destination, scope);
+		const migratedTo = (source: ListedManagedCandidate, destination: ListedManagedCandidate): boolean => {
+			const receipt = receipts.get(source);
+			return (
+				receipt !== undefined &&
+				destination.provenance === "v2" &&
+				receipt.destinationPath === destination.path &&
+				receiptMatches(receiptPathFor(scope, receipt.source), receipt.source, destination, scope)
+			);
+		};
+		// A candidate that changed before its digest could be bound proves neither
+		// retirement nor migration; report it the way listing reports any other change.
+		const changed = new Set<ListedManagedCandidate>();
+		for (const [candidate, bound] of digests) {
+			if (bound !== undefined) continue;
+			changed.add(candidate);
+			invalid.push({
+				code: "source_changed",
+				...(safeManagedCandidateSessionId(candidate.sessionId) === undefined
+					? {}
+					: { sessionId: candidate.sessionId }),
+			});
+		}
 		const active = visible.filter(
-			candidate => candidate.provenance === "v2" || !visible.some(destination => migratedTo(candidate, destination)),
+			candidate =>
+				!changed.has(candidate) &&
+				(candidate.provenance === "v2" || !visible.some(destination => migratedTo(candidate, destination))),
 		);
 		return {
 			kind: "complete",
@@ -836,10 +945,62 @@ function receiptDestinationPath(receiptPath: string): string | undefined {
 	}
 }
 
+const COMMITTED_RECEIPT_NAME = /^[0-9a-f]{64}\.json$/;
+
+/**
+ * Source path and stat identity named by each committed receipt, keyed as
+ * {@link receiptSourceKey} keys a candidate. `receiptMatches` requires both to be
+ * equal, so a legacy candidate whose key is absent has no matching receipt and
+ * needs no digest to find its receipt path.
+ */
+function committedReceiptSources(scope: ManagedScope): ReadonlySet<string> {
+	const keys = new Set<string>();
+	const directory = path.join(managedInternalDirectory(scope), MANAGED_RECEIPTS_DIRECTORY);
+	let names: string[];
+	try {
+		names = fs.readdirSync(directory);
+	} catch {
+		return keys;
+	}
+	for (const name of names) {
+		if (!COMMITTED_RECEIPT_NAME.test(name)) continue;
+		try {
+			const value: unknown = JSON.parse(
+				captureManagedFileNoFollow(path.join(directory, name)).bytes.toString("utf8"),
+			);
+			if (!value || typeof value !== "object") continue;
+			const source = (
+				value as {
+					source?: {
+						path?: unknown;
+						identity?: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown };
+					};
+				}
+			).source;
+			const recorded = source?.identity;
+			keys.add(JSON.stringify([source?.path, recorded?.dev, recorded?.ino, recorded?.size, recorded?.mtimeNs]));
+		} catch {
+			/* an unreadable receipt matches no source */
+		}
+	}
+	return keys;
+}
+
+/** Encodes the fields `receiptMatches` compares by strict equality; distinct values encode distinctly. */
+function receiptSourceKey(candidate: ListedManagedCandidate): string {
+	return JSON.stringify([
+		candidate.path,
+		String(candidate.identity.dev),
+		String(candidate.identity.ino),
+		candidate.identity.size,
+		String(candidate.identity.mtimeNs),
+	]);
+}
+
 export function receiptMatches(
 	receiptPath: string,
 	source: ManagedCandidate,
-	destination: ManagedCandidate,
+	destination: ListedManagedCandidate,
 	scope: ManagedScope,
 ): boolean {
 	try {
@@ -893,14 +1054,16 @@ export function receiptMatches(
 			return false;
 		const exact = (
 			recorded: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown } | undefined,
-			candidate: ManagedCandidate,
+			candidate: ListedManagedCandidate,
 		): boolean =>
 			recorded?.dev === String(candidate.identity.dev) &&
 			recorded.ino === String(candidate.identity.ino) &&
 			recorded.size === candidate.identity.size &&
 			recorded.mtimeNs === String(candidate.identity.mtimeNs);
-		const lineage = (recorded: { dev?: unknown; ino?: unknown } | undefined, candidate: ManagedCandidate): boolean =>
-			recorded?.dev === String(candidate.identity.dev) && recorded.ino === String(candidate.identity.ino);
+		const lineage = (
+			recorded: { dev?: unknown; ino?: unknown } | undefined,
+			candidate: ListedManagedCandidate,
+		): boolean => recorded?.dev === String(candidate.identity.dev) && recorded.ino === String(candidate.identity.ino);
 		const sourceSnapshot = captureManagedFileNoFollow(source.path);
 		const destinationSnapshot = captureManagedFileNoFollow(destination.path);
 		const appendLineage =
@@ -1069,10 +1232,11 @@ export function admitCleanupReceiptReplayRead(budget: CleanupReceiptReplayBudget
 }
 
 /**
- * Identity fields a retired tombstone target must match exactly for a candidate
- * to be hidden. `dev`, `ino`, and `mtimeNs` are persisted as decimal strings.
+ * Identity fields other than the digest that a retired tombstone target must
+ * match exactly for a candidate to be hidden. `dev`, `ino`, and `mtimeNs` are
+ * persisted as decimal strings.
  */
-type RetiredTargetIdentity = readonly [
+type RetiredTargetStatIdentity = readonly [
 	path: string,
 	sessionId: string,
 	cwd: string,
@@ -1081,10 +1245,9 @@ type RetiredTargetIdentity = readonly [
 	ino: string,
 	size: number,
 	mtimeNs: string,
-	sha256: string,
 ];
 
-function candidateRetiredIdentity(candidate: ManagedCandidate): RetiredTargetIdentity {
+function candidateRetiredStatIdentity(candidate: ListedManagedCandidate): RetiredTargetStatIdentity {
 	return [
 		candidate.path,
 		candidate.sessionId,
@@ -1094,12 +1257,11 @@ function candidateRetiredIdentity(candidate: ManagedCandidate): RetiredTargetIde
 		String(candidate.identity.ino),
 		candidate.identity.size,
 		String(candidate.identity.mtimeNs),
-		candidate.identity.sha256,
 	];
 }
 
 /** Returns the target's identity only when every field has the type a candidate can carry. */
-function parseRetiredTargetIdentity(target: unknown): RetiredTargetIdentity | undefined {
+function parseRetiredTargetIdentity(target: unknown): { stat: RetiredTargetStatIdentity; sha256: string } | undefined {
 	if (!target || typeof target !== "object") return undefined;
 	const value = target as { path?: unknown; sessionId?: unknown; cwd?: unknown; identity?: unknown };
 	if (!value.identity || typeof value.identity !== "object") return undefined;
@@ -1123,17 +1285,19 @@ function parseRetiredTargetIdentity(target: unknown): RetiredTargetIdentity | un
 		typeof identity.sha256 !== "string"
 	)
 		return undefined;
-	return [
-		value.path,
-		value.sessionId,
-		value.cwd,
-		identity.canonicalPath,
-		identity.dev,
-		identity.ino,
-		identity.size,
-		identity.mtimeNs,
-		identity.sha256,
-	];
+	return {
+		stat: [
+			value.path,
+			value.sessionId,
+			value.cwd,
+			identity.canonicalPath,
+			identity.dev,
+			identity.ino,
+			identity.size,
+			identity.mtimeNs,
+		],
+		sha256: identity.sha256,
+	};
 }
 
 /**
@@ -1141,9 +1305,12 @@ function parseRetiredTargetIdentity(target: unknown): RetiredTargetIdentity | un
  * numbers encode distinctly. A non-finite tombstone `size` encodes as `null`,
  * which no candidate produces.
  */
-function retiredIdentityKey(identity: RetiredTargetIdentity): string {
+function retiredIdentityKey(identity: RetiredTargetStatIdentity): string {
 	return JSON.stringify(identity);
 }
+
+/** Digests of the retired targets, keyed by the rest of their identity. */
+export type RetiredTargets = ReadonlyMap<string, ReadonlySet<string>>;
 
 /**
  * Snapshot of the identities retired by a scope's tombstones.
@@ -1154,8 +1321,8 @@ function retiredIdentityKey(identity: RetiredTargetIdentity): string {
  * against it, so its cost is linear in tombstones rather than in
  * candidates x tombstones.
  */
-export function retiredTargetKeys(scope: ManagedScope): ReadonlySet<string> {
-	const keys = new Set<string>();
+export function retiredTargetKeys(scope: ManagedScope): RetiredTargets {
+	const keys = new Map<string, Set<string>>();
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
 	const digest = scopeDigest(scope.platform, scope.canonicalCwd);
 	try {
@@ -1173,7 +1340,11 @@ export function retiredTargetKeys(scope: ManagedScope): ReadonlySet<string> {
 				continue;
 			for (const target of record.targets) {
 				const identity = parseRetiredTargetIdentity(target);
-				if (identity) keys.add(retiredIdentityKey(identity));
+				if (!identity) continue;
+				const key = retiredIdentityKey(identity.stat);
+				const digests = keys.get(key) ?? new Set<string>();
+				digests.add(identity.sha256);
+				keys.set(key, digests);
 			}
 		}
 	} catch {
@@ -1182,8 +1353,15 @@ export function retiredTargetKeys(scope: ManagedScope): ReadonlySet<string> {
 	return keys;
 }
 
-export function isRetiredIn(retired: ReadonlySet<string>, candidate: ManagedCandidate): boolean {
-	return retired.has(retiredIdentityKey(candidateRetiredIdentity(candidate)));
+/** Whether a tombstone names this candidate's identity apart from its digest, so retirement depends on the digest. */
+export function mayBeRetiredIn(retired: RetiredTargets, candidate: ListedManagedCandidate): boolean {
+	return retired.has(retiredIdentityKey(candidateRetiredStatIdentity(candidate)));
+}
+
+export function isRetiredIn(retired: RetiredTargets, candidate: ManagedCandidate): boolean {
+	return (
+		retired.get(retiredIdentityKey(candidateRetiredStatIdentity(candidate)))?.has(candidate.identity.sha256) ?? false
+	);
 }
 
 export type ArtifactManifestEntry =

@@ -4,7 +4,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as util from "node:util";
-import { listManagedCandidates, type ManagedCandidate, type ManagedScope } from "../src/sdk/session-readonly/scope";
+import {
+	bindManagedCandidateDigest,
+	listManagedCandidates,
+	type ManagedCandidate,
+	type ManagedScope,
+} from "../src/sdk/session-readonly/scope";
 import type { ManagedGcSessionRetirementReceipt } from "../src/session/internal/managed-gc-retirement-codec";
 import {
 	bindManagedGcSessionRetirementTarget,
@@ -139,7 +144,8 @@ function makeFixture(): Fixture {
 	if (!evidence) throw new Error("fixture_owner_evidence_missing");
 	const listing = listManagedCandidates(scope);
 	if (listing.kind !== "complete") throw new Error(`fixture_candidate_listing_failed:${listing.kind}`);
-	const candidate = listing.owned.find(item => item.path === transcriptPath);
+	const listed = listing.owned.find(item => item.path === transcriptPath);
+	const candidate = listed && bindManagedCandidateDigest(listed);
 	if (!candidate) throw new Error("fixture_candidate_missing");
 	return {
 		root,
@@ -195,7 +201,8 @@ function makeSiblingTarget(fixture: Fixture): SiblingTarget {
 	}
 	const listing = listManagedCandidates(scope);
 	if (listing.kind !== "complete") throw new Error(`fixture_sibling_listing_failed:${listing.kind}`);
-	const candidate = listing.owned.find(item => item.path === transcriptPath);
+	const listed = listing.owned.find(item => item.path === transcriptPath);
+	const candidate = listed && bindManagedCandidateDigest(listed);
 	if (!candidate) throw new Error("fixture_sibling_candidate_missing");
 	return { scope, transcriptPath, candidate };
 }

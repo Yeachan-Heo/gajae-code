@@ -1,5 +1,6 @@
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
 import {
+	bindManagedCandidateDigest,
 	listManagedCandidates,
 	type ManagedCandidate,
 	type ManagedCandidateListing,
@@ -7,6 +8,7 @@ import {
 	type ManagedScopeErrorCode,
 	type ManagedScopeResolution,
 	resolveManagedScope,
+	safeManagedCandidateSessionId,
 } from "./session-readonly/scope";
 import type { ResumeSessionIdentity } from "./session-readonly/storage";
 
@@ -99,12 +101,26 @@ function toResolveResult(result: ManagedScopeResolution): ResolveManagedSessionS
 
 function toListingResult(result: ManagedCandidateListing): ListManagedSessionCandidatesResult {
 	if (result.kind === "error") return result;
+	// A public candidate carries a content digest, so bind one to every listed candidate.
+	const owned: LogicalSessionCandidate[] = [];
+	const invalid = [...result.invalid];
+	for (const listed of result.owned) {
+		const candidate = bindManagedCandidateDigest(listed);
+		if (candidate) {
+			owned.push(toPublicCandidate(candidate));
+			continue;
+		}
+		invalid.push({
+			code: "source_changed",
+			...(safeManagedCandidateSessionId(listed.sessionId) === undefined ? {} : { sessionId: listed.sessionId }),
+		});
+	}
 	return {
 		kind: "complete",
 		scope: toPublicScope(result.scope),
-		owned: result.owned.map(toPublicCandidate),
+		owned,
 		foreignCount: result.foreignCount,
-		invalid: result.invalid,
+		invalid,
 	};
 }
 
