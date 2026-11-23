@@ -58,7 +58,6 @@ import {
 	Settings2,
 	Target,
 	Trash2,
-	TriangleAlert,
 	Unplug,
 	Wrench,
 } from "lucide-react";
@@ -123,7 +122,7 @@ import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboa
 import { ProvidersDialog } from "./ProvidersDialog";
 import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
-import { DeleteRecoveryWarning, RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
+import { DeleteConversationConfirmation, RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
 import { Select } from "./Select";
 import { DisconnectConfirmation, disconnectConfirmTitle, SessionConnectionNotice } from "./SessionConnection";
 import { connectionState, SessionConnectionBadge } from "./SessionConnectionMark";
@@ -3690,45 +3689,32 @@ export default function App() {
 						/>
 					)}
 					{dialog === "delete" && (
-						<>
-							<div className="delete-confirmation">
-								<p>{t("shell.deleteConversationConfirm", { title: session?.title ?? "" })}</p>
-								<p className="delete-warning">
-									<TriangleAlert aria-hidden="true" />
-									<strong>{t("shell.deleteConversationIrreversible")}</strong>
-								</p>
-							</div>
-							{/* Deleting drops the conversation's recovery records too; name the unrestored ones. */}
-							<DeleteRecoveryWarning
-								texts={recoveries
-									.filter(
-										item =>
-											item.sessionId === selected &&
-											!item.restored &&
-											!item.finalizing &&
-											(item.disposition === "unknown" ||
-												item.disposition === "failed" ||
-												unsentRepairs.current.get(item.id) === item.sessionId),
-									)
-									.map(item => item.text)}
-							/>
-							<Button
-								className="danger"
-								disabled={!connected || pending[selected]}
-								onClick={() => {
-									const sessionId = selected;
-									const generation = dialogGeneration.current;
-									void run(sessionId, async () => {
-										await request("session.delete", { sessionId });
-										dropRecoveries(sessionId);
-										if (dialogGeneration.current === generation && selectedRef.current === sessionId)
-											closeDialog();
-									});
-								}}
-							>
-								{t("shell.dialogDelete")}
-							</Button>
-						</>
+						<DeleteConversationConfirmation
+							title={session?.title ?? ""}
+							// Deleting drops the conversation's recovery records too; name the unrestored ones.
+							texts={recoveries
+								.filter(
+									item =>
+										item.sessionId === selected &&
+										!item.restored &&
+										!item.finalizing &&
+										(item.disposition === "unknown" ||
+											item.disposition === "failed" ||
+											unsentRepairs.current.get(item.id) === item.sessionId),
+								)
+								.map(item => item.text)}
+							disabled={!connected || !!pending[selected]}
+							onDelete={() => {
+								const sessionId = selected;
+								const generation = dialogGeneration.current;
+								void run(sessionId, async () => {
+									await request("session.delete", { sessionId });
+									dropRecoveries(sessionId);
+									if (dialogGeneration.current === generation && selectedRef.current === sessionId)
+										closeDialog();
+								});
+							}}
+						/>
 					)}
 					{dialog === "goal" && (
 						<>

@@ -220,4 +220,69 @@ suite("Recovery card showcase", () => {
 			await context.close();
 		}
 	}, 30000);
+
+	test("the showcase opens every Delete dialog state in the real dialog, the refused copy included", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-delete-confirmation .delete-dialog-opener");
+			expect(await page.$('.showcase-index a[href="#showcase-delete-confirmation"]')).not.toBeNull();
+			const openers = await page.$$eval("#showcase-delete-confirmation .delete-dialog-opener", nodes => nodes.length);
+			const seen: unknown[] = [];
+			for (let index = 0; index < openers; index++) {
+				await page.evaluate(
+					position =>
+						document.querySelectorAll<HTMLButtonElement>("#showcase-delete-confirmation .delete-dialog-opener")[
+							position
+						]!.click(),
+					index,
+				);
+				await page.waitForSelector("dialog[open] .delete-confirmation");
+				const caption = await page.evaluate(
+					position =>
+						document
+							.querySelectorAll("#showcase-delete-confirmation .delete-dialog-opener")
+							[position]!.closest(".showcase-todo-state")
+							?.querySelector("h3")?.textContent,
+					index,
+				);
+				if (caption?.startsWith("Copy refused")) {
+					await page.evaluate(() =>
+						[...document.querySelectorAll<HTMLButtonElement>("dialog[open] .delete-recoveries button")]
+							.find(button => button.textContent === "Copy text")
+							?.click(),
+					);
+					await page.waitForSelector("dialog[open] .recovery-copy-error");
+				}
+				seen.push(
+					await page.$eval("dialog[open]", dialog => ({
+						title: dialog.querySelector("header h2")?.textContent,
+						warning: dialog.querySelector(".delete-recoveries > p")?.textContent?.split(".")[0] ?? null,
+						refused: dialog.querySelector(".recovery-copy-error") !== null,
+						deletes: [...dialog.querySelectorAll("button.danger")].map(button => button.textContent),
+					})),
+				);
+				await page.keyboard.press("Escape");
+				await page.waitForFunction(() => !document.querySelector("dialog[open]"));
+			}
+			const dialog = (warning: string | null, refused = false) => ({
+				title: "Delete conversation",
+				warning,
+				refused,
+				deletes: ["Delete conversation"],
+			});
+			expect(seen).toEqual([
+				dialog(null),
+				dialog("Deleting also discards 1 unsent message whose draft was never restored"),
+				dialog("Deleting also discards 3 unsent messages whose drafts were never restored"),
+				dialog("Deleting also discards 2 unsent messages whose drafts were never restored"),
+				dialog("Deleting also discards 1 unsent message whose draft was never restored"),
+				dialog("Deleting also discards 1 unsent message whose draft was never restored", true),
+			]);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
 });

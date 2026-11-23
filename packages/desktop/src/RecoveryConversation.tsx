@@ -1,5 +1,5 @@
 import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
-import { Check, ChevronRight, CircleAlert } from "lucide-react";
+import { Check, ChevronRight, CircleAlert, TriangleAlert } from "lucide-react";
 import { useId, useState } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
@@ -60,12 +60,20 @@ type CopyState = "idle" | "copied" | "failed";
  * Copies unsent text on the user's click and remembers how it went. `copy` must run inside the
  * click handler, so WebKit keeps the user gesture for the clipboard write.
  */
-function useCopyText(text: string, onFailure: () => void): [CopyState, () => void] {
+/** Writes plain text to the system clipboard; fixtures pass their own to show a refused write. */
+export type ClipboardWriter = (text: string) => Promise<void>;
+
+const writeClipboard: ClipboardWriter = async text =>
+	navigator.clipboard.write([new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }) })]);
+
+function useCopyText(
+	text: string,
+	onFailure: () => void,
+	writer: ClipboardWriter = writeClipboard,
+): [CopyState, () => void] {
 	const [state, setState] = useState<CopyState>("idle");
 	const copy = () => {
-		const write = async () =>
-			navigator.clipboard.write([new ClipboardItem({ "text/plain": new Blob([text], { type: "text/plain" }) })]);
-		write().then(
+		writer(text).then(
 			() => setState("copied"),
 			() => {
 				setState("failed");
@@ -212,10 +220,10 @@ export function RecoveryCard({
  * unrestored recovery records, so it says how many unsent messages go with it and offers their
  * text first, as an orphan card does. Renders nothing when there are none.
  */
-export function DeleteRecoveryWarning({ texts }: { texts: readonly string[] }) {
+export function DeleteRecoveryWarning({ texts, writer }: { texts: readonly string[]; writer?: ClipboardWriter }) {
 	const [textOpen, setTextOpen] = useState(false);
 	const joined = texts.join("\n\n");
-	const [copy, copyText] = useCopyText(joined, () => setTextOpen(true));
+	const [copy, copyText] = useCopyText(joined, () => setTextOpen(true), writer);
 	if (texts.length === 0) return null;
 	const one = texts.length === 1;
 	return (
@@ -227,5 +235,41 @@ export function DeleteRecoveryWarning({ texts }: { texts: readonly string[] }) {
 			</div>
 			<CopyFeedback state={copy} />
 		</div>
+	);
+}
+
+/**
+ * The Delete conversation dialog's body: the question, that it cannot be undone, the unsent texts
+ * it discards (if any) and the Delete action. Presentational, so the App and the showcase render
+ * the same dialog; the App decides when Delete is available and what it does.
+ */
+export function DeleteConversationConfirmation({
+	title,
+	texts,
+	disabled,
+	onDelete,
+	writer,
+}: {
+	title: string;
+	/** The conversation's unrestored recovery texts, in the order they were sent. */
+	texts: readonly string[];
+	disabled: boolean;
+	onDelete: () => void;
+	writer?: ClipboardWriter;
+}) {
+	return (
+		<>
+			<div className="delete-confirmation">
+				<p>{t("shell.deleteConversationConfirm", { title })}</p>
+				<p className="delete-warning">
+					<TriangleAlert aria-hidden="true" />
+					<strong>{t("shell.deleteConversationIrreversible")}</strong>
+				</p>
+			</div>
+			<DeleteRecoveryWarning texts={texts} writer={writer} />
+			<Button className="danger" disabled={disabled} onClick={onDelete}>
+				{t("shell.dialogDelete")}
+			</Button>
+		</>
 	);
 }

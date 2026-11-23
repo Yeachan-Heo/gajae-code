@@ -33,4 +33,14 @@ export const recovery = {
 	"recovery.showcaseLong": "Long and Korean title · narrow width",
 	"recovery.showcaseOrphanLong": "Orphan · long text behind a disclosure",
 	"recovery.showcaseStacked": "Three cards stacked in the conversation column",
+	"recovery.showcaseDeleteNav": "Delete dialog · unsent texts",
+	"recovery.showcaseDeleteHeading": "Delete conversation dialog · unsent texts it discards",
+	"recovery.showcaseDeleteNote":
+		"Design example · Each button opens the real Delete dialog in a native dialog with fixture texts. Delete only closes it; nothing is deleted.",
+	"recovery.showcaseDeleteNone": "No unsent texts · the dialog as before",
+	"recovery.showcaseDeleteOne": "One unsent message",
+	"recovery.showcaseDeleteSeveral": "Several messages, one with two paragraphs",
+	"recovery.showcaseDeleteLong": "A long message and a short one",
+	"recovery.showcaseDeleteKorean": "Korean text",
+	"recovery.showcaseDeleteRefused": "Copy refused · select Copy text to see it",
 } as const;

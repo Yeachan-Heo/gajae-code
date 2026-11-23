@@ -3,7 +3,7 @@ import { type ReactNode, useState } from "react";
 import { Button, Modal, SessionRow } from "./components";
 import { type DeliveryRecovery, recoveryNotice } from "./delivery-recovery";
 import { type MessageKey, t } from "./i18n";
-import { RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
+import { DeleteConversationConfirmation, RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
 import { DisconnectConfirmation, disconnectConfirmTitle, SessionConnectionNotice } from "./SessionConnection";
 import { SessionConnectionBadge } from "./SessionConnectionMark";
 
@@ -73,6 +73,7 @@ export function ShowcaseSessionNav() {
 	return (
 		<>
 			<a href="#showcase-recovery-cards">{t("recovery.showcaseNav")}</a>
+			<a href="#showcase-delete-confirmation">{t("recovery.showcaseDeleteNav")}</a>
 			<a href="#showcase-session-connection">{t("connection.showcaseNav")}</a>
 		</>
 	);
@@ -194,8 +195,72 @@ export function ShowcaseSession() {
 	return (
 		<>
 			<ShowcaseRecovery />
+			<ShowcaseDeleteConfirmation />
 			<ShowcaseConnection />
 		</>
+	);
+}
+
+// Fixture texts only; nothing here is read from or written to the recovery store.
+const deleteFixtures: Array<{ caption: MessageKey; texts: string[]; refuse?: boolean }> = [
+	{ caption: "recovery.showcaseDeleteNone", texts: [] },
+	{ caption: "recovery.showcaseDeleteOne", texts: ["Summarize the failing test output"] },
+	{
+		caption: "recovery.showcaseDeleteSeveral",
+		texts: [
+			"Rerun the failing test.\n\nThen summarize what changed since yesterday.",
+			"Open the release checklist",
+			"Draft the changelog entry",
+		],
+	},
+	{ caption: "recovery.showcaseDeleteLong", texts: [longText, "A second, short message"] },
+	{
+		caption: "recovery.showcaseDeleteKorean",
+		texts: ["실패한 테스트 출력을 요약하고, 어제 이후 바뀐 내용을 정리해 주세요."],
+	},
+	{ caption: "recovery.showcaseDeleteRefused", texts: ["Summarize the failing test output"], refuse: true },
+];
+const refuseCopy = () => Promise.reject(new Error("Design example: the clipboard refused the write."));
+
+/** The Delete conversation dialog, opened in the App's native dialog from fixture texts; it deletes nothing. */
+function DeleteDialog({ texts, refuse }: { texts: string[]; refuse?: boolean }) {
+	const [open, setOpen] = useState(false);
+	const close = () => setOpen(false);
+	return (
+		<>
+			<div className="actions">
+				<Button className="delete-dialog-opener" onClick={() => setOpen(true)}>
+					{t("connection.showcaseOpenDialog")}
+				</Button>
+			</div>
+			{open && (
+				<Modal title={t("shell.dialogDelete")} onClose={close}>
+					<DeleteConversationConfirmation
+						title="Fix the flaky test"
+						texts={texts}
+						disabled={false}
+						onDelete={close}
+						writer={refuse ? refuseCopy : undefined}
+					/>
+				</Modal>
+			)}
+		</>
+	);
+}
+
+function ShowcaseDeleteConfirmation() {
+	return (
+		<section id="showcase-delete-confirmation">
+			<h2>{t("recovery.showcaseDeleteHeading")}</h2>
+			<p className="muted">{t("recovery.showcaseDeleteNote")}</p>
+			<div className="showcase-todo-states">
+				{deleteFixtures.map(fixture => (
+					<State key={fixture.caption} caption={fixture.caption}>
+						<DeleteDialog texts={fixture.texts} refuse={fixture.refuse} />
+					</State>
+				))}
+			</div>
+		</section>
 	);
 }
 
