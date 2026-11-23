@@ -239,19 +239,12 @@ export interface DesktopSession {
 	error?: string;
 	errorOwner?: string;
 	/**
-	 * Whether the app writes this conversation itself. Absent only on a row an earlier build saved
-	 * without a transcript path, until the shared store's listing places it.
+	 * Whether the app writes this conversation itself. The Host always sets it; a client treats a
+	 * missing value as `connected`.
 	 */
 	connection?: DesktopSessionConnection;
 }
 
-/**
- * Who writes a conversation, whichever surface created it. `connected`: the app opens its own writer when the
- * conversation is used. `disconnected`: the user released it (`session.disconnect`) so another
- * surface, such as the terminal, can continue it; it survives restarts, its history is read from
- * the transcript and nothing can be sent until `session.connect`. `elsewhere`: another gjc
- * process has it open, so the app shows it read-only; `session.connect` checks again.
- */
 /**
  * A request refused because the app does not write the conversation right now: it is released
  * (`disconnected`), being released (`disconnecting`), or another gjc process has it (`elsewhere`).
@@ -262,6 +255,13 @@ export interface DesktopSession {
  */
 export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnecting" | "unavailable" | "placed";
 
+/**
+ * Who writes a conversation, whichever surface created it. `connected`: the app opens its own writer
+ * when the conversation is used. `disconnected`: the user released it (`session.disconnect`) so
+ * another surface, such as the terminal, can continue it; it survives restarts, its history is read
+ * from the transcript and nothing can be sent until `session.connect`. `elsewhere`: another gjc
+ * process has it open, so the app shows it read-only; `session.connect` checks again.
+ */
 export interface DesktopSessionConnection {
 	/**
 	 * `unavailable`: a row an earlier build saved without a transcript path that the shared store
