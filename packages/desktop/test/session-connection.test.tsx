@@ -260,4 +260,100 @@ suite("Session connection", () => {
 			await closeComponentFixture(context, page);
 		}
 	}, 30000);
+
+	test("a pending Connect keeps its width, its focus and a legible label, and ignores a second click", async () => {
+		const { context, page } = await fixture();
+		try {
+			await mount(
+				page,
+				`import { SessionConnectionNotice } from '/src/SessionConnection.tsx';`,
+				`const calls = [];
+				window.connectCalls = calls;
+				function Fixture() {
+					const [pending, setPending] = React.useState({ disconnected: false, elsewhere: false });
+					const notice = state => h(SessionConnectionNotice, { state, pending: pending[state], onConnect: () => {
+						calls.push(state);
+						setPending(previous => ({ ...previous, [state]: true }));
+					} });
+					return h('div', { style: { width: '632px' } }, notice('disconnected'), notice('elsewhere'));
+				}
+				ReactDOM.createRoot(root).render(h(Fixture));`,
+			);
+			await page.waitForSelector(".connection-notice");
+			const geometry = (state: string) =>
+				page.$eval(`.connection-notice[data-state="${state}"]`, notice => ({
+					button: Math.round(notice.querySelector(".connection-notice-action")!.getBoundingClientRect().width * 10) / 10,
+					text: Math.round(notice.querySelector(".connection-notice-text")!.getBoundingClientRect().width * 10) / 10,
+				}));
+			for (const [state, idle, busy] of [
+				["disconnected", "Connect", "Connecting…"],
+				["elsewhere", "Check again", "Checking…"],
+			] as const) {
+				const before = await geometry(state);
+				const button = `.connection-notice[data-state="${state}"] .connection-notice-action`;
+				expect(await page.$eval(button, node => node.textContent)).toBe(idle);
+				await page.focus(button);
+				await page.keyboard.press("Enter");
+				await page.waitForFunction(
+					(selector, label) => document.querySelector(selector)?.textContent === label,
+					{},
+					button,
+					busy,
+				);
+				// A second press while pending sends nothing, and focus stays on the button.
+				await page.keyboard.press("Enter");
+				await page.click(button);
+				expect(await page.evaluate(selector => document.activeElement === document.querySelector(selector), button)).toBe(
+					true,
+				);
+				expect(await geometry(state)).toEqual(before);
+				const name = await page.$eval(button, node => node.textContent);
+				expect(name).toBe(busy);
+				const failures: string[] = [];
+				for (const theme of THEME_IDS) {
+					await page.evaluate(id => window.connectionTest.theme(id), theme);
+					const [sample] = await page.evaluate(measureContrast, [button]);
+					if (sample!.ratio < 4.5) failures.push(`${theme}: ${sample!.ratio}`);
+				}
+				expect(failures).toEqual([]);
+			}
+			expect(await page.evaluate(() => (window as unknown as { connectCalls: string[] }).connectCalls)).toEqual([
+				"disconnected",
+				"elsewhere",
+			]);
+			// The accessible name is the visible label only: the reserved width adds no text.
+			const snapshot = await page.accessibility.snapshot({
+				root: (await page.$('.connection-notice[data-state="disconnected"] .connection-notice-action')) ?? undefined,
+			});
+			expect(snapshot?.name).toBe("Connecting…");
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a sidebar row's status icon and connection mark grow with the text together", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			const row = "#showcase-session-connection .showcase-session-rows .session-row:has(.connection-mark)";
+			await page.waitForSelector(row);
+			const sizes = (px: number) =>
+				page.evaluate(
+					(size, selector) => {
+						document.documentElement.style.setProperty("--text-size", `${size}px`);
+						const box = (node: Element) => Math.round(node.getBoundingClientRect().width);
+						const target = document.querySelector(selector)!;
+						return { status: box(target.querySelector(".session-state svg")!), mark: box(target.querySelector(".connection-mark svg")!) };
+					},
+					px,
+					row,
+				);
+			expect(await sizes(14)).toEqual({ status: 13, mark: 12 });
+			expect(await sizes(20)).toEqual({ status: 19, mark: 17 });
+		} finally {
+			await context.close();
+		}
+	}, 30000);
 });

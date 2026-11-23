@@ -225,7 +225,8 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .session-select { display: flex; flex: 1; min-width: 0; align-items: center; text-align: left; gap: 7px; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 5px 8px; }
 .session-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere; line-height: 1.45; }
 .session-state { display: inline-flex; flex: none; align-items: center; color: var(--muted); }
-.session-state svg { width: 13px; height: 13px; }
+/* In rem, like the connection mark beside it (13px at the default size), so the pair grows together. */
+.session-state svg { width: 0.8125rem; height: 0.8125rem; }
 .session-state.running { color: var(--status-running); }
 .session-state.waiting { color: var(--status-waiting); }
 .session-state.done { color: var(--status-done); }
@@ -1132,6 +1133,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .connection-notice-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; word-break: keep-all; overflow-wrap: anywhere; }
 .connection-notice-text > span { color: var(--muted); font-size: 0.8125rem; }
 .connection-notice-action { flex: none; margin-left: auto; }
+/* Both labels reserve the button's width, so the pending label never reflows the text beside it. */
+.connection-notice-label { display: inline-flex; flex-direction: column; align-items: center; }
+.connection-notice-label::after { content: attr(data-reserve); height: 0; overflow: hidden; visibility: hidden; }
+/* Pending keeps the primary colors (a legible label is the only sign of progress), adds an inset edge
+   and a progress cursor, and does not react to the pointer. */
+.button.primary.connection-notice-action[aria-disabled="true"] { cursor: progress; background: var(--accent); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--on-accent) 30%, transparent); }
 /* Header chip beside the title and the sidebar mark beside a row's name: muted, never a status hue. */
 /* The gap sits on the title's end, so a badge that wraps to its own line starts flush with the title. */
 .toolbar-title h1:has(+ .connection-badge) { display: inline; margin-right: 8px; }

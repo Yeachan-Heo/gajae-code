@@ -18,6 +18,8 @@ export function SessionConnectionNotice({
 }) {
 	const Icon = connectionIcons[state];
 	const disconnected = state === "disconnected";
+	const idle = t(disconnected ? "connection.connect" : "connection.retry");
+	const busy = t(disconnected ? "connection.connecting" : "connection.checking");
 	return (
 		<div className="connection-notice" role="status" data-state={state}>
 			{/* Icon and text wrap as one unit, so the icon never lands on a line of its own. */}
@@ -28,15 +30,19 @@ export function SessionConnectionNotice({
 					<span>{t(disconnected ? "connection.disconnectedBody" : "connection.elsewhereBody")}</span>
 				</div>
 			</div>
+			{/* While pending it stays focusable and legible (aria-disabled, not disabled) and ignores clicks. */}
 			<Button
 				className="primary connection-notice-action"
-				disabled={pending}
-				aria-busy={pending}
-				onClick={onConnect}
+				aria-disabled={pending || undefined}
+				aria-busy={pending || undefined}
+				onClick={() => {
+					if (!pending) onConnect();
+				}}
 			>
-				{pending
-					? t(disconnected ? "connection.connecting" : "connection.checking")
-					: t(disconnected ? "connection.connect" : "connection.retry")}
+				{/* The other label reserves its width (as generated content, outside the accessible name). */}
+				<span className="connection-notice-label" data-reserve={pending ? idle : busy}>
+					{pending ? busy : idle}
+				</span>
 			</Button>
 		</div>
 	);
