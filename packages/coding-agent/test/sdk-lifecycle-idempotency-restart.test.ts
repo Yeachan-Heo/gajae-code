@@ -291,6 +291,17 @@ describe("SDK lifecycle ledger", () => {
 			expect(large.hasLegacyIdentity(fenced)).toBe(true);
 			expect(large.warnings).toContain("Oversized spawn-anchor attestation ignored");
 			expect(await fs.readFile(attestation, "utf8")).toBe(oversized);
+			// maxBytes is inclusive: maxBytes + 1 bytes is refused, exactly maxBytes is honored.
+			const atBound = valid.padEnd(limits.maxBytes, " ");
+			expect(Buffer.byteLength(atBound)).toBe(limits.maxBytes);
+			await fs.writeFile(attestation, `${atBound} `);
+			const pastBound = await openWithin("one byte oversized");
+			expect(pastBound.hasLegacyIdentity(fenced)).toBe(true);
+			expect(pastBound.warnings).toContain("Oversized spawn-anchor attestation ignored");
+			await fs.writeFile(attestation, atBound);
+			const exact = await openWithin("exactly bounded");
+			expect(exact.hasLegacyIdentity(fenced)).toBe(false);
+			expect(exact.warnings).toEqual([]);
 			// A file that grows past its fstat size while it is read is not trusted.
 			await fs.writeFile(attestation, valid);
 			const open = fs.open;
