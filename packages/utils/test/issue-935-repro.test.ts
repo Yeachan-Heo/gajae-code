@@ -36,20 +36,24 @@ describe("issue #935 path equivalence", () => {
 		expect(resolveExistingEquivalentPath(inputPath)).toBeUndefined();
 	});
 
-	it("agrees with resolveEquivalentPath for an existing symlinked directory", () => {
-		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-existing-equivalent-")));
-		try {
-			const target = path.join(root, "target");
-			const link = path.join(root, "link");
-			fs.mkdirSync(target);
-			fs.symlinkSync(target, link, "dir");
+	// Creating a directory symlink needs extra privilege on Windows.
+	it.skipIf(process.platform === "win32")(
+		"agrees with resolveEquivalentPath for an existing symlinked directory",
+		() => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-existing-equivalent-")));
+			try {
+				const target = path.join(root, "target");
+				const link = path.join(root, "link");
+				fs.mkdirSync(target);
+				fs.symlinkSync(target, link, "dir");
 
-			expect(resolveExistingEquivalentPath(link)).toBe(target);
-			expect(resolveEquivalentPath(link)).toBe(target);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+				expect(resolveExistingEquivalentPath(link)).toBe(target);
+				expect(resolveEquivalentPath(link)).toBe(target);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("issue #6446 Windows path casing", () => {
