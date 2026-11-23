@@ -1017,6 +1017,31 @@ async function selectionWrites(page: Page): Promise<DesktopRequest[]> {
 }
 
 suite("mounted model and preset scope confirmation", () => {
+	test("the model list does not wait for preferences; presets fill in when they answer", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(() => {
+				window.fixture.setModels([
+					{ id: "fixture/model-one", name: "Model One", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+					{ id: "fixture/model-two", name: "Model Two", provider: "fixture", contextWindow: 128000, reasoning: false, thinking: { options: [] } },
+				]);
+				// A slow preferences read: preset availability may wait on credential checks.
+				window.fixture.holdPreferences("preferences.get", true);
+			});
+			await select(page);
+			await selectionSession(page, "idle");
+			await page.waitForFunction(() => document.querySelector(".model-trigger")?.textContent?.includes("Model One"));
+			expect(await page.evaluate(() => window.fixture.requests().some(request => request.method === "preferences.get"))).toBe(true);
+			await page.click(".model-trigger");
+			await page.waitForSelector('[data-model-id="fixture/model-two"]');
+			await page.evaluate(() => document.querySelectorAll<HTMLButtonElement>(".model-tab")[0]!.click());
+			await page.waitForFunction(() => document.querySelector(".model-dialog")?.textContent?.includes("Loading presets…"));
+			const read = (await page.evaluate(() => window.fixture.requests())).filter(request => request.method === "preferences.get").at(-1)!;
+			await page.evaluate(({ id, result }) => window.fixture.emit({ type: "response", id, ok: true, result }), { id: read.id, result: deferralPreferences });
+			await page.waitForSelector(".preset-group-head");
+			expect(await page.evaluate(() => document.querySelector(".model-dialog")?.textContent?.includes("Loading presets…"))).toBe(false);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
 	test("unavailable owner preferences do not discard valid session model controls", async () => {
 		const { context, page } = await selectionFixture(deferralPreferences, "Remote preferences unavailable");
 		try {

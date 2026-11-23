@@ -112,6 +112,8 @@ export interface ModelPickerProps {
 	refreshing?: boolean;
 	/** The catalog is still arriving, so the trigger names the state instead of a model. */
 	loading?: boolean;
+	/** Presets are still arriving; the model list is already usable. */
+	loadingProfiles?: boolean;
 }
 
 export function ModelPicker({
@@ -129,6 +131,7 @@ export function ModelPicker({
 	onRefresh,
 	refreshing,
 	loading = false,
+	loadingProfiles = false,
 }: ModelPickerProps) {
 	const tabId = useId();
 	const [open, setOpen] = useState(false);
@@ -516,7 +519,9 @@ export function ModelPicker({
 								</p>
 							)}
 							{profileList.length === 0 ? (
-								<div className="empty model-empty">{t("models.noPresets")}</div>
+								<div className="empty model-empty" aria-busy={loadingProfiles || undefined}>
+									{loadingProfiles ? t("models.loadingPresets") : t("models.noPresets")}
+								</div>
 							) : filteredProfiles.length === 0 ? (
 								<div className="empty model-empty">{t("models.noPresetMatches")}</div>
 							) : (

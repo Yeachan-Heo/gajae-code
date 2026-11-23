@@ -166,6 +166,29 @@ type Dialog =
 	| "btw"
 	| "disconnect"
 	| null;
+/** One conversation's model list and preferences; each lands when its own request answers. */
+interface ModelCatalog {
+	sessionId: string;
+	generation: number | null;
+	models: DesktopModel[];
+	roles?: DesktopModelRolePreference[];
+	profiles?: DesktopModelProfile[];
+	/** The model list is still arriving. */
+	loading: boolean;
+	/** Preferences (presets, roles) are still arriving; the model list does not wait for them. */
+	preferencesLoading?: boolean;
+	modelsError?: string;
+	preferencesError?: string;
+	/** Both errors, for display. */
+	error?: string;
+}
+
+function withCatalogError(catalog: ModelCatalog): ModelCatalog {
+	const errors = [catalog.modelsError, catalog.preferencesError].filter((error): error is string => !!error);
+	const { error: _previous, ...rest } = catalog;
+	return errors.length ? { ...rest, error: errors.join("\n") } : rest;
+}
+
 interface GateView {
 	sessionId: string;
 	presentation: DesktopGatePresentation;
@@ -282,15 +305,12 @@ export default function App() {
 			return next;
 		});
 	}, []);
-	const [modelCatalog, setModelCatalog] = useState<{
-		sessionId: string;
-		generation: number | null;
-		models: DesktopModel[];
-		roles?: DesktopModelRolePreference[];
-		profiles?: DesktopModelProfile[];
-		loading: boolean;
-		error?: string;
-	}>({ sessionId: "", generation: null, models: [], loading: false });
+	const [modelCatalog, setModelCatalog] = useState<ModelCatalog>({
+		sessionId: "",
+		generation: null,
+		models: [],
+		loading: false,
+	});
 	const [theme, setTheme] = useState<DesktopThemeId>(readThemePreference);
 	/** Root size in pixels; every layout size in `styles.css` is expressed in rem. */
 	const [fontSize, setFontSize] = useState<number>(readFontSizePreference);
@@ -1115,32 +1135,43 @@ export default function App() {
 		if (!selected || !connected || modelGeneration === null) return;
 		let alive = true;
 		const owner = modelOwner;
-		setModelCatalog({ sessionId: selected, generation: modelGeneration, models: [], loading: true });
+		setModelCatalog({
+			sessionId: selected,
+			generation: modelGeneration,
+			models: [],
+			loading: true,
+			preferencesLoading: true,
+		});
 		const refresh = refreshModelCatalog.current;
 		refreshModelCatalog.current = false;
-		void Promise.allSettled([
-			request<DesktopModel[]>("models.list", { sessionId: selected, ...(refresh ? { refresh: true } : {}) }),
-			request<DesktopPreferences>("preferences.get", { sessionId: selected }),
-		]).then(([models, preferences]) => {
+		const failure = (error: unknown) => (error instanceof Error ? error.message : t("shell.modelsLoadFailed"));
+		// Each answer lands on its own: the model list never waits for preferences, whose preset
+		// availability can take credential checks.
+		const land = (update: (current: ModelCatalog) => ModelCatalog) => {
 			if (!alive || modelOwnerRef.current !== owner) return;
-			const errors = [models, preferences].flatMap(result =>
-				result.status === "rejected"
-					? [result.reason instanceof Error ? result.reason.message : t("shell.modelsLoadFailed")]
-					: [],
+			setModelCatalog(current =>
+				current.sessionId === selected && current.generation === modelGeneration
+					? withCatalogError(update(current))
+					: current,
 			);
-			setModelCatalog({
-				sessionId: selected,
-				generation: modelGeneration,
-				models: models.status === "fulfilled" ? models.value : [],
-				// Unsupported preferences do not invalidate the owner's model registry.
-				// Leave their capabilities absent and their error visible, not fabricated.
-				...(preferences.status === "fulfilled"
-					? { roles: preferences.value.roles, profiles: preferences.value.profiles }
-					: {}),
-				loading: false,
-				...(errors.length ? { error: errors.join("\n") } : {}),
-			});
-		});
+		};
+		void request<DesktopModel[]>("models.list", { sessionId: selected, ...(refresh ? { refresh: true } : {}) }).then(
+			models => land(current => ({ ...current, models, loading: false, modelsError: undefined })),
+			error => land(current => ({ ...current, models: [], loading: false, modelsError: failure(error) })),
+		);
+		void request<DesktopPreferences>("preferences.get", { sessionId: selected }).then(
+			preferences =>
+				land(current => ({
+					...current,
+					roles: preferences.roles,
+					profiles: preferences.profiles,
+					preferencesLoading: false,
+					preferencesError: undefined,
+				})),
+			// Unsupported preferences do not invalidate the owner's model registry.
+			// Leave their capabilities absent and their error visible, not fabricated.
+			error => land(current => ({ ...current, preferencesLoading: false, preferencesError: failure(error) })),
+		);
 		return () => {
 			alive = false;
 		};
@@ -2153,6 +2184,7 @@ export default function App() {
 					}}
 					refreshing={catalog?.loading === true}
 					loading={loadingModels}
+					loadingProfiles={catalog?.preferencesLoading === true}
 					onApplyProfile={
 						catalog?.profiles
 							? (profileId, scope) => {

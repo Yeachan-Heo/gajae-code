@@ -20,6 +20,7 @@ export const models = {
 	"models.refreshPresets": "Refresh presets",
 	"models.presetResults": "Preset search results",
 	"models.noPresets": "No presets available.",
+	"models.loadingPresets": "Loading presets…",
 	"models.noPresetMatches": "No matching presets. Try another name or model.",
 	"models.choosePreset": "Choose preset: {name}",
 	"models.presetGroup": "Preset provider {name}",
