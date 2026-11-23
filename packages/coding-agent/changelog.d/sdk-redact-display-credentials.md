@@ -1,0 +1,4 @@
+### Fixed
+
+- SDK activity controls no longer expose stored credentials in display fields. Job, task and cron labels, task model names, cron expressions and prompts, MCP server names and monitor output now show `[REDACTED]` in place of any stored API key, OAuth token or structured key token. Masking happens before display limits, so a credential cut by the limit cannot leak a partial prefix. Opaque refs and the controls they drive still act on the real job, task, cron or server.
+- SDK composer observation `info()` no longer exposes stored credentials in session name, cwd, model provider, id and name, model profile or HUD branch. Credentials hidden by terminal control sequences are masked as well, and a field is replaced entirely by `[REDACTED]` when display normalization would consume part of a credential.
