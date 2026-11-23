@@ -86,6 +86,39 @@ function coldEligibleTranscript(): string {
 	return jsonl(records);
 }
 
+/** Compacted history whose retired part holds an assistant turn with stale replay metadata. */
+function coldStaleReplayTranscript(): string {
+	const records: Record<string, unknown>[] = [
+		header("readonly-cold-stale"),
+		userEntry("stale-user", null, "question", 0),
+		assistantEntry("stale-assistant", "stale-user", {
+			content: [
+				{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
+				{ type: "text", text: "answer" },
+			],
+			providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [] },
+		}),
+	];
+	let parentId = "stale-assistant";
+	for (let index = 0; index < 2_000; index++) {
+		const id = `cold-stale-${index}`;
+		records.push(userEntry(id, parentId, `cold-${index}-${"x".repeat(512)}`, index + 1));
+		parentId = id;
+	}
+	records.push(userEntry("kept", parentId, "kept", 2_001));
+	records.push({
+		type: "compaction",
+		id: "compaction",
+		parentId: "kept",
+		timestamp: TIMESTAMP,
+		summary: "summary",
+		shortSummary: "short",
+		firstKeptEntryId: "kept",
+		tokensBefore: 2_000,
+	});
+	return jsonl(records);
+}
+
 /** A v3 transcript; loading migrates it to the current version in memory. */
 function legacyVersionTranscript(): string {
 	return jsonl([
@@ -124,6 +157,7 @@ const FIXTURES: ReadonlyArray<{ name: string; build: () => string }> = [
 	{ name: "cold-eligible compacted history", build: coldEligibleTranscript },
 	{ name: "pre-v5 transcript", build: legacyVersionTranscript },
 	{ name: "existing patch records", build: patchBearingTranscript },
+	{ name: "stale replay metadata in compacted history", build: coldStaleReplayTranscript },
 ];
 
 interface TreeNode {
