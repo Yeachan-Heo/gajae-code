@@ -14,6 +14,8 @@ import { createDesktopPreferencesController, DesktopPreferenceError } from "../s
 
 const provider = "desktop-preferences-fixture";
 const selector = (id: string) => `${provider}/${id}`;
+const keyless = "desktop-preferences-keyless";
+const local = "desktop-preferences-local";
 const model: Model = {
 	id: "base",
 	name: "Base",
@@ -61,6 +63,24 @@ async function fixture(durable = false) {
 						},
 					],
 				},
+				// Configured to read its key from the credential store, which holds none.
+				[keyless]: {
+					api: model.api,
+					baseUrl: model.baseUrl,
+					credential: "store",
+					models: [
+						{ id: "base", name: "Base", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 1024 },
+					],
+				},
+				// An endpoint that needs no credential.
+				[local]: {
+					api: model.api,
+					baseUrl: model.baseUrl,
+					auth: "none",
+					models: [
+						{ id: "base", name: "Base", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 1024 },
+					],
+				},
 			},
 			profiles: {
 				"desk-a": {
@@ -72,6 +92,34 @@ async function fixture(durable = false) {
 					display_name: "Desktop B",
 					required_providers: [provider],
 					model_mapping: { default: selector("nested/next"), executor: selector("base") },
+				},
+				// A provider nothing configures, and one configured without a credential.
+				"desk-unconfigured": {
+					display_name: "Desktop Unconfigured",
+					required_providers: ["desktop-preferences-absent"],
+					model_mapping: { default: "desktop-preferences-absent/base" },
+				},
+				"desk-keyless": {
+					display_name: "Desktop Keyless",
+					required_providers: [keyless],
+					model_mapping: { default: `${keyless}/base` },
+				},
+				"desk-local": {
+					display_name: "Desktop Local",
+					required_providers: [local],
+					model_mapping: { default: `${local}/base` },
+				},
+				// Both providers are required; only one has a credential.
+				"desk-partial": {
+					display_name: "Desktop Partial",
+					required_providers: [provider, "desktop-preferences-absent"],
+					model_mapping: { default: selector("base") },
+				},
+				// The provider has a credential, but the default model is not in its catalog.
+				"desk-unresolved": {
+					display_name: "Desktop Unresolved",
+					required_providers: [provider],
+					model_mapping: { default: selector("absent") },
 				},
 			},
 		}),
@@ -117,6 +165,53 @@ async function fixture(durable = false) {
 }
 
 describe("desktop SDK preferences delegation", () => {
+	test("lists every profile with the availability the managed profile list reports", async () => {
+		const { controller, session } = await fixture();
+		expect(session.modelRegistry.getError()).toBeUndefined();
+		const profiles = (await controller.read()).profiles;
+		// Built-in presets are listed too; their availability depends on the environment.
+		expect(
+			profiles.filter(profile => profile.id.startsWith("desk-")).map(profile => [profile.id, profile.available]),
+		).toEqual([
+			["desk-a", true],
+			["desk-b", true],
+			["desk-keyless", false],
+			// No credential is needed, so the profile can be selected.
+			["desk-local", true],
+			["desk-partial", false],
+			["desk-unconfigured", false],
+			// Its provider has a credential, but selecting it could not resolve the default model.
+			["desk-unresolved", false],
+		]);
+		expect(await controller.listProfiles()).toEqual(profiles);
+	});
+	test("a listed profile selects for the session exactly when it is listed available", async () => {
+		const outcomes: Array<[string, boolean, boolean]> = [];
+		for (const id of [
+			"desk-a",
+			"desk-keyless",
+			"desk-local",
+			"desk-partial",
+			"desk-unconfigured",
+			"desk-unresolved",
+		]) {
+			const { controller } = await fixture();
+			const listed = (await controller.read()).profiles.find(profile => profile.id === id);
+			const selected = await controller.apply({ type: "profile.select", name: id, scope: "session" }).then(
+				() => true,
+				() => false,
+			);
+			outcomes.push([id, listed?.available ?? false, selected]);
+		}
+		expect(outcomes).toEqual([
+			["desk-a", true, true],
+			["desk-keyless", false, false],
+			["desk-local", true, true],
+			["desk-partial", false, false],
+			["desk-unconfigured", false, false],
+			["desk-unresolved", false, false],
+		]);
+	});
 	test("maps session/default profile scopes and reads the canonical SDK result", async () => {
 		const { controller, session, settings } = await fixture(true);
 		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile");
@@ -128,7 +223,7 @@ describe("desktop SDK preferences delegation", () => {
 		});
 		expect(select).toHaveBeenLastCalledWith({ name: "desk-b", scope: "session" });
 		expect(session.getActiveModelProfile()).toBe("desk-b");
-		expect(controller.read().profiles.find(item => item.id === "desk-b")).toMatchObject({
+		expect((await controller.read()).profiles.find(item => item.id === "desk-b")).toMatchObject({
 			name: "Desktop B",
 			active: true,
 			group: "CUSTOM",
@@ -141,7 +236,7 @@ describe("desktop SDK preferences delegation", () => {
 		});
 		expect(select).toHaveBeenLastCalledWith({ name: "desk-a", scope: "global" });
 		expect(settings.getGlobal("modelProfile.default")).toBe("desk-a");
-		expect(controller.read().profiles.find(item => item.id === "desk-a")?.default).toBe(true);
+		expect((await controller.read()).profiles.find(item => item.id === "desk-a")?.default).toBe(true);
 	});
 
 	test("delegates nested default model identities and task-role ownership/clear", async () => {
@@ -153,7 +248,7 @@ describe("desktop SDK preferences delegation", () => {
 		expect(session.model?.id).toBe("nested/next");
 		await controller.apply({ type: "role.set", role: "planner", modelId: selector("base") });
 		expect(role).toHaveBeenLastCalledWith({ role: "planner", modelId: selector("base") });
-		expect(controller.read().roles.find(item => item.id === "planner")).toMatchObject({
+		expect((await controller.read()).roles.find(item => item.id === "planner")).toMatchObject({
 			configured: true,
 			model: { id: "base", provider },
 			scope: "session",
@@ -161,7 +256,7 @@ describe("desktop SDK preferences delegation", () => {
 		});
 		await controller.apply({ type: "role.set", role: "planner", modelId: null });
 		expect(role).toHaveBeenLastCalledWith({ role: "planner", modelId: null });
-		expect(controller.read().roles.find(item => item.id === "planner")?.canClear.available).toBe(false);
+		expect((await controller.read()).roles.find(item => item.id === "planner")?.canClear.available).toBe(false);
 	});
 
 	test("SDK role readback is authoritative, not a reconstructed settings override", async () => {
@@ -169,7 +264,7 @@ describe("desktop SDK preferences delegation", () => {
 		const readRoles = vi.spyOn(SdkPreferenceControls.prototype, "readRoles");
 		// A real role write exercises both SDK-owned source and effective-resolution mapping.
 		await controller.apply({ type: "role.set", role: "architect", modelId: selector("nested/next") });
-		const dto = controller.read();
+		const dto = await controller.read();
 		expect(readRoles).toHaveBeenCalled();
 		expect(dto.roles.find(item => item.id === "architect")).toMatchObject({
 			configured: true,
@@ -177,7 +272,7 @@ describe("desktop SDK preferences delegation", () => {
 			canClear: { available: true },
 		});
 		dto.profiles[0]!.name = "caller mutation";
-		expect(controller.read().profiles[0]!.name).not.toBe("caller mutation");
+		expect((await controller.read()).profiles[0]!.name).not.toBe("caller mutation");
 		expect(JSON.stringify(dto)).not.toContain("fixture-key");
 		expect(JSON.stringify(dto)).not.toContain("example.invalid");
 	});
@@ -296,7 +391,7 @@ describe("desktop SDK preferences delegation", () => {
 		} finally {
 			await reopened.close();
 		}
-		expect(() => controller.read()).toThrow("Session preferences have been closed.");
+		await expect(controller.read()).rejects.toThrow("Session preferences have been closed.");
 	});
 
 	test("post-application readback failures retain the native receipt without exposing backend errors", async () => {

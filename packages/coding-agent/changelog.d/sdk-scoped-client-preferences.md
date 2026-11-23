@@ -1,2 +1,2 @@
 ### Added
-- Expose identity-fenced read-only profile labels, provider grouping/ranks, availability and role selectors through the public preference service so embedders preserve canonical picker presentation without internal imports or catalog refresh.
+- Expose identity-fenced read-only profile labels, provider grouping/ranks, availability and role selectors through the public preference service (`await readProfiles()`) so embedders preserve canonical picker presentation without internal imports or catalog refresh. A profile's availability is the same decision the managed `models.profiles.list` query reports for the session: its providers are authenticated (directly, through an alternative, or through a configured proxy) and its mapped models resolve.

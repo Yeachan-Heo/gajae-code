@@ -10,6 +10,8 @@ import { readDurableModelProfileOwnership } from "../src/config/model-profile-ow
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { createSdkSurfaceFactory } from "../src/sdk/host/session-runtime";
 import {
 	createSdkPreferenceControls,
 	isSdkPreferenceControlOperation,
@@ -153,7 +155,7 @@ describe("SDK preference controls", () => {
 		vi.spyOn(f.registry, "getModelProfiles").mockReturnValue(new Map([[profile.name, definition]]));
 		await f.auth.set("fixture", { type: "api_key", key: "fixture-profile-secret" });
 		const refresh = vi.spyOn(f.registry, "refresh");
-		const [entry] = f.controls.readProfiles();
+		const [entry] = await f.controls.readProfiles();
 		expect(entry).toMatchObject({
 			id: profile.name,
 			displayName: "Desktop Profile",
@@ -166,7 +168,154 @@ describe("SDK preference controls", () => {
 		expect(JSON.stringify(entry)).not.toContain("fixture-profile-secret");
 		expect(refresh).not.toHaveBeenCalled();
 		f.controls.dispose();
-		expect(() => f.controls.readProfiles()).toThrow(SdkPreferenceError);
+		await expect(f.controls.readProfiles()).rejects.toThrow(SdkPreferenceError);
+	});
+	it("reports configured, unconfigured and partially configured providers' profiles as before", async () => {
+		const f = await fixture();
+		const other: Model = { ...first, id: "other-model", name: "Other", provider: "fixture-other" };
+		vi.spyOn(f.registry, "getAvailable").mockReturnValue([first, second, other]);
+		vi.spyOn(f.registry, "getAll").mockReturnValue([first, second, other]);
+		// Only `fixture` has a credential; `fixture-other` has none.
+		await f.auth.set("fixture", { type: "api_key", key: "fixture-profile-secret" });
+		vi.spyOn(f.registry, "getApiKeyForProvider").mockImplementation(async provider =>
+			provider === "fixture" ? "fixture-profile-secret" : undefined,
+		);
+		const definitions: ModelProfileDefinition[] = [
+			{
+				name: "configured",
+				source: "user",
+				requiredProviders: ["fixture"],
+				modelMapping: { default: "fixture/first" },
+			},
+			{
+				name: "unconfigured",
+				source: "user",
+				requiredProviders: ["fixture-other"],
+				modelMapping: { default: "fixture-other/other-model" },
+			},
+			{
+				name: "partial",
+				source: "user",
+				requiredProviders: ["fixture", "fixture-other"],
+				modelMapping: { default: "fixture/first", executor: "fixture-other/other-model" },
+			},
+			{
+				name: "partial-alternative",
+				source: "user",
+				requiredProviders: ["fixture", "fixture-other"],
+				alternativeProviderGroups: [["fixture", "fixture-other"]],
+				modelMapping: { default: "fixture/first" },
+			},
+			{
+				name: "roles-only",
+				source: "user",
+				requiredProviders: ["fixture"],
+				modelMapping: { executor: "fixture/first:low" },
+			},
+		];
+		vi.spyOn(f.registry, "getModelProfiles").mockReturnValue(
+			new Map(definitions.map(definition => [definition.name, definition])),
+		);
+		const rows = await f.controls.readProfiles();
+		expect(rows.map(row => [row.id, row.available])).toEqual([
+			["configured", true],
+			["partial", false],
+			["partial-alternative", true],
+			["roles-only", true],
+			["unconfigured", false],
+		]);
+		expect(rows.find(row => row.id === "partial")?.roles).toContainEqual({
+			role: "executor",
+			model: "fixture-other/other-model",
+		});
+	});
+	it("reads profile availability without changing the session's model, profile or roles", async () => {
+		const f = await fixture();
+		const other: Model = { ...first, id: "other-model", name: "Other", provider: "fixture-other" };
+		vi.spyOn(f.registry, "getAvailable").mockReturnValue([first, second, other]);
+		vi.spyOn(f.registry, "getAll").mockReturnValue([first, second, other]);
+		vi.spyOn(f.registry, "getApiKeyForProvider").mockImplementation(async provider =>
+			provider === "fixture" ? "fixture-key" : undefined,
+		);
+		vi.spyOn(f.registry, "getApiKey").mockImplementation(async candidate =>
+			candidate.provider === "fixture" ? "fixture-key" : undefined,
+		);
+		vi.spyOn(f.registry, "getModelProfiles").mockReturnValue(
+			new Map<string, ModelProfileDefinition>([
+				// A bare selector and a chain whose first entry has no credential.
+				[
+					"bare",
+					{ name: "bare", source: "user", requiredProviders: ["fixture"], modelMapping: { default: "first" } },
+				],
+				[
+					"chain",
+					{
+						name: "chain",
+						source: "user",
+						requiredProviders: ["fixture"],
+						modelMapping: { default: ["fixture-other/other-model", "fixture/first"] },
+					},
+				],
+			]),
+		);
+		const clear = vi.spyOn(f.registry, "clearCanonicalVariant");
+		const before = {
+			model: f.session.model,
+			thinking: f.session.thinkingLevel,
+			profile: f.session.getActiveModelProfile(),
+			roles: f.controls.readRoles(),
+		};
+		const rows = await f.controls.readProfiles();
+		expect(rows.map(row => [row.id, row.available])).toEqual([
+			["bare", true],
+			["chain", true],
+		]);
+		expect(clear).not.toHaveBeenCalled();
+		expect({
+			model: f.session.model,
+			thinking: f.session.thinkingLevel,
+			profile: f.session.getActiveModelProfile(),
+			roles: f.controls.readRoles(),
+		}).toEqual(before);
+	});
+	it("decides profile availability the way the managed models.profiles.list query does", async () => {
+		const f = await fixture();
+		// The provider is authenticated, but the profile's default model is not in the catalog:
+		// a provider-only check would offer it, and selecting it would then fail.
+		const unresolvable: ModelProfileDefinition = {
+			name: "unresolvable",
+			source: "user",
+			requiredProviders: ["fixture"],
+			modelMapping: { default: "fixture/absent" },
+		};
+		vi.spyOn(f.registry, "getModelProfiles").mockReturnValue(
+			new Map([
+				[profile.name, profile],
+				[unresolvable.name, unresolvable],
+			]),
+		);
+		await f.auth.set("fixture", { type: "api_key", key: "fixture-profile-secret" });
+		const ctx = {
+			cwd: f.cwd,
+			workflowGate: undefined,
+			sdkBindings: () => [],
+			sessionManager: f.session.sessionManager,
+			getGoalState: () => undefined,
+			modelRegistry: f.registry,
+			settings: f.settings,
+			credentialSessionId: f.session.credentialSessionId,
+		} as unknown as ExtensionContext;
+		const managed = (await createSdkSurfaceFactory({
+			ctx,
+			id: f.session.sessionId,
+			api: {} as ExtensionAPI,
+			settings: f.settings,
+		}).query.getModelProfiles!()) as Array<{ id: string; available: boolean }>;
+		const inProcess = await f.controls.readProfiles();
+		const availability = (rows: Array<{ id: string; available: boolean }>) =>
+			Object.fromEntries(rows.map(row => [row.id, row.available]));
+		expect(availability(inProcess)).toEqual({ [profile.name]: true, [unresolvable.name]: false });
+		expect(availability(inProcess)).toEqual(availability(managed));
 	});
 	it("publishes a closed query/control allowlist without changing model.set", async () => {
 		const f = await fixture();

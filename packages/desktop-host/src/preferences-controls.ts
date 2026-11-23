@@ -55,8 +55,8 @@ export class DesktopPreferenceError extends Error {
 }
 
 export interface DesktopPreferencesController {
-	listProfiles(): DesktopModelProfile[];
-	read(): DesktopPreferences;
+	listProfiles(): Promise<DesktopModelProfile[]>;
+	read(): Promise<DesktopPreferences>;
 	apply(action: unknown): Promise<DesktopPreferenceResult>;
 	/** Host-only scoped config seam; preserve SDK application/durability receipts verbatim. */
 	writeConfig(input: SdkWriteConfigInput): Promise<SdkWriteConfigResult>;
@@ -158,11 +158,15 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 		controls.readRoles();
 	};
 	const canPersist = (): boolean => settings.canPersistDurableConfig() && settings.canWriteDurableConfig();
-	const listProfiles = (): DesktopModelProfile[] => {
+	const listProfiles = async (): Promise<DesktopModelProfile[]> => {
+		assertCurrent();
+		const profiles = await controls.readProfiles();
+		// Availability is resolved asynchronously; mark the active and default profiles as they are
+		// once it settles, and refuse a controller closed meanwhile.
 		assertCurrent();
 		const active = session.getActiveModelProfile();
 		const defaultName = settings.getGlobal("modelProfile.default");
-		return controls.readProfiles().map(profile => {
+		return profiles.map(profile => {
 			return {
 				id: profile.id,
 				name: profile.displayName,
@@ -184,8 +188,8 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			};
 		});
 	};
-	const read = (): DesktopPreferences => {
-		assertCurrent();
+	const read = async (): Promise<DesktopPreferences> => {
+		const profiles = await listProfiles();
 		const rolePreferences = controls.readRoles();
 		const catalog = new Map(getSettingsCatalog(settings).items.map(item => [item.path, item]));
 		const roles: DesktopModelRolePreference[] = ROLES.map(id => {
@@ -223,7 +227,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			};
 		});
 		return {
-			profiles: listProfiles(),
+			profiles,
 			roles,
 			sampling: SAMPLING_PARAMETERS.map(parameter => {
 				const item = catalog.get(parameter)!;
@@ -273,7 +277,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 						profileId: result.profileId,
 						scope: action.scope,
 						durability: requireAppliedPreference(result),
-						preferences: read(),
+						preferences: await read(),
 						outcome: projectPreferenceOutcome(result),
 					};
 				}
@@ -295,7 +299,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 						role: action.role,
 						scope: "default",
 						durability: requireAppliedPreference(result),
-						preferences: read(),
+						preferences: await read(),
 						outcome: projectPreferenceOutcome(result),
 					};
 				}
@@ -306,7 +310,7 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 					role: action.role,
 					scope: "session",
 					durability: requireAppliedPreference(result),
-					preferences: read(),
+					preferences: await read(),
 					outcome: projectPreferenceOutcome(result),
 				};
 			} catch (error) {

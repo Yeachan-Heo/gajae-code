@@ -9,7 +9,11 @@ import {
 	applyAtomicYamlPatchesWithCurrent,
 } from "../config/atomic-yaml-patch";
 import {
-	isModelProfileProviderAvailable,
+	collectModelProfileAuthentication,
+	isModelProfileSelectable,
+	type ModelProfileAvailabilityContext,
+} from "../config/model-profile-availability";
+import {
 	type ModelProfileCatalogItem,
 	projectModelProfileCatalog,
 	validateModelProfileName,
@@ -322,29 +326,35 @@ export class SdkPreferenceControls {
 			throw new SdkPreferenceError("preference_busy", "A newer model selection superseded the request.");
 	}
 
-	/** Canonical read-only profile presentation; no registry refresh or credential resolution. */
-	readProfiles(): SdkProfileCatalogEntry[] {
+	/**
+	 * Canonical read-only profile presentation. Availability is the managed
+	 * `models.profiles.list` decision for this session's credentials; it reads (and may refresh)
+	 * stored credentials but never refreshes the registry's catalogs.
+	 */
+	async readProfiles(): Promise<SdkProfileCatalogEntry[]> {
 		this.#assertIdentity();
 		const definitions = this.#registry.getModelProfiles();
-		const authenticated = new Set<string>();
-		for (const definition of definitions.values()) {
-			for (const provider of [
-				...definition.requiredProviders,
-				...(definition.alternativeProviderGroups ?? []).flat(),
-			])
-				if (this.#registry.hasUsableAuthForProvider(provider)) authenticated.add(provider);
-		}
-		const result = projectModelProfileCatalog(definitions, this.#registry.getError()).map(profile => {
-			const definition = definitions.get(profile.id)!;
-			return {
-				...profile,
-				available: isModelProfileProviderAvailable(definition, authenticated),
-				roles: (["default", "image", ...ROLES] as const).map(role => {
-					const model = definition.modelMapping[role];
-					return { role, model: Array.isArray(model) ? (model[0] ?? null) : (model ?? null) };
-				}),
-			};
-		});
+		const catalog = projectModelProfileCatalog(definitions, this.#registry.getError());
+		const context: ModelProfileAvailabilityContext = {
+			registry: this.#registry,
+			settings: this.#settings,
+			resolutionSettings: this.#settings,
+			credentialSessionId: this.#session.credentialSessionId,
+		};
+		const authenticated = await collectModelProfileAuthentication(context, definitions);
+		const result = await Promise.all(
+			catalog.map(async profile => {
+				const definition = definitions.get(profile.id)!;
+				return {
+					...profile,
+					available: await isModelProfileSelectable(context, definition, authenticated),
+					roles: (["default", "image", ...ROLES] as const).map(role => {
+						const model = definition.modelMapping[role];
+						return { role, model: Array.isArray(model) ? (model[0] ?? null) : (model ?? null) };
+					}),
+				};
+			}),
+		);
 		this.#assertIdentity();
 		return result;
 	}
