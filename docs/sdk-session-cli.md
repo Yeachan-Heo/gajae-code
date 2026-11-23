@@ -587,11 +587,11 @@ not settle earlier effects.
   already-attested identities are excluded. Unproven rows stay fenced. The file
   takes effect at the next broker start for the same agent directory; the
   restart notice names that directory, shell-quoted. Restart through the
-  external supervisor for `gjc sdk broker run --agent-dir <dir>`. Restart a
-  running on-demand broker with
-  `gjc doctor --fix --repair service.restart-owned --target <id> --allow-risk service-interruption`,
-  using the broker target id that `gjc doctor --check service` reports, run
-  with `GJC_CODING_AGENT_DIR` set to that directory (see [doctor](doctor.md));
+  external supervisor for `gjc sdk broker run --agent-dir <dir>`. To restart a
+  running on-demand broker, set `GJC_CODING_AGENT_DIR` to that directory for
+  both `gjc doctor --check service`, which reports its broker target id, and
+  `gjc doctor --fix --repair service.restart-owned --target <id> --allow-risk service-interruption --yes`
+  (see [doctor](doctor.md));
   if none is running, the next `gjc sdk session`, `search` or `spawn` command
   run with `--agent-dir <dir>` (not attach-only) starts one. From a source
   checkout, `bun run restart:sdk-broker -- --agent-dir <dir>` also restarts it

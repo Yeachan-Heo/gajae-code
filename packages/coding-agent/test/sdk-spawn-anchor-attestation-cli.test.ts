@@ -820,7 +820,7 @@ describe("SDK spawn-anchor attestation", () => {
 				expect(notice).toContain(`next broker start for agent directory ${quoted}.`);
 				expect(notice).toContain(`your supervisor for gjc sdk broker run --agent-dir ${quoted}.`);
 				expect(notice).toContain(
-					`gjc doctor --fix --repair service.restart-owned --target <broker target from gjc doctor --check service> --allow-risk service-interruption, run with GJC_CODING_AGENT_DIR set to ${quoted};`,
+					`set GJC_CODING_AGENT_DIR to ${quoted} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes;`,
 				);
 				expect(notice).toContain(
 					`the next gjc sdk session, search or spawn command run with --agent-dir ${quoted} starts one.`,

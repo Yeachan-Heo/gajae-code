@@ -40,7 +40,7 @@ export function spawnAnchorAttestationRestartNotice(agentDir: string, platform =
 	return [
 		`Takes effect at the next broker start for agent directory ${dir}.`,
 		`Restart through your supervisor for gjc sdk broker run --agent-dir ${dir}.`,
-		`Restart a running on-demand broker with gjc doctor --fix --repair service.restart-owned --target <broker target from gjc doctor --check service> --allow-risk service-interruption, run with GJC_CODING_AGENT_DIR set to ${dir}; if none is running, the next gjc sdk session, search or spawn command run with --agent-dir ${dir} starts one.`,
+		`To restart a running on-demand broker, set GJC_CODING_AGENT_DIR to ${dir} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes; if none is running, the next gjc sdk session, search or spawn command run with --agent-dir ${dir} starts one.`,
 		`From a source checkout, bun run restart:sdk-broker -- --agent-dir ${dir} also restarts it.`,
 	].join(" ");
 }
