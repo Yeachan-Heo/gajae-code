@@ -1,8 +1,9 @@
 import type { DesktopSession } from "@gajae-code/desktop-host/protocol";
 import type { ReactNode } from "react";
 import { SessionRow } from "./components";
+import { type DeliveryRecovery, recoveryNotice } from "./delivery-recovery";
 import { type MessageKey, t } from "./i18n";
-import { RecoveryCard } from "./RecoveryConversation";
+import { RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
 import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
 import { SessionConnectionBadge } from "./SessionConnectionMark";
 
@@ -14,6 +15,15 @@ function State({ caption, narrow, children }: { caption: MessageKey; narrow?: bo
 		</div>
 	);
 }
+
+// A fixture record with an unknown outcome; nothing here is read from or written to the store.
+const record: DeliveryRecovery = {
+	id: "showcase-recovery",
+	sessionId: "showcase",
+	text: "Summarize the failing test output",
+	attachments: [],
+	disposition: "unknown",
+};
 
 /** The App's recovery card around a fixture record; its buttons do nothing here. */
 function FixtureCard({
@@ -32,15 +42,19 @@ function FixtureCard({
 	const none = () => {};
 	return (
 		<RecoveryCard
-			notice={t("support.deliveryOutcomeUnknown")}
+			notice={recoveryNotice(record, false, orphan) ?? ""}
 			orphan={orphan}
 			title={title}
 			rememberedTitle={rememberedTitle}
 			current={current}
-			text="Summarize the failing test output"
+			text={record.text}
 			onOpen={none}
 			restore={orphan ? undefined : { label: t("shell.restoreDraft"), disabled: restored, onClick: none }}
-			discard={{ label: t("shell.discardRestoredRecord"), disabled: !orphan && !restored, onClick: none }}
+			discard={{
+				label: recoveryDiscardLabel(orphan, record.disposition),
+				disabled: !orphan && !restored,
+				onClick: none,
+			}}
 		/>
 	);
 }

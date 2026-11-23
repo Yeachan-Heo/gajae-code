@@ -1,6 +1,16 @@
+import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
 import { useState } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
+
+/**
+ * The card's discard action. A listed conversation's unknown outcome is discarded once restored;
+ * an orphan's record was never restored and cannot be, so it is just a record.
+ */
+export function recoveryDiscardLabel(orphan: boolean, disposition: DesktopDeliveryReceipt["disposition"]): string {
+	if (orphan) return t("recovery.discardOrphan");
+	return disposition === "unknown" ? t("shell.discardRestoredRecord") : t("shell.discardRecoveryRecord");
+}
 
 export interface RecoveryConversationProps {
 	/** The conversation is not in the app's list (deleted, or its workspace closed). */
@@ -95,7 +105,7 @@ export interface RecoveryCardProps extends RecoveryConversationProps {
  */
 export function RecoveryCard({ notice, error, retry, restore, discard, ...conversation }: RecoveryCardProps) {
 	return (
-		<div className="notice" role="status">
+		<div className="notice recovery-card" role="status">
 			<p>{notice}</p>
 			{error && <p>{error}</p>}
 			<RecoveryConversation {...conversation} />

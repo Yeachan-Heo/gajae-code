@@ -40,6 +40,25 @@ test("recovery notices distinguish actionable outcomes from routine bookkeeping"
 	}
 });
 
+test("an orphan's notice never mentions restoring, which it cannot offer", () => {
+	const entry: DeliveryRecovery = {
+		id: "id",
+		sessionId: "gone",
+		text: "payload",
+		attachments: [],
+		disposition: "unknown",
+	};
+	const unknown = recoveryNotice(entry, false, true);
+	expect(unknown).toContain("It may already have run");
+	expect(unknown).not.toMatch(/restor/iu);
+	const failed = recoveryNotice({ ...entry, disposition: "failed" }, false, true);
+	expect(failed).toContain("Some work may already have run");
+	expect(failed).not.toMatch(/restor/iu);
+	// A listed conversation keeps today's wording.
+	expect(recoveryNotice(entry, false, false)).toBe(recoveryNotice(entry, false));
+	expect(recoveryNotice(entry, false)).toContain("will not resend it automatically");
+});
+
 test("prompt envelope validation includes exact UTF-8 bytes at the frame boundary", () => {
 	const id = "request-id";
 	const params = { sessionId: "세션", text: "", attachments: [{ kind: "text", name: "a.txt", text: "첨부" }] };

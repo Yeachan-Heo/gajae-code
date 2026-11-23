@@ -5,6 +5,10 @@ export const recovery = {
 	"recovery.orphanUnnamed": "This conversation is no longer in the conversation list.",
 	"recovery.orphanHint":
 		"It may have been deleted, or its workspace closed. Copy the text if you still need it, then discard the record.",
+	"recovery.orphanOutcomeUnknown":
+		"Delivery recovery: the outcome is unknown. It may already have run; the app will not send it again.",
+	"recovery.orphanFailed": "Delivery recovery: delivery failed. Some work may already have run.",
+	"recovery.discardOrphan": "Discard record",
 	"recovery.openConversation": "Open conversation",
 	"recovery.copyText": "Copy text",
 	"recovery.copied": "Text copied.",

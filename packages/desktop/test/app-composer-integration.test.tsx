@@ -3651,6 +3651,8 @@ suite("mounted composer delivery recovery", () => {
 			const card = await page.$eval(".recovery-conversation", el => el.textContent);
 			expect(card).toContain("Old chat");
 			expect(card).toContain("no longer in the conversation list");
+			// Nothing on the card offers or mentions a restore it cannot do.
+			expect(await page.$eval(".recovery-card", el => el.textContent)).not.toMatch(/restor/iu);
 			// No draft can be restored into a conversation that is not listed.
 			expect(await page.evaluate(() => [...document.querySelectorAll("button")].some(button => button.textContent?.includes("Restore draft")))).toBe(false);
 			await installResponseClipboard(page);

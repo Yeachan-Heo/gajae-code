@@ -25,11 +25,16 @@ export function nextDeliverySequence(): number {
 	return lastSequence;
 }
 
-export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean): string | null {
+/**
+ * The card's account of a delivery. An orphan (its conversation is not in the list) cannot be
+ * restored, so its wording never mentions restoring.
+ */
+export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean, orphan = false): string | null {
 	if (unsentRepair) return t("support.deliveryRepairPending");
 	if (entry.finalizing) return null;
-	if (entry.disposition === "unknown") return t("support.deliveryOutcomeUnknown");
-	if (entry.disposition === "failed") return t("support.deliveryFailed");
+	if (entry.disposition === "unknown")
+		return orphan ? t("recovery.orphanOutcomeUnknown") : t("support.deliveryOutcomeUnknown");
+	if (entry.disposition === "failed") return orphan ? t("recovery.orphanFailed") : t("support.deliveryFailed");
 	return null;
 }
 

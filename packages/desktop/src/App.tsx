@@ -123,7 +123,7 @@ import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboa
 import { ProvidersDialog } from "./ProvidersDialog";
 import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
-import { RecoveryCard } from "./RecoveryConversation";
+import { RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
 import { Select } from "./Select";
 import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
 import { connectionState, SessionConnectionBadge } from "./SessionConnectionMark";
@@ -2554,13 +2554,13 @@ export default function App() {
 	const recoveryPanel = (item: DeliveryRecovery) => {
 		if (!recoveryBootstrapSettled) return null;
 		const restorationFailure = restorationFailures.current.get(item.id);
-		const copy =
-			restorationFailure?.sessionId === item.sessionId
-				? t("shell.recoveryRestoreFailed")
-				: recoveryNotice(item, unsentRepairs.current.get(item.id) === item.sessionId);
 		const owner = snapshot?.sessions.find(entry => entry.id === item.sessionId);
 		// Only a settled snapshot can say a conversation is gone (deleted, or its workspace closed).
 		const orphan = snapshot !== null && !owner;
+		const copy =
+			restorationFailure?.sessionId === item.sessionId
+				? t("shell.recoveryRestoreFailed")
+				: recoveryNotice(item, unsentRepairs.current.get(item.id) === item.sessionId, orphan);
 		return copy ? (
 			<RecoveryCard
 				key={item.id}
@@ -2612,8 +2612,7 @@ export default function App() {
 							}
 				}
 				discard={{
-					label:
-						item.disposition === "unknown" ? t("shell.discardRestoredRecord") : t("shell.discardRecoveryRecord"),
+					label: recoveryDiscardLabel(orphan, item.disposition),
 					disabled:
 						item.finalizing ||
 						(!orphan &&
