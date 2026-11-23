@@ -68,6 +68,7 @@ import {
 	readGjcTmuxProviderAuthoritySync,
 	resolveGjcTmuxCommand,
 	resolveGjcTmuxProviderContext,
+	tmuxClientFlags,
 } from "./tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
@@ -398,24 +399,6 @@ function environmentForProviderAuthority(
 		[GJC_COORDINATOR_SESSION_ID_ENV]: authority.sessionId,
 		[GJC_TMUX_OWNER_GENERATION_ENV]: authority.generation,
 	};
-}
-
-/**
- * tmux lets a client write UTF-8 only when it was started with `-u`, runs inside tmux
- * (`$TMUX`), or the first set of LC_ALL/LC_CTYPE/LANG names UTF-8. Any other client gets
- * every byte outside printable ASCII replaced with `_`, including the tab separators and
- * non-ASCII names and paths parsed here. A detached Broker inherits its launcher's locale,
- * and launchd or a service manager provides none, so every native tmux client this module
- * runs for managed-session creation, inspection, and mutation requests UTF-8 output instead
- * of depending on the caller's environment. The flag precedes the subcommand, so the Linux
- * owner-isolation server proof inherits it from the new-session control prefix. psmux has
- * its own client flags and never receives it. Interactive attach is deliberately excluded:
- * its output goes to the user's terminal, whose locale is authoritative.
- */
-const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
-
-function tmuxClientFlags(isPsmux: boolean): string[] {
-	return isPsmux ? [] : [NATIVE_TMUX_UTF8_CLIENT_FLAG];
 }
 
 function runTmux(
