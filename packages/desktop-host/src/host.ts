@@ -2745,7 +2745,12 @@ export class DesktopHost {
 	 */
 	async #recheckOwner(checked: LiveSession, method: DesktopRequest["method"]): Promise<void> {
 		if (!this.#idle(checked)) return;
-		if ((await this.#ownerAnswer(checked.metadata)).kind !== "live") return;
+		const answer = await this.#ownerAnswer(checked.metadata);
+		// Deleting needs a definite answer, as for a released conversation: nobody has it open, or no
+		// broker runs. A broker that runs but cannot answer may be hiding a terminal.
+		if (method === "session.delete" && answer.kind === "unknown" && answer.reason === "broker_unavailable")
+			throw new Error(OWNER_UNCHECKED_DELETE);
+		if (answer.kind !== "live") return;
 		// The answer is about the transcript, not the copy that asked. If another request replaced
 		// that copy while the broker answered, it holds for the copy that replaced it; a copy still
 		// opening checks for itself, and a released conversation has none.

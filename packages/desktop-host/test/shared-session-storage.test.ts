@@ -1160,6 +1160,27 @@ test("a released conversation is deleted only once the broker can say no termina
 	await h.close();
 });
 
+test("a connected conversation is deleted only once a running broker can say no terminal has it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const file = live.sessionFile!;
+	// The broker is running but cannot answer: a terminal may have it open, so nothing is removed.
+	h.failBroker(true);
+	await expect(h.call("session.delete", { sessionId })).rejects.toThrow("could not check");
+	expect(await Bun.file(file).exists()).toBe(true);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([sessionId]);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	expect(live.isDisposed).toBe(false);
+	// A definite answer that nobody has it open lets the delete go ahead.
+	h.failBroker(false);
+	await h.call("session.delete", { sessionId });
+	expect(await Bun.file(file).exists()).toBe(false);
+	expect(h.snapshot().sessions).toEqual([]);
+	await h.close();
+});
+
 test("an unreachable broker never blocks opening; the app opens writable as before", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
