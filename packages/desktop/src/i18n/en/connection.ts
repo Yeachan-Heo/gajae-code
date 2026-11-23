@@ -5,14 +5,14 @@ export const connection = {
 	"connection.connecting": "Connecting…",
 	"connection.retry": "Check again",
 	"connection.checking": "Checking…",
-	"connection.badgeDisconnected": "Disconnected",
-	"connection.badgeElsewhere": "Open in terminal",
-	"connection.markDisconnected": "disconnected from the app",
-	"connection.markElsewhere": "open in a terminal",
-	"connection.disconnectedTitle": "Disconnected from the app",
+	"connection.badgeDisconnected": "Not connected here",
+	"connection.badgeElsewhere": "In use in a terminal",
+	"connection.markDisconnected": "not connected to the app",
+	"connection.markElsewhere": "in use in a terminal",
+	"connection.disconnectedTitle": "Not connected to the app",
 	"connection.disconnectedBody":
 		"The terminal can continue this conversation now. Its history stays here, read-only. Connect to continue here; your draft is kept.",
-	"connection.elsewhereTitle": "Open in a terminal",
+	"connection.elsewhereTitle": "In use in a terminal",
 	"connection.elsewhereBody":
 		"Another gjc process, usually a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.",
 	"connection.stillElsewhere":
@@ -27,9 +27,9 @@ export const connection = {
 	"connection.showcaseHeading": "Conversation connection · Disconnect, Connect and read-only states",
 	"connection.showcaseNote":
 		"Design example · Fixture states of the composer replacement, header badge, sidebar mark and the Disconnect confirmation. Buttons do nothing here.",
-	"connection.showcaseDisconnected": "Disconnected · composer replaced by Connect",
+	"connection.showcaseDisconnected": "Not connected · composer replaced by Connect",
 	"connection.showcaseConnecting": "Connect pending",
-	"connection.showcaseElsewhere": "Open in a terminal · check again",
+	"connection.showcaseElsewhere": "In use in a terminal · check again",
 	"connection.showcaseChecking": "Check pending",
 	"connection.showcaseBadges": "Header badges",
 	"connection.showcaseRows": "Sidebar rows",

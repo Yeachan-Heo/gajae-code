@@ -1182,10 +1182,10 @@ suite("mounted desktop navigation", () => {
 			await conversationAction(page, "Disconnect from app");
 			await page.waitForSelector(".connection-notice");
 			expect(await page.$(".composer textarea")).toBeNull();
-			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Disconnected from the app");
-			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Disconnected");
+			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Not connected to the app");
+			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Not connected here");
 			expect(await page.$eval('.session-select[aria-current="page"]', node => node.getAttribute("aria-label"))).toBe(
-				"Oldest conversation · Idle · disconnected from the app",
+				"Oldest conversation · Idle · not connected to the app",
 			);
 			// A read-only conversation offers only what works without the app's writer.
 			expect(await page.$eval('button[aria-label="Review changes"]', node => (node as HTMLButtonElement).disabled)).toBe(true);
@@ -1230,8 +1230,8 @@ suite("mounted desktop navigation", () => {
 				window.navigationFixture.emit({ type: "session", session: { ...session, controlGeneration: null, connection: { state: "elsewhere" } } });
 			});
 			await page.waitForSelector(".connection-notice");
-			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Open in a terminal");
-			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Open in terminal");
+			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("In use in a terminal");
+			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("In use in a terminal");
 			// Still open there: the answer says so instead of looking like nothing happened.
 			await page.evaluate(() => window.navigationFixture.setElsewhere(["old"]));
 			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(button => button.textContent === "Check again")?.click());
