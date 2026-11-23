@@ -244,11 +244,22 @@ a handler waiting for an already-disconnected renderer.
 
 `result.jobObservation` lazily returns a view captured from the factory's actual
 background manager and agent owner, not the transcript session ID or the
-process-global manager. Repeated settled reads return the same view. A read during
-temporary maintenance retires the cached view without permanently revoking the
-unchanged owner; read the getter again after maintenance to obtain a fresh view
-only after the captured generation, session manager, session ID and control scope
-are revalidated. An ownership mismatch observed during maintenance remains
+process-global manager. Repeated settled reads return the same view. While MCP
+control admission is held (`session.isMcpControlActive`; for example an MCP
+suspend, resume or reconnect through `withMcpControlAdmission`), reads keep
+returning the same readable view, and its mutations (monitor and task cancel,
+pause, resume, cron deletion, failure acknowledgement) refuse with
+`session_transitioning` until admission ends; monitor cancel, cron deletion and
+failure acknowledgement still report their usual target errors first. An internal
+MCP control that commits a new generation (a conventional `/mcp` connect,
+disconnect or reconnect, or an exact-config suspend, resume or reconnect) runs no
+transition cleanup: the view is retired at the first getter read after that
+commit, which returns a fresh view, and a handle kept from before the commit is
+not disposed until then. A read during any other temporary maintenance, such as
+compaction, retires the cached view without permanently revoking the unchanged
+owner; read the getter again after maintenance to obtain a fresh view only after
+the captured generation, session manager, session ID and control scope are
+revalidated. An ownership mismatch observed during maintenance remains
 invalid even if the old values are later restored; only a committed generation
 advance can authorize a new binding. Retired handles remain disposed and must not
 be reused. It is

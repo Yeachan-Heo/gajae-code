@@ -147,7 +147,7 @@ function expectCode(action: () => unknown, code: JobObservationError["code"]): v
 	expect(action).toThrow(expect.objectContaining({ name: "JobObservationError", code }));
 }
 
-async function createCron(ownerId = OWNER): Promise<{ id: string; createdAt: number }> {
+async function createCron(ownerId = OWNER, value = managers[0]!): Promise<{ id: string; createdAt: number }> {
 	const session = {
 		cwd: process.cwd(),
 		hasUI: false,
@@ -164,7 +164,7 @@ async function createCron(ownerId = OWNER): Promise<{ id: string; createdAt: num
 	});
 	const id = result.details!.id!;
 	// Query through the same public facade a client uses, not the schedule store.
-	const observation = observe(managers[0]!, ownerId);
+	const observation = observe(value, ownerId);
 	return observation.getSnapshot().crons.find(cron => cron.id === id)!;
 }
 
@@ -708,7 +708,7 @@ describe("owner-scoped SDK job observation", () => {
 	});
 
 	for (const initialView of [false, true]) {
-		test(`real factory maintenance observation recovers after a transition read ${initialView ? "with a retained view" : "before initial admission"}`, async () => {
+		test(`real factory MCP admission preserves observation identity ${initialView ? "with a retained view" : "before initial admission"}`, async () => {
 			const fixture = await observationFactory();
 			const { result, ownerId } = fixture;
 			const { session } = result;
@@ -722,10 +722,52 @@ describe("owner-scoped SDK job observation", () => {
 				const capturedManager = AsyncJobManager.forEndpoint(sessionId)!;
 				const scope = capturedManager.getSubagentControlScope();
 				const target = monitor(capturedManager, ownerId);
+				capturedManager.appendOutput(target.id, "retained monitor output");
+				const cron = await createCron(ownerId, capturedManager);
 				taskRecord(capturedManager, "maintenance-owned", ownerId);
 				taskRecord(capturedManager, "maintenance-foreign", "foreign-owner");
+				const pausing = runningTask(capturedManager, "maintenance-pause", ownerId);
+				let pauses = 0;
+				capturedManager.registerLiveHandle("maintenance-pause", {
+					requestPause: () => {
+						pauses++;
+						pausing.gate.resolve({ kind: "paused" });
+					},
+					injectMessage: async () => {},
+				});
+				taskRecord(capturedManager, "maintenance-resume", ownerId);
+				const resumedGate = Promise.withResolvers<SubagentRunOutcome>();
+				let resumes = 0;
+				capturedManager.registerResumeDescriptor({ subagentId: "maintenance-resume", ownerId, data: {} }, id => {
+					resumes++;
+					return capturedManager.register(
+						"task",
+						id,
+						({ signal }) => {
+							signal.addEventListener(
+								"abort",
+								() => resumedGate.resolve({ kind: "completed", text: "aborted" }),
+								{ once: true },
+							);
+							return resumedGate.promise;
+						},
+						{ ownerId },
+					);
+				});
+				const failedId = capturedManager.register(
+					"bash",
+					"maintenance failure",
+					async () => {
+						throw new Error("retained failure evidence");
+					},
+					{ ownerId, metadata: { monitor: true } },
+				);
+				await capturedManager.getJob(failedId)!.promise;
+				await capturedManager.drainDeliveries({ timeoutMs: 1_000 });
 				const predecessor = initialView ? result.jobObservation! : undefined;
 				const oldTask = predecessor && taskTarget(predecessor, "maintenance-owned");
+				let changes = 0;
+				let unsubscribe = predecessor?.onChange(() => changes++);
 				maintenance = session.withMcpControlAdmission(generation, async () => {
 					entered.resolve();
 					await release.promise;
@@ -733,18 +775,51 @@ describe("owner-scoped SDK job observation", () => {
 				await entered.promise;
 				expect(session.sessionLifecycle.transitioning).toBe(true);
 				expect(session.sessionLifecycle.generation).toBe(generation);
-				expect(result.jobObservation).toBe(predecessor);
-				if (predecessor && oldTask) {
-					expectCode(() => predecessor.getSnapshot(), "disposed");
-					expectCode(() => predecessor.cancelMonitor(target), "disposed");
-					for (const action of ["cancelTask", "pauseTask", "resumeTask"] as const) {
-						expectCode(() => predecessor[action](oldTask), "disposed");
-					}
-				}
+				const during = result.jobObservation;
+				expect(during).toBeDefined();
+				if (!during) throw new Error("MCP admission must retain its observation owner");
+				if (predecessor) expect(during).toBe(predecessor);
+				unsubscribe ??= during.onChange(() => changes++);
+				const before = during.getSnapshot();
+				expect(before.tasks.map(task => task.id)).toEqual([
+					"maintenance-owned",
+					"maintenance-pause",
+					"maintenance-resume",
+				]);
+				expect(during.getMonitorOutput(target)).toBe("retained monitor output");
+				expect(during.getRunningNonMonitorCount()).toBe(1);
+				expect(before.failedUnacknowledged).toBe(true);
+				const cancelTarget = taskTarget(during, "maintenance-owned");
+				const pauseTarget = taskTarget(during, "maintenance-pause");
+				const resumeTarget = taskTarget(during, "maintenance-resume");
+				const mutations = [
+					() => during.cancelMonitor(target),
+					() => during.deleteCron(cron),
+					() => during.cancelTask(cancelTarget),
+					() => during.pauseTask(pauseTarget),
+					() => during.resumeTask(resumeTarget, "resume input"),
+					() => during.acknowledgeFailures(before.failureRevision),
+					() => during.acknowledgeFailures(),
+				];
+				for (const mutate of mutations) expectCode(mutate, "session_transitioning");
+				expect(during.getSnapshot()).toEqual(before);
+				expect(capturedManager.getJob(target.id)?.abortController.signal.aborted).toBe(false);
+				expect(pausing.job.abortController.signal.aborted).toBe(false);
+				expect(pauses).toBe(0);
+				expect(resumes).toBe(0);
+				const previousChanges = changes;
+				taskRecord(capturedManager, "maintenance-foreign", "foreign-owner");
+				await Bun.sleep(0);
+				expect(changes).toBeGreaterThan(previousChanges);
+				await expect(
+					session.withMcpControlAdmission(generation, async () => {
+						throw new Error("Overlapping MCP mutation must not enter");
+					}),
+				).rejects.toMatchObject({ code: "busy" });
 				expect(capturedManager.getJob(target.id)?.status).toBe("running");
 				expect(capturedManager.getSubagentRecord("maintenance-owned")?.status).toBe("paused");
 				await session.notifySessionIdentityChanged();
-				expect(result.jobObservation).toBe(predecessor);
+				expect(result.jobObservation).toBe(during);
 				release.resolve();
 				await maintenance;
 				expect(session.sessionLifecycle.transitioning).toBe(false);
@@ -755,16 +830,29 @@ describe("owner-scoped SDK job observation", () => {
 				const settled = result.jobObservation;
 				expect(settled).toBeDefined();
 				if (!settled) throw new Error("Expected settled same-owner observation");
-				expect(settled).not.toBe(predecessor);
+				expect(settled).toBe(during);
 				expect(result.jobObservation).toBe(settled);
-				expect(settled.getSnapshot().tasks.map(task => task.id)).toEqual(["maintenance-owned"]);
 				expect(settled.cancelMonitor(target)).toBe(true);
-				expect(settled.cancelTask(taskTarget(settled, "maintenance-owned"))).toBe(true);
+				expect(settled.deleteCron(cron)).toBe(true);
+				expect(settled.cancelTask(cancelTarget)).toBe(true);
+				expect(settled.pauseTask(pauseTarget)).toEqual({ status: "running" });
+				await pausing.job.promise;
+				expect(pauses).toBe(1);
+				expect(pausing.record.status).toBe("paused");
+				const resumed = settled.resumeTask(resumeTarget, "resume input");
+				expect(resumed).toMatchObject({ status: "running", queued: false });
+				expect(resumes).toBe(1);
+				resumedGate.resolve({ kind: "completed", text: "resumed successfully" });
+				await capturedManager.getJob(resumed.jobId!)!.promise;
+				settled.acknowledgeFailures(settled.getSnapshot().failureRevision);
+				expect(settled.getSnapshot().failedUnacknowledged).toBe(false);
+				expect(settled.getSnapshot().crons).toEqual([]);
+				unsubscribe();
 				if (predecessor && oldTask) {
-					expectCode(() => predecessor.cancelTask(oldTask), "disposed");
+					expect(predecessor.getSnapshot().tasks[0]?.status).toBe("cancelled");
 					predecessor.dispose();
 					expect(result.jobObservation).toBe(settled);
-					expect(settled.getSnapshot().tasks[0]?.status).toBe("cancelled");
+					expectCode(() => predecessor.cancelTask(oldTask), "disposed");
 				}
 				await session.dispose();
 				expect(result.jobObservation).toBe(settled);
@@ -776,6 +864,85 @@ describe("owner-scoped SDK job observation", () => {
 			}
 		});
 	}
+
+	for (const readDuringTransition of [true, false]) {
+		test(`real factory non-MCP transition keeps pre-existing view semantics ${readDuringTransition ? "after a getter read" : "for a retained handle"}`, async () => {
+			const fixture = await observationFactory();
+			const { result, ownerId } = fixture;
+			const { session } = result;
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			// Hold manual compaction open at its first await, inside the transition lease.
+			const abort = spyOn(session, "abort").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			let compaction: Promise<unknown> | undefined;
+			try {
+				const generation = session.sessionLifecycle.generation;
+				const capturedManager = AsyncJobManager.forEndpoint(session.sessionId)!;
+				const target = monitor(capturedManager, ownerId);
+				taskRecord(capturedManager, "compaction-owned", ownerId);
+				const predecessor = result.jobObservation!;
+				const oldTask = taskTarget(predecessor, "compaction-owned");
+				compaction = session.compact().catch(() => undefined);
+				await entered.promise;
+				expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: true });
+				if (readDuringTransition) {
+					expect(result.jobObservation).toBe(predecessor);
+					expectCode(() => predecessor.getSnapshot(), "disposed");
+					expectCode(() => predecessor.cancelMonitor(target), "disposed");
+					expectCode(() => predecessor.cancelTask(oldTask), "disposed");
+					expect(capturedManager.getJob(target.id)?.status).toBe("running");
+				} else {
+					// The mutation fence is MCP-only: an unread retained handle acts as before.
+					expect(predecessor.getSnapshot().tasks.map(task => task.id)).toEqual(["compaction-owned"]);
+					expect(predecessor.cancelMonitor(target)).toBe(true);
+				}
+				expect(capturedManager.getSubagentRecord("compaction-owned")?.status).toBe("paused");
+				release.resolve();
+				await compaction;
+				expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: false });
+				const settled = result.jobObservation;
+				expect(settled).toBeDefined();
+				if (!settled) throw new Error("Expected settled same-owner observation");
+				if (readDuringTransition) {
+					expect(settled).not.toBe(predecessor);
+					expect(settled.cancelMonitor(target)).toBe(true);
+				} else {
+					expect(settled).toBe(predecessor);
+				}
+				expect(settled.cancelTask(taskTarget(settled, "compaction-owned"))).toBe(true);
+			} finally {
+				release.resolve();
+				await compaction;
+				abort.mockRestore();
+				await fixture.dispose();
+			}
+		});
+	}
+
+	test("real factory view mutations behave as before when no transition or identity change is in progress", async () => {
+		const fixture = await observationFactory();
+		const { result, ownerId } = fixture;
+		try {
+			const capturedManager = AsyncJobManager.forEndpoint(result.session.sessionId)!;
+			const view = result.jobObservation!;
+			const target = monitor(capturedManager, ownerId);
+			const cron = await createCron(ownerId, capturedManager);
+			taskRecord(capturedManager, "steady-owned", ownerId);
+			expect(view.cancelMonitor(target)).toBe(true);
+			expectCode(() => view.cancelMonitor(target), "already_terminal");
+			expect(view.deleteCron(cron)).toBe(true);
+			expectCode(() => view.deleteCron(cron), "not_found");
+			expect(view.cancelTask(taskTarget(view, "steady-owned"))).toBe(true);
+			view.acknowledgeFailures();
+			expect(result.jobObservation).toBe(view);
+			expect(view.getSnapshot().crons).toEqual([]);
+		} finally {
+			await fixture.dispose();
+		}
+	});
 
 	for (const disposeDuringTransition of [false, true]) {
 		test(`real factory maintenance observation never recreates a host-disposed view ${disposeDuringTransition ? "during transition" : "before transition"}`, async () => {
