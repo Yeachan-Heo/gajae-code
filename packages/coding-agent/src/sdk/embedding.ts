@@ -24,7 +24,7 @@ import {
 } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { type BrokerDiscovery, readBrokerDiscovery } from "./broker/discovery";
-import { processIncarnation } from "./broker/process-incarnation";
+import { observeProcess } from "./broker/process-incarnation";
 import { SessionIndex, sessionIndexPresent, sessionIndexStartupLockOptions } from "./broker/session-index";
 import { SdkClient } from "./client/client";
 import { type SessionLifecycleClient, SessionLifecycleService } from "./lifecycle/service";
@@ -738,39 +738,56 @@ async function runningBrokerClient(
 
 /**
  * With no broker running, the session index still holds every CLI run's registration, but nothing
- * keeps its liveness current. Read the session's latest registration (under the index lock, within
- * the caller's deadline) and probe that exact process: it is live only while the same process
- * (pid and OS start incarnation) runs. A registration without an incarnation, from an older build,
- * cannot be told apart from a reused pid, so it decides nothing.
+ * keeps its liveness current. Read the session's latest registration from the index and observe
+ * that exact process the way the broker does (`observeProcess`, by pid and recorded start
+ * incarnation, `processIncarnation ?? hostIncarnation`): `alive` is live, `exited` is none, and
+ * `uncertain` (no incarnation recorded, or a process the probe cannot inspect) decides nothing. A
+ * row the broker itself would not act on, terminal-uncertain or ambiguous, decides nothing either.
+ * Reading takes the machine-global index lock within the caller's deadline; see
+ * `findEmbeddedLiveOwner` for what that does on disk.
  */
 async function indexedLiveOwner(
 	agentDir: string,
 	sessionId: string,
 	remaining: () => number,
 ): Promise<EmbeddedLiveOwner> {
+	const undecided = { kind: "unknown", reason: "broker_absent" } as const;
 	// No index: nothing has registered here. Opening one would create it, so a reader does not.
 	if (!(await sessionIndexPresent(agentDir))) return { kind: "none" };
 	const index = await new SessionIndex(agentDir).open(
 		sessionIndexStartupLockOptions(performance.now() + remaining(), AbortSignal.timeout(remaining())),
 	);
 	const row = index.listSessions(new Map(), new Set([sessionId])).sessions.find(item => item.sessionId === sessionId);
-	if (!row || row.terminal || row.terminalUncertain) return { kind: "none" };
-	if (!row.processIncarnation) return { kind: "unknown", reason: "broker_absent" };
-	return processIncarnation(row.pid) === row.processIncarnation ? { kind: "live" } : { kind: "none" };
+	if (!row) return { kind: "none" };
+	if (row.terminalUncertain || row.ambiguous) return undecided;
+	if (row.terminal) return { kind: "none" };
+	switch (observeProcess(row.pid, row.processIncarnation ?? row.hostIncarnation)) {
+		case "alive":
+			return { kind: "live" };
+		case "exited":
+			return { kind: "none" };
+		default:
+			return undecided;
+	}
 }
 
 /**
  * Ask the running SDK broker whether a live process holds `sessionId` open: any CLI run with a
  * durable transcript (it registers in the session index at startup, whatever its mode or SDK
  * hosting) or an owner the broker started. An embedding's own session, with SDK hosting off, is
- * never reported. Read-only and bounded: it never starts, restarts or recovers a broker, makes one
- * exact `session.list` lookup with a single connection and no reconnects, and answers `unknown`
- * instead of waiting past `timeoutMs`, which covers reading the discovery file too (only its
- * synchronous process-incarnation probe cannot be cut short). With no broker running, it reads the
- * session's latest registration from the session index (under the index lock, within the same
- * deadline; it creates no index where there is none) and probes that exact process by pid and
- * start incarnation, which covers a terminal started with `GJC_SDK_DISABLE=1` or one whose broker
- * could not start.
+ * never reported. Bounded: it never starts, restarts or recovers a broker, makes one exact
+ * `session.list` lookup with a single connection and no reconnects, and answers `unknown` instead
+ * of waiting past `timeoutMs`, which covers reading the discovery file too (only its synchronous
+ * process-incarnation probe cannot be cut short). With a broker running it only reads.
+ *
+ * With no broker running, it reads the session's latest registration from the session index and
+ * observes that exact process the way the broker does, which covers a terminal started with
+ * `GJC_SDK_DISABLE=1` or one whose broker could not start. That is not a pure read: where an
+ * index exists it takes the machine-global index lock (within the same deadline), may create the
+ * index folder and set its permissions, replays the whole index, may append to or rotate the
+ * index's rejection audit file, and may create the agent directory's machine identity file. On a
+ * large index this costs about 100 to 250 ms. Where no index exists it answers `none` and writes
+ * nothing. A replay that outlives `timeoutMs` keeps the lock until it finishes.
  * Advisory only: a process that opens the transcript after the answer is not seen.
  * `client` replaces the agent directory's broker connection (tests, custom transports).
  */

@@ -476,12 +476,19 @@ a running broker reports each of them as live while its process is. An embedding
 (created with SDK hosting off, as `createEmbeddedAgentSession` callers do) registers nothing and
 is never reported. The helper never starts, restarts or recovers a broker. With no broker
 running, nothing keeps the index's liveness current, so it reads the session's latest
-registration from the index itself (under the index lock, within the same deadline; with no
-index on disk it answers `none` and creates none) and probes that exact process by pid and OS
-start incarnation: `live` while the same process runs, `none` once it has exited or was never
-registered. A registration that recorded no incarnation (an older gjc) cannot be told apart from
-a reused pid and yields `broker_absent`, as does an index that cannot be read. A broker that
-fails or does not answer within `timeoutMs` (default 1 s) yields `broker_unavailable`. The bound covers the whole lookup, reading the discovery file included;
+registration from the index itself and observes that exact process the way the broker does, by
+pid and the start incarnation the registration recorded (`processIncarnation`, or for an
+SDK-hosting terminal `hostIncarnation`): `live` while that process runs, `none` once it has
+exited (or its pid now belongs to another process) or when the session was never registered.
+`broker_absent` means the index could not decide: the process cannot be inspected (another
+user's, say), no incarnation was recorded, the row is one the broker itself would not act on
+(terminal-uncertain or ambiguous), or the index could not be read. This fallback is not a pure
+read: where an index exists it takes the machine-global index lock within the same deadline, may
+create the index folder and set its permissions, replays the whole index, may append to or
+rotate the index's rejection audit file and may create the agent directory's machine identity
+file; on a large index it costs about 100 to 250 ms, and a replay that outlives the deadline keeps
+the lock until it finishes. With no index on disk it answers `none` and writes nothing. A broker
+that fails or does not answer within `timeoutMs` (default 1 s) yields `broker_unavailable`. The bound covers the whole lookup, reading the discovery file included;
 only the synchronous check that the broker's process is still the one that wrote that file
 cannot be cut short, so on a slow system the answer can come that much later. The answer is advisory: a process that opens the transcript after the
 check, or a process that registered nothing (an ACP session, an older gjc), is not seen, so keep relying on the store's

@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { $ } from "bun";
 import { registerDirectSession } from "../src/main";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
+import { resolveSessionLocator, SessionIndex } from "../src/sdk/broker/session-index";
 import { closeEmbeddedIdleOwner, createEmbeddedAgentSession, findEmbeddedLiveOwner } from "../src/sdk/embedding";
 import { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 import type { SessionLifecycleClient } from "../src/sdk/lifecycle/service";
@@ -313,11 +315,50 @@ test("a real broker closes the idle owner it started, and nobody holds the trans
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "none" });
 }, 120_000);
 
-test("with no broker, a registration whose process is gone is none, and one with no recorded incarnation decides nothing", async () => {
+/** Registers `sessionId` in the index the way an SDK-hosting terminal does: an endpoint generation and only `hostIncarnation`. */
+async function registerHosted(dir: string, cwd: string, sessionId: string, pid: number, hostIncarnation?: string) {
+	const index = await new SessionIndex(dir).open();
+	await index.append({
+		type: "host_registered",
+		sessionId,
+		locator: await resolveSessionLocator(cwd, dir),
+		endpointGeneration: 1,
+		pid,
+		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
+	});
+}
+
+test("with no broker, an SDK-hosting terminal's registration is observed like the broker does", async () => {
+	const { dir, cwd } = await brokerWorkspace();
+	const ask = (sessionId: string) => findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 5_000 });
+	const ownIncarnation = processIncarnation(process.pid);
+	if (!ownIncarnation) throw new Error("This platform reports no process incarnation");
+	// Live: the registered process (this one) runs, with the incarnation it recorded.
+	const live = (await sharedTranscript(cwd, dir)).getSessionId();
+	await registerHosted(dir, cwd, live, process.pid, ownIncarnation);
+	expect(await ask(live)).toEqual({ kind: "live" });
+	// Exited: the registered process has finished.
+	const child = Bun.spawn(["true"]);
+	await child.exited;
+	const exited = (await sharedTranscript(cwd, dir)).getSessionId();
+	await registerHosted(dir, cwd, exited, child.pid, "darwin:1:1");
+	expect(await ask(exited)).toEqual({ kind: "none" });
+	// Pid reused: a process runs under that pid, but not the one that registered.
+	const reused = (await sharedTranscript(cwd, dir)).getSessionId();
+	await registerHosted(dir, cwd, reused, process.pid, "a-process-that-has-exited");
+	expect(await ask(reused)).toEqual({ kind: "none" });
+	// A running process this one cannot inspect (pid 1 belongs to the system) decides nothing.
+	const uninspectable = (await sharedTranscript(cwd, dir)).getSessionId();
+	await registerHosted(dir, cwd, uninspectable, 1, "system-process");
+	expect(await ask(uninspectable)).toEqual({ kind: "unknown", reason: "broker_absent" });
+	// A session never registered is none, and nothing started a broker.
+	expect(await ask("1b0f8a52-6a8f-4a59-9d1c-1f3c2d4e5f60")).toEqual({ kind: "none" });
+	expect(await Bun.file(path.join(dir, "sdk", "broker.json")).exists()).toBe(false);
+}, 60_000);
+
+test("with no broker, a direct registration whose process is gone is none", async () => {
 	const { dir, cwd } = await brokerWorkspace();
 	const gone = await sharedTranscript(cwd, dir);
-	// The recorded start incarnation is not this process's: the process that registered has exited
-	// and its pid was reused.
 	await registerDirectSession(gone, dir, undefined, {
 		registerPostmortem: () => () => {},
 		processIncarnation: () => "a-process-that-has-exited",
@@ -325,22 +366,4 @@ test("with no broker, a registration whose process is gone is none, and one with
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId: gone.getSessionId(), timeoutMs: 5_000 })).toEqual({
 		kind: "none",
 	});
-	const legacy = await sharedTranscript(cwd, dir);
-	await registerDirectSession(legacy, dir, undefined, {
-		registerPostmortem: () => () => {},
-		processIncarnation: () => undefined,
-	});
-	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId: legacy.getSessionId(), timeoutMs: 5_000 })).toEqual({
-		kind: "unknown",
-		reason: "broker_absent",
-	});
-	// A session never registered is none.
-	expect(
-		await findEmbeddedLiveOwner({
-			agentDir: dir,
-			sessionId: "1b0f8a52-6a8f-4a59-9d1c-1f3c2d4e5f60",
-			timeoutMs: 5_000,
-		}),
-	).toEqual({ kind: "none" });
-	expect(await Bun.file(path.join(dir, "sdk", "broker.json")).exists()).toBe(false);
 }, 60_000);

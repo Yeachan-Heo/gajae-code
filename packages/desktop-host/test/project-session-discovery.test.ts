@@ -1032,26 +1032,27 @@ test.skipIf(process.platform !== "darwin")(
 test("with no broker running, the session index tells whether a terminal still has a conversation open", async () => {
 	const h = await fixture({ broker: false });
 	const held = await h.persist("Open in a terminal with SDK hosting off", h.projectDir, true);
-	const legacy = await h.persist("Registered by an older terminal", h.projectDir, true);
+	const unsure = await h.persist("Held by a process the app cannot inspect", h.projectDir, true);
 	const free = await h.persist("Nobody has this one");
 	await h.call("project.open", { path: h.projectDir });
 	// A terminal registers its session in the index at startup, whatever its SDK hosting; this test's
-	// own process stands in for it. The second registered before incarnations were recorded.
+	// own process stands in for it. The second is held by a process the index cannot decide on (another
+	// user's terminal, say); the SDK tests cover how the index decides, so the answer is given here.
 	await registerDirectSession(held.manager, h.agentDir, undefined, { registerPostmortem: () => () => {} });
-	await registerDirectSession(legacy.manager, h.agentDir, undefined, {
-		registerPostmortem: () => () => {},
-		processIncarnation: () => undefined,
-	});
+	const lookup = sdk.findEmbeddedLiveOwner;
+	vi.spyOn(sdk, "findEmbeddedLiveOwner").mockImplementation(input =>
+		input.sessionId === unsure.id ? Promise.resolve({ kind: "unknown", reason: "broker_absent" }) : lookup(input),
+	);
 	// Held: read-only, and not deleted.
 	const selected = await h.call<DesktopSession>("session.select", { sessionId: held.id });
 	expect(selected.connection).toEqual({ state: "elsewhere" });
 	await expect(h.call("session.delete", { sessionId: held.id })).rejects.toThrow("has this conversation open");
 	// Undecidable: it opens (the store's compare-and-append stays the backstop for writes), but a
 	// delete needs proof, so it is refused with a way out.
-	await expect(h.call("session.delete", { sessionId: legacy.id })).rejects.toThrow(
+	await expect(h.call("session.delete", { sessionId: unsure.id })).rejects.toThrow(
 		"Delete it from the terminal, or close any terminal using it and try again.",
 	);
-	expect(await Bun.file(legacy.file).exists()).toBe(true);
+	expect(await Bun.file(unsure.file).exists()).toBe(true);
 	// Proven free: deleted.
 	await h.call("session.delete", { sessionId: free.id });
 	expect(await Bun.file(free.file).exists()).toBe(false);
