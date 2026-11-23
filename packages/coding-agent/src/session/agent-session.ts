@@ -7296,6 +7296,14 @@ export class AgentSession {
 			},
 		});
 
+		// Restore goal mode state from the saved session branch during initialization.
+		// Schedule it to run after construction so we can call onThreadResumed.
+		queueMicrotask(() => {
+			if (!this.#isDisposed) {
+				void this.#restoreGoalModeStateFromBranch();
+			}
+		});
+
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
 		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
@@ -20950,6 +20958,57 @@ export class AgentSession {
 			phase.tasks = phase.tasks.filter(t => t.status !== "completed" && t.status !== "abandoned");
 		}
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
+	}
+
+	/**
+	 * Restore goal mode state from the saved session branch during initialization.
+	 * When a session is resumed from a saved state, the goal mode information is
+	 * stored in the branch's mode_change entries, but it is not automatically
+	 * applied to the agent session. This function restores it.
+	 *
+	 * Mirrors the interactive goal-mode-controller: calls onThreadResumed() to set
+	 * up the accounting baseline, and respects explicit empty tool selection.
+	 */
+	async #restoreGoalModeStateFromBranch(): Promise<void> {
+		const sessionContext = this.buildDisplaySessionContext();
+		const mode = sessionContext.mode;
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		if (!savedGoal) return;
+
+		// When an SDK session explicitly requests zero tools (--no-tools), the goal
+		// tool is excluded to honor that contract. In this case, do not enable the goal
+		// to avoid automatic continuation with no way to interact with it.
+		const goalToolAvailable = this.getActiveToolNames().includes("goal");
+		const isExplicitEmpty = this.isExplicitEmptyToolSelection();
+		if (!goalToolAvailable && isExplicitEmpty) {
+			return;
+		}
+
+		// Set the initial goal state, preserving terminal states for completed/dropped goals
+		if (savedGoal.status === "complete") {
+			// A completed goal must be disabled and in exiting mode
+			this.setGoalModeState({ enabled: false, mode: "exiting", reason: "completed", goal: savedGoal });
+		} else if (savedGoal.status === "dropped") {
+			// A dropped goal should not be restored as active
+			return;
+		} else if (savedGoal.status === "paused") {
+			// A paused goal is disabled but remains in active mode
+			this.setGoalModeState({ enabled: false, mode: "active", goal: savedGoal });
+		} else {
+			// An active goal is enabled in active mode (or mode_change persisted it as "goal")
+			this.setGoalModeState({ enabled: true, mode: "active", goal: savedGoal });
+		}
+
+		// Call onThreadResumed to set up the accounting baseline, just like the
+		// interactive goal-mode-controller does (see goal-mode-controller.ts:298).
+		// This ensures token accounting is properly initialized for active goals.
+		// For terminal goals (complete/dropped), this call is benign and maintains consistency.
+		// onThreadResumed already commits the state; do not reapply a stale paused
+		// state if the goal was resumed via operateGoal() while this restore was pending.
+		await this.#goalRuntime.onThreadResumed();
 	}
 
 	async #compactionStateSnapshot(
