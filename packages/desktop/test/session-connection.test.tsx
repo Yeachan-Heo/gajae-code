@@ -101,6 +101,22 @@ suite("Session connection", () => {
 				await page.mouse.down();
 				await check(theme, "pressed");
 				await page.mouse.up();
+				// Beyond hue, which sits near the accent in some palettes, a danger button carries an edge
+				// of its own (plain buttons have none) at 3:1 or better against the dialog.
+				await page.mouse.move(1, 1);
+				const edge = await page.$eval(danger, node => {
+					const style = getComputedStyle(node);
+					const probe = document.createElement("span");
+					probe.id = "danger-edge-probe";
+					probe.textContent = "edge";
+					probe.style.color = style.borderTopColor;
+					node.closest(".disconnect-confirmation")!.append(probe);
+					return { width: Number.parseFloat(style.borderTopWidth), style: style.borderTopStyle };
+				});
+				const [edgeSample] = await page.evaluate(measureContrast, ["#danger-edge-probe"]);
+				await page.$eval("#danger-edge-probe", node => node.remove());
+				if (edge.width < 1 || edge.style !== "solid" || edgeSample!.ratio < 3)
+					failures.push(`${theme} · edge: ${edge.width}px ${edge.style} ${edgeSample!.ratio}`);
 			}
 			expect(failures).toEqual([]);
 		} finally {

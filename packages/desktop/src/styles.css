@@ -121,9 +121,11 @@ p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-a
 .button:active:not(:disabled) { background: var(--surface); }
 .button.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 600; box-shadow: var(--shadow-rest); }
 .button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
-/* Danger ink is the theme's error hue mixed 60% toward the body ink, so it clears 4.5:1 on a card or
-   dialog, a hovered button and a pressed one in every bundled palette. */
-.button.danger { color: color-mix(in srgb, var(--error) 60%, var(--text)); }
+/* Danger ink is the fixed status red (not the theme's error hue, which sits near the accent in some
+   palettes) mixed 72% toward the body ink: 4.5:1 or better on a card or dialog, hovered and pressed, in
+   every bundled palette. Hue alone cannot part it from a red-orange accent, so a danger button also
+   carries a status-red edge, which plain and primary buttons never have. */
+.button.danger { color: color-mix(in srgb, var(--status-error) 72%, var(--text)); border-color: var(--status-error); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .app-shell { display: flex; height: 100dvh; overflow: hidden; }
 .sidebar {
