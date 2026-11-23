@@ -18684,9 +18684,16 @@ export class SessionManager {
 	 * been established yet and once the manager has released its artifact
 	 * authority while closing — released authority stays observable as absence
 	 * (matching `isArtifactManagerAuthorized`), while artifact *operations* are
-	 * fenced by `#assertArtifactOpen()` and keep throwing.
+	 * fenced by `#assertArtifactOpen()` and keep throwing. Always null on a read-only
+	 * snapshot, whose artifact directory belongs to the source session.
 	 */
 	getArtifactManager(): ArtifactManager | null {
+		// The manager can write and delete in the source artifact directory.
+		if (this.#readOnlySnapshot) return null;
+		return this.#currentArtifactManager();
+	}
+
+	#currentArtifactManager(): ArtifactManager | null {
 		if (this.#artifactClosing || this.#strictClosePending) return null;
 		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
 	}
@@ -18694,6 +18701,8 @@ export class SessionManager {
 	/** Linearizably establish this session's persistent or ephemeral artifact manager. */
 	async ensureArtifactManager(): Promise<ArtifactManager | null> {
 		this.#assertArtifactOpen();
+		// Callers already treat null as "artifact persistence unavailable".
+		if (this.#readOnlySnapshot) return null;
 		const token = this.#syncArtifactLifecycle();
 		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;
@@ -18909,7 +18918,8 @@ export class SessionManager {
 	 */
 	async getArtifactPath(id: string): Promise<string | null> {
 		this.#assertArtifactOpen();
-		const manager = this.getArtifactManager();
+		// Path resolution only reads, so snapshots keep it.
+		const manager = this.#currentArtifactManager();
 		if (!manager) return null;
 		return manager.getPath(id);
 	}
@@ -25418,11 +25428,18 @@ export class SessionManager {
 	 * `allocateArtifactPath`, `copyArtifactsForFork`, `adoptArtifactManager`,
 	 * `stageAdoptedArtifactManagerForTransition`, `putBlob`,
 	 * `stageDefaultModelSelection`, `moveTo`, `discardUncommittedSession`,
-	 * `deleteSessionVerified`, `restoreState`, and `restoreRollbackState`.
-	 * `appendMessageDurably` returns a failure outcome instead of throwing, and writes
-	 * nothing. Reads, `flush`, `close`, and `createMemoryGuardCheckpoint` (which writes
-	 * only under the caller's checkpoint root) still work. Callers only read from it
-	 * and then `close()` it.
+	 * `deleteSessionVerified`, `restoreState`, and `restoreRollbackState`; and, for
+	 * this session only, `dropSession` and `setSessionStarredForPicker`.
+	 * `getArtifactManager` and `ensureArtifactManager` return null, so no caller gets
+	 * a manager that can write the source artifact directory; `getArtifactPath` still
+	 * resolves artifact paths. Shared-session appends (`*SharingSession`) are rejected
+	 * because a snapshot is never a managed destination.
+	 *
+	 * Not refused, by design: `dropSession` and `setSessionStarredForPicker` on a
+	 * different session path still act, as a session picker needs;
+	 * `appendMessageDurably` returns a failure outcome without writing; reads, `flush`,
+	 * `close`, and `createMemoryGuardCheckpoint` (which writes only under the caller's
+	 * checkpoint root) still work. Callers only read from it and then `close()` it.
 	 */
 	static async openReadOnlySnapshot(
 		filePath: string,

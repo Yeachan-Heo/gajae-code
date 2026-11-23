@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
+import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { RESUME_TRANSCRIPT_MAX_BYTES, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { VerifiedSessionDeleteTarget } from "@gajae-code/coding-agent/session/session-storage";
 import { getSessionsDir, getTerminalSessionsDir } from "@gajae-code/utils";
@@ -367,6 +368,9 @@ describe("read-only session snapshot", () => {
 		const siblingFile = path.join(sourceDir, "sibling.jsonl");
 		fs.writeFileSync(siblingFile, jsonl([header("readonly-sibling")]), { mode: 0o600 });
 		const moveTarget = makeTempDir("move-target");
+		const adoptDir = makeTempDir("adopt");
+		const savedArtifact = path.join(sessionFile.slice(0, -".jsonl".length), "7.bash.log");
+		fs.writeFileSync(savedArtifact, "saved artifact", { mode: 0o600 });
 		const forkTarget = path.join(makeTempDir("fork-target"), "fork.jsonl");
 		const stat = fs.statSync(sessionFile, { bigint: true });
 		const deleteTarget: VerifiedSessionDeleteTarget = {
@@ -413,12 +417,19 @@ describe("read-only session snapshot", () => {
 			discardUncommittedSession: snapshot => snapshot.discardUncommittedSession(siblingFile),
 			restoreState: snapshot => snapshot.restoreState(snapshot.captureState()),
 			restoreRollbackState: async snapshot => snapshot.restoreRollbackState(await snapshot.captureRollbackState()),
-			adoptArtifactManager: async snapshot => {
-				const manager = await snapshot.ensureArtifactManager();
-				if (!manager) throw new Error("artifact manager unavailable");
-				snapshot.adoptArtifactManager(manager);
-			},
+			adoptArtifactManager: snapshot => snapshot.adoptArtifactManager(new ArtifactManager(adoptDir)),
 			stageAdoptedArtifactManagerForTransition: snapshot => snapshot.stageAdoptedArtifactManagerForTransition(),
+			// For the two artifact getters, a null manager is the refusal.
+			getArtifactManager: async snapshot => {
+				const manager = snapshot.getArtifactManager();
+				if (manager) await manager.removeNamedBestEffort("draft.txt");
+				else throw new Error("read_only_snapshot");
+			},
+			ensureArtifactManager: async snapshot => {
+				const manager = await snapshot.ensureArtifactManager();
+				if (manager) await manager.removeNamedBestEffort("draft.txt");
+				else throw new Error("read_only_snapshot");
+			},
 			// Last: without the guard it moves the source transcript away.
 			moveTo: snapshot => snapshot.moveTo(moveTarget),
 		};
@@ -445,6 +456,14 @@ describe("read-only session snapshot", () => {
 			),
 		);
 		expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
+		expect(snapshotTree(sourceDir)).toEqual(before);
+		// Artifact path resolution is a read and still works on a snapshot.
+		const reader = await SessionManager.openReadOnlySnapshot(sessionFile);
+		try {
+			expect(await reader.getArtifactPath("7")).toBe(savedArtifact);
+		} finally {
+			await reader.close();
+		}
 		expect(snapshotTree(sourceDir)).toEqual(before);
 	});
 
