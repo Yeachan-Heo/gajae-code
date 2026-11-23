@@ -21,7 +21,7 @@ export {
 	type SideConversationOperation,
 } from "./protocol/client-control-contracts";
 
-import { collectSdkStoredSecrets } from "./credential-secrets";
+import { collectSdkStoredSecrets, maskStoredSecrets } from "./credential-secrets";
 import type { SideConversationOperation } from "./protocol/client-control-contracts";
 export const SIDE_CONVERSATION_MAX_DELTA_CHUNKS = 256;
 export const SIDE_CONVERSATION_MAX_DELTA_CHARS = 32 * 1024;
@@ -106,50 +106,8 @@ const SENSITIVE_PATH_PART =
 	/^(?:\.env(?:\..*)?|\.envrc|\.git|\.gjc|\.pi|\.ssh|\.aws|\.azure|\.gnupg|\.docker|\.netrc|_netrc|\.npmrc|\.pypirc|\.git-credentials|auth\.(?:db|json)(?:[-.].*)?|credentials(?:\..*)?|application_default_credentials\.json|.*\.(?:pem|key|p12|pfx|kdbx|db|sqlite|sqlite3)(?:[-.].*)?)$/i;
 
 function redactSideOutput(text: string, secrets: readonly string[], maskPartial = false): string {
-	// Mask the union: replacing one literal first could hide an overlapping match.
-	const masks = new Uint8Array(text.length);
-	for (const secret of secrets) {
-		for (let start = text.indexOf(secret); start !== -1; start = text.indexOf(secret, start + 1))
-			masks.fill(1, start, start + secret.length);
-		if (!maskPartial) continue;
-		// Native replies are already bounded. Match a possibly cut-off suffix in
-		// linear time, even for long credentials with repetitive prefixes.
-		const prefixes = new Uint32Array(secret.length);
-		for (let index = 1, matched = 0; index < secret.length; index++) {
-			while (matched && secret[index] !== secret[matched]) matched = prefixes[matched - 1]!;
-			if (secret[index] === secret[matched]) matched++;
-			prefixes[index] = matched;
-		}
-		let matched = 0;
-		for (let index = Math.max(0, text.length - secret.length + 1); index < text.length; index++) {
-			while (matched && text[index] !== secret[matched]) matched = prefixes[matched - 1]!;
-			if (text[index] === secret[matched]) matched++;
-		}
-		if (matched) masks.fill(1, text.length - matched);
-	}
-	// A mask must not leave the other half of a UTF-16 pair publicly visible.
-	for (let index = 0; index + 1 < text.length; index++) {
-		const first = text.charCodeAt(index);
-		const second = text.charCodeAt(index + 1);
-		if (
-			first >= 0xd800 &&
-			first <= 0xdbff &&
-			second >= 0xdc00 &&
-			second <= 0xdfff &&
-			(masks[index] || masks[index + 1])
-		) {
-			masks[index] = 1;
-			masks[index + 1] = 1;
-		}
-	}
-	const parts: string[] = [];
-	for (let index = 0; index < text.length; ) {
-		const start = index;
-		const masked = masks[index];
-		while (index < text.length && masks[index] === masked) index++;
-		parts.push(masked ? REDACTED : text.slice(start, index));
-	}
-	return redactCrashSecrets(parts.join(""))
+	// `maskPartial` also masks a credential cut off at the end of bounded native output.
+	return redactCrashSecrets(maskStoredSecrets(text, secrets, REDACTED, maskPartial))
 		.replace(/[^\s"'`<>]+/g, token =>
 			token.split(/[\\/]/).some(part => SENSITIVE_PATH_PART.test(part.replace(/^[([{]+|[)\]},;:.]+$/g, "")))
 				? REDACTED
