@@ -1,6 +1,6 @@
 import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
 import { Check, ChevronRight, CircleAlert, TriangleAlert } from "lucide-react";
-import { useId, useState } from "react";
+import { type RefObject, useId, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
 
@@ -27,6 +27,28 @@ export interface RecoveryConversationProps {
 	onOpen: () => void;
 }
 
+/**
+ * A Tab stop (0) only while the element actually scrolls, so the keyboard can scroll it (WebKit
+ * gives a scroller no stop of its own) without adding a stop to a box that fits. Re-measured when
+ * the box or its children resize, which covers a disclosure opening and a text-size change.
+ */
+function useScrollableTabIndex<T extends HTMLElement>(): [RefObject<T | null>, 0 | undefined] {
+	const ref = useRef<T>(null);
+	const [scrolls, setScrolls] = useState(false);
+	useLayoutEffect(() => {
+		const node = ref.current;
+		if (!node) return;
+		const measure = () =>
+			setScrolls(node.scrollHeight > node.clientHeight + 1 || node.scrollWidth > node.clientWidth + 1);
+		measure();
+		const observer = new ResizeObserver(measure);
+		observer.observe(node);
+		for (const child of node.children) observer.observe(child);
+		return () => observer.disconnect();
+	});
+	return [ref, scrolls ? 0 : undefined];
+}
+
 /** Past this length or line count the orphan's text starts collapsed behind a disclosure. */
 const LONG_TEXT_CHARACTERS = 280;
 const LONG_TEXT_LINES = 4;
@@ -36,9 +58,9 @@ const LONG_TEXT_LINES = 4;
  * must survive a clipboard that refuses the write. Long text starts collapsed.
  */
 function RecoveryText({ text, open, onToggle }: { text: string; open: boolean; onToggle(open: boolean): void }) {
+	const [ref, tabIndex] = useScrollableTabIndex<HTMLPreElement>();
 	const body = (
-		// Focusable so the keyboard can scroll a long text in WebKit too.
-		<pre className="recovery-text" tabIndex={0} aria-label={t("recovery.textLabel")}>
+		<pre ref={ref} className="recovery-text" tabIndex={tabIndex} aria-label={t("recovery.textLabel")}>
 			{text}
 		</pre>
 	);
@@ -229,11 +251,17 @@ export function DeleteRecoveryWarning({ texts, writer }: { texts: readonly strin
 		? (texts[0] ?? "")
 		: texts.map((text, index) => `${t("recovery.copyBoundary", { index: index + 1, count })}\n${text}`).join("\n\n");
 	const [copy, copyText] = useCopyText(copied, () => {}, writer);
+	const [listRef, listTabIndex] = useScrollableTabIndex<HTMLOListElement>();
 	if (count === 0) return null;
 	return (
 		<div className="delete-recoveries">
 			<p>{one ? t("recovery.deleteDiscardsOne") : t("recovery.deleteDiscards", { count })}</p>
-			<ol className="delete-recovery-texts" aria-label={t("recovery.textsLabel")}>
+			<ol
+				ref={listRef}
+				className="delete-recovery-texts"
+				tabIndex={listTabIndex}
+				aria-label={t("recovery.textsLabel")}
+			>
 				{texts.map((text, index) => (
 					// Texts have no identity of their own; their order is fixed while the dialog is open.
 					<li key={index}>

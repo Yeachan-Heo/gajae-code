@@ -144,6 +144,23 @@ suite("Recovery card", () => {
 		}
 	}, 30000);
 
+	test("a text block takes a Tab stop only while it actually scrolls", async () => {
+		const { context, page } = await fixture("accept");
+		try {
+			const tabIndex = (card: number) =>
+				page.$eval(`.recovery-card:nth-child(${card}) .recovery-text`, node => node.getAttribute("tabindex"));
+			// The short text fits: no Tab stop. The long one, once opened, scrolls: one Tab stop.
+			expect(await tabIndex(1)).toBeNull();
+			await page.click(".recovery-text-disclosure > summary");
+			await page.waitForFunction(
+				() => document.querySelector(".recovery-card:nth-child(2) .recovery-text")?.getAttribute("tabindex") === "0",
+			);
+			expect(await tabIndex(2)).toBe("0");
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("a successful copy says so visibly", async () => {
 		const { context, page } = await fixture("accept");
 		try {
@@ -273,6 +290,31 @@ suite("Delete conversation dialog", () => {
 			]);
 		} finally {
 			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("the message list takes a Tab stop only while it scrolls", async () => {
+		const many = Array.from({ length: 6 }, (_, index) => `Message body ${index}\n`.repeat(8));
+		for (const [texts, stop] of [
+			[["A short message"], null],
+			[many, "0"],
+		] as const) {
+			const { context, page } = await deleteDialog([...texts]);
+			try {
+				await page.waitForFunction(
+					expected =>
+						document.querySelector("dialog[open] .delete-recovery-texts")?.getAttribute("tabindex") === expected,
+					{},
+					stop,
+				);
+				expect(
+					await page.$$eval("dialog[open] .delete-recovery-texts .recovery-text", nodes =>
+						nodes.filter(node => node.hasAttribute("tabindex")).length,
+					),
+				).toBe(0);
+			} finally {
+				await closeComponentFixture(context, page);
+			}
 		}
 	}, 30000);
 
