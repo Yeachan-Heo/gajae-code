@@ -587,11 +587,11 @@ not settle earlier effects.
   history is a single unkeyed, unmarked `accepted` row with no session target
   and no quarantined or corruption-uncertain history; other entries, and the
   whole file when it is malformed or cannot be read (for example a directory or
-  a file without read permission), are ignored and stay fenced. The broker reads
-  the file without following a final-component symlink and without blocking:
-  a symlink, FIFO, device or other non-regular file counts as unreadable, and a
-  file larger than the lifecycle ledger byte bound (64 MiB by default) is
-  ignored as oversized. An unreadable or oversized
+  a file without read permission), are ignored and stay fenced. On POSIX the
+  broker opens the file without blocking and without following a final-component
+  symlink: a symlink, FIFO, device or other non-regular file counts as
+  unreadable (on Windows a symlink is followed). A file larger than the
+  lifecycle ledger byte bound (64 MiB by default) is ignored as oversized. An unreadable or oversized
   file is logged as a broker warning and never stops the broker from starting. A still-fenced
   identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
   restores its fence at the next broker start.

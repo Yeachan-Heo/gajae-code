@@ -1066,9 +1066,10 @@ export class LifecycleLedger {
 	 * The file is optional and only ever lifts fences, so failing to read it leaves
 	 * the attested set empty instead of failing the ledger open.
 	 *
-	 * The read goes through one no-follow, nonblocking descriptor that must be a
-	 * regular file, and stops at the ledger byte bound: a symlink, FIFO, device or
-	 * oversized file is ignored instead of stalling or exhausting broker startup.
+	 * The read goes through one descriptor that must be a regular file within the
+	 * ledger byte bound, opened nonblocking and no-follow on POSIX: a FIFO, device,
+	 * symlink or oversized file is ignored instead of stalling or exhausting broker
+	 * startup. Windows has neither flag; a symlink there is followed.
 	 */
 	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
 		let text: string;
@@ -1135,7 +1136,8 @@ export class LifecycleLedger {
 	/**
 	 * Returns the attestation text, `undefined` when the file is absent, or
 	 * `"oversized"` past the ledger byte bound. Throws for anything that is not a
-	 * regular file reached without following a final-component symlink.
+	 * regular file (on POSIX, also a final-component symlink) and for a file that
+	 * grows while it is read.
 	 */
 	async #readSpawnAnchorAttestation(): Promise<string | "oversized" | undefined> {
 		const flags =
@@ -1151,22 +1153,23 @@ export class LifecycleLedger {
 		try {
 			const stat = await handle.stat();
 			if (!stat.isFile())
-				throw Object.assign(new Error("spawn-anchor attestation is not a regular file"), { code: "EINVAL" });
-			const maxBytes = this.#limits.maxBytes;
-			if (stat.size > maxBytes) return "oversized";
-			// The size is re-checked while reading, so a file that grows after fstat
-			// still stops one byte past the bound.
-			const chunks: Buffer[] = [];
+				throw Object.assign(new Error("spawn-anchor attestation is not a regular file"), {
+					code: "not_regular_file",
+				});
+			if (stat.size > this.#limits.maxBytes) return "oversized";
+			// One spare byte detects a file that grew after fstat; reading stops there.
+			const bytes = Buffer.allocUnsafe(stat.size + 1);
 			let length = 0;
-			while (length <= maxBytes) {
-				const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - length));
-				const { bytesRead } = await handle.read(chunk, 0, chunk.length, length);
+			while (length < bytes.length) {
+				const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
 				if (bytesRead === 0) break;
-				chunks.push(chunk.subarray(0, bytesRead));
 				length += bytesRead;
 			}
-			if (length > maxBytes) return "oversized";
-			return Buffer.concat(chunks, length).toString("utf8");
+			if (length > stat.size)
+				throw Object.assign(new Error("spawn-anchor attestation changed while it was read"), {
+					code: "changed_during_read",
+				});
+			return bytes.toString("utf8", 0, length);
 		} finally {
 			await handle.close().catch(() => undefined);
 		}

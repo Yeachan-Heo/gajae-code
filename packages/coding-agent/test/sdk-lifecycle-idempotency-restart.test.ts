@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { ModelProfileRegistryError, UnknownModelProfileError } from "../src/config/model-profile-contract";
@@ -237,10 +238,16 @@ describe("SDK lifecycle ledger", () => {
 		const limits = { maxBytes: 4096 };
 		const openWithin = async (label: string): Promise<LifecycleLedger> => {
 			const opened = new LifecycleLedger(dir, limits).open();
-			const timedOut = Bun.sleep(5_000).then(() => {
-				throw new Error(`ledger open stalled on a ${label} attestation`);
-			});
-			return Promise.race([opened, timedOut]);
+			const timedOut = Promise.withResolvers<never>();
+			const timer = setTimeout(
+				() => timedOut.reject(new Error(`ledger open stalled on a ${label} attestation`)),
+				5_000,
+			);
+			try {
+				return await Promise.race([opened, timedOut.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
 		};
 		try {
 			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
@@ -284,8 +291,26 @@ describe("SDK lifecycle ledger", () => {
 			expect(large.hasLegacyIdentity(fenced)).toBe(true);
 			expect(large.warnings).toContain("Oversized spawn-anchor attestation ignored");
 			expect(await fs.readFile(attestation, "utf8")).toBe(oversized);
-			// The same attestation inside the bound is honored.
+			// A file that grows past its fstat size while it is read is not trusted.
 			await fs.writeFile(attestation, valid);
+			const open = fs.open;
+			const growing = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+				const handle = await open(file, flags, mode);
+				if (file !== attestation) return handle;
+				const stat = handle.stat.bind(handle);
+				const shrunk = async (): Promise<Stats> => Object.assign(await stat(), { size: valid.length - 8 });
+				handle.stat = shrunk as typeof handle.stat;
+				return handle;
+			});
+			try {
+				const grown = await openWithin("growing");
+				expect(growing.mock.calls.some(([file]) => file === attestation)).toBe(true);
+				expect(grown.hasLegacyIdentity(fenced)).toBe(true);
+				expect(grown.warnings).toContain("Unreadable spawn-anchor attestation ignored");
+			} finally {
+				growing.mockRestore();
+			}
+			// The same attestation inside the bound is honored.
 			const bounded = await openWithin("regular");
 			expect(bounded.hasLegacyIdentity(fenced)).toBe(false);
 			expect(bounded.warnings).toEqual([]);
