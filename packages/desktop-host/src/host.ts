@@ -35,6 +35,7 @@ import {
 	type InputEventResult,
 	isEmbeddedAncestor,
 	isEmbeddedAppendRefused,
+	isEmbeddedSameDirectory,
 	type JobObservationSnapshot,
 	type lifecycle,
 	listEmbeddedProjectSessions,
@@ -693,6 +694,14 @@ export class DesktopHost {
 	 * left uncataloged (a branch fork's ancestor, retained cleanup, a failed removal). In-run only.
 	 */
 	#heldTranscripts = new Set<string>();
+	/**
+	 * Directory spellings sessions record as their project directory, by the workspace path they
+	 * resolve to. A transcript the terminal wrote through a symlink (macOS `/var` for `/private/var`,
+	 * a linked project folder) records that spelling, not the workspace's real path. Resolved once,
+	 * when a session opens, so the synchronous fences below compare the same directory, not the
+	 * same string (`#inProject`). In-run only.
+	 */
+	#directories = new Map<string, string>();
 	/** Catalog rows whose turn ended while this Host ran. Loading or opening a row never adds it. */
 	#endedTurns = new Set<string>();
 	/** History of conversations the app does not write, by catalog id; filled when they are shown. */
@@ -1469,6 +1478,15 @@ export class DesktopHost {
 			throw error;
 		}
 	}
+	/** Records the workspace a session's recorded directory resolves to, when that is this project. */
+	async #noteDirectory(cwd: string, project: DesktopProject): Promise<void> {
+		if (cwd === project.path || this.#directories.has(cwd)) return;
+		if (await isEmbeddedSameDirectory(cwd, project.path)) this.#directories.set(cwd, project.path);
+	}
+	/** Whether a session's recorded directory is this workspace's directory, whatever its spelling. */
+	#inProject(project: DesktopProject, cwd: string): boolean {
+		return cwd === project.path || this.#directories.get(cwd) === project.path;
+	}
 	/** Remove the transcript this host created for a conversation that never published. */
 	async #discardUnpublishedTranscript(metadata: SavedSession): Promise<void> {
 		const file = metadata.file;
@@ -1514,9 +1532,10 @@ export class DesktopHost {
 				directory: path.join(this.dataDir, "sessions", project.id),
 			});
 			const listed = managed.find(session => session.id === metadata.id);
-			// As in discovery: the header must name this exact workspace directory.
-			const cwd = listed?.cwd ? await fs.realpath(listed.cwd).catch(() => undefined) : undefined;
-			file = listed && cwd === project.path ? await this.#sharedStorePath(listed.path) : undefined;
+			// As in discovery: the header must name this exact workspace directory, by the same test
+			// the SDK applies when it opens the transcript.
+			const inProject = !!listed?.cwd && (await isEmbeddedSameDirectory(listed.cwd, project.path));
+			file = listed && inProject ? await this.#sharedStorePath(listed.path) : undefined;
 		} catch {
 			return "unavailable";
 		}
@@ -1593,6 +1612,7 @@ export class DesktopHost {
 			sdkHostModeSupported: false,
 		});
 		this.#holdTranscript(result.session.sessionManager);
+		await this.#noteDirectory(result.session.sessionManager.getCwd(), project);
 		const candidate: SessionCandidate = {
 			sdk: result.session,
 			factory: result,
@@ -2505,7 +2525,7 @@ export class DesktopHost {
 				!this.#catalog.projects.includes(project) ||
 				project.closed ||
 				project.id !== metadata.projectId ||
-				project.path !== cwd ||
+				!this.#inProject(project, cwd) ||
 				lifecycle.disposed ||
 				lifecycle.transitioning ||
 				lifecycle.generation !== generation ||
@@ -4360,7 +4380,7 @@ export class DesktopHost {
 				!live.gateMutation &&
 				!!project &&
 				!project.closed &&
-				project.path === cwd &&
+				this.#inProject(project, cwd) &&
 				!lifecycle.disposed &&
 				!lifecycle.transitioning &&
 				lifecycle.generation === generation &&
@@ -4415,7 +4435,8 @@ export class DesktopHost {
 			sdk.sessionManager === manager &&
 			manager.getSessionId() === managerId &&
 			manager.getSessionIdentityGeneration() === identityGeneration &&
-			manager.getCwd() === cwd &&
+			!!project &&
+			this.#inProject(project, manager.getCwd()) &&
 			manager.getSessionFile() === file &&
 			sdk.sessionFile === file;
 		if (!current()) throw new Error("Session changed. Select the conversation again.");
@@ -4569,9 +4590,9 @@ export class DesktopHost {
 			const createdAt = session.created.getTime();
 			if (!ID.test(session.id) || !session.cwd || !Number.isFinite(createdAt) || createdAt < 0) continue;
 			// Managed inventories can include legacy and project-local candidates. Header
-			// scope must still name this exact directory, never a parent or sibling project.
-			const cwd = await fs.realpath(session.cwd).catch(() => undefined);
-			if (cwd !== project.path) continue;
+			// scope must still name this exact directory, never a parent or sibling project, by the
+			// same test the SDK applies when it opens the transcript.
+			if (!(await isEmbeddedSameDirectory(session.cwd, project.path))) continue;
 			const existing = catalogRow(session);
 			if (existing?.projectId === project.id) creationTimes.set(existing.id, createdAt);
 			if (existing?.managed && existing.projectId === project.id && existing.id === session.id) {

@@ -801,3 +801,73 @@ test("a conversation in the store's older per-project directory opens in the app
 	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
 });
+
+test("a conversation the terminal recorded under a symlinked spelling of the workspace opens and works in the app", async () => {
+	const h = await fixture();
+	// The terminal was started from a symlink to the workspace (as macOS `/var` is to `/private/var`),
+	// so its transcript records that spelling; the app's workspace is the real path.
+	const linked = path.join(path.dirname(h.projectDir), "linked-project");
+	await fs.symlink(h.projectDir, linked);
+	const terminal = await h.persist("Started through a symlink", linked);
+	const header = JSON.parse((await Bun.file(terminal.file).text()).split("\n")[0]!) as { cwd: string };
+	expect(header.cwd).toBe(linked);
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	expect(project.path).toBe(h.projectDir);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+	expect(selected.connection).toEqual({ state: "connected" });
+	expect(h.created).toHaveLength(1);
+	expect(h.created[0]?.session.sessionManager.getCwd()).toBe(linked);
+	// Every fence that asks whether the session still belongs to this workspace accepts it.
+	const copy = selected.messages[0]?.copy;
+	if (!copy) throw new Error("The terminal's message offers no copy");
+	expect(await h.call<{ text: string }>("message.copyText", { sessionId: terminal.id, ...copy })).toEqual({
+		text: "Message for Started through a symlink",
+	});
+	const completions = await h.call<{ items: unknown[] }>("composer.complete", {
+		sessionId: terminal.id,
+		sessionGeneration: copy.sessionGeneration,
+		text: "/",
+		cursor: 1,
+	});
+	expect(completions.items.length).toBeGreaterThan(0);
+	await h.call("session.rename", { sessionId: terminal.id, title: "Renamed through the real path" });
+	const fork = await h.call<{ session: DesktopSession }>("session.fork", { sessionId: terminal.id });
+	expect(fork.session.messages.map(message => message.text)).toEqual(["Message for Started through a symlink"]);
+	expect(await h.call("session.disconnect", { sessionId: terminal.id })).toMatchObject({ disconnected: true });
+	expect((await h.call<DesktopSession>("session.connect", { sessionId: terminal.id })).connection).toEqual({
+		state: "connected",
+	});
+	await h.call("session.delete", { sessionId: terminal.id });
+	expect(await Bun.file(terminal.file).exists()).toBe(false);
+	expect(h.snapshot().sessions.map(session => session.id)).toEqual([fork.session.id]);
+});
+
+test.skipIf(process.platform !== "darwin")(
+	"a conversation the terminal recorded as /var/... opens, copies and deletes in the /private/... workspace",
+	async () => {
+		const h = await fixture();
+		expect(h.projectDir.startsWith("/private/")).toBe(true);
+		// The terminal strips `/private` from its project directory on macOS; the app keeps the real path.
+		const terminalSpelling = h.projectDir.slice("/private".length);
+		const terminal = await h.persist("Recorded without /private", terminalSpelling);
+		const header = JSON.parse((await Bun.file(terminal.file).text()).split("\n")[0]!) as { cwd: string };
+		expect(header.cwd).toBe(terminalSpelling);
+		await h.call("project.open", { path: h.projectDir });
+		const selected = await h.call<DesktopSession>("session.select", { sessionId: terminal.id });
+		expect(selected.connection).toEqual({ state: "connected" });
+		expect(selected.messages.map(message => message.text)).toEqual(["Message for Recorded without /private"]);
+		const history = await h.call<{ messages: DesktopSession["messages"] }>("history.get", {
+			sessionId: terminal.id,
+		});
+		expect(history.messages.map(message => message.text)).toEqual(["Message for Recorded without /private"]);
+		const copy = selected.messages[0]?.copy;
+		if (!copy) throw new Error("The terminal's message offers no copy");
+		expect(await h.call<{ text: string }>("message.copyText", { sessionId: terminal.id, ...copy })).toEqual({
+			text: "Message for Recorded without /private",
+		});
+		await h.call("session.delete", { sessionId: terminal.id });
+		expect(await Bun.file(terminal.file).exists()).toBe(false);
+		expect(h.snapshot().sessions).toEqual([]);
+	},
+);

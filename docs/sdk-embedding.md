@@ -457,6 +457,14 @@ Without `whenTail`, the saved entry is shown unless it is a strict ancestor of t
 the same rule as above. It returns `undefined` for an absent, oversized or
 unreadable file. The result is display data only; reopen the transcript to continue it.
 
+`createEmbeddedAgentSession` refuses a transcript whose recorded directory is not the `cwd` it
+is given ("Session project does not match catalog"). It compares directories, not spellings:
+a terminal on macOS records `/var/...` or `/tmp/...` for a project under `/private`, and a
+terminal started from a symlinked folder records that folder, and both open for the real path.
+An embedding that lists transcripts for a project (`listEmbeddedProjectSessions`) should admit
+exactly those `await isEmbeddedSameDirectory(recordedCwd, projectPath)` accepts, the same test
+the factory applies, so a listed transcript always opens.
+
 Before opening a writer for a transcript another surface may hold, an embedding can call
 `await findEmbeddedLiveOwner({ agentDir, sessionId })`. It asks the agent directory's running
 SDK broker, with one exact `session.list` lookup over a single connection, whether a live

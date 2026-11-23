@@ -6,3 +6,4 @@
 ### Fixed
 - Opening a terminal-started conversation no longer starts a background SDK broker and a session process that kept running after the app closed. A process an earlier build left behind is closed the next time its conversation is checked, only while it is idle, and a terminal is never closed.
 - Conversations an earlier build listed from the terminal keep loading. One whose transcript no longer exists says so in plain words and can be removed.
+- A terminal conversation in a workspace under `/tmp` or `/var/folders` on macOS, or one started from a symlinked folder, now opens, copies and deletes in the app instead of failing with "Session project does not match catalog".
