@@ -320,7 +320,10 @@ continuations, completion delivery, `/btw`, and IRC/background side turns
 cannot start after that fence. A busy host returns `busy` without closing or
 signalling it and remains usable. Retry the
 same key after it becomes idle: `busy` retains the request binding but is not a
-terminal ledger result. The default derived key includes the idle-only mode so
+terminal ledger result. The error's recovery step says the same (inspect, wait,
+rerun the same close) for `gjc sdk session close` and for
+`gjc sdk session raw global --op session.close`; it never recommends steering.
+The default derived key includes the idle-only mode so
 it cannot collide with an ordinary forced close. An unsupported or unreachable
 runtime refuses idle-fenced close rather than falling back to process signals.
 Once close is accepted, runtime teardown proceeds even if the close response is

@@ -2442,10 +2442,15 @@ async function runRawGlobal(
 			throw failure;
 		}
 	} catch (error) {
-		throw normalizeSessionFailure(error, {
+		const failure = normalizeSessionFailure(error, {
 			...args,
 			sessionId: typeof input.sessionId === "string" ? input.sessionId : args.sessionId,
 		});
+		// The raw global command path does not name the operation; carry it so a busy or stale
+		// close gets close guidance (wait and retry the same key) instead of steering advice.
+		throw operation === "session.close"
+			? new PublicCommandFailure({ ...failure.input, sessionClose: true })
+			: failure;
 	}
 	return response;
 }

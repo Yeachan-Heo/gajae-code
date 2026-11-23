@@ -54,7 +54,12 @@ async function run(args: Record<string, unknown>): Promise<{ outputs: unknown[];
 	} catch (error) {
 		expect(error).toBeInstanceOf(PublicCommandFailure);
 		expect(outputs).toEqual([]);
-		const command = args.action === "close" ? ["sdk", "session", "close"] : ["sdk", "session"];
+		const command =
+			args.action === "close"
+				? ["sdk", "session", "close"]
+				: args.action === "raw"
+					? ["sdk", "session", "raw", String(args.rawAction)]
+					: ["sdk", "session"];
 		const rendered = await renderPublicCommandFailure(error, { command, json: true });
 		expect(rendered.stderr).toBe("");
 		const envelope = JSON.parse(rendered.stdout);
@@ -236,6 +241,39 @@ test("a busy close recommends inspect, wait and same-key retry; a stale close re
 	expect(staleStep.argv).toEqual(["sdk", "session", "inspect", "sess-1"]);
 	expect(staleStep.description).toContain("terminal for its idempotency key");
 	expect(staleStep.description).not.toContain("rerun the same close command");
+});
+
+test("a busy raw global session.close gets the same wait-and-retry guidance, not steering advice", async () => {
+	executeResult = {
+		ok: false,
+		operation: "session.close",
+		certainty: "retryable",
+		error: { code: "busy", message: "Session is not idle." },
+	};
+	const rawClose = async (operation: string) =>
+		(
+			await run({
+				action: "raw",
+				rawAction: "global",
+				operation,
+				idempotencyKey: "raw-close-key",
+				jsonInput: '{"sessionId":"sess-1","ifIdle":true}',
+			})
+		).outputs[0] as {
+			error: { code: string; retryability: string; nextSteps: { description: string; argv?: string[] }[] };
+		};
+	const busy = await rawClose("session.close");
+	expect(busy.error).toMatchObject({ code: "busy", retryability: "yes" });
+	expect(busy.error.nextSteps).toHaveLength(1);
+	expect(busy.error.nextSteps[0]!.argv).toEqual(["sdk", "session", "inspect", "sess-1"]);
+	expect(busy.error.nextSteps[0]!.description).toContain("rerun the same close command");
+	expect(busy.error.nextSteps[0]!.description).not.toContain("turn.steer");
+
+	// Another busy raw lifecycle operation keeps the generic busy advice.
+	executeResult = { ...(executeResult as object), operation: "session.delete" };
+	const other = await rawClose("session.delete");
+	expect(other.error.code).toBe("busy");
+	expect(other.error.nextSteps[0]!.description).toContain("turn.steer");
 });
 
 test("a row without endpoint authority refuses before any close is sent and omits the terminal-key step", async () => {
