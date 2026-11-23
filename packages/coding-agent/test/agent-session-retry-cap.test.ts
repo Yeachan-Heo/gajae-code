@@ -7,6 +7,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
@@ -407,6 +408,17 @@ describe("AgentSession retry admission: repetition guard", () => {
 		const last = lastAssistant(session!);
 		expect(last.stopReason).toBe("error");
 		expect(last.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+	});
+
+	// Finding 2: Gemini header runaway should be classified as terminal
+	it("does not retry a turn the Gemini header runaway detector stopped", async () => {
+		const runawayMessage = `Gemini reasoning-summary header runaway detected at 64 consecutive headers. Interrupted to prevent budget exhaustion.`;
+		const retryStartEvents = await runTurn(GEMINI_HEADER_RUNAWAY_ERROR_CODE, runawayMessage);
+
+		expect(retryStartEvents).toEqual([]);
+		const last = lastAssistant(session!);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorCode).toBe(GEMINI_HEADER_RUNAWAY_ERROR_CODE);
 	});
 
 	// Pins the delta rather than just the new branch: the identical message
