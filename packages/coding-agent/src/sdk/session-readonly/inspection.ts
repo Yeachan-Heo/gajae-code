@@ -3,6 +3,48 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { NativeOwnerOnlySecurityResult } from "@gajae-code/natives";
 
+/** LRU cache for file digest memos. Key: colon-separated (dev, ino, size, mtimeNs, ctimeNs) + path. */
+class DigestMemoCache {
+	readonly maxEntries = 4096;
+	readonly entries = new Map<string, { hash: string; lastUsed: number }>();
+	private counter = 0;
+
+	get(pathname: string, dev: bigint, ino: bigint, size: number, mtimeNs: bigint, ctimeNs: bigint): string | undefined {
+		const key = `${pathname}:${dev}:${ino}:${size}:${mtimeNs}:${ctimeNs}`;
+		const entry = this.entries.get(key);
+		if (entry) {
+			entry.lastUsed = this.counter++;
+			return entry.hash;
+		}
+		return undefined;
+	}
+
+	set(pathname: string, dev: bigint, ino: bigint, size: number, mtimeNs: bigint, ctimeNs: bigint, hash: string): void {
+		const key = `${pathname}:${dev}:${ino}:${size}:${mtimeNs}:${ctimeNs}`;
+		this.entries.set(key, { hash, lastUsed: this.counter++ });
+
+		// LRU eviction: remove oldest entry if cache is full
+		if (this.entries.size > this.maxEntries) {
+			let oldest: { key: string; lastUsed: number } | undefined;
+			for (const [k, v] of this.entries) {
+				if (!oldest || v.lastUsed < oldest.lastUsed) {
+					oldest = { key: k, lastUsed: v.lastUsed };
+				}
+			}
+			if (oldest) {
+				this.entries.delete(oldest.key);
+			}
+		}
+	}
+}
+
+const digestMemoCache = new DigestMemoCache();
+
+/** Test-only hook to clear the digest memo cache. */
+export function __testClearDigestMemoCache(): void {
+	digestMemoCache.entries.clear();
+}
+
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 128 * 1024 * 1024;
@@ -204,7 +246,17 @@ export function captureManagedFileNoFollowLimit(
 		const named = fs.lstatSync(pathname, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
 			throw new Error("source_changed");
-		snapshot = { bytes, identity: identity(before, createHash("sha256").update(bytes).digest("hex")) };
+
+		// Try to get the hash from the memo cache
+		let sha256 = digestMemoCache.get(pathname, before.dev, before.ino, fileSize, before.mtimeNs, before.ctimeNs);
+
+		if (!sha256) {
+			// Hash not in cache; compute it
+			sha256 = createHash("sha256").update(bytes).digest("hex");
+			digestMemoCache.set(pathname, before.dev, before.ino, fileSize, before.mtimeNs, before.ctimeNs, sha256);
+		}
+
+		snapshot = { bytes, identity: identity(before, sha256) };
 	} catch (error) {
 		failed = true;
 		failure = error;
@@ -233,23 +285,60 @@ export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number
 		const hash = createHash("sha256");
 		const chunk = Buffer.alloc(64 * 1024);
 		let offset = 0;
-		for (;;) {
-			const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
-			if (count === 0) break;
-			hash.update(chunk.subarray(0, count));
-			if (offset < prefix.byteLength) {
-				const copied = Math.min(count, prefix.byteLength - offset);
-				chunk.copy(prefix, offset, 0, copied);
+
+		// Try to get the hash from the memo cache
+		const cachedHash = digestMemoCache.get(
+			pathname,
+			before.dev,
+			before.ino,
+			Number(before.size),
+			before.mtimeNs,
+			before.ctimeNs,
+		);
+
+		if (cachedHash) {
+			// Hash is cached, but still need to read the file to fill the prefix
+			for (;;) {
+				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+				if (count === 0) break;
+				if (offset < prefix.byteLength) {
+					const copied = Math.min(count, prefix.byteLength - offset);
+					chunk.copy(prefix, offset, 0, copied);
+				}
+				offset += count;
 			}
-			offset += count;
+			if (offset !== Number(before.size)) throw new Error("source_changed");
+		} else {
+			// Hash not in cache; read file and compute hash
+			for (;;) {
+				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+				if (count === 0) break;
+				hash.update(chunk.subarray(0, count));
+				if (offset < prefix.byteLength) {
+					const copied = Math.min(count, prefix.byteLength - offset);
+					chunk.copy(prefix, offset, 0, copied);
+				}
+				offset += count;
+			}
+			if (offset !== Number(before.size)) throw new Error("source_changed");
+			const sha256 = hash.digest("hex");
+			digestMemoCache.set(
+				pathname,
+				before.dev,
+				before.ino,
+				Number(before.size),
+				before.mtimeNs,
+				before.ctimeNs,
+				sha256,
+			);
 		}
-		if (offset !== Number(before.size)) throw new Error("source_changed");
+
 		const after = fs.fstatSync(fd, { bigint: true });
 		if (!sameIdentity(identity(before), identity(after))) throw new Error("source_changed");
 		const named = fs.lstatSync(pathname, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
 			throw new Error("source_changed");
-		return { bytes: prefix, identity: identity(before, hash.digest("hex")) };
+		return { bytes: prefix, identity: identity(before, cachedHash || hash.digest("hex")) };
 	} finally {
 		fs.closeSync(fd);
 	}

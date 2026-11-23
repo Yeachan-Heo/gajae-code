@@ -8,7 +8,6 @@ import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
-import * as sessionInspection from "../../src/sdk/session-readonly/inspection";
 import {
 	MANAGED_ARTIFACT_MAX_FILES,
 	validateManagedArtifactTree,

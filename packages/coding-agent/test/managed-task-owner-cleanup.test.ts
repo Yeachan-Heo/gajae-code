@@ -59,7 +59,7 @@ interface Fixture {
 
 const roots: string[] = [];
 
-afterEach(() => {
+afterEach(() {
 	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });

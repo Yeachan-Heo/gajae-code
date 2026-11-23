@@ -63,6 +63,7 @@ import type { CreateLifecycleAgentSessionResult } from "../src/sdk/lifecycle-ses
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
+import * as sessionInspection from "../src/sdk/session-readonly/inspection";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 import { type AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
@@ -83,6 +84,7 @@ function expectedDurableRollbackReceipt(endpointGeneration: number | null) {
 }
 
 afterEach(async () => {
+	sessionInspection.__testClearDigestMemoCache();
 	for (const process of spawned.splice(0)) {
 		if (process.exitCode === null) process.kill("SIGTERM");
 		await process.exited;
