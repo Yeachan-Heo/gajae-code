@@ -1555,6 +1555,39 @@ test("a select while the app is stepping aside joins it, and nothing internal re
 	await h.close();
 });
 
+for (const terminal of ["still open", "closed"] as const)
+	test(`Check again while the app is stepping aside answers once it has, with the terminal ${terminal}`, async () => {
+		const h = await controlledFixture();
+		const sessionId = h.session.id;
+		await h.call("prompt", { sessionId, text: "app turn" });
+		const first = h.sdk();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const dispose = first.dispose.bind(first);
+		vi.spyOn(first, "dispose").mockImplementation(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return dispose(...args);
+		});
+		const owner = await transcriptId(h);
+		h.liveOwners.add(owner);
+		const stepping = respond(h, "session.select", { sessionId });
+		await entered.promise;
+		if (terminal === "closed") h.liveOwners.delete(owner);
+		const checking = respond(h, "session.connect", { sessionId });
+		await Bun.sleep(50);
+		release.resolve();
+		const [selected, checked] = await Promise.all([stepping, checking]);
+		const state = terminal === "closed" ? "connected" : "elsewhere";
+		// The select answers as the step-aside did; Check again checks once it is over.
+		expect(selected).toMatchObject({ ok: true });
+		expect(checked).toMatchObject({ ok: true, result: { connection: { state } } });
+		expect(h.snapshot().sessions[0]?.connection).toEqual({ state });
+		expect(JSON.stringify(h.frames)).not.toContain("Cannot construct session");
+		await first.awaitDisposeCompletion();
+		await h.close();
+	});
+
 test("an owner check that answers after its copy was replaced applies to the copy that replaced it", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;

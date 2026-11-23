@@ -433,6 +433,17 @@ const STILL_STOPPING = "The conversation is still stopping. Try Disconnect again
 /** A live process other than the app (usually a terminal) holds the transcript open. */
 const ELSEWHERE =
 	"A terminal (another gjc process) is using this conversation, so the app shows it read-only. Finish there, then check again.";
+/**
+ * The app found another process holding the transcript and showed it read-only instead. The
+ * request is answered as a read-only one even if a later "Check again" has already cleared the
+ * finding by the time it is answered.
+ */
+class SteppedAside extends Error {
+	constructor() {
+		super(ELSEWHERE);
+		this.name = "SteppedAside";
+	}
+}
 /** A terminal has the conversation open, but the app still holds it because its background work runs. */
 const ELSEWHERE_BACKGROUND =
 	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs, so nothing new starts here; Disconnect stops that work and leaves the conversation to the terminal.";
@@ -1358,7 +1369,7 @@ export class DesktopHost {
 		if (!manager && (await this.#ownedElsewhere(metadata))) {
 			await this.#loadReadOnly(metadata);
 			this.#emit({ type: "session", session: this.#dto(metadata) });
-			throw new Error(ELSEWHERE);
+			throw new SteppedAside();
 		}
 		// A conversation this load creates has no catalog transcript yet; if it never
 		// publishes, its transcript must not survive as a conversation the user never got.
@@ -2786,7 +2797,7 @@ export class DesktopHost {
 				if (!this.#closed && this.#catalog.sessions.includes(metadata))
 					this.#emit({ type: "session", session: this.#dto(metadata) });
 			}
-			throw new Error(ELSEWHERE);
+			throw new SteppedAside();
 		})();
 		this.#opening.set(metadata.id, steppingAside);
 		const release = () => {
@@ -2988,6 +2999,9 @@ export class DesktopHost {
 	/** Take the conversation back through the normal open path, which lands on any newer tail. */
 	async #connect(metadata: SavedSession): Promise<DesktopSession> {
 		if (metadata.managed) return this.#dto(metadata);
+		// Check again once the app has finished stepping aside (or opening), if it still is.
+		const pending = this.#opening.get(metadata.id);
+		if (pending) await pending.catch(() => {});
 		// Check again: the process that held it open may have closed.
 		this.#elsewhere.delete(metadata.id);
 		const wasDisconnected = metadata.disconnected === true;
@@ -3679,8 +3693,11 @@ export class DesktopHost {
 						? await this.#current(opened)
 						: opened;
 		} catch (error) {
-			// The owner check found another process holding it: answer as a read-only conversation.
-			if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
+			// The owner check found another process holding it: answer as a read-only conversation. A
+			// delete it refused stays refused, whatever a "Check again" found since.
+			if (error instanceof SteppedAside && method === "session.delete") throw new Error(ELSEWHERE_DELETE);
+			if (error instanceof SteppedAside || !this.#writable(metadata))
+				return this.#dispatchReadOnly(request, metadata);
 			// The open failed again where an earlier reopen left the transcript shown in its place:
 			// keep showing what the file holds now (it is re-read only when the file changed).
 			if (this.#readOnly.has(metadata.id) && !this.#live.has(metadata.id) && !this.#opening.has(metadata.id)) {
