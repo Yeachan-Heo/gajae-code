@@ -547,8 +547,8 @@ export interface SpawnRegistrationRequest {
 	 * Set only for the post-deadline recheck. The host already registered and
 	 * published readiness, so the outcome can be decided before `deadlineAt`: the
 	 * wait ends when a completed read shows the host's recorded row no longer
-	 * matches, or as soon as `decided()` resolves true (a failure receipt, or an
-	 * owner that provably exited), including while waiting for the index lock.
+	 * matches, or as soon as `decided()` resolves true (a readable failure receipt,
+	 * or an owner that provably exited), including while waiting for the index lock.
 	 * Polled every {@link SPAWN_LATE_RECHECK_PROBE_MS}.
 	 */
 	recheck?: { decided: () => Promise<boolean> };
@@ -714,9 +714,10 @@ const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
  * to hold a spawn. 20 s stays well inside the budgets around it: a refused
  * spawn still answers around 28 s after the claim plus release, far below the
  * master CLI's 120 s spawn timeout, and the host applies no cutoff once its
- * startup committed. The recheck ends early on a mismatch row, a failure
- * receipt, or a dead owner, so only a live, ready host behind a held lock
- * waits out the bound.
+ * startup committed. The recheck ends early on a decisive mismatch row, a
+ * readable failure receipt, or an owner that provably exited; an owner whose
+ * incarnation cannot be read, or a row that fails only the read-time liveness
+ * check, keeps it open until it is decided or the bound passes.
  */
 const SPAWN_LATE_REGISTRATION_RECHECK_MS = 20_000;
 /**
@@ -892,8 +893,9 @@ async function readSpawnHostRegistration(
 	if (!rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0))
 		return { kind: "absent" };
 	// Row content is append-only, but `live` is projected at read time from an
-	// OS probe that can fail transiently. A row that fails only on liveness may
-	// match on the next read; any other mismatch (terminal, another pid,
+	// OS probe that can fail transiently, and from cross-root ambiguity that can
+	// resolve when the other root terminates. A row that fails only on `live`
+	// may match on the next read; any other mismatch (terminal, another pid,
 	// incarnation, request or locator) cannot.
 	return {
 		kind: "mismatch",
@@ -3158,14 +3160,17 @@ export class Broker {
 					registration = await this.#spawnPromptLayer.awaitRegistration({
 						...registrationRequest,
 						deadlineAt: Date.now() + SPAWN_LATE_REGISTRATION_RECHECK_MS,
-						// An owner that provably exited or a failure receipt already decides
-						// the refusal; do not hold the spawn (or keep polling a contended
-						// index) for the bound. An unreadable incarnation is uncertain, not
-						// death, and keeps waiting.
+						// An owner that provably exited or a readable failure receipt already
+						// decides the refusal; do not hold the spawn (or keep polling a
+						// contended index) for the bound. An unreadable incarnation is
+						// uncertain, not death, and a receipt still being promoted is not yet
+						// readable (ending on it would misreport the failure as a timeout);
+						// both keep waiting.
 						recheck: {
 							decided: async () =>
 								observeProcess(pid, incarnation, owner => processIncarnationForBroker(this, owner)) ===
-									"exited" || hasSessionLifecycleFailureEvidence(prep.stateRoot, prep.childId, marker),
+									"exited" ||
+								(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) !== undefined,
 						},
 					});
 				}

@@ -1754,10 +1754,12 @@ describe("Broker spawn flow driver", () => {
 				{ ...spawnInput(), cwd: agentDir },
 				"uncertain-owner",
 			);
+			const answeredAt = Date.now();
 			await holder;
 			const claim = await latestClaim(agentDir);
 			expect(unreadableProbes).toBeGreaterThan(0);
-			expect(Date.now()).toBeGreaterThan(deadlineAt + lockHeldPastDeadlineMs);
+			// Admitted by the read after the lock was released, not before.
+			expect(answeredAt).toBeGreaterThanOrEqual(deadlineAt + lockHeldPastDeadlineMs);
 			expect(calls).toBe(2);
 			expect(response).toMatchObject({ ok: true });
 			expect(dispatches).toBe(1);
