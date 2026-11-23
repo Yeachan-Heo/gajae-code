@@ -214,6 +214,13 @@ async function fixture(observeRecoveryNotices = false): Promise<{ context: Brows
 				if (command !== "engine_request" || !args.request) throw new Error(command);
 				const request = args.request;
 				const state = stored(); state.requests.push(request); save(state);
+				// One typed connection refusal for the next request of a method, as the Host answers it.
+				const refusal = JSON.parse(sessionStorage.getItem("refuseNext") || "null") as { method: string; error: string; state: string } | null;
+				if (refusal && refusal.method === request.method) {
+					sessionStorage.removeItem("refuseNext");
+					queueMicrotask(() => emit({ type: "response", id: request.id, ok: false, error: refusal.error, connectionRefusal: refusal.state } as DesktopFrame));
+					return;
+				}
 				if (request.method === "prompt" || request.method === "message.copyText" || heldPreferences.has(request.method)) return;
 				if (request.method === "bootstrap" && sessionStorage.getItem("bufferedReceipts")) {
 					const receipts = JSON.parse(sessionStorage.getItem("bufferedReceipts")!) as DesktopDeliveryReceipt[];
@@ -3112,7 +3119,7 @@ suite("mounted composer delivery recovery", () => {
 
 	test("a Remove dialog closes when its conversation becomes openable, instead of turning into Delete", async () => {
 		const { context, page } = await fixture();
-		const conversation = (connection: object) => ({
+		const conversation = (connection: DesktopSession["connection"]): DesktopSession => ({
 			id: "a",
 			title: "Session A",
 			projectId: "p",
@@ -3135,6 +3142,41 @@ suite("mounted composer delivery recovery", () => {
 			await page.waitForFunction(() => !document.querySelector("dialog[open] .delete-dialog"));
 			const deletes = await page.evaluate(() => window.fixture.requests().filter(request => request.method === "session.delete"));
 			expect(deletes).toEqual([]);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
+	test("a read-only refusal inside a dialog is shown in the dialog, not swallowed", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() => {
+				const row = [...document.querySelectorAll(".desktop-sidebar .session-item")].find(
+					node => node.querySelector(".session-title")?.textContent === "Session B",
+				);
+				row?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 200 }));
+			});
+			await page.waitForSelector('.context-menu [role="menuitem"]');
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>('.context-menu [role="menuitem"]')].at(1)?.click(),
+			);
+			await page.waitForSelector("#session-title");
+			// The conversation was disconnected (in a terminal, say) while the dialog was open.
+			const refusal = "This conversation is not connected to the app, so a terminal can continue it. Connect it to continue here.";
+			await page.evaluate(
+				error => sessionStorage.setItem("refuseNext", JSON.stringify({ method: "session.rename", error, state: "disconnected" })),
+				refusal,
+			);
+			await page.click("#session-title", { count: 3 });
+			await page.type("#session-title", "Renamed B");
+			await page.click('.modal form button[type="submit"]');
+			await page.waitForFunction(
+				text => [...document.querySelectorAll("dialog[open] .error-banner")].some(node => node.textContent?.includes(text)),
+				{},
+				refusal,
+			);
+			expect(await page.$("#session-title")).not.toBeNull();
 		} finally {
 			await closeFixture(context, page);
 		}

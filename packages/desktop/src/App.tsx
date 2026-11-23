@@ -1380,9 +1380,12 @@ export default function App() {
 			await action();
 		} catch (error) {
 			const refusal = error instanceof DesktopRequestError ? error.connectionRefusal : undefined;
-			// The conversation's connection notice already says it is read-only (another process has it,
-			// it is disconnected, or the app cannot open it): a banner repeating that would only go stale.
-			if (refusal === "elsewhere" || refusal === "disconnected" || refusal === "unavailable") return;
+			// In the conversation itself, its connection notice already says it is read-only (another
+			// process has it, it is disconnected, or the app cannot open it): a banner there repeating
+			// that would only go stale. A dialog covers the notice, so its refusal is still shown there.
+			const conversationScope = scope === errorSessionId || scope === `select:${errorSessionId}`;
+			if (conversationScope && (refusal === "elsewhere" || refusal === "disconnected" || refusal === "unavailable"))
+				return;
 			// "Being disconnected" is not a connection state yet; it is shown until the state changes.
 			if (refusal && errorSessionId) connectionRefusals.current.set(scope, errorSessionId);
 			if (error instanceof DesktopRequestError)
