@@ -84,12 +84,13 @@ Abort is not blocked on extension callbacks.
 
 After the 50ms timeout:
 
-1. `#ttsrAbortPending = false`
-2. read `ttsrManager.getSettings().contextMode`
-3. if `contextMode === "discard"`, drop the targeted partial assistant output with `agent.replaceMessages(...slice(0, targetAssistantIndex))`
-4. build injection content from pending rules using `ttsr-interrupt.md` template
-5. append and persist a hidden `custom_message`/runtime custom message with `customType: "ttsr-injection"` and `details.rules`
-6. mark those rule names injected, persist a `ttsr_injection` entry, and call `agent.continue()` to retry generation
+1. read `ttsrManager.getSettings().contextMode`
+2. build injection content from pending rules and undelivered per-tool reminders using `ttsr-interrupt.md` template; with `contextMode === "discard"`, reminders already delivered in the suffix that will be dropped (settled tool reminders and earlier retry reminders) are carried into this payload as written
+3. publish the hidden `custom_message` with `customType: "ttsr-injection"`, `details.rules` and `details.messageCount` before touching live history (see "Interrupt reminder publication outcomes" in section 7)
+4. only when the retry still owns the resume and the publication outcome lets it run (committed, or rejected for an in-memory retry): if `contextMode === "discard"`, drop the targeted assistant message and everything after it with `agent.replaceMessages(...slice(0, targetAssistantIndex))`, then append the same reminder to live history
+5. mark those rule names injected (a durable `ttsr_injection` marker only after a committed publication) and schedule the owner-guarded continue that retries generation
+
+`#ttsrAbortPending` stays true while the reminder is published; it is cleared when the retry continues or is skipped, or when the retry ends early.
 
 Template payload is:
 
@@ -100,7 +101,7 @@ Template payload is:
 </system-interrupt>
 ```
 
-Pending injections are cleared after content generation.
+Pending injections and carried per-tool claims leave their buckets once the publication outcome is known: a retry that runs consumes them, and every other outcome releases them.
 
 ### `contextMode` behavior on partial output
 
@@ -213,7 +214,7 @@ An interrupt retry publishes its hidden `ttsr-injection` custom message before t
 - **committed**: the retry runs. The reminder is appended to live history, and the rules are marked at `messageCount` and get a durable `ttsr_injection` marker. The marker is a separate write; in a shared session it is published in the background.
 - **rejected** (definite non-commit): this is the only outcome that permits an in-memory retry. A `warning` notice says the reminder could not be saved and the retry runs with it in memory only. The live message is appended and the rules are marked consumed in the live manager (so a `repeatMode: "once"` rule cannot interrupt-loop in this session), but no `ttsr_injection` marker is written. After reopen the rule is eligible again. If the retry was aborted, superseded, or the session was disposed while the append was pending, the retry just releases its claims.
 - **stale** (`transcript_moved`, `unsupported_transcript`, `persistence_latched`, `rewrite_required`, `cursor_not_committed`): later shared writes cannot commit, so the retry stops, the session is disposed, and a `warning` notice names the reason and says the session must be reopened. Nothing is retried in memory and no marker is written.
-- **unknown** or an unclassified failure: the reminder may already be in the transcript, but that does not prove the model saw it. The retry stops, consumption is not persisted, and the session is disposed so a later prompt cannot get past the rule through another match path or repeat gap. The notice includes the attempted entry id when one is known.
+- **unknown** or an unclassified failure: the reminder may already be in the transcript, but that does not prove the model saw it. The retry stops, the live manager does not mark the rules and releases any carried provisional claims, no `ttsr_injection` marker is written, and the session is disposed so a later prompt cannot get past the rule through another match path or repeat gap. The notice includes the attempted entry id when one is known. If the reminder entry did commit, it is still durable evidence: reopening reconciles consumption from it (see "Reconciliation from persisted reminder messages" below).
 
 The stale and unknown fail-closed paths apply even when the retry was invalidated while the append was pending, because they describe this session's persistence state. A reminder that committed after its retry was invalidated is still delivered into live history (marked at its checkpoint, with no new marker) if this retry still owns the resume, the session is not disposed, and live history is unchanged. If the session was already disposed, nothing more happens. Otherwise the session is disposed and must be reopened, so the reminder is neither skipped nor published twice.
 
