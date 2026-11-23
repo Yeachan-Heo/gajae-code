@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { ModelProfileRegistryError, UnknownModelProfileError } from "../src/config/model-profile-contract";
@@ -232,6 +233,91 @@ describe("SDK lifecycle ledger", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("ignores a FIFO, symlinked, or oversized spawn-anchor attestation without stalling the ledger open", async () => {
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-attestation-special-"));
+		const limits = { maxBytes: 4096 };
+		const openWithin = async (label: string): Promise<LifecycleLedger> => {
+			const opened = new LifecycleLedger(dir, limits).open();
+			const timedOut = Promise.withResolvers<never>();
+			const timer = setTimeout(
+				() => timedOut.reject(new Error(`ledger open stalled on a ${label} attestation`)),
+				5_000,
+			);
+			try {
+				return await Promise.race([opened, timedOut.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			const attestation = path.join(dir, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 });
+			await fs.writeFile(
+				ledgerPath,
+				[
+					lifecycleRow("keyed-k", "request-k", "accepted", 10, {
+						operationKey: "session.create\0k",
+						fingerprint: "f",
+					}),
+					lifecycleRow("old-anchor-s", "binding-mac", "accepted", 30),
+				]
+					.map(row => `${JSON.stringify(row)}\n`)
+					.join(""),
+			);
+			const fenced = new Set<string>();
+			const valid = `${JSON.stringify({ version: 1, identities: ["old-anchor-s"] })}\n`;
+			if (process.platform !== "win32") {
+				// A FIFO with no writer would block a plain read forever.
+				const mkfifo = Bun.spawnSync(["mkfifo", attestation]);
+				expect(mkfifo.exitCode).toBe(0);
+				const fifo = await openWithin("FIFO");
+				expect(fifo.hasLegacyIdentity(fenced)).toBe(true);
+				expect(fifo.warnings).toContain("Unreadable spawn-anchor attestation ignored");
+				await fs.rm(attestation);
+				// A final-component symlink is refused even when its target is a valid attestation.
+				const target = path.join(dir, "attestation-target.json");
+				await fs.writeFile(target, valid);
+				await fs.symlink(target, attestation);
+				const symlinked = await openWithin("symlinked");
+				expect(symlinked.hasLegacyIdentity(fenced)).toBe(true);
+				expect(symlinked.warnings).toContain("Unreadable spawn-anchor attestation ignored");
+				await fs.rm(attestation);
+			}
+			// A valid attestation past the ledger byte bound is not read, so the mirror stays fenced.
+			const oversized = `${valid}${" ".repeat(limits.maxBytes)}`;
+			await fs.writeFile(attestation, oversized);
+			const large = await openWithin("oversized");
+			expect(large.hasLegacyIdentity(fenced)).toBe(true);
+			expect(large.warnings).toContain("Oversized spawn-anchor attestation ignored");
+			expect(await fs.readFile(attestation, "utf8")).toBe(oversized);
+			// A file that grows past its fstat size while it is read is not trusted.
+			await fs.writeFile(attestation, valid);
+			const open = fs.open;
+			const growing = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+				const handle = await open(file, flags, mode);
+				if (file !== attestation) return handle;
+				const stat = handle.stat.bind(handle);
+				const shrunk = async (): Promise<Stats> => Object.assign(await stat(), { size: valid.length - 8 });
+				handle.stat = shrunk as typeof handle.stat;
+				return handle;
+			});
+			try {
+				const grown = await openWithin("growing");
+				expect(growing.mock.calls.some(([file]) => file === attestation)).toBe(true);
+				expect(grown.hasLegacyIdentity(fenced)).toBe(true);
+				expect(grown.warnings).toContain("Unreadable spawn-anchor attestation ignored");
+			} finally {
+				growing.mockRestore();
+			}
+			// The same attestation inside the bound is honored.
+			const bounded = await openWithin("regular");
+			expect(bounded.hasLegacyIdentity(fenced)).toBe(false);
+			expect(bounded.warnings).toEqual([]);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 20_000);
 	it.each([
 		["skips", "win32"],
 		["keeps", "linux"],

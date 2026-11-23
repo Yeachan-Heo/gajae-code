@@ -27,6 +27,7 @@ import {
 	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 	sanitizeTmuxToken,
+	tmuxClientFlags,
 } from "../gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
@@ -574,6 +575,16 @@ function scopedBootstrapReceipt(stdout: Uint8Array): ScopedBootstrapReceipt | nu
 	}
 }
 
+/**
+ * Client prefix for every command on the harness owner's private tmux socket. Their
+ * replies are parsed (server pid, native session id, the tab-separated session binding,
+ * the cleanup sentinel), so they request UTF-8 output like the managed-session clients.
+ * psmux never reaches this path: it cannot prove native session identity.
+ */
+function privateTmuxControlArgv(tmuxCommand: string, socketKey: string): string[] {
+	return [tmuxCommand, ...tmuxClientFlags(false), "-L", socketKey];
+}
+
 function ownerIsolationPlatform(): NodeJS.Platform {
 	return process.platform === "linux" || process.env.GJC_HARNESS_TEST_ASSUME_LINUX_OWNER_ISOLATION !== "1"
 		? process.platform
@@ -876,7 +887,7 @@ export default class Harness extends Command {
 			probeServer: async (socketKey, tmuxControlArgv): Promise<TmuxServerProof> => {
 				const platform = ownerIsolationPlatform();
 				if (!socketKey || socketKey.length > 128) return { state: "unverifiable" };
-				const controlArgv = tmuxControlArgv ?? [tmuxCommand, "-L", socketKey];
+				const controlArgv = tmuxControlArgv ?? privateTmuxControlArgv(tmuxCommand, socketKey);
 				if (controlArgv.length < 3 || controlArgv[0] !== tmuxCommand || !controlArgv.includes("-L")) {
 					return { state: "unverifiable" };
 				}
@@ -925,9 +936,7 @@ export default class Harness extends Command {
 	): Promise<boolean> {
 		const result = Bun.spawnSync(
 			[
-				tmuxCommand,
-				"-L",
-				socketKey,
+				...privateTmuxControlArgv(tmuxCommand, socketKey),
 				"display-message",
 				"-p",
 				"-t",
@@ -955,14 +964,12 @@ export default class Harness extends Command {
 
 		if (!(await this.#nativeSessionBoundToName(tmuxCommand, socketKey, nativeSessionId, sessionName)))
 			throw new Error("tmux-owner-cleanup_uncertain");
-		const current = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
+		const current = await probeServer(socketKey, privateTmuxControlArgv(tmuxCommand, socketKey));
 		if (!sameServerIdentity(proof, current)) throw new Error("tmux-owner-cleanup_uncertain");
 		const predicate = `#{&&:#{==:#{pid},${proof.pid}},#{&&:#{==:#{session_id},${nativeSessionId}},#{==:#{session_name},${sessionName}}}}`;
 		const killed = Bun.spawnSync(
 			[
-				tmuxCommand,
-				"-L",
-				socketKey,
+				...privateTmuxControlArgv(tmuxCommand, socketKey),
 				"if-shell",
 				"-t",
 				nativeSessionId,
@@ -1035,9 +1042,7 @@ export default class Harness extends Command {
 		probe.probeServer = async (requestedSocketKey, controlArgv) =>
 			requestedSocketKey === socketKey ? probeServer(requestedSocketKey, controlArgv) : { state: "unverifiable" };
 		const tmuxArgv = [
-			tmuxCommand,
-			"-L",
-			socketKey,
+			...privateTmuxControlArgv(tmuxCommand, socketKey),
 			"new-session",
 			"-d",
 			"-s",
@@ -1110,7 +1115,7 @@ export default class Harness extends Command {
 					? "tmux-owner-scope_bootstrap_failed"
 					: "tmux-owner-native_session_identity_unavailable",
 			);
-		const postSpawnServer = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
+		const postSpawnServer = await probeServer(socketKey, privateTmuxControlArgv(tmuxCommand, socketKey));
 		cleanupProof = postSpawnServer;
 		if (postSpawnServer.state === "unsafe") return fail("tmux-owner-server_unsafe");
 		if (!isSafeServerProof(postSpawnServer, ownerIsolationPlatform())) return fail("tmux-owner-server_unverifiable");
@@ -1123,7 +1128,7 @@ export default class Harness extends Command {
 			return fail("tmux-owner-receipt_server_mismatch");
 		if (!(await this.#nativeSessionBoundToName(tmuxCommand, socketKey, nativeSessionId, sessionName)))
 			return fail("tmux-owner-native_session_identity_unproven");
-		const boundServer = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
+		const boundServer = await probeServer(socketKey, privateTmuxControlArgv(tmuxCommand, socketKey));
 		if (!sameServerIdentity(postSpawnServer, boundServer)) return fail("tmux-owner-server_race");
 		cleanupProof = boundServer;
 		if (

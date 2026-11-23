@@ -10,8 +10,8 @@
  */
 import { assertEndpointConfiguration, type EndpointConfiguration, readEndpointConfiguration } from "@gajae-code/utils";
 import {
+	buildAnthropicMessagesUrl,
 	buildAnthropicHeaders as buildProviderAnthropicHeaders,
-	normalizeAnthropicBaseUrl,
 } from "../providers/anthropic";
 import { isFoundryEnabled } from "./foundry";
 
@@ -26,7 +26,15 @@ const DEFAULT_BASE_URL = "https://api.anthropic.com";
 
 function normalizeBaseUrl(baseUrl: string | undefined): string | undefined {
 	const trimmed = baseUrl?.trim();
-	return trimmed ? trimmed.replace(/\/+$/, "") : undefined;
+	if (!trimmed) {
+		return undefined;
+	}
+	// Trim slashes from the path only: a slash inside a signed query is data.
+	const suffixStart = trimmed.search(/[?#]/);
+	if (suffixStart === -1) {
+		return trimmed.replace(/\/+$/, "");
+	}
+	return `${trimmed.slice(0, suffixStart).replace(/\/+$/, "")}${trimmed.slice(suffixStart)}`;
 }
 
 /**
@@ -94,7 +102,5 @@ export function buildAnthropicSearchHeaders(auth: AnthropicAuthConfig): Record<s
  * Builds the full API URL for Anthropic messages endpoint.
  */
 export function buildAnthropicUrl(auth: AnthropicAuthConfig): string {
-	const normalizedBaseUrl = normalizeAnthropicBaseUrl(auth.baseUrl);
-	const base = `${normalizedBaseUrl}/v1/messages`;
-	return `${base}?beta=true`;
+	return buildAnthropicMessagesUrl(auth.baseUrl, "beta=true");
 }
