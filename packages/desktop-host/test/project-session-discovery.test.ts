@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { registerDirectSession } from "@gajae-code/coding-agent/main";
 import * as sdk from "@gajae-code/coding-agent/sdk";
 import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -55,7 +56,7 @@ async function waitForEntry(entered: Promise<void>, operation: Promise<unknown>)
 	}
 }
 
-async function fixture() {
+async function fixture(options: { broker?: boolean } = {}) {
 	const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-discovery-")));
 	const dataDir = path.join(directory, "app");
 	const agentDir = path.join(dataDir, "agent");
@@ -106,7 +107,8 @@ async function fixture() {
 				created.push(result);
 				return result;
 			},
-			liveOwnerClient,
+			// Without one, the Host asks the agent directory's real broker, of which none runs here.
+			...(options.broker === false ? {} : { liveOwnerClient }),
 		});
 	let host = createHost();
 	cleanups.push(async () => {
@@ -146,7 +148,7 @@ async function fixture() {
 		const id = manager.getSessionId();
 		const bytes = await Bun.file(file).text();
 		if (!keepOpen) await manager.close();
-		return { id, file, bytes };
+		return { id, file, bytes, manager };
 	};
 	const catalogFile = path.join(dataDir, "catalog.json");
 	const restart = async () => {
@@ -1005,3 +1007,33 @@ test.skipIf(process.platform !== "darwin")(
 		expect(h.snapshot().sessions).toEqual([]);
 	},
 );
+
+test("with no broker running, the session index tells whether a terminal still has a conversation open", async () => {
+	const h = await fixture({ broker: false });
+	const held = await h.persist("Open in a terminal with SDK hosting off", h.projectDir, true);
+	const legacy = await h.persist("Registered by an older terminal", h.projectDir, true);
+	const free = await h.persist("Nobody has this one");
+	await h.call("project.open", { path: h.projectDir });
+	// A terminal registers its session in the index at startup, whatever its SDK hosting; this test's
+	// own process stands in for it. The second registered before incarnations were recorded.
+	await registerDirectSession(held.manager, h.agentDir, undefined, { registerPostmortem: () => () => {} });
+	await registerDirectSession(legacy.manager, h.agentDir, undefined, {
+		registerPostmortem: () => () => {},
+		processIncarnation: () => undefined,
+	});
+	// Held: read-only, and not deleted.
+	const selected = await h.call<DesktopSession>("session.select", { sessionId: held.id });
+	expect(selected.connection).toEqual({ state: "elsewhere" });
+	await expect(h.call("session.delete", { sessionId: held.id })).rejects.toThrow("has this conversation open");
+	// Undecidable: it opens (the store's compare-and-append stays the backstop for writes), but a
+	// delete needs proof, so it is refused with a way out.
+	await expect(h.call("session.delete", { sessionId: legacy.id })).rejects.toThrow(
+		"Delete it from the terminal, or close any terminal using it and try again.",
+	);
+	expect(await Bun.file(legacy.file).exists()).toBe(true);
+	// Proven free: deleted.
+	await h.call("session.delete", { sessionId: free.id });
+	expect(await Bun.file(free.file).exists()).toBe(false);
+	expect(await Bun.file(held.file).exists()).toBe(true);
+	expect(await Bun.file(path.join(h.agentDir, "sdk", "broker.json")).exists()).toBe(false);
+});

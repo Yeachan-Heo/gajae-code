@@ -24,6 +24,8 @@ import {
 } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { type BrokerDiscovery, readBrokerDiscovery } from "./broker/discovery";
+import { processIncarnation } from "./broker/process-incarnation";
+import { SessionIndex, sessionIndexPresent, sessionIndexStartupLockOptions } from "./broker/session-index";
 import { SdkClient } from "./client/client";
 import { type SessionLifecycleClient, SessionLifecycleService } from "./lifecycle/service";
 import { createSdkPreferenceControls } from "./preference-controls";
@@ -690,9 +692,10 @@ export function isEmbeddedAppendRefused(session: Pick<CreateAgentSessionResult["
 }
 
 /**
- * Whether another process is registered with the SDK broker as the live owner of a transcript.
- * `unknown` means the answer could not be had: no broker is running (`broker_absent`), or it
- * failed or did not answer in time (`broker_unavailable`).
+ * Whether another live process holds a transcript open. `unknown` means the answer could not be
+ * had: no broker is running and the session index cannot decide (`broker_absent`: its
+ * registration predates recorded process incarnations, or the index could not be read), or the
+ * broker failed or did not answer in time (`broker_unavailable`).
  */
 export type EmbeddedLiveOwner =
 	| { kind: "live" }
@@ -734,14 +737,40 @@ async function runningBrokerClient(
 }
 
 /**
+ * With no broker running, the session index still holds every CLI run's registration, but nothing
+ * keeps its liveness current. Read the session's latest registration (under the index lock, within
+ * the caller's deadline) and probe that exact process: it is live only while the same process
+ * (pid and OS start incarnation) runs. A registration without an incarnation, from an older build,
+ * cannot be told apart from a reused pid, so it decides nothing.
+ */
+async function indexedLiveOwner(
+	agentDir: string,
+	sessionId: string,
+	remaining: () => number,
+): Promise<EmbeddedLiveOwner> {
+	// No index: nothing has registered here. Opening one would create it, so a reader does not.
+	if (!(await sessionIndexPresent(agentDir))) return { kind: "none" };
+	const index = await new SessionIndex(agentDir).open(
+		sessionIndexStartupLockOptions(performance.now() + remaining(), AbortSignal.timeout(remaining())),
+	);
+	const row = index.listSessions(new Map(), new Set([sessionId])).sessions.find(item => item.sessionId === sessionId);
+	if (!row || row.terminal || row.terminalUncertain) return { kind: "none" };
+	if (!row.processIncarnation) return { kind: "unknown", reason: "broker_absent" };
+	return processIncarnation(row.pid) === row.processIncarnation ? { kind: "live" } : { kind: "none" };
+}
+
+/**
  * Ask the running SDK broker whether a live process holds `sessionId` open: any CLI run with a
  * durable transcript (it registers in the session index at startup, whatever its mode or SDK
  * hosting) or an owner the broker started. An embedding's own session, with SDK hosting off, is
  * never reported. Read-only and bounded: it never starts, restarts or recovers a broker, makes one
  * exact `session.list` lookup with a single connection and no reconnects, and answers `unknown`
  * instead of waiting past `timeoutMs`, which covers reading the discovery file too (only its
- * synchronous process-incarnation probe cannot be cut short). With no broker running nothing is
- * seen (`broker_absent`).
+ * synchronous process-incarnation probe cannot be cut short). With no broker running, it reads the
+ * session's latest registration from the session index (under the index lock, within the same
+ * deadline; it creates no index where there is none) and probes that exact process by pid and
+ * start incarnation, which covers a terminal started with `GJC_SDK_DISABLE=1` or one whose broker
+ * could not start.
  * Advisory only: a process that opens the transcript after the answer is not seen.
  * `client` replaces the agent directory's broker connection (tests, custom transports).
  */
@@ -753,6 +782,7 @@ export async function findEmbeddedLiveOwner(input: {
 }): Promise<EmbeddedLiveOwner> {
 	const timeoutMs = input.timeoutMs ?? LIVE_OWNER_TIMEOUT_MS;
 	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
+	const absent = { kind: "unknown", reason: "broker_absent" } as const;
 	// One deadline for the whole lookup, from reading the discovery file to the broker's answer. The
 	// discovery read's process-incarnation probe is synchronous, so the answer can come only once
 	// that probe returns; everything else stops counting at the deadline.
@@ -760,7 +790,7 @@ export async function findEmbeddedLiveOwner(input: {
 	const remaining = () => Math.max(1, deadline - Date.now());
 	const lookup = (async (): Promise<EmbeddedLiveOwner> => {
 		const client = input.client ?? (await runningBrokerClient(input.agentDir, timeoutMs, remaining));
-		if (!client) return { kind: "unknown", reason: "broker_absent" };
+		if (!client) return indexedLiveOwner(input.agentDir, input.sessionId, remaining).catch(() => absent);
 		const listed = await new SessionLifecycleService(client).list({
 			actor: LIVE_OWNER_ACTOR,
 			capability: "session.list",

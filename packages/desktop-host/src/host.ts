@@ -490,6 +490,12 @@ const ELSEWHERE_BACKGROUND =
 /** A released conversation is not deleted while the running broker cannot say whether a terminal has it. */
 const OWNER_UNCHECKED_DELETE =
 	"The app could not check whether a terminal has this conversation open, so it was not deleted. Try again in a moment.";
+/**
+ * No broker runs and the session index cannot tell whether the terminal that registered this
+ * conversation is still running (a registration from an older gjc), so nothing proves it is free.
+ */
+const OWNER_UNKNOWN_DELETE =
+	"The app could not tell whether a terminal still has this conversation open, so it was not deleted. Delete it from the terminal, or close any terminal using it and try again.";
 /** The app must not remove a transcript another process may be writing. */
 const ELSEWHERE_DELETE =
 	"Another gjc process, such as a terminal, has this conversation open. Close it there before deleting it here.";
@@ -2904,10 +2910,11 @@ export class DesktopHost {
 	async #recheckOwner(checked: LiveSession, method: DesktopRequest["method"]): Promise<void> {
 		if (!this.#idle(checked)) return;
 		const answer = await this.#ownerAnswer(checked.metadata);
-		// Deleting needs a definite answer, as for a released conversation: nobody has it open, or no
-		// broker runs. A broker that runs but cannot answer may be hiding a terminal.
-		if (method === "session.delete" && answer.kind === "unknown" && answer.reason === "broker_unavailable")
-			throw new Error(OWNER_UNCHECKED_DELETE);
+		// Deleting needs a definite answer, as for a released conversation: the broker, or with none
+		// running the session index and a process probe, says nobody has it open. Anything less may
+		// be hiding a terminal.
+		if (method === "session.delete" && answer.kind === "unknown")
+			throw new Error(answer.reason === "broker_unavailable" ? OWNER_UNCHECKED_DELETE : OWNER_UNKNOWN_DELETE);
 		if (answer.kind !== "live") return;
 		// The answer is about the transcript, not the copy that asked. If another request replaced
 		// that copy while the broker answered, it holds for the copy that replaced it; a copy still
@@ -3246,15 +3253,15 @@ export class DesktopHost {
 				// A released conversation may since have been opened by the terminal; never remove a
 				// transcript another process may be writing.
 				if (this.#elsewhere.has(metadata.id)) throw new Error(ELSEWHERE_DELETE);
-				// Deleting needs a definite answer: nobody has it open, or no broker runs (an interactive
-				// terminal starts one). A broker that runs but cannot answer may be hiding a terminal.
+				// Deleting needs a definite answer: the broker, or with none running the session index and a
+				// process probe, says nobody has it open. Anything less may be hiding a terminal.
 				const owner = await this.#ownerAnswer(metadata);
 				if (owner.kind === "live") {
 					this.#elsewhere.add(metadata.id);
 					throw new Error(ELSEWHERE_DELETE);
 				}
-				if (owner.kind === "unknown" && owner.reason === "broker_unavailable")
-					throw new Error(OWNER_UNCHECKED_DELETE);
+				if (owner.kind === "unknown")
+					throw new Error(owner.reason === "broker_unavailable" ? OWNER_UNCHECKED_DELETE : OWNER_UNKNOWN_DELETE);
 				this.#readOnly.delete(metadata.id);
 				return this.#forgetMissingSession(metadata);
 			}

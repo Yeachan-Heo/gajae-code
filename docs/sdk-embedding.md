@@ -474,13 +474,17 @@ the agent directory's session index at startup, whatever its mode (interactive, 
 ACP) and with or without `GJC_SDK_DISABLE=1`, and owners the broker started are registered too;
 a running broker reports each of them as live while its process is. An embedding's own session
 (created with SDK hosting off, as `createEmbeddedAgentSession` callers do) registers nothing and
-is never reported. The helper never starts, restarts or recovers a broker: with no broker
-running it returns `broker_absent` after one file read even though registrations are on disk,
-and a broker that fails or does not answer within `timeoutMs` (default 1 s) yields
-`broker_unavailable`. The bound covers the whole lookup, reading the discovery file included;
+is never reported. The helper never starts, restarts or recovers a broker. With no broker
+running, nothing keeps the index's liveness current, so it reads the session's latest
+registration from the index itself (under the index lock, within the same deadline; with no
+index on disk it answers `none` and creates none) and probes that exact process by pid and OS
+start incarnation: `live` while the same process runs, `none` once it has exited or was never
+registered. A registration that recorded no incarnation (an older gjc) cannot be told apart from
+a reused pid and yields `broker_absent`, as does an index that cannot be read. A broker that
+fails or does not answer within `timeoutMs` (default 1 s) yields `broker_unavailable`. The bound covers the whole lookup, reading the discovery file included;
 only the synchronous check that the broker's process is still the one that wrote that file
 cannot be cut short, so on a slow system the answer can come that much later. The answer is advisory: a process that opens the transcript after the
-check, or any process while no broker runs, is not seen, so keep relying on the store's
+check, or a process that registered nothing (an ACP session, an older gjc), is not seen, so keep relying on the store's
 compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop. A turn the session
 starts by itself, for example when background work it owns completes, is preceded by no
 embedding request, so no check can run before it writes. The refusal covers the plain append

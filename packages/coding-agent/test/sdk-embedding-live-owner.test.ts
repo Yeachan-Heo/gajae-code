@@ -41,15 +41,13 @@ function broker(sessions: Array<{ sessionId: string; live?: boolean }>, seen: un
 	};
 }
 
-test("with no broker running it answers at once and starts nothing", async () => {
+test("with no broker and no session index it answers none at once, and creates neither", async () => {
 	const dir = await agentDir();
 	const started = Date.now();
-	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId })).toEqual({
-		kind: "unknown",
-		reason: "broker_absent",
-	});
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId })).toEqual({ kind: "none" });
 	expect(Date.now() - started).toBeLessThan(500);
 	expect(await Bun.file(path.join(dir, "sdk", "broker.json")).exists()).toBe(false);
+	expect(await fs.readdir(dir)).toEqual([]);
 });
 
 test("reports a live owner only for the exact session the broker lists as live", async () => {
@@ -159,11 +157,10 @@ test("a terminal session's registration is reported live by a real broker, and n
 	// What every CLI run with a durable transcript does at startup, whatever its mode or SDK hosting.
 	// Its process-exit cleanup is not this test's to install.
 	await registerDirectSession(manager, dir, undefined, { registerPostmortem: () => () => {} });
-	// The registration is on disk, but only a running broker reports it.
-	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId })).toEqual({
-		kind: "unknown",
-		reason: "broker_absent",
-	});
+	// With no broker running, the registration in the session index and a probe of that exact
+	// process (this test's own) report it.
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 5_000 })).toEqual({ kind: "live" });
+	expect(await Bun.file(path.join(dir, "sdk", "broker.json")).exists()).toBe(false);
 	await startBroker();
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "live" });
 }, 60_000);
@@ -315,3 +312,35 @@ test("a real broker closes the idle owner it started, and nobody holds the trans
 	expect(await closeEmbeddedIdleOwner({ agentDir: dir, sessionId, timeoutMs: 30_000 })).toEqual({ kind: "closed" });
 	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 10_000 })).toEqual({ kind: "none" });
 }, 120_000);
+
+test("with no broker, a registration whose process is gone is none, and one with no recorded incarnation decides nothing", async () => {
+	const { dir, cwd } = await brokerWorkspace();
+	const gone = await sharedTranscript(cwd, dir);
+	// The recorded start incarnation is not this process's: the process that registered has exited
+	// and its pid was reused.
+	await registerDirectSession(gone, dir, undefined, {
+		registerPostmortem: () => () => {},
+		processIncarnation: () => "a-process-that-has-exited",
+	});
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId: gone.getSessionId(), timeoutMs: 5_000 })).toEqual({
+		kind: "none",
+	});
+	const legacy = await sharedTranscript(cwd, dir);
+	await registerDirectSession(legacy, dir, undefined, {
+		registerPostmortem: () => () => {},
+		processIncarnation: () => undefined,
+	});
+	expect(await findEmbeddedLiveOwner({ agentDir: dir, sessionId: legacy.getSessionId(), timeoutMs: 5_000 })).toEqual({
+		kind: "unknown",
+		reason: "broker_absent",
+	});
+	// A session never registered is none.
+	expect(
+		await findEmbeddedLiveOwner({
+			agentDir: dir,
+			sessionId: "1b0f8a52-6a8f-4a59-9d1c-1f3c2d4e5f60",
+			timeoutMs: 5_000,
+		}),
+	).toEqual({ kind: "none" });
+	expect(await Bun.file(path.join(dir, "sdk", "broker.json")).exists()).toBe(false);
+}, 60_000);
