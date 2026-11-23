@@ -15,6 +15,7 @@ import {
 	loadExtensions,
 } from "@gajae-code/coding-agent/extensibility/extensions";
 import { type CreateAgentSessionResult, createSdkOperatorControls } from "@gajae-code/coding-agent/sdk";
+import { approvalGate } from "@gajae-code/coding-agent/sdk/workflow-gates";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
@@ -1361,6 +1362,47 @@ describe("desktop streaming lifecycle", () => {
 			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
 		).toBe(true);
 	}, 20_000);
+
+	test("a confirmed Disconnect waits for the shell command it stopped", async () => {
+		const h = await launch();
+		const { call, session, sdk } = h;
+		const sessionId = session.id;
+		await call("operator.execute", { sessionId, text: "! sleep 30" });
+		for (let i = 0; i < 400 && !sdk.isBashRunning; i++) await Bun.sleep(5);
+		expect(sdk.isBashRunning).toBe(true);
+		expect(await call<DesktopDisconnectResult>("session.disconnect", { sessionId })).toEqual({
+			disconnected: false,
+			confirm: { running: true, queued: 0 },
+		});
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		expect(sdk.isBashRunning).toBe(false);
+	}, 20_000);
+
+	test("a Disconnect asks first when an approval is waiting, and never answers it", async () => {
+		const { call, session, sdk } = await launch();
+		const sessionId = session.id;
+		const emitter = sdk.getWorkflowGateEmitter();
+		if (!emitter) throw new Error("Missing the session's workflow gate emitter");
+		let answered = false;
+		const waiting = emitter
+			.emitGate(approvalGate({ plan: "Plan waiting for approval" }), { signal: new AbortController().signal })
+			.then(() => {
+				answered = true;
+			});
+		void waiting.catch(() => {});
+		for (let i = 0; i < 400 && !sdk.getWorkflowGateEmitter()?.listPendingGates?.().length; i++) await Bun.sleep(5);
+		// Waiting work, like a running turn, needs the user's confirmation before it is released.
+		expect(await call<DesktopDisconnectResult>("session.disconnect", { sessionId })).toEqual({
+			disconnected: false,
+			confirm: { running: true, queued: 0 },
+		});
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		expect(answered).toBe(false);
+	});
 
 	test("a second Disconnect and a delete wait for a Disconnect that is still stopping the run", async () => {
 		const h = await launch();

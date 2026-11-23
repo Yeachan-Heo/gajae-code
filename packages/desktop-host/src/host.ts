@@ -2744,12 +2744,16 @@ export class DesktopHost {
 	#recordRunStop(sessionId: string, arrival: number): void {
 		this.#runStops.set(sessionId, Math.max(this.#runStops.get(sessionId) ?? 0, arrival));
 	}
-	/** Work Disconnect would stop: a turn, queued input, a command or a question still waiting. */
+	/** Work Disconnect would stop: a turn, queued input, a command, an approval or a question still waiting. */
 	#disconnectWouldStop(live: LiveSession): { running: boolean; queued: number } | undefined {
+		// Read the gates now, not from the last published activity: an approval can be waiting with
+		// nothing else running, and releasing the writer would leave it unanswerable here.
+		const gates = live.activity.getSnapshot().sessionState?.gates;
 		const running =
 			live.sdk.isStreaming ||
 			live.exclusiveDone !== undefined ||
 			live.operator?.isBusy() === true ||
+			(gates?.available === true && gates.pending.length > 0) ||
 			[...this.#questions.values()].some(pending => pending.ownerToken === live.viewOwnerToken);
 		return running || live.queued.size > 0 ? { running, queued: live.queued.size } : undefined;
 	}
@@ -2815,6 +2819,12 @@ export class DesktopHost {
 				}
 			};
 			if (stopping) await within(this.#stop(stopped, arrival));
+			// A stopped shell command settles on its own schedule; wait for it within the same budget.
+			await within(
+				(async () => {
+					while (stopped.operator?.isBusy() && !stopBudget.aborted) await Bun.sleep(25);
+				})(),
+			);
 			// Join the stopped request until its receipt and view are written; disposing earlier would
 			// turn a cancelled prompt into an unknown one.
 			for (let attempt = 0; attempt < 3 && stopped.exclusiveDone; attempt++) await within(stopped.exclusiveDone);
