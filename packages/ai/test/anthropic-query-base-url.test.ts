@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { buildAnthropicClientOptions, normalizeAnthropicBaseUrl, streamAnthropic } from "../src/providers/anthropic";
 import type { Context, FetchImpl, Model, ProviderDispatch } from "../src/types";
+import { buildAnthropicAuthConfig, buildAnthropicUrl } from "../src/utils/anthropic-auth";
 
 const baseModel: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -124,6 +125,52 @@ describe("Anthropic Messages requests with a query-bearing base URL", () => {
 			"https://gateway.example.com/anthropic2/v1/messages",
 			"https://other.example.com/anthropic/v1/messages",
 		]);
+	});
+});
+
+describe("base query fetch wrapper", () => {
+	it("passes an unmatched Request through untouched, body included", async () => {
+		const seen: Array<string | URL | Request> = [];
+		const fetchImpl = (async (input: string | URL | Request): Promise<Response> => {
+			seen.push(input);
+			return new Response(null, { status: 204 });
+		}) as FetchImpl;
+		const requestFetch = buildAnthropicClientOptions({
+			model: { ...baseModel, baseUrl: "https://gateway.example.com/anthropic?sig=abc" },
+			apiKey: "test-key",
+			fetch: fetchImpl,
+		}).fetch!;
+		const other = new Request("https://other.example.com/v1/messages", { method: "POST", body: "payload" });
+		const matched = new Request("https://gateway.example.com/anthropic/v1/messages", {
+			method: "POST",
+			body: "signed-payload",
+		});
+
+		await requestFetch(other);
+		await requestFetch(matched);
+
+		const passed = seen[0] as Request;
+		expect(passed.url).toBe("https://other.example.com/v1/messages");
+		expect(await passed.text()).toBe("payload");
+		const rebuilt = seen[1] as Request;
+		expect(rebuilt.url).toBe("https://gateway.example.com/anthropic/v1/messages?sig=abc");
+		expect(rebuilt.method).toBe("POST");
+		expect(await rebuilt.text()).toBe("signed-payload");
+	});
+});
+
+describe("buildAnthropicUrl (web search Messages request)", () => {
+	it("puts /v1/messages on the path and keeps the signed query ahead of beta=true", () => {
+		const url = (baseUrl: string) => buildAnthropicUrl(buildAnthropicAuthConfig("sk-ant-api-key", baseUrl));
+		expect(url("https://gateway.example.com/anthropic/v1/?sig=abc/")).toBe(
+			"https://gateway.example.com/anthropic/v1/messages?sig=abc/&beta=true",
+		);
+		expect(url("https://gateway.example.com/anthropic?sig=a/b%2Bc#frag")).toBe(
+			"https://gateway.example.com/anthropic/v1/messages?sig=a/b%2Bc&beta=true",
+		);
+		expect(url("https://gateway.example.com/anthropic/v1/")).toBe(
+			"https://gateway.example.com/anthropic/v1/messages?beta=true",
+		);
 	});
 });
 

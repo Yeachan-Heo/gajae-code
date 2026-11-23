@@ -183,6 +183,16 @@ function splitAnthropicBaseUrlQuery(baseUrl: string | undefined): { baseURL: str
 	return { baseURL: baseUrl.slice(0, suffixStart), query };
 }
 
+/**
+ * Composes the Messages URL for a base URL: `/v1/messages` goes on the path exactly once
+ * and the base query is kept verbatim, ahead of `extraQuery`.
+ */
+export function buildAnthropicMessagesUrl(baseUrl: string, extraQuery?: string): string {
+	const { baseURL, query } = splitAnthropicBaseUrlQuery(normalizeAnthropicBaseUrl(baseUrl) ?? baseUrl);
+	const search = [query, extraQuery].filter(Boolean).join("&");
+	return `${baseURL}/v1/messages${search ? `?${search}` : ""}`;
+}
+
 // Build deduplicated beta header string
 export function buildBetaHeader(baseBetas: string[], extraBetas: string[]): string {
 	const seen = new Set<string>();
@@ -1700,7 +1710,8 @@ function wrapAnthropicFetchForBaseQuery(baseFetch: FetchImpl, sdkBaseUrl: string
 	return Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			if (input instanceof Request) {
-				return baseFetch(new Request(withBaseQuery(input.url), input), init);
+				const url = withBaseQuery(input.url);
+				return baseFetch(url === input.url ? input : new Request(url, input), init);
 			}
 			return baseFetch(withBaseQuery(String(input)), init);
 		},
@@ -2511,7 +2522,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					api: output.api,
 					model: model.id,
 					method: "POST",
-					url: `${baseUrl}/v1/messages`,
+					url: buildAnthropicMessagesUrl(baseUrl),
 					body,
 				};
 			};
