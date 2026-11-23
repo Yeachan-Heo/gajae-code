@@ -114,6 +114,73 @@ describe("resume listing trailing-patch scan cost", () => {
 		expect(counter.reads()).toBeLessThan(readsAtFourKiB / 4);
 	});
 
+	it("does not join scanned chunks into new buffers when a transcript has no header patch", async () => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-copy-"));
+		const cwd = path.join(testDir, "cwd");
+		const sessionDir = path.join(testDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(sessionDir, { recursive: true });
+
+		const sessionFile = writeTranscript(sessionDir, cwd, "scan-copy", 4 * 1024 * 1024);
+		const size = fs.statSync(sessionFile).size;
+		let copiedBytes = 0;
+		const realConcat = Buffer.concat;
+		vi.spyOn(Buffer, "concat").mockImplementation((...args: Parameters<typeof Buffer.concat>) => {
+			const joined = realConcat(...args);
+			copiedBytes += joined.byteLength;
+			return joined;
+		});
+
+		const candidates = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		expect(candidates.find(item => item.id === "scan-copy")?.title).toBe("header-title");
+
+		// Counts bytes returned by Buffer.concat during the listing. The walk reaches
+		// BOF, so joining each chunk to its carried partial line copied the whole
+		// transcript once more on every listing.
+		expect(copiedBytes).toBeLessThan(size / 4);
+	});
+
+	it("finds a header patch whose marker is split across a scan chunk boundary", async () => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-split-marker-"));
+		const cwd = path.join(testDir, "cwd");
+		const sessionDir = path.join(testDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(sessionDir, { recursive: true });
+
+		// Mirrors the scanner's 64 KiB chunk: chunk edges sit at multiples of it from EOF.
+		const chunkBytes = 64 * 1024;
+		const marker = "header_patch";
+		const splits = Array.from({ length: marker.length - 1 }, (_, index) => index + 1);
+		for (const bytesBeforeEdge of splits) {
+			const id = `split-${bytesBeforeEdge}`;
+			const header = JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id,
+				timestamp: "2026-08-16T00:00:00.000Z",
+				cwd,
+				title: "header-title",
+			});
+			const padding = JSON.stringify({ type: "custom", customType: "padding", data: "p".repeat(chunkBytes) });
+			// Title only, so the temp path cannot add another marker occurrence after the type field.
+			const patch = JSON.stringify({ type: "header_patch", patch: { title: `renamed-${bytesBeforeEdge}` } });
+			// Size the last line so `bytesBeforeEdge` marker bytes fall before the chunk edge
+			// and the rest after it. Offsets are UTF-8 bytes; the temp path may be non-ASCII.
+			const markerFromEof = chunkBytes + bytesBeforeEdge;
+			const patchBytesFromMarker = Buffer.byteLength(patch.slice(patch.indexOf(marker)));
+			const filler = "f".repeat(markerFromEof - patchBytesFromMarker - 2);
+			const content = Buffer.from(`${header}\n${padding}\n${patch}\n${filler}\n`);
+			expect(content.byteLength - content.lastIndexOf(marker)).toBe(markerFromEof);
+			fs.writeFileSync(path.join(sessionDir, `${id}.jsonl`), content);
+		}
+
+		const candidates = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		for (const bytesBeforeEdge of splits) {
+			const listed = candidates.find(item => item.id === `split-${bytesBeforeEdge}`);
+			expect(listed?.title).toBe(`renamed-${bytesBeforeEdge}`);
+		}
+	});
+
 	it("keeps legacy metadata patches bounded when the star capability is absent", async () => {
 		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-legacy-patch-"));
 		const cwd = path.join(testDir, "cwd");
