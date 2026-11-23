@@ -835,11 +835,20 @@ describe("session MCP controls on AgentSession", () => {
 		await expect(control(h, "disconnect", "fakeon")).rejects.toThrow("cleanup failed");
 		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("disconnected");
 		const spawns = spawnCount(c, "fakeon");
+		const barriers: Promise<void>[] = [];
+		const extend = h.session.extendStartupTurnBarrier.bind(h.session);
+		h.session.extendStartupTurnBarrier = barrier => {
+			barriers.push(barrier);
+			extend(barrier);
+		};
 		await h.session.newSession();
-		const deadline = Date.now() + 5000;
-		while (Date.now() < deadline && h.result.mcpManager?.getConnectionStatus("fakeon") !== "connected")
-			await sleep(50);
+		expect(barriers).toHaveLength(1);
+		// Wait for the whole restore, not just "connected": the manager reports a
+		// server connected before its tools/list returns, and ending the test there
+		// lets teardown abort that request and fail the restore.
+		await barriers[0];
 		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("connected");
+		expect(mcpToolsOf(h.session.getActiveToolNames(), "fakeon").length).toBe(1);
 		expect(spawnCount(c, "fakeon")).toBe(spawns + 1);
 	}, 30_000);
 
