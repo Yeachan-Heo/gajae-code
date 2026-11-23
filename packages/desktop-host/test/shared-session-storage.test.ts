@@ -1226,6 +1226,23 @@ for (const broker of ["failing", "silent"] as const)
 		await h.close();
 	});
 
+test("a broker that does not answer holds a request up for at most half a second", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const lookups = h.ownerLookups.length;
+	const releaseBroker = h.holdBroker();
+	cleanups.push(async () => releaseBroker());
+	const started = performance.now();
+	expect((await h.call<DesktopSession>("session.select", { sessionId })).connection).toEqual({ state: "connected" });
+	const waited = performance.now() - started;
+	// It did ask, and waited for the answer until the bound, not the SDK's one-second default.
+	expect(h.ownerLookups.length).toBeGreaterThan(lookups);
+	expect(waited).toBeGreaterThanOrEqual(450);
+	expect(waited).toBeLessThan(900);
+	await h.close();
+});
+
 /** A request's own response frame, whether it succeeded or not. */
 async function respond(
 	h: {

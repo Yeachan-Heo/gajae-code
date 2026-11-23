@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { $ } from "bun";
 import { registerDirectSession } from "../src/main";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { createEmbeddedAgentSession, findEmbeddedLiveOwner } from "../src/sdk/embedding";
@@ -88,6 +89,25 @@ test("a broker that fails or does not answer in time is reported as unknown", as
 		reason: "broker_unavailable",
 	});
 	expect(Date.now() - started).toBeLessThan(1000);
+});
+
+test.skipIf(process.platform === "win32")("the timeout also covers reading the broker's discovery file", async () => {
+	const dir = await agentDir();
+	const discovery = path.join(dir, "sdk", "broker.json");
+	await fs.mkdir(path.dirname(discovery), { recursive: true });
+	// A named pipe: reading it waits until a writer opens it, a discovery read that does not finish.
+	await $`mkfifo ${discovery}`;
+	cleanups.push(async () => {
+		// Let the read still waiting on the pipe finish, so nothing stays blocked.
+		await fs.writeFile(discovery, "{}");
+	});
+	const started = performance.now();
+	const answer = await Promise.race([
+		findEmbeddedLiveOwner({ agentDir: dir, sessionId, timeoutMs: 100 }),
+		Bun.sleep(2_000).then(() => "still waiting"),
+	]);
+	expect(answer).toEqual({ kind: "unknown", reason: "broker_unavailable" });
+	expect(performance.now() - started).toBeLessThan(1_000);
 });
 
 test("a real broker accepts the exact lookup and answers none for a transcript nobody holds", async () => {

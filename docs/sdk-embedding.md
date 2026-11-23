@@ -469,7 +469,9 @@ a running broker reports each of them as live while its process is. An embedding
 is never reported. The helper never starts, restarts or recovers a broker: with no broker
 running it returns `broker_absent` after one file read even though registrations are on disk,
 and a broker that fails or does not answer within `timeoutMs` (default 1 s) yields
-`broker_unavailable`. The answer is advisory: a process that opens the transcript after the
+`broker_unavailable`. The bound covers the whole lookup, reading the discovery file included;
+only the synchronous check that the broker's process is still the one that wrote that file
+cannot be cut short, so on a slow system the answer can come that much later. The answer is advisory: a process that opens the transcript after the
 check, or any process while no broker runs, is not seen, so keep relying on the store's
 compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop. A turn the session
 starts by itself, for example when background work it owns completes, is preceded by no

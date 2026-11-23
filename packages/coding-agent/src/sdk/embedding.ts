@@ -691,7 +691,9 @@ const LIVE_OWNER_TIMEOUT_MS = 1_000;
  * hosting) or an owner the broker started. An embedding's own session, with SDK hosting off, is
  * never reported. Read-only and bounded: it never starts, restarts or recovers a broker, makes one
  * exact `session.list` lookup with a single connection and no reconnects, and answers `unknown`
- * instead of waiting past `timeoutMs`. With no broker running nothing is seen (`broker_absent`).
+ * instead of waiting past `timeoutMs`, which covers reading the discovery file too (only its
+ * synchronous process-incarnation probe cannot be cut short). With no broker running nothing is
+ * seen (`broker_absent`).
  * Advisory only: a process that opens the transcript after the answer is not seen.
  * `client` replaces the agent directory's broker connection (tests, custom transports).
  */
@@ -703,33 +705,38 @@ export async function findEmbeddedLiveOwner(input: {
 }): Promise<EmbeddedLiveOwner> {
 	const timeoutMs = input.timeoutMs ?? LIVE_OWNER_TIMEOUT_MS;
 	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
-	let client = input.client;
-	if (!client) {
-		let discovery: BrokerDiscovery | null;
-		try {
-			discovery = await readBrokerDiscovery(input.agentDir);
-		} catch {
-			return unavailable;
-		}
-		if (!discovery) return { kind: "unknown", reason: "broker_absent" };
-		const { url, token } = discovery;
-		client = {
-			global: async (operation, request, options) => {
-				const connection = await SdkClient.connect(url, token, { timeoutMs, reconnectAttempts: 0 });
-				try {
-					return await connection.global(operation, request, { timeoutMs: options.timeoutMs ?? timeoutMs });
-				} finally {
-					await connection.close().catch(() => {});
-				}
-			},
-		};
-	}
+	// One deadline for the whole lookup, from reading the discovery file to the broker's answer. The
+	// discovery read's process-incarnation probe is synchronous, so the answer can come only once
+	// that probe returns; everything else stops counting at the deadline.
+	const deadline = Date.now() + timeoutMs;
+	const remaining = () => Math.max(1, deadline - Date.now());
 	const lookup = (async (): Promise<EmbeddedLiveOwner> => {
+		let client = input.client;
+		if (!client) {
+			const discovery: BrokerDiscovery | null = await readBrokerDiscovery(input.agentDir);
+			if (!discovery) return { kind: "unknown", reason: "broker_absent" };
+			const { url, token } = discovery;
+			client = {
+				global: async (operation, request, options) => {
+					const connection = await SdkClient.connect(url, token, {
+						timeoutMs: remaining(),
+						reconnectAttempts: 0,
+					});
+					try {
+						return await connection.global(operation, request, {
+							timeoutMs: Math.min(options.timeoutMs ?? timeoutMs, remaining()),
+						});
+					} finally {
+						await connection.close().catch(() => {});
+					}
+				},
+			};
+		}
 		const listed = await new SessionLifecycleService(client).list({
 			actor: LIVE_OWNER_ACTOR,
 			capability: "session.list",
 			target: { resolveSessionId: input.sessionId },
-			timeoutMs,
+			timeoutMs: remaining(),
 		});
 		if (!listed.ok || "rows" in listed.result) return unavailable;
 		return listed.result.sessions.some(entry => entry.sessionId === input.sessionId && entry.live === true)
