@@ -597,10 +597,11 @@ export interface EmbeddedTranscriptHistory {
 /**
  * Read a transcript's conversation for display without opening a session, taking a writer or
  * migrating the file. `leaf` selects a saved position: it is shown when `whenTail` is still the
- * newest entry (or was never recorded), otherwise the newest entry is, exactly as reopening the
- * transcript after another surface appended would land. An unknown target also falls back to the
- * newest entry. Undefined when the file is absent, larger than a resumable transcript, or not a
- * readable transcript.
+ * newest entry, otherwise the newest entry is, exactly as reopening the transcript after another
+ * surface appended would land. Without a recorded `whenTail` the position is shown unless it is a
+ * strict ancestor of the newest entry (`isEmbeddedAncestor`), which means something was appended
+ * after it. An unknown target also falls back to the newest entry. Undefined when the file is
+ * absent, larger than a resumable transcript, or not a readable transcript.
  */
 export async function readEmbeddedTranscriptHistory(
 	file: string,
@@ -623,18 +624,43 @@ export async function readEmbeddedTranscriptHistory(
 	);
 	const tail = sessionEntries.at(-1)?.id ?? null;
 	const target = leaf?.entryId;
-	const leafId =
-		leaf &&
-		(leaf.whenTail === undefined || leaf.whenTail === tail) &&
-		(target === null || sessionEntries.some(entry => entry.id === target))
-			? (target ?? null)
-			: tail;
+	const parents = new Map(sessionEntries.map(entry => [entry.id, entry.parentId]));
+	const restore =
+		leaf !== undefined &&
+		(target === null || sessionEntries.some(entry => entry.id === target)) &&
+		(leaf.whenTail === undefined
+			? !isEmbeddedAncestor(entryId => parents.get(entryId), target ?? null, tail)
+			: leaf.whenTail === tail);
+	const leafId = restore ? (target ?? null) : tail;
 	return {
 		sessionId: header.id,
 		tail,
 		leafId,
 		messages: buildSessionContext(sessionEntries, leafId, undefined, header.id).messages,
 	};
+}
+
+/**
+ * Whether `entryId` lies on the path from the root to `tail` without being `tail` itself; the
+ * empty root (`null`) is an ancestor of every entry. `parentOf` answers an entry's parent id
+ * (`undefined` for an unknown entry). A view saved before tails were recorded whose position is
+ * a strict ancestor of today's tail was at what was then the end of the transcript, so what
+ * follows it was appended later; a position on another branch was a deliberate choice.
+ */
+export function isEmbeddedAncestor(
+	parentOf: (entryId: string) => string | null | undefined,
+	entryId: string | null,
+	tail: string | null,
+): boolean {
+	if (tail === null || entryId === tail) return false;
+	if (entryId === null) return true;
+	const seen = new Set<string>();
+	for (let current = parentOf(tail); current; current = parentOf(current)) {
+		if (current === entryId) return true;
+		if (seen.has(current)) return false;
+		seen.add(current);
+	}
+	return false;
 }
 
 /**

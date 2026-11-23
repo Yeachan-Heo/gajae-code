@@ -531,23 +531,81 @@ test("a saved view does not hide turns the terminal appended after it", async ()
 	]);
 });
 
-test("a row saved before tails were recorded keeps restoring its exact view", async () => {
+/** Turns a saved row into one written before tails were recorded: the view stays, its tail goes. */
+async function forgetRecordedTail(h: { dataDir: string }, view?: SdkSessionView) {
+	const catalog = await readCatalog(h.dataDir);
+	delete catalog.sessions[0]!.viewTail;
+	if (view) catalog.sessions[0]!.view = view;
+	await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify(catalog));
+}
+
+test("a row saved before tails were recorded opens at a continuation appended after its position", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
 	await h.call("prompt", { sessionId, text: "app turn" });
 	const saved = captureSessionView(h.sdk());
 	const transcript = h.sdk().sessionFile!;
 	await h.close();
-	const catalog = await readCatalog(h.dataDir);
-	delete catalog.sessions[0]!.viewTail;
-	await Bun.write(path.join(h.dataDir, "catalog.json"), JSON.stringify(catalog));
-	await continueInTerminal(transcript, h.projectDir, h.agentDir, h.track);
+	await forgetRecordedTail(h);
+	const { tail } = await continueInTerminal(transcript, h.projectDir, h.agentDir, h.track);
 	await h.restart();
 	await h.call("session.select", { sessionId });
-	// Without a recorded tail there is no evidence of who wrote later: restore exactly, as before.
-	expect(captureSessionView(h.sdk())).toEqual(saved);
+	// The saved position was the end of the transcript then; the terminal's turn came after it.
+	expect(captureSessionView(h.sdk())).toEqual({ sessionId: saved.sessionId, leafEntryId: tail });
 	const history = await h.call<DesktopHistory>("history.get", { sessionId });
-	expect(JSON.stringify(history.messages)).not.toContain("continued in the terminal");
+	expect(history.messages.map(message => message.text)).toContain("continued in the terminal");
+	// The next save records where the conversation now is, never the stale position.
+	await h.close();
+	const row = (await readCatalog(h.dataDir)).sessions[0];
+	expect(row?.view).toEqual({ sessionId: saved.sessionId, leafEntryId: tail });
+	expect(row?.viewTail).toBe(tail);
+});
+
+test("a row saved before tails were recorded keeps an older revision the user chose", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "original prompt" });
+	const original = h.lastUser();
+	await h.call("prompt", { sessionId, editEntryId: original, text: "revised prompt" });
+	// The user went back to the original revision; the newest entry is on the revised branch.
+	await h.call("session.revision", { sessionId, entryId: original });
+	const older = captureSessionView(h.sdk());
+	await h.close();
+	await forgetRecordedTail(h);
+	await h.restart();
+	await h.call("session.select", { sessionId });
+	expect(captureSessionView(h.sdk())).toEqual(older);
+	const history = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(JSON.stringify(history.messages)).toContain("original prompt");
+	expect(JSON.stringify(history.messages)).not.toContain("revised prompt");
+});
+
+test("a row saved before tails were recorded at the empty root opens at the newest entry", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const shown = captureSessionView(h.sdk());
+	await h.close();
+	await forgetRecordedTail(h, { sessionId: shown.sessionId, leafEntryId: null });
+	await h.restart();
+	await h.call("session.select", { sessionId });
+	// The empty root is an ancestor of every entry, so the turns after it are shown.
+	expect(captureSessionView(h.sdk())).toEqual(shown);
+});
+
+test("a released row saved before tails were recorded shows the terminal's continuation read-only", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const transcript = h.sdk().sessionFile!;
+	await h.call("session.disconnect", { sessionId });
+	await h.close();
+	await forgetRecordedTail(h);
+	await continueInTerminal(transcript, h.projectDir, h.agentDir, h.track);
+	await h.restart();
+	const selected = await h.call<DesktopSession>("session.select", { sessionId });
+	expect(selected.connection).toEqual({ state: "disconnected" });
+	expect(selected.messages.map(message => message.text)).toContain("continued in the terminal");
 });
 
 test("a recorded tail needs a saved view and an entry id", async () => {

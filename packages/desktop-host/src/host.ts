@@ -32,6 +32,7 @@ import {
 	getSessionMessageEntryId,
 	getSettingsCatalog,
 	type InputEventResult,
+	isEmbeddedAncestor,
 	isEmbeddedAppendRefused,
 	type lifecycle,
 	listEmbeddedProjectSessions,
@@ -1507,10 +1508,22 @@ export class DesktopHost {
 			if (metadata.view) {
 				// A tail other than the one saved with the view means another surface (the terminal)
 				// continued this transcript: stay at its new tail, where the transcript opened, so
-				// those turns are visible and the next prompt continues them. Rows saved before tails
-				// were recorded, and an unreadable tail, keep restoring the exact view.
-				const tail = metadata.viewTail === undefined ? undefined : await this.#transcriptTail(candidate);
-				if (!tail || tail.committed === metadata.viewTail) await restoreSessionView(result.session, metadata.view);
+				// those turns are visible and the next prompt continues them. A row saved before tails
+				// were recorded has no such evidence; its position is restored unless it is a strict
+				// ancestor of the tail (the end of the transcript then, appended to since), exactly as
+				// the read-only view decides. An unreadable tail keeps restoring the exact view.
+				const tail = await this.#transcriptTail(candidate);
+				const manager = result.session.sessionManager;
+				const restore =
+					!tail ||
+					(metadata.viewTail === undefined
+						? !isEmbeddedAncestor(
+								entryId => manager.getEntry(entryId)?.parentId,
+								metadata.view.leafEntryId,
+								tail.committed,
+							)
+						: tail.committed === metadata.viewTail);
+				if (restore) await restoreSessionView(result.session, metadata.view);
 				else if (result.session.sessionId !== metadata.view.sessionId)
 					throw new Error("Saved session view identity does not match transcript");
 			}

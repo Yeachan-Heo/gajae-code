@@ -429,7 +429,12 @@ A saved view can go stale when another surface continues the transcript. Save th
 `held` id from `await readEmbeddedTranscriptTail(session)` together with the view.
 On reopen, restore the view only when the transcript's `committed` tail still equals
 that saved id; otherwise stay where the transcript opened, at its newest entry, so the
-other surface's turns are visible and the next prompt continues them. While a session
+other surface's turns are visible and the next prompt continues them. A view saved without
+a tail has no such evidence: restore it unless its position is a strict ancestor of the
+`committed` tail (`isEmbeddedAncestor(parentOf, leafEntryId, committed)`, where `parentOf`
+returns an entry's `parentId`; the empty root counts as an ancestor of every entry). A strict
+ancestor was the end of the transcript when the view was saved, so what follows it was
+appended later; a position on another branch was a deliberate choice and is restored. While a session
 is open, `committed !== held` means another process appended after this session read
 the file. `isEmbeddedAppendRefused(session)` reports the store's lasting refusal of a
 stale writer; reopen the transcript to continue. Both read only; neither changes the
@@ -447,8 +452,9 @@ so another surface could continue it, call `await readEmbeddedTranscriptHistory(
 It parses the transcript without opening a session, taking a writer or rewriting the file, and
 returns `{ sessionId, tail, leafId, messages }`. Pass the saved view as
 `{ entryId: view.leafEntryId, whenTail: savedHeldTail }` to show the same position a reopen
-would: the saved entry while `whenTail` is still the newest entry (or when no tail was
-recorded), otherwise the newest entry. It returns `undefined` for an absent, oversized or
+would: the saved entry while `whenTail` is still the newest entry, otherwise the newest entry.
+Without `whenTail`, the saved entry is shown unless it is a strict ancestor of the newest entry,
+the same rule as above. It returns `undefined` for an absent, oversized or
 unreadable file. The result is display data only; reopen the transcript to continue it.
 
 Before opening a writer for a transcript another surface may hold, an embedding can call
