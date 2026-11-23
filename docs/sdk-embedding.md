@@ -460,14 +460,18 @@ unreadable file. The result is display data only; reopen the transcript to conti
 Before opening a writer for a transcript another surface may hold, an embedding can call
 `await findEmbeddedLiveOwner({ agentDir, sessionId })`. It asks the agent directory's running
 SDK broker, with one exact `session.list` lookup over a single connection, whether a live
-process (a terminal session hosting the SDK, or an owner the broker started) holds that
-transcript open, and answers `{ kind: "live" }`, `{ kind: "none" }` or
-`{ kind: "unknown", reason }`. It never starts, restarts or recovers a broker: with no broker
-running it returns `broker_absent` after one file read, and a broker that fails or does not
-answer within `timeoutMs` (default 1 s) yields `broker_unavailable`. The answer is advisory.
-A process started with `GJC_SDK_DISABLE=1`, a non-interactive run that does not host the SDK,
-or a process that opens the transcript after the check is not reported, so keep relying on the
-store's compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop.
+process holds that transcript open, and answers `{ kind: "live" }`, `{ kind: "none" }` or
+`{ kind: "unknown", reason }`. Every CLI run with a durable transcript registers its session in
+the agent directory's session index at startup, whatever its mode (interactive, `-p`, RPC; not
+ACP) and with or without `GJC_SDK_DISABLE=1`, and owners the broker started are registered too;
+a running broker reports each of them as live while its process is. An embedding's own session
+(created with SDK hosting off, as `createEmbeddedAgentSession` callers do) registers nothing and
+is never reported. The helper never starts, restarts or recovers a broker: with no broker
+running it returns `broker_absent` after one file read even though registrations are on disk,
+and a broker that fails or does not answer within `timeoutMs` (default 1 s) yields
+`broker_unavailable`. The answer is advisory: a process that opens the transcript after the
+check, or any process while no broker runs, is not seen, so keep relying on the store's
+compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.

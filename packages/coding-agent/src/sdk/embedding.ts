@@ -686,11 +686,13 @@ const LIVE_OWNER_ACTOR = { id: "embedding", namespace: "embedding-live-owner" };
 const LIVE_OWNER_TIMEOUT_MS = 1_000;
 
 /**
- * Ask the running SDK broker whether a live process (a terminal session hosting the SDK, or an
- * owner the broker started) holds `sessionId` open. Read-only and bounded: it never starts,
- * restarts or recovers a broker, makes one exact `session.list` lookup with a single connection
- * and no reconnects, and answers `unknown` instead of waiting past `timeoutMs`. Advisory only: a
- * process that does not register with the broker, or registers after the answer, is not seen.
+ * Ask the running SDK broker whether a live process holds `sessionId` open: any CLI run with a
+ * durable transcript (it registers in the session index at startup, whatever its mode or SDK
+ * hosting) or an owner the broker started. An embedding's own session, with SDK hosting off, is
+ * never reported. Read-only and bounded: it never starts, restarts or recovers a broker, makes one
+ * exact `session.list` lookup with a single connection and no reconnects, and answers `unknown`
+ * instead of waiting past `timeoutMs`. With no broker running nothing is seen (`broker_absent`).
+ * Advisory only: a process that opens the transcript after the answer is not seen.
  * `client` replaces the agent directory's broker connection (tests, custom transports).
  */
 export async function findEmbeddedLiveOwner(input: {
