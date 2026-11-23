@@ -8,6 +8,8 @@ export const recovery = {
 	"recovery.orphanOutcomeUnknown":
 		"Delivery recovery: the outcome is unknown. It may already have run; the app will not send it again.",
 	"recovery.orphanFailed": "Delivery recovery: delivery failed. Some work may already have run.",
+	"recovery.listedFailed":
+		"Delivery recovery: delivery failed. Some work may already have run. Restore the draft to review its text in the message box, or discard the record.",
 	"recovery.discardOrphan": "Discard record",
 	"recovery.restoreFirst":
 		"Restore the draft first. The outcome is unknown, so this record keeps the text until it is back in the message box.",

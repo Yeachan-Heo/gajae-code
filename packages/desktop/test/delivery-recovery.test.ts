@@ -54,6 +54,11 @@ test("an orphan's notice never mentions restoring, which it cannot offer", () =>
 	const failed = recoveryNotice({ ...entry, disposition: "failed" }, false, true);
 	expect(failed).toContain("Some work may already have run");
 	expect(failed).not.toMatch(/restor/iu);
+	// A listed failed card never shows its text: Restore draft is how the text comes back to review.
+	const listedFailed = recoveryNotice({ ...entry, sessionId: "listed", disposition: "failed" }, false, false);
+	expect(listedFailed).toContain("Some work may already have run");
+	expect(listedFailed).not.toContain("Review the text");
+	expect(listedFailed).toContain("Restore the draft to review its text in the message box");
 	// A listed conversation keeps today's wording.
 	expect(recoveryNotice(entry, false, false)).toBe(recoveryNotice(entry, false));
 	expect(recoveryNotice(entry, false)).toContain("will not resend it automatically");

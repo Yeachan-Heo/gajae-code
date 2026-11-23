@@ -34,7 +34,8 @@ export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean, o
 	if (entry.finalizing) return null;
 	if (entry.disposition === "unknown")
 		return orphan ? t("recovery.orphanOutcomeUnknown") : t("support.deliveryOutcomeUnknown");
-	if (entry.disposition === "failed") return orphan ? t("recovery.orphanFailed") : t("support.deliveryFailed");
+	// A listed card shows no text of its own: Restore draft brings the text back to review.
+	if (entry.disposition === "failed") return orphan ? t("recovery.orphanFailed") : t("recovery.listedFailed");
 	return null;
 }
 
