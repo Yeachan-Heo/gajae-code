@@ -85,6 +85,7 @@ import {
 	isCanonicalSessionId,
 	type LifecycleFailureArtifact,
 	prepareSpawnChildHostLaunch,
+	processIncarnationForBroker,
 	readSessionLifecycleFailure,
 	supportsEphemeralSessions,
 	validateBrokerModelPresetSync,
@@ -131,7 +132,11 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { isProcessIncarnation, observeProcessIncarnation, processIncarnation } from "./process-incarnation";
+import {
+	isProcessIncarnation,
+	observeProcessIncarnation,
+	type ProcessIncarnationObservation,
+} from "./process-incarnation";
 import {
 	armPublicationLivenessWatchdog,
 	disarmPublicationLivenessWatchdog,
@@ -542,6 +547,17 @@ export interface SpawnRegistrationRequest {
 	owner: SpawnLifecycleOwner;
 	effectMarker: string;
 	deadlineAt: number;
+	/**
+	 * Set only for the post-deadline recheck. The host already registered and
+	 * published readiness, so the outcome can be decided before `deadlineAt`: the
+	 * wait ends as soon as `decided()` resolves true (a readable failure receipt,
+	 * or an owner that provably exited), including while waiting for the index lock.
+	 * A completed read showing the host's recorded row no longer matches stops the
+	 * index reads, and the refusal then waits for `decided()` or the bound, because
+	 * a rolling-back host unregisters before its failure receipt is readable.
+	 * Polled every {@link SPAWN_LATE_RECHECK_PROBE_MS}.
+	 */
+	recheck?: { decided: () => Promise<boolean> };
 }
 
 /**
@@ -697,11 +713,28 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 /**
  * Bound for the single post-deadline registration observation after the host
- * published readiness: the observer gets the same 8 s semantic window the host
- * had, so index contention that outlasts the deadline by up to that much still
- * admits a host that registered in time. The master CLI waits 120 s for spawn.
+ * published readiness. The largest observed overrun past the semantic deadline
+ * was about 8.7 s (macOS, the global session index lock held by another
+ * process), so 20 s covers it with more than 2x margin. No tighter bound exists
+ * in the code: the lock itself retries for up to 60 s, which is far too long
+ * to hold a spawn. 20 s stays well inside the budgets around it: a refused
+ * spawn still answers around 28 s after the claim plus release, far below the
+ * master CLI's 120 s spawn timeout, and the host applies no cutoff once its
+ * startup committed. The recheck ends early on a readable failure receipt or an
+ * owner that provably exited (OS-confirmed absence or a changed incarnation). A
+ * decisive mismatch row stops the index reads but still waits for one of those
+ * or the bound, since a rolling-back host unregisters before its receipt is
+ * readable. An owner the OS cannot query or whose incarnation cannot be read,
+ * or a row that fails only the read-time liveness check, keeps it open until it
+ * is decided or the bound passes.
  */
-const SPAWN_LATE_REGISTRATION_RECHECK_MS = 8_000;
+const SPAWN_LATE_REGISTRATION_RECHECK_MS = 20_000;
+/**
+ * How often the recheck asks whether its outcome is already decided. The early
+ * end only needs to beat the 20 s bound, and the OS observation is a
+ * synchronous native call, so it runs coarser than the index poll.
+ */
+const SPAWN_LATE_RECHECK_PROBE_MS = 250;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
 /** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
@@ -837,11 +870,13 @@ async function readSpawnHostRegistration(
 	index: SessionIndex,
 	input: SpawnRegistrationRequest,
 	readStartDeadlineAt: number,
+	signal: AbortSignal | undefined,
 ): Promise<
 	| { kind: "match"; registration: SpawnHostRegistration & { lifecycleRequestId: string } }
-	| { kind: "mismatch" | "absent" }
+	| { kind: "mismatch"; decisive: boolean }
+	| { kind: "absent" }
 > {
-	await index.refresh({ readStartDeadlineAt });
+	await index.refresh({ readStartDeadlineAt, signal });
 	// The launch locator is authority: a same-id row registered by an
 	// unrelated workspace must never be adopted as this spawn's child.
 	const rows = index.listSessionIdentities(undefined, new Set([input.childId]));
@@ -863,11 +898,49 @@ async function readSpawnHostRegistration(
 			},
 		};
 	}
+	if (!rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0))
+		return { kind: "absent" };
+	// Row content is append-only, but `live` is projected at read time from an
+	// OS probe that can fail transiently, and from cross-root ambiguity that can
+	// resolve when the other root terminates. A row that fails only on `live`
+	// may match on the next read; any other mismatch (terminal, another pid,
+	// incarnation, request or locator) cannot.
 	return {
-		kind: rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0)
-			? "mismatch"
-			: "absent",
+		kind: "mismatch",
+		decisive: !rows.some(
+			candidate => !candidate.live && spawnRegistrationMatches({ ...candidate, live: true }, input),
+		),
 	};
+}
+
+/**
+ * Whether the spawned host's owner process provably exited: the OS confirms
+ * the pid is absent, or it now names a process with another incarnation.
+ * Every inconclusive observation (an unavailable addon, or a pid that cannot be
+ * opened or queried, which `Process.fromPid` reports as `null` on Windows) is
+ * not proof of exit.
+ */
+export function spawnOwnerProvablyExited(
+	pid: number,
+	expectedIncarnation: string,
+	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
+): boolean {
+	const observed = observe(pid);
+	if (observed.status === "absent") return true;
+	if (observed.status === "unknown") return false;
+	return observed.incarnation !== expectedIncarnation;
+}
+
+/** Resolve when `decided` settles or `deadlineAt` passes, without leaving a timer behind. */
+async function waitUntilDecidedOrDeadline(decided: Promise<void>, deadlineAt: number): Promise<void> {
+	const remaining = deadlineAt - Date.now();
+	if (remaining <= 0) return;
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([decided, new Promise<void>(resolve => (timer = setTimeout(resolve, remaining)))]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 /**
@@ -879,12 +952,19 @@ async function readSpawnHostRegistration(
  * that registered in time only because the observer was slow. Admission still
  * requires the full predicate against that read, including current liveness and
  * incarnation, never just an early publication timestamp.
+ *
+ * A recheck (`input.recheck`) ends when its `decided()` probe turns true, so a
+ * host that rolled back or died is refused without waiting out the recheck
+ * bound. A decisive mismatch row stops the index reads, and the refusal then
+ * waits only for that probe (or the bound), because a rolling-back host
+ * unregisters before its failure receipt becomes readable.
  */
 export async function awaitSpawnHostRegistration(
 	index: SessionIndex,
 	input: SpawnRegistrationRequest,
 ): Promise<SpawnRegistrationResult> {
 	const deadline = input.deadlineAt;
+	const recheck = input.recheck;
 	// A child row seen once stays a mismatch: the index is append-only. Absence
 	// is time-dependent, so it is reported only when a completed read near the
 	// deadline saw no row and no later attempt failed or was abandoned;
@@ -902,22 +982,63 @@ export async function awaitSpawnHostRegistration(
 			return "absent";
 		return "inconclusive";
 	};
-	for (;;) {
-		if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false, reason: miss() };
-		try {
-			const read = await readSpawnHostRegistration(index, input, deadline);
-			if (read.kind === "match") return { ok: true, registration: read.registration };
-			if (read.kind === "mismatch") mismatchSeen = true;
-			else {
-				absentCompletedAt = Date.now();
-				failedSinceAbsent = false;
+	// The probe runs beside the reads so it can also cut short a wait for the
+	// index lock held by another process; it never interrupts a read in progress.
+	const stop = new AbortController();
+	const decided = Promise.withResolvers<void>();
+	if (recheck)
+		void (async () => {
+			while (!stop.signal.aborted) {
+				let done = false;
+				try {
+					done = await recheck.decided();
+				} catch {
+					// An unreadable probe proves nothing; keep waiting within the bound.
+				}
+				if (done && !stop.signal.aborted) {
+					stop.abort(new Error("Spawn registration recheck outcome decided"));
+					decided.resolve();
+					return;
+				}
+				await Promise.race([Bun.sleep(SPAWN_LATE_RECHECK_PROBE_MS), decided.promise]);
 			}
-		} catch {
-			// A queue or lock wait that reached the deadline, or a transient read failure.
-			failedSinceAbsent = true;
+		})();
+	const ended = (): boolean => Date.now() >= deadline || stop.signal.aborted;
+	try {
+		for (;;) {
+			if (!Number.isSafeInteger(deadline) || ended()) return { ok: false, reason: miss() };
+			try {
+				const read = await readSpawnHostRegistration(index, input, deadline, recheck ? stop.signal : undefined);
+				if (read.kind === "match") return { ok: true, registration: read.registration };
+				if (read.kind === "mismatch") {
+					mismatchSeen = true;
+					// The host appended its row before it published readiness, so a row
+					// whose recorded content no longer matches cannot match on a later poll.
+					// Stop reading the index, but a host rolling back unregisters before it
+					// writes its failure receipt: wait (within the bound) for the probe to
+					// see that receipt or the owner exit, so the refusal reports the
+					// receipt rather than a timeout.
+					if (recheck && read.decisive) {
+						await waitUntilDecidedOrDeadline(decided.promise, deadline);
+						return { ok: false, reason: "mismatch" };
+					}
+				} else {
+					absentCompletedAt = Date.now();
+					failedSinceAbsent = false;
+				}
+			} catch {
+				// A queue or lock wait that reached the deadline or was cut short, or a transient read failure.
+				failedSinceAbsent = true;
+			}
+			if (ended()) return { ok: false, reason: miss() };
+			await Promise.race([
+				Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now())),
+				decided.promise,
+			]);
 		}
-		if (Date.now() >= deadline) return { ok: false, reason: miss() };
-		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
+	} finally {
+		stop.abort();
+		decided.resolve();
 	}
 }
 
@@ -944,12 +1065,13 @@ async function awaitLateSpawnHostVerdict(
 	childId: string,
 	marker: { pid: number; incarnation: string; effectMarker: string },
 	waitDeadlineAt: number,
+	readIncarnation: (pid: number) => string | undefined,
 ): Promise<{ kind: "ready" } | { kind: "failed"; failure: LifecycleFailureArtifact } | { kind: "unconfirmed" }> {
 	for (;;) {
 		const committed =
 			hasSessionLifecycleStartupCommit(stateRoot, childId, marker) &&
 			(await hasSessionLifecycleReadiness(stateRoot, childId, marker)) &&
-			processIncarnation(marker.pid) === marker.incarnation;
+			readIncarnation(marker.pid) === marker.incarnation;
 		// Read the failure last, so a receipt written after the reads above wins.
 		const failure = await readSessionLifecycleFailure(stateRoot, childId, marker);
 		if (failure) return { kind: "failed", failure };
@@ -3073,10 +3195,11 @@ export class Broker {
 				// commit); admission below still needs the exact predicate on that fresh
 				// read and the late verdict, which requires the host's startup commit.
 				let firstMiss: SpawnRegistrationMiss | undefined;
+				const ownerAlive = (): boolean => processIncarnationForBroker(this, pid) === incarnation;
 				if (
 					!registration.ok &&
 					registration.reason !== "mismatch" &&
-					processIncarnation(pid) === incarnation &&
+					ownerAlive() &&
 					(await hasSessionLifecycleReadiness(prep.stateRoot, prep.childId, marker)) &&
 					(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) === undefined
 				) {
@@ -3084,6 +3207,18 @@ export class Broker {
 					registration = await this.#spawnPromptLayer.awaitRegistration({
 						...registrationRequest,
 						deadlineAt: Date.now() + SPAWN_LATE_REGISTRATION_RECHECK_MS,
+						// An owner that provably exited or a readable failure receipt already
+						// decides the refusal; do not hold the spawn (or keep polling a
+						// contended index) for the bound. Only the tri-state observer decides
+						// exit: an owner it cannot query (a Windows PID that fails to open is
+						// one) is uncertain, not death, and a receipt still being promoted is
+						// not yet readable (ending on it would misreport the failure as a
+						// timeout); both keep waiting.
+						recheck: {
+							decided: async () =>
+								spawnOwnerProvablyExited(pid, incarnation) ||
+								(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) !== undefined,
+						},
 					});
 				}
 				const registrationMatches =
@@ -3108,6 +3243,7 @@ export class Broker {
 								prep.childId,
 								marker,
 								prep.terminationStartDeadlineAt,
+								pid => processIncarnationForBroker(this, pid),
 							)
 						: ({ kind: "ready" } as const);
 				// `!registration.ok` is implied by `!registrationMatches`; it is kept for type narrowing.

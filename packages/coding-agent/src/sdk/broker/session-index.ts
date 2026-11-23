@@ -1886,8 +1886,10 @@ export class SessionIndex {
 	 * runs to completion (a lock holder is never interrupted), so a resolved call
 	 * proves the projection reflects a read started before the deadline, even when
 	 * it finished after it.
+	 * `signal` (only with `readStartDeadlineAt`) ends that wait early the same way;
+	 * it never interrupts a read that already began.
 	 */
-	async refresh(options: { readStartDeadlineAt?: number } = {}): Promise<void> {
+	async refresh(options: { readStartDeadlineAt?: number; signal?: AbortSignal } = {}): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		const deadlineAt = options.readStartDeadlineAt;
 		if (deadlineAt === undefined) {
@@ -1896,24 +1898,25 @@ export class SessionIndex {
 			);
 			return;
 		}
-		await this.#refreshStartedBy(indexPath, deadlineAt);
+		await this.#refreshStartedBy(indexPath, deadlineAt, options.signal);
 	}
-	async #refreshStartedBy(indexPath: string, deadlineAt: number): Promise<void> {
+	async #refreshStartedBy(indexPath: string, deadlineAt: number, signal: AbortSignal | undefined): Promise<void> {
 		const expired = (): Error => new Error("Session index read did not start before its deadline");
 		if (!Number.isFinite(deadlineAt) || Date.now() >= deadlineAt) throw expired();
+		signal?.throwIfAborted();
 		const budget = new AbortController();
 		const abandoned = Promise.withResolvers<never>();
 		let reading = false;
+		const abandon = (reason: unknown): void => {
+			budget.abort(reason);
+			// A read already under the lock is awaited to completion; only a caller
+			// still waiting in the queue or on the lock is released here.
+			if (!reading) abandoned.reject(budget.signal.reason);
+		};
+		const onCallerAbort = (): void => abandon(signal?.reason);
+		signal?.addEventListener("abort", onCallerAbort, { once: true });
 		// The delay is clamped: setTimeout overflows above 2^31-1 ms and fires at once.
-		const timer = setTimeout(
-			() => {
-				budget.abort(expired());
-				// A read already under the lock is awaited to completion; only a caller
-				// still waiting in the queue or on the lock is released here.
-				if (!reading) abandoned.reject(budget.signal.reason);
-			},
-			Math.min(deadlineAt - Date.now(), 2 ** 31 - 1),
-		);
+		const timer = setTimeout(() => abandon(expired()), Math.min(deadlineAt - Date.now(), 2 ** 31 - 1));
 		timer.unref?.();
 		const queued = SessionIndex.#enqueue(indexPath, async () => {
 			budget.signal.throwIfAborted();
@@ -1936,6 +1939,7 @@ export class SessionIndex {
 			await Promise.race([queued, abandoned.promise]);
 		} finally {
 			clearTimeout(timer);
+			signal?.removeEventListener("abort", onCallerAbort);
 		}
 	}
 	async #refreshUnderLock(): Promise<void> {

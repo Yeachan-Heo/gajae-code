@@ -1813,7 +1813,7 @@ export function setProcessIncarnationForTest(
 	else processIncarnationReadersForTest.delete(broker);
 }
 
-function processIncarnationForBroker(broker: BrokerIndex, pid: number): string | undefined {
+export function processIncarnationForBroker(broker: BrokerIndex, pid: number): string | undefined {
 	const reader = processIncarnationReadersForTest.get(broker);
 	return reader ? reader(pid) : processIncarnation(pid);
 }
