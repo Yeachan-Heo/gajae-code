@@ -1573,6 +1573,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				return;
 			}
 
+			// A Gemini runaway detector abort can also complete the stream normally
+			// if the provider had already buffered the rest of the response.
+			if (geminiHeaderRunawaySelfAbort && !abortTracker.wasCallerAbort()) {
+				output.stopReason = "error";
+				output.errorCode = GEMINI_HEADER_RUNAWAY_ERROR_CODE;
+				output.errorMessage = `Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector?.count ?? 0} consecutive headers. Interrupted to prevent budget exhaustion.`;
+				output.duration = Date.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+				return;
+			}
+
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			if (firstEventTimeoutError) {
 				throw firstEventTimeoutError;
