@@ -1118,6 +1118,28 @@ test("Connect on a disconnected conversation the terminal still has open waits f
 	await h.close();
 });
 
+test("Connect while a terminal still has the conversation keeps it released on disk until the app takes it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	await h.call("session.disconnect", { sessionId });
+	const owner = await transcriptId(h);
+	h.liveOwners.add(owner);
+	expect((await h.call<DesktopSession>("session.connect", { sessionId })).connection).toEqual({ state: "elsewhere" });
+	// The app holds no writer yet, so a restart finds the conversation still released.
+	expect((await readCatalog(h.dataDir)).sessions[0]?.disconnected).toBe(true);
+	await h.restart();
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "disconnected" });
+	expect((await h.call<DesktopSession>("session.connect", { sessionId })).connection).toEqual({ state: "elsewhere" });
+	// Once the terminal closes, selecting takes it, and only then is the saved flag cleared.
+	h.liveOwners.delete(owner);
+	expect((await h.call<DesktopSession>("session.select", { sessionId })).connection).toEqual({ state: "connected" });
+	expect((await readCatalog(h.dataDir)).sessions[0]?.disconnected).toBeUndefined();
+	await h.restart();
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	await h.close();
+});
+
 test("a released conversation is deleted only once the broker can say no terminal has it", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;

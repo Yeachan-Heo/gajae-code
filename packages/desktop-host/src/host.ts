@@ -660,6 +660,12 @@ export class DesktopHost {
 	#readOnly = new Map<string, ReadOnlyView>();
 	/** Rows another live process holds open, from the last owner check; never persisted. */
 	#elsewhere = new Set<string>();
+	/**
+	 * Disconnected rows the user asked to Connect while a terminal still had them. They read as
+	 * connected in this run, so the next select takes them, but stay released on disk until the
+	 * app actually holds the writer again.
+	 */
+	#connectPending = new Set<string>();
 	readonly #liveOwnerClient?: lifecycle.SessionLifecycleClient;
 	#opening = new Map<string, Promise<LiveSession>>();
 	/**
@@ -1078,7 +1084,16 @@ export class DesktopHost {
 		return result.scope.directoryPath;
 	}
 	#save(): Promise<void> {
-		const content = JSON.stringify(this.#catalog);
+		const content = JSON.stringify(
+			this.#connectPending.size === 0
+				? this.#catalog
+				: {
+						...this.#catalog,
+						sessions: this.#catalog.sessions.map(session =>
+							this.#connectPending.has(session.id) ? { ...session, disconnected: true } : session,
+						),
+					},
+		);
 		const save = this.#saving.then(async () => {
 			const temporary = path.join(this.dataDir, `catalog.${crypto.randomUUID()}.tmp`);
 			try {
@@ -1352,6 +1367,8 @@ export class DesktopHost {
 			throw error;
 		}
 		const previousTitle = metadata.title;
+		// The writer is held from here: a Connect that waited for a terminal is now saved as connected.
+		const connected = this.#connectPending.delete(metadata.id);
 		try {
 			const live = this.#publishCandidate(candidate);
 			const title = live.sdk.sessionManager.getSessionName();
@@ -1360,6 +1377,7 @@ export class DesktopHost {
 			if (metadata.title !== previousTitle) this.#publishSnapshot();
 			return live;
 		} catch (error) {
+			if (connected) this.#connectPending.add(metadata.id);
 			metadata.title = previousTitle;
 			const live = this.#live.get(metadata.id);
 			if (live) {
@@ -2926,6 +2944,7 @@ export class DesktopHost {
 		}
 		// From here every writing request refuses, and nothing reopens the writer behind this.
 		metadata.disconnected = true;
+		this.#connectPending.delete(metadata.id);
 		const failures: unknown[] = [];
 		if (live) {
 			this.#live.delete(metadata.id);
@@ -2957,13 +2976,10 @@ export class DesktopHost {
 		this.#elsewhere.delete(metadata.id);
 		const wasDisconnected = metadata.disconnected === true;
 		if (wasDisconnected) {
+			// Saved as released until the open below (or a later select) holds the writer; the open
+			// saves the catalog then. A restart before that finds it still disconnected.
 			delete metadata.disconnected;
-			try {
-				await this.#save();
-			} catch (error) {
-				metadata.disconnected = true;
-				throw error;
-			}
+			this.#connectPending.add(metadata.id);
 		}
 		try {
 			const live = await this.#open(metadata);
@@ -2977,10 +2993,7 @@ export class DesktopHost {
 				return this.#dto(metadata);
 			}
 			// A reopen that fails leaves the conversation released, with Connect still offered.
-			if (wasDisconnected) {
-				metadata.disconnected = true;
-				await this.#save().catch(() => {});
-			}
+			if (wasDisconnected && this.#connectPending.delete(metadata.id)) metadata.disconnected = true;
 			this.#emit({ type: "session", session: this.#dto(metadata) });
 			throw error;
 		}
