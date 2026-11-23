@@ -81,6 +81,7 @@ import {
 	executeLifecycle,
 	hasSessionLifecycleReadiness,
 	isCanonicalSessionId,
+	type LifecycleFailureArtifact,
 	prepareSpawnChildHostLaunch,
 	readSessionLifecycleFailure,
 	supportsEphemeralSessions,
@@ -850,24 +851,34 @@ export async function awaitSpawnHostRegistration(
 /**
  * Host-side verdict for a registration the broker observed only after the
  * semantic deadline. The host publishes readiness only before that deadline
- * and writes a startup failure when it rolls back, so wait (bounded by the
- * host's own termination-start deadline) for one of the two. Readiness also
- * requires the owner to still be the same live process.
+ * and writes a startup failure when it rolls back, so wait, bounded by
+ * `waitDeadlineAt`, for one of the two. The ready marker becomes visible
+ * slightly before the host's last cutoff check, so readiness counts only when
+ * it is still present on a second read taken at least two polls past the
+ * semantic deadline, with the owner still the same live process and no
+ * failure receipt. A failure receipt always wins.
  */
 async function awaitLateSpawnHostVerdict(
 	stateRoot: string,
 	childId: string,
 	marker: { pid: number; incarnation: string; effectMarker: string },
-	deadlineAt: number,
-): Promise<"ready" | "failed" | "unconfirmed"> {
+	semanticDeadlineAt: number,
+	waitDeadlineAt: number,
+): Promise<{ kind: "ready" } | { kind: "failed"; failure: LifecycleFailureArtifact } | { kind: "unconfirmed" }> {
+	const confirmAt = semanticDeadlineAt + 2 * SPAWN_HOST_REGISTRATION_POLL_MS;
+	let readySeen = false;
 	for (;;) {
-		const ready = await hasSessionLifecycleReadiness(stateRoot, childId, marker);
+		const ready =
+			(await hasSessionLifecycleReadiness(stateRoot, childId, marker)) &&
+			processIncarnation(marker.pid) === marker.incarnation;
 		// Read the failure after readiness: a host that revokes readiness on its
 		// cutoff writes the failure, and that must win over a stale ready read.
-		if (await readSessionLifecycleFailure(stateRoot, childId, marker)) return "failed";
-		if (ready && processIncarnation(marker.pid) === marker.incarnation) return "ready";
-		const remaining = deadlineAt - Date.now();
-		if (remaining <= 0) return "unconfirmed";
+		const failure = await readSessionLifecycleFailure(stateRoot, childId, marker);
+		if (failure) return { kind: "failed", failure };
+		if (ready && readySeen && Date.now() >= confirmAt) return { kind: "ready" };
+		readySeen = ready;
+		const remaining = waitDeadlineAt - Date.now();
+		if (remaining <= 0) return { kind: "unconfirmed" };
 		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, remaining));
 	}
 }
@@ -2996,11 +3007,16 @@ export class Broker {
 								prep.stateRoot,
 								prep.childId,
 								marker,
+								prep.semanticReadyDeadlineAt,
 								prep.terminationStartDeadlineAt,
 							)
-						: "ready";
-				if (!registrationMatches || lateVerdict !== "ready" || !registration.ok) {
-					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
+						: ({ kind: "ready" } as const);
+				// `!registration.ok` is implied by `!registrationMatches`; it is kept for type narrowing.
+				if (!registrationMatches || lateVerdict.kind !== "ready" || !registration.ok) {
+					const startupFailure =
+						lateVerdict.kind === "failed"
+							? lateVerdict.failure
+							: await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					const miss: SpawnRegistrationMiss | undefined = !registration.ok
 						? registration.reason
 						: registrationMatches

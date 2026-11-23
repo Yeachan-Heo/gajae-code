@@ -1080,7 +1080,7 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
-	for (const host of ["ready", "failed", "silent"] as const) {
+	for (const host of ["ready", "failed", "silent", "ready-then-failed", "failed-late", "revoked"] as const) {
 		it(`settles a registration observed after the deadline on the host's own verdict: ${host}`, async () => {
 			// The registration layer may return a read that began in time after the
 			// clock passed the deadline (the macOS child_registration_timeout report:
@@ -1116,10 +1116,8 @@ describe("Broker spawn flow driver", () => {
 				spawnPromptLayer: {
 					awaitRegistration: async (input: SpawnRegistrationRequest) => {
 						deadlineAt = input.deadlineAt;
-						if (host === "ready")
-							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
-						if (host === "failed")
-							await writeSessionLifecycleFailure(
+						const writeFailure = () =>
+							writeSessionLifecycleFailure(
 								input.stateRoot,
 								input.childId,
 								input.effectMarker,
@@ -1135,6 +1133,26 @@ describe("Broker spawn flow driver", () => {
 								incarnation,
 								process.pid,
 							);
+						if (host === "ready" || host === "ready-then-failed")
+							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+						if (host === "failed" || host === "ready-then-failed") await writeFailure();
+						if (host === "revoked") {
+							// The host published readiness, then revoked it at its cutoff.
+							let revoke: (() => Promise<boolean>) | undefined;
+							await writeSessionLifecycleReady(
+								input.stateRoot,
+								input.childId,
+								input.effectMarker,
+								() => true,
+								captured => {
+									revoke = captured;
+								},
+							);
+							expect(await revoke?.()).toBe(true);
+						}
+						if (host === "failed-late")
+							// The host's failure receipt lands only after the late path started polling.
+							setTimeout(() => void writeFailure(), Math.max(0, input.deadlineAt - Date.now()) + 200);
 						await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 50);
 						return {
 							ok: true as const,
@@ -1182,7 +1200,10 @@ describe("Broker spawn flow driver", () => {
 					error: {
 						code: "spawn_failed",
 						details: {
-							code: host === "failed" ? "child_registration_failed" : "child_registration_timeout",
+							code:
+								host === "silent" || host === "revoked"
+									? "child_registration_timeout"
+									: "child_registration_failed",
 						},
 					},
 				});
@@ -1190,7 +1211,8 @@ describe("Broker spawn flow driver", () => {
 				expect(closes).toBe(1);
 				expect(claim?.state).toBe("pre_send_rejected");
 				expect(claim?.seed).toBeUndefined();
-				if (host === "silent") expect(claim?.failure?.message).toContain("did not confirm readiness");
+				if (host === "silent" || host === "revoked")
+					expect(claim?.failure?.message).toContain("did not confirm readiness");
 			} finally {
 				await broker.stop();
 			}

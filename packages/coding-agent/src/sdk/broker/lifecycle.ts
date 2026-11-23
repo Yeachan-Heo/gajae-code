@@ -1718,7 +1718,11 @@ export type SpawnChildHostLaunch = {
 	env: Readonly<Record<string, string>>;
 	effectMarker: string;
 	semanticReadyDeadlineAt: number;
-	/** Host rollback has started by then; bounds a broker waiting for the host's own startup verdict. */
+	/**
+	 * Broker-side bound for waiting on the host's own startup verdict after the
+	 * semantic deadline (the same convention termination scheduling uses). The
+	 * host does not promise its failure receipt by then.
+	 */
 	terminationStartDeadlineAt: number;
 };
 
@@ -2399,7 +2403,7 @@ export interface LifecycleTranscriptEvidence {
 	identity: SessionLifecycleTranscriptIdentity;
 }
 
-type LifecycleFailureArtifact = EffectMarker &
+export type LifecycleFailureArtifact = EffectMarker &
 	SdkStartupFailure & {
 		rollback: SdkStartupRollbackResult;
 		transcript?: LifecycleTranscriptEvidence;
