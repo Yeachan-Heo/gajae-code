@@ -16,6 +16,7 @@ import {
 	setLifecycleCommandResolverForTest,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
+	writeSessionLifecycleStartupCommit,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import * as incarnationModule from "../src/sdk/broker/process-incarnation";
@@ -1096,6 +1097,7 @@ describe("Broker spawn flow driver", () => {
 	for (const host of [
 		"ready",
 		"ready-stalled",
+		"ready-uncommitted",
 		"failed",
 		"silent",
 		"ready-then-failed",
@@ -1107,7 +1109,7 @@ describe("Broker spawn flow driver", () => {
 			// clock passed the deadline (the macOS child_registration_timeout report:
 			// host registered at +1.9 s of 8 s). The flow driver must not discard that
 			// host on the clock alone, but past the deadline the host may already be
-			// rolling back, so admission needs its committed readiness.
+			// rolling back, so admission needs its startup commit.
 			const agentDir = await temp();
 			const incarnation = processIncarnation(process.pid);
 			if (!incarnation) throw new Error("test process incarnation is unavailable");
@@ -1165,12 +1167,16 @@ describe("Broker spawn flow driver", () => {
 								incarnation,
 								process.pid,
 							);
+						const commitStartup = () =>
+							writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
 						if (host === "ready-stalled") {
 							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+							await commitStartup();
 							stallArmed = true;
 						}
-						if (host === "ready" || host === "ready-then-failed")
+						if (host === "ready" || host === "ready-uncommitted" || host === "ready-then-failed")
 							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+						if (host === "ready") await commitStartup();
 						if (host === "failed" || host === "ready-then-failed") await writeFailure();
 						if (host === "revoked") {
 							// The host published readiness, then revoked it at its cutoff.
@@ -1239,7 +1245,7 @@ describe("Broker spawn flow driver", () => {
 						code: "spawn_failed",
 						details: {
 							code:
-								host === "silent" || host === "revoked"
+								host === "silent" || host === "revoked" || host === "ready-uncommitted"
 									? "child_registration_timeout"
 									: "child_registration_failed",
 						},
@@ -1249,7 +1255,7 @@ describe("Broker spawn flow driver", () => {
 				expect(closes).toBe(1);
 				expect(claim?.state).toBe("pre_send_rejected");
 				expect(claim?.seed).toBeUndefined();
-				if (host === "silent" || host === "revoked")
+				if (host === "silent" || host === "revoked" || host === "ready-uncommitted")
 					expect(claim?.failure?.message).toContain("did not confirm readiness");
 			} finally {
 				incarnationSpy.mockRestore();
@@ -1263,7 +1269,7 @@ describe("Broker spawn flow driver", () => {
 	// the deadline; earlier reports came back 4 s and 8.7 s late.
 	for (const path_ of ["late-read", "recheck"] as const) {
 		for (const readiness of [true, false] as const) {
-			it(`${readiness ? "admits" : "refuses"} a host registered 2.1 s before and observed 3.7 s past the deadline (${path_}, readiness ${readiness ? "published" : "absent"})`, async () => {
+			it(`${readiness ? "admits" : "refuses"} a host registered 2.1 s before and observed 3.7 s past the deadline (${path_}, readiness and startup commit ${readiness ? "published" : "absent"})`, async () => {
 				const agentDir = await temp();
 				const incarnation = processIncarnation(process.pid);
 				if (!incarnation) throw new Error("test process incarnation is unavailable");
@@ -1316,8 +1322,10 @@ describe("Broker spawn flow driver", () => {
 								hostIncarnation: incarnation,
 								lifecycleRequestId: input.effectMarker,
 							});
-							if (readiness)
+							if (readiness) {
 								await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+								await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+							}
 							// The observer only comes back 3.7 s past the deadline.
 							await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 3_700);
 							if (path_ === "recheck") return { ok: false as const, reason: "inconclusive" as const };
@@ -1381,7 +1389,7 @@ describe("Broker spawn flow driver", () => {
 	}
 
 	for (const readiness of [true, false] as const) {
-		it(`${readiness ? "admits" : "refuses"} a timely host when the index lock is held until 3.7 s past the deadline (real reader, readiness ${readiness ? "published" : "absent"})`, async () => {
+		it(`${readiness ? "admits" : "refuses"} a timely host when the index lock is held until 3.7 s past the deadline (real reader, readiness and startup commit ${readiness ? "published" : "absent"})`, async () => {
 			const agentDir = await temp();
 			const incarnation = processIncarnation(process.pid);
 			if (!incarnation) throw new Error("test process incarnation is unavailable");
@@ -1429,8 +1437,10 @@ describe("Broker spawn flow driver", () => {
 								hostIncarnation: incarnation,
 								lifecycleRequestId: input.effectMarker,
 							});
-							if (readiness)
+							if (readiness) {
 								await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+								await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+							}
 							// Another process holds the machine-global index lock from before
 							// the broker can read the row until 3.7 s past the deadline.
 							const acquired = Promise.withResolvers<void>();

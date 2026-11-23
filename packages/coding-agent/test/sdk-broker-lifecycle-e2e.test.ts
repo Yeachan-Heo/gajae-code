@@ -33,6 +33,7 @@ import {
 	classifyLateAdmissionSpawnFailure,
 	deriveLifecycleDeadlines,
 	executeLifecycle,
+	hasSessionLifecycleStartupCommit,
 	hasValidLifecycleDeadlines,
 	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
@@ -49,6 +50,7 @@ import {
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
+	writeSessionLifecycleStartupCommit,
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -1231,6 +1233,160 @@ test("session host publishes SIGTERM failure without waiting for hung readiness 
 		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		releaseLateReadiness.resolve();
+		await startup?.catch(() => {});
+		await fixture.restore();
+	}
+}, 10_000);
+
+/** A minimal lifecycle session over the host's opened session manager. */
+function startupCommitHostSession(sessionId: string, openedSessionManager: SessionManager | undefined): AgentSession {
+	if (!openedSessionManager) throw new Error("Expected an opened lifecycle session manager.");
+	const sessionManager = {
+		getSessionId: () => sessionId,
+		ensureOnDisk: async () => await openedSessionManager.ensureOnDisk(),
+		getSessionFile: () => openedSessionManager.getSessionFile(),
+	} as unknown as SessionManager;
+	return {
+		sessionManager,
+		settings: {},
+		modelRegistry: {},
+		registerToolSessionTransitionCleanup: (_cleanup: () => Promise<void>) => {},
+		dispose: async () => await openedSessionManager.close(),
+		awaitDisposeCompletion: async () => {},
+	} as unknown as AgentSession;
+}
+
+for (const race of ["post-publication check", "post-stage check"] as const) {
+	test(`session host never publishes its startup commit when it loses the cutoff race after readiness was visible (${race})`, async () => {
+		const fixture = await createSessionHostFixture(`commit-cutoff-${race.split(" ")[0]}`, "commit-cutoff-marker");
+		const { root, sessionId, failurePath, readyPath } = fixture;
+		const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+		let nowMs = 1_000;
+		const commits: string[] = [];
+		let readyVisible = false;
+		let startup: Promise<void> | undefined;
+		try {
+			startup = runSessionHost({
+				cwd: root,
+				now: () => nowMs,
+				sleep: async () => await new Promise<void>(() => {}),
+				processIncarnation: () => "test-incarnation",
+				applyStartupModelProfiles: async () => {},
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner) throw new Error("Expected lifecycle startup owner.");
+					const session = startupCommitHostSession(sessionId, options?.sessionManager);
+					owner.capability.settleStarted();
+					return {
+						session,
+						capability: owner.capability,
+						rollback: owner.rollback,
+						startDeferredMemoryBackend: async () => {},
+					};
+				},
+				writeSessionLifecycleReady: async (_root, _id, effectMarker, canPublish, onPublishing, onPublished) => {
+					if (!canPublish) throw new Error("Readiness publication has no owner-bound cutoff guard.");
+					await fs.writeFile(readyPath, JSON.stringify({ pid: process.pid, effectMarker }));
+					readyVisible = true;
+					onPublishing?.(async () => {
+						await fs.rm(readyPath, { force: true });
+						return true;
+					});
+					// The host stalls with readiness visible until past its deadline.
+					nowMs = deadlines.semanticReadyDeadlineAt + 1;
+					if (race === "post-publication check" && !canPublish())
+						throw new Error("Lifecycle readiness cutoff passed during publication.");
+					onPublished?.();
+				},
+				writeSessionLifecycleStartupCommit: async (_root, _id, effectMarker) => {
+					commits.push(effectMarker);
+				},
+			});
+			const outcome = await Promise.race([
+				startup.then(
+					() => ({ kind: "resolved" as const }),
+					error => ({ kind: "rejected" as const, error }),
+				),
+				Bun.sleep(3_000).then(() => ({ kind: "timed_out" as const })),
+			]);
+			expect(readyVisible).toBe(true);
+			expect(outcome.kind).toBe("rejected");
+			if (outcome.kind !== "rejected") return;
+			expect(outcome.error).toMatchObject({ phase: "startup", reason: "pending" });
+			expect(commits).toEqual([]);
+			expect(await Bun.file(failurePath).exists()).toBe(true);
+			await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await startup?.catch(() => {});
+			await fixture.restore();
+		}
+	}, 10_000);
+}
+
+test("session host publishes its startup commit only after startup completed", async () => {
+	const fixture = await createSessionHostFixture("commit-after-startup", "commit-after-startup-marker");
+	const { root, sessionId, effectMarker, failurePath } = fixture;
+	const stateRoot = path.join(root, ".gjc", "state");
+	const previousSigtermListeners = process.listeners("SIGTERM");
+	const originalSleep = Bun.sleep.bind(Bun);
+	// The post-startup watchers poll every 15 s or more; stop the host there.
+	const sleepSpy = vi.spyOn(Bun, "sleep").mockImplementation(async (ms: number | Date) => {
+		const delay = typeof ms === "number" ? ms : ms.getTime() - Date.now();
+		if (delay >= 15_000) throw new Error("stop-watchers");
+		return originalSleep(ms);
+	});
+	const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+		throw new Error(`process.exit:${code ?? ""}`);
+	}) as typeof process.exit);
+	let startupSignalArmedAtCommit: boolean | undefined;
+	let startup: Promise<void> | undefined;
+	try {
+		startup = runSessionHost({
+			cwd: root,
+			now: () => 1_000,
+			sleep: async () => await new Promise<void>(() => {}),
+			processIncarnation: () => "test-incarnation",
+			applyStartupModelProfiles: async () => {},
+			createLifecycleAgentSession: async (options, owner) => {
+				if (!owner) throw new Error("Expected lifecycle startup owner.");
+				const session = startupCommitHostSession(sessionId, options?.sessionManager);
+				owner.capability.settleStarted();
+				return {
+					session,
+					capability: owner.capability,
+					rollback: owner.rollback,
+					startDeferredMemoryBackend: async () => {},
+				};
+			},
+			writeSessionLifecycleReady: async (_root, _id, _effectMarker, canPublish, onPublishing, onPublished) => {
+				if (canPublish && !canPublish()) throw new Error("cannot-publish");
+				onPublishing?.(async () => true);
+				onPublished?.();
+			},
+			writeSessionLifecycleStartupCommit: async (commitRoot, id, marker) => {
+				// Startup rollback is armed through the owner-bound SIGTERM handler;
+				// it must already be gone when the commit is written.
+				startupSignalArmedAtCommit = process
+					.listeners("SIGTERM")
+					.some(listener => !previousSigtermListeners.includes(listener));
+				await writeSessionLifecycleStartupCommit(commitRoot, id, marker);
+			},
+		});
+		const outcome = await startup.then(
+			() => ({ error: undefined as unknown }),
+			(error: unknown) => ({ error }),
+		);
+		expect((outcome.error as Error).message).toBe("stop-watchers");
+		expect(startupSignalArmedAtCommit).toBe(false);
+		const incarnation = processIncarnation(process.pid);
+		if (!incarnation) throw new Error("test process incarnation is unavailable");
+		expect(
+			hasSessionLifecycleStartupCommit(stateRoot, sessionId, { pid: process.pid, incarnation, effectMarker }),
+		).toBe(true);
+		expect(await Bun.file(failurePath).exists()).toBe(false);
+		expect(exitSpy).not.toHaveBeenCalled();
+	} finally {
+		sleepSpy.mockRestore();
+		exitSpy.mockRestore();
 		await startup?.catch(() => {});
 		await fixture.restore();
 	}

@@ -80,6 +80,7 @@ import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
 	hasSessionLifecycleReadiness,
+	hasSessionLifecycleStartupCommit,
 	isCanonicalSessionId,
 	type LifecycleFailureArtifact,
 	prepareSpawnChildHostLaunch,
@@ -921,51 +922,35 @@ export async function awaitSpawnHostRegistration(
 
 /**
  * Host-side verdict for a registration the broker observed only after the
- * semantic deadline. The host publishes its readiness marker only before that
- * deadline and writes a startup failure receipt when it rolls back, but the
- * marker becomes visible slightly before the host's last cutoff check and can
- * still be revoked. So readiness counts only when it is present on two reads at
- * least one poll apart, the later one no earlier than the termination start
- * (`waitDeadlineAt`), with the owner still the same live process and no failure receipt
- * on either read.
- * A failure receipt always wins.
+ * semantic deadline. Past the deadline the readiness marker alone proves
+ * nothing: it becomes visible before the host's last cutoff check, and a host
+ * that loses that check revokes it and writes its failure receipt, possibly
+ * much later. Admission therefore needs the host's startup commit, which the
+ * host writes only after startup can no longer roll back, together with the
+ * owner and readiness markers naming this launch and the owner still being the
+ * same live process. A failure receipt always wins.
  *
- * `waitDeadlineAt` bounds waiting for a verdict that has not appeared. It does
- * not bound confirming readiness that is already present: one confirming read
- * is always taken, so a host that published readiness in time is admitted even
- * when the broker observes it seconds late. A flapping marker resets the
- * confirmation and is then bounded by `waitDeadlineAt`.
+ * The commit is irreversible, so one observation suffices even when the broker
+ * observes it seconds late. `waitDeadlineAt` (termination start) bounds waiting
+ * for a verdict that has not appeared; at least one read is always taken. A
+ * host that never writes a commit (one that predates it, or whose write
+ * failed) stays unconfirmed: the late path fails closed.
  */
 async function awaitLateSpawnHostVerdict(
 	stateRoot: string,
 	childId: string,
 	marker: { pid: number; incarnation: string; effectMarker: string },
-	semanticDeadlineAt: number,
 	waitDeadlineAt: number,
 ): Promise<{ kind: "ready" } | { kind: "failed"; failure: LifecycleFailureArtifact } | { kind: "unconfirmed" }> {
-	// The confirming read lands no earlier than `waitDeadlineAt` (termination
-	// start), giving a host that lost its cutoff race time to revoke readiness.
-	const confirmAt = Math.max(semanticDeadlineAt + 2 * SPAWN_HOST_REGISTRATION_POLL_MS, waitDeadlineAt);
-	let readySince: number | undefined;
 	for (;;) {
-		const observedAt = Date.now();
-		const ready =
+		const committed =
+			hasSessionLifecycleStartupCommit(stateRoot, childId, marker) &&
 			(await hasSessionLifecycleReadiness(stateRoot, childId, marker)) &&
 			processIncarnation(marker.pid) === marker.incarnation;
-		// Read the failure after readiness: a host that revokes readiness on its
-		// cutoff writes the failure, and that must win over a stale ready read.
+		// Read the failure last, so a receipt written after the reads above wins.
 		const failure = await readSessionLifecycleFailure(stateRoot, childId, marker);
 		if (failure) return { kind: "failed", failure };
-		if (ready && readySince !== undefined) return { kind: "ready" };
-		if (ready) {
-			// Confirmation is count-based: the second read is always taken, at
-			// least one poll later and past the confirmation point, so a broker
-			// event-loop stall cannot turn present readiness into unconfirmed.
-			readySince = observedAt;
-			await Bun.sleep(Math.max(0, Math.max(readySince + SPAWN_HOST_REGISTRATION_POLL_MS, confirmAt) - Date.now()));
-			continue;
-		}
-		readySince = undefined;
+		if (committed) return { kind: "ready" };
 		const remaining = waitDeadlineAt - Date.now();
 		if (remaining <= 0) return { kind: "unconfirmed" };
 		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, remaining));
@@ -3081,8 +3066,9 @@ export class Broker {
 				// No row was observed in time, but the host published readiness, which it
 				// does only after registering and only before its cutoff. The observer was
 				// too slow, not the host: allow one bounded post-deadline observation.
-				// Admission below still needs the exact predicate on that fresh read and
-				// the late readiness verdict.
+				// Readiness only gates this extra look (the host may still be writing its
+				// commit); admission below still needs the exact predicate on that fresh
+				// read and the late verdict, which requires the host's startup commit.
 				let firstMiss: SpawnRegistrationMiss | undefined;
 				if (
 					!registration.ok &&
@@ -3111,14 +3097,13 @@ export class Broker {
 				// even when it ends after it, so a slow observer no longer discards a
 				// host that registered in time. Registration is not readiness, though:
 				// past the deadline the host may already be rolling back, so a late
-				// observation is admitted only on the host's confirmed readiness marker.
+				// observation is admitted only on the host's startup commit.
 				const lateVerdict =
 					registrationMatches && Date.now() >= prep.semanticReadyDeadlineAt
 						? await awaitLateSpawnHostVerdict(
 								prep.stateRoot,
 								prep.childId,
 								marker,
-								prep.semanticReadyDeadlineAt,
 								prep.terminationStartDeadlineAt,
 							)
 						: ({ kind: "ready" } as const);
