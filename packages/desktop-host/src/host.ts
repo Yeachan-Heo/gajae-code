@@ -108,6 +108,7 @@ import type {
 	DesktopCommand,
 	DesktopCommandResult,
 	DesktopCompletionResult,
+	DesktopConnectionRefusal,
 	DesktopDeliveryReceipt,
 	DesktopDiff,
 	DesktopDisconnectResult,
@@ -451,9 +452,18 @@ const ELSEWHERE =
  * request is answered as a read-only one even if a later "Check again" has already cleared the
  * finding by the time it is answered.
  */
-class SteppedAside extends Error {
+class ConnectionRefusal extends Error {
+	constructor(
+		readonly state: DesktopConnectionRefusal,
+		message: string,
+	) {
+		super(message);
+		this.name = "ConnectionRefusal";
+	}
+}
+class SteppedAside extends ConnectionRefusal {
 	constructor() {
-		super(ELSEWHERE);
+		super("elsewhere", ELSEWHERE);
 		this.name = "SteppedAside";
 	}
 }
@@ -1272,10 +1282,10 @@ export class DesktopHost {
 	#writable(metadata: SavedSession): boolean {
 		return !this.#disconnecting.has(metadata.id) && this.#connection(metadata) === "connected";
 	}
-	#notWritable(metadata: SavedSession): Error {
-		return new Error(
-			metadata.disconnected ? DISCONNECTED : this.#disconnecting.has(metadata.id) ? DISCONNECTING : ELSEWHERE,
-		);
+	#notWritable(metadata: SavedSession): ConnectionRefusal {
+		if (metadata.disconnected) return new ConnectionRefusal("disconnected", DISCONNECTED);
+		if (this.#disconnecting.has(metadata.id)) return new ConnectionRefusal("disconnecting", DISCONNECTING);
+		return new ConnectionRefusal("elsewhere", ELSEWHERE);
 	}
 	/**
 	 * Ask the broker whether another live process holds this transcript open, and remember the
@@ -3374,6 +3384,7 @@ export class DesktopHost {
 					error: this.#error(error),
 					...(deliveryDisposition ? { deliveryDisposition } : {}),
 					...(preferenceOutcome ? { preferenceOutcome } : {}),
+					...(error instanceof ConnectionRefusal ? { connectionRefusal: error.state } : {}),
 				},
 				false,
 				preferenceOutcome,

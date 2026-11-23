@@ -1,6 +1,11 @@
 import { assertDesktopAttachmentRequestSize } from "@gajae-code/desktop-host/attachment-protocol";
 import type { DesktopPreferenceOutcome } from "@gajae-code/desktop-host/preferences-protocol";
-import type { DesktopFrame, DesktopMethod, DesktopRequest } from "@gajae-code/desktop-host/protocol";
+import type {
+	DesktopConnectionRefusal,
+	DesktopFrame,
+	DesktopMethod,
+	DesktopRequest,
+} from "@gajae-code/desktop-host/protocol";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { t } from "./i18n";
@@ -11,6 +16,8 @@ export class DesktopRequestError extends Error {
 		message: string,
 		readonly deliveryDisposition?: "refused" | "failed" | "unknown",
 		readonly preferenceOutcome?: DesktopPreferenceOutcome,
+		/** The Host refused only because the app does not write the conversation right now. */
+		readonly connectionRefusal?: DesktopConnectionRefusal,
 	) {
 		super(message);
 		this.name = "DesktopRequestError";
@@ -55,6 +62,7 @@ function receive(frame: DesktopFrame): void {
 						frame.error,
 						frame.deliveryDisposition,
 						frame.preferenceOutcome ? structuredClone(frame.preferenceOutcome) : undefined,
+						frame.connectionRefusal,
 					),
 				);
 		}

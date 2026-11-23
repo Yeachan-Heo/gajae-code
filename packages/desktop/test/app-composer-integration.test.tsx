@@ -2968,6 +2968,97 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("a prompt refused because the conversation is read-only shows no banner, and none is left after it is writable again", async () => {
+		const { context, page } = await fixture();
+		const conversation = (state: "connected" | "disconnected" | "elsewhere") => ({
+			id: "a",
+			title: "Session A",
+			projectId: "p",
+			status: "idle" as const,
+			starred: false,
+			imageInput: { supported: true, blocked: false },
+			operatorRunning: false,
+			controlGeneration: state === "connected" ? 1 : null,
+			messages: [],
+			connection: { state },
+		});
+		const banners = () =>
+			page.$$eval(".conversation-column .error-banner", nodes => nodes.map(node => node.textContent ?? ""));
+		try {
+			await select(page);
+			const cases = [
+				{
+					state: "elsewhere" as const,
+					error: "A terminal (another gjc process) is using this conversation, so the app shows it read-only. Finish there, then check again.",
+				},
+				{
+					state: "disconnected" as const,
+					error: "This conversation is not connected to the app, so a terminal can continue it. Connect it to continue here.",
+				},
+			];
+			for (const { state, error } of cases) {
+				const request = await send(page, `refused while ${state}`);
+				// The Host steps aside (or finds it released) and answers the prompt as a typed refusal.
+				await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation(state));
+				await page.evaluate(
+					({ id, error, state }) =>
+						window.fixture.emit({
+							type: "response",
+							id,
+							ok: false,
+							error,
+							deliveryDisposition: "refused",
+							connectionRefusal: state,
+						}),
+					{ id: request.id, error, state },
+				);
+				await page.waitForSelector(".composer-area .connection-notice");
+				// The read-only notice says it; a red banner repeating it is not shown.
+				expect({ state, banners: await banners() }).toEqual({ state, banners: [] });
+				// "Check again" (or Connect) takes the conversation back: the draft is back, still no banner.
+				await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation("connected"));
+				await page.waitForFunction(
+					text => (document.querySelector(".composer textarea") as HTMLTextAreaElement | null)?.value === text,
+					{},
+					`refused while ${state}`,
+				);
+				expect({ state, banners: await banners() }).toEqual({ state, banners: [] });
+				await page.$eval(".composer textarea", node => {
+					const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+					setter?.call(node, "");
+					node.dispatchEvent(new Event("input", { bubbles: true }));
+				});
+				await page.waitForFunction(() => (document.querySelector(".composer textarea") as HTMLTextAreaElement).value === "");
+			}
+			// "Being disconnected" is not a connection state the notice shows, so it is a banner, until the
+			// conversation's connection changes.
+			const request = await send(page, "refused while disconnecting");
+			const disconnecting = "This conversation is being disconnected from the app, so nothing new can start in it. Connect it again to continue here.";
+			await page.evaluate(
+				({ id, error }) =>
+					window.fixture.emit({
+						type: "response",
+						id,
+						ok: false,
+						error,
+						deliveryDisposition: "refused",
+						connectionRefusal: "disconnecting",
+					}),
+				{ id: request.id, error: disconnecting },
+			);
+			await page.waitForFunction(
+				text => [...document.querySelectorAll(".conversation-column .error-banner")].some(node => node.textContent?.includes(text)),
+				{},
+				disconnecting,
+			);
+			await page.evaluate(session => window.fixture.emit({ type: "session", session }), conversation("disconnected"));
+			await page.waitForSelector(".composer-area .connection-notice");
+			expect(await banners()).toEqual([]);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
 	test("the sidebar menu renames another conversation without selecting it", async () => {
 		const { context, page } = await fixture();
 		try {

@@ -252,6 +252,13 @@ export interface DesktopSession {
  * the transcript and nothing can be sent until `session.connect`. `elsewhere`: another gjc
  * process has it open, so the app shows it read-only; `session.connect` checks again.
  */
+/**
+ * A request refused because the app does not write the conversation right now: it is released
+ * (`disconnected`), being released (`disconnecting`), or another gjc process has it (`elsewhere`).
+ * The session's `connection` state already says the first and last of these.
+ */
+export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnecting";
+
 export interface DesktopSessionConnection {
 	state: "connected" | "disconnected" | "elsewhere";
 }
@@ -425,6 +432,8 @@ export type DesktopFrame =
 			error: string;
 			deliveryDisposition?: "refused" | "failed" | "unknown";
 			preferenceOutcome?: DesktopPreferenceOutcome;
+			/** Set when the request was refused only because of who writes the conversation. */
+			connectionRefusal?: DesktopConnectionRefusal;
 	  }
 	| { type: "snapshot"; snapshot: DesktopSnapshot }
 	| { type: "session"; session: DesktopSession }

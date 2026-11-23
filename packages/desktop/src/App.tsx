@@ -301,6 +301,11 @@ export default function App() {
 	const [connection, setConnection] = useState(t("shell.connecting"));
 	const [fatal, setFatal] = useState(false);
 	const [errors, setErrors] = useState<Record<string, string>>({});
+	/**
+	 * Scopes whose error is a refusal about who writes a conversation, by that conversation. The
+	 * banner is stale once the conversation's connection changes, so it is cleared then.
+	 */
+	const connectionRefusals = useRef(new Map<string, string>());
 	const [errorOwners, setErrorOwners] = useState<Record<string, { requestId: string; sessionId: string }>>({});
 	const [recoveries, setRecoveries] = useState<DeliveryRecovery[]>([]);
 	const [recoveryBootstrapSettled, setRecoveryBootstrapSettled] = useState(false);
@@ -721,6 +726,20 @@ export default function App() {
 	const session = snapshot?.sessions.find(item => item.id === selected);
 	/** The app writes the selected conversation itself; otherwise it is shown read-only. */
 	const writable = connectionState(session) === "connected";
+	const sessionConnection = session ? connectionState(session) : undefined;
+	// A refusal about who writes this conversation goes stale when its connection changes: after
+	// Disconnect finishes, Connect, or "Check again" taking it back.
+	useEffect(() => {
+		if (!selected) return;
+		const stale = [...connectionRefusals.current].filter(([, sessionId]) => sessionId === selected);
+		if (!stale.length) return;
+		for (const [scope] of stale) connectionRefusals.current.delete(scope);
+		setErrors(previous => {
+			const next = { ...previous };
+			for (const [scope] of stale) next[scope] = "";
+			return next;
+		});
+	}, [selected, sessionConnection]);
 	const rememberedTranscript = transcriptPositions.current.get(selected);
 	const transcriptRuns = useTranscriptRuns(selected, session?.controlGeneration ?? null);
 	const anchorIndex =
@@ -1338,6 +1357,7 @@ export default function App() {
 		locks.current.add(scope);
 		setPending(previous => ({ ...previous, [scope]: true }));
 		setErrors(previous => ({ ...previous, [scope]: "" }));
+		connectionRefusals.current.delete(scope);
 		setErrorOwners(previous => {
 			const next = { ...previous };
 			delete next[scope];
@@ -1347,6 +1367,12 @@ export default function App() {
 		try {
 			await action();
 		} catch (error) {
+			const refusal = error instanceof DesktopRequestError ? error.connectionRefusal : undefined;
+			// The conversation's connection notice already says it is read-only (another process has it,
+			// or it is disconnected): a banner repeating that would only go stale.
+			if (refusal === "elsewhere" || refusal === "disconnected") return;
+			// "Being disconnected" is not a connection state yet; it is shown until the state changes.
+			if (refusal && errorSessionId) connectionRefusals.current.set(scope, errorSessionId);
 			if (error instanceof DesktopRequestError)
 				setErrorOwners(previous => ({
 					...previous,

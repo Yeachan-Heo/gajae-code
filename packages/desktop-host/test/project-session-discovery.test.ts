@@ -112,8 +112,11 @@ async function fixture() {
 		for (const manager of managers) await manager.close();
 		await fs.rm(directory, { recursive: true, force: true });
 	});
-	const call = async <T>(method: DesktopRequest["method"], params: Record<string, unknown> = {}): Promise<T> => {
-		const id = crypto.randomUUID();
+	const call = async <T>(
+		method: DesktopRequest["method"],
+		params: Record<string, unknown> = {},
+		id: string = crypto.randomUUID(),
+	): Promise<T> => {
 		await host.handle(parseRequest(JSON.stringify({ id, method, params })));
 		const response = frames.find(frame => frame.type === "response" && frame.id === id);
 		if (response?.type !== "response") throw new Error("Missing response");
@@ -438,6 +441,19 @@ test("a conversation created in the terminal opens in the app like one the app c
 	// Disconnect releases it for the terminal, which continues the same transcript; Connect
 	// takes it back and lands on what the terminal added.
 	expect(await h.call("session.disconnect", { sessionId: terminal.id })).toMatchObject({ disconnected: true });
+	const released = crypto.randomUUID();
+	await expect(h.call("prompt", { sessionId: terminal.id, text: "while released" }, released)).rejects.toThrow(
+		"not connected to the app",
+	);
+	expect(h.frames.find(frame => frame.type === "response" && frame.id === released)).toMatchObject({
+		connectionRefusal: "disconnected",
+	});
+	// A failure that is not about the connection carries no such type.
+	const failed = crypto.randomUUID();
+	await expect(h.call("session.select", { sessionId: "not-a-conversation" }, failed)).rejects.toThrow();
+	expect(h.frames.find(frame => frame.type === "response" && frame.id === failed)).not.toHaveProperty(
+		"connectionRefusal",
+	);
 	const resumed = await SessionManager.open(
 		terminal.file,
 		SessionManager.managedDestination(h.projectDir, h.agentDir),
@@ -481,9 +497,16 @@ test("a terminal-created conversation a terminal has open is read-only in the ap
 	expect(selected.messages.map(message => message.text)).toEqual(["Message for Open in a terminal"]);
 	expect(selected.controlGeneration).toBeNull();
 	expect(h.created).toHaveLength(0);
-	await expect(h.call("prompt", { sessionId: terminal.id, text: "from the app" })).rejects.toThrow(
+	const refused = crypto.randomUUID();
+	await expect(h.call("prompt", { sessionId: terminal.id, text: "from the app" }, refused)).rejects.toThrow(
 		"A terminal (another gjc process) is using this conversation",
 	);
+	// The refusal is typed, so the app can tell it apart from a failure without matching its text.
+	expect(h.frames.find(frame => frame.type === "response" && frame.id === refused)).toMatchObject({
+		ok: false,
+		deliveryDisposition: "refused",
+		connectionRefusal: "elsewhere",
+	});
 	await expect(h.call("session.delete", { sessionId: terminal.id })).rejects.toThrow("has this conversation open");
 	// Reads of panels that need a writer answer as unavailable, not with an error.
 	const activity = await h.call<{ activity: { available: boolean } }>("activity.get", { sessionId: terminal.id });
