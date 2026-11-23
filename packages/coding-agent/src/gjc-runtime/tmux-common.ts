@@ -41,14 +41,14 @@ export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
  * (`$TMUX`), or the first set of LC_ALL/LC_CTYPE/LANG names UTF-8. Any other client gets
  * every byte outside printable ASCII replaced with `_`, including tab separators and
  * non-ASCII names and paths in parsed replies. A detached Broker or harness start inherits
- * its launcher's locale, and launchd or a service manager provides none, so every native
- * tmux client GJC runs and parses requests UTF-8 output instead of depending on the
- * caller's environment. The flag precedes the subcommand, so the Linux owner-isolation
- * server proof inherits it from the new-session control prefix. psmux has its own client
- * flags and never receives it. Interactive attach is deliberately excluded: its output
- * goes to the user's terminal, whose locale is authoritative.
+ * its launcher's locale, and launchd or a service manager provides none, so the managed-session
+ * clients and the harness owner's private-socket clients request UTF-8 output instead of
+ * depending on the caller's environment. The flag precedes the subcommand, so the Linux
+ * owner-isolation server proof inherits it from the new-session control prefix. psmux has its
+ * own client flags and never receives it. Interactive attach is deliberately excluded: its
+ * output goes to the user's terminal, whose locale is authoritative.
  */
-export const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
+const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
 
 export function tmuxClientFlags(isPsmux: boolean): string[] {
 	return isPsmux ? [] : [NATIVE_TMUX_UTF8_CLIENT_FLAG];

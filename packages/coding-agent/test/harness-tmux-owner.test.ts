@@ -533,17 +533,20 @@ describe.skipIf(!realTmux)("HarnessCommand tmux-resident owner from a non-UTF-8 
 	});
 
 	afterEach(async () => {
-		await retireLiveFixtureOwner(privateEnv());
-		const socketDir = path.join(tmuxTmpdir, `tmux-${process.getuid?.() ?? 0}`);
-		for (const socket of await readdir(socketDir).catch(() => [])) {
-			// Only servers inside this fixture's socket directory are removed.
-			Bun.spawnSync([realTmux!, "-L", socket, "kill-server"], {
-				stdout: "pipe",
-				stderr: "pipe",
-				env: { TMUX_TMPDIR: tmuxTmpdir },
-			});
+		try {
+			await retireLiveFixtureOwner(privateEnv());
+		} finally {
+			const socketDir = path.join(tmuxTmpdir, `tmux-${process.getuid?.() ?? 0}`);
+			for (const socket of await readdir(socketDir).catch(() => [])) {
+				// Only servers inside this fixture's socket directory are removed.
+				Bun.spawnSync([realTmux!, "-L", socket, "kill-server"], {
+					stdout: "pipe",
+					stderr: "pipe",
+					env: { TMUX_TMPDIR: tmuxTmpdir },
+				});
+			}
+			await rm(tmuxTmpdir, { recursive: true, force: true });
 		}
-		await rm(tmuxTmpdir, { recursive: true, force: true });
 	});
 
 	it("proves the private owner session binding with a real tmux server", async () => {
