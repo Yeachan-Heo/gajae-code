@@ -3559,6 +3559,8 @@ export class DesktopHost {
 			if (!target.managed && !this.#writable(target)) return this.#dispatchReadOnly(request, target);
 			const live = await this.#open(target).catch(error => {
 				if (!target.managed && !this.#writable(target)) return undefined;
+				// A conversation the app could not reopen is shown from its transcript; so is its history.
+				if (!target.managed && this.#readOnly.has(target.id) && !this.#live.has(target.id)) return undefined;
 				throw error;
 			});
 			if (!live) return this.#dispatchReadOnly(request, target);
@@ -3679,6 +3681,13 @@ export class DesktopHost {
 		} catch (error) {
 			// The owner check found another process holding it: answer as a read-only conversation.
 			if (!this.#writable(metadata)) return this.#dispatchReadOnly(request, metadata);
+			// The open failed again where an earlier reopen left the transcript shown in its place:
+			// keep showing what the file holds now (it is re-read only when the file changed).
+			if (this.#readOnly.has(metadata.id) && !this.#live.has(metadata.id) && !this.#opening.has(metadata.id)) {
+				await this.#loadReadOnly(metadata).catch(() => {});
+				if (!this.#closed && this.#catalog.sessions.includes(metadata))
+					this.#emit({ type: "session", session: this.#dto(metadata) });
+			}
 			throw error;
 		}
 		// A Disconnect that began while this request waited for the conversation to open fences it.

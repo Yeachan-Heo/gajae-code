@@ -883,6 +883,53 @@ test("a reload that cannot reopen still shows the conversation, and selecting ag
 	await h.close();
 });
 
+test("the conversation shown after a failed reopen stays current and its full history loads", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	const file = stale.sessionFile!;
+	const entries = stale.sessionManager.getEntries();
+	const answer = entries.at(-1)!;
+	// A newer terminal appended an entry this build cannot open, so every open of it fails.
+	await fs.appendFile(
+		file,
+		`${JSON.stringify({ type: "future_entry_kind", id: "0f0f0f0f", parentId: answer.id, timestamp: new Date().toISOString() })}\n`,
+	);
+	await expect(h.call("session.select", { sessionId })).rejects.toThrow();
+	await stale.awaitDisposeCompletion();
+	expect(h.snapshot().sessions[0]?.messages.map(message => message.text)).toEqual(["app turn", "controlled answer"]);
+	// The terminal goes on writing; the app still cannot open the file, but it shows what is there now.
+	const lines = (await Bun.file(file).text()).trimEnd().split("\n");
+	const prompt = lines
+		.map(line => JSON.parse(line))
+		.find(entry => entry.type === "message" && entry.message?.role === "user");
+	await fs.appendFile(
+		file,
+		`${JSON.stringify({
+			...prompt,
+			id: "1a1a1a1a",
+			parentId: answer.id,
+			timestamp: new Date().toISOString(),
+			message: { ...prompt.message, content: [{ type: "text", text: "continued in the terminal" }] },
+		})}\n`,
+	);
+	await expect(h.call("session.select", { sessionId })).rejects.toThrow();
+	expect(h.snapshot().sessions[0]?.messages.map(message => message.text)).toEqual([
+		"app turn",
+		"controlled answer",
+		"continued in the terminal",
+	]);
+	// Loading the full history reads it from the transcript too, instead of failing.
+	const history = await h.call<DesktopHistory>("history.get", { sessionId });
+	expect(history.messages.map(message => message.text)).toEqual([
+		"app turn",
+		"controlled answer",
+		"continued in the terminal",
+	]);
+	await h.close();
+});
+
 test("a refused write hands back queued input it can never send, then reloads", async () => {
 	let hold = false;
 	const entered = Promise.withResolvers<void>();
