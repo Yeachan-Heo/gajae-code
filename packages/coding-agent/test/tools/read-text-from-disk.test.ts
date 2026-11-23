@@ -44,6 +44,22 @@ describe("readTextFromDisk", () => {
 	});
 
 	it.skipIf(!fs.existsSync("/dev/zero"))("refuses character devices", async () => {
-		await expect(readTextFromDisk("/dev/zero")).rejects.toThrow("character device");
+		const outcome = await Promise.race([
+			readTextFromDisk("/dev/zero").then(
+				() => "READ" as const,
+				(error: unknown) => error,
+			),
+			Bun.sleep(1_500).then(() => "HUNG" as const),
+		]);
+		if (outcome === "HUNG") {
+			// Release the blocked reader so the test process can exit.
+			try {
+				fs.closeSync(fs.openSync("/dev/zero", fs.constants.O_RDONLY | fs.constants.O_NONBLOCK));
+			} catch {}
+		}
+		expect(outcome).toBeInstanceOf(Error);
+		expect((outcome as Error).message).toBe(
+			"Cannot open '/dev/zero': it is a character device, not a regular file or directory.",
+		);
 	});
 });

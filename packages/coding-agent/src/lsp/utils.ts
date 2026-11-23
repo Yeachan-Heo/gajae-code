@@ -19,8 +19,8 @@ import type {
 	WorkspaceEdit,
 } from "./types";
 
-export { detectLanguageId } from "../utils/lang-from-path";
 export { readTextFromDisk, specialFileKind } from "../tools/path-utils";
+export { detectLanguageId } from "../utils/lang-from-path";
 
 // =============================================================================
 // URI Handling (Cross-Platform)

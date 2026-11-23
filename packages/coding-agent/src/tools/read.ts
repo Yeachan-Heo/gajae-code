@@ -72,6 +72,7 @@ import {
 	expandPath,
 	formatPathRelativeToCwd,
 	resolveReadPath,
+	specialFileKind,
 	splitInternalUrlSel,
 	splitPathAndSel,
 } from "./path-utils";
@@ -2842,6 +2843,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		if (parsed.kind === "conflicts") {
 			return this.#readFileConflicts(absolutePath, suffixResolution, signal, params.truncation);
+		}
+
+		// Refuse special files (FIFOs, devices, sockets) that can block indefinitely
+		const fileStat = await Bun.file(absolutePath).stat();
+		const kind = specialFileKind(fileStat);
+		if (kind) {
+			throw new ToolError(`Cannot open '${localReadPath}': it is a ${kind}, not a regular file or directory.`);
 		}
 
 		const imageMetadata = await readImageMetadata(absolutePath);
