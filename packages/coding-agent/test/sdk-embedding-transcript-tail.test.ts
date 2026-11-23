@@ -123,3 +123,54 @@ test("a same-size rewrite is seen even when the rewriter restores the modificati
 	expect([after.ino, after.size, after.mtimeNs]).toEqual([before.ino, before.size, before.mtimeNs]);
 	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: replacement, held: null });
 });
+
+test("a read that cannot be told apart from a write in the same tick is not reused", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close());
+	const own = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	// The file's last change is not clearly before the read: here its modification time is ahead.
+	const ahead = new Date(Date.now() + 60_000);
+	await fs.utimes(app.getSessionFile()!, ahead, ahead);
+	const reads = vi.spyOn(SessionManager.prototype, "captureCommittedSnapshot");
+	cleanups.push(async () => reads.mockRestore());
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	// A write in that tick could leave every stat field equal, so each check reads the file again.
+	expect(reads).toHaveBeenCalledTimes(2);
+});
+
+test("a read during which another process appended is not reused, even when file times look old", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close());
+	const own = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	await settle();
+	// A filesystem whose clock lags this process (a network share, say) makes every change look settled.
+	const now = Date.now();
+	const lagging = vi.spyOn(Date, "now").mockReturnValue(now + 60_000);
+	cleanups.push(async () => lagging.mockRestore());
+	const capture = SessionManager.prototype.captureCommittedSnapshot;
+	let foreign: string | undefined;
+	const reads = vi.spyOn(SessionManager.prototype, "captureCommittedSnapshot").mockImplementation(async function (
+		this: SessionManager,
+	) {
+		const read = await capture.call(this);
+		if (foreign === undefined) {
+			// Another process appends after the snapshot was read, before this check finishes.
+			const terminal = await SessionManager.open(app.getSessionFile()!, destination);
+			foreign = terminal.appendMessage(user("terminal turn"));
+			await terminal.flush();
+			await terminal.closeStrict();
+		}
+		return read;
+	});
+	cleanups.push(async () => reads.mockRestore());
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	// The file changed while it was read, so the next check reads it again and sees the append.
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: foreign, held: own });
+});
