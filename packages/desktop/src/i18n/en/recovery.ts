@@ -14,9 +14,9 @@ export const recovery = {
 	"recovery.restoreFirst":
 		"Restore the draft first. The outcome is unknown, so this record keeps the text until it is back in the message box.",
 	"recovery.deleteDiscardsOne":
-		"Deleting also discards 1 unsent message whose draft was never restored. Copy its text first if you still need it.",
+		"Deleting also discards 1 unsent message that is neither in the conversation nor back in the message box. Copy its text first if you still need it.",
 	"recovery.deleteDiscards":
-		"Deleting also discards {count} unsent messages whose drafts were never restored. Copy their text first if you still need it.",
+		"Deleting also discards {count} unsent messages that are neither in the conversation nor back in the message box. Copy their text first if you still need it.",
 	"recovery.copyAllText": "Copy all text",
 	"recovery.textsLabel": "Unsent messages",
 	"recovery.messageNumber": "Message {index} of {count}",

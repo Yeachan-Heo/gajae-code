@@ -3698,6 +3698,39 @@ suite("mounted composer delivery recovery", () => {
 		} finally { await closeFixture(context, page); }
 	}, 30000);
 
+	test("the Delete confirmation names a refused message whose automatic restore failed", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.evaluate(async () => {
+				const db = await new Promise<IDBDatabase>((resolve, reject) => {
+					const open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+					open.onsuccess = () => resolve(open.result);
+					open.onerror = () => reject(open.error);
+				});
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction("deliveries", "readwrite");
+					tx.objectStore("deliveries").put({ id: "refused-lost", sessionId: "b", text: "refused payload", attachments: [], disposition: "pending" });
+					tx.oncomplete = () => resolve();
+					tx.onabort = () => reject(tx.error);
+				});
+				db.close();
+				const state = JSON.parse(sessionStorage.getItem("fixture") || '{"receipts":[],"requests":[]}') as FixtureState;
+				state.receipts = [{ id: "refused-lost", sessionId: "b", disposition: "refused" }];
+				sessionStorage.setItem("fixture", JSON.stringify(state));
+				// The refusal's automatic restore into the composer fails, so the text stays only in the record.
+				sessionStorage.setItem("failBootstrapRestore", "yes");
+			});
+			await page.reload(); await select(page, 1);
+			await page.waitForFunction(() => document.body.textContent?.includes("Retry recovery"));
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.evaluate(() => [...document.querySelectorAll<HTMLButtonElement>(".command-list button")].find(button => button.textContent?.includes("Delete"))?.click());
+			await page.waitForSelector(".delete-confirmation");
+			await page.waitForSelector(".delete-recoveries");
+			expect(await page.$eval(".delete-recoveries", node => node.textContent)).toContain("1 unsent message");
+			expect(await page.$$eval(".delete-recoveries .recovery-text", nodes => nodes.map(node => node.textContent))).toEqual(["refused payload"]);
+		} finally { await closeFixture(context, page); }
+	}, 30000);
+
 	test("stacked recovery cards are separate cards in the reading column, each with one row of distinct actions", async () => {
 		const { context, page } = await fixture();
 		try {

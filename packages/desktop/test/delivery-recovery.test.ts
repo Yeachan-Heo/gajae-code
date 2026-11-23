@@ -6,7 +6,7 @@ import {
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { DesktopLocalRequestError, validateDesktopRequest } from "../src/bridge";
 import type * as Recovery from "../src/delivery-recovery";
-import { type DeliveryRecovery, recoveryNotice } from "../src/delivery-recovery";
+import { type DeliveryRecovery, recoveriesDroppedWithConversation, recoveryNotice } from "../src/delivery-recovery";
 import { browserPath } from "./component-fixture";
 
 test("recovery notices distinguish actionable outcomes from routine bookkeeping", () => {
@@ -62,6 +62,45 @@ test("an orphan's notice never mentions restoring, which it cannot offer", () =>
 	// A listed conversation keeps today's wording.
 	expect(recoveryNotice(entry, false, false)).toBe(recoveryNotice(entry, false));
 	expect(recoveryNotice(entry, false)).toContain("will not resend it automatically");
+});
+
+test("deleting a conversation names every record whose text it loses, from the same list it drops", () => {
+	const record = (id: string, changes: Partial<DeliveryRecovery>): DeliveryRecovery => ({
+		id,
+		sessionId: "doomed",
+		text: `text of ${id}`,
+		attachments: [],
+		disposition: "pending",
+		...changes,
+	});
+	const entries = [
+		record("ran", { disposition: "completed" }),
+		record("stopped", { disposition: "cancelled" }),
+		record("back-in-composer", { disposition: "unknown", restored: true }),
+		record("being-discarded", { disposition: "unknown", finalizing: true }),
+		// A refused input whose automatic restore failed: its text is neither run nor in the composer.
+		record("refused-restore-failed", { disposition: "refused" }),
+		record("removed-restore-failed", { disposition: "removed" }),
+		record("unknown", { disposition: "unknown" }),
+		record("failed", { disposition: "failed" }),
+		record("unsent-repair", { disposition: "pending", prepared: true }),
+		record("in-flight", { disposition: "accepted" }),
+		{ ...record("elsewhere", { disposition: "unknown" }), sessionId: "other" },
+	];
+	const { dropped, lost } = recoveriesDroppedWithConversation(entries, "doomed");
+	expect(dropped.map(entry => entry.id)).toEqual(
+		entries.filter(entry => entry.sessionId === "doomed").map(entry => entry.id),
+	);
+	expect(lost.map(entry => entry.id)).toEqual([
+		"refused-restore-failed",
+		"removed-restore-failed",
+		"unknown",
+		"failed",
+		"unsent-repair",
+		"in-flight",
+	]);
+	// Every lost record is one that is dropped.
+	expect(lost.every(entry => dropped.includes(entry))).toBe(true);
 });
 
 test("prompt envelope validation includes exact UTF-8 bytes at the frame boundary", () => {

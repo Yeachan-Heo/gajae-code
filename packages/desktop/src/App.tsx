@@ -108,6 +108,7 @@ import {
 	loadDeliveries,
 	loadDrafts,
 	nextDeliverySequence,
+	recoveriesDroppedWithConversation,
 	recoveryNotice,
 	saveDelivery,
 	saveDrafts,
@@ -505,7 +506,7 @@ export default function App() {
 	/** The Host already forgot a deleted conversation's receipts; its local records go with it. */
 	const dropRecoveries = (sessionId: string) =>
 		enqueueRecovery(async () => {
-			for (const entry of recoveriesRef.current.filter(item => item.sessionId === sessionId)) {
+			for (const entry of recoveriesDroppedWithConversation(recoveriesRef.current, sessionId).dropped) {
 				await deleteDelivery(entry.id);
 				restorationFailures.current.delete(entry.id);
 				if (unsentRepairs.current.has(entry.id)) finishUnsentRepair(entry.id, sessionId);
@@ -3691,18 +3692,8 @@ export default function App() {
 					{dialog === "delete" && (
 						<DeleteConversationConfirmation
 							title={session?.title ?? ""}
-							// Deleting drops the conversation's recovery records too; name the unrestored ones.
-							texts={recoveries
-								.filter(
-									item =>
-										item.sessionId === selected &&
-										!item.restored &&
-										!item.finalizing &&
-										(item.disposition === "unknown" ||
-											item.disposition === "failed" ||
-											unsentRepairs.current.get(item.id) === item.sessionId),
-								)
-								.map(item => item.text)}
+							// Deleting drops the conversation's recovery records too; name every text that goes with them.
+							texts={recoveriesDroppedWithConversation(recoveries, selected).lost.map(item => item.text)}
 							disabled={!connected || !!pending[selected]}
 							onDelete={() => {
 								const sessionId = selected;

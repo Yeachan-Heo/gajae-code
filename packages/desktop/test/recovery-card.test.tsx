@@ -484,11 +484,11 @@ suite("Recovery card showcase", () => {
 			});
 			expect(seen).toEqual([
 				dialog(null),
-				dialog("Deleting also discards 1 unsent message whose draft was never restored"),
-				dialog("Deleting also discards 3 unsent messages whose drafts were never restored"),
-				dialog("Deleting also discards 2 unsent messages whose drafts were never restored"),
-				dialog("Deleting also discards 1 unsent message whose draft was never restored"),
-				dialog("Deleting also discards 1 unsent message whose draft was never restored", true),
+				dialog("Deleting also discards 1 unsent message that is neither in the conversation nor back in the message box"),
+				dialog("Deleting also discards 3 unsent messages that are neither in the conversation nor back in the message box"),
+				dialog("Deleting also discards 2 unsent messages that are neither in the conversation nor back in the message box"),
+				dialog("Deleting also discards 1 unsent message that is neither in the conversation nor back in the message box"),
+				dialog("Deleting also discards 1 unsent message that is neither in the conversation nor back in the message box", true),
 			]);
 		} finally {
 			await context.close();

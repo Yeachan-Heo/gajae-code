@@ -39,6 +39,25 @@ export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean, o
 	return null;
 }
 
+/** A record's text is safe once it ran into the transcript or is back in the composer. */
+const textIsSafe = (entry: DeliveryRecovery) =>
+	entry.restored === true || entry.disposition === "completed" || entry.disposition === "cancelled";
+
+/**
+ * What deleting a conversation does to its delivery-recovery records: `dropped` is every record for
+ * it (all go with it), and `lost` the ones whose text goes too — neither in the transcript nor back
+ * in the composer, and not already being discarded. That covers an unknown or failed outcome, an
+ * input in flight or awaiting repair, and a refused or handed-back input whose automatic restore
+ * failed. The Delete dialog's warning and the drop both come from here, so they cannot drift apart.
+ */
+export function recoveriesDroppedWithConversation(
+	entries: readonly DeliveryRecovery[],
+	sessionId: string,
+): { dropped: DeliveryRecovery[]; lost: DeliveryRecovery[] } {
+	const dropped = entries.filter(entry => entry.sessionId === sessionId);
+	return { dropped, lost: dropped.filter(entry => !entry.finalizing && !textIsSafe(entry)) };
+}
+
 export interface DurableDraft {
 	sessionId: string;
 	text: string;
