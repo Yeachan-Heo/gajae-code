@@ -1882,6 +1882,9 @@ type CustomModelOverlay = {
 	isOAuth?: boolean;
 };
 
+/** Overlay-declared thinking keyed by exact provider, then exact model id. */
+type DeclaredThinkingIndex = Map<string, Map<string, ThinkingConfig>>;
+
 function mergeCustomModelHeaders(
 	providerHeaders: Record<string, string> | undefined,
 	modelHeaders: Record<string, string> | undefined,
@@ -5057,11 +5060,21 @@ export class ModelRegistry {
 	}
 
 	#resolveDiscoveredModelCatalog(baseModels: readonly Model<Api>[], discovered: readonly Model<Api>[]): Model<Api>[] {
+		// First base entry per provider + id, matching the order a linear `find` would pick.
+		const baseByProvider = new Map<string, Map<string, Model<Api>>>();
+		for (const candidate of baseModels) {
+			let byId = baseByProvider.get(candidate.provider);
+			if (!byId) {
+				byId = new Map();
+				baseByProvider.set(candidate.provider, byId);
+			}
+			if (!byId.has(candidate.id)) byId.set(candidate.id, candidate);
+		}
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
 				mergeDiscoveredModel(
 					model,
-					baseModels.find(candidate => candidate.provider === model.provider && candidate.id === model.id),
+					baseByProvider.get(model.provider)?.get(model.id),
 					this.#resolveProviderOverride(model.provider),
 				),
 			),
@@ -6622,9 +6635,13 @@ export class ModelRegistry {
 		}
 		return result;
 	}
-	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
+	#applyRuntimeProviderOverride(
+		model: Model<Api>,
+		override: ProviderOverride,
+		declaredThinking?: DeclaredThinkingIndex,
+	): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(
-			this.#restoreDeclaredThinking(model),
+			this.#restoreDeclaredThinking(model, declaredThinking),
 			override,
 		);
 		const sanitizedBaseUrl = this.#stripUrlUserinfo(withTransportOverride.baseUrl);
@@ -6644,21 +6661,25 @@ export class ModelRegistry {
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
+		let declaredThinking: DeclaredThinkingIndex | undefined;
 		return models.map(model => {
 			const override = this.#runtimeProviderOverrides.get(model.provider);
 			if (!override) return model;
 			const runtimeCredentialRevoked =
 				this.#runtimeProviderApiKeys.has(model.provider) &&
 				!this.#runtimeProviderCredentialInstalled.has(model.provider);
+			declaredThinking ??= this.#buildDeclaredThinkingIndex();
 			return this.#applyRuntimeProviderOverride(
 				model,
 				runtimeCredentialRevoked ? { ...override, apiKey: undefined, authHeader: undefined } : override,
+				declaredThinking,
 			);
 		});
 	}
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
+		const declaredThinking = this.#buildDeclaredThinkingIndex();
 		const finalized = models.map(model => {
-			const restored = { ...this.#restoreDeclaredThinking(model) };
+			const restored = { ...this.#restoreDeclaredThinking(model, declaredThinking) };
 			// Preserve models with endpoint-provided reasoning effort maps to avoid overriding
 			// with inferred defaults. enrichModelThinking would infer wider ranges based on
 			// provider/API defaults rather than the endpoint's advertised values.
@@ -6734,11 +6755,41 @@ export class ModelRegistry {
 		}
 		return result;
 	}
-	#restoreDeclaredThinking(model: Model<Api>): Model<Api> {
+	/**
+	 * Index of overlay-declared thinking by exact provider + model id. Runtime
+	 * overlays take precedence over config overlays, and within each list the
+	 * first declaring overlay wins — the same order a linear `find` would use.
+	 * Built per finalize pass so a catalog of N models costs O(N + overlays)
+	 * instead of O(N × overlays).
+	 */
+	#buildDeclaredThinkingIndex(): DeclaredThinkingIndex {
+		const index: DeclaredThinkingIndex = new Map();
+		for (const overlays of [this.#runtimeModelOverlays, this.#customModelOverlays]) {
+			for (const overlay of overlays) {
+				if (overlay.thinking === undefined) continue;
+				let byId = index.get(overlay.provider);
+				if (!byId) {
+					byId = new Map();
+					index.set(overlay.provider, byId);
+				}
+				if (!byId.has(overlay.id)) byId.set(overlay.id, overlay.thinking);
+			}
+		}
+		return index;
+	}
+	/**
+	 * Batch callers pass an index from `#buildDeclaredThinkingIndex()`; single-model
+	 * callers omit it and keep the short-circuiting linear lookup.
+	 */
+	#restoreDeclaredThinking(model: Model<Api>, declaredThinking?: DeclaredThinkingIndex): Model<Api> {
 		const overrideThinking = this.#modelOverrides
 			.get(model.provider.toLowerCase())
 			?.get(model.id.toLowerCase())?.thinking;
 		if (overrideThinking !== undefined) return { ...model, thinking: overrideThinking as ThinkingConfig };
+		if (declaredThinking) {
+			const thinking = declaredThinking.get(model.provider)?.get(model.id);
+			return thinking === undefined ? model : { ...model, thinking };
+		}
 		const hasDeclaredThinking = (candidate: CustomModelOverlay) =>
 			candidate.provider === model.provider && candidate.id === model.id && candidate.thinking !== undefined;
 		const overlay =
