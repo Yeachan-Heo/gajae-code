@@ -47,7 +47,17 @@ test("reports the committed tail and the tail this session holds once another pr
 	expect(isEmbeddedAppendRefused({ sessionManager: app })).toBe(true);
 });
 
-test("a terminal that resumed before the embedding's last write is refused too, so the transcript never branches", async () => {
+/** The transcript's message entries as `[id, parentId]`, in file order. */
+async function messageGraph(file: string) {
+	return (await Bun.file(file).text())
+		.trimEnd()
+		.split("\n")
+		.map(line => JSON.parse(line) as { type: string; id?: string; parentId?: string | null })
+		.filter(entry => entry.type === "message")
+		.map(entry => [entry.id, entry.parentId]);
+}
+
+test("a stale write on the plain append path, as a non-interactive run (`gjc -p`) makes, is refused", async () => {
 	const { cwd, destination } = await store();
 	const app = SessionManager.create(cwd, destination);
 	cleanups.push(() => app.close().catch(() => {}));
@@ -60,15 +70,36 @@ test("a terminal that resumed before the embedding's last write is refused too, 
 	const second = app.appendMessage(user("second app turn"));
 	await app.flush();
 	expect(() => terminal.appendMessage(user("stale terminal write"))).toThrow("managed_append_identity_mismatch");
-	const entries = (await Bun.file(app.getSessionFile()!).text())
-		.trimEnd()
-		.split("\n")
-		.map(line => JSON.parse(line) as { type: string; id?: string; parentId?: string | null })
-		.filter(entry => entry.type === "message");
-	expect(entries.map(entry => [entry.id, entry.parentId])).toEqual([
+	expect(await messageGraph(app.getSessionFile()!)).toEqual([
 		[first, null],
 		[second, first],
 	]);
+});
+
+test("a stale write on the shared append path, as an interactive terminal makes, commits a sibling branch", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close().catch(() => {}));
+	const first = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	// An interactive terminal resumes the transcript, then the embedding writes before it does.
+	const terminal = await SessionManager.open(app.getSessionFile()!, destination);
+	cleanups.push(() => terminal.close().catch(() => {}));
+	const second = app.appendMessage(user("second app turn"));
+	await app.flush();
+	// Not refused: the terminal's entry is a child of its own position, beside the embedding's.
+	const shared = await terminal.appendMessageSharingSession(user("stale terminal write"));
+	if (shared.kind !== "committed") throw new Error(`The shared append was not committed: ${shared.kind}`);
+	expect(await messageGraph(app.getSessionFile()!)).toEqual([
+		[first, null],
+		[second, first],
+		[shared.id, first],
+	]);
+	// The newest entry is now the terminal's, so the embedding's next append is refused, and a
+	// reopen lands on the terminal's branch with the embedding's turn on the other one.
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: shared.id, held: second });
+	expect(() => app.appendMessage(user("next app turn"))).toThrow("managed_append_identity_mismatch");
 });
 
 test("has no tail to report before the transcript is published", async () => {
