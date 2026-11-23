@@ -1616,10 +1616,11 @@ describe("Broker spawn flow driver", () => {
 				},
 			});
 			brokerRef = broker;
-			// The owner process "dies" through the broker's incarnation seam; the
+			// The owner process provably exits through the broker's incarnation seam:
+			// its pid now reads as a different, readable incarnation (pid reuse). The
 			// index's own liveness probe still sees this live test process.
 			setProcessIncarnationForTest(broker, pid =>
-				ownerDead && pid === process.pid ? undefined : processIncarnation(pid),
+				ownerDead && pid === process.pid ? "replaced-incarnation" : processIncarnation(pid),
 			);
 			await broker.start();
 			try {
@@ -1658,6 +1659,116 @@ describe("Broker spawn flow driver", () => {
 			}
 		}, 40_000);
 	}
+
+	// An unreadable incarnation is uncertain, not death: probes that cannot read
+	// the owner while the lock is held must not end the recheck, and the host is
+	// admitted once the lock is released.
+	it("keeps the post-deadline recheck open while the owner incarnation is transiently unreadable", async () => {
+		const agentDir = await temp();
+		const incarnation = processIncarnation(process.pid);
+		if (!incarnation) throw new Error("test process incarnation is unavailable");
+		const lockHeldPastDeadlineMs = 3_000;
+		let closes = 0;
+		let dispatches = 0;
+		let calls = 0;
+		let deadlineAt = 0;
+		let unreadableProbes = 0;
+		let holder: Promise<void> | undefined;
+		let brokerRef: Broker | undefined;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "uncertain-owner-provider",
+						pid: process.pid,
+						processIncarnation: incarnation,
+					},
+				}),
+				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
+				close: async () => {
+					closes += 1;
+					return { ok: true };
+				},
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async (input: SpawnRegistrationRequest) => {
+					calls += 1;
+					if (!brokerRef) throw new Error("broker not set");
+					if (calls === 1) {
+						deadlineAt = input.deadlineAt;
+						await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+						const host = await new SessionIndex(agentDir).open();
+						await host.append({
+							type: "host_registered",
+							sessionId: input.childId,
+							locator: await resolveSessionLocator(input.cwd, input.stateRoot),
+							endpointGeneration: 1,
+							pid: process.pid,
+							processIncarnation: incarnation,
+							hostIncarnation: incarnation,
+							lifecycleRequestId: input.effectMarker,
+						});
+						await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+						await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+						const acquired = Promise.withResolvers<void>();
+						holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+							acquired.resolve();
+							await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + lockHeldPastDeadlineMs);
+						});
+						await acquired.promise;
+					}
+					return await awaitSpawnHostRegistration(brokerRef.index, input);
+				},
+				dispatch: async () => {
+					dispatches += 1;
+					return {
+						kind: "accepted" as const,
+						commandId: "cmd-uncertain-owner",
+						turnId: "turn-uncertain-owner",
+						acceptedAt: Date.now(),
+					};
+				},
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		brokerRef = broker;
+		// Unreadable from 0.5 s to 2.5 s past the deadline, inside the recheck and
+		// the lock hold; readable again before the lock is released.
+		setProcessIncarnationForTest(broker, pid => {
+			const sinceDeadline = Date.now() - deadlineAt;
+			if (pid === process.pid && deadlineAt > 0 && sinceDeadline > 500 && sinceDeadline < 2_500) {
+				unreadableProbes += 1;
+				return undefined;
+			}
+			return processIncarnation(pid);
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				"uncertain-owner",
+			);
+			await holder;
+			const claim = await latestClaim(agentDir);
+			expect(unreadableProbes).toBeGreaterThan(0);
+			expect(Date.now()).toBeGreaterThan(deadlineAt + lockHeldPastDeadlineMs);
+			expect(calls).toBe(2);
+			expect(response).toMatchObject({ ok: true });
+			expect(dispatches).toBe(1);
+			expect(closes).toBe(0);
+			expect(claim?.state).toBe("accepted");
+		} finally {
+			await holder;
+			setProcessIncarnationForTest(broker, undefined);
+			await broker.stop();
+		}
+	}, 40_000);
 
 	for (const scenario of [
 		{ reason: "absent", message: "no registration row was observed" },

@@ -1927,7 +1927,6 @@ export class SessionIndex {
 					// The timer can lag a blocked event loop; the wall clock decides
 					// whether this read started within budget.
 					if (Date.now() >= deadlineAt) throw expired();
-					budget.signal.throwIfAborted();
 					reading = true;
 					await this.#refreshUnderLock();
 				},

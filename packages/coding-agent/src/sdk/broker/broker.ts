@@ -132,7 +132,7 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
+import { isProcessIncarnation, observeProcess, observeProcessIncarnation } from "./process-incarnation";
 import {
 	armPublicationLivenessWatchdog,
 	disarmPublicationLivenessWatchdog,
@@ -546,10 +546,10 @@ export interface SpawnRegistrationRequest {
 	/**
 	 * Set only for the post-deadline recheck. The host already registered and
 	 * published readiness, so the outcome can be decided before `deadlineAt`: the
-	 * wait ends on a mismatch row (the host's row exists and no longer matches),
-	 * or as soon as `decided()` resolves true (a failure receipt or a dead owner),
-	 * including while waiting for the index lock. Polled every registration poll
-	 * interval.
+	 * wait ends when a completed read shows the host's recorded row no longer
+	 * matches, or as soon as `decided()` resolves true (a failure receipt, or an
+	 * owner that provably exited), including while waiting for the index lock.
+	 * Polled every {@link SPAWN_LATE_RECHECK_PROBE_MS}.
 	 */
 	recheck?: { decided: () => Promise<boolean> };
 }
@@ -719,6 +719,13 @@ const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
  * waits out the bound.
  */
 const SPAWN_LATE_REGISTRATION_RECHECK_MS = 20_000;
+/**
+ * How often the recheck asks whether its outcome is already decided. The early
+ * end only needs to beat the 20 s bound, and the incarnation probe is
+ * synchronous (a PowerShell fallback on Windows), so it runs coarser than the
+ * index poll.
+ */
+const SPAWN_LATE_RECHECK_PROBE_MS = 250;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
 /** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
@@ -857,7 +864,8 @@ async function readSpawnHostRegistration(
 	signal: AbortSignal | undefined,
 ): Promise<
 	| { kind: "match"; registration: SpawnHostRegistration & { lifecycleRequestId: string } }
-	| { kind: "mismatch" | "absent" }
+	| { kind: "mismatch"; decisive: boolean }
+	| { kind: "absent" }
 > {
 	await index.refresh({ readStartDeadlineAt, signal });
 	// The launch locator is authority: a same-id row registered by an
@@ -881,10 +889,17 @@ async function readSpawnHostRegistration(
 			},
 		};
 	}
+	if (!rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0))
+		return { kind: "absent" };
+	// Row content is append-only, but `live` is projected at read time from an
+	// OS probe that can fail transiently. A row that fails only on liveness may
+	// match on the next read; any other mismatch (terminal, another pid,
+	// incarnation, request or locator) cannot.
 	return {
-		kind: rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0)
-			? "mismatch"
-			: "absent",
+		kind: "mismatch",
+		decisive: !rows.some(
+			candidate => !candidate.live && spawnRegistrationMatches({ ...candidate, live: true }, input),
+		),
 	};
 }
 
@@ -898,9 +913,9 @@ async function readSpawnHostRegistration(
  * requires the full predicate against that read, including current liveness and
  * incarnation, never just an early publication timestamp.
  *
- * A recheck (`input.recheck`) also ends on a mismatch row and when its
- * `decided()` probe turns true, so a host that rolled back or died is refused
- * without waiting out the recheck bound.
+ * A recheck (`input.recheck`) also ends on a decisive mismatch row and when
+ * its `decided()` probe turns true, so a host that rolled back or died is
+ * refused without waiting out the recheck bound.
  */
 export async function awaitSpawnHostRegistration(
 	index: SessionIndex,
@@ -943,7 +958,7 @@ export async function awaitSpawnHostRegistration(
 					decided.resolve();
 					return;
 				}
-				await Promise.race([Bun.sleep(SPAWN_HOST_REGISTRATION_POLL_MS), decided.promise]);
+				await Promise.race([Bun.sleep(SPAWN_LATE_RECHECK_PROBE_MS), decided.promise]);
 			}
 		})();
 	const ended = (): boolean => Date.now() >= deadline || stop.signal.aborted;
@@ -956,8 +971,8 @@ export async function awaitSpawnHostRegistration(
 				if (read.kind === "mismatch") {
 					mismatchSeen = true;
 					// The host appended its row before it published readiness, so a row
-					// that no longer matches cannot match on a later poll.
-					if (recheck) return { ok: false, reason: "mismatch" };
+					// whose recorded content no longer matches cannot match on a later poll.
+					if (recheck && read.decisive) return { ok: false, reason: "mismatch" };
 				} else {
 					absentCompletedAt = Date.now();
 					failedSinceAbsent = false;
@@ -3143,11 +3158,14 @@ export class Broker {
 					registration = await this.#spawnPromptLayer.awaitRegistration({
 						...registrationRequest,
 						deadlineAt: Date.now() + SPAWN_LATE_REGISTRATION_RECHECK_MS,
-						// A dead owner or a failure receipt already decides the refusal; do
-						// not hold the spawn (or keep polling a contended index) for the bound.
+						// An owner that provably exited or a failure receipt already decides
+						// the refusal; do not hold the spawn (or keep polling a contended
+						// index) for the bound. An unreadable incarnation is uncertain, not
+						// death, and keeps waiting.
 						recheck: {
 							decided: async () =>
-								!ownerAlive() || hasSessionLifecycleFailureEvidence(prep.stateRoot, prep.childId, marker),
+								observeProcess(pid, incarnation, owner => processIncarnationForBroker(this, owner)) ===
+									"exited" || hasSessionLifecycleFailureEvidence(prep.stateRoot, prep.childId, marker),
 						},
 					});
 				}

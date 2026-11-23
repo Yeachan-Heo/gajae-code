@@ -14,6 +14,7 @@ import {
 	writeSessionLifecycleReady,
 	writeSessionLifecycleStartupCommit,
 } from "../src/sdk/broker/lifecycle";
+import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import {
 	resolveSessionLocator,
@@ -267,6 +268,45 @@ describe("awaitSpawnHostRegistration", () => {
 		await f.host.append(f.registration({ type: "host_unregistered" }));
 		const result = await awaitSpawnHostRegistration(f.observer, f.request(Date.now() + 300));
 		expect(result).toEqual({ ok: false, reason: "mismatch" });
+	});
+
+	it("ends a recheck on the first read of a row the host unregistered", async () => {
+		const f = await fixture("child-recheck-unregistered");
+		await f.host.append(f.registration());
+		await f.host.append(f.registration({ type: "host_unregistered" }));
+		const startedAt = Date.now();
+		const result = await awaitSpawnHostRegistration(f.observer, {
+			...f.request(startedAt + 5_000),
+			recheck: { decided: async () => false },
+		});
+		expect(result).toEqual({ ok: false, reason: "mismatch" });
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
+	});
+
+	it("keeps a recheck open when a row fails only on a transiently unreadable liveness probe", async () => {
+		const f = await fixture("child-recheck-liveness-flake");
+		await f.host.append(f.registration());
+		// The projection reads the owner incarnation at read time; the first reads
+		// cannot observe it, so the row projects as not live (a liveness-only mismatch).
+		const real = incarnationModule.processIncarnation;
+		let unreadable = 3;
+		const spy = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation((pid, options) => {
+			if (pid === process.pid && unreadable > 0) {
+				unreadable -= 1;
+				return undefined;
+			}
+			return real(pid, options);
+		});
+		try {
+			const result = await awaitSpawnHostRegistration(f.observer, {
+				...f.request(Date.now() + 3_000),
+				recheck: { decided: async () => false },
+			});
+			expect(unreadable).toBe(0);
+			expect(result).toMatchObject({ ok: true, registration: { sessionId: "child-recheck-liveness-flake" } });
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });
 
