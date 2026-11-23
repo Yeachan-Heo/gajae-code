@@ -484,6 +484,33 @@ test("sorts an older late discovery before newer desktop sessions across refresh
 	expect(await Bun.file(older.file).text()).toBe(older.bytes);
 });
 
+test("a workspace closed while a background refresh found its new conversation is not published again", async () => {
+	const h = await fixture();
+	const other = path.join(path.dirname(h.projectDir), "other-project");
+	await fs.mkdir(other);
+	const closing = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	await h.call<DesktopProject>("project.open", { path: other });
+	const found = await h.persist("Created in the terminal later");
+	// The other workspace's listing is held, so the refresh pass outlives the first one's close.
+	const release = Promise.withResolvers<void>();
+	const list = sdk.listEmbeddedProjectSessions;
+	vi.spyOn(sdk, "listEmbeddedProjectSessions").mockImplementation(async options => {
+		if (options.cwd === other) await release.promise;
+		return list(options);
+	});
+	await h.call<DesktopSnapshot>("bootstrap");
+	for (let i = 0; i < 400 && !h.snapshot().sessions.some(session => session.id === found.id); i++) await Bun.sleep(5);
+	expect(h.snapshot().sessions.map(session => session.id)).toContain(found.id);
+	// The workspace whose pass changed the catalog closes; its close publishes the snapshot.
+	await h.call("project.close", { projectId: closing.id });
+	const published = h.frames.filter(frame => frame.type === "snapshot").length;
+	release.resolve();
+	await h.refreshed();
+	// The pass that found the conversation ends after the close: it has nothing left to show.
+	expect(h.frames.filter(frame => frame.type === "snapshot")).toHaveLength(published);
+	expect(h.snapshot().sessions.map(session => session.id)).not.toContain(found.id);
+});
+
 test("late discovery preserves explicit desktop session order across refresh and restart", async () => {
 	const h = await fixture();
 	const older = await h.persist("Older terminal conversation");
