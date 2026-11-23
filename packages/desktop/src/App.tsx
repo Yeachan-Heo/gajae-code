@@ -123,7 +123,7 @@ import { ProviderOnboardingNotice, useProviderOnboarding } from "./ProviderOnboa
 import { ProvidersDialog } from "./ProvidersDialog";
 import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
-import { RecoveryConversation } from "./RecoveryConversation";
+import { RecoveryCard } from "./RecoveryConversation";
 import { Select } from "./Select";
 import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
 import { connectionState, SessionConnectionBadge } from "./SessionConnectionMark";
@@ -2562,63 +2562,65 @@ export default function App() {
 		// Only a settled snapshot can say a conversation is gone (deleted, or its workspace closed).
 		const orphan = snapshot !== null && !owner;
 		return copy ? (
-			<div className="notice" key={item.id} role="status">
-				<p>{copy}</p>
-				{item.error && <p>{item.error}</p>}
-				<RecoveryConversation
-					title={owner?.title}
-					rememberedTitle={item.title}
-					current={owner?.id === session?.id}
-					text={item.text}
-					onOpen={() => owner && select(owner)}
-				/>
-				{(unsentRepairs.current.get(item.id) === item.sessionId ||
-					restorationFailure?.sessionId === item.sessionId) && (
-					<Button
-						onClick={() =>
-							enqueueRecovery(async () => {
-								const current = recoveriesRef.current.find(entry => entry.id === item.id);
-								const failure = restorationFailures.current.get(item.id);
-								if (
-									current &&
-									(unsentRepairs.current.get(current.id) === current.sessionId ||
-										failure?.sessionId === current.sessionId)
-								)
-									await reconcileReceipt({
-										id: current.id,
-										sessionId: current.sessionId,
-										disposition: failure?.sessionId === current.sessionId ? failure.disposition : "refused",
-									});
-							})
-						}
-					>
-						{t("shell.retryRecovery")}
-					</Button>
-				)}
-				{!orphan && (
-					<Button
-						disabled={
-							item.restored || unsentBlocked[item.sessionId] || restorationFailure?.sessionId === item.sessionId
-						}
-						onClick={() =>
-							enqueueRecovery(async () => {
-								const current = recoveriesRef.current.find(entry => entry.id === item.id);
-								if (current) await restoreRecovery(current);
-							})
-						}
-					>
-						{t("shell.restoreDraft")}
-					</Button>
-				)}
-				<Button
-					disabled={
+			<RecoveryCard
+				key={item.id}
+				notice={copy}
+				error={item.error}
+				orphan={orphan}
+				title={owner?.title}
+				rememberedTitle={item.title}
+				current={owner?.id === session?.id}
+				text={item.text}
+				onOpen={() => owner && select(owner)}
+				retry={
+					unsentRepairs.current.get(item.id) === item.sessionId || restorationFailure?.sessionId === item.sessionId
+						? {
+								label: t("shell.retryRecovery"),
+								onClick: () =>
+									enqueueRecovery(async () => {
+										const current = recoveriesRef.current.find(entry => entry.id === item.id);
+										const failure = restorationFailures.current.get(item.id);
+										if (
+											current &&
+											(unsentRepairs.current.get(current.id) === current.sessionId ||
+												failure?.sessionId === current.sessionId)
+										)
+											await reconcileReceipt({
+												id: current.id,
+												sessionId: current.sessionId,
+												disposition:
+													failure?.sessionId === current.sessionId ? failure.disposition : "refused",
+											});
+									}),
+							}
+						: undefined
+				}
+				restore={
+					orphan
+						? undefined
+						: {
+								label: t("shell.restoreDraft"),
+								disabled:
+									item.restored ||
+									unsentBlocked[item.sessionId] ||
+									restorationFailure?.sessionId === item.sessionId,
+								onClick: () =>
+									enqueueRecovery(async () => {
+										const current = recoveriesRef.current.find(entry => entry.id === item.id);
+										if (current) await restoreRecovery(current);
+									}),
+							}
+				}
+				discard={{
+					label:
+						item.disposition === "unknown" ? t("shell.discardRestoredRecord") : t("shell.discardRecoveryRecord"),
+					disabled:
 						item.finalizing ||
 						(!orphan &&
 							((!isFinalDelivery(item.disposition) && !(item.disposition === "unknown" && item.restored)) ||
 								unsentRepairs.current.has(item.id) ||
-								restorationFailure?.sessionId === item.sessionId))
-					}
-					onClick={() =>
+								restorationFailure?.sessionId === item.sessionId)),
+					onClick: () =>
 						enqueueRecovery(async () => {
 							const current = recoveriesRef.current.find(entry => entry.id === item.id);
 							if (!current || current.finalizing) return;
@@ -2639,12 +2641,9 @@ export default function App() {
 								(current.disposition === "unknown" && current.restored)
 							)
 								await finalizeRecovery(current);
-						})
-					}
-				>
-					{item.disposition === "unknown" ? t("shell.discardRestoredRecord") : t("shell.discardRecoveryRecord")}
-				</Button>
-			</div>
+						}),
+				}}
+			/>
 		) : null;
 	};
 	const menuSession =

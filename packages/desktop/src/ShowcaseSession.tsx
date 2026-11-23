@@ -1,8 +1,8 @@
 import type { DesktopSession } from "@gajae-code/desktop-host/protocol";
 import type { ReactNode } from "react";
-import { Button, SessionRow } from "./components";
+import { SessionRow } from "./components";
 import { type MessageKey, t } from "./i18n";
-import { RecoveryConversation } from "./RecoveryConversation";
+import { RecoveryCard } from "./RecoveryConversation";
 import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
 import { SessionConnectionBadge } from "./SessionConnectionMark";
 
@@ -15,15 +15,33 @@ function State({ caption, narrow, children }: { caption: MessageKey; narrow?: bo
 	);
 }
 
-/** The App's recovery card markup around fixture records; its buttons do nothing here. */
-function RecoveryCard({ orphan, restored, children }: { orphan?: boolean; restored?: boolean; children: ReactNode }) {
+/** The App's recovery card around a fixture record; its buttons do nothing here. */
+function FixtureCard({
+	orphan = false,
+	restored = false,
+	title,
+	rememberedTitle,
+	current = false,
+}: {
+	orphan?: boolean;
+	restored?: boolean;
+	title?: string;
+	rememberedTitle?: string;
+	current?: boolean;
+}) {
+	const none = () => {};
 	return (
-		<div className="notice" role="status">
-			<p>{t("support.deliveryOutcomeUnknown")}</p>
-			{children}
-			{!orphan && <Button disabled={restored}>{t("shell.restoreDraft")}</Button>}
-			<Button disabled={!orphan && !restored}>{t("shell.discardRestoredRecord")}</Button>
-		</div>
+		<RecoveryCard
+			notice={t("support.deliveryOutcomeUnknown")}
+			orphan={orphan}
+			title={title}
+			rememberedTitle={rememberedTitle}
+			current={current}
+			text="Summarize the failing test output"
+			onOpen={none}
+			restore={orphan ? undefined : { label: t("shell.restoreDraft"), disabled: restored, onClick: none }}
+			discard={{ label: t("shell.discardRestoredRecord"), disabled: !orphan && !restored, onClick: none }}
+		/>
 	);
 }
 
@@ -132,46 +150,25 @@ export function ShowcaseSession() {
 }
 
 function ShowcaseRecovery() {
-	const text = "Summarize the failing test output";
 	return (
 		<section id="showcase-recovery-cards">
 			<h2>{t("recovery.showcaseHeading")}</h2>
 			<p className="muted">{t("recovery.showcaseNote")}</p>
 			<div className="showcase-todo-states">
 				<State caption="recovery.showcaseListed">
-					<RecoveryCard>
-						<RecoveryConversation title="Fix the flaky test" current={false} text={text} onOpen={() => {}} />
-					</RecoveryCard>
+					<FixtureCard title="Fix the flaky test" />
 				</State>
 				<State caption="recovery.showcaseCurrent">
-					<RecoveryCard restored>
-						<RecoveryConversation title="Fix the flaky test" current text={text} onOpen={() => {}} />
-					</RecoveryCard>
+					<FixtureCard title="Fix the flaky test" current restored />
 				</State>
 				<State caption="recovery.showcaseOrphan">
-					<RecoveryCard orphan>
-						<RecoveryConversation
-							rememberedTitle="Release checklist"
-							current={false}
-							text={text}
-							onOpen={() => {}}
-						/>
-					</RecoveryCard>
+					<FixtureCard orphan rememberedTitle="Release checklist" />
 				</State>
 				<State caption="recovery.showcaseOrphanUnnamed">
-					<RecoveryCard orphan>
-						<RecoveryConversation current={false} text={text} onOpen={() => {}} />
-					</RecoveryCard>
+					<FixtureCard orphan />
 				</State>
 				<State caption="recovery.showcaseLong" narrow>
-					<RecoveryCard>
-						<RecoveryConversation
-							title="터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 화면에서도 자연스럽게 줄바꿈되는지 확인합니다"
-							current={false}
-							text={text}
-							onOpen={() => {}}
-						/>
-					</RecoveryCard>
+					<FixtureCard title="터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 화면에서도 자연스럽게 줄바꿈되는지 확인합니다" />
 				</State>
 			</div>
 		</section>

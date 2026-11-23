@@ -3,7 +3,9 @@ import { Button } from "./components";
 import { t } from "./i18n";
 
 export interface RecoveryConversationProps {
-	/** The conversation's current title while it is in the app's list; absent for an orphan. */
+	/** The conversation is not in the app's list (deleted, or its workspace closed). */
+	orphan: boolean;
+	/** The conversation's current title while it is in the app's list. */
 	title?: string;
 	/** Title remembered when the prompt was sent; names an orphan when present. */
 	rememberedTitle?: string;
@@ -20,9 +22,16 @@ export interface RecoveryConversationProps {
  * its text instead, because restoring a draft into it would write into a conversation the
  * user cannot see.
  */
-export function RecoveryConversation({ title, rememberedTitle, current, text, onOpen }: RecoveryConversationProps) {
+export function RecoveryConversation({
+	orphan,
+	title,
+	rememberedTitle,
+	current,
+	text,
+	onOpen,
+}: RecoveryConversationProps) {
 	const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle");
-	const orphan = title === undefined;
+	const name = title ?? rememberedTitle;
 	return (
 		<div className="recovery-conversation">
 			<p className="recovery-conversation-name">
@@ -30,7 +39,7 @@ export function RecoveryConversation({ title, rememberedTitle, current, text, on
 					? rememberedTitle
 						? t("recovery.orphanNamed", { title: rememberedTitle })
 						: t("recovery.orphanUnnamed")
-					: t("recovery.conversation", { title })}
+					: name !== undefined && t("recovery.conversation", { title: name })}
 			</p>
 			{orphan && <p className="recovery-conversation-hint">{t("recovery.orphanHint")}</p>}
 			{!orphan && !current && <Button onClick={onOpen}>{t("recovery.openConversation")}</Button>}
@@ -57,6 +66,52 @@ export function RecoveryConversation({ title, rememberedTitle, current, text, on
 				</span>
 			)}
 			{copy === "failed" && <span role="alert">{t("recovery.copyFailed")}</span>}
+		</div>
+	);
+}
+
+/** One of a recovery card's actions; App owns every condition and handler. */
+export interface RecoveryAction {
+	label: string;
+	disabled?: boolean;
+	onClick?: () => void;
+}
+
+export interface RecoveryCardProps extends RecoveryConversationProps {
+	/** What happened to the delivery, as `recoveryNotice` words it. */
+	notice: string;
+	error?: string;
+	/** Retry a storage repair or a failed restore; absent when there is nothing to retry. */
+	retry?: RecoveryAction;
+	/** Restore the draft into its conversation; absent for an orphan. */
+	restore?: RecoveryAction;
+	discard: RecoveryAction;
+}
+
+/**
+ * A delivery-recovery card: what happened, which conversation it belongs to, and its actions.
+ * Presentational only, so the App and the showcase render the same card; the App decides what
+ * each action does and when it is available.
+ */
+export function RecoveryCard({ notice, error, retry, restore, discard, ...conversation }: RecoveryCardProps) {
+	return (
+		<div className="notice" role="status">
+			<p>{notice}</p>
+			{error && <p>{error}</p>}
+			<RecoveryConversation {...conversation} />
+			{retry && (
+				<Button disabled={retry.disabled} onClick={retry.onClick}>
+					{retry.label}
+				</Button>
+			)}
+			{restore && (
+				<Button disabled={restore.disabled} onClick={restore.onClick}>
+					{restore.label}
+				</Button>
+			)}
+			<Button disabled={discard.disabled} onClick={discard.onClick}>
+				{discard.label}
+			</Button>
 		</div>
 	);
 }
