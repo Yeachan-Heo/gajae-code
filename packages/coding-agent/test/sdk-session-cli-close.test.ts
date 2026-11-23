@@ -243,7 +243,7 @@ test("a busy close recommends inspect, wait and same-key retry; a stale close re
 	expect(staleStep.description).not.toContain("rerun the same close command");
 });
 
-test("a busy raw global session.close gets the same wait-and-retry guidance, not steering advice", async () => {
+test("a busy raw global session.close gets close guidance: wait-and-retry when busy, terminal key when stale", async () => {
 	executeResult = {
 		ok: false,
 		operation: "session.close",
@@ -274,6 +274,22 @@ test("a busy raw global session.close gets the same wait-and-retry guidance, not
 	const other = await rawClose("session.delete");
 	expect(other.error.code).toBe("busy");
 	expect(other.error.nextSteps[0]!.description).toContain("turn.steer");
+
+	// A stale raw close is terminal for its key, like the semantic close.
+	executeResult = {
+		ok: false,
+		operation: "session.close",
+		certainty: "terminal",
+		error: { code: "endpoint_stale", message: "Endpoint changed." },
+	};
+	const stale = await rawClose("session.close");
+	expect(stale.error.code).toBe("endpoint_stale");
+	expect(stale.error.nextSteps[0]!.argv).toEqual(["sdk", "session", "inspect", "sess-1"]);
+	expect(stale.error.nextSteps[0]!.description).toContain("terminal for its idempotency key");
+	executeResult = { ...(executeResult as object), operation: "session.delete" };
+	const staleOther = await rawClose("session.delete");
+	expect(staleOther.error.code).toBe("endpoint_stale");
+	expect(JSON.stringify(staleOther.error.nextSteps)).not.toContain("terminal for its idempotency key");
 });
 
 test("a row without endpoint authority refuses before any close is sent and omits the terminal-key step", async () => {
