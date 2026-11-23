@@ -7294,6 +7294,90 @@ describe("openai-codex streaming", () => {
 		).toBe(false);
 	});
 
+	it("does not clear replacement socket when receiving stale close event", async () => {
+		// Regression test for issue where a stale close event from an old socket
+		// could clear this.#socket = null even though a replacement socket was
+		// already created after the first socket closed.
+		const tempDir = trackedTempDir("@pi-codex-stream-stale-close-");
+		setAgentDir(tempDir.path());
+		let socketCount = 0;
+		let staleCloseEmitted = false;
+		const sockets: { socket: MockWebSocket; id: number }[] = [];
+
+		class ReconnectWithStaleCloseWebSocket extends MockWebSocket {
+			private id: number;
+
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.id = ++socketCount;
+				sockets.push({ socket: this, id: this.id });
+
+				// First socket closes, triggering a reconnect.
+				// Emit the close event asynchronously after a delay to simulate
+				// a stale close event arriving after the new socket is created.
+				if (this.id === 1) {
+					this.scheduleOpen();
+					queueMicrotask(() => {
+						// Close first socket
+						this.readyState = MockWebSocket.CLOSED;
+						// Delay the close event to let reconnect create socket #2
+						setTimeout(() => {
+							staleCloseEmitted = true;
+							this.emit("close", { code: 1000 } as unknown as Event);
+						}, 50);
+					});
+				} else if (this.id === 2) {
+					// Second socket succeeds normally
+					this.scheduleOpen();
+				}
+			}
+
+			override send(): void {
+				this.emitCodexResponse({
+					messageId: `msg_socket_${this.id}`,
+					responseId: `resp_socket_${this.id}`,
+					text: `From socket ${this.id}`,
+				});
+			}
+		}
+
+		global.WebSocket = ReconnectWithStaleCloseWebSocket as unknown as typeof WebSocket;
+
+		const fetchMock = vi.fn(async () => {
+			throw new Error("Should not fall back to SSE if socket is working");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-stale-close-reconnect",
+			providerSessionState,
+		};
+
+		try {
+			const result = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+
+			// Verify the result came from the reconnected socket (socket #2)
+			expect(result.stopReason).toBe("stop");
+			expect(result.content).toContainEqual(expect.objectContaining({ text: "From socket 2" }));
+
+			// Verify both sockets were created (reconnection happened)
+			expect(sockets).toHaveLength(2);
+			expect(sockets[0]?.id).toBe(1);
+			expect(sockets[1]?.id).toBe(2);
+
+			// Verify the stale close event was emitted
+			expect(staleCloseEmitted).toBe(true);
+
+			// Verify no SSE fallback occurred
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			for (const state of providerSessionState.values()) state.close();
+		}
+	});
+
 	it("disables websocket after a fatal prewarm handshake failure", async () => {
 		const tempDir = trackedTempDir("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
