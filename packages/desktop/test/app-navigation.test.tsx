@@ -1220,6 +1220,47 @@ suite("mounted desktop navigation", () => {
 		} finally { await context.close(); }
 	}, 30000);
 
+	test("in the minimum window at 20 px text, a long title and the connection notice keep Connect in view", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.setViewport({ width: 720, height: 520 });
+			await page.click('.session-select[title="Oldest conversation · Idle"]');
+			await page.waitForSelector(".composer textarea");
+			await page.evaluate(() => document.documentElement.style.setProperty("--text-size", "20px"));
+			await page.evaluate(() => {
+				const session = window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!;
+				window.navigationFixture.emit({
+					type: "session",
+					session: {
+						...session,
+						// Long enough to take about six lines in the header, as the reviewed case did.
+						title: "터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 창에서도 몇 줄에 걸쳐 줄바꿈되는지 확인하는 제목입니다 ".repeat(3).trim(),
+						controlGeneration: null,
+						connection: { state: "disconnected" },
+					},
+				});
+			});
+			await page.waitForSelector(".connection-notice");
+			const placement = await page.evaluate(() => {
+				const button = [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(
+					node => node.textContent === "Connect",
+				)!;
+				const box = button.getBoundingClientRect();
+				const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+				return {
+					inView: box.top >= 0 && box.bottom <= window.innerHeight,
+					unobstructed: hit === button || button.contains(hit),
+					titleLines: Math.round(
+						document.querySelector(".toolbar-title h1")!.getBoundingClientRect().height /
+							Number.parseFloat(getComputedStyle(document.querySelector(".toolbar-title h1")!).lineHeight),
+					),
+				};
+			});
+			expect(placement.titleLines).toBeGreaterThanOrEqual(5);
+			expect({ inView: placement.inView, unobstructed: placement.unobstructed }).toEqual({ inView: true, unobstructed: true });
+		} finally { await context.close(); }
+	}, 30000);
+
 	test("a conversation another process has open is read-only and can be checked again", async () => {
 		const { context, page } = await fixture();
 		try {

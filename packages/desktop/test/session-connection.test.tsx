@@ -170,4 +170,94 @@ suite("Session connection", () => {
 			await context.close();
 		}
 	}, 30000);
+
+	test("both connection notices lay out alike at the app's composer widths: icon beside and level with the title", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.setViewport({ width: 720, height: 900 });
+			// The composer area's content at a 720 px window: 432 px beside the open sidebar, 632 px beside the rail.
+			await mount(
+				page,
+				`import { SessionConnectionNotice } from '/src/SessionConnection.tsx';`,
+				`const notice = state => h(SessionConnectionNotice, { state, pending: false, onConnect: () => {} });
+				ReactDOM.createRoot(root).render([432, 632].map(width =>
+					h('div', { key: width, 'data-width': width, style: { width: width + 'px' } }, notice('disconnected'), notice('elsewhere'))));`,
+			);
+			await page.waitForSelector(".connection-notice");
+			const layouts: Record<string, unknown> = {};
+			for (const size of [14, 20]) {
+				await page.evaluate(px => document.documentElement.style.setProperty("--text-size", `${px}px`), size);
+				for (const width of [432, 632]) {
+					layouts[`${width}@${size}`] = await page.$$eval(`[data-width="${width}"] .connection-notice`, notices =>
+						notices.map(notice => {
+							const icon = notice.querySelector(".connection-notice-icon")!.getBoundingClientRect();
+							const title = notice.querySelector(".connection-notice-text > strong")!;
+							const range = document.createRange();
+							range.selectNodeContents(title);
+							const firstLine = range.getClientRects()[0]!;
+							const text = notice.querySelector(".connection-notice-text")!.getBoundingClientRect();
+							const button = notice.querySelector(".connection-notice-action")!.getBoundingClientRect();
+							const wrapped = button.top >= text.bottom - 0.5;
+							return {
+								iconBesideTitle: icon.right <= text.left + 0.5,
+								iconLevelWithTitle:
+									Math.abs(icon.top + icon.height / 2 - (firstLine.top + firstLine.height / 2)) <= 1.5,
+								// A wrapped button never sits under the icon.
+								buttonClearOfIcon: !wrapped || button.left >= text.left - 0.5,
+								wrapped,
+							};
+						}),
+					);
+				}
+			}
+			for (const [key, value] of Object.entries(layouts)) {
+				const [disconnected, elsewhere] = value as Array<Record<string, boolean>>;
+				expect({ key, ...disconnected }).toMatchObject({
+					key,
+					iconBesideTitle: true,
+					iconLevelWithTitle: true,
+					buttonClearOfIcon: true,
+				});
+				// The two sibling states lay out the same way at the same width.
+				expect({ key, ...elsewhere }).toEqual({ key, ...disconnected });
+			}
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a header badge that wraps starts flush with the title; on the title's line it keeps its 8 px gap", async () => {
+		const { context, page } = await fixture();
+		try {
+			await mount(
+				page,
+				`import { SessionConnectionBadge } from '/src/SessionConnectionMark.tsx';`,
+				`const title = (key, text, width) => h('div', { key, className: 'toolbar-title', 'data-badge': key, style: { width: width + 'px' } },
+					h('h1', null, text), h(SessionConnectionBadge, { session: { connection: { state: 'elsewhere' } } }));
+				ReactDOM.createRoot(root).render([title('short', 'Short title', 600), title('wrapped', 'A title long enough to fill the line', 300)]);`,
+			);
+			await page.waitForSelector(".connection-badge");
+			const placement = await page.$$eval(".toolbar-title", titles =>
+				titles.map(node => {
+					const range = document.createRange();
+					range.selectNodeContents(node.querySelector("h1")!);
+					const lines = [...range.getClientRects()];
+					const badge = node.querySelector(".connection-badge")!.getBoundingClientRect();
+					const last = lines.at(-1)!;
+					const sameLine = badge.top < last.bottom && badge.bottom > last.top;
+					return {
+						sameLine,
+						gap: sameLine ? Math.round(badge.left - last.right) : null,
+						indent: sameLine ? null : Math.round(badge.left - lines[0]!.left),
+					};
+				}),
+			);
+			expect(placement).toEqual([
+				{ sameLine: true, gap: 8, indent: null },
+				{ sameLine: false, gap: null, indent: 0 },
+			]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
 });

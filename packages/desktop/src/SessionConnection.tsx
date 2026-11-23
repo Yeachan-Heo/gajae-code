@@ -20,10 +20,13 @@ export function SessionConnectionNotice({
 	const disconnected = state === "disconnected";
 	return (
 		<div className="connection-notice" role="status" data-state={state}>
-			<Icon className="connection-notice-icon" aria-hidden="true" />
-			<div className="connection-notice-text">
-				<strong>{t(disconnected ? "connection.disconnectedTitle" : "connection.elsewhereTitle")}</strong>
-				<span>{t(disconnected ? "connection.disconnectedBody" : "connection.elsewhereBody")}</span>
+			{/* Icon and text wrap as one unit, so the icon never lands on a line of its own. */}
+			<div className="connection-notice-main">
+				<Icon className="connection-notice-icon" aria-hidden="true" />
+				<div className="connection-notice-text">
+					<strong>{t(disconnected ? "connection.disconnectedTitle" : "connection.elsewhereTitle")}</strong>
+					<span>{t(disconnected ? "connection.disconnectedBody" : "connection.elsewhereBody")}</span>
+				</div>
 			</div>
 			<Button
 				className="primary connection-notice-action"

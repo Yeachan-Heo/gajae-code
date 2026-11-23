@@ -1125,18 +1125,30 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 /* The composer's place while the app does not write the conversation: a neutral card in the
    composer's 800px column, not an error. The draft is kept and returns with the composer. */
 .connection-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; max-width: 800px; min-width: 0; margin: 0 auto; padding: 0.75rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); }
-.connection-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; color: var(--muted); }
-.connection-notice-text { flex: 1 1 16rem; min-width: 0; display: grid; gap: 2px; word-break: keep-all; overflow-wrap: anywhere; }
+/* Icon and text are one flex item, as in the onboarding notice: the button wraps below them, never
+   the icon, and both states lay out alike at any width. The icon sits level with the title line. */
+.connection-notice-main { flex: 1 1 16rem; min-width: 0; display: flex; align-items: flex-start; gap: 0.75rem; }
+.connection-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; margin-top: max(0px, calc((1lh - 1.125rem) / 2)); color: var(--muted); }
+.connection-notice-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; word-break: keep-all; overflow-wrap: anywhere; }
 .connection-notice-text > span { color: var(--muted); font-size: 0.8125rem; }
+.connection-notice-action { flex: none; margin-left: auto; }
 /* Header chip beside the title and the sidebar mark beside a row's name: muted, never a status hue. */
-.toolbar-title h1:has(+ .connection-badge) { display: inline; }
-.connection-badge { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; padding: 2px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); font-size: 0.6875rem; font-weight: 500; line-height: 1.4; vertical-align: 0.15em; white-space: nowrap; }
+/* The gap sits on the title's end, so a badge that wraps to its own line starts flush with the title. */
+.toolbar-title h1:has(+ .connection-badge) { display: inline; margin-right: 8px; }
+.connection-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); font-size: 0.6875rem; font-weight: 500; line-height: 1.4; vertical-align: 0.15em; white-space: nowrap; }
 .connection-badge svg, .connection-mark svg { width: 0.75rem; height: 0.75rem; }
 .connection-mark { flex: none; display: inline-flex; color: var(--muted); }
 .desktop-sidebar[data-compact] .connection-mark { display: none; }
 .disconnect-confirmation p { word-break: keep-all; overflow-wrap: anywhere; }
 @media (max-width: 480px) {
 	.connection-notice-action { flex: 1 1 100%; width: 100%; }
+}
+/* A short window keeps the action in view under a long title: one visible line sized to the title,
+   with the explanation still available to assistive technology (as the onboarding notice does). */
+@media (max-height: 640px) {
+	.connection-notice { padding: 0.5rem 0.75rem; }
+	.connection-notice-main { flex-basis: auto; }
+	.connection-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 }
 /* Showcase only: the narrow state's column and a sidebar-width strip of rows. */
 .showcase-session-narrow { max-width: 20rem; }
