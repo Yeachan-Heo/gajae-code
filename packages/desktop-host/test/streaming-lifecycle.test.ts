@@ -1323,6 +1323,45 @@ describe("desktop streaming lifecycle", () => {
 		expect(userTurns(sdk)).toEqual(["long task"]);
 	});
 
+	test("a Disconnect whose stop outlasts its budget gives up and leaves the conversation usable", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-wedged");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		// The run's abort is wedged until the test lets it go.
+		const abort = sdk.abort.bind(sdk);
+		const unwedge = Promise.withResolvers<void>();
+		const spy = vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			await unwedge.promise;
+			return abort(options);
+		});
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true }).then(
+			() => "disconnected",
+			(error: Error) => error.message,
+		);
+		expect(await Promise.race([disconnecting, Bun.sleep(9_000).then(() => "still waiting")])).toContain(
+			"still stopping",
+		);
+		// Nothing was released, and the fence is gone: requests are answered normally again.
+		const state = await snapshot();
+		expect(state.sessions[0]?.connection).toEqual({ state: "connected" });
+		expect((await call<DesktopSession>("session.select", { sessionId })).connection).toEqual({
+			state: "connected",
+		});
+		unwedge.resolve();
+		spy.mockRestore();
+		expect(await running).toBeNull();
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+	}, 20_000);
+
 	test("a second Disconnect and a delete wait for a Disconnect that is still stopping the run", async () => {
 		const h = await launch();
 		const { call, snapshot, session, sdk, control } = h;

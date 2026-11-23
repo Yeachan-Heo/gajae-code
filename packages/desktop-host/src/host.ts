@@ -425,6 +425,10 @@ const DISCONNECTING =
 	"This conversation is being disconnected from the app, so nothing new can start in it. Connect it again to continue here.";
 /** How long a Disconnect waits for inputs still being admitted, or settling, before it releases the writer. */
 const DISCONNECT_SETTLE_MS = 5_000;
+/** How long a Disconnect waits for the run, a shell command and the final view to stop and settle. */
+const DISCONNECT_STOP_MS = 5_000;
+/** A Disconnect that could not stop the conversation in time releases nothing; the user can try again. */
+const STILL_STOPPING = "The conversation is still stopping. Try Disconnect again.";
 /** A live process other than the app (usually a terminal) holds the transcript open. */
 const ELSEWHERE =
 	"Another gjc process, such as a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.";
@@ -2794,16 +2798,32 @@ export class DesktopHost {
 	): Promise<DesktopDisconnectResult> {
 		let live = found;
 		if (live && !metadata.disconnected) {
-			if (stopping) await this.#stop(live, arrival);
+			// Stopping is bounded like a workspace close's abort: a wedged run fails this Disconnect
+			// with "still stopping" (the fence lifts and nothing is released) instead of leaving the
+			// conversation refused until restart.
+			const stopBudget = AbortSignal.timeout(DISCONNECT_STOP_MS);
+			const stopped = live;
+			const within = async (work: Promise<unknown> | undefined) => {
+				if (!work) return;
+				try {
+					await bounded(
+						work.catch(() => {}),
+						stopBudget,
+					);
+				} catch {
+					throw new Error(STILL_STOPPING);
+				}
+			};
+			if (stopping) await within(this.#stop(stopped, arrival));
 			// Join the stopped request until its receipt and view are written; disposing earlier would
 			// turn a cancelled prompt into an unknown one.
-			for (let attempt = 0; attempt < 3 && live.exclusiveDone; attempt++) await live.exclusiveDone;
+			for (let attempt = 0; attempt < 3 && stopped.exclusiveDone; attempt++) await within(stopped.exclusiveDone);
 			// Inputs still being admitted (a delivery record, an input hook, the SDK's admission) are
 			// refused or handed back against the recorded stop; let them finish against this session.
 			const budget = AbortSignal.timeout(DISCONNECT_SETTLE_MS);
 			await bounded(Promise.allSettled([...(this.#inputs.get(metadata.id) ?? [])]), budget).catch(() => {});
-			await live.viewPersistence?.catch(() => {});
-			if (live.sdk.isStreaming) await live.sdk.waitForIdle().catch(() => {});
+			await within(stopped.viewPersistence);
+			if (stopped.sdk.isStreaming) await within(stopped.sdk.waitForIdle());
 			// The Stop's sweep, and the queued branch's own check after it, handed back what no run took.
 			// Let the inputs the run took settle from this session's transcript before it is disposed.
 			await bounded(Promise.allSettled([...live.queued.values()].map(tracked => tracked.settled)), budget).catch(
@@ -2811,7 +2831,7 @@ export class DesktopHost {
 			);
 			const current = this.#live.get(metadata.id);
 			if (current && (current.busy || current.sdk.isStreaming || current.operator?.isBusy()))
-				throw new Error("The conversation is still stopping. Try Disconnect again.");
+				throw new Error(STILL_STOPPING);
 			live = current;
 		}
 		// From here every writing request refuses, and nothing reopens the writer behind this.
