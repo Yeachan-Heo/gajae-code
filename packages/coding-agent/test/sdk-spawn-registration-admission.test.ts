@@ -270,17 +270,43 @@ describe("awaitSpawnHostRegistration", () => {
 		expect(result).toEqual({ ok: false, reason: "mismatch" });
 	});
 
-	it("ends a recheck on the first read of a row the host unregistered", async () => {
+	it("stops reading on an unregistered row but holds the recheck refusal until the probe decides", async () => {
 		const f = await fixture("child-recheck-unregistered");
+		await f.host.append(f.registration());
+		await f.host.append(f.registration({ type: "host_unregistered" }));
+		const observer = f.observer;
+		const refresh = vi.spyOn(observer, "refresh");
+		// A rolling-back host unregisters first and writes its failure receipt later.
+		const startedAt = Date.now();
+		const receiptAt = startedAt + 600;
+		try {
+			const result = await awaitSpawnHostRegistration(observer, {
+				...f.request(startedAt + 5_000),
+				recheck: { decided: async () => Date.now() >= receiptAt },
+			});
+			const elapsed = Date.now() - startedAt;
+			expect(result).toEqual({ ok: false, reason: "mismatch" });
+			expect(elapsed).toBeGreaterThanOrEqual(600);
+			expect(elapsed).toBeLessThan(2_000);
+			expect(refresh).toHaveBeenCalledTimes(1);
+		} finally {
+			refresh.mockRestore();
+		}
+	});
+
+	it("ends a recheck on an unregistered row at the bound when the probe never decides", async () => {
+		const f = await fixture("child-recheck-unregistered-undecided");
 		await f.host.append(f.registration());
 		await f.host.append(f.registration({ type: "host_unregistered" }));
 		const startedAt = Date.now();
 		const result = await awaitSpawnHostRegistration(f.observer, {
-			...f.request(startedAt + 5_000),
+			...f.request(startedAt + 800),
 			recheck: { decided: async () => false },
 		});
+		const elapsed = Date.now() - startedAt;
 		expect(result).toEqual({ ok: false, reason: "mismatch" });
-		expect(Date.now() - startedAt).toBeLessThan(2_000);
+		expect(elapsed).toBeGreaterThanOrEqual(750);
+		expect(elapsed).toBeLessThan(2_000);
 	});
 
 	it("keeps a recheck open when a row fails only on a transiently unreadable liveness probe", async () => {

@@ -1479,10 +1479,12 @@ describe("Broker spawn flow driver", () => {
 					{ ...spawnInput(), cwd: agentDir },
 					`lock-incident-${overrunMs}-${readiness}`,
 				);
+				const answeredAt = Date.now();
 				await holder;
 				const claim = await latestClaim(agentDir);
 				if (readiness) {
-					expect(Date.now()).toBeGreaterThan(deadlineAt + overrunMs);
+					// Admission must come from the read after the lock was released.
+					expect(answeredAt).toBeGreaterThanOrEqual(deadlineAt + overrunMs);
 					expect(calls).toBe(2);
 					expect(response).toMatchObject({ ok: true });
 					expect(dispatches).toBe(1);
@@ -1509,15 +1511,19 @@ describe("Broker spawn flow driver", () => {
 
 	// The recheck may last 20 s, but only a live, ready host behind a held lock
 	// should wait for it. Each case decides the refusal mid-recheck while the lock
-	// is still held (or, for a mismatch, on the first recheck read); the broker
-	// must answer within a few polls, not at lock release or the recheck bound.
-	for (const outcome of ["dead-owner", "failure-receipt", "mismatch"] as const) {
+	// is still held; the broker must answer within a few polls, not at lock
+	// release or the recheck bound. `unregistered-then-receipt` is a host rolling
+	// back in its real order (unregister, then the failure receipt): the first
+	// recheck read sees the unregistered row before the receipt exists, and the
+	// refusal must still report the receipt, not a timeout.
+	for (const outcome of ["dead-owner", "failure-receipt", "unregistered-then-receipt"] as const) {
 		it(`ends the post-deadline recheck early on a ${outcome}`, async () => {
 			const agentDir = await temp();
 			const incarnation = processIncarnation(process.pid);
 			if (!incarnation) throw new Error("test process incarnation is unavailable");
-			const lockHeldPastDeadlineMs = outcome === "mismatch" ? 1_000 : 10_000;
-			const decidedPastDeadlineMs = 1_000;
+			const unregistered = outcome === "unregistered-then-receipt";
+			const lockHeldPastDeadlineMs = unregistered ? 1_000 : 10_000;
+			const decidedPastDeadlineMs = unregistered ? 1_800 : 1_000;
 			let closes = 0;
 			let dispatches = 0;
 			let calls = 0;
@@ -1568,7 +1574,7 @@ describe("Broker spawn flow driver", () => {
 							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
 							await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
 							// The host's row no longer matches once it unregisters.
-							if (outcome === "mismatch") await host.append({ ...registration, type: "host_unregistered" });
+							if (unregistered) await host.append({ ...registration, type: "host_unregistered" });
 							const acquired = Promise.withResolvers<void>();
 							holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
 								acquired.resolve();
@@ -1576,30 +1582,29 @@ describe("Broker spawn flow driver", () => {
 							});
 							await acquired.promise;
 							const { stateRoot, childId, effectMarker } = input;
-							if (outcome !== "mismatch")
-								decision = (async () => {
-									await Bun.sleep(Math.max(0, deadlineAt - Date.now()) + decidedPastDeadlineMs);
-									if (outcome === "dead-owner") {
-										ownerDead = true;
-										return;
-									}
-									await writeSessionLifecycleFailure(
-										stateRoot,
-										childId,
-										effectMarker,
-										{ phase: "startup", reason: "failed", message: "host failed after readiness" },
-										{
-											endpointGeneration: 1,
-											fenced: true,
-											runtimeRemoved: true,
-											hostStopped: true,
-											brokerRegistrationReleased: true,
-										},
-										undefined,
-										incarnation,
-										process.pid,
-									);
-								})();
+							decision = (async () => {
+								await Bun.sleep(Math.max(0, deadlineAt - Date.now()) + decidedPastDeadlineMs);
+								if (outcome === "dead-owner") {
+									ownerDead = true;
+									return;
+								}
+								await writeSessionLifecycleFailure(
+									stateRoot,
+									childId,
+									effectMarker,
+									{ phase: "startup", reason: "failed", message: "host failed after readiness" },
+									{
+										endpointGeneration: 1,
+										fenced: true,
+										runtimeRemoved: true,
+										hostStopped: true,
+										brokerRegistrationReleased: true,
+									},
+									undefined,
+									incarnation,
+									process.pid,
+								);
+							})();
 						}
 						return await awaitSpawnHostRegistration(brokerRef.index, input);
 					},
@@ -1634,7 +1639,9 @@ describe("Broker spawn flow driver", () => {
 				await holder;
 				const claim = await latestClaim(agentDir);
 				expect(calls).toBe(2);
-				// Decided at +1 s; the lock (+10 s) and the recheck bound (+21 s) are far later.
+				// Decided at +1 s (+1.8 s for the receipt after the unregistered row); the
+				// lock (+10 s, or +1 s when unregistered) and the recheck bound (+21 s) are later.
+				// For an unregistered row, the row alone must not settle the refusal before the receipt.
 				expect(answeredAt).toBeGreaterThan(deadlineAt + decidedPastDeadlineMs);
 				expect(answeredAt).toBeLessThan(deadlineAt + decidedPastDeadlineMs + 3_000);
 				expect(response).toMatchObject({
@@ -1642,11 +1649,10 @@ describe("Broker spawn flow driver", () => {
 					error: {
 						code: "spawn_failed",
 						details: {
-							code: outcome === "failure-receipt" ? "child_registration_failed" : "child_registration_timeout",
+							code: outcome === "dead-owner" ? "child_registration_timeout" : "child_registration_failed",
 						},
 					},
 				});
-				if (outcome === "mismatch") expect(claim?.failure?.message).toContain("did not match the launched host");
 				expect(dispatches).toBe(0);
 				expect(closes).toBe(1);
 				expect(claim?.state).toBe("pre_send_rejected");

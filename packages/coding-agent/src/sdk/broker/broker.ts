@@ -905,6 +905,18 @@ async function readSpawnHostRegistration(
 	};
 }
 
+/** Resolve when `decided` settles or `deadlineAt` passes, without leaving a timer behind. */
+async function waitUntilDecidedOrDeadline(decided: Promise<void>, deadlineAt: number): Promise<void> {
+	const remaining = deadlineAt - Date.now();
+	if (remaining <= 0) return;
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([decided, new Promise<void>(resolve => (timer = setTimeout(resolve, remaining)))]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /**
  * Poll the session index for the exact child host registration.
  *
@@ -915,9 +927,11 @@ async function readSpawnHostRegistration(
  * requires the full predicate against that read, including current liveness and
  * incarnation, never just an early publication timestamp.
  *
- * A recheck (`input.recheck`) also ends on a decisive mismatch row and when
- * its `decided()` probe turns true, so a host that rolled back or died is
- * refused without waiting out the recheck bound.
+ * A recheck (`input.recheck`) ends when its `decided()` probe turns true, so a
+ * host that rolled back or died is refused without waiting out the recheck
+ * bound. A decisive mismatch row stops the index reads, and the refusal then
+ * waits only for that probe (or the bound), because a rolling-back host
+ * unregisters before its failure receipt becomes readable.
  */
 export async function awaitSpawnHostRegistration(
 	index: SessionIndex,
@@ -974,7 +988,14 @@ export async function awaitSpawnHostRegistration(
 					mismatchSeen = true;
 					// The host appended its row before it published readiness, so a row
 					// whose recorded content no longer matches cannot match on a later poll.
-					if (recheck && read.decisive) return { ok: false, reason: "mismatch" };
+					// Stop reading the index, but a host rolling back unregisters before it
+					// writes its failure receipt: wait (within the bound) for the probe to
+					// see that receipt or the owner exit, so the refusal reports the
+					// receipt rather than a timeout.
+					if (recheck && read.decisive) {
+						await waitUntilDecidedOrDeadline(decided.promise, deadline);
+						return { ok: false, reason: "mismatch" };
+					}
 				} else {
 					absentCompletedAt = Date.now();
 					failedSinceAbsent = false;
