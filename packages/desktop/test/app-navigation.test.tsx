@@ -1183,6 +1183,8 @@ suite("mounted desktop navigation", () => {
 			await page.waitForSelector(".connection-notice");
 			expect(await page.$(".composer textarea")).toBeNull();
 			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Not connected to the app");
+			// A terminal continues from the latest message, not from an earlier version the app may show.
+			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("from its latest message");
 			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("Not connected here");
 			expect(await page.$eval('.session-select[aria-current="page"]', node => node.getAttribute("aria-label"))).toBe(
 				"Oldest conversation · Idle · not connected to the app",
@@ -1272,6 +1274,8 @@ suite("mounted desktop navigation", () => {
 			});
 			await page.waitForSelector(".connection-notice");
 			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("In use in a terminal");
+			// The app says what it found and what to do, never that only one surface can write.
+			expect(await page.$eval(".connection-notice", node => node.textContent)).toContain("Finish there, then check again.");
 			expect(await page.$eval(".toolbar .connection-badge", node => node.textContent)).toBe("In use in a terminal");
 			// Still open there: the answer says so instead of looking like nothing happened.
 			await page.evaluate(() => window.navigationFixture.setElsewhere(["old"]));

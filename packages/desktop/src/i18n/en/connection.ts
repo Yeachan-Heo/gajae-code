@@ -11,18 +11,18 @@ export const connection = {
 	"connection.markElsewhere": "in use in a terminal",
 	"connection.disconnectedTitle": "Not connected to the app",
 	"connection.disconnectedBody":
-		"The terminal can continue this conversation now. Its history stays here, read-only. Connect to continue here; your draft is kept.",
+		"A terminal can continue this conversation now, from its latest message, even if the app was showing an earlier version. Its history stays here, read-only. Connect to continue here; your draft is kept.",
 	"connection.elsewhereTitle": "In use in a terminal",
 	"connection.elsewhereBody":
-		"Another gjc process, usually a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.",
-	"connection.stillElsewhere":
-		"Another gjc process still has this conversation open. Close it there, then check again.",
+		"The app found this conversation open in another gjc process, usually a terminal, so it shows it read-only here. Finish there, then check again.",
+	"connection.stillElsewhere": "Another gjc process still has this conversation open. Finish there, then check again.",
 	"connection.confirmTitle": "Disconnect while it is working?",
 	"connection.confirmTitleQueued": "Disconnect with queued messages?",
 	"connection.confirmRunning": "Disconnecting stops the current turn, as Stop does.",
 	"connection.confirmQueuedOne": "1 queued message goes back to the message box.",
 	"connection.confirmQueued": "{count} queued messages go back to the message box.",
-	"connection.confirmKept": "The conversation and its history are kept. The terminal can continue it afterwards.",
+	"connection.confirmKept":
+		"The conversation and its history are kept. A terminal can continue it afterwards, from its latest message.",
 	"connection.confirmAction": "Stop and disconnect",
 	"connection.confirmActionQueued": "Disconnect",
 	"connection.showcaseOpenDialog": "Open the confirmation",
