@@ -3724,6 +3724,14 @@ suite("mounted composer delivery recovery", () => {
 			// and a 390 px window, where the open sidebar leaves the column 126 px.
 			for (const [width, columnWidth] of [[920, 656], [720, 456], [390, 126]] as const) {
 				await page.setViewport({ width, height: 900 });
+				// The shell reacts to the new width a render later (the narrow-layout listener moves the
+				// sidebar), so measure only once the column has reached this viewport's width.
+				await page.waitForFunction(
+					expected =>
+						Math.round(document.querySelector(".conversation-column")!.getBoundingClientRect().width) === expected,
+					{},
+					columnWidth,
+				);
 				const layout = await page.evaluate(() => {
 					const column = document.querySelector(".conversation-column")!.getBoundingClientRect();
 					const cards = [...document.querySelectorAll<HTMLElement>(".conversation-column > .recovery-card")];

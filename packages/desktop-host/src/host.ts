@@ -419,7 +419,7 @@ const STALE_OUTCOME: Record<StaleReplacement, string> = {
 };
 /** Every writing request on a released conversation answers with this, before any work starts. */
 const DISCONNECTED =
-	"This conversation is disconnected from the app, so the terminal can continue it. Connect it to continue here.";
+	"This conversation is not connected to the app, so a terminal can continue it. Connect it to continue here.";
 /** A request that arrives once a Disconnect has committed to releasing the conversation. */
 const DISCONNECTING =
 	"This conversation is being disconnected from the app, so nothing new can start in it. Connect it again to continue here.";
@@ -431,7 +431,7 @@ const DISCONNECT_STOP_MS = 5_000;
 const STILL_STOPPING = "The conversation is still stopping. Try Disconnect again.";
 /** A live process other than the app (usually a terminal) holds the transcript open. */
 const ELSEWHERE =
-	"Another gjc process, such as a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.";
+	"A terminal (another gjc process) is using this conversation, so the app shows it read-only. Finish there, then check again.";
 /** A released conversation is not deleted while the running broker cannot say whether a terminal has it. */
 const OWNER_UNCHECKED_DELETE =
 	"The app could not check whether a terminal has this conversation open, so it was not deleted. Try again in a moment.";
