@@ -88,6 +88,8 @@ export const providers = {
 	"providers.noticeTitle": "No models available yet",
 	"providers.noticeBody": "Connect an account or add an API key to start a conversation.",
 	"providers.noticeAction": "Connect a provider",
+	"providers.noticeShowDetails": "Show details",
+	"providers.noticeHideDetails": "Hide details",
 	"providers.summaryTitle": "Providers",
 	"providers.summaryHint": "Sign in to a provider or add an API key. Credentials are shared with the terminal app.",
 	"providers.summaryProviders": "{count} providers with models",

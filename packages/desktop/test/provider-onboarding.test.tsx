@@ -317,7 +317,7 @@ suite("Zero-model onboarding notice", () => {
 			await page.waitForSelector(ABOVE_COMPOSER);
 			await page.click(".session-work-toggle");
 			await page.waitForSelector(".session-work-card");
-			await page.click(`${ABOVE_COMPOSER} .button`);
+			await page.click(`${ABOVE_COMPOSER} .provider-notice-action`);
 			await page.waitForSelector("dialog.providers-dialog[open] .provider-row");
 			await page.keyboard.press("Escape");
 			await page.waitForFunction(() => !document.querySelector("dialog.providers-dialog"));
@@ -335,7 +335,7 @@ suite("Zero-model onboarding notice", () => {
 			await select(page, "Oldest conversation · Idle");
 			await answerModelLists(page, 0, []);
 			await page.waitForSelector(ABOVE_COMPOSER);
-			await page.click(`${ABOVE_COMPOSER} .button`);
+			await page.click(`${ABOVE_COMPOSER} .provider-notice-action`);
 			await page.waitForSelector("dialog.providers-dialog[open] .provider-row");
 			await page.click('.provider-row[data-provider-id="fixture"]');
 			await page.waitForSelector(".provider-key input");

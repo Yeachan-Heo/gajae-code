@@ -1,6 +1,6 @@
 import type { DesktopModel, DesktopSession } from "@gajae-code/desktop-host/protocol";
-import { TriangleAlert } from "lucide-react";
-import { useEffect, useId, useRef } from "react";
+import { ChevronDown, TriangleAlert } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Button } from "./components";
 import { t } from "./i18n";
 import {
@@ -16,15 +16,29 @@ import {
  */
 export function ProviderOnboardingNotice({ onConnect }: { onConnect(): void }) {
 	const titleId = useId();
+	const bodyId = useId();
+	const [expanded, setExpanded] = useState(false);
+	const details = expanded ? t("providers.noticeHideDetails") : t("providers.noticeShowDetails");
 	return (
-		<div className="provider-notice" role="status" aria-labelledby={titleId}>
+		<div className="provider-notice" role="status" aria-labelledby={titleId} data-expanded={expanded || undefined}>
 			{/* Icon and text wrap as one unit, so the icon never lands on a line of its own. */}
 			<div className="provider-notice-main">
 				<TriangleAlert className="provider-notice-icon" aria-hidden="true" />
 				<div className="provider-notice-text">
 					<strong id={titleId}>{t("providers.noticeTitle")}</strong>
-					<span>{t("providers.noticeBody")}</span>
+					<span id={bodyId}>{t("providers.noticeBody")}</span>
 				</div>
+				{/* Shown only in short windows, where the explanation is folded away to keep the action in view. */}
+				<Button
+					className="provider-notice-more"
+					aria-expanded={expanded}
+					aria-controls={bodyId}
+					aria-label={details}
+					title={details}
+					onClick={() => setExpanded(value => !value)}
+				>
+					<ChevronDown aria-hidden="true" />
+				</Button>
 			</div>
 			<Button className="primary provider-notice-action" onClick={onConnect}>
 				{t("providers.noticeAction")}

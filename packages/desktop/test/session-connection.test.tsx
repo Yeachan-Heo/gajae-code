@@ -356,4 +356,48 @@ suite("Session connection", () => {
 			await context.close();
 		}
 	}, 30000);
+
+	test("in a short window a compact notice's explanation stays one press away; a tall window shows it outright", async () => {
+		const { context, page } = await fixture();
+		try {
+			await page.setViewport({ width: 900, height: 520 });
+			await mount(
+				page,
+				`import { SessionConnectionNotice } from '/src/SessionConnection.tsx';
+				import { ProviderOnboardingNotice } from '/src/ProviderOnboardingNotice.tsx';`,
+				`ReactDOM.createRoot(root).render(h('div', { style: { width: '632px' } },
+					h(SessionConnectionNotice, { state: 'disconnected', pending: false, onConnect: () => {} }),
+					h(SessionConnectionNotice, { state: 'elsewhere', pending: false, onConnect: () => {} }),
+					h(ProviderOnboardingNotice, { onConnect: () => {} })));`,
+			);
+			const notices = [
+				['.connection-notice[data-state="disconnected"]', ".connection-notice-text > span", "your draft is kept"],
+				['.connection-notice[data-state="elsewhere"]', ".connection-notice-text > span", "Finish there, then check again."],
+				[".provider-notice", ".provider-notice-text > span", "Connect an account or add an API key"],
+			] as const;
+			const shown = (notice: string, body: string) =>
+				page.$eval(`${notice} ${body}`, node => {
+					const box = node.getBoundingClientRect();
+					return node.checkVisibility() && box.width > 20 && box.height > 8;
+				});
+			for (const [notice, body, words] of notices) {
+				expect(await page.$eval(`${notice} ${body}`, node => node.textContent)).toContain(words);
+				// Compact: the explanation is hidden, and a visible toggle reveals it in place.
+				expect({ notice, shown: await shown(notice, body) }).toEqual({ notice, shown: false });
+				const toggle = `${notice} [aria-expanded]`;
+				expect(await page.$eval(toggle, node => (node as HTMLElement).checkVisibility())).toBe(true);
+				await page.click(toggle);
+				await page.waitForFunction(selector => document.querySelector(selector)?.getAttribute("aria-expanded") === "true", {}, toggle);
+				expect({ notice, shown: await shown(notice, body) }).toEqual({ notice, shown: true });
+			}
+			// A tall window shows every explanation and no toggle.
+			await page.setViewport({ width: 900, height: 900 });
+			for (const [notice, body] of notices) {
+				expect(await page.$eval(`${notice} [aria-expanded]`, node => (node as HTMLElement).checkVisibility())).toBe(false);
+				expect({ notice, shown: await shown(notice, body) }).toEqual({ notice, shown: true });
+			}
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
 });

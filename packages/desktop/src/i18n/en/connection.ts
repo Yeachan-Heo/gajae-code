@@ -4,6 +4,8 @@ export const connection = {
 	"connection.connect": "Connect",
 	"connection.connecting": "Connecting…",
 	"connection.retry": "Check again",
+	"connection.showDetails": "Show details",
+	"connection.hideDetails": "Hide details",
 	"connection.checking": "Checking…",
 	"connection.badgeDisconnected": "Not connected here",
 	"connection.badgeElsewhere": "In use in a terminal",

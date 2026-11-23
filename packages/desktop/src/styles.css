@@ -1074,7 +1074,8 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 	.provider-notice { padding: 0.5rem 0.75rem; }
 	/* Only the title shows, so the text asks for its own width and the button stays beside it whenever both fit. */
 	.provider-notice-main { flex-basis: auto; }
-	.provider-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+	.provider-notice:not([data-expanded]) .provider-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+	.provider-notice[data-expanded] .provider-notice-main { flex-basis: 16rem; }
 }
 /* 404px is the panel's width in the dialog of a 480px window at the default text size. */
 @container providers-panel (max-width: 404px) {
@@ -1162,10 +1163,17 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 }
 /* A short window keeps the action in view under a long title: one visible line sized to the title,
    with the explanation still available to assistive technology (as the onboarding notice does). */
+/* The details toggle exists only where the explanation is folded away (short windows, below). */
+.connection-notice-more, .provider-notice-more { display: none; }
 @media (max-height: 640px) {
 	.connection-notice { padding: 0.5rem 0.75rem; }
 	.connection-notice-main { flex-basis: auto; }
-	.connection-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+	.connection-notice:not([data-expanded]) .connection-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+	/* Unfolded, the notice lays out as in a tall window: the explanation wraps beside the icon. */
+	.connection-notice[data-expanded] .connection-notice-main { flex-basis: 16rem; }
+	.connection-notice-more, .provider-notice-more { display: inline-flex; flex: none; min-height: 0; margin-top: max(0px, calc((1lh - 1.75rem) / 2)); padding: 0.25rem; color: var(--muted); }
+	.connection-notice-more > svg, .provider-notice-more > svg { width: 1.25rem; height: 1.25rem; transition: transform var(--dur) var(--ease); }
+	:is(.connection-notice, .provider-notice)[data-expanded] :is(.connection-notice-more, .provider-notice-more) > svg { transform: rotate(180deg); }
 }
 /* Showcase only: the narrow state's column and a sidebar-width strip of rows. */
 .showcase-session-narrow { max-width: 20rem; }
