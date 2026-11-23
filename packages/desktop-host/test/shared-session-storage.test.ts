@@ -24,6 +24,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { DesktopHost } from "../src/host";
 import {
+	type DesktopActivityUpdate,
 	type DesktopDisconnectResult,
 	type DesktopFrame,
 	type DesktopHistory,
@@ -1308,7 +1309,8 @@ function backgroundJob(h: { created: CreateAgentSessionResult[] }) {
 			);
 			return finished.promise;
 		},
-		{ ownerId: MAIN_AGENT_ID },
+		// A monitor, so the activity controls can cancel it.
+		{ ownerId: MAIN_AGENT_ID, metadata: { monitor: true } },
 	);
 	// The conversation's own job view lists it, so it runs in this conversation's manager.
 	if (!result.jobObservation?.getSnapshot().jobs.some(job => job.id === id && job.status === "running"))
@@ -1351,6 +1353,34 @@ test("selecting a conversation whose background job runs keeps it, even once a t
 	const after = await h.call<DesktopSession>("session.select", { sessionId });
 	expect(after.connection).toEqual({ state: "elsewhere" });
 	await live.awaitDisposeCompletion();
+	await h.close();
+});
+
+test("stopping background work never waits on the broker or steps aside, while a terminal has it", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const job = backgroundJob(h);
+	const update = await h.call<DesktopActivityUpdate>("activity.get", { sessionId });
+	if (!update.activity.available) throw new Error(update.activity.reason);
+	const ref = update.activity.jobs.find(entry => entry.label === "background build")?.ref;
+	if (!ref) throw new Error("The background job is not shown");
+	h.liveOwners.add(await transcriptId(h));
+	// A broker that never answers: a stop must not wait for it.
+	const releaseBroker = h.holdBroker();
+	cleanups.push(async () => releaseBroker());
+	const lookups = h.ownerLookups.length;
+	const stopped = await Promise.race([
+		h.call("activity.operate", { sessionId, ref, operation: "cancel" }).then(() => "answered"),
+		Bun.sleep(1_500).then(() => "waiting"),
+	]);
+	expect(stopped).toBe("answered");
+	expect(h.ownerLookups).toHaveLength(lookups);
+	await until(() => !job.running(), "the job to stop");
+	expect(job.stopped).toBe(true);
+	expect(live.isDisposed).toBe(false);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
 	await h.close();
 });
 

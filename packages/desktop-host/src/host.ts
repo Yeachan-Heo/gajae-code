@@ -468,6 +468,17 @@ const OWNER_CHECKED_METHODS = new Set<DesktopRequest["method"]>([
 	"mcp.operate",
 	"activity.operate",
 ]);
+/**
+ * Activity operations that only end or halt work. They never wait on the broker or step aside: a
+ * user stopping background work must not be held up, or have the conversation released under it.
+ */
+const STOP_LIKE_ACTIVITY = new Set<unknown>(["cancel", "stop", "delete", "pause"] satisfies DesktopActivityOperation[]);
+/** Whether a request asks the broker first: one that starts or changes work, never one that only stops it. */
+function ownerChecked(method: DesktopRequest["method"], params: Record<string, unknown>): boolean {
+	return (
+		OWNER_CHECKED_METHODS.has(method) && !(method === "activity.operate" && STOP_LIKE_ACTIVITY.has(params.operation))
+	);
+}
 /** Activity for a conversation the app does not hold open; the Session work card shows the reason. */
 const READ_ONLY_ACTIVITY = "Background work is shown only while the app is connected to this conversation.";
 /** Released identities kept; the oldest are dropped first. */
@@ -3650,13 +3661,14 @@ export class DesktopHost {
 		let live: LiveSession;
 		try {
 			const opened = await this.#open(metadata);
-			if (OWNER_CHECKED_METHODS.has(method)) await this.#recheckOwner(opened, method);
+			const checked = ownerChecked(method, params);
+			if (checked) await this.#recheckOwner(opened, method);
 			// The check may have waited for the broker while another request replaced the copy: go on
 			// with the conversation's current copy (joining a replacement still opening), never a retired one.
 			live =
 				method === "session.select" || method === "prompt"
 					? await this.#refreshIfMoved(opened)
-					: OWNER_CHECKED_METHODS.has(method)
+					: checked
 						? await this.#current(opened)
 						: opened;
 		} catch (error) {
