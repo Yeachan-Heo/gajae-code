@@ -535,11 +535,23 @@ export interface SpawnRegistrationRequest {
 	deadlineAt: number;
 }
 
+/**
+ * Why a spawn admission saw no matching registration:
+ * - `absent`: the last completed index read held no endpoint row for the child;
+ * - `mismatch`: an endpoint row for the child exists but fails the exact
+ *   identity, authority, or liveness predicate;
+ * - `inconclusive`: the last observation attempt could not read the index before
+ *   the deadline (queue or lock wait, or a read error), so absence is unproven.
+ */
+export type SpawnRegistrationMiss = "absent" | "mismatch" | "inconclusive";
+
+export type SpawnRegistrationResult =
+	| { ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } }
+	| { ok: false; reason?: SpawnRegistrationMiss };
+
 /** Q26-only host control seam. It never receives or returns durable request material. */
 export interface SpawnPromptLayer {
-	awaitRegistration(
-		input: SpawnRegistrationRequest,
-	): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }>;
+	awaitRegistration(input: SpawnRegistrationRequest): Promise<SpawnRegistrationResult>;
 	dispatch(input: {
 		sessionId: string;
 		task: string;
@@ -770,6 +782,75 @@ export function spawnRegistrationMatches(
 		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(expected.cwd) &&
 		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(expected.stateRoot)
 	);
+}
+
+/**
+ * Poll the session index for the exact child host registration.
+ *
+ * Each read must begin before `deadlineAt`; waiting in the index queue or on the
+ * machine-global lock never runs past it. A read that began in time is evaluated
+ * even when it completes after the deadline: discarding it would reject a host
+ * that registered in time only because the observer was slow. Admission still
+ * requires the full predicate against that read, including current liveness and
+ * incarnation, never just an early publication timestamp. The projection is
+ * scoped to the awaited child so each poll probes only its rows.
+ */
+export async function awaitSpawnHostRegistration(
+	index: SessionIndex,
+	input: SpawnRegistrationRequest,
+): Promise<SpawnRegistrationResult> {
+	const deadline = input.deadlineAt;
+	const scope = new Set([input.childId]);
+	let miss: SpawnRegistrationMiss = "inconclusive";
+	for (;;) {
+		if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false, reason: miss };
+		try {
+			await index.refresh({ readStartDeadlineAt: deadline });
+			// The launch locator is authority: a same-id row registered by an
+			// unrelated workspace must never be adopted as this spawn's child.
+			const rows = index.listSessionIdentities(undefined, scope);
+			const row = rows.find(candidate => spawnRegistrationMatches(candidate, input));
+			const incarnation = row?.hostIncarnation ?? row?.processIncarnation;
+			// An incarnation-less row is incomplete endpoint evidence; a partial pin
+			// previously just failed later at dispatch, so failing at registration keeps one boundary.
+			if (row && incarnation !== undefined) {
+				return {
+					ok: true,
+					registration: {
+						sessionId: row.sessionId,
+						endpointGeneration: row.endpointGeneration,
+						pid: row.pid,
+						processIncarnation: incarnation,
+						lifecycleRequestId: input.effectMarker,
+						cwd: row.locator.cwd,
+						stateRoot: row.locator.stateRoot,
+					},
+				};
+			}
+			miss = rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0)
+				? "mismatch"
+				: "absent";
+		} catch {
+			// A queue or lock wait that reached the deadline, or a transient read
+			// failure: this attempt observed nothing, so absence is unproven.
+			miss = "inconclusive";
+		}
+		if (Date.now() >= deadline) return { ok: false, reason: miss };
+		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
+	}
+}
+
+function spawnRegistrationMissMessage(reason: SpawnRegistrationMiss | undefined): string {
+	switch (reason) {
+		case "absent":
+			return "session.spawn child host did not register before the bounded admission deadline (no registration row was observed)";
+		case "mismatch":
+			return "session.spawn child host registration did not match the launched host identity, authority, or liveness";
+		case "inconclusive":
+			return "session.spawn child host registration could not be observed before the bounded admission deadline (the session index could not be read in time)";
+		default:
+			return "session.spawn child host did not register before the bounded admission deadline";
+	}
 }
 
 /** Rebuilds the provider proof from durable authority facts only. */
@@ -1810,7 +1891,7 @@ export class Broker {
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
-			awaitRegistration: async input => await this.#awaitSpawnHostRegistration(input),
+			awaitRegistration: async input => await awaitSpawnHostRegistration(this.index, input),
 			dispatch: async input => await this.#dispatchSpawnPrompt(input),
 			reconcile: async input => await this.#reconcileSpawnPrompt(input),
 		};
@@ -2860,9 +2941,12 @@ export class Broker {
 					effectMarker: prep.effectMarker,
 					deadlineAt: prep.semanticReadyDeadlineAt,
 				});
+				// No clock check here: the registration layer bounds every index read by
+				// this deadline and evaluates a read that began in time even if it ends
+				// after it. Re-checking the clock would discard a host that registered
+				// in time only because the observer was slow.
 				if (
 					!registration.ok ||
-					Date.now() >= prep.semanticReadyDeadlineAt ||
 					registration.registration.sessionId !== prep.childId ||
 					registration.registration.pid !== pid ||
 					registration.registration.processIncarnation !== incarnation ||
@@ -2873,6 +2957,11 @@ export class Broker {
 					resolveEquivalentPath(registration.registration.stateRoot) !== resolveEquivalentPath(prep.stateRoot)
 				) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
+					const miss: SpawnRegistrationMiss | undefined = registration.ok ? "mismatch" : registration.reason;
+					if (startupFailure === undefined)
+						logger.warn(
+							`sdk broker: spawn child ${prep.childId} registration not admitted (${miss ?? "unknown"})`,
+						);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
 					if (release === "closed" || release === "gone") {
 						const failure: SpawnSubstrateFailure = {
@@ -2880,7 +2969,7 @@ export class Broker {
 							code: startupFailure === undefined ? "child_registration_timeout" : "child_registration_failed",
 							message:
 								startupFailure === undefined
-									? "session.spawn child host did not register before the bounded admission deadline"
+									? spawnRegistrationMissMessage(miss)
 									: `session.spawn child host failed during ${startupFailure.phase}/${startupFailure.reason}`,
 						};
 						current = (
@@ -3520,52 +3609,6 @@ export class Broker {
 				logger.warn(`sdk broker: deferred managed child close failed for ${ref.nativeIdentity}: ${String(caught)}`);
 				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
 			});
-	}
-
-	async #awaitSpawnHostRegistration(input: {
-		childId: string;
-		cwd: string;
-		stateRoot: string;
-		owner: SpawnLifecycleOwner;
-		effectMarker: string;
-		deadlineAt: number;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }> {
-		const deadline = input.deadlineAt;
-		for (;;) {
-			if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false };
-			try {
-				await this.index.refresh();
-				if (Date.now() >= deadline) return { ok: false };
-				// The launch locator is authority: a same-id row registered by an
-				// unrelated workspace must never be adopted as this spawn's child.
-				const row = this.index
-					.listSessionIdentities()
-					.find(candidate => spawnRegistrationMatches(candidate, input));
-				if (row) {
-					const incarnation = row.hostIncarnation ?? row.processIncarnation;
-					// An incarnation-less row is incomplete endpoint evidence; a partial pin
-					// previously just failed later at dispatch, so failing at registration keeps one boundary.
-					if (incarnation !== undefined) {
-						return {
-							ok: true,
-							registration: {
-								sessionId: row.sessionId,
-								endpointGeneration: row.endpointGeneration,
-								pid: row.pid,
-								processIncarnation: incarnation,
-								lifecycleRequestId: input.effectMarker,
-								cwd: row.locator.cwd,
-								stateRoot: row.locator.stateRoot,
-							},
-						};
-					}
-				}
-			} catch {
-				// A transient index read failure only delays the poll.
-			}
-			if (Date.now() >= deadline) return { ok: false };
-			await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
-		}
 	}
 
 	/** One nonce-correlated frame exchange over a child host's authenticated endpoint. */

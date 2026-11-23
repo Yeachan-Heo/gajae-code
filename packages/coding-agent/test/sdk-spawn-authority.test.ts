@@ -1076,6 +1076,134 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	it("admits a valid registration that the registration layer observed after the deadline", async () => {
+		// The registration layer bounds its own reads by the deadline and may return
+		// a read that began in time after the clock passed it. The flow driver must
+		// not discard that host by re-checking the clock (the macOS
+		// child_registration_timeout report: host registered at +1.9 s of 8 s).
+		const agentDir = await temp();
+		let closes = 0;
+		let dispatches = 0;
+		let deadlineAt = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "late-observer-provider",
+						pid: 996,
+						processIncarnation: "inc-996",
+					},
+				}),
+				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
+				close: async () => {
+					closes += 1;
+					return { ok: true };
+				},
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async (input: SpawnRegistrationRequest) => {
+					deadlineAt = input.deadlineAt;
+					await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 50);
+					return {
+						ok: true as const,
+						registration: {
+							sessionId: input.childId,
+							lifecycleRequestId: input.effectMarker,
+							endpointGeneration: 1,
+							pid: 996,
+							processIncarnation: "inc-996",
+							cwd: input.cwd,
+							stateRoot: input.stateRoot,
+						},
+					};
+				},
+				dispatch: async () => {
+					dispatches += 1;
+					return { kind: "accepted" as const, commandId: "cmd-late", turnId: "turn-late", acceptedAt: Date.now() };
+				},
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest("session.spawn", spawnInput(), "late-observer-key");
+			expect(Date.now()).toBeGreaterThan(deadlineAt);
+			expect(response).toMatchObject({ ok: true });
+			expect(dispatches).toBe(1);
+			expect(closes).toBe(0);
+			expect((await latestClaim(agentDir))?.state).toBe("accepted");
+		} finally {
+			await broker.stop();
+		}
+	}, 20_000);
+
+	for (const scenario of [
+		{ reason: "absent", message: "no registration row was observed" },
+		{ reason: "mismatch", message: "did not match the launched host" },
+		{ reason: "inconclusive", message: "could not be observed" },
+		{ reason: undefined, message: "did not register before the bounded admission deadline" },
+	] as const) {
+		it(`reports a ${scenario.reason ?? "legacy"} registration miss distinctly and releases the child once`, async () => {
+			const agentDir = await temp();
+			let closes = 0;
+			let dispatches = 0;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "miss-provider",
+							pid: 995,
+							processIncarnation: "inc-995",
+						},
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async () =>
+						scenario.reason === undefined
+							? { ok: false as const }
+							: { ok: false as const, reason: scenario.reason },
+					dispatch: async () => {
+						dispatches += 1;
+						return { kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 };
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest("session.spawn", spawnInput(), `miss-${scenario.reason}`);
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "child_registration_timeout" } },
+				});
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				const claim = await latestClaim(agentDir);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.failure?.code).toBe("child_registration_timeout");
+				expect(claim?.failure?.message).toContain(scenario.message);
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await broker.stop();
+			}
+		});
+	}
+
 	it("re-drives an uncertain registration to a deterministic failure on retry", async () => {
 		const agentDir = await temp();
 		let verifyCalls = 0;

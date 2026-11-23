@@ -1878,11 +1878,61 @@ export class SessionIndex {
 		if (!this.#warnings.includes(message)) this.#warnings.push(message);
 	}
 
-	async refresh(): Promise<void> {
+	/**
+	 * Locked re-read of the index. `readStartDeadlineAt` (wall clock, `Date.now()`)
+	 * bounds only the wait before the read: queueing behind other operations on
+	 * this index and acquiring the machine-global lock. If the read has not begun
+	 * by then, the call rejects without reading. A read that began in time always
+	 * runs to completion (a lock holder is never interrupted), so a resolved call
+	 * proves the projection reflects a read started before the deadline, even when
+	 * it finished after it.
+	 */
+	async refresh(options: { readStartDeadlineAt?: number } = {}): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
-		await SessionIndex.#enqueue(indexPath, () =>
-			withSessionIndexLock("refresh", this.#agentDir, () => this.#refreshUnderLock()),
-		);
+		const deadlineAt = options.readStartDeadlineAt;
+		if (deadlineAt === undefined) {
+			await SessionIndex.#enqueue(indexPath, () =>
+				withSessionIndexLock("refresh", this.#agentDir, () => this.#refreshUnderLock()),
+			);
+			return;
+		}
+		await this.#refreshStartedBy(indexPath, deadlineAt);
+	}
+	async #refreshStartedBy(indexPath: string, deadlineAt: number): Promise<void> {
+		const expired = (): Error => new Error("Session index read did not start before its deadline");
+		if (!Number.isFinite(deadlineAt) || Date.now() >= deadlineAt) throw expired();
+		const budget = new AbortController();
+		const abandoned = Promise.withResolvers<never>();
+		let reading = false;
+		const timer = setTimeout(() => {
+			budget.abort(expired());
+			// A read already under the lock is awaited to completion; only a caller
+			// still waiting in the queue or on the lock is released here.
+			if (!reading) abandoned.reject(budget.signal.reason);
+		}, deadlineAt - Date.now());
+		timer.unref?.();
+		const queued = SessionIndex.#enqueue(indexPath, async () => {
+			budget.signal.throwIfAborted();
+			await withSessionIndexLock(
+				"refresh",
+				this.#agentDir,
+				async () => {
+					// The timer can lag a blocked event loop; the wall clock decides
+					// whether this read started within budget.
+					if (Date.now() >= deadlineAt) throw expired();
+					reading = true;
+					await this.#refreshUnderLock();
+				},
+				{ ...SESSION_INDEX_LOCK_OPTIONS, signal: budget.signal },
+			);
+		});
+		// An abandoned operation still settles later; never leave it unhandled.
+		queued.catch(() => {});
+		try {
+			await Promise.race([queued, abandoned.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 	async #refreshUnderLock(): Promise<void> {
 		// A newly constructed reader has no replay cursor. Refresh must still load
@@ -2444,9 +2494,15 @@ export class SessionIndex {
 	 * Broker-internal current composite-identity rows. Unlike {@link listSessions},
 	 * this retains losing roots so an exact dead registration can be retired without
 	 * disturbing the surviving authority.
+	 * `sessionIds` scopes the projection (and its OS liveness probes) to those
+	 * sessions; projection is keyed by session id, so their rows are unchanged.
 	 */
-	listSessionIdentities(probedIncarnations?: ReadonlyMap<string, string | undefined>): IndexedSession[] {
-		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).identities;
+	listSessionIdentities(
+		probedIncarnations?: ReadonlyMap<string, string | undefined>,
+		sessionIds?: ReadonlySet<string>,
+	): IndexedSession[] {
+		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations, sessionIds)
+			.identities;
 	}
 
 	/** Reconstructs a receipt-bound identity even when admission superseded it. */
