@@ -132,9 +132,9 @@ suite("Session connection", () => {
 			await page.goto(`${origin}/?showcase`);
 			await page.waitForSelector("#showcase-session-connection .disconnect-dialog-opener");
 			const openers = await page.$$eval("#showcase-session-connection .disconnect-dialog-opener", nodes => nodes.length);
-			expect(openers).toBe(2);
+			expect(openers).toBe(3);
 			const seen: unknown[] = [];
-			for (const index of [0, 1]) {
+			for (const index of [0, 1, 2]) {
 				// Opened from the keyboard, as a user would, so the opener holds focus to return to.
 				await page.evaluate(
 					position =>
@@ -181,6 +181,13 @@ suite("Session connection", () => {
 				},
 				// Only queued messages go back: nothing is working, so nothing says it is.
 				{ title: "Disconnect with queued messages?", actions: ["Cancel", "Disconnect"], focus: true, onCard: true },
+				// Background work alone is work the Disconnect ends, so it reads as the working case.
+				{
+					title: "Disconnect while it is working?",
+					actions: ["Cancel", "Stop and disconnect"],
+					focus: true,
+					onCard: true,
+				},
 			]);
 		} finally {
 			await context.close();

@@ -76,30 +76,43 @@ export function SessionConnectionNotice({
 }
 
 /**
- * The Disconnect confirmation's dialog title. A running turn is stopped; with only queued
- * messages nothing is working, and those messages simply go back to the message box.
+ * The Disconnect confirmation's dialog title. A running turn or background work is stopped
+ * (`working`); with only queued messages nothing is working, and those messages simply go back
+ * to the message box.
  */
-export function disconnectConfirmTitle(running: boolean): string {
-	return running ? t("connection.confirmTitle") : t("connection.confirmTitleQueued");
+export function disconnectConfirmTitle(working: boolean): string {
+	return working ? t("connection.confirmTitle") : t("connection.confirmTitleQueued");
 }
 
 /** What a confirmed Disconnect stops; the conversation itself is always kept. */
 export function DisconnectConfirmation({
 	running,
 	queued,
+	background = 0,
 	pending,
 	onConfirm,
 	onCancel,
 }: {
 	running: boolean;
 	queued: number;
+	/** Background jobs or tasks the conversation is still running; a confirmed Disconnect ends them. */
+	background?: number;
 	pending: boolean;
 	onConfirm: () => void;
 	onCancel: () => void;
 }) {
+	// Stopping a turn or ending background work is the destructive case; queued messages just come back.
+	const working = running || background > 0;
 	return (
 		<div className="disconnect-confirmation">
 			{running && <p>{t("connection.confirmRunning")}</p>}
+			{background > 0 && (
+				<p>
+					{background === 1
+						? t("connection.confirmBackgroundOne")
+						: t("connection.confirmBackground", { count: background })}
+				</p>
+			)}
 			{queued > 0 && (
 				<p>{queued === 1 ? t("connection.confirmQueuedOne") : t("connection.confirmQueued", { count: queued })}</p>
 			)}
@@ -107,12 +120,12 @@ export function DisconnectConfirmation({
 			<div className="actions">
 				<Button onClick={onCancel}>{t("support.cancel")}</Button>
 				<Button
-					className={running ? "danger" : "primary"}
+					className={working ? "danger" : "primary"}
 					disabled={pending}
 					aria-busy={pending}
 					onClick={onConfirm}
 				>
-					{running ? t("connection.confirmAction") : t("connection.confirmActionQueued")}
+					{working ? t("connection.confirmAction") : t("connection.confirmActionQueued")}
 				</Button>
 			</div>
 		</div>

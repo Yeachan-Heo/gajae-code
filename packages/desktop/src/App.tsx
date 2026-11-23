@@ -700,9 +700,12 @@ export default function App() {
 	const [renaming, setRenaming] = useState<{ sessionId: string; title: string } | null>(null);
 	const [result, setResult] = useState("");
 	/** What a confirmed Disconnect would stop, for the conversation it was asked about. */
-	const [disconnectAsk, setDisconnectAsk] = useState<{ sessionId: string; running: boolean; queued: number } | null>(
-		null,
-	);
+	const [disconnectAsk, setDisconnectAsk] = useState<{
+		sessionId: string;
+		running: boolean;
+		queued: number;
+		background?: number;
+	} | null>(null);
 	const transcriptPositions = useRef(new Map<string, TranscriptPosition>());
 	const transcriptView = useRef<TranscriptView | null>(null);
 	const [, setTranscriptRevision] = useState(0);
@@ -3240,7 +3243,9 @@ export default function App() {
 							mcp: t("shell.dialogMcp"),
 							"session-info": t("shell.sessionStatus"),
 							"session-actions": t("shell.conversationActions"),
-							disconnect: disconnectConfirmTitle(disconnectAsk?.running ?? true),
+							disconnect: disconnectConfirmTitle(
+								(disconnectAsk?.running ?? true) || (disconnectAsk?.background ?? 0) > 0,
+							),
 						}[dialog]
 					}
 					onClose={closeDialog}
@@ -3684,6 +3689,7 @@ export default function App() {
 						<DisconnectConfirmation
 							running={disconnectAsk.running}
 							queued={disconnectAsk.queued}
+							background={disconnectAsk.background}
 							pending={!connected || !!pending[connectionScope(dialogOwner)]}
 							onCancel={closeDialog}
 							onConfirm={() => disconnectSession(dialogOwner, true)}

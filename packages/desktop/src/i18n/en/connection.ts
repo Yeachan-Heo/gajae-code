@@ -21,6 +21,8 @@ export const connection = {
 	"connection.confirmTitle": "Disconnect while it is working?",
 	"connection.confirmTitleQueued": "Disconnect with queued messages?",
 	"connection.confirmRunning": "Disconnecting stops the current turn, as Stop does.",
+	"connection.confirmBackgroundOne": "Disconnecting ends 1 background job or task in this conversation.",
+	"connection.confirmBackground": "Disconnecting ends {count} background jobs or tasks in this conversation.",
 	"connection.confirmQueuedOne": "1 queued message goes back to the message box.",
 	"connection.confirmQueued": "{count} queued messages go back to the message box.",
 	"connection.confirmKept":
@@ -40,5 +42,6 @@ export const connection = {
 	"connection.showcaseRows": "Sidebar rows",
 	"connection.showcaseConfirm": "Disconnect confirmation · running turn and queued messages",
 	"connection.showcaseConfirmQueued": "Disconnect confirmation · queued messages only",
+	"connection.showcaseConfirmBackground": "Disconnect confirmation · background work only",
 	"connection.showcaseNarrow": "Narrow width · Korean title",
 } as const;

@@ -94,7 +94,15 @@ const row = (id: string, title: string, state: "connected" | "disconnected" | "e
 });
 
 /** The Disconnect confirmation in the App's native dialog, opened from the showcase; it does nothing. */
-function ConfirmationDialog({ running, queued }: { running: boolean; queued: number }) {
+function ConfirmationDialog({
+	running,
+	queued,
+	background = 0,
+}: {
+	running: boolean;
+	queued: number;
+	background?: number;
+}) {
 	const [open, setOpen] = useState(false);
 	const close = () => setOpen(false);
 	return (
@@ -105,10 +113,11 @@ function ConfirmationDialog({ running, queued }: { running: boolean; queued: num
 				</Button>
 			</div>
 			{open && (
-				<Modal title={disconnectConfirmTitle(running)} onClose={close}>
+				<Modal title={disconnectConfirmTitle(running || background > 0)} onClose={close}>
 					<DisconnectConfirmation
 						running={running}
 						queued={queued}
+						background={background}
 						pending={false}
 						onConfirm={close}
 						onCancel={close}
@@ -173,6 +182,9 @@ function ShowcaseConnection() {
 				</State>
 				<State caption="connection.showcaseConfirmQueued">
 					<ConfirmationDialog running={false} queued={1} />
+				</State>
+				<State caption="connection.showcaseConfirmBackground">
+					<ConfirmationDialog running={false} queued={0} background={2} />
 				</State>
 				<State caption="connection.showcaseNarrow" narrow>
 					<div className="showcase-session-rows">
