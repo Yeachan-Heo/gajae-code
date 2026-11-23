@@ -1465,6 +1465,258 @@ describe("managed session write protocol", () => {
 		]);
 	});
 
+	it("keeps a migrated session singular when the receipts directory cannot be enumerated", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "unlisted-receipts.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("unlisted-receipts", cwd));
+		const initial = listManagedCandidates(scope);
+		if (initial.kind !== "complete") throw new Error(initial.message);
+		const legacyCandidate = initial.owned.find(candidate => candidate.path === source);
+		if (!legacyCandidate) throw new Error("Missing unlisted-receipts legacy candidate");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error(opened.message);
+		await expect(fs.stat(source)).resolves.toBeDefined();
+
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const readdirSync = syncFs.readdirSync;
+		const denied = vi.spyOn(syncFs, "readdirSync").mockImplementation(((directory, options) => {
+			if (path.resolve(String(directory)) === receipts)
+				throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+			return readdirSync(directory, options as never);
+		}) as typeof syncFs.readdirSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				denied.mockRestore();
+			}
+		})();
+		expect(listed).toMatchObject({ kind: "complete" });
+		if (listed.kind !== "complete") return;
+		expect(listed.owned.filter(candidate => candidate.sessionId === "unlisted-receipts")).toEqual([
+			expect.objectContaining({ provenance: "v2", path: opened.path }),
+		]);
+	});
+
+	it("keeps a migrated session singular when receipts are enumerated under another spelling", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "aliased-receipt.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("aliased-receipt", cwd));
+		const initial = listManagedCandidates(scope);
+		if (initial.kind !== "complete") throw new Error(initial.message);
+		const legacyCandidate = initial.owned.find(candidate => candidate.path === source);
+		if (!legacyCandidate) throw new Error("Missing aliased-receipt legacy candidate");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error(opened.message);
+
+		// A casefolding directory may list an entry spelled differently from the name a
+		// lookup computes ("ſ" folds to "s") and still resolve the computed name to it.
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const alias = (name: string): string => name.replace(/\.json$/u, ".j\u017Fon");
+		const aliases = new Map(
+			(await fs.readdir(receipts)).map(name => [path.join(receipts, alias(name)), path.join(receipts, name)]),
+		);
+		const resolveAlias = (target: unknown): unknown =>
+			typeof target === "string" ? (aliases.get(path.resolve(target)) ?? target) : target;
+		const readdirSync = syncFs.readdirSync;
+		const openSync = syncFs.openSync;
+		const lstatSync = syncFs.lstatSync;
+		const readdir = vi.spyOn(syncFs, "readdirSync").mockImplementation(((directory, options) => {
+			const names = readdirSync(directory, options as never);
+			return path.resolve(String(directory)) === receipts ? (names as string[]).map(alias) : names;
+		}) as typeof syncFs.readdirSync);
+		const open = vi
+			.spyOn(syncFs, "openSync")
+			.mockImplementation(((file, flags, mode) =>
+				openSync(resolveAlias(file) as syncFs.PathLike, flags, mode)) as typeof syncFs.openSync);
+		const lstat = vi
+			.spyOn(syncFs, "lstatSync")
+			.mockImplementation(((file, options) =>
+				lstatSync(resolveAlias(file) as syncFs.PathLike, options as never)) as typeof syncFs.lstatSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				readdir.mockRestore();
+				open.mockRestore();
+				lstat.mockRestore();
+			}
+		})();
+		expect(listed).toMatchObject({ kind: "complete" });
+		if (listed.kind !== "complete") return;
+		expect(listed.owned.filter(candidate => candidate.sessionId === "aliased-receipt")).toEqual([
+			expect.objectContaining({ provenance: "v2", path: opened.path }),
+		]);
+	});
+
+	it("looks receipts up by name instead of reading an oversized receipts directory", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "oversized-receipts.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("oversized-receipts", cwd));
+		const initial = listManagedCandidates(scope);
+		if (initial.kind !== "complete") throw new Error(initial.message);
+		const legacyCandidate = initial.owned.find(candidate => candidate.path === source);
+		if (!legacyCandidate) throw new Error("Missing oversized-receipts legacy candidate");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error(opened.message);
+
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const unrelated = path.join(receipts, "unrelated.bin");
+		await fs.writeFile(unrelated, "");
+		await fs.truncate(unrelated, 64 * 1024 * 1024);
+		const openedPaths: string[] = [];
+		const openSync = syncFs.openSync;
+		const open = vi.spyOn(syncFs, "openSync").mockImplementation(((file, flags, mode) => {
+			openedPaths.push(path.resolve(String(file)));
+			return openSync(file, flags, mode);
+		}) as typeof syncFs.openSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				open.mockRestore();
+			}
+		})();
+		expect(openedPaths).toContain(source);
+		expect(openedPaths).not.toContain(unrelated);
+		expect(listed).toMatchObject({ kind: "complete" });
+		if (listed.kind !== "complete") return;
+		expect(listed.owned.filter(candidate => candidate.sessionId === "oversized-receipts")).toEqual([
+			expect.objectContaining({ provenance: "v2", path: opened.path }),
+		]);
+	});
+
+	it("does not open receipts-directory entries past the index cap and looks receipts up by name", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "crowded-receipts.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("crowded-receipts", cwd));
+		const initial = listManagedCandidates(scope);
+		if (initial.kind !== "complete") throw new Error(initial.message);
+		const legacyCandidate = initial.owned.find(candidate => candidate.path === source);
+		if (!legacyCandidate) throw new Error("Missing crowded-receipts legacy candidate");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error(opened.message);
+
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const padding = 10_000;
+		await Promise.all(
+			Array.from({ length: padding }, (_, index) => fs.writeFile(path.join(receipts, `pad-${index}`), "")),
+		);
+		const openedPaths: string[] = [];
+		const openSync = syncFs.openSync;
+		const open = vi.spyOn(syncFs, "openSync").mockImplementation(((file, flags, mode) => {
+			openedPaths.push(path.resolve(String(file)));
+			return openSync(file, flags, mode);
+		}) as typeof syncFs.openSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				open.mockRestore();
+			}
+		})();
+		expect(openedPaths).toContain(source);
+		expect(openedPaths.filter(file => path.basename(file).startsWith("pad-"))).toEqual([]);
+		expect(listed).toMatchObject({ kind: "complete" });
+		if (listed.kind !== "complete") return;
+		expect(listed.owned.filter(candidate => candidate.sessionId === "crowded-receipts")).toEqual([
+			expect.objectContaining({ provenance: "v2", path: opened.path }),
+		]);
+	});
+
+	it("does not read migration receipts when no legacy candidate is visible", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "v2-only.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("v2-only", cwd));
+		const initial = listManagedCandidates(scope);
+		if (initial.kind !== "complete") throw new Error(initial.message);
+		const legacyCandidate = initial.owned.find(candidate => candidate.path === source);
+		if (!legacyCandidate) throw new Error("Missing v2-only legacy candidate");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error(opened.message);
+		await fs.unlink(source);
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		expect((await fs.readdir(receipts)).length).toBeGreaterThan(0);
+
+		let receiptAccesses = 0;
+		const touchesReceipts = (target: unknown): boolean =>
+			typeof target === "string" &&
+			(path.resolve(target) === receipts || path.dirname(path.resolve(target)) === receipts);
+		const readdirSync = syncFs.readdirSync;
+		const openSync = syncFs.openSync;
+		const readdir = vi.spyOn(syncFs, "readdirSync").mockImplementation(((directory, options) => {
+			if (touchesReceipts(directory)) receiptAccesses += 1;
+			return readdirSync(directory, options as never);
+		}) as typeof syncFs.readdirSync);
+		const open = vi.spyOn(syncFs, "openSync").mockImplementation(((file, flags, mode) => {
+			if (touchesReceipts(file)) receiptAccesses += 1;
+			return openSync(file, flags, mode);
+		}) as typeof syncFs.openSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				readdir.mockRestore();
+				open.mockRestore();
+			}
+		})();
+		expect(listed).toMatchObject({
+			kind: "complete",
+			owned: [expect.objectContaining({ sessionId: "v2-only", provenance: "v2" })],
+		});
+		expect(receiptAccesses).toBe(0);
+	});
+
+	it("does not list a transcript whose raw lstat identity differs from its descriptor identity", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "signed-identity.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("signed-identity", cwd));
+		// A Windows file ID with its top bit set can surface from lstat as the signed
+		// form of the unsigned value the descriptor reports. Both canonicalize to the
+		// same ID, but the full inspection that binds a digest compares the raw lstat
+		// value, so the listing must refuse the file exactly as that inspection does.
+		const realIno = (await fs.stat(source, { bigint: true })).ino;
+		const unsignedIno = (BigInt.asUintN(64, realIno) & (2n ** 63n - 1n)) | (2n ** 63n);
+		const lstatSync = syncFs.lstatSync;
+		const fstatSync = syncFs.fstatSync;
+		const signedLstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+			const stat = lstatSync(file, options as never);
+			if (typeof stat?.ino === "bigint" && stat.ino === realIno)
+				(stat as unknown as syncFs.BigIntStats).ino = BigInt.asIntN(64, unsignedIno);
+			return stat;
+		}) as typeof syncFs.lstatSync);
+		const unsignedFstat = vi.spyOn(syncFs, "fstatSync").mockImplementation(((descriptor, options) => {
+			const stat = fstatSync(descriptor, options as never);
+			if (typeof stat?.ino === "bigint" && stat.ino === realIno)
+				(stat as unknown as syncFs.BigIntStats).ino = unsignedIno;
+			return stat;
+		}) as typeof syncFs.fstatSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				signedLstat.mockRestore();
+				unsignedFstat.mockRestore();
+			}
+		})();
+		expect(listed).toMatchObject({ kind: "complete" });
+		if (listed.kind !== "complete") return;
+		expect(listed.owned.some(candidate => candidate.path === source)).toBe(false);
+		expect(listed.invalid).toContainEqual(expect.objectContaining({ code: "source_changed" }));
+	});
+
 	it("completes migrated deletion after descriptor-bound artifact payload scrubbing", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);

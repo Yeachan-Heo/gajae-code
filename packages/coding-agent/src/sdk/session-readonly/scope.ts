@@ -9,6 +9,7 @@ import { isSessionTranscriptFileName } from "./format";
 import type { ManagedFileSnapshot } from "./inspection";
 import {
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
 	captureManagedFilePrefixNoFollow,
 	identity as fileIdentity,
 	inspectManagedFileNoFollow,
@@ -593,9 +594,13 @@ function listedCandidate(
 			mtimeNs: preflight.identity.mtimeNs,
 			ctimeNs: preflight.identity.ctimeNs,
 		};
+		// Compare the raw `dev`/`ino` as `inspectCandidate` does, so a file that binding
+		// would refuse is not listed as openable.
 		if (
 			!named.isFile() ||
 			named.isSymbolicLink() ||
+			named.dev !== statIdentity.dev ||
+			named.ino !== statIdentity.ino ||
 			!sameIdentity(fileIdentity(named), { ...statIdentity, sha256: "" })
 		)
 			return { code: "source_changed" };
@@ -838,10 +843,13 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		// destination path, and `receiptMatches` rejects every other destination. Read
 		// each source's receipt once instead of once per (source, v2 destination) pair.
 		const receipts = new Map<ListedManagedCandidate, { source: ManagedCandidate; destinationPath: string }>();
-		const hasV2 = visible.some(candidate => candidate.provenance === "v2");
-		const receiptSources = hasV2 ? committedReceiptSources(scope) : new Set<string>();
-		for (const source of hasV2 ? visible : []) {
-			if (source.provenance !== "legacy" || !receiptSources.has(receiptSourceKey(source))) continue;
+		const pairable =
+			visible.some(candidate => candidate.provenance === "v2") &&
+			visible.some(candidate => candidate.provenance === "legacy");
+		const receiptSources = pairable ? committedReceiptSources(scope) : new Set<string>();
+		for (const source of pairable ? visible : []) {
+			if (source.provenance !== "legacy") continue;
+			if (receiptSources !== undefined && !receiptSources.has(receiptSourceKey(source))) continue;
 			const bound = digested(source);
 			if (!bound) continue;
 			const destinationPath = receiptDestinationPath(receiptPathFor(scope, bound));
@@ -945,29 +953,47 @@ function receiptDestinationPath(receiptPath: string): string | undefined {
 	}
 }
 
-const COMMITTED_RECEIPT_NAME = /^[0-9a-f]{64}\.json$/;
+const RECEIPT_INDEX_MAX_ENTRIES = 4096;
+const RECEIPT_INDEX_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * Source path and stat identity named by each committed receipt, keyed as
  * {@link receiptSourceKey} keys a candidate. `receiptMatches` requires both to be
  * equal, so a legacy candidate whose key is absent has no matching receipt and
- * needs no digest to find its receipt path.
+ * needs no digest to find its receipt path. Every entry is read whatever its name,
+ * because the filesystem may resolve a computed receipt name to an entry spelled
+ * differently. Returns `undefined` when the receipts directory exists but cannot be
+ * enumerated, or when it holds more than {@link RECEIPT_INDEX_MAX_ENTRIES} entries or
+ * {@link RECEIPT_INDEX_MAX_BYTES} of regular files; every legacy candidate then looks
+ * up its receipt by name. The names are listed in full first: Bun's `opendirSync`
+ * reads the whole directory on its first `readSync`, so a partial listing would cost
+ * the same.
  */
-function committedReceiptSources(scope: ManagedScope): ReadonlySet<string> {
+function committedReceiptSources(scope: ManagedScope): ReadonlySet<string> | undefined {
 	const keys = new Set<string>();
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_RECEIPTS_DIRECTORY);
 	let names: string[];
 	try {
 		names = fs.readdirSync(directory);
-	} catch {
-		return keys;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? keys : undefined;
 	}
+	if (names.length > RECEIPT_INDEX_MAX_ENTRIES) return undefined;
+	let indexedBytes = 0;
 	for (const name of names) {
-		if (!COMMITTED_RECEIPT_NAME.test(name)) continue;
+		const entry = path.join(directory, name);
+		let size: number;
 		try {
-			const value: unknown = JSON.parse(
-				captureManagedFileNoFollow(path.join(directory, name)).bytes.toString("utf8"),
-			);
+			const stat = fs.lstatSync(entry);
+			if (!stat.isFile()) continue;
+			size = stat.size;
+		} catch {
+			continue;
+		}
+		indexedBytes += size;
+		if (indexedBytes > RECEIPT_INDEX_MAX_BYTES) return undefined;
+		try {
+			const value: unknown = JSON.parse(captureManagedFileNoFollowBounded(entry, size).bytes.toString("utf8"));
 			if (!value || typeof value !== "object") continue;
 			const source = (
 				value as {
@@ -979,7 +1005,9 @@ function committedReceiptSources(scope: ManagedScope): ReadonlySet<string> {
 			).source;
 			const recorded = source?.identity;
 			keys.add(JSON.stringify([source?.path, recorded?.dev, recorded?.ino, recorded?.size, recorded?.mtimeNs]));
-		} catch {
+		} catch (error) {
+			// A receipt that grew past its listed size may still match; look it up by name.
+			if ((error as Error).message === "artifact_capacity_exceeded") return undefined;
 			/* an unreadable receipt matches no source */
 		}
 	}
