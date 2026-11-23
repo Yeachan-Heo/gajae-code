@@ -20985,11 +20985,9 @@ export class AgentSession {
 		// Call onThreadResumed to set up the accounting baseline, just like the
 		// interactive goal-mode-controller does (see goal-mode-controller.ts:298).
 		// This ensures token accounting is properly initialized for active goals.
-		const restored = await this.#goalRuntime.onThreadResumed();
-		if (restored && !restored.enabled && goalToolAvailable) {
-			// If onThreadResumed decided to disable the goal (e.g., paused), update state.
-			this.setGoalModeState({ enabled: false, mode: "active", goal: restored.goal });
-		}
+		// onThreadResumed already commits the state; do not reapply a stale paused
+		// state if the goal was resumed via operateGoal() while this restore was pending.
+		await this.#goalRuntime.onThreadResumed();
 	}
 
 	async #compactionStateSnapshot(
