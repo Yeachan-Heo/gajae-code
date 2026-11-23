@@ -79,6 +79,7 @@ import {
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
+	hasSessionLifecycleFailureEvidence,
 	hasSessionLifecycleReadiness,
 	hasSessionLifecycleStartupCommit,
 	isCanonicalSessionId,
@@ -928,7 +929,9 @@ export async function awaitSpawnHostRegistration(
  * much later. Admission therefore needs the host's startup commit, which the
  * host writes only after startup can no longer roll back, together with the
  * owner and readiness markers naming this launch and the owner still being the
- * same live process. A failure receipt always wins.
+ * same live process. A readable failure receipt always wins; a receipt that is
+ * present but unreadable or still being promoted is unknown evidence and
+ * blocks admission until it resolves or the wait ends.
  *
  * The commit is irreversible, so one observation suffices even when the broker
  * observes it seconds late. `waitDeadlineAt` (termination start) bounds waiting
@@ -950,7 +953,7 @@ async function awaitLateSpawnHostVerdict(
 		// Read the failure last, so a receipt written after the reads above wins.
 		const failure = await readSessionLifecycleFailure(stateRoot, childId, marker);
 		if (failure) return { kind: "failed", failure };
-		if (committed) return { kind: "ready" };
+		if (committed && !hasSessionLifecycleFailureEvidence(stateRoot, childId, marker)) return { kind: "ready" };
 		const remaining = waitDeadlineAt - Date.now();
 		if (remaining <= 0) return { kind: "unconfirmed" };
 		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, remaining));

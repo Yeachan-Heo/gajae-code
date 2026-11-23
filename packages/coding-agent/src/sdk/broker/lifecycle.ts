@@ -2204,13 +2204,15 @@ export async function writeSessionLifecycleStartupCommit(
 		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
 		0o600,
 	);
+	// The exclusive temp name is ours alone; remove it on every path, including
+	// a failed write, sync, or close before the rename.
 	try {
-		await handle.writeFile(canonicalJson(lifecycleStartupCommit({ pid: process.pid, incarnation, effectMarker })));
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	try {
+		try {
+			await handle.writeFile(canonicalJson(lifecycleStartupCommit({ pid: process.pid, incarnation, effectMarker })));
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
 		await fs.rename(temporary, path.join(directory, lifecycleStartupCommitName(id)));
 		await syncDirectory(directory);
 	} finally {
@@ -4715,6 +4717,24 @@ export async function readSessionLifecycleFailure(
 ): Promise<LifecycleFailureArtifact | undefined> {
 	return (await readLifecycleFailureArtifact(lifecycleFailurePath(root, id, expected.effectMarker), expected))
 		?.artifact;
+}
+
+/**
+ * Whether anything occupies the failure receipt path for `expected` or its
+ * promotion fence, readable or not. A receipt that is still being published or
+ * cannot be read is unknown evidence, not absence.
+ */
+export function hasSessionLifecycleFailureEvidence(root: string, id: string, expected: EffectMarker): boolean {
+	const failurePath = lifecycleFailurePath(root, id, expected.effectMarker);
+	for (const file of [failurePath, lifecycleFailurePromotionPath(failurePath)]) {
+		try {
+			fsSync.lstatSync(file);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+		}
+	}
+	return false;
 }
 
 /**

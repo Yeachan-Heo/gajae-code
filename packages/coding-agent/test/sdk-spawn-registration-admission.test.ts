@@ -502,6 +502,36 @@ describe("late spawn admission requires the host's startup commit", () => {
 			},
 		},
 		{
+			name: "a commit while a failure receipt is present but unreadable",
+			code: "child_registration_timeout",
+			host: async (input: SpawnRegistrationRequest) => {
+				await publishReadiness(input);
+				await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+				await Bun.write(
+					path.join(input.stateRoot, "sdk", `${input.childId}.lifecycle.failure.${input.effectMarker}.json`),
+					"{not json",
+				);
+				return undefined;
+			},
+		},
+		{
+			name: "a commit while a failure receipt is still being promoted",
+			code: "child_registration_timeout",
+			host: async (input: SpawnRegistrationRequest) => {
+				await publishReadiness(input);
+				await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+				await Bun.write(
+					path.join(
+						input.stateRoot,
+						"sdk",
+						`${input.childId}.lifecycle.failure.${input.effectMarker}.json.promoting`,
+					),
+					"",
+				);
+				return undefined;
+			},
+		},
+		{
 			name: "a commit from another incarnation of the owner pid",
 			code: "child_registration_timeout",
 			host: async (input: SpawnRegistrationRequest) => {
