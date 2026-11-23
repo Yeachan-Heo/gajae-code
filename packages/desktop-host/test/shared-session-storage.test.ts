@@ -1083,6 +1083,35 @@ test("a prompt sent just before a Disconnect of an idle conversation never runs 
 	await h.close();
 });
 
+test("an owner check that answers after its copy was replaced leaves the new copy and the row alone", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const stale = h.sdk();
+	const releaseBroker = h.holdBroker();
+	const lookups = h.ownerLookups.length;
+	// The prompt's owner check waits for the broker.
+	const checking = h.call("prompt", { sessionId, text: "checked late" });
+	void checking.catch(() => {});
+	await until(() => h.ownerLookups.length > lookups, "the owner lookup");
+	// Meanwhile the terminal appends, and a select replaces the stale copy with a fresh one.
+	await continueInTerminal(stale.sessionFile!, h.projectDir, h.agentDir, h.track);
+	await h.call("session.select", { sessionId });
+	const fresh = h.sdk();
+	expect(fresh).not.toBe(stale);
+	// The late answer says "live", but it was about a copy that is no longer the conversation's.
+	h.liveOwners.add(await transcriptId(h));
+	releaseBroker();
+	await checking;
+	expect(fresh.isDisposed).toBe(false);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "completed" });
+	// The fresh copy's own next write checks, and steps aside.
+	await expect(h.call("prompt", { sessionId, text: "next" })).rejects.toThrow("terminal");
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
+	await h.close();
+});
+
 test("a turn that starts while the owner check is waiting is not released under it", async () => {
 	const held = heldTurn();
 	const h = await controlledFixture(held.handler);

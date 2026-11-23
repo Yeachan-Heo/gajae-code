@@ -21,6 +21,7 @@ import {
 	createSessionImageInput,
 	deleteEmbeddedSession,
 	type EmbeddedAgentSessionResult,
+	type EmbeddedLiveOwner,
 	type EmbeddedTranscriptTail,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -1184,16 +1185,20 @@ export class DesktopHost {
 	 * store's compare-and-append refusal stays the backstop.
 	 */
 	async #ownedElsewhere(metadata: SavedSession): Promise<boolean> {
-		if (!metadata.sessionId || !metadata.file) return false;
-		const owner = await findEmbeddedLiveOwner({
+		const owner = await this.#ownerAnswer(metadata);
+		if (owner.kind === "live") this.#elsewhere.add(metadata.id);
+		else this.#elsewhere.delete(metadata.id);
+		return owner.kind === "live";
+	}
+	/** The broker's answer for this row's transcript, without changing what the row shows. */
+	async #ownerAnswer(metadata: SavedSession): Promise<EmbeddedLiveOwner> {
+		if (!metadata.sessionId || !metadata.file) return { kind: "none" };
+		return findEmbeddedLiveOwner({
 			agentDir: this.agentDir,
 			sessionId: metadata.sessionId,
 			timeoutMs: OWNER_CHECK_TIMEOUT_MS,
 			...(this.#liveOwnerClient ? { client: this.#liveOwnerClient } : {}),
 		});
-		if (owner.kind === "live") this.#elsewhere.add(metadata.id);
-		else this.#elsewhere.delete(metadata.id);
-		return owner.kind === "live";
 	}
 	snapshot(): DesktopSnapshot {
 		return {
@@ -2664,23 +2669,23 @@ export class DesktopHost {
 	 */
 	async #recheckOwner(live: LiveSession): Promise<void> {
 		if (!this.#reloadable(live)) return;
-		if (!(await this.#ownedElsewhere(live.metadata))) return;
-		if (this.#live.get(live.metadata.id) === live && !this.#reloadable(live)) {
-			// Work started in this copy while the broker answered (another request found no owner and
-			// started a turn). Releasing it now would dispose that work, so keep the copy writable;
-			// the next write checks again, and the store's compare-and-append refusal stays the backstop.
-			this.#elsewhere.delete(live.metadata.id);
-			return;
-		}
-		if (this.#live.get(live.metadata.id) === live) {
-			this.#live.delete(live.metadata.id);
-			this.#retiredLive.add(live);
-			try {
-				this.#cancelQuestions(live);
-				await this.#disposeLive(live);
-			} catch (error) {
-				console.error(`Desktop could not fully release a conversation another process opened: ${String(error)}`);
-			}
+		if ((await this.#ownerAnswer(live.metadata)).kind !== "live") return;
+		// Another request replaced or released this copy while the broker answered. The answer was
+		// about a copy that is no longer the conversation's: leave the row as it is, and let the
+		// current copy's own checks apply (the request goes on to find the current copy).
+		if (this.#live.get(live.metadata.id) !== live) return;
+		// Work started in this copy meanwhile (another request found no owner and started a turn).
+		// Releasing it now would dispose that work, so keep the copy writable; the next write checks
+		// again, and the store's compare-and-append refusal stays the backstop.
+		if (!this.#reloadable(live)) return;
+		this.#elsewhere.add(live.metadata.id);
+		this.#live.delete(live.metadata.id);
+		this.#retiredLive.add(live);
+		try {
+			this.#cancelQuestions(live);
+			await this.#disposeLive(live);
+		} catch (error) {
+			console.error(`Desktop could not fully release a conversation another process opened: ${String(error)}`);
 		}
 		await this.#loadReadOnly(live.metadata);
 		this.#emit({ type: "session", session: this.#dto(live.metadata) });
