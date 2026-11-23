@@ -132,7 +132,11 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { isProcessIncarnation, observeProcess, observeProcessIncarnation } from "./process-incarnation";
+import {
+	isProcessIncarnation,
+	observeProcessIncarnation,
+	type ProcessIncarnationObservation,
+} from "./process-incarnation";
 import {
 	armPublicationLivenessWatchdog,
 	disarmPublicationLivenessWatchdog,
@@ -903,6 +907,24 @@ async function readSpawnHostRegistration(
 			candidate => !candidate.live && spawnRegistrationMatches({ ...candidate, live: true }, input),
 		),
 	};
+}
+
+/**
+ * Whether the spawned host's owner process provably exited: the OS confirms
+ * the pid is absent, or it now names a process with another incarnation.
+ * Every inconclusive observation (an unavailable addon, or a pid that cannot be
+ * opened or queried, which `Process.fromPid` reports as `null` on Windows) is
+ * not proof of exit.
+ */
+export function spawnOwnerProvablyExited(
+	pid: number,
+	expectedIncarnation: string,
+	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
+): boolean {
+	const observed = observe(pid);
+	if (observed.status === "absent") return true;
+	if (observed.status === "unknown") return false;
+	return observed.incarnation !== expectedIncarnation;
 }
 
 /** Resolve when `decided` settles or `deadlineAt` passes, without leaving a timer behind. */
@@ -3183,14 +3205,14 @@ export class Broker {
 						deadlineAt: Date.now() + SPAWN_LATE_REGISTRATION_RECHECK_MS,
 						// An owner that provably exited or a readable failure receipt already
 						// decides the refusal; do not hold the spawn (or keep polling a
-						// contended index) for the bound. An unreadable incarnation is
-						// uncertain, not death, and a receipt still being promoted is not yet
-						// readable (ending on it would misreport the failure as a timeout);
-						// both keep waiting.
+						// contended index) for the bound. Only the tri-state observer decides
+						// exit: an owner it cannot query (a Windows PID that fails to open is
+						// one) is uncertain, not death, and a receipt still being promoted is
+						// not yet readable (ending on it would misreport the failure as a
+						// timeout); both keep waiting.
 						recheck: {
 							decided: async () =>
-								observeProcess(pid, incarnation, owner => processIncarnationForBroker(this, owner)) ===
-									"exited" ||
+								spawnOwnerProvablyExited(pid, incarnation) ||
 								(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) !== undefined,
 						},
 					});

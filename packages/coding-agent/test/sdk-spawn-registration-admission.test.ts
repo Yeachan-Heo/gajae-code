@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { withFileLock } from "../src/config/file-lock";
-import { awaitSpawnHostRegistration, Broker, type SpawnRegistrationRequest } from "../src/sdk/broker/broker";
+import {
+	awaitSpawnHostRegistration,
+	Broker,
+	type SpawnRegistrationRequest,
+	spawnOwnerProvablyExited,
+} from "../src/sdk/broker/broker";
 import {
 	hasSessionLifecycleStartupCommit,
 	reapDeadLifecycleMarkers,
@@ -747,5 +752,23 @@ describe("lifecycle startup commit record", () => {
 		expect(await reapDeadLifecycleMarkers(dir)).toBe(1);
 		expect(await Bun.file(markerPath).exists()).toBe(false);
 		expect(await Bun.file(commitPath(dir, id)).exists()).toBe(false);
+	});
+});
+
+describe("spawnOwnerProvablyExited", () => {
+	const expected = "linux:1234";
+	it("decides exit only on OS-confirmed absence or a changed incarnation", () => {
+		expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "absent" }))).toBe(true);
+		expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "present", incarnation: "linux:9999" }))).toBe(
+			true,
+		);
+		expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "present", incarnation: expected }))).toBe(false);
+	});
+
+	it("treats an owner the OS cannot query as not exited", () => {
+		// Windows reports a pid it cannot open or query as a null process reference;
+		// the tri-state observer surfaces that (and an unavailable addon) as unknown.
+		for (const reasonCode of ["open_failed", "observe_unavailable", "native_addon_unavailable"])
+			expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "unknown", reasonCode }))).toBe(false);
 	});
 });

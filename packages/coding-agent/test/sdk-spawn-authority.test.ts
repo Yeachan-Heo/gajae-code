@@ -1621,11 +1621,18 @@ describe("Broker spawn flow driver", () => {
 				},
 			});
 			brokerRef = broker;
-			// The owner process provably exits through the broker's incarnation seam:
-			// its pid now reads as a different, readable incarnation (pid reuse). The
-			// index's own liveness probe still sees this live test process.
+			// The owner process provably exits: its pid now names a different, readable
+			// incarnation (pid reuse), both through the broker's incarnation seam and
+			// through the tri-state OS observer the recheck decides on. The index's own
+			// liveness probe still sees this live test process.
 			setProcessIncarnationForTest(broker, pid =>
 				ownerDead && pid === process.pid ? "replaced-incarnation" : processIncarnation(pid),
+			);
+			const realObserve = incarnationModule.observeProcessIncarnation;
+			const observeSpy = spyOn(incarnationModule, "observeProcessIncarnation").mockImplementation((pid, options) =>
+				ownerDead && pid === process.pid
+					? { status: "present", incarnation: "replaced-incarnation" }
+					: realObserve(pid, options),
 			);
 			await broker.start();
 			try {
@@ -1661,6 +1668,7 @@ describe("Broker spawn flow driver", () => {
 				await decision;
 				await holder;
 				setProcessIncarnationForTest(broker, undefined);
+				observeSpy.mockRestore();
 				await broker.stop();
 			}
 		}, 40_000);
@@ -1743,15 +1751,20 @@ describe("Broker spawn flow driver", () => {
 			},
 		});
 		brokerRef = broker;
-		// Unreadable from 0.5 s to 2.5 s past the deadline, inside the recheck and
-		// the lock hold; readable again before the lock is released.
-		setProcessIncarnationForTest(broker, pid => {
+		// The OS observer cannot query the owner from 0.5 s to 2.5 s past the
+		// deadline, inside the recheck and the lock hold (a Windows PID that fails
+		// to open looks like this); it reads the owner again before the lock is
+		// released. The broker's incarnation seam goes unreadable in the same window.
+		const unreadable = (pid: number): boolean => {
 			const sinceDeadline = Date.now() - deadlineAt;
-			if (pid === process.pid && deadlineAt > 0 && sinceDeadline > 500 && sinceDeadline < 2_500) {
-				unreadableProbes += 1;
-				return undefined;
-			}
-			return processIncarnation(pid);
+			return pid === process.pid && deadlineAt > 0 && sinceDeadline > 500 && sinceDeadline < 2_500;
+		};
+		setProcessIncarnationForTest(broker, pid => (unreadable(pid) ? undefined : processIncarnation(pid)));
+		const realObserve = incarnationModule.observeProcessIncarnation;
+		const observeSpy = spyOn(incarnationModule, "observeProcessIncarnation").mockImplementation((pid, options) => {
+			if (!unreadable(pid)) return realObserve(pid, options);
+			unreadableProbes += 1;
+			return { status: "unknown", reasonCode: "open_failed" };
 		});
 		await broker.start();
 		try {
@@ -1774,6 +1787,7 @@ describe("Broker spawn flow driver", () => {
 		} finally {
 			await holder;
 			setProcessIncarnationForTest(broker, undefined);
+			observeSpy.mockRestore();
 			await broker.stop();
 		}
 	}, 40_000);
