@@ -106,6 +106,7 @@ import {
 	StreamRepetitionGuard,
 	type StreamRepetitionTrip,
 } from "../utils/stream-repetition-guard";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE, GeminiHeaderRunDetector, isGeminiModel } from "../utils/thinking-loop";
 import {
 	DsmlToolCallHealer,
 	type HealedToolCall,
@@ -575,6 +576,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		// alone is true for all three, and using it there discarded the real
 		// timeout/transport facts and flipped the retry classification (#5627 review r4).
 		let repetitionSelfAbort = false;
+		// Gemini reasoning-summary header runaway detector (Gemini models only).
+		const isGemini = isGeminiModel(model.id);
+		const geminiHeaderRunDetector = isGemini ? new GeminiHeaderRunDetector() : null;
+		let geminiHeaderRunawaySelfAbort = false;
 		const finalizeRepetitionGuardStop = (): void => {
 			if (!repetitionTrip) return;
 			// `error`, not `aborted`: this is a provider-side failure we detected
@@ -1275,6 +1280,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 								normalizeStreamingContentText(choice.delta.content),
 							);
 							if (normalizedDeltaText.length > 0) {
+								// Reset Gemini header runaway detector when transitioning to visible text.
+								geminiHeaderRunDetector?.reset();
 								if (!firstTokenTime) firstTokenTime = Date.now();
 								if (parseMiniMaxThinkTags) {
 									taggedTextBuffer += normalizedDeltaText;
@@ -1329,9 +1336,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 							if (foundReasoningField) {
 								const delta = (choice.delta as any)[foundReasoningField];
 								appendThinkingDelta(delta, foundReasoningField);
+								// Feed reasoning to Gemini header runaway detector (Gemini models only).
+								if (geminiHeaderRunDetector?.push(delta)) {
+									logger.debug(
+										`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupting stream.`,
+									);
+									geminiHeaderRunawaySelfAbort = true;
+									// Defer abort until after tool calls in this frame are processed.
+								}
 							}
 
 							if (choice?.delta?.tool_calls && choice.delta.tool_calls.length > 0) {
+								// Reset Gemini header runaway detector when transitioning to tool calls.
+								geminiHeaderRunDetector?.reset();
 								for (const toolCall of choice.delta.tool_calls) {
 									if (currentBlock?.type !== "toolCall" || (toolCall.id && currentBlock.id !== toolCall.id)) {
 										finishCurrentBlock(currentBlock);
@@ -1381,6 +1398,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 										}
 									}
 								}
+							}
+
+							// After frame is fully processed, commit the detector-triggered abort.
+							if (geminiHeaderRunawaySelfAbort && !repetitionTrippedAt) {
+								requestAbortController.abort();
 							}
 						}
 					}
@@ -1551,6 +1573,19 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				return;
 			}
 
+			// A Gemini runaway detector abort can also complete the stream normally
+			// if the provider had already buffered the rest of the response.
+			if (geminiHeaderRunawaySelfAbort && !abortTracker.wasCallerAbort()) {
+				output.stopReason = "error";
+				output.errorCode = GEMINI_HEADER_RUNAWAY_ERROR_CODE;
+				output.errorMessage = `Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector?.count ?? 0} consecutive headers. Interrupted to prevent budget exhaustion.`;
+				output.duration = Date.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+				return;
+			}
+
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			if (firstEventTimeoutError) {
 				throw firstEventTimeoutError;
@@ -1598,6 +1633,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			// wins: the user's cancel is the more meaningful intent. Keyed on the
 			// self-abort flag, not on `repetitionTrip`: a stall or transport error
 			// during the drain window must keep its own facts.
+			if (geminiHeaderRunawaySelfAbort && !abortTracker.wasCallerAbort()) {
+				output.stopReason = "error";
+				output.errorCode = GEMINI_HEADER_RUNAWAY_ERROR_CODE;
+				output.errorMessage = `Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector?.count ?? 0} consecutive headers. Interrupted to prevent budget exhaustion.`;
+				output.duration = Date.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				stream.push({ type: "error", reason: "error", error: output });
+				stream.end();
+				return;
+			}
 			if (repetitionSelfAbort && !abortTracker.wasCallerAbort()) {
 				finalizeRepetitionGuardStop();
 				return;

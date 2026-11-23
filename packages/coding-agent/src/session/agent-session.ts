@@ -151,6 +151,7 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
@@ -16473,6 +16474,11 @@ export class AgentSession {
 		});
 	}
 
+	/** MCP control admission fences mutations but does not replace the session's read identity. */
+	get isMcpControlActive(): boolean {
+		return this.#sessionTransitionKind === "mcp-control" && !this.#handoffTransitionActive;
+	}
+
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;
@@ -31243,6 +31249,11 @@ export class AgentSession {
 		// Without this the message carries no transport facts and would fall
 		// through to "unknown", which is admitted for bounded retry (#5627).
 		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
+		// Gemini reasoning-summary header runaway is deterministic for the submitted
+		// context: replaying the identical conversation re-triggers the identical
+		// runaway, so an auto-retry loop can never succeed and only re-bills the
+		// full context on every attempt.
+		if (message.errorCode === GEMINI_HEADER_RUNAWAY_ERROR_CODE) return "terminal";
 		// A 2xx body in the wrong protocol replays identically; its embedded body text
 		// (e.g. "HTTP 503") must not be reparsed as a transient failure.
 		if (message.errorCode === PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE) return "terminal";

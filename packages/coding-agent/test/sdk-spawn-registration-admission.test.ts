@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { withFileLock } from "../src/config/file-lock";
-import { awaitSpawnHostRegistration, Broker, type SpawnRegistrationRequest } from "../src/sdk/broker/broker";
+import {
+	awaitSpawnHostRegistration,
+	Broker,
+	type SpawnRegistrationRequest,
+	spawnOwnerProvablyExited,
+} from "../src/sdk/broker/broker";
 import {
 	hasSessionLifecycleStartupCommit,
 	reapDeadLifecycleMarkers,
@@ -14,6 +19,7 @@ import {
 	writeSessionLifecycleReady,
 	writeSessionLifecycleStartupCommit,
 } from "../src/sdk/broker/lifecycle";
+import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import {
 	resolveSessionLocator,
@@ -267,6 +273,71 @@ describe("awaitSpawnHostRegistration", () => {
 		await f.host.append(f.registration({ type: "host_unregistered" }));
 		const result = await awaitSpawnHostRegistration(f.observer, f.request(Date.now() + 300));
 		expect(result).toEqual({ ok: false, reason: "mismatch" });
+	});
+
+	it("stops reading on an unregistered row but holds the recheck refusal until the probe decides", async () => {
+		const f = await fixture("child-recheck-unregistered");
+		await f.host.append(f.registration());
+		await f.host.append(f.registration({ type: "host_unregistered" }));
+		const observer = f.observer;
+		const refresh = vi.spyOn(observer, "refresh");
+		// A rolling-back host unregisters first and writes its failure receipt later.
+		const startedAt = Date.now();
+		const receiptAt = startedAt + 600;
+		try {
+			const result = await awaitSpawnHostRegistration(observer, {
+				...f.request(startedAt + 5_000),
+				recheck: { decided: async () => Date.now() >= receiptAt },
+			});
+			const elapsed = Date.now() - startedAt;
+			expect(result).toEqual({ ok: false, reason: "mismatch" });
+			expect(elapsed).toBeGreaterThanOrEqual(600);
+			expect(elapsed).toBeLessThan(2_000);
+			expect(refresh).toHaveBeenCalledTimes(1);
+		} finally {
+			refresh.mockRestore();
+		}
+	});
+
+	it("ends a recheck on an unregistered row at the bound when the probe never decides", async () => {
+		const f = await fixture("child-recheck-unregistered-undecided");
+		await f.host.append(f.registration());
+		await f.host.append(f.registration({ type: "host_unregistered" }));
+		const startedAt = Date.now();
+		const result = await awaitSpawnHostRegistration(f.observer, {
+			...f.request(startedAt + 800),
+			recheck: { decided: async () => false },
+		});
+		const elapsed = Date.now() - startedAt;
+		expect(result).toEqual({ ok: false, reason: "mismatch" });
+		expect(elapsed).toBeGreaterThanOrEqual(750);
+		expect(elapsed).toBeLessThan(2_000);
+	});
+
+	it("keeps a recheck open when a row fails only on a transiently unreadable liveness probe", async () => {
+		const f = await fixture("child-recheck-liveness-flake");
+		await f.host.append(f.registration());
+		// The projection reads the owner incarnation at read time; the first reads
+		// cannot observe it, so the row projects as not live (a liveness-only mismatch).
+		const real = incarnationModule.processIncarnation;
+		let unreadable = 3;
+		const spy = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation((pid, options) => {
+			if (pid === process.pid && unreadable > 0) {
+				unreadable -= 1;
+				return undefined;
+			}
+			return real(pid, options);
+		});
+		try {
+			const result = await awaitSpawnHostRegistration(f.observer, {
+				...f.request(Date.now() + 3_000),
+				recheck: { decided: async () => false },
+			});
+			expect(unreadable).toBe(0);
+			expect(result).toMatchObject({ ok: true, registration: { sessionId: "child-recheck-liveness-flake" } });
+		} finally {
+			spy.mockRestore();
+		}
 	});
 });
 
@@ -681,5 +752,23 @@ describe("lifecycle startup commit record", () => {
 		expect(await reapDeadLifecycleMarkers(dir)).toBe(1);
 		expect(await Bun.file(markerPath).exists()).toBe(false);
 		expect(await Bun.file(commitPath(dir, id)).exists()).toBe(false);
+	});
+});
+
+describe("spawnOwnerProvablyExited", () => {
+	const expected = "linux:1234";
+	it("decides exit only on OS-confirmed absence or a changed incarnation", () => {
+		expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "absent" }))).toBe(true);
+		expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "present", incarnation: "linux:9999" }))).toBe(
+			true,
+		);
+		expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "present", incarnation: expected }))).toBe(false);
+	});
+
+	it("treats an owner the OS cannot query as not exited", () => {
+		// Windows reports a pid it cannot open or query as a null process reference;
+		// the tri-state observer surfaces that (and an unavailable addon) as unknown.
+		for (const reasonCode of ["open_failed", "observe_unavailable", "native_addon_unavailable"])
+			expect(spawnOwnerProvablyExited(7, expected, () => ({ status: "unknown", reasonCode }))).toBe(false);
 	});
 });
