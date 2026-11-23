@@ -3757,12 +3757,18 @@ suite("mounted composer delivery recovery", () => {
 			// and a 390 px window, where the open sidebar leaves the column 126 px.
 			for (const [width, columnWidth] of [[920, 656], [720, 456], [390, 126]] as const) {
 				await page.setViewport({ width, height: 900 });
-				// The shell reacts to the new width a render later (the narrow-layout listener moves the
-				// sidebar), so measure only once the column has reached this viewport's width.
+				// Below 760 px the shell collapses the sidebar to its rail when its layout listener runs,
+				// and whether that has happened yet after a viewport change is a race. This case measures
+				// the tightest column, beside the open sidebar, so keep reopening the sidebar (as a user
+				// would) until the column has this viewport's width.
 				await page.waitForFunction(
-					expected =>
-						Math.round(document.querySelector(".conversation-column")!.getBoundingClientRect().width) === expected,
-					{},
+					expected => {
+						document.querySelector<HTMLButtonElement>('button[aria-label="Expand sidebar"]')?.click();
+						return (
+							Math.round(document.querySelector(".conversation-column")!.getBoundingClientRect().width) === expected
+						);
+					},
+					{ polling: 50 },
 					columnWidth,
 				);
 				const layout = await page.evaluate(() => {
