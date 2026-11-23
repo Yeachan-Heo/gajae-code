@@ -29,6 +29,20 @@ describe("maskStoredSecrets", () => {
 		const text = "answer ends with sk-partial-cre";
 		const secrets = ["sk-partial-credential"];
 		expect(maskStoredSecrets(text, secrets, "*")).toBe(text);
-		expect(maskStoredSecrets(text, secrets, "*", true)).toBe("answer ends with *");
+		expect(maskStoredSecrets(text, secrets, "*", { trailingPartial: 1 })).toBe("answer ends with *");
+	});
+
+	it("leaves a cut-off fragment shorter than the requested minimum visible", () => {
+		const secrets = ["sk-partial-credential"];
+		expect(maskStoredSecrets("ends with sk-part", secrets, "*", { trailingPartial: 8 })).toBe("ends with sk-part");
+		expect(maskStoredSecrets("ends with sk-parti", secrets, "*", { trailingPartial: 8 })).toBe("ends with *");
+	});
+
+	it("masks a credential tail at the start of text only when asked", () => {
+		const secrets = ["sk-partial-credential"];
+		const text = "l-credential then output";
+		expect(maskStoredSecrets(text, secrets, "*")).toBe(text);
+		expect(maskStoredSecrets(text, secrets, "*", { leadingPartial: 8 })).toBe("* then output");
+		expect(maskStoredSecrets("dential then output", secrets, "*", { leadingPartial: 8 })).toBe("dential then output");
 	});
 });

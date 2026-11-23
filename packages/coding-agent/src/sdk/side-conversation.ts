@@ -107,7 +107,7 @@ const SENSITIVE_PATH_PART =
 
 function redactSideOutput(text: string, secrets: readonly string[], maskPartial = false): string {
 	// `maskPartial` also masks a credential cut off at the end of bounded native output.
-	return redactCrashSecrets(maskStoredSecrets(text, secrets, REDACTED, maskPartial))
+	return redactCrashSecrets(maskStoredSecrets(text, secrets, REDACTED, maskPartial ? { trailingPartial: 1 } : {}))
 		.replace(/[^\s"'`<>]+/g, token =>
 			token.split(/[\\/]/).some(part => SENSITIVE_PATH_PART.test(part.replace(/^[([{]+|[)\]},;:.]+$/g, "")))
 				? REDACTED
