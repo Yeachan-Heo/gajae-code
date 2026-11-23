@@ -10,6 +10,7 @@ import {
 } from "../config/atomic-yaml-patch";
 import {
 	collectModelProfileAuthentication,
+	createPassiveModelProfileCredentials,
 	isModelProfileSelectable,
 	type ModelProfileAvailabilityContext,
 } from "../config/model-profile-availability";
@@ -328,8 +329,11 @@ export class SdkPreferenceControls {
 
 	/**
 	 * Canonical read-only profile presentation. Availability is the managed
-	 * `models.profiles.list` decision for this session's credentials; it reads (and may refresh)
-	 * stored credentials but never refreshes the registry's catalogs.
+	 * `models.profiles.list` decision (providers authenticated directly, through an alternative or a
+	 * configured proxy, and mapped models resolvable) with one difference: a credential counts when
+	 * a usable one exists. The read resolves no key, refreshes no OAuth token and records no session
+	 * credential choice, so it never changes which credential a later request uses. It never
+	 * refreshes the registry's catalogs either.
 	 */
 	async readProfiles(): Promise<SdkProfileCatalogEntry[]> {
 		this.#assertIdentity();
@@ -340,6 +344,7 @@ export class SdkPreferenceControls {
 			settings: this.#settings,
 			resolutionSettings: this.#settings,
 			credentialSessionId: this.#session.credentialSessionId,
+			credentials: createPassiveModelProfileCredentials(this.#registry),
 		};
 		const authenticated = await collectModelProfileAuthentication(context, definitions);
 		const result = await Promise.all(

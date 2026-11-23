@@ -185,6 +185,37 @@ describe("desktop SDK preferences delegation", () => {
 		]);
 		expect(await controller.listProfiles()).toEqual(profiles);
 	});
+	test("preferences.get leaves stored credentials and the session's credential choice untouched", async () => {
+		const { controller, session, agentDir } = await fixture();
+		const auth = session.modelRegistry.authStorage;
+		// Two stored keys: resolving one would record it as this session's choice.
+		await auth.set(keyless, [
+			{ type: "api_key", key: "keyless-one" },
+			{ type: "api_key", key: "keyless-two" },
+		]);
+		const sessionId = session.credentialSessionId;
+		const snapshot = async () => {
+			const files: Array<[string, string]> = [];
+			for (const name of (await fs.readdir(agentDir, { recursive: true })).sort()) {
+				const file = path.join(agentDir, name);
+				if (!(await fs.stat(file)).isFile()) continue;
+				files.push([name, Buffer.from(await Bun.file(file).arrayBuffer()).toString("base64")]);
+			}
+			return files;
+		};
+		const resolving = [
+			vi.spyOn(auth, "getApiKey"),
+			vi.spyOn(auth, "getApiKeyWithCredentialRowId"),
+			vi.spyOn(auth, "peekApiKey"),
+		];
+		const before = await snapshot();
+		const profiles = (await controller.read()).profiles;
+		expect(profiles.find(profile => profile.id === "desk-keyless")?.available).toBe(true);
+		for (const spy of resolving) expect(spy).not.toHaveBeenCalled();
+		expect(auth.getSessionCredentialType(keyless, sessionId)).toBeUndefined();
+		expect(auth.getSessionCredentialType(provider, sessionId)).toBeUndefined();
+		expect(await snapshot()).toEqual(before);
+	});
 	test("a listed profile selects for the session exactly when it is listed available", async () => {
 		const outcomes: Array<[string, boolean, boolean]> = [];
 		for (const id of [

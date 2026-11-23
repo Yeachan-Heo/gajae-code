@@ -34,6 +34,46 @@ export interface ModelProfileAvailabilityContext {
 	resolutionSettings: Settings | undefined;
 	/** The session whose credentials decide authentication. */
 	credentialSessionId: string;
+	/**
+	 * How a provider's credential is looked up. Without it, availability resolves the credential
+	 * through `registry.getApiKeyForProvider`, as the managed profile list does: that may refresh
+	 * OAuth tokens and records the session's credential choice. Pass
+	 * `createPassiveModelProfileCredentials` for a read that must leave credential state alone.
+	 */
+	credentials?: ModelProfileCredentialLookup;
+}
+
+/** A provider's key, `kNoAuth` for a provider that needs none, or undefined when it has no credential. */
+export type ModelProfileCredentialLookup = (
+	provider: string,
+	sessionId: string | undefined,
+	baseUrl?: string,
+) => Promise<string | undefined>;
+
+/**
+ * Stands in for a credential that exists and is usable but was not resolved. Availability only
+ * tests it; it is never sent to a provider.
+ */
+const PASSIVE_CREDENTIAL_PRESENT = "passive-credential-present";
+
+/**
+ * A lookup that asks only whether a usable credential exists (`hasUsableAuthForProvider`, or a
+ * provider that needs none). It resolves no key, refreshes no OAuth token, ranks no accounts and
+ * records no session credential choice, so reading availability never changes which credential a
+ * later request uses. An expired OAuth login whose refresh would fail still counts as present.
+ */
+export function createPassiveModelProfileCredentials(registry: ModelRegistry): ModelProfileCredentialLookup {
+	return async (provider, sessionId) => {
+		if (registry.isCredentiallessProvider(provider)) return kNoAuth;
+		return registry.hasUsableAuthForProvider(provider, sessionId) ? PASSIVE_CREDENTIAL_PRESENT : undefined;
+	};
+}
+
+function credentialLookup(context: ModelProfileAvailabilityContext): ModelProfileCredentialLookup {
+	return (
+		context.credentials ??
+		((provider, sessionId, baseUrl) => context.registry.getApiKeyForProvider(provider, sessionId, baseUrl))
+	);
 }
 
 export interface ModelProfileAvailability {
@@ -72,7 +112,7 @@ export async function resolveModelProfileAvailability(
 			const credentialless =
 				proxyProvider === "opencodex" &&
 				!configuredProviders?.includes(proxyProvider) &&
-				(await context.registry.getApiKeyForProvider(proxyProvider, context.credentialSessionId)) === kNoAuth;
+				(await credentialLookup(context)(proxyProvider, context.credentialSessionId)) === kNoAuth;
 			if (!isModelProfileProxyConfigured(proxyProvider, configuredProviders, credentialless))
 				return { available: false };
 		}
@@ -91,7 +131,7 @@ export async function resolveModelProfileAvailability(
 			...context.registry,
 			getAvailable: () => availableModels,
 			getApiKey: (model: Model<Api>, sessionId?: string) =>
-				context.registry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+				credentialLookup(context)(model.provider, sessionId, model.baseUrl),
 			resolveCanonicalModel: context.registry.resolveCanonicalModel?.bind(context.registry),
 			getCanonicalVariants: context.registry.getCanonicalVariants?.bind(context.registry),
 			getCanonicalId: context.registry.getCanonicalId?.bind(context.registry),
@@ -160,7 +200,7 @@ export async function collectModelProfileAuthentication(
 	await Promise.all(
 		[...providers].map(async provider => {
 			try {
-				const apiKey = await context.registry.getApiKeyForProvider(provider, context.credentialSessionId);
+				const apiKey = await credentialLookup(context)(provider, context.credentialSessionId);
 				if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticated.add(provider);
 			} catch {
 				// A provider whose credential state cannot be read is not currently configurable.
@@ -175,7 +215,7 @@ export async function collectModelProfileAuthentication(
 	}
 	for (const proxyProvider of proxyProviders) {
 		try {
-			const apiKey = await context.registry.getApiKeyForProvider(proxyProvider, context.credentialSessionId);
+			const apiKey = await credentialLookup(context)(proxyProvider, context.credentialSessionId);
 			if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticated.add(proxyProvider);
 		} catch {
 			// Passive availability must degrade to unavailable when proxy credential
