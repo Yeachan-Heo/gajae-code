@@ -1106,10 +1106,12 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .recovery-conversation-hint { word-break: keep-all; overflow-wrap: anywhere; }
 .recovery-card-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 /* Scoped to the card, among muted prose: an enabled action is filled and in the body ink, a disabled
-   one unfilled with a dashed edge, so the two differ by more than color in every palette. */
+   one unfilled with a dashed muted edge, so the two differ by more than color in every palette. The
+   disabled one is not faded as well: fading made its edge vanish (about 1.2:1); at full strength the
+   muted edge clears 3:1 on the card. */
 .recovery-card-actions > .button { border-color: var(--border-soft); background: var(--surface-2); color: var(--text); }
 .recovery-card-actions > .button:hover:not(:disabled) { background: var(--surface); }
-.recovery-card-actions > .button:disabled { border-style: dashed; background: transparent; color: var(--muted); }
+.recovery-card-actions > .button:disabled { opacity: 1; border-style: dashed; border-color: var(--muted); background: transparent; color: var(--muted); }
 .recovery-card-reason { font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
 /* In the Delete conversation confirmation: the unrestored texts that go with it, and a copy first. */
 .delete-recoveries { display: grid; gap: 0.5rem; margin: 0 0 1rem; }

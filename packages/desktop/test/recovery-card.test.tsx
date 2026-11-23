@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
-import { THEME_IDS } from "../src/themes";
+import { THEME_IDS, THEME_STORAGE_KEY } from "../src/themes";
 import { browserPath, closeComponentFixture, componentFixture, componentReady } from "./component-fixture";
 import { measureContrast } from "./fixtures/contrast";
 
@@ -336,6 +336,39 @@ suite("Delete conversation dialog", () => {
 });
 
 suite("Recovery card showcase", () => {
+	test("a disabled card action shows a visible dashed edge, unfaded, in every bundled theme", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			const failures: string[] = [];
+			for (const theme of THEME_IDS) {
+				await page.evaluate((key, id) => localStorage.setItem(key, id), THEME_STORAGE_KEY, theme);
+				await page.reload();
+				await page.waitForFunction(id => document.documentElement.dataset.theme === id, {}, theme);
+				await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+				await page.waitForSelector("#showcase-recovery-cards .recovery-card-actions > .button:disabled");
+				const edge = await page.$eval("#showcase-recovery-cards .recovery-card-actions > .button:disabled", node => {
+					const style = getComputedStyle(node);
+					const probe = document.createElement("span");
+					probe.id = "disabled-edge-probe";
+					probe.textContent = "edge";
+					probe.style.color = style.borderTopColor;
+					node.closest(".recovery-card")!.append(probe);
+					return { style: style.borderTopStyle, opacity: style.opacity };
+				});
+				const [sample] = await page.evaluate(measureContrast, ["#disabled-edge-probe"]);
+				// The edge is measured at full strength only if nothing fades the button.
+				if (edge.style !== "dashed" || edge.opacity !== "1" || sample!.ratio < 3)
+					failures.push(`${theme}: ${edge.style} opacity ${edge.opacity} edge ${sample!.ratio}`);
+			}
+			expect(failures).toEqual([]);
+		} finally {
+			await context.close();
+		}
+	}, 60000);
+
 	test("three stacked cards keep their gutter, edges and actions inside them at 390 px and with 20 px text", async () => {
 		const context = await browser.createBrowserContext();
 		try {
