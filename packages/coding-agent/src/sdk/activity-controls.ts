@@ -4,6 +4,7 @@ import {
 	MCPServerControlError,
 	type MCPServerControlTarget,
 } from "../runtime-mcp/manager";
+import { collectSdkStoredSecrets, maskStoredSecrets } from "./credential-secrets";
 import {
 	JobObservationError,
 	type JobObservationErrorCode,
@@ -180,8 +181,23 @@ function failure(error: unknown): ActivityControlError {
 	return new ActivityControlError("backend_failure");
 }
 
-function text(value: string): string {
-	return value.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
+/** Upstream producers (for example bash job labels) cut long values and append one of these. */
+const TRUNCATION_MARKERS = ["...", "\u2026"] as const;
+/** A cut-off credential fragment shorter than this is left alone, so ordinary text is not masked. */
+const PARTIAL_SECRET_MIN_CHARS = 8;
+
+function text(value: string, secrets: readonly string[]): string {
+	// Inspect complete display fields before bounding them. A value already cut
+	// upstream may end in a credential's prefix, just before its marker.
+	if (!secrets.length) return value.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
+	const marker = TRUNCATION_MARKERS.find(candidate => value.endsWith(candidate));
+	const safe =
+		marker === undefined
+			? maskStoredSecrets(value, secrets, "[REDACTED]")
+			: maskStoredSecrets(value.slice(0, -marker.length), secrets, "[REDACTED]", {
+					trailingPartial: PARTIAL_SECRET_MIN_CHARS,
+				}) + marker;
+	return safe.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
 }
 
 function count(value: number): number {
@@ -294,6 +310,7 @@ export class ActivityControls {
 		target: Target,
 		snapshot: JobObservationSnapshot,
 		ref: string,
+		secrets: readonly string[],
 		jobs: JobObservationSnapshot["jobs"] = observedJobs(snapshot),
 	): ActivityEntry {
 		const controls: ActivityAction[] = [];
@@ -307,7 +324,11 @@ export class ActivityControls {
 				throw new ActivityControlError(jobs.some(row => row.id === target.id) ? "stale_generation" : "not_found");
 			label = job.label;
 			status = job.status;
-			fields = { jobKind: text(job.kind), backgrounded: job.backgrounded, deliveryState: job.deliveryState };
+			fields = {
+				jobKind: text(job.kind, secrets),
+				backgrounded: job.backgrounded,
+				deliveryState: job.deliveryState,
+			};
 			readable =
 				job.kind === "bash" &&
 				!job.backgrounded &&
@@ -321,8 +342,8 @@ export class ActivityControls {
 			label = task.id;
 			status = task.status;
 			fields = {
-				...(task.requestedModel === undefined ? {} : { requestedModel: text(task.requestedModel) }),
-				...(task.effectiveModel === undefined ? {} : { effectiveModel: text(task.effectiveModel) }),
+				...(task.requestedModel === undefined ? {} : { requestedModel: text(task.requestedModel, secrets) }),
+				...(task.effectiveModel === undefined ? {} : { effectiveModel: text(task.effectiveModel, secrets) }),
 			};
 			if (task.capabilities.cancel) controls.push("cancel");
 			if (task.capabilities.pause) controls.push("pause");
@@ -334,8 +355,8 @@ export class ActivityControls {
 			label = cron.humanSchedule;
 			status = cron.firing ? "firing" : "scheduled";
 			fields = {
-				cronExpression: text(cron.cronExpression),
-				prompt: text(cron.prompt),
+				cronExpression: text(cron.cronExpression, secrets),
+				prompt: text(cron.prompt, secrets),
 				recurring: cron.recurring,
 				...(cron.nextFireAt === undefined ? {} : { nextFireAt: count(cron.nextFireAt) }),
 			};
@@ -345,7 +366,7 @@ export class ActivityControls {
 			...fields,
 			ref,
 			kind: target.kind,
-			label: text(label),
+			label: text(label, secrets),
 			status,
 			controls: this.#session.sessionLifecycle.transitioning ? [] : controls,
 			readable,
@@ -356,10 +377,11 @@ export class ActivityControls {
 		try {
 			this.#assertCurrent(true);
 			const snapshot = this.#view().getSnapshot();
+			const secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage);
 			const retained = new Set<string>();
 			const allJobs = observedJobs(snapshot);
 			const project = (target: Target): ActivityEntry =>
-				this.#entry(target, snapshot, this.#reference(target, retained), allJobs);
+				this.#entry(target, snapshot, this.#reference(target, retained), secrets, allJobs);
 			const jobs = allJobs
 				.slice(0, ACTIVITY_CONTROL_LIMITS.entries)
 				.map(row => project({ kind: "job", id: row.id, generation: row.generation }));
@@ -396,7 +418,8 @@ export class ActivityControls {
 		this.#assertCurrent();
 		const target = this.#references.get(ref);
 		if (!target) throw new ActivityControlError("not_found");
-		const entry = this.#entry(target, this.#view().getSnapshot(), ref);
+		const secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage);
+		const entry = this.#entry(target, this.#view().getSnapshot(), ref, secrets);
 		this.#assertCurrent();
 		return { target, entry };
 	}
@@ -408,10 +431,18 @@ export class ActivityControls {
 			let detail: ActivityDetail = { entry };
 			if (target.kind === "job" && entry.readable) {
 				const output = this.#view().getMonitorOutput(target);
+				// The retained window can start inside a credential (oldest output is
+				// evicted) and a running job's output can end inside one.
+				const safe = maskStoredSecrets(
+					output,
+					collectSdkStoredSecrets(this.#session.modelRegistry.authStorage),
+					"[REDACTED]",
+					{ leadingPartial: PARTIAL_SECRET_MIN_CHARS, trailingPartial: PARTIAL_SECRET_MIN_CHARS },
+				);
 				detail = {
 					entry,
-					output: output.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars),
-					outputTruncated: output.length > ACTIVITY_CONTROL_LIMITS.outputChars,
+					output: safe.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars),
+					outputTruncated: safe.length > ACTIVITY_CONTROL_LIMITS.outputChars,
 				};
 			}
 			this.#assertCurrent();
@@ -472,6 +503,7 @@ export class ActivityControls {
 			this.#assertCurrent(true);
 			if (!this.#manager) throw new ActivityControlError("unavailable");
 			const snapshot = this.#manager.getServerControlSnapshot();
+			const secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage);
 			const retained = new Set<string>();
 			const servers = snapshot.slice(0, ACTIVITY_CONTROL_LIMITS.entries).map(server => {
 				let ref: string | undefined;
@@ -492,7 +524,7 @@ export class ActivityControls {
 				retained.add(ref);
 				return {
 					ref,
-					label: text(server.target.name),
+					label: text(server.target.name, secrets),
 					state: server.state,
 					transport: server.transport,
 					sharing: server.sharing,

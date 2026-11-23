@@ -244,7 +244,7 @@ import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
-import { JobObservation } from "./job-observation";
+import { JobObservation, JobObservationError } from "./job-observation";
 import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	isStableSessionApiKeyCredentialType,
@@ -6704,7 +6704,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationManager.getSubagentControlScope() !== observationScope
 				)
 					observationInvalidated = true;
-				if (lifecycle.transitioning) {
+				if (lifecycle.transitioning && !observationSession.isMcpControlActive) {
 					// Observe ownership conflicts even during exclusion: restoring mutable
 					// identities before settlement cannot undo a captured mismatch.
 					observationSuspended = true;
@@ -6723,7 +6723,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationSuspended = false;
 				}
 				if (!jobObservation) {
-					const view = new JobObservation(observationManager, resolvedAgentId);
+					// MCP admission keeps this view readable, never its mutation authority.
+					const view = new JobObservation(observationManager, resolvedAgentId, () => {
+						if (observationSession.isMcpControlActive) throw new JobObservationError("session_transitioning");
+					});
 					const disposeView = view.dispose.bind(view);
 					const unregisterDisposal = observationSession.registerToolSessionCleanup(() => cleanup());
 					const unregisterTransition = observationSession.registerToolSessionTransitionCleanup(() => cleanup());
