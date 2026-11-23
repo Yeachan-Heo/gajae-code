@@ -2731,20 +2731,35 @@ export class DesktopHost {
 			if (method === "session.select") return;
 			throw new Error(ELSEWHERE_BACKGROUND);
 		}
-		this.#elsewhere.add(live.metadata.id);
-		this.#live.delete(live.metadata.id);
-		this.#retiredLive.add(live);
-		try {
-			this.#cancelQuestions(live);
-			await this.#disposeLive(live);
-		} catch (error) {
-			console.error(
-				`Desktop could not fully release a conversation another process opened: ${this.#diagnostic(error)}`,
-			);
-		}
-		await this.#loadReadOnly(live.metadata);
-		this.#emit({ type: "session", session: this.#dto(live.metadata) });
-		throw new Error(ELSEWHERE);
+		const metadata = live.metadata;
+		this.#elsewhere.add(metadata.id);
+		// Registered like a reload, synchronously, so a request arriving while the copy is released
+		// joins this step-aside instead of opening a second copy on the same transcript.
+		const steppingAside = (async (): Promise<never> => {
+			this.#live.delete(metadata.id);
+			this.#retiredLive.add(live);
+			try {
+				this.#cancelQuestions(live);
+				await this.#disposeLive(live);
+			} catch (error) {
+				console.error(
+					`Desktop could not fully release a conversation another process opened: ${this.#diagnostic(error)}`,
+				);
+			}
+			try {
+				await this.#loadReadOnly(metadata);
+			} finally {
+				if (!this.#closed && this.#catalog.sessions.includes(metadata))
+					this.#emit({ type: "session", session: this.#dto(metadata) });
+			}
+			throw new Error(ELSEWHERE);
+		})();
+		this.#opening.set(metadata.id, steppingAside);
+		const release = () => {
+			if (this.#opening.get(metadata.id) === steppingAside) this.#opening.delete(metadata.id);
+		};
+		void steppingAside.then(release, release);
+		await steppingAside;
 	}
 	/**
 	 * A user Stop; a confirmed Disconnect stops a conversation exactly this way. `arrival` is the
@@ -3601,8 +3616,12 @@ export class DesktopHost {
 		}
 		if (method === "session.connect") return this.#connect(metadata);
 		if (!this.#writable(metadata)) {
+			// The app may still be stepping aside for a terminal (or finding one as it opens): join
+			// that, and answer as it does.
+			const pending = this.#opening.get(metadata.id);
+			if (pending) await pending.catch(() => {});
 			// The terminal that had it open may have closed since: selecting checks again.
-			if (method === "session.select" && !metadata.disconnected) this.#elsewhere.delete(metadata.id);
+			if (method === "session.select" && !metadata.disconnected && !pending) this.#elsewhere.delete(metadata.id);
 			else return this.#dispatchReadOnly(request, metadata);
 		}
 		// A transcript another surface removed must not wedge its row. A session this host

@@ -1354,6 +1354,46 @@ test("Disconnect asks before stopping background work, and a confirmed Disconnec
 	await h.close();
 });
 
+test("a select while the app is stepping aside joins it, and nothing internal reaches the user", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const first = h.sdk();
+	// The app's copy is held while it is being released.
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const dispose = first.dispose.bind(first);
+	vi.spyOn(first, "dispose").mockImplementation(async (...args) => {
+		entered.resolve();
+		await release.promise;
+		return dispose(...args);
+	});
+	const owner = await transcriptId(h);
+	h.liveOwners.add(owner);
+	const opened = h.created.length;
+	const stepping = respond(h, "session.select", { sessionId });
+	await entered.promise;
+	// The terminal closes while the app is still releasing its copy, and the row is selected again.
+	h.liveOwners.delete(owner);
+	const joining = respond(h, "session.select", { sessionId });
+	await Bun.sleep(50);
+	// No second copy opens on the transcript while the first is still being released.
+	expect(h.created).toHaveLength(opened);
+	release.resolve();
+	const answers = await Promise.all([stepping, joining]);
+	// Both selects answer as the step-aside did, and the row agrees with them.
+	for (const answer of answers)
+		expect(answer).toMatchObject({ ok: true, result: { connection: { state: "elsewhere" } } });
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
+	expect(JSON.stringify(h.frames)).not.toContain("Cannot construct session");
+	await first.awaitDisposeCompletion();
+	// The next select checks again, finds the terminal closed, and takes the conversation back.
+	expect((await h.call<DesktopSession>("session.select", { sessionId })).connection).toEqual({ state: "connected" });
+	await h.call("prompt", { sessionId, text: "after the terminal closed" });
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "completed" });
+	await h.close();
+});
+
 test("an owner check that answers after its copy was replaced leaves the new copy and the row alone", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
