@@ -785,10 +785,13 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 
 /**
  * The spawning master to show on a listed row, or undefined. Spawn authority is
- * keyed by session id, so the row must also come from a state root the child's
- * host registered in: an ambiguous row cannot say which root it describes, and
- * a row from another root (the same id opened or resumed elsewhere) is not the
- * spawned host. Either carries no spawning master rather than a wrong one.
+ * keyed by session id, so the row's state root must also resolve to a canonical
+ * root the child's host registered in: an ambiguous row cannot say which root it
+ * describes, and a row from another root (the same id opened or resumed
+ * elsewhere) is not the spawned host. Either carries no spawning master rather
+ * than a wrong one. The recorded roots were resolved at registration; they are
+ * never re-resolved here, because a symlinked root retargeted since then would
+ * name a different directory.
  */
 function spawnOwnerForRow(
 	session: IndexedSession,
@@ -796,11 +799,22 @@ function spawnOwnerForRow(
 ): string | undefined {
 	if (!isSessionAuthorityEligible(session)) return undefined;
 	const owner = owners?.get(session.sessionId);
-	if (owner === undefined) return undefined;
-	if (owner.stateRoots.has(session.locator.stateRoot)) return owner.ownerSessionId;
-	const rowRoot = resolveEquivalentPath(session.locator.stateRoot);
-	for (const root of owner.stateRoots) if (resolveEquivalentPath(root) === rowRoot) return owner.ownerSessionId;
-	return undefined;
+	if (owner === undefined || owner.stateRoots.size === 0) return undefined;
+	return owner.stateRoots.has(resolveEquivalentPath(session.locator.stateRoot)) ? owner.ownerSessionId : undefined;
+}
+
+/**
+ * Canonical path of an existing state root, or undefined when it cannot be
+ * resolved. Same resolution as `resolveEquivalentPath` (used by
+ * `spawnOwnerForRow`) minus its lexical fallback, so an unresolvable root is
+ * never recorded as if it were canonical.
+ */
+async function canonicalStateRoot(stateRoot: string): Promise<string | undefined> {
+	try {
+		return await fs.realpath(path.resolve(stateRoot));
+	} catch {
+		return undefined;
+	}
 }
 
 /** Exact admission predicate for the child host row published after launch. */
@@ -3175,6 +3189,9 @@ export class Broker {
 						`sdk broker: spawn child ${prep.childId} admitted by the post-deadline recheck (first observation: ${firstMiss})`,
 					);
 				pinnedRegistration = registration.registration;
+				// Taken now, while the registration is fresh, so attribution never depends
+				// on where a symlinked spelling points later.
+				const stateRootIdentity = await canonicalStateRoot(registration.registration.stateRoot);
 				const now = Date.now();
 				const proof = launched.proof;
 				const authorityRecord: SpawnAuthorityV1 = {
@@ -3196,6 +3213,7 @@ export class Broker {
 					endpointIncarnation: registration.registration.processIncarnation,
 					endpointCwd: registration.registration.cwd,
 					endpointStateRoot: registration.registration.stateRoot,
+					...(stateRootIdentity === undefined ? {} : { endpointStateRootIdentity: stateRootIdentity }),
 					closeState: "active",
 					createdAt: now,
 					updatedAt: now,

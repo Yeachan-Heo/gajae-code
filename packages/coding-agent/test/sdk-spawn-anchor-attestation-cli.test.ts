@@ -7,9 +7,17 @@ import { dispatchPublicCommand } from "../src/cli/public-command-entry";
 import { PUBLIC_COMMAND_DIAGNOSTICS, type PublicCommandDiagnosticCode } from "../src/cli/public-command-errors";
 import Sdk from "../src/commands/sdk";
 import { MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH } from "../src/sdk/broker/identity";
-import { LifecycleLedger, type LifecycleLedgerEntry } from "../src/sdk/broker/lifecycle-ledger";
+import {
+	DEFAULT_LIFECYCLE_LEDGER_LIMITS,
+	LifecycleLedger,
+	type LifecycleLedgerEntry,
+} from "../src/sdk/broker/lifecycle-ledger";
 import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
-import { renderSpawnAnchorAttestation, runSpawnAnchorAttestation } from "../src/sdk/cli/spawn-anchor-attestation-cli";
+import {
+	renderSpawnAnchorAttestation,
+	runSpawnAnchorAttestation,
+	spawnAnchorAttestationRestartNotice,
+} from "../src/sdk/cli/spawn-anchor-attestation-cli";
 
 const identityKey = "ab".repeat(32);
 const roots: string[] = [];
@@ -24,10 +32,10 @@ interface Fixture {
 	evidencePath: string;
 }
 
-async function fixture(): Promise<Fixture> {
+async function fixture(agentDirName = "agent"): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-attest-spawn-"));
 	roots.push(root);
-	const agentDir = path.join(root, "agent");
+	const agentDir = path.join(root, agentDirName);
 	await Bun.write(path.join(agentDir, "sdk", "broker.identity"), `${identityKey}\n`);
 	const evidencePath = path.join(root, "evidence.jsonl");
 	await Bun.write(evidencePath, "");
@@ -45,6 +53,9 @@ function identity(token: string, operation = "session.spawn", version = 3): stri
 		.update(`${version}|${operation}|${token}${version === 4 ? "|" : ""}`)
 		.digest("hex");
 }
+
+/** A well-formed prior attestation entry that is not in the test ledger. */
+const preserved = identity("preserved-not-in-ledger");
 
 function row(id: string, fields: Partial<LifecycleLedgerEntry> = {}): LifecycleLedgerEntry {
 	return { version: 1, identity: id, requestHash: "request", state: "accepted", ts: 1, ...fields };
@@ -128,7 +139,7 @@ function expectFailureEnvelope(
 	expect(result.stdout).not.toMatch(/[a-f0-9]{64}/i);
 }
 
-async function dispatchInProcess(f: Fixture, flags: string[], failFirstOutput = false) {
+async function dispatchInProcess(f: Fixture, flags: string[], failFirstOutput = false, agentDir = f.agentDir) {
 	let stdout = "";
 	let stderr = "";
 	const out = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
@@ -146,7 +157,7 @@ async function dispatchInProcess(f: Fixture, flags: string[], failFirstOutput = 
 	const originalExitCode = process.exitCode ?? 0;
 	try {
 		process.exitCode = 0;
-		await dispatchPublicCommand(["broker", "attest-spawn-anchors", "--agent-dir", f.agentDir, ...flags], {
+		await dispatchPublicCommand(["broker", "attest-spawn-anchors", "--agent-dir", agentDir, ...flags], {
 			command: "sdk",
 			bin: "gjc",
 			version: "test",
@@ -232,7 +243,6 @@ describe("SDK spawn-anchor attestation", () => {
 		const prior = identity("prior-token");
 		const next = identity("next-token");
 		const current = identity("current-token");
-		const preserved = "preserved-identity-not-in-this-ledger";
 		await writeRows(f, [row(prior), row(next), row(current)]);
 		await Bun.write(f.attestationPath, JSON.stringify({ version: 1, identities: [prior, preserved] }));
 		const authority = new SpawnAuthorityStore(f.agentDir, identityKey);
@@ -332,7 +342,7 @@ describe("SDK spawn-anchor attestation", () => {
 		const id = identity("valid-but-blocked");
 		await Bun.write(f.ledgerPath, `${JSON.stringify(row(id))}\n${malformed}\n`);
 		await Bun.write(f.evidencePath, "valid-but-blocked");
-		const original = JSON.stringify({ version: 1, identities: ["retained"] });
+		const original = JSON.stringify({ version: 1, identities: [preserved] });
 		await Bun.write(f.attestationPath, original);
 		await expect(
 			runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath], write: true }),
@@ -412,7 +422,7 @@ describe("SDK spawn-anchor attestation", () => {
 		const f = await fixture();
 		await writeRows(f, [row(identity("unreadable-attestation-token"))]);
 		await Bun.write(f.evidencePath, "unreadable-attestation-token");
-		const original = JSON.stringify({ version: 1, identities: ["preserved"] });
+		const original = JSON.stringify({ version: 1, identities: [preserved] });
 		await Bun.write(f.attestationPath, original);
 		await fs.chmod(f.attestationPath, 0o000);
 		try {
@@ -442,7 +452,7 @@ describe("SDK spawn-anchor attestation", () => {
 			const f = await fixture();
 			await writeRows(f, [row(identity("write-error-token"))]);
 			await Bun.write(f.evidencePath, "write-error-token");
-			const original = JSON.stringify({ version: 1, identities: ["preserved"] });
+			const original = JSON.stringify({ version: 1, identities: [preserved] });
 			await Bun.write(f.attestationPath, original);
 			const sdkDir = path.dirname(f.ledgerPath);
 			await fs.chmod(sdkDir, 0o500);
@@ -591,7 +601,7 @@ describe("SDK spawn-anchor attestation", () => {
 			rows.push((await Bun.file(other.file).text()).trim());
 		}
 		await Bun.write(store.file, `${rows.join("\n")}\n`);
-		const original = JSON.stringify({ version: 1, identities: ["preserved"] });
+		const original = JSON.stringify({ version: 1, identities: [preserved] });
 		await Bun.write(f.attestationPath, original);
 		const result = await cliCommand(f, ["--evidence", f.evidencePath, "--write", "--json"]);
 		expectFailureEnvelope(result, "spawn_anchor_journal_invalid");
@@ -606,7 +616,7 @@ describe("SDK spawn-anchor attestation", () => {
 		const id = identity("publication-canary");
 		await writeRows(f, [row(id)]);
 		await Bun.write(f.evidencePath, "publication-canary");
-		const original = JSON.stringify({ version: 1, identities: ["preserved"] });
+		const original = JSON.stringify({ version: 1, identities: [preserved] });
 		await Bun.write(f.attestationPath, original);
 		const open = fs.open;
 		const fault = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
@@ -633,7 +643,7 @@ describe("SDK spawn-anchor attestation", () => {
 		);
 		expect(result.stdout).not.toContain("private-error");
 		if (renamed)
-			expect(await Bun.file(f.attestationPath).json()).toEqual({ version: 1, identities: ["preserved", id].sort() });
+			expect(await Bun.file(f.attestationPath).json()).toEqual({ version: 1, identities: [preserved, id].sort() });
 		else expect(await Bun.file(f.attestationPath).text()).toBe(original);
 		expect((await fs.readdir(path.dirname(f.attestationPath))).some(name => name.endsWith(".tmp"))).toBe(false);
 	});
@@ -698,4 +708,166 @@ describe("SDK spawn-anchor attestation", () => {
 			stream.mockRestore();
 		}
 	});
+
+	it("refuses a ledger past the broker row bound without writing, and accepts one at the bound", async () => {
+		const f = await fixture();
+		const { maxRows } = DEFAULT_LIFECYCLE_LEDGER_LIMITS;
+		const id = identity("row-bound-canary");
+		const filler = Array.from({ length: maxRows - 1 }, (_, index) => row(identity(`filler-${index}`)));
+		await writeRows(f, [row(id), ...filler]);
+		await Bun.write(f.evidencePath, "row-bound-canary");
+		const atBound = await runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath] });
+		expect(atBound).toMatchObject({ candidates: maxRows, proven: 1, written: false });
+		await writeRows(f, [row(id), ...filler, row(identity("one-row-too-many"))]);
+		await Bun.write(f.attestationPath, JSON.stringify({ version: 1, identities: [preserved] }));
+		const before = await Bun.file(f.attestationPath).text();
+		await expect(
+			runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath], write: true }),
+		).rejects.toMatchObject({ input: { proof: "pre-effect", diagnostics: ["spawn_anchor_ledger_invalid"] } });
+		expect(await Bun.file(f.attestationPath).text()).toBe(before);
+		// The real broker refuses the same source, so a written attestation would never load.
+		await expect(new LifecycleLedger(f.agentDir).open()).rejects.toThrow("maximum row count");
+	}, 30_000);
+
+	it("refuses a ledger of valid rows past the broker byte bound", async () => {
+		const f = await fixture();
+		const { maxBytes, maxLineBytes, maxRows } = DEFAULT_LIFECYCLE_LEDGER_LIMITS;
+		// Every row is valid JSON padded with trailing whitespace, within the row and line bounds;
+		// only the total byte bound can reject this source.
+		const rowCount = Math.ceil(maxBytes / (maxLineBytes - 1024)) + 1;
+		expect(rowCount).toBeLessThan(maxRows);
+		const lines = Array.from({ length: rowCount }, (_, index) =>
+			JSON.stringify(row(identity(`byte-bound-${index}`))).padEnd(maxLineBytes - 1024, " "),
+		);
+		await Bun.write(f.ledgerPath, `${lines.join("\n")}\n`);
+		expect((await fs.stat(f.ledgerPath)).size).toBeGreaterThan(maxBytes);
+		await Bun.write(f.evidencePath, "byte-bound-0");
+		const result = await cliCommand(f, ["--evidence", f.evidencePath, "--write", "--json"]);
+		expectFailureEnvelope(result, "spawn_anchor_ledger_invalid");
+		expect(await Bun.file(f.attestationPath).exists()).toBe(false);
+		// The real broker refuses the same source, so a written attestation would never load.
+		await expect(new LifecycleLedger(f.agentDir).open()).rejects.toThrow("maximum file byte length");
+	}, 60_000);
+
+	it.each([
+		["a non-digest string", "not-an-identity"],
+		["an uppercase digest", identity("uppercase").toUpperCase()],
+		["a truncated digest", identity("short").slice(0, 63)],
+	])("refuses an existing attestation that lists %s without changing it", async (_label, junk) => {
+		const f = await fixture();
+		await writeRows(f, [row(identity("junk-attestation-token"))]);
+		await Bun.write(f.evidencePath, "junk-attestation-token");
+		const original = JSON.stringify({ version: 1, identities: [preserved, junk] });
+		await Bun.write(f.attestationPath, original);
+		await expect(
+			runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath], write: true }),
+		).rejects.toMatchObject({ input: { proof: "pre-effect", diagnostics: ["spawn_anchor_attestation_invalid"] } });
+		expect(await Bun.file(f.attestationPath).text()).toBe(original);
+	});
+
+	it("refuses a well-formed existing attestation past the broker byte bound", async () => {
+		const f = await fixture();
+		await writeRows(f, [row(identity("oversized-attestation-token"))]);
+		await Bun.write(f.evidencePath, "oversized-attestation-token");
+		// Valid JSON apart from its size: trailing whitespace parses, so only the byte bound refuses it.
+		const original = JSON.stringify({ version: 1, identities: [preserved] }).padEnd(
+			DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes + 1,
+			" ",
+		);
+		expect(JSON.parse(original)).toEqual({ version: 1, identities: [preserved] });
+		await Bun.write(f.attestationPath, original);
+		await expect(
+			runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath], write: true }),
+		).rejects.toMatchObject({ input: { proof: "pre-effect", diagnostics: ["spawn_anchor_attestation_invalid"] } });
+		expect((await fs.stat(f.attestationPath)).size).toBe(DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes + 1);
+	}, 30_000);
+
+	it("does not publish a union the broker would ignore as oversized", async () => {
+		const f = await fixture();
+		const id = identity("union-bound-canary");
+		await writeRows(f, [row(id)]);
+		await Bun.write(f.evidencePath, "union-bound-canary");
+		// Each sorted entry costs 67 bytes ("<64 hex>",) around a 29-byte envelope and newline.
+		const count = Math.floor((DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes - 29) / 67);
+		const existing = Array.from({ length: count }, (_, index) => index.toString(16).padStart(64, "0"));
+		const original = `${JSON.stringify({ version: 1, identities: existing })}\n`;
+		expect(Buffer.byteLength(original)).toBeLessThanOrEqual(DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes);
+		await Bun.write(f.attestationPath, original);
+		await expect(
+			runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath], write: true }),
+		).rejects.toMatchObject({ input: { proof: "pre-effect", diagnostics: ["spawn_anchor_write_failed"] } });
+		expect((await fs.stat(f.attestationPath)).size).toBe(Buffer.byteLength(original));
+		expect((await fs.readdir(path.dirname(f.attestationPath))).some(name => name.endsWith(".tmp"))).toBe(false);
+	}, 60_000);
+
+	it.skipIf(process.platform === "win32")(
+		"names the selected agent directory, shell-quoted, in every restart route",
+		async () => {
+			const f = await fixture("agent dir's");
+			await writeRows(f, [row(identity("restart-notice-canary"))]);
+			await Bun.write(f.evidencePath, "restart-notice-canary");
+			const quoted = `'${f.agentDir.replace(/'/g, `'\\''`)}'`;
+			const json = await cliCommand(f, ["--evidence", f.evidencePath, "--write", "--json"]);
+			expect(json.code).toBe(0);
+			const text = await runSpawnAnchorAttestation({ agentDir: f.agentDir, evidence: [f.evidencePath] });
+			expect(renderSpawnAnchorAttestation(text)).not.toContain("next broker start");
+			for (const notice of [
+				json.stderr,
+				renderSpawnAnchorAttestation({ ...text, written: true })
+					.split("\n")
+					.at(-2) ?? "",
+			]) {
+				expect(notice).toContain(`next broker start for agent directory ${quoted}.`);
+				expect(notice).toContain(`your supervisor for gjc sdk broker run --agent-dir ${quoted}.`);
+				expect(notice).toContain(
+					`set GJC_CODING_AGENT_DIR to ${quoted} for both gjc doctor --check service (which reports its broker target) and gjc doctor --fix --repair service.restart-owned --target <that target> --allow-risk service-interruption --yes;`,
+				);
+				expect(notice).toContain(
+					`the next gjc sdk session, search or spawn command run with --agent-dir ${quoted} starts one.`,
+				);
+				expect(notice).toContain(`bun run restart:sdk-broker -- --agent-dir ${quoted} also restarts it.`);
+				expect(notice).not.toMatch(/[a-f0-9]{64}/i);
+			}
+			// The quoted form round-trips through a POSIX shell to the exact directory.
+			const echoed = Bun.spawnSync(["sh", "-c", `printf %s ${quoted}`]).stdout.toString();
+			expect(echoed).toBe(f.agentDir);
+		},
+		30_000,
+	);
+
+	it("quotes the agent directory for PowerShell on Windows", () => {
+		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o'neil\\gjc agent", "win32")).toContain(
+			"--agent-dir 'C:\\Users\\o''neil\\gjc agent'",
+		);
+		// PowerShell treats U+2018 through U+201B as single quotes too.
+		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o\u2019neil\u201b", "win32")).toContain(
+			"--agent-dir 'C:\\Users\\o\u2019\u2019neil\u201b\u201b'",
+		);
+	});
+
+	// Windows paths cannot contain a newline.
+	it.skipIf(process.platform === "win32")(
+		"refuses an agent directory no broker can run for before reading any state",
+		async () => {
+			const f = await fixture();
+			await writeRows(f, [row(identity("unsafe-dir-canary"))]);
+			await Bun.write(f.evidencePath, "unsafe-dir-canary");
+			const unsafe = `${f.agentDir}\nnext`;
+			await fs.cp(f.agentDir, unsafe, { recursive: true });
+			await expect(
+				runSpawnAnchorAttestation({ agentDir: unsafe, evidence: [f.evidencePath], write: true }),
+			).rejects.toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+			// The real public boundary reports a usage refusal with exit 2.
+			const result = await dispatchInProcess(f, ["--evidence", f.evidencePath, "--write", "--json"], false, unsafe);
+			expect(result.code).toBe(2);
+			expect(JSON.parse(result.stdout)).toMatchObject({
+				ok: false,
+				command: ["sdk", "broker", "attest-spawn-anchors"],
+				error: { code: "usage", outcomeCertainty: "not-applied" },
+			});
+			expect(
+				await Bun.file(path.join(unsafe, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json")).exists(),
+			).toBe(false);
+		},
+	);
 });

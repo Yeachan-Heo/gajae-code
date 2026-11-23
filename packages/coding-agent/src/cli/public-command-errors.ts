@@ -101,13 +101,13 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	spawn_anchor_identity_unavailable:
 		"The original sdk/broker.identity is missing, invalid, or unreadable. Restore the original identity key before attesting spawn mirrors.",
 	spawn_anchor_attestation_invalid:
-		"The existing spawn-anchor attestation is malformed or unreadable. Preserve it and investigate before writing.",
+		"The existing spawn-anchor attestation is malformed, unreadable, larger than the lifecycle ledger byte bound, or lists an entry that is not a lowercase 64-character hex identity. Preserve it and investigate before writing.",
 	spawn_anchor_ledger_invalid:
-		"The lifecycle ledger is malformed, unsupported, or unreadable. No attestation was written.",
+		"The lifecycle ledger is malformed, unsupported, unreadable, or past the bounds the broker applies when it opens it. No attestation was written.",
 	spawn_anchor_journal_invalid:
 		"The spawn-authority journal failed authenticated replay validation or could not be read. No attestation was written.",
 	spawn_anchor_write_failed:
-		"Spawn-anchor attestation publication failed before rename. The previous attestation was not replaced.",
+		"Spawn-anchor attestation publication failed before rename, or the union would exceed the byte bound the broker loads. The previous attestation was not replaced.",
 	spawn_anchor_publication_uncertain:
 		"The attestation was renamed, but its durability could not be confirmed. Inspect the existing attestation before any retry; it may take effect at the next broker start.",
 	spawn_anchor_output_failed:
@@ -283,6 +283,10 @@ function step(
 		...(argv ? { executable: "gjc" as const, argv } : {}),
 	};
 }
+const CLOSE_BUSY_STEP =
+	"The session is not idle and nothing was closed. Inspect it, wait until its turn, queued input and jobs settle, then rerun the same close command; a busy refusal keeps the same idempotency key retryable. Do not switch to a forced close to get past busy.";
+const CLOSE_STALE_STEP =
+	"This close refusal is terminal for its idempotency key and may follow an earlier close attempt, so replaying it only repeats the refusal. Inspect the session and its current endpoint authority before deciding whether a new close with a new idempotency key is needed.";
 export function classifyPublicCommandFailure(
 	error: unknown,
 	command: readonly string[],
@@ -366,6 +370,11 @@ export function classifyPublicCommandFailure(
 			nextSteps.push(step("Wait for the existing restart to finish, then inspect status; do not restart again."));
 		const session = references.find(ref => ref.kind === "sessionId");
 		const operation = references.find(ref => ref.kind === "operationRef");
+		const isSessionClose = canonical[0] === "sdk" && canonical[1] === "session" && canonical[2] === "close";
+		const inspectArgv =
+			session && executableValue(session.value)
+				? ["sdk", "session", "inspect", session.value]
+				: ["sdk", "session", "list"];
 		if (kind === "broker_unavailable" && input.diagnostics?.includes("lock_refused")) {
 			// The refused owner still holds broker.lock. Every broker-contacting step (session list
 			// autostarts the broker) would only be refused again, so the guidance stays inert.
@@ -389,15 +398,20 @@ export function classifyPublicCommandFailure(
 					"Keep the broker stopped. Preserve the existing attestation and restore the original sdk/broker.identity, then rerun this command without --write to inspect the result.",
 				),
 			);
+		} else if (isSessionClose && kind === "busy" && outcomeCertainty === "not-applied") {
+			// Idle close is retirement: steering would add work. busy stays retryable under the same key.
+			nextSteps.push(step(CLOSE_BUSY_STEP, inspectArgv));
+		} else if (isSessionClose && kind === "endpoint_stale" && outcomeCertainty !== "not-applied") {
+			// Unlike busy, a broker stale-endpoint close is terminal for its key and does not prove no effect.
+			// A pre-send refusal (no live endpoint authority) sent no close and falls through to inspect.
+			nextSteps.push(step(CLOSE_STALE_STEP, inspectArgv));
 		} else if (kind === "busy" && canonical[0] === "sdk" && outcomeCertainty === "not-applied") {
 			// A refused-before-execution request has no operation record to reconcile:
 			// point at the busy turn instead of a status lookup that can only say unknown.
 			nextSteps.push(
 				step(
 					"Steer the active turn with `sdk session raw control <sessionId> --op turn.steer`, or wait until the session is idle before sending again.",
-					session && executableValue(session.value)
-						? ["sdk", "session", "inspect", session.value]
-						: ["sdk", "session", "list"],
+					inspectArgv,
 				),
 			);
 		} else if (

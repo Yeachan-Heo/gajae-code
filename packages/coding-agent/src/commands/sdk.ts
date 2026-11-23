@@ -70,9 +70,10 @@ import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
 import {
+	attestationAgentDir,
 	renderSpawnAnchorAttestation,
 	runSpawnAnchorAttestation,
-	SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE,
+	spawnAnchorAttestationRestartNotice,
 } from "../sdk/cli/spawn-anchor-attestation-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
@@ -1751,7 +1752,7 @@ export default class Sdk extends Command {
 					try {
 						process.stdout.write(renderSpawnAnchorAttestation(result, flags.json === true));
 						if (flags.json && result.written)
-							process.stderr.write(`${SPAWN_ANCHOR_ATTESTATION_RESTART_NOTICE}\n`);
+							process.stderr.write(`${spawnAnchorAttestationRestartNotice(attestationAgentDir(result))}\n`);
 					} catch {
 						throw new PublicCommandFailure({
 							kind: "operation_failed",
