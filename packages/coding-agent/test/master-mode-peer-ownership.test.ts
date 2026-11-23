@@ -128,6 +128,56 @@ class BrokerClient implements SessionLifecycleClient {
 	}
 }
 
+/** Records one durable spawn authority through the real store transitions. */
+async function recordSpawnAuthority(
+	store: SpawnAuthorityStore,
+	input: {
+		identity: string;
+		childId: string;
+		ownerSessionId: string;
+		pid: number;
+		endpointStateRoot?: string;
+		endpointStateRootIdentity?: string;
+	},
+): Promise<void> {
+	const { identity, childId, ownerSessionId, pid } = input;
+	const owner = await store.claimOrJoin(identity, `${"c".repeat(63)}${pid % 10}`);
+	if (owner.kind !== "owner") throw new Error("expected owner");
+	await store.persistTransition(identity, {
+		claimId: owner.claim.claimId,
+		from: "prepared",
+		to: "substrate_starting",
+		childId,
+	});
+	const at = Date.now();
+	await store.persistTransition(identity, {
+		claimId: owner.claim.claimId,
+		from: "substrate_starting",
+		to: "authority_active",
+		childId,
+		authority: {
+			version: 1,
+			authorityId: `authority-${identity}`,
+			claimId: owner.claim.claimId,
+			childId,
+			ownerSessionId,
+			lifecycleIdentity: identity,
+			substrateKind: "headless",
+			providerIdentity: "p",
+			pid,
+			processIncarnation: `inc-${pid}`,
+			...(input.endpointStateRoot === undefined ? {} : { endpointStateRoot: input.endpointStateRoot }),
+			...(input.endpointStateRootIdentity === undefined
+				? {}
+				: { endpointStateRootIdentity: input.endpointStateRootIdentity }),
+			closeState: "active",
+			createdAt: at,
+			updatedAt: at,
+		},
+	});
+	await store.releaseOwner(identity);
+}
+
 function ownership(rows: readonly SdkSearchRowV1[]): Record<string, unknown> {
 	return Object.fromEntries(
 		rows.map(row => [
@@ -452,6 +502,187 @@ describe("master peer ownership", () => {
 		}
 	});
 
+	it("binds the spawn owner to the state root's canonical identity at registration", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-peer-owner-symlink-")));
+		const agentDir = path.join(root, "agent");
+		const targetA = path.join(root, "targets", "a");
+		const targetB = path.join(root, "targets", "b");
+		const targetC = path.join(root, "targets", "c");
+		for (const dir of [agentDir, targetA, targetB, targetC]) await fs.mkdir(dir, { recursive: true });
+		// Three workspaces: one whose state root is a symlink that is later
+		// retargeted, one whose symlinked state root never changes, and one whose
+		// state root is a plain directory.
+		const repos = {
+			retarget: path.join(root, "repo-retarget"),
+			stable: path.join(root, "repo-stable"),
+			plain: path.join(root, "repo-plain"),
+		};
+		for (const repo of Object.values(repos)) {
+			await fs.mkdir(path.join(repo, ".gjc"), { recursive: true });
+			const git = Bun.spawn(["git", "init", "-q", repo]);
+			if ((await git.exited) !== 0) throw new Error("git init failed");
+		}
+		const retargetLink = path.join(repos.retarget, ".gjc", "state");
+		await fs.symlink(targetA, retargetLink);
+		await fs.symlink(targetC, path.join(repos.stable, ".gjc", "state"));
+		await fs.mkdir(path.join(repos.plain, ".gjc", "state"));
+		const locators = {
+			retarget: await resolveSessionLocator(repos.retarget, retargetLink),
+			stable: await resolveSessionLocator(repos.stable, path.join(repos.stable, ".gjc", "state")),
+			plain: await resolveSessionLocator(repos.plain, path.join(repos.plain, ".gjc", "state")),
+		};
+
+		const registeredPids = new Map<string, number>();
+		const broker = new Broker({
+			agentDir,
+			spawnSubstrateProvider: substrateFake(),
+			spawnPromptLayer: promptLayerFake(registeredPids),
+			masterCapabilityVerifier: {
+				verifyMasterCapability: async (owner, supplied, suppliedEpoch) => ({
+					allowed: masters.some(m => m.id === owner && m.grant === supplied && m.epoch === suppliedEpoch),
+				}),
+			},
+		});
+		await broker.start();
+		try {
+			await appendIndex(agentDir, masterRegistration(masters[0], locators.plain));
+			const spawn = async (repo: string, key: string): Promise<string> => {
+				const spawned = await runSdkSpawn(
+					{ cwd: repo, prompt: `task ${key}`, agentDir, idempotencyKey: `symlink-${key}` },
+					{
+						env: { GJC_MASTER_CAPABILITY: masters[0].grant, GJC_MASTER_OWNER_SESSION_ID: masters[0].id },
+						dispatch: async (_dir: string, payload: Record<string, unknown>, idempotencyKey: string) =>
+							await broker.handleRequest("session.spawn", payload, idempotencyKey),
+					},
+				);
+				expect(spawned.rendered.code).toBe("spawn_accepted");
+				if (!spawned.rendered.sessionId) throw new Error("spawn returned no child id");
+				return spawned.rendered.sessionId;
+			};
+			const retargeted = await spawn(repos.retarget, "retarget");
+			const stable = await spawn(repos.stable, "stable");
+			const plain = await spawn(repos.plain, "plain");
+			const registration = (sessionId: string, at: SessionLocatorV2, pid: number) =>
+				indexEvent({
+					type: "host_registered",
+					sessionId,
+					locator: at,
+					endpointGeneration: 1,
+					pid,
+					processIncarnation: `inc-${pid}`,
+					hostIncarnation: `inc-${pid}`,
+				});
+			// The retargeted child registered through the symlink spelling, then stopped.
+			const retargetedPid = registeredPids.get(retargeted)!;
+			await appendIndex(agentDir, [
+				registration(retargeted, locators.retarget, retargetedPid),
+				indexEvent({
+					type: "host_unregistered",
+					sessionId: retargeted,
+					locator: locators.retarget,
+					endpointGeneration: 1,
+					pid: retargetedPid,
+					processIncarnation: `inc-${retargetedPid}`,
+					hostIncarnation: `inc-${retargetedPid}`,
+				}),
+				registration(stable, locators.stable, registeredPids.get(stable)!),
+				registration(plain, locators.plain, registeredPids.get(plain)!),
+			]);
+			// The symlink now names another directory, where an unrelated host reuses
+			// the stopped child's session id.
+			await fs.rm(retargetLink);
+			await fs.symlink(targetB, retargetLink);
+			const foreignLocator = await resolveSessionLocator(repos.retarget, targetB);
+			await appendIndex(agentDir, [registration(retargeted, foreignLocator, process.pid)]);
+
+			const listed = (await broker.handleRequest("session.list", {}, undefined)) as {
+				ok: true;
+				result: { sessions: Array<Record<string, unknown>> };
+			};
+			const byId = new Map(listed.result.sessions.map(session => [session.sessionId, session]));
+			expect(byId.get(retargeted)).toMatchObject({ ambiguous: false, locator: { stateRoot: targetB } });
+			expect(byId.get(retargeted)).not.toHaveProperty("spawnedBy");
+			expect(toSessionRowV1(byId.get(retargeted)!)).not.toHaveProperty("spawnedBy");
+			// Negative controls: an unchanged symlink and a plain directory keep their owner.
+			expect(byId.get(stable)).toMatchObject({ ambiguous: false, spawnedBy: { masterSessionId: "master-a" } });
+			expect(byId.get(plain)).toMatchObject({ ambiguous: false, spawnedBy: { masterSessionId: "master-a" } });
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("attributes no listed row to an authority without a registration-time canonical root", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-peer-owner-legacy-")));
+		const agentDir = path.join(root, "agent");
+		const repo = path.join(root, "repo");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(stateRoot, { recursive: true });
+		const git = Bun.spawn(["git", "init", "-q", repo]);
+		if ((await git.exited) !== 0) throw new Error("git init failed");
+		const locator = await resolveSessionLocator(repo, stateRoot);
+
+		// Durable authority written before this Broker starts: a legacy row that
+		// carries only the state-root spelling, a pre-pin row with no root at all,
+		// and a current row with the canonical identity as the control.
+		const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+		await store.open();
+		const base = { ownerSessionId: "master-a" };
+		await recordSpawnAuthority(store, {
+			...base,
+			identity: "legacy",
+			childId: "legacy-child",
+			pid: 911,
+			endpointStateRoot: stateRoot,
+		});
+		await recordSpawnAuthority(store, { ...base, identity: "rootless", childId: "rootless-child", pid: 912 });
+		await recordSpawnAuthority(store, {
+			...base,
+			identity: "current",
+			childId: "current-child",
+			pid: 913,
+			endpointStateRoot: stateRoot,
+			endpointStateRootIdentity: stateRoot,
+		});
+
+		const broker = new Broker({ agentDir, spawnSubstrateProvider: substrateFake() });
+		await broker.start();
+		try {
+			await appendIndex(
+				agentDir,
+				["legacy-child", "rootless-child", "current-child"].map((sessionId, index) =>
+					indexEvent({
+						type: "host_registered",
+						sessionId,
+						locator,
+						endpointGeneration: 1,
+						pid: 6100 + index,
+						processIncarnation: `inc-${6100 + index}`,
+						hostIncarnation: `inc-${6100 + index}`,
+					}),
+				),
+			);
+			const listed = (await broker.handleRequest("session.list", {}, undefined)) as {
+				ok: true;
+				result: { sessions: Array<Record<string, unknown>> };
+			};
+			const byId = new Map(listed.result.sessions.map(session => [session.sessionId, session]));
+			for (const sessionId of ["legacy-child", "rootless-child"]) {
+				expect(byId.get(sessionId)).toMatchObject({ ambiguous: false, locator: { stateRoot } });
+				expect(byId.get(sessionId)).not.toHaveProperty("spawnedBy");
+				expect(toSessionRowV1(byId.get(sessionId)!)).not.toHaveProperty("spawnedBy");
+			}
+			expect(byId.get("current-child")).toMatchObject({
+				ambiguous: false,
+				spawnedBy: { masterSessionId: "master-a" },
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("validates ownership fields on search rows strictly", () => {
 		const base = { id: "s", locator: { cwd: "/r", worktreeRoot: "/r", stateRoot: "/st" }, live: true };
 		expect(sdkSearchRowV1({ ...base, role: "master", spawnedBy: { masterSessionId: "m", self: false } })).toEqual({
@@ -492,58 +723,35 @@ describe("master peer ownership", () => {
 		try {
 			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
 			await store.open();
-			const record = async (
+			const current = { endpointStateRoot: "/state-a", endpointStateRootIdentity: "/state-a" };
+			const record = (
 				identity: string,
 				childId: string,
 				ownerSessionId: string,
 				pid: number,
-				endpointStateRoot: string | null = "/state-a",
-			) => {
-				const owner = await store.claimOrJoin(identity, `${"c".repeat(63)}${pid % 10}`);
-				if (owner.kind !== "owner") throw new Error("expected owner");
-				await store.persistTransition(identity, {
-					claimId: owner.claim.claimId,
-					from: "prepared",
-					to: "substrate_starting",
-					childId,
-				});
-				const at = Date.now();
-				await store.persistTransition(identity, {
-					claimId: owner.claim.claimId,
-					from: "substrate_starting",
-					to: "authority_active",
-					childId,
-					authority: {
-						version: 1,
-						authorityId: `authority-${identity}`,
-						claimId: owner.claim.claimId,
-						childId,
-						ownerSessionId,
-						lifecycleIdentity: identity,
-						substrateKind: "headless",
-						providerIdentity: "p",
-						pid,
-						processIncarnation: `inc-${pid}`,
-						...(endpointStateRoot === null ? {} : { endpointStateRoot }),
-						closeState: "active",
-						createdAt: at,
-						updatedAt: at,
-					},
-				});
-				await store.releaseOwner(identity);
-			};
+				roots: { endpointStateRoot?: string; endpointStateRootIdentity?: string } = current,
+			) => recordSpawnAuthority(store, { identity, childId, ownerSessionId, pid, ...roots });
 			await record("one", "child-one", "master-a", 901);
 			await record("agree-1", "child-agree", "master-b", 902);
 			await record("agree-2", "child-agree", "master-b", 903);
 			await record("split-1", "child-split", "master-a", 904);
 			await record("split-2", "child-split", "master-b", 905);
 			// A pre-pin authority names the owner but records no state root.
-			await record("pre-pin", "child-pre-pin", "master-a", 906, null);
+			await record("pre-pin", "child-pre-pin", "master-a", 906, {});
+			// A legacy authority records the state-root spelling but no canonical identity.
+			await record("legacy", "child-legacy", "master-a", 907, { endpointStateRoot: "/state-a" });
+			// Roots are collected from the canonical identity, never from the spelling.
+			await record("spelled", "child-spelled", "master-b", 908, {
+				endpointStateRoot: "/link/state",
+				endpointStateRootIdentity: "/real/state",
+			});
 
 			const expected = new Map<string, SpawnOwnerRecord>([
 				["child-one", { ownerSessionId: "master-a", stateRoots: new Set(["/state-a"]) }],
 				["child-agree", { ownerSessionId: "master-b", stateRoots: new Set(["/state-a"]) }],
 				["child-pre-pin", { ownerSessionId: "master-a", stateRoots: new Set() }],
+				["child-legacy", { ownerSessionId: "master-a", stateRoots: new Set() }],
+				["child-spelled", { ownerSessionId: "master-b", stateRoots: new Set(["/real/state"]) }],
 			]);
 			expect(new Map(store.spawnOwnersByChild())).toEqual(expected);
 			// Ownership is durable: a reopened store derives the same attribution.
