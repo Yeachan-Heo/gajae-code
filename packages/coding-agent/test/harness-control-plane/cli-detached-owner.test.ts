@@ -105,6 +105,8 @@ async function createFakeTmuxBin(rootDir: string, options: { skipOwnerLaunch?: b
 		tmuxPath,
 		`#!/usr/bin/env bash
 	echo "$@" >> ${JSON.stringify(logPath)}
+	[ "${"$"}{1:-}" = "-u" ] || exit 9
+	shift
 	[ "${"$"}{1:-}" = "-L" ] || exit 9
 	[ "${"$"}#" -ge 3 ] || exit 9
 	socket="${"$"}2"
@@ -276,7 +278,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 				.split("\n")
 				.filter(call => Boolean(call) && call !== "-V" && call !== "--version");
 			expect(calls).not.toHaveLength(0);
-			expect(calls.filter(call => !call.startsWith(`-L ${socket} `))).toEqual([]);
+			expect(calls.filter(call => !call.startsWith(`-u -L ${socket} `))).toEqual([]);
 		};
 		await assertOnlyOwnerSocket();
 
