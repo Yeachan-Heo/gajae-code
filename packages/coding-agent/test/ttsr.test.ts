@@ -2068,7 +2068,16 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 				// keep: no retry rewrite; the aborted partial output stays in live history.
 				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(false);
 				const live = target.session.agent.state.messages;
-				expect(live.some(message => message.role === "assistant" && message.stopReason === "aborted")).toBe(true);
+				const abortedIndex = live.findIndex(
+					message => message.role === "assistant" && message.stopReason === "aborted",
+				);
+				const reminderIndexes = live.flatMap((message, index) =>
+					message.role === "custom" && message.customType === "ttsr-injection" ? [index] : [],
+				);
+				expect(abortedIndex).toBeGreaterThanOrEqual(0);
+				// One reminder, appended after the kept partial output.
+				expect(reminderIndexes).toHaveLength(1);
+				expect(reminderIndexes[0]).toBeGreaterThan(abortedIndex);
 			}
 			// The retry ran: a second model call that carries the reminder.
 			expect(target.modelMessages).toHaveLength(calls + (refused ? 2 : 1));
