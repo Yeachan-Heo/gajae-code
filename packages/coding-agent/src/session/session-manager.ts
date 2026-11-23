@@ -7986,7 +7986,11 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#readOnlyResume = false;
-	/** Set only by {@link SessionManager.openReadOnlySnapshot}; every mutation entry point refuses. */
+	/**
+	 * Set only by {@link SessionManager.openReadOnlySnapshot}. Refused with `read_only_snapshot`: every
+	 * method behind {@link #assertRecoveryHydrationWritable}, non-`"off"` session-memory modes, and the
+	 * direct checks on fork, draft, artifact, blob, move, discard/delete, and state-restore methods.
+	 */
 	#readOnlySnapshot = false;
 	#strictResumeMutationPending = false;
 	#resumedDraftConsumed = false;
@@ -8844,6 +8848,7 @@ export class SessionManager {
 
 	/** Puts a binary blob into the blob store and returns the blob reference */
 	async putBlob(data: Buffer): Promise<BlobPutResult> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		return this.#blobStore.put(data);
 	}
 
@@ -9017,6 +9022,7 @@ export class SessionManager {
 
 	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
 	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		const issued = this.#authenticateStateSnapshot(snapshot);
 		if (!issued.coldRestoreFile) {
 			this.restoreState(snapshot);
@@ -9195,6 +9201,7 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.#assertArtifactOpen();
 		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
 		const previousId = this.#sessionId;
@@ -11156,6 +11163,7 @@ export class SessionManager {
 
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
@@ -11518,6 +11526,7 @@ export class SessionManager {
 	 * tolerates missing files.
 	 */
 	async discardUncommittedSession(sessionPath: string): Promise<void> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		if (this.destination.kind === "managed") {
 			const transcript = this.#managedTranscriptStore(sessionPath).readExpected(path.basename(sessionPath));
 			if (transcript) this.#assertDiscardTranscriptAllowed(transcript.bytes);
@@ -11587,6 +11596,7 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
 		this.#ensureFullHotView();
@@ -11758,6 +11768,7 @@ export class SessionManager {
 		oldSessionFile: string,
 		newSessionFile: string,
 	): Promise<ForkArtifactPublication | undefined> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		const sourceDir = oldSessionFile.slice(0, -6);
 		const finalDestinationDir = newSessionFile.slice(0, -6);
 		if (this.destination.kind !== "managed") {
@@ -12460,6 +12471,7 @@ export class SessionManager {
 	 * share this exclusive transition so concurrent moves cannot interleave.
 	 */
 	moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
+		if (this.#readOnlySnapshot) return Promise.reject(new Error("read_only_snapshot"));
 		const owner = this.#cwdTransitionOwner;
 		const work = this.#moveTo(newCwd, options);
 		if (owner !== undefined && cwdTransitionAls.getStore() === owner) {
@@ -17403,6 +17415,7 @@ export class SessionManager {
 		thinkingLevel: string | undefined,
 		options?: DefaultModelSelectionEntriesOptions,
 	): Promise<DefaultModelSelectionStage> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.assertLegacyMutationAllowed("stage default model selection");
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
@@ -18592,6 +18605,7 @@ export class SessionManager {
 	 * the parent session's artifact directory and ID counter.
 	 */
 	adoptArtifactManager(manager: ArtifactManager, parent?: ArtifactManager): void {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.#assertArtifactOpen();
 		if (this.#adoptedArtifactManager !== manager) this.#artifactLifecycle = Symbol("artifact-adoption");
 		this.#adoptedArtifactManager = manager;
@@ -18608,6 +18622,7 @@ export class SessionManager {
 
 	/** Temporarily release adopted authority while an outer transition validates its successor. */
 	stageAdoptedArtifactManagerForTransition(): void {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		if (this.#adoptedArtifactManager) this.releaseArtifactManager(this.#adoptedArtifactManager);
 	}
 
@@ -18722,6 +18737,7 @@ export class SessionManager {
 	 * Returns an empty object when the session is not persisted.
 	 */
 	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		const manager = this.#getOrCreateArtifactManager();
 		if (!manager) return {};
 		const token = this.#syncArtifactLifecycle();
@@ -18741,6 +18757,7 @@ export class SessionManager {
 	 * read back from the filesystem instead of being retained in memory.
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.#assertArtifactOpen();
 		if (!/^[a-zA-Z0-9_-]+$/.test(toolType)) throw new Error("Unsafe artifact tool type");
 		const token = this.#syncArtifactLifecycle();
@@ -18984,6 +19001,7 @@ export class SessionManager {
 	 * session is not persisted.
 	 */
 	async saveDraft(text: string): Promise<void> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		if (this.destination.kind === "managed") {
 			if (text.length === 0) {
 				const store = this.#getManagedDraftStore();
@@ -19047,6 +19065,7 @@ export class SessionManager {
 	 * sidecar so a subsequent resume does not re-restore the same text.
 	 */
 	async consumeDraft(): Promise<string | null> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		if (this.destination.kind === "managed") {
 			const draft = await this.#getManagedDraftStore()?.consume("draft.txt");
 			if (draft && this.#readOnlyResume) this.#resumedDraftConsumed = true;
@@ -25390,9 +25409,20 @@ export class SessionManager {
 	 * sidecar cleanup, and no managed-store adoption. Shared content-addressed blobs
 	 * and the process resident cache under the agent dir may still be written, as
 	 * on every load. Session memory stays `"off"`, so transcripts above the eager
-	 * inspection cap fail with {@link SessionTranscriptOversizedError}. The returned
-	 * manager refuses every mutation ({@link isReadOnlySnapshot}); callers only read
-	 * from it and then `close()` it.
+	 * inspection cap fail with {@link SessionTranscriptOversizedError}.
+	 *
+	 * The returned manager ({@link isReadOnlySnapshot}) throws `read_only_snapshot` from:
+	 * transcript appends and edits, rename and star, branch and leaf changes, rewrite,
+	 * `ensureOnDisk`, new/branched/switched sessions, enabling session memory, `fork`
+	 * and `prepareFork`, `saveDraft` and `consumeDraft`, `saveArtifact`,
+	 * `allocateArtifactPath`, `copyArtifactsForFork`, `adoptArtifactManager`,
+	 * `stageAdoptedArtifactManagerForTransition`, `putBlob`,
+	 * `stageDefaultModelSelection`, `moveTo`, `discardUncommittedSession`,
+	 * `deleteSessionVerified`, `restoreState`, and `restoreRollbackState`.
+	 * `appendMessageDurably` returns a failure outcome instead of throwing, and writes
+	 * nothing. Reads, `flush`, `close`, and `createMemoryGuardCheckpoint` (which writes
+	 * only under the caller's checkpoint root) still work. Callers only read from it
+	 * and then `close()` it.
 	 */
 	static async openReadOnlySnapshot(
 		filePath: string,
@@ -25425,7 +25455,7 @@ export class SessionManager {
 		return manager;
 	}
 
-	/** True for a manager from {@link SessionManager.openReadOnlySnapshot}, which refuses every mutation. */
+	/** True for a manager from {@link SessionManager.openReadOnlySnapshot}; see that method for what it refuses. */
 	isReadOnlySnapshot(): boolean {
 		return this.#readOnlySnapshot;
 	}
@@ -25956,6 +25986,7 @@ export class SessionManager {
 	 * authorization target captured from a complete strict inventory.
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
+		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		// Storage verifies this logical ID against the retained transcript header before
 		// deletion. A caller-supplied path or the active manager ID is not authority.
 		this.#assertLogicalSessionMutationAllowed(target.sessionId, "delete verified session", true);

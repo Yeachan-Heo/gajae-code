@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { RESUME_TRANSCRIPT_MAX_BYTES, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import type { VerifiedSessionDeleteTarget } from "@gajae-code/coding-agent/session/session-storage";
 import { getSessionsDir, getTerminalSessionsDir } from "@gajae-code/utils";
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
@@ -213,6 +214,7 @@ function seedSource(content: string): { sourceDir: string; sessionFile: string }
 	const artifactRoot = sessionFile.slice(0, -".jsonl".length);
 	fs.mkdirSync(artifactRoot, { mode: 0o700 });
 	fs.writeFileSync(path.join(artifactRoot, "tool-output.txt"), "artifact payload", { mode: 0o600 });
+	fs.writeFileSync(path.join(artifactRoot, "draft.txt"), "unsent draft", { mode: 0o600 });
 	fs.writeFileSync(path.join(artifactRoot, "leftover.tmp"), "decoy temporary file", { mode: 0o600 });
 	fs.writeFileSync(`${sessionFile}.spill.idx`, "decoy legacy sidecar", { mode: 0o600 });
 	return { sourceDir, sessionFile };
@@ -355,36 +357,93 @@ describe("standalone HTML export of legacy and vanished sources", () => {
 });
 
 describe("read-only session snapshot", () => {
-	it("refuses every mutation and leaves the source untouched", async () => {
-		const content = staleReplayTranscript();
+	it("refuses the guarded mutations and leaves the source untouched", async () => {
+		// The header cwd must exist, or moveTo fails for an unrelated reason.
+		const cwd = makeTempDir("cwd");
+		const content = staleReplayTranscript().replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`);
 		const { sourceDir, sessionFile } = seedSource(content);
+		const draftPath = path.join(sessionFile.slice(0, -".jsonl".length), "draft.txt");
+		// A sibling transcript that discard/delete calls could target.
+		const siblingFile = path.join(sourceDir, "sibling.jsonl");
+		fs.writeFileSync(siblingFile, jsonl([header("readonly-sibling")]), { mode: 0o600 });
+		const moveTarget = makeTempDir("move-target");
+		const forkTarget = path.join(makeTempDir("fork-target"), "fork.jsonl");
+		const stat = fs.statSync(sessionFile, { bigint: true });
+		const deleteTarget: VerifiedSessionDeleteTarget = {
+			sessionsRoot: sourceDir,
+			transcriptPath: sessionFile,
+			sessionId: "readonly-stale-replay",
+			cwd,
+			transcriptIdentity: {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: Number(stat.size),
+				mtimeNs: stat.mtimeNs,
+				sha256: crypto.createHash("sha256").update(content).digest("hex"),
+			},
+		};
+		const mutations: Record<string, (snapshot: SessionManager) => unknown> = {
+			appendMessage: snapshot => snapshot.appendMessage({ role: "user", content: "probe", timestamp: 2 }),
+			appendCustomEntry: snapshot => snapshot.appendCustomEntry("probe", { value: 1 }),
+			appendModelChange: snapshot => snapshot.appendModelChange("openai/test"),
+			appendThinkingLevelChange: snapshot => snapshot.appendThinkingLevelChange("high"),
+			appendLabelChange: snapshot => snapshot.appendLabelChange("user", "label"),
+			appendCompaction: snapshot => snapshot.appendCompaction("summary", "short", "user", 1),
+			setSessionName: snapshot => snapshot.setSessionName("Renamed", "user"),
+			setSessionStarred: snapshot => snapshot.setSessionStarred(true),
+			branch: snapshot => snapshot.branch("user"),
+			resetLeaf: snapshot => snapshot.resetLeaf(),
+			rewriteEntries: snapshot => snapshot.rewriteEntries(),
+			ensureOnDisk: snapshot => snapshot.ensureOnDisk(),
+			newSession: snapshot => snapshot.newSession(),
+			sanitizeLoadedOpenAIResponsesReplayMetadata: snapshot =>
+				snapshot.sanitizeLoadedOpenAIResponsesReplayMetadata(),
+			setSessionMemoryModeEnabled: snapshot => snapshot.setSessionMemoryMode("enabled"),
+			fork: snapshot => snapshot.fork(),
+			prepareFork: snapshot => snapshot.prepareFork(),
+			saveDraftText: snapshot => snapshot.saveDraft("replacement draft"),
+			saveDraftEmpty: snapshot => snapshot.saveDraft(""),
+			consumeDraft: snapshot => snapshot.consumeDraft(),
+			saveArtifact: snapshot => snapshot.saveArtifact("artifact body", "bash"),
+			allocateArtifactPath: snapshot => snapshot.allocateArtifactPath("bash"),
+			copyArtifactsForFork: snapshot => snapshot.copyArtifactsForFork(sessionFile, forkTarget),
+			putBlob: snapshot => snapshot.putBlob(Buffer.from("snapshot blob")),
+			stageDefaultModelSelection: snapshot => snapshot.stageDefaultModelSelection("openai/test", undefined),
+			deleteSessionVerified: snapshot => snapshot.deleteSessionVerified(deleteTarget),
+			discardUncommittedSession: snapshot => snapshot.discardUncommittedSession(siblingFile),
+			restoreState: snapshot => snapshot.restoreState(snapshot.captureState()),
+			restoreRollbackState: async snapshot => snapshot.restoreRollbackState(await snapshot.captureRollbackState()),
+			adoptArtifactManager: async snapshot => {
+				const manager = await snapshot.ensureArtifactManager();
+				if (!manager) throw new Error("artifact manager unavailable");
+				snapshot.adoptArtifactManager(manager);
+			},
+			stageAdoptedArtifactManagerForTransition: snapshot => snapshot.stageAdoptedArtifactManagerForTransition(),
+			// Last: without the guard it moves the source transcript away.
+			moveTo: snapshot => snapshot.moveTo(moveTarget),
+		};
 		const before = snapshotTree(sourceDir);
-		const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
-		try {
+		const outcomes: Record<string, { refusal: string | undefined; sourceUnchanged: boolean }> = {};
+		for (const [name, mutate] of Object.entries(mutations)) {
+			// A fresh snapshot per call, so one accepted mutation cannot mask the next.
+			// Without the guard an earlier row may delete the draft; reseed it so each row is judged alone.
+			if (!fs.existsSync(draftPath)) fs.writeFileSync(draftPath, "unsent draft", { mode: 0o600 });
+			const rowBefore = snapshotTree(sourceDir);
+			const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
 			expect(snapshot.isReadOnlySnapshot()).toBe(true);
-			const mutations: Record<string, () => unknown> = {
-				appendMessage: () => snapshot.appendMessage({ role: "user", content: "probe", timestamp: 2 }),
-				appendCustomEntry: () => snapshot.appendCustomEntry("probe", { value: 1 }),
-				appendModelChange: () => snapshot.appendModelChange("openai/test"),
-				appendThinkingLevelChange: () => snapshot.appendThinkingLevelChange("high"),
-				appendLabelChange: () => snapshot.appendLabelChange("user", "label"),
-				appendCompaction: () => snapshot.appendCompaction("summary", "short", "user", 1),
-				setSessionName: () => snapshot.setSessionName("Renamed", "user"),
-				setSessionStarred: () => snapshot.setSessionStarred(true),
-				branch: () => snapshot.branch("user"),
-				resetLeaf: () => snapshot.resetLeaf(),
-				rewriteEntries: () => snapshot.rewriteEntries(),
-				ensureOnDisk: () => snapshot.ensureOnDisk(),
-				newSession: () => snapshot.newSession(),
-				sanitizeLoadedOpenAIResponsesReplayMetadata: () => snapshot.sanitizeLoadedOpenAIResponsesReplayMetadata(),
-				setSessionMemoryModeEnabled: () => snapshot.setSessionMemoryMode("enabled"),
-			};
-			const refusals: Record<string, string | undefined> = {};
-			for (const [name, mutate] of Object.entries(mutations)) refusals[name] = await rejectionMessage(mutate);
-			expect(refusals).toEqual(Object.fromEntries(Object.keys(mutations).map(name => [name, "read_only_snapshot"])));
-		} finally {
-			await snapshot.close();
+			let refusal: string | undefined;
+			try {
+				refusal = await rejectionMessage(() => mutate(snapshot));
+			} finally {
+				await snapshot.close();
+			}
+			outcomes[name] = { refusal, sourceUnchanged: Bun.deepEquals(snapshotTree(sourceDir), rowBefore) };
 		}
+		expect(outcomes).toEqual(
+			Object.fromEntries(
+				Object.keys(mutations).map(name => [name, { refusal: "read_only_snapshot", sourceUnchanged: true }]),
+			),
+		);
 		expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
 		expect(snapshotTree(sourceDir)).toEqual(before);
 	});
