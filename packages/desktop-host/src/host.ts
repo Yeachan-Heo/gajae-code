@@ -2714,17 +2714,17 @@ export class DesktopHost {
 	 * keeping its final view, and the request is refused before anything runs (an input's text
 	 * returns to the composer). A slow or failing broker never holds this up past its timeout.
 	 */
-	async #recheckOwner(live: LiveSession, method: DesktopRequest["method"]): Promise<void> {
-		if (!this.#idle(live)) return;
-		if ((await this.#ownerAnswer(live.metadata)).kind !== "live") return;
-		// Another request replaced or released this copy while the broker answered. The answer was
-		// about a copy that is no longer the conversation's: leave the row as it is, and let the
-		// current copy's own checks apply (the request goes on to find the current copy).
-		if (this.#live.get(live.metadata.id) !== live) return;
-		// Work started in this copy meanwhile (another request found no owner and started a turn).
+	async #recheckOwner(checked: LiveSession, method: DesktopRequest["method"]): Promise<void> {
+		if (!this.#idle(checked)) return;
+		if ((await this.#ownerAnswer(checked.metadata)).kind !== "live") return;
+		// The answer is about the transcript, not the copy that asked. If another request replaced
+		// that copy while the broker answered, it holds for the copy that replaced it; a copy still
+		// opening checks for itself, and a released conversation has none.
+		const live = this.#live.get(checked.metadata.id);
+		// Work started in the copy meanwhile (another request found no owner and started a turn).
 		// Releasing it now would dispose that work, so keep the copy writable; the next write checks
 		// again, and the store's compare-and-append refusal stays the backstop.
-		if (!this.#idle(live)) return;
+		if (!live || !this.#idle(live)) return;
 		// Stepping aside would dispose the session and end its background work. Keep the copy, and
 		// start nothing new in it while the terminal has it; selecting it still shows it.
 		if (this.#backgroundWork(live) > 0) {

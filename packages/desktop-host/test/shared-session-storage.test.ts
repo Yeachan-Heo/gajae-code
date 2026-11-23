@@ -1394,7 +1394,7 @@ test("a select while the app is stepping aside joins it, and nothing internal re
 	await h.close();
 });
 
-test("an owner check that answers after its copy was replaced leaves the new copy and the row alone", async () => {
+test("an owner check that answers after its copy was replaced applies to the copy that replaced it", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
 	await h.call("prompt", { sessionId, text: "app turn" });
@@ -1410,15 +1410,16 @@ test("an owner check that answers after its copy was replaced leaves the new cop
 	await h.call("session.select", { sessionId });
 	const fresh = h.sdk();
 	expect(fresh).not.toBe(stale);
-	// The late answer says "live", but it was about a copy that is no longer the conversation's.
+	// The late answer says "live". It is about the transcript, so it holds for the fresh copy too:
+	// the prompt is refused before it runs and the app steps aside, disposing no other work.
 	h.liveOwners.add(await transcriptId(h));
+	const calls = h.model.calls.length;
 	releaseBroker();
-	await checking;
-	expect(fresh.isDisposed).toBe(false);
-	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "connected" });
-	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "completed" });
-	// The fresh copy's own next write checks, and steps aside.
-	await expect(h.call("prompt", { sessionId, text: "next" })).rejects.toThrow("terminal");
+	await expect(checking).rejects.toThrow("terminal");
+	expect(h.model.calls).toHaveLength(calls);
+	expect(h.snapshot().deliveries.at(-1)).toMatchObject({ sessionId, disposition: "refused" });
+	await fresh.awaitDisposeCompletion();
+	expect(fresh.isDisposed).toBe(true);
 	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
 	await h.close();
 });
