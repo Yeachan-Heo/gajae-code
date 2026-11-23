@@ -250,13 +250,27 @@ function buildExclusionSet(exclusions: readonly string[] | undefined): Set<strin
 	return result;
 }
 
+/**
+ * Last compiled non-empty config, keyed by its normalized content. Reloading
+ * `models.yml` yields a fresh equivalence object with the same content on every
+ * catalog refresh; returning the same compiled object keeps its per-model
+ * resolution memo (`kModelResolutionCache`) alive across those rebuilds.
+ */
+let lastCompiledEquivalence: { key: string; compiled: CompiledEquivalenceConfig } | undefined;
+
 function compileEquivalenceConfig(config: ModelEquivalenceConfig | undefined): CompiledEquivalenceConfig {
 	const overrides = buildOverrideMap(config?.overrides);
 	const exclude = buildExclusionSet(config?.exclude);
 	if (overrides.size === 0 && exclude.size === 0) {
 		return EMPTY_COMPILED_EQUIVALENCE;
 	}
-	return { overrides, exclude };
+	const key = JSON.stringify([[...overrides], [...exclude]]);
+	if (lastCompiledEquivalence?.key === key) {
+		return lastCompiledEquivalence.compiled;
+	}
+	const compiled: CompiledEquivalenceConfig = { overrides, exclude };
+	lastCompiledEquivalence = { key, compiled };
+	return compiled;
 }
 
 function addCanonicalCandidate(candidates: Set<string>, candidate: string): void {

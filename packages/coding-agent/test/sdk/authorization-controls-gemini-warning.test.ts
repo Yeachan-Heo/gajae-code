@@ -37,6 +37,7 @@ describe("AuthorizationControls SDK warning confirmation", () => {
 				refresh: async () => {},
 				getAuthStorageOwner: () => ({}),
 				getAll: () => [],
+				getConfiguredProviderIds: () => [],
 			} as any,
 			registerToolSessionCleanup: () => () => {},
 			registerToolSessionTransitionCleanup: () => () => {},
