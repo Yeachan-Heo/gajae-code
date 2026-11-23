@@ -700,7 +700,7 @@ test("a catalog saved by an earlier build keeps loading, and its terminal refere
 	// The other cannot open, says so in plain words, and can be removed for good.
 	for (const method of ["session.select", "history.get", "activity.get", "preferences.get"] as const)
 		await expect(h.call(method, { sessionId: gone.id })).rejects.toThrow(
-			"its transcript is not in the shared conversation store",
+			"its transcript was not found in the shared conversation store",
 		);
 	await h.call("session.delete", { sessionId: gone.id });
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([listed.id]);
@@ -711,6 +711,37 @@ test("a catalog saved by an earlier build keeps loading, and its terminal refere
 	await h.call("bootstrap");
 	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => session.id)).toEqual([listed.id]);
+});
+
+test("an earlier build's reference to a transcript in the project's .gjc folder says to continue it in the terminal", async () => {
+	const h = await fixture();
+	const project = await h.call<DesktopProject>("project.open", { path: h.projectDir });
+	// Earlier builds listed project-local transcripts too; this one is not offered as a row.
+	const local = SessionManager.create(
+		h.projectDir,
+		SessionManager.explicitDestination(path.join(h.projectDir, ".gjc", "sessions")),
+	);
+	local.appendMessage({ role: "user", content: [{ type: "text", text: "project-local" }], timestamp: Date.now() });
+	await local.ensureOnDisk();
+	await local.flush();
+	const file = local.getSessionFile();
+	const id = local.getSessionId();
+	await local.close();
+	if (!file) throw new Error("Missing project-local transcript");
+	const catalog = (await Bun.file(path.join(h.dataDir, "catalog.json")).json()) as {
+		sessions: Array<Record<string, unknown>>;
+	};
+	catalog.sessions.push({ id, projectId: project.id, title: "Project-local", starred: false, managed: true });
+	await h.restartWithCatalog(catalog);
+	for (const method of ["session.select", "history.get"] as const)
+		await expect(h.call(method, { sessionId: id })).rejects.toThrow(
+			"its transcript is kept in the project's .gjc folder, outside the conversation store the app uses. Continue it in the terminal, or remove it from this list.",
+		);
+	// Removing it forgets the reference only; the terminal's transcript stays.
+	await h.call("session.delete", { sessionId: id });
+	expect(h.snapshot().sessions).toEqual([]);
+	expect(await Bun.file(file).exists()).toBe(true);
+	expect(h.created).toHaveLength(0);
 });
 
 test("selecting an earlier build's terminal reference places it at once, before any refresh", async () => {

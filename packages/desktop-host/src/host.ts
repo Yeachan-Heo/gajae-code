@@ -474,7 +474,10 @@ const ELSEWHERE_LEFTOVER =
 	"A background process that an earlier version of the app started is still working on this conversation, so the app shows it read-only. Check again when it has finished.";
 /** A row saved by an earlier build whose transcript the shared store does not list (any more). */
 const UNPLACED =
-	"The app cannot open this conversation: its transcript is not in the shared conversation store. It may have been deleted or moved in the terminal. You can remove it from this list.";
+	"The app cannot open this conversation: its transcript was not found in the shared conversation store. It may have been deleted or moved in the terminal. You can remove it from this list.";
+/** A row an earlier build saved whose transcript exists, but outside the store the app opens rows from. */
+const UNPLACED_OUTSIDE =
+	"The app cannot open this conversation here: its transcript is kept in the project's .gjc folder, outside the conversation store the app uses. Continue it in the terminal, or remove it from this list.";
 /** The store's listing failed, so the app cannot tell whether such a row's transcript still exists. */
 const UNPLACED_UNCHECKED = "The app could not look up this conversation's transcript just now. Try again in a moment.";
 /** How long an idle owner left by an earlier build gets to close before the app answers anyway. */
@@ -1593,10 +1596,11 @@ export class DesktopHost {
 	 * if the store lists that transcript for this workspace now. `unlisted`: it is gone, or lies
 	 * outside the store. `unavailable`: the listing failed, which proves nothing.
 	 */
-	async #place(metadata: SavedSession): Promise<"placed" | "unlisted" | "unavailable"> {
+	async #place(metadata: SavedSession): Promise<"placed" | "unlisted" | "outside" | "unavailable"> {
 		const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
 		if (!project) return "unlisted";
 		let file: string | undefined;
+		let outside = false;
 		try {
 			const { managed } = await listEmbeddedProjectSessions({
 				cwd: project.path,
@@ -1608,12 +1612,15 @@ export class DesktopHost {
 			// the SDK applies when it opens the transcript.
 			const inProject = !!listed?.cwd && (await isEmbeddedSameDirectory(listed.cwd, project.path));
 			file = listed && inProject ? await this.#sharedStorePath(listed.path) : undefined;
+			// Listed for this workspace, but outside the shared store: the terminal resumes it.
+			outside = !!listed && inProject && !file;
 		} catch {
 			return "unavailable";
 		}
 		// Another request, or a workspace refresh, placed or removed it while the listing ran.
 		if (!metadata.managed) return "placed";
-		if (!file || !this.#catalog.sessions.includes(metadata)) return "unlisted";
+		if (!this.#catalog.sessions.includes(metadata)) return "unlisted";
+		if (!file) return outside ? "outside" : "unlisted";
 		const undo = this.#applyPlacement(metadata, file);
 		try {
 			await this.#save();
@@ -3480,11 +3487,12 @@ export class DesktopHost {
 				// places it, it goes on below as an ordinary row. Until then nothing can read or open
 				// it, and deleting it only forgets the reference: the app never held that transcript.
 				const placement = await this.#place(this.#metadata(params));
-				if (placement === "unlisted" && method === "session.delete")
+				if ((placement === "unlisted" || placement === "outside") && method === "session.delete")
 					// An inventory can come back empty without failing, so absence is not proof enough
 					// to release the identity: a transcript that is truly gone never lists again anyway.
 					return this.#forgetMissingSession(metadata, false);
 				if (placement === "unavailable") throw new Error(UNPLACED_UNCHECKED);
+				if (placement === "outside") throw new Error(UNPLACED_OUTSIDE);
 				if (placement === "unlisted") throw new Error(UNPLACED);
 			}
 		}
