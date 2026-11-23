@@ -1214,6 +1214,26 @@ test("a terminal that opens the conversation between two prompts makes the next 
 	await h.close();
 });
 
+test("a slash command run on an idle conversation a terminal has since opened steps aside first", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const live = h.sdk();
+	const owner = await transcriptId(h);
+	const transcript = await Bun.file(live.sessionFile!).text();
+	h.liveOwners.add(owner);
+	const lookups = h.ownerLookups.length;
+	// `/clear` would start a new transcript in the app's copy; it is refused before it runs.
+	await expect(h.call("command.run", { sessionId, text: "/clear" })).rejects.toThrow("terminal");
+	expect(h.ownerLookups.length).toBeGreaterThan(lookups);
+	expect(await transcriptId(h)).toBe(owner);
+	expect(await Bun.file(live.sessionFile!).text()).toBe(transcript);
+	await live.awaitDisposeCompletion();
+	expect(live.isDisposed).toBe(true);
+	expect(h.snapshot().sessions[0]?.connection).toEqual({ state: "elsewhere" });
+	await h.close();
+});
+
 test("selecting an idle conversation a terminal has since opened shows it read-only", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;
