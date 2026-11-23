@@ -293,6 +293,77 @@ describe("SDK secure-local authorization controls", () => {
 		}
 	});
 
+	it("enrolls a configured custom provider with an empty catalog through public API-key controls", async () => {
+		const provider = "sdk-empty-catalog";
+		const key = "sdk-empty-catalog-private-key";
+		const modelsPath = path.join(dir, "empty-models.json");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					[provider]: { api: "openai-completions", baseUrl: "https://empty.example/v1", models: [] },
+				},
+			}),
+		);
+		const settings = Settings.isolated();
+		const registry = new ModelRegistry(auth, modelsPath, settings);
+		const customSession = new AgentSession({
+			agent: new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(dir),
+			settings,
+			modelRegistry: registry,
+		});
+		const customControls = new AuthorizationControls(customSession);
+		const refresh = spyOn(registry, "refresh").mockResolvedValue(undefined);
+		try {
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.getConfiguredProviderIds()).toContain(provider);
+			expect(
+				registry.getAll(customSession.credentialSessionId).filter(model => model.provider === provider),
+			).toEqual([]);
+			const initial = await customControls.execute("auth.status", { provider });
+			expect(initial).toEqual({
+				provider,
+				canEnroll: false,
+				canStoreApiKey: true,
+				stored: false,
+				configured: false,
+				credentialKinds: [],
+			});
+			const inventory = await customControls.execute("auth.providers.status", {});
+			if (!Array.isArray(inventory) || Array.isArray(initial) || !("canStoreApiKey" in initial))
+				throw new Error("Expected provider status inventory");
+			expect(inventory).toContainEqual(initial);
+			const saved = await customControls.execute("auth.apiKey.store", { provider, key });
+			expect(saved).toEqual({ provider, saved: true, catalogRefreshed: true });
+			expect(auth.get(provider)).toEqual({ type: "api_key", key });
+			const enrolled = await customControls.execute("auth.status", { provider });
+			expect(enrolled).toEqual({
+				provider,
+				canEnroll: false,
+				canStoreApiKey: true,
+				stored: true,
+				configured: true,
+				credentialKinds: ["api_key"],
+			});
+			const enrolledInventory = await customControls.execute("auth.providers.status", {});
+			if (!Array.isArray(enrolledInventory) || Array.isArray(enrolled) || !("canStoreApiKey" in enrolled))
+				throw new Error("Expected enrolled provider inventory");
+			expect(enrolledInventory).toContainEqual(enrolled);
+			expect(JSON.stringify([initial, inventory, saved, enrolled, enrolledInventory])).not.toContain(key);
+			expect(registry.getAll(customSession.credentialSessionId).some(model => model.provider === provider)).toBe(
+				false,
+			);
+			expect(refresh).toHaveBeenCalledWith("offline", customSession.credentialSessionId);
+		} finally {
+			await customControls.close();
+			await customSession.dispose();
+			refresh.mockRestore();
+			await registry.dispose();
+			await settings.close();
+		}
+	});
+
 	it("does not claim saved credentials when storage rejects, but preserves a saved key when refresh fails", async () => {
 		const set = spyOn(auth, "set").mockRejectedValue(new Error("credential-bearing storage exception"));
 		try {
@@ -688,5 +759,148 @@ describe("SDK secure-local authorization controls", () => {
 		expect(isAuthorizationControlOperation("auth.providers")).toBe(false);
 		expect(isAuthorizationControlOperation("auth.apiKey.store")).toBe(true);
 		expect(auth.get("anthropic")).toBeUndefined();
+	});
+
+	it("still refuses providers that models.yml does not configure and keeps custom providers off OAuth enrollment", async () => {
+		const configured = "sdk-configured-empty";
+		const unconfigured = "sdk-unconfigured-provider";
+		const modelsPath = path.join(dir, "configured-models.json");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					[configured]: { api: "openai-completions", baseUrl: "https://configured.example/v1", models: [] },
+				},
+			}),
+		);
+		const settings = Settings.isolated();
+		const registry = new ModelRegistry(auth, modelsPath, settings);
+		const customSession = new AgentSession({
+			agent: new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(dir),
+			settings,
+			modelRegistry: registry,
+		});
+		const customControls = new AuthorizationControls(customSession);
+		const refresh = spyOn(registry, "refresh").mockResolvedValue(undefined);
+		const login = spyOn(auth, "login");
+		try {
+			expect(registry.getError()).toBeUndefined();
+			expect(registry.getConfiguredProviderIds()).toContain(configured);
+			expect(registry.getConfiguredProviderIds()).not.toContain(unconfigured);
+			for (const [operation, input] of [
+				["auth.status", { provider: unconfigured }],
+				["auth.start", { provider: unconfigured }],
+				["auth.apiKey.store", { provider: unconfigured, key: "unconfigured-private-key" }],
+				["auth.status", { provider: `${configured}/../${unconfigured}` }],
+				["auth.start", { provider: configured }],
+			] as const) {
+				await expect(customControls.execute(operation, input)).rejects.toThrow(
+					"Authorization operation failed or is no longer available",
+				);
+			}
+			expect(login).not.toHaveBeenCalled();
+			expect(refresh).not.toHaveBeenCalled();
+			expect(auth.get(unconfigured)).toBeUndefined();
+			expect(auth.get(configured)).toBeUndefined();
+			const inventory = await customControls.execute("auth.providers.status", {});
+			if (!Array.isArray(inventory)) throw new Error("Expected provider status inventory");
+			expect(inventory.map(status => status.provider)).not.toContain(unconfigured);
+		} finally {
+			await customControls.close();
+			await customSession.dispose();
+			login.mockRestore();
+			refresh.mockRestore();
+			await registry.dispose();
+			await settings.close();
+		}
+	});
+
+	it("leaves built-in model selection unchanged and keeps an enrolled empty custom provider unselectable", async () => {
+		const provider = "sdk-empty-selection";
+		const key = "sdk-empty-selection-private-key";
+		const modelsPath = path.join(dir, "selection-models.json");
+		const writeModels = (config: { models: { id: string }[]; credential?: "store" }) =>
+			Bun.write(
+				modelsPath,
+				JSON.stringify({
+					providers: {
+						[provider]: { api: "openai-completions", baseUrl: "https://selection.example/v1", ...config },
+					},
+				}),
+			);
+		await writeModels({ models: [] });
+		// A stored built-in key gives the available-model comparison real content.
+		await auth.set("anthropic", { type: "api_key", key: "sdk-built-in-selection-key" });
+		const baselineSettings = Settings.isolated();
+		const baseline = new ModelRegistry(auth, path.join(dir, "absent-models.json"), baselineSettings);
+		const settings = Settings.isolated();
+		const registry = new ModelRegistry(auth, modelsPath, settings);
+		const customSession = new AgentSession({
+			agent: new Agent({ initialState: { systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.inMemory(dir),
+			settings,
+			modelRegistry: registry,
+		});
+		const customControls = new AuthorizationControls(customSession);
+		const scope = customSession.credentialSessionId;
+		const fetched: string[] = [];
+		using _fetch = hookFetch(async input => {
+			fetched.push(String(input));
+			throw new Error("network is disabled in this test");
+		});
+		const keys = (models: readonly { provider: string; id: string }[]) =>
+			models.map(model => `${model.provider}/${model.id}`).sort();
+		const builtIn = (models: readonly { provider: string; id: string }[]) =>
+			keys(models.filter(model => model.provider !== provider));
+		const custom = (models: readonly { provider: string; id: string }[]) =>
+			models.filter(model => model.provider === provider);
+		try {
+			expect(registry.getError()).toBeUndefined();
+			const builtInCatalog = builtIn(baseline.getAll(scope));
+			const builtInAvailable = builtIn(baseline.getAvailable(scope));
+			expect(builtInCatalog.length).toBeGreaterThan(0);
+			expect(builtInAvailable.some(model => model.startsWith("anthropic/"))).toBe(true);
+			expect(builtIn(registry.getAll(scope))).toEqual(builtInCatalog);
+			expect(builtIn(registry.getAvailable(scope))).toEqual(builtInAvailable);
+			const selectedBefore = customSession.model;
+
+			expect(await customControls.execute("auth.apiKey.store", { provider, key })).toEqual({
+				provider,
+				saved: true,
+				catalogRefreshed: true,
+			});
+			expect(registry.getError()).toBeUndefined();
+			expect(providerStatus(await customControls.execute("auth.status", { provider }))).toMatchObject({
+				stored: true,
+				configured: true,
+			});
+			expect(builtIn(registry.getAll(scope))).toEqual(builtInCatalog);
+			expect(builtIn(registry.getAvailable(scope))).toEqual(builtInAvailable);
+			expect(keys(customSession.getAvailableModels())).toEqual(keys(registry.getAvailable(scope)));
+			expect(custom(registry.getAll(scope))).toEqual([]);
+			expect(custom(registry.getAvailable(scope))).toEqual([]);
+			expect(custom(customSession.getAvailableModels())).toEqual([]);
+			expect(registry.find(provider, "any-model", scope)).toBeUndefined();
+			expect(customSession.model).toBe(selectedBefore);
+			expect(fetched).toEqual([]);
+
+			// The provider becomes selectable only once its catalog declares a model
+			// backed by the key that enrollment stored.
+			await writeModels({ models: [{ id: "selection-model" }], credential: "store" });
+			await registry.refresh("offline", scope);
+			expect(registry.getError()).toBeUndefined();
+			expect(keys(custom(registry.getAvailable(scope)))).toEqual([`${provider}/selection-model`]);
+			expect(keys(custom(customSession.getAvailableModels()))).toEqual([`${provider}/selection-model`]);
+			expect(builtIn(registry.getAll(scope))).toEqual(builtInCatalog);
+			expect(builtIn(registry.getAvailable(scope))).toEqual(builtInAvailable);
+		} finally {
+			await customControls.close();
+			await customSession.dispose();
+			await registry.dispose();
+			await baseline.dispose();
+			await settings.close();
+			await baselineSettings.close();
+		}
 	});
 });
