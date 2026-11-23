@@ -446,7 +446,7 @@ class SteppedAside extends Error {
 }
 /** A terminal has the conversation open, but the app still holds it because its background work runs. */
 const ELSEWHERE_BACKGROUND =
-	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs, so nothing new starts here; Disconnect stops that work and leaves the conversation to the terminal.";
+	"A terminal (another gjc process) is using this conversation. The app keeps it open while its background work runs and does not start what you send; when that work finishes, the app may still add its result and a reply. Disconnect stops that work and leaves the conversation to the terminal.";
 /** A released conversation is not deleted while the running broker cannot say whether a terminal has it. */
 const OWNER_UNCHECKED_DELETE =
 	"The app could not check whether a terminal has this conversation open, so it was not deleted. Try again in a moment.";
@@ -2773,7 +2773,8 @@ export class DesktopHost {
 		// again, and the store's compare-and-append refusal stays the backstop.
 		if (!live || !this.#idle(live)) return;
 		// Stepping aside would dispose the session and end its background work. Keep the copy, and
-		// start nothing new in it while the terminal has it; selecting it still shows it.
+		// start nothing the user sends while the terminal has it; selecting it still shows it. (A turn
+		// the SDK starts by itself when that work completes is not a request, so nothing checks it.)
 		if (this.#backgroundWork(live) > 0) {
 			if (method === "session.select") return;
 			throw new Error(ELSEWHERE_BACKGROUND);
