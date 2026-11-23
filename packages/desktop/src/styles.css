@@ -386,8 +386,10 @@ summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
 .modal-content { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 4px; }
 .delete-confirmation { display: grid; gap: 12px; margin-bottom: 16px; overflow-wrap: anywhere; }
 .delete-confirmation p { margin: 0; }
-.delete-warning { display: flex; align-items: flex-start; gap: 10px; padding: 12px; color: var(--status-error); background: color-mix(in srgb, var(--status-error) 9%, transparent); border: 1px solid color-mix(in srgb, var(--status-error) 30%, transparent); border-radius: var(--radius-sm); }
-.delete-warning svg { flex: none; width: 18px; height: 18px; }
+/* The warning's words mix the status red toward the body ink (as tool-card error text does), so they
+   clear 4.5:1 on its tint in every bundled palette; the icon and edge keep the pure red. */
+.delete-warning { display: flex; align-items: flex-start; gap: 10px; padding: 12px; color: color-mix(in srgb, var(--status-error) 72%, var(--text)); background: color-mix(in srgb, var(--status-error) 9%, transparent); border: 1px solid color-mix(in srgb, var(--status-error) 30%, transparent); border-radius: var(--radius-sm); }
+.delete-warning svg { flex: none; width: 18px; height: 18px; color: var(--status-error); }
 /* In rem, so the close button grows with the title beside it (34px and a 16px icon at the default size). */
 .modal-close { flex: none; width: 2.125rem; height: 2.125rem; padding: 0; border-radius: var(--radius-sm); }
 .modal-close > svg { width: 1rem; height: 1rem; }

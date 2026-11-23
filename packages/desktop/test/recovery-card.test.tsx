@@ -187,6 +187,58 @@ suite("Recovery card", () => {
 	}, 30000);
 });
 
+/** The real Delete dialog in a native Modal with the given unsent texts; the clipboard accepts. */
+async function deleteDialog(texts: string[], viewport = { width: 1000, height: 900 }) {
+	const { context, page } = await componentFixture(browser, origin);
+	try {
+		await page.setViewport(viewport);
+		await componentReady(page, async () => {
+			await page.addScriptTag({
+				type: "module",
+				content: `
+					import '/src/styles.css';
+					import React from '/node_modules/.vite/deps/react.js';
+					import ReactDOM from '/node_modules/.vite/deps/react-dom_client.js';
+					import { Modal } from '/src/components.tsx';
+					import { DeleteConversationConfirmation } from '/src/RecoveryConversation.tsx';
+					import { applyTheme } from '/src/themes.ts';
+					const h = React.createElement;
+					window.recoveryTest = { discards: [], theme: applyTheme };
+					const root = document.createElement('div');
+					document.body.replaceChildren(root);
+					ReactDOM.createRoot(root).render(h(Modal, { title: 'Delete conversation', onClose: () => {} },
+						h(DeleteConversationConfirmation, { title: 'Fix the flaky test', texts: ${JSON.stringify(texts)}, disabled: false,
+							onDelete: () => {}, writer: () => Promise.resolve() })));
+				`,
+			});
+			await page.waitForSelector("dialog[open] .delete-confirmation");
+		});
+		await page.addStyleTag({ url: `${origin}/src/styles.css` });
+		await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
+		return { context, page };
+	} catch (error) {
+		await context.close();
+		throw error;
+	}
+}
+
+suite("Delete conversation dialog", () => {
+	test("its irreversible warning reads at 4.5:1 or better in every bundled theme", async () => {
+		const { context, page } = await deleteDialog([]);
+		try {
+			const failures: string[] = [];
+			for (const theme of THEME_IDS) {
+				await page.evaluate(id => window.recoveryTest.theme(id), theme);
+				const [sample] = await page.evaluate(measureContrast, ["dialog[open] .delete-warning strong"]);
+				if (sample!.ratio < 4.5) failures.push(`${theme}: ${sample!.ratio}`);
+			}
+			expect(failures).toEqual([]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+});
+
 suite("Recovery card showcase", () => {
 	test("three stacked cards keep their gutter, edges and actions inside them at 390 px and with 20 px text", async () => {
 		const context = await browser.createBrowserContext();
