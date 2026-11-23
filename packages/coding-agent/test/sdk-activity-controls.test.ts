@@ -776,6 +776,23 @@ describe("session-owned SDK activity controls", () => {
 		expect(f.controls.operateActivity({ ref }, "cancel")).toEqual({ cancelled: true });
 	});
 
+	test("an observation read during MCP admission does not retire bound activity controls", async () => {
+		const f = await fixture();
+		const job = monitor(f.manager, f.owner);
+		const ref = f.controls.getActivitySnapshot().jobs[0]!.ref;
+		const view = f.result.jobObservation;
+		await f.result.session.withMcpControlAdmission(f.result.session.sessionLifecycle.generation, async () => {
+			// Any client listing operations reads the factory job view mid-admission.
+			expect(getSdkClientControlOperations(f.result.session)).toContain("activity.cancel");
+			expect(f.result.jobObservation).toBe(view);
+			expect(f.controls.getActivitySnapshot().jobs.map(entry => entry.controls)).toEqual([[]]);
+		});
+		expect(f.result.jobObservation).toBe(view);
+		expect(f.controls.getActivitySnapshot().jobs[0]!.ref).toBe(ref);
+		expect(f.controls.operateActivity({ ref }, "cancel")).toEqual({ cancelled: true });
+		expect(job.abortController.signal.aborted).toBe(true);
+	});
+
 	test("dispose detaches subscriptions without disposing the shared observation or manager", async () => {
 		const f = await fixture();
 		const job = monitor(f.manager, f.owner);

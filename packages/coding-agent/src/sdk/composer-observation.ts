@@ -392,7 +392,8 @@ export class SdkComposerObservation {
 			this.#retire("stale_session");
 			throw new SdkComposerObservationError("stale_session");
 		}
-		if (lifecycle.transitioning) throw new SdkComposerObservationError("session_transitioning");
+		if (lifecycle.transitioning && !this.#session.isMcpControlActive)
+			throw new SdkComposerObservationError("session_transitioning");
 	}
 
 	#commands(): CatalogCommand[] {

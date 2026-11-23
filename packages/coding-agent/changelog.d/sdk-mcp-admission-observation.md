@@ -1,0 +1,3 @@
+### Fixed
+
+- SDK composer/HUD observations (`info`, `catalog`, `complete`) and the factory `jobObservation` view now stay readable while an MCP enable, suspend, resume or reconnect holds control admission. Previously reads failed with `session_transitioning`, and any read of `jobObservation` during the admission disposed the view, which left bound activity controls permanently `stale_session` afterwards. Factory job mutations (monitor/task cancel, pause, resume, cron delete, failure acknowledgement) are refused with `session_transitioning` for the duration of MCP admission; behaviour outside MCP admission is unchanged.

@@ -113,6 +113,60 @@ describe("SDK composer and HUD observation", () => {
 		dir.removeSync();
 	});
 
+	it("keeps HUD observations readable during real MCP admission without granting mutation authority", async () => {
+		const generation = session.sessionLifecycle.generation;
+		await session.withMcpControlAdmission(generation, async () => {
+			expect(session.sessionLifecycle.transitioning).toBe(true);
+			expect(observation.info({})).toMatchObject({ sessionGeneration: generation, sessionId: session.sessionId });
+			expect(observation.catalog({}).commands.map(command => command.name)).toContain("project-task");
+			const completion = await observation.complete({ text: "/project-ta", cursor: 11 });
+			expect(completion.items.map(item => item.value)).toContain("project-task");
+			const openedDuringAdmission = createSdkComposerObservation(session);
+			try {
+				expect(openedDuringAdmission.info({}).sessionGeneration).toBe(generation);
+			} finally {
+				openedDuringAdmission.dispose();
+			}
+			expect(session.isMcpControlActive).toBe(true);
+			await expect(
+				session.withMcpControlAdmission(generation, async () => {
+					throw new Error("A second MCP mutation must not run");
+				}),
+			).rejects.toMatchObject({ code: "busy" });
+		});
+		expect(session.isMcpControlActive).toBe(false);
+		expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: false });
+	});
+
+	it("still refuses HUD reads during a non-MCP transition that keeps the session generation", async () => {
+		const generation = session.sessionLifecycle.generation;
+		expect(observation.info({}).sessionGeneration).toBe(generation);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		// Hold manual compaction open at its first await, inside the transition lease.
+		const abort = spyOn(session, "abort").mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+		});
+		const compaction = session.compact().catch(() => undefined);
+		try {
+			await entered.promise;
+			expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: true });
+			failure(() => observation.info({}), "session_transitioning");
+			failure(() => observation.catalog({}), "session_transitioning");
+			await expect(observation.complete({ text: "/project-ta", cursor: 11 })).rejects.toMatchObject({
+				code: "session_transitioning",
+			});
+			failure(() => createSdkComposerObservation(session), "session_transitioning");
+		} finally {
+			release.resolve();
+			await compaction;
+			abort.mockRestore();
+		}
+		expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: false });
+		expect(observation.info({}).sessionGeneration).toBe(generation);
+	});
+
 	it("advertises executable SDK builtins and live dynamic commands, never UI-only builtins or internal paths", () => {
 		commands.push(
 			custom("model", "Must not shadow builtin"),
