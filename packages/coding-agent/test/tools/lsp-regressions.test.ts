@@ -26,12 +26,13 @@ import {
 	resolveDiagnosticTargets,
 	resolveSymbolColumn,
 } from "@gajae-code/coding-agent/lsp/utils";
-import { getThemeByName } from "@gajae-code/coding-agent/modes/theme/theme";
+
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { clampTimeout } from "@gajae-code/coding-agent/tools/tool-timeouts";
 import * as piUtils from "@gajae-code/utils";
 import { sanitizeText, TempDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm } from "../../../../scripts/safe-cleanup";
+import { loadTestTheme } from "../helpers/test-theme";
 
 describe("lsp regressions", () => {
 	afterEach(() => {
@@ -257,7 +258,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("sanitizes symbol metadata in renderer output", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const renderOptions: RenderResultOptions = { expanded: false, isPartial: false };
@@ -295,7 +296,7 @@ describe("lsp regressions", () => {
 	});
 
 	it("sanitizes tabs in rendered diagnostic output", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const renderOptions: RenderResultOptions = { expanded: false, isPartial: false };

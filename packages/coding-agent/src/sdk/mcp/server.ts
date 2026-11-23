@@ -1,13 +1,16 @@
 import { getAgentDir, VERSION } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { brokerLockRefusalApiMessage, normalizeBrokerLockRefusalError } from "../broker/lock-refusal";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClientError } from "../client/client";
+import { BrokerStartupError } from "../broker/startup-failure";
+import { bounded, SdkClientError } from "../client/client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
+	SessionLifecycleMutationOperation,
 	SessionLifecycleMutationRequest,
-	SessionLifecycleOperation,
 	SessionLifecycleService,
 } from "../lifecycle/service";
+import { isSessionLifecycleMutationOperation } from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
@@ -124,11 +127,44 @@ function asString(args: Arguments, name: string): string | null {
 }
 
 function resultError(error: unknown): { ok: false; error: { code: string; message: string; path?: string } } {
-	if (error instanceof SessionRouterError) return { ok: false, error: { code: error.phase, message: error.message } };
-	if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
+	// Map lock refusal errors to safe code/message without paths or stderr excerpts.
+	// Unwrap AggregateError to handle cleanup failures alongside primary refusal.
+	const normalized = normalizeBrokerLockRefusalError(error);
+	if (normalized.refusalCode !== undefined) {
+		return {
+			ok: false,
+			error: {
+				code: "broker_unavailable",
+				message: normalized.cleanupUnverified
+					? brokerLockRefusalApiMessage(normalized.refusalCode) + " Spawned broker cleanup was not verified."
+					: brokerLockRefusalApiMessage(normalized.refusalCode),
+			},
+		};
+	}
+	if (normalized.primaryError instanceof BrokerStartupError && normalized.primaryError.lockRefused) {
+		const refusalMsg = normalized.primaryError.refusalCode
+			? brokerLockRefusalApiMessage(normalized.primaryError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+		return {
+			ok: false,
+			error: {
+				code: "broker_unavailable",
+				message: normalized.cleanupUnverified
+					? `${refusalMsg} Spawned broker cleanup was not verified.`
+					: refusalMsg,
+			},
+		};
+	}
+	if (normalized.primaryError instanceof SessionRouterError)
+		return { ok: false, error: { code: normalized.primaryError.phase, message: normalized.primaryError.message } };
+	if (normalized.primaryError instanceof SdkClientError)
+		return { ok: false, error: { code: normalized.primaryError.code, message: normalized.primaryError.message } };
 	return {
 		ok: false,
-		error: { code: "unavailable", message: error instanceof Error ? error.message : "SDK request failed" },
+		error: {
+			code: "unavailable",
+			message: normalized.primaryError instanceof Error ? normalized.primaryError.message : "SDK request failed",
+		},
 	};
 }
 
@@ -162,30 +198,6 @@ function mcpOperationError(
 const MCP_LIFECYCLE_ACTOR = { id: "gjc-sdk-mcp", namespace: "sdk:mcp" } as const;
 const ROUTER_START_TIMEOUT_MS = 3_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
-type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
-
-function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
-}
-
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: NodeJS.Timeout | undefined;
-	const timeout = Promise.withResolvers<never>();
-	try {
-		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
-		return await Promise.race([promise, timeout.promise]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
-}
-
 class McpSessionListBrokerResponseError extends Error {
 	readonly #response: Arguments;
 
@@ -282,7 +294,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 	}
 
 	async function runLifecycle(
-		operation: LifecycleMutationOperation,
+		operation: SessionLifecycleMutationOperation,
 		input: Arguments,
 		requestKey: string,
 	): Promise<unknown> {
@@ -370,7 +382,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 					ok: false,
 					error: { code: "invalid_input", message: "idempotencyKey must be a non-empty string" },
 				};
-			if (isLifecycleOperation(operation) && !idempotencyKey)
+			if (isSessionLifecycleMutationOperation(operation) && !idempotencyKey)
 				return {
 					ok: false,
 					error: { code: "invalid_input", message: "idempotencyKey is required for lifecycle operations" },
@@ -381,7 +393,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 					await start();
 					return await paginatedSessionList(router, input);
 				}
-				if (!isLifecycleOperation(operation))
+				if (!isSessionLifecycleMutationOperation(operation))
 					return {
 						ok: false,
 						error: { code: "unknown_operation", message: `Unknown global operation: ${operation}` },

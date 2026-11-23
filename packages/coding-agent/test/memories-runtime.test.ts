@@ -15,6 +15,7 @@ import * as memoryStorage from "@gajae-code/coding-agent/memories/storage";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend";
 import { getAgentDbPath, Snowflake } from "@gajae-code/utils";
 import fc from "fast-check";
+import { retryUntil } from "../../utils/test/helpers/wait-for";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 interface SessionFixture {
@@ -200,20 +201,8 @@ async function createFixture(
 	return { agentDir, sessionDir, sessionFile, settings, session, modelRegistry, model };
 }
 
-async function waitFor(assertion: () => Promise<void> | void, timeoutMs = 3000): Promise<void> {
-	const start = Date.now();
-	let lastError: unknown;
-	while (Date.now() - start < timeoutMs) {
-		try {
-			await assertion();
-			return;
-		} catch (error) {
-			lastError = error;
-		}
-		await Bun.sleep(20);
-	}
-	throw lastError;
-}
+const waitFor = (assertion: () => Promise<void> | void, timeoutMs = 3000): Promise<void> =>
+	retryUntil(assertion, timeoutMs, { intervalMs: 20 });
 
 describe("memories runtime", () => {
 	let savedXdgData: string | undefined;

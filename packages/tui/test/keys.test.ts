@@ -52,6 +52,14 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[12626;2u", "shift+o")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+	it("matches iTerm2's Korean Ctrl+V CSI-u when the Kitty protocol was not negotiated", () => {
+		// iTerm2 3.6 with "Report modifiers using CSI u" and the 2-Set Korean layout
+		// sends this for Ctrl+V with no keyboard flags pushed (GJC_TUI_KEYBOARD_PROTOCOL=0).
+		setKittyProtocolActive(false);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+b")).toBe(false);
+		expect(matchesKey("\x1b[12621;5:3u", "ctrl+v")).toBe(false);
+	});
 
 	it("should prefer codepoint for symbol keys even when base layout differs", () => {
 		setKittyProtocolActive(true);

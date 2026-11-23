@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * External credential discovery reads `CLAUDE_CONFIG_DIR` and `CODEX_HOME` so an
@@ -28,13 +28,7 @@ interface Resolved {
 	skipped: string[];
 }
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cred-root-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
+const { tempDir, projectDir } = createTrustTempDirs("gjc-cred-root-trust-");
 
 function claudeCredentials(account: string): string {
 	return JSON.stringify({
@@ -75,16 +69,6 @@ function homeWithDefaults(): string {
 	fs.writeFileSync(path.join(dir, ".codex", "auth.json"), codexAuth("home"));
 	return dir;
 }
-
-function projectDir(dotenv?: string): string {
-	const dir = tempDir();
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
 
 async function discoverIn(cwd: string, homeDir: string, overrides: Record<string, string> = {}): Promise<Resolved> {
 	const env: Record<string, string> = {};

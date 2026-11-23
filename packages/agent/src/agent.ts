@@ -534,10 +534,12 @@ export class Agent {
 		error: undefined,
 	};
 	#contextRevision = 0;
+	#historyRevision = 0;
 	#attemptAuthority = createAttemptScopeAuthority();
 	#runHandles = new Map<number | ManagedLogicalRunId, AttemptRunHandle>();
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#canonicalEventProcessor?: (event: AgentEvent) => Promise<void> | undefined;
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (
@@ -547,7 +549,9 @@ export class Agent {
 	) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
 	#steeringWaiters = new Set<() => void>();
+	#queueChangeWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
+	#followUpWaiters = new Set<() => void>();
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#followUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
@@ -956,6 +960,15 @@ export class Agent {
 		return this.#contextRevision;
 	}
 
+	/**
+	 * Revision of the committed message history alone. Unlike `contextRevision`,
+	 * prompt, tool and model publications do not advance it, so callers that need
+	 * to fence message ownership independently can compare only this counter.
+	 */
+	get historyRevision(): number {
+		return this.#historyRevision;
+	}
+
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
 		return this.#appendOnlyContext;
 	}
@@ -967,6 +980,15 @@ export class Agent {
 	subscribe(fn: (e: AgentEvent) => void): () => void {
 		this.#listeners.add(fn);
 		return () => this.#listeners.delete(fn);
+	}
+
+	/** Session-owned publication acknowledgment, separate from best-effort observers. */
+	subscribeCanonicalEvents(processor: (event: AgentEvent) => Promise<void> | undefined): () => void {
+		if (this.#canonicalEventProcessor) throw new Error("Canonical event processor is already subscribed");
+		this.#canonicalEventProcessor = processor;
+		return () => {
+			if (this.#canonicalEventProcessor === processor) this.#canonicalEventProcessor = undefined;
+		};
 	}
 
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
@@ -1295,6 +1317,7 @@ export class Agent {
 		}
 		this.#state.messages = ms.slice();
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	appendMessage(m: AgentMessage) {
@@ -1303,6 +1326,7 @@ export class Agent {
 		// via slice() at the API boundary, so no caller relies on per-append array identity.
 		this.#state.messages.push(m);
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	popMessage(): AgentMessage | undefined {
@@ -1310,6 +1334,7 @@ export class Agent {
 		const removed = this.#state.messages.at(-1);
 		this.#state.messages = messages;
 		this.#contextRevision++;
+		this.#historyRevision++;
 
 		if (removed && this.#state.streamMessage === removed) {
 			this.#state.streamMessage = null;
@@ -1319,11 +1344,13 @@ export class Agent {
 	}
 
 	/**
-	 * For callers that mutate committed messages or the system prompt in place
-	 * outside Agent-owned mutators.
+	 * For callers that mutate committed messages in place outside Agent-owned
+	 * mutators. Prompt mutations must use `setSystemPrompt` so they stay out of the
+	 * history revision.
 	 */
 	touchContext(): void {
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	/**
@@ -1396,6 +1423,55 @@ export class Agent {
 	}
 
 	/**
+	 * Resolves when a follow-up message is queued after the wait starts, or when `signal` aborts, without consuming the message. Used by wait-style tools to interrupt their observation when the user queues a follow-up.
+	 */
+	waitForFollowUpArrival(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			this.#followUpWaiters.delete(settle);
+			signal.removeEventListener("abort", settle);
+			resolve();
+		};
+		this.#followUpWaiters.add(settle);
+		signal.addEventListener("abort", settle, { once: true });
+		return promise;
+	}
+
+	/**
+	 * Notify follow-up waiters without queueing a message. Used by the session
+	 * when a deferred SDK follow-up is admitted, so job poll can interrupt
+	 * immediately without waiting for the message to enter the agent queue.
+	 */
+	notifyFollowUpWaiters(): void {
+		for (const notify of [...this.#followUpWaiters]) notify();
+	}
+
+	/**
+	 * Resolves when the queue state changes (messages removed or reordered), or
+	 * when `signal` aborts. Used by snapshot consumers to observe queue mutations
+	 * without being affected by arrival-only waiter semantics.
+	 */
+	waitForQueueChange(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			this.#queueChangeWaiters.delete(settle);
+			signal.removeEventListener("abort", settle);
+			resolve();
+		};
+		this.#queueChangeWaiters.add(settle);
+		signal.addEventListener("abort", settle, { once: true });
+		return promise;
+	}
+
+	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 *
@@ -1409,6 +1485,7 @@ export class Agent {
 			this.#followUpForceOneAtATime.add(m);
 		}
 		this.#followUpQueue.push(m);
+		for (const notify of [...this.#followUpWaiters]) notify();
 	}
 
 	/**
@@ -1447,16 +1524,27 @@ export class Agent {
 	}
 
 	clearSteeringQueue() {
-		this.#steeringQueue = [];
+		if (this.#steeringQueue.length > 0) {
+			this.#steeringQueue = [];
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	clearFollowUpQueue() {
-		this.#followUpQueue = [];
+		if (this.#followUpQueue.length > 0) {
+			this.#followUpQueue = [];
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	clearAllQueues() {
+		const hadSteering = this.#steeringQueue.length > 0;
+		const hadFollowUp = this.#followUpQueue.length > 0;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		if (hadSteering || hadFollowUp) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	hasQueuedMessages(): boolean {
@@ -1482,6 +1570,7 @@ export class Agent {
 	restoreSteering(messages: AgentMessage[]): void {
 		if (messages.length === 0) return;
 		this.#steeringQueue = [...messages, ...this.#steeringQueue];
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 	}
 
 	/** Snapshot the follow-up queue without mutating it. */
@@ -1493,6 +1582,7 @@ export class Agent {
 	restoreFollowUp(messages: AgentMessage[]): void {
 		if (messages.length === 0) return;
 		this.#followUpQueue = [...messages, ...this.#followUpQueue];
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 	}
 
 	/** Snapshot both executable queues as one atomic session-level view. */
@@ -1505,8 +1595,17 @@ export class Agent {
 
 	/** Replace both executable queues with a prior snapshot. */
 	restoreQueues(snapshot: AgentQueueSnapshot): void {
+		const steeringChanged =
+			this.#steeringQueue.length !== snapshot.steering.length ||
+			this.#steeringQueue.some((msg, i) => msg !== snapshot.steering[i]);
+		const followUpChanged =
+			this.#followUpQueue.length !== snapshot.followUp.length ||
+			this.#followUpQueue.some((msg, i) => msg !== snapshot.followUp[i]);
 		this.#steeringQueue = snapshot.steering.slice();
 		this.#followUpQueue = snapshot.followUp.slice();
+		if (steeringChanged || followUpChanged) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 	}
 
 	/**
@@ -1545,6 +1644,7 @@ export class Agent {
 		const taken = takes.flat();
 		if (taken.length === 0) return [];
 		this.#steeringQueue = this.#steeringQueue.slice(taken.length);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return taken;
 	}
 
@@ -1556,16 +1656,19 @@ export class Agent {
 			this.#followUpBatches.delete(first);
 			if (batch.every((message, index) => this.#followUpQueue[index] === message)) {
 				this.#followUpQueue = this.#followUpQueue.slice(batch.length);
+				for (const notify of [...this.#queueChangeWaiters]) notify();
 				return [...batch];
 			}
 		}
 		if (this.#followUpMode === "one-at-a-time") {
 			this.#followUpQueue = this.#followUpQueue.slice(1);
+			for (const notify of [...this.#queueChangeWaiters]) notify();
 			return [first];
 		}
 
 		if (this.#followUpForceOneAtATime.has(first)) {
 			this.#followUpQueue = this.#followUpQueue.slice(1);
+			for (const notify of [...this.#queueChangeWaiters]) notify();
 			return [first];
 		}
 
@@ -1573,6 +1676,7 @@ export class Agent {
 		const takeCount = forcedIndex === -1 ? this.#followUpQueue.length : forcedIndex;
 		const followUp = this.#followUpQueue.slice(0, takeCount);
 		this.#followUpQueue = this.#followUpQueue.slice(takeCount);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return followUp;
 	}
 
@@ -1581,16 +1685,25 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
-		return this.#steeringQueue.pop();
+		const removed = this.#steeringQueue.pop();
+		if (removed !== undefined) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return removed;
 	}
 	removeSteerAt(index: number): AgentMessage | undefined {
 		if (index < 0 || index >= this.#steeringQueue.length) return undefined;
 		const [removed] = this.#steeringQueue.splice(index, 1);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return removed;
 	}
 
 	moveSteer(fromIndex: number, toIndex: number): boolean {
-		return this.#moveQueuedMessage(this.#steeringQueue, fromIndex, toIndex);
+		const success = this.#moveQueuedMessage(this.#steeringQueue, fromIndex, toIndex);
+		if (success && fromIndex !== toIndex) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return success;
 	}
 
 	/**
@@ -1598,16 +1711,25 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
-		return this.#followUpQueue.pop();
+		const removed = this.#followUpQueue.pop();
+		if (removed !== undefined) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return removed;
 	}
 	removeFollowUpAt(index: number): AgentMessage | undefined {
 		if (index < 0 || index >= this.#followUpQueue.length) return undefined;
 		const [removed] = this.#followUpQueue.splice(index, 1);
+		for (const notify of [...this.#queueChangeWaiters]) notify();
 		return removed;
 	}
 
 	moveFollowUp(fromIndex: number, toIndex: number): boolean {
-		return this.#moveQueuedMessage(this.#followUpQueue, fromIndex, toIndex);
+		const success = this.#moveQueuedMessage(this.#followUpQueue, fromIndex, toIndex);
+		if (success && fromIndex !== toIndex) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
+		return success;
 	}
 
 	#moveQueuedMessage<T>(queue: T[], fromIndex: number, toIndex: number): boolean {
@@ -1642,12 +1764,17 @@ export class Agent {
 		}
 		const steering = beforeSteering - this.#steeringQueue.length;
 		const followUp = beforeFollowUp - this.#followUpQueue.length;
+		// Notify queue-change listeners when queue state changes
+		if (steering > 0 || followUp > 0) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 		return { steering, followUp, total: steering + followUp };
 	}
 
 	clearMessages() {
 		this.#state.messages = [];
 		this.#contextRevision++;
+		this.#historyRevision++;
 	}
 
 	abort() {
@@ -1769,13 +1896,19 @@ export class Agent {
 	reset() {
 		this.#state.messages = [];
 		this.#contextRevision++;
+		this.#historyRevision++;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls = new Set<string>();
 		this.#managedLogicalRunOwner = undefined;
 		this.#state.error = undefined;
+		const hadSteering = this.#steeringQueue.length > 0;
+		const hadFollowUp = this.#followUpQueue.length > 0;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		if (hadSteering || hadFollowUp) {
+			for (const notify of [...this.#queueChangeWaiters]) notify();
+		}
 		// A reset starts a new provider cache lineage (/new, context clear, handoff):
 		// its first request must report `initial`, not a mutation of the old session.
 		this.#promptPrefixTracker = new PromptPrefixTracker();
@@ -2155,6 +2288,7 @@ export class Agent {
 			resourceRunId: this.#activeResourceRunId,
 			resourceCancellationDomain: this.#activeResourceCancellationDomain,
 			resourceSealOwner: "caller",
+			canonicalEventAcknowledgment: this.#canonicalEventProcessor !== undefined,
 			getApiKey: this.getApiKey,
 			getAuthCredentialType: this.getAuthCredentialType,
 			getToolContext: this.#getToolContext,
@@ -2322,7 +2456,12 @@ export class Agent {
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
 						if (event.message.role === "assistant" && this.#cursorToolResultBuffer.length > 0) {
-							this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							try {
+								await this.#emitCursorSplitAssistantMessage(event.message as AssistantMessage);
+							} catch (error) {
+								abortController.abort(error);
+								throw error;
+							}
 							continue; // Skip default emit - split method handles everything
 						}
 						this.#state.streamMessage = null;
@@ -2373,8 +2512,17 @@ export class Agent {
 						continue;
 				}
 
-				// Emit to listeners
-				this.#emit(event);
+				// Wait only for this emission's canonical append, not observer or extension delivery.
+				const completion = this.#emit(event);
+				if (completion) {
+					try {
+						await completion;
+					} catch (error) {
+						// A producer parked on a consumer drain must wake before this consumer unwinds.
+						abortController.abort(error);
+						throw error;
+					}
+				}
 			}
 
 			if (this.#activeRunId !== runId) {
@@ -2411,13 +2559,32 @@ export class Agent {
 				return;
 			}
 			const providerCode = providerFailureCode(err);
-			const runtimeFailureCode = abortController.signal.aborted
-				? "aborted"
-				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
+			const aborted = abortController.signal.aborted;
+			const abortReason = abortController.signal.reason;
+			// A publication rejection aborts the run with its own error. That is a
+			// failure to diagnose, not a caller cancellation, so keep the cause log.
+			// Only the DOMException our own `abort()` installs marks a caller cancellation.
+			// Keying on the name alone would also suppress a publication error that happens
+			// to be named "AbortError".
+			const cancelled = aborted && abortReason instanceof DOMException && abortReason.name === "AbortError";
+			const runtimeFailureCode = aborted ? "aborted" : (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
 			const errorName = safeErrorName(err);
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				logger.warn("Agent run failed", {
+					provider: model.provider,
+					model: model.id,
+					code: sanitized.code,
+					status: safeErrorStatus(err),
+					...describeRunFailureForLog(err),
+				});
+			} else if (!cancelled) {
+				// The only in-band abort reason is a canonical publication rejection, which
+				// aborts with its own error. Report that cause under a distinct diagnostic
+				// instead of mislabeling it as a run failure. `forceAbort` clears the active
+				// run before this catch can observe it, so a deliberate forced abort never
+				// reaches here, and `abort()` takes the cancellation branch above.
+				logger.warn("Agent run aborted with an underlying failure", {
 					provider: model.provider,
 					model: model.id,
 					code: sanitized.code,
@@ -2440,7 +2607,7 @@ export class Agent {
 					totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
-				stopReason: abortController.signal.aborted ? "aborted" : "error",
+				stopReason: aborted ? "aborted" : "error",
 				errorMessage: sanitized.message,
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
@@ -2458,7 +2625,7 @@ export class Agent {
 			// Store the sanitized message only: the raw provider error may carry request
 			// bodies, credentials, or tokens (exact-head review P1).
 			this.#state.error = sanitizeAgentFailure(err).message;
-			if (!abortController.signal.aborted) {
+			if (!aborted) {
 				this.#emit({
 					type: "agent_failed",
 					// Only the identity-checked local staging diagnostic may assert a
@@ -2468,7 +2635,7 @@ export class Agent {
 				});
 			}
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
-				stopReason: abortController.signal.aborted ? "cancelled" : "error",
+				stopReason: aborted ? "cancelled" : "error",
 				messages: [errorMsg],
 			});
 		} finally {
@@ -2559,7 +2726,16 @@ export class Agent {
 		}
 	}
 
-	#emit(e: AgentEvent) {
+	#emit(e: AgentEvent): Promise<void> | undefined {
+		let completion: Promise<void> | undefined;
+		try {
+			completion = this.#canonicalEventProcessor?.(e);
+		} catch (error) {
+			completion = Promise.reject(error);
+		}
+		// External synchronous emissions and terminal events do not wait for effects;
+		// still observe failures even when there is no loop consumer awaiting them.
+		void completion?.catch(error => logger.warn("Canonical event publication failed", { error }));
 		for (const listener of this.#listeners) {
 			try {
 				listener(e);
@@ -2572,6 +2748,7 @@ export class Agent {
 				console.warn("[pi-agent] event listener threw; swallowing:", sanitizeAgentFailure(error));
 			}
 		}
+		return completion;
 	}
 
 	/** Calculate total text length from an assistant message's content blocks */
@@ -2610,6 +2787,7 @@ export class Agent {
 		if (this.#steeringQueue.length > 0) {
 			terminalEvent.disownedSteering = this.#steeringQueue;
 			this.#steeringQueue = [];
+			for (const notify of [...this.#queueChangeWaiters]) notify();
 		}
 		if (domain) {
 			setAgentTerminalOwnerContext(terminalEvent, {
@@ -2652,7 +2830,7 @@ export class Agent {
 	 *
 	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
 	 */
-	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
+	async #emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): Promise<void> {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
@@ -2660,7 +2838,8 @@ export class Agent {
 			// No tool results, emit normally
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			const completion = this.#emit({ type: "message_end", message: assistantMessage });
+			if (completion) await completion;
 			return;
 		}
 
@@ -2681,13 +2860,15 @@ export class Agent {
 			// Emit assistant message first, then tool results (original behavior but with buffered results)
 			this.#state.streamMessage = null;
 			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
+			const completion = this.#emit({ type: "message_end", message: assistantMessage });
+			if (completion) await completion;
 
 			// Emit buffered tool results
 			for (const { toolResult } of buffer) {
 				this.#emit({ type: "message_start", message: toolResult });
 				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
+				const toolCompletion = this.#emit({ type: "message_end", message: toolResult });
+				if (toolCompletion) await toolCompletion;
 			}
 			return;
 		}
@@ -2711,13 +2892,15 @@ export class Agent {
 		// Emit preamble
 		this.#state.streamMessage = null;
 		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		const preambleCompletion = this.#emit({ type: "message_end", message: preambleMessage });
+		if (preambleCompletion) await preambleCompletion;
 
 		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
 			this.#emit({ type: "message_start", message: toolResult });
 			this.appendMessage(toolResult);
-			this.#emit({ type: "message_end", message: toolResult });
+			const toolCompletion = this.#emit({ type: "message_end", message: toolResult });
+			if (toolCompletion) await toolCompletion;
 		}
 
 		// Emit continuation message (text after tools) if non-empty
@@ -2740,7 +2923,8 @@ export class Agent {
 			};
 			this.#emit({ type: "message_start", message: continuationMessage });
 			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
+			const continuationCompletion = this.#emit({ type: "message_end", message: continuationMessage });
+			if (continuationCompletion) await continuationCompletion;
 		}
 	}
 }

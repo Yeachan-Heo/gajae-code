@@ -238,6 +238,8 @@ export function isContinuingMidRunMaintenanceOutcome(outcome: unknown): boolean 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	/** Session policy owns context overflow; successful empty stops remain terminal. */
 	contextOverflowManaged?: boolean;
+	/** The event consumer awaits canonical message admission before requesting its next event. */
+	canonicalEventAcknowledgment?: boolean;
 	model: Model;
 	/**
 	 * Supplies a fresh opaque token at each concrete managed transport invocation.

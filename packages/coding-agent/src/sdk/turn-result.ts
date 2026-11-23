@@ -5,7 +5,12 @@ export const TURN_RESULT_ERROR_MESSAGE_MAX_LENGTH = 512;
 export type TurnResultSelector =
 	| { kind: "prompt" | "skill"; clientRef: string }
 	| { kind: "prompt" | "skill"; commandId: string; turnId: string };
-export type TurnResultStatus = "unknown" | "accepted" | "in_flight" | "terminal_ok" | "failed";
+/**
+ * `admitted`: the host reserved the clientRef and generated the correlation, but
+ * the submission is still in preflight (for example a pre-prompt compaction) and
+ * is neither accepted nor rejected yet.
+ */
+export type TurnResultStatus = "unknown" | "admitted" | "accepted" | "in_flight" | "terminal_ok" | "failed";
 export interface TurnResultContent {
 	version: typeof TURN_RESULT_VERSION;
 	type: "text";

@@ -768,7 +768,7 @@ function scheduleResidentCacheRootSweep(root: string): void {
  * directories; callers must use {@link EphemeralBlobStore.adoptVerifiedDir}
  * rather than the destructive EphemeralBlobStore constructor.
  */
-function openVerifiedCacheInstanceDir(root: string, instanceName?: string): string {
+export function openVerifiedResidentCacheInstanceDir(root: string): string {
 	const uid = residentCacheOwnerUid(root);
 	let rootDescriptor: number | null = null;
 	let instanceDir: string | null = null;
@@ -780,27 +780,7 @@ function openVerifiedCacheInstanceDir(root: string, instanceName?: string): stri
 		}
 		rootDescriptor = openVerifiedResidentCacheDirectory(root, uid);
 		try {
-			if (instanceName === undefined) instanceDir = fs.mkdtempSync(path.join(root, "i-"));
-			else {
-				if (!/^s-[a-f0-9]{32}$/.test(instanceName))
-					throw new ResidentCacheTrustError("instance_name_invalid", instanceName);
-				const candidate = path.join(root, instanceName);
-				try {
-					fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
-				} catch (error) {
-					if (errorCode(error) !== "EEXIST") throw error;
-					const staleInstance = readResidentCacheOwnerSnapshot(candidate, uid);
-					if (
-						staleInstance === null ||
-						!residentCacheOwnerIsStale(staleInstance.owner, new Map<number, ResidentCacheProcessStart>()) ||
-						!reapResidentCacheInstanceDir(root, rootDescriptor, candidate, staleInstance, uid)
-					) {
-						throw error;
-					}
-					fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
-				}
-				instanceDir = candidate;
-			}
+			instanceDir = fs.mkdtempSync(path.join(root, "i-"));
 		} catch (error) {
 			throw residentCacheTrustError("instance_create_failed", root, error);
 		}
@@ -830,15 +810,6 @@ function openVerifiedCacheInstanceDir(root: string, instanceName?: string): stri
 			}
 		}
 	}
-}
-
-export function openVerifiedResidentCacheInstanceDir(root: string): string {
-	return openVerifiedCacheInstanceDir(root);
-}
-
-/** Open the deterministic per-session managed-sidecar instance in its separate cache root. */
-export function openVerifiedSidecarCacheInstanceDir(root: string, sessionHash: string): string {
-	return openVerifiedCacheInstanceDir(root, `s-${sessionHash}`);
 }
 
 function sha256Hex(data: Buffer): string {

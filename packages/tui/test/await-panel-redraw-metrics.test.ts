@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, TUI } from "@gajae-code/tui";
 import { renderMetrics } from "@gajae-code/tui/metrics";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 /**
  * Deterministic `PI_TUI_METRICS` repro for the subagent-await UI perf work.
@@ -37,12 +37,6 @@ class MutableLines implements Component {
 	render(width: number): string[] {
 		return this.#lines.map(line => line.slice(0, width));
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
 }
 
 // Viewport of 8 rows over a 30-line transcript: lines 0..21 are above the viewport

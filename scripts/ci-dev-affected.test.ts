@@ -176,7 +176,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain(
 			"    name: ${{ ((github.event_name == 'workflow_dispatch' && inputs.head_sha != '') || (github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null)) && 'Not code evidence - affected validation skipped' || 'Affected path validation' }}",
 		);
-		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
+		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, ci-meta-tests, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
 		expect(workflow).toContain("artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}");
@@ -226,7 +226,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}");
 		expect(workflow).toContain("affected-darwin-arm64-tab-worker-smoke:");
-		expect(workflow).toContain("runs-on: macos-14");
+		expect(workflow).toContain("runs-on: macos-15");
 		expect(workflow).toContain("TARGET_PLATFORM: darwin");
 		expect(workflow).toContain("TARGET_ARCH: arm64");
 		expect(workflow).toContain("process.platform");
@@ -256,7 +256,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  affected-native:"));
 		expect(windowsJob).toContain("runs-on: windows-latest");
 		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
-		expect(windowsJob).toContain("Windows session-path canonicalization regression");
+		expect(windowsJob).toContain("Windows session-path canonicalization regression\n        shell: pwsh\n        run: |");
 		// The `./` prefix is load-bearing on Windows: without it Bun treats the argument
 		// as a name filter rather than a path, matches nothing, and exits 1. Pinned here
 		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
@@ -264,6 +264,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		const authorityRegressionCommand = "bun test ./packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts";
+		expect(windowsJob).toContain(`${authorityRegressionCommand}\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`);
+		expect(windowsJob).toContain("run: bun run ci:build:native");
+		expect(windowsJob.indexOf(authorityRegressionCommand)).toBeGreaterThan(windowsJob.indexOf("run: bun run ci:build:native"));
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/doctor-plugin-restore.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
@@ -1383,6 +1387,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
 			"packages/coding-agent/src/sdk/session-directory.ts",
+			"packages/coding-agent/src/sdk/secure-local-authority.ts",
+			"packages/coding-agent/test/sdk-secure-local-controls.test.ts",
+			"packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/src/sdk/broker/session-index.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
@@ -1975,13 +1982,68 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(targeted(["packages/coding-agent/changelog.d/5491-rebase-free-release-notes.md"])).toEqual([]);
 	});
 
-	// docs/ is the source the embedded docs index is generated from, so shipping a
-	// docs edit without regenerating that index is the one drift class a docs-only
-	// change can introduce. Both planners must select that gate, because dev CI runs
-	// on push as well as pull_request. The gate reads the generated corpus through the
-	// package barrel, so it is a native consumer: it has to bring its own producer, or
-	// the shard's `if: matrix.native` download step asks for an artifact that the
-	// skipped `affected-native` job never uploaded.
+	test("runtime Markdown keeps direct consumer tests in PR plans without broad suites", () => {
+		for (const changed of [
+			"packages/coding-agent/src/prompts/agents/planner.md",
+			"packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md",
+			"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+		]) {
+			const keys = targeted([changed]).map(task => task.key);
+			expect(keys).toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(false);
+		}
+	});
+
+	test("prompt fragments select their actual consumers before skipping CLI smoke", () => {
+		for (const [fragment, consumer] of [
+			["browser-aside", "sdk-browser-aside-backend.test.ts"],
+			["ralplan-persistence", "gjc-runtime/ralplan-worktree-root.test.ts"],
+		]) {
+			const keys = targeted([`packages/coding-agent/src/prompts/agent-fragments/${fragment}.md`]).map(task => task.key);
+			expect(keys).toContain(`test:packages/coding-agent/test/${consumer}`);
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).not.toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+			expect(keys).not.toContain("cli-smoke");
+		}
+	});
+
+	test("unmapped prompt fragments keep CLI smoke rather than an unrelated definitions test", () => {
+		for (const fragment of ["restricted-bash", "future-fragment"]) {
+			const keys = targeted([`packages/coding-agent/src/prompts/agent-fragments/${fragment}.md`]).map(task => task.key);
+			expect(keys).toContain("cli-smoke");
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).not.toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+		}
+	});
+
+	test("push plans retain runtime Markdown coverage and root README stays cheap", () => {
+		const roleKeys = planTasks(["packages/coding-agent/src/prompts/agents/planner.md"], targetingPackages).map(task => task.key);
+		expect(roleKeys).toContain("check:@gajae-code/coding-agent");
+		expect(roleKeys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(true);
+		const deepInterviewKeys = planTasks(["packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md"], targetingPackages).map(task => task.key);
+		expect(deepInterviewKeys).toContain("deep-interview-definitions");
+		expect(deepInterviewKeys).toContain("deep-interview-runtime");
+		expect(planTasks(["README.md"], targetingPackages)).toEqual([]);
+		expect(targeted(["README.md", "packages/coding-agent/CHANGELOG.md"])).toEqual([]);
+	});
+
+	test("mixed prose and runtime Markdown plans retain both bounded gates exactly once", () => {
+		const keys = targeted(["docs/guide.md", "packages/coding-agent/src/prompts/agents/planner.md", "packages/coding-agent/src/prompts/agents/critic.md"]).map(task => task.key);
+		expect(keys.filter(key => key === "test:packages/coding-agent/test/default-gjc-definitions.test.ts")).toHaveLength(1);
+		expect(keys).toContain(EMBEDDED_DOCS_GATE_KEY);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
+	});
+
+	test("other bundled source Markdown retains owning package checks and smoke", () => {
+		const keys = targeted(["packages/agent/src/compaction/prompts/compaction-summary-context.md"]).map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/agent-core");
+		expect(keys).toContain("cli-smoke");
+	});
+
 	test("custom provider recipes select runtime loader validation in both planning modes", () => {
 		for (const tasks of [targeted(["docs/custom-providers-and-multi-account.md"]), planTasks(["docs/custom-providers-and-multi-account.md"], packages)]) {
 			const keys = tasks.map(task => task.key);
@@ -1991,6 +2053,13 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		}
 	});
 
+	// docs/ is the source the embedded docs index is generated from, so shipping a
+	// docs edit without regenerating that index is the one drift class a docs-only
+	// change can introduce. Both planners must select that gate, because dev CI runs
+	// on push as well as pull_request. The gate reads the generated corpus through the
+	// package barrel, so it is a native consumer: it has to bring its own producer, or
+	// the shard's `if: matrix.native` download step asks for an artifact that the
+	// skipped `affected-native` job never uploaded.
 	test("docs-only changes select the embedded-docs gate and its native producer", () => {
 		const changed = ["docs/guide.md", "docs/nested/other.md"];
 		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>

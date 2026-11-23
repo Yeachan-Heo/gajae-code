@@ -13,6 +13,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ProviderDiagnostic } from "@gajae-code/ai/core";
+import { isRecord } from "@gajae-code/utils";
 import { failedPromptOutcome, providerDiagnosticField } from "../prompt-failure";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
 import type { ReceiptState } from "../receipt-state";
@@ -204,10 +205,6 @@ export function reconciliationStorePath(sessionFile: string, sessionId: string):
 			code: "invalid_input",
 		});
 	return path.join(path.dirname(sessionFile), RECONCILIATION_DIR_NAME, `${sessionId}.json`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Record-level validation: JSON-valid but malformed entries must be quarantined too. */

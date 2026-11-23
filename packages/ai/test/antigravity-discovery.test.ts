@@ -381,7 +381,7 @@ describe("Antigravity model discovery", () => {
 		try {
 			await fetchAntigravityDiscoveryModels({
 				token: "test-token",
-				endpoint: "https://antigravity.example.test",
+				endpoint: "https://proxy-user:proxy-secret@antigravity.example.test/tenant-path?key=query-secret",
 				fetcher,
 			});
 
@@ -391,7 +391,10 @@ describe("Antigravity model discovery", () => {
 			expect(requestUserAgents).toEqual([expect.any(String)]);
 			expect(output).toContain(`User-Agent: ${requestUserAgents[0]}`);
 			expect(output).not.toContain("(using default getAntigravityUserAgent())");
-			expect(output).toContain("Endpoint:");
+			expect(output).toContain("Endpoint: https://antigravity.example.test");
+			expect(output).not.toContain("proxy-secret");
+			expect(output).not.toContain("query-secret");
+			expect(output).not.toContain("tenant-path");
 			expect(output).toContain("Total raw models from response:");
 			expect(output).toContain("=== KEPT MODELS ===");
 			expect(output).toContain("gemini-3.1-pro-low");

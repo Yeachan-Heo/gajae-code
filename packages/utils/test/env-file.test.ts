@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import fc from "fast-check";
 import { canonicalEnvKey, parseEnvFileContent, projectEnvSnapshot } from "../src/env-file";
+import { lcgUnit } from "./helpers/prng";
 
 const tempDirs: string[] = [];
 
@@ -15,14 +16,6 @@ function tempDir(prefix: string): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	tempDirs.push(dir);
 	return dir;
-}
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
 }
 
 function randomString(random: () => number, alphabet: string, maxLength: number): string {
@@ -37,7 +30,7 @@ function randomString(random: () => number, alphabet: string, maxLength: number)
 describe("parseEnvFileContent dotenv comment properties", () => {
 	test("matches Bun for seeded comment, quoted-hash, and escaped-quote values", async () => {
 		const seed = 0x5eedc0de;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 		const literalAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-";
 		const commentAlphabet = `${literalAlphabet} \\"'`;
 		const cases: Array<{ key: string; raw: string; expected: string }> = [];
@@ -112,7 +105,7 @@ describe("parseEnvFileContent dotenv comment properties", () => {
 describe("projectEnvSnapshot non-identifier declaration properties", () => {
 	test("marks seeded Bun-loaded npm key variants dynamic across dotenv layers", async () => {
 		const seed = 0x5eedc0de;
-		const random = seededRandom(seed);
+		const random = lcgUnit(seed);
 		const separators = ["_", "-", "."];
 		const layerFiles = [".env", ".env.development", ".env.local", ".env.development.local"];
 		const declarationsByLayer: Record<string, string[]> = Object.fromEntries(layerFiles.map(file => [file, []]));
@@ -304,6 +297,59 @@ describe("projectEnvSnapshot bounded reads", () => {
 		]);
 		expect(exitCode, stderr).toBe(0);
 		expect(JSON.parse(stdout.trim())).toEqual({ incomplete: true });
+	}, 10_000);
+});
+
+describe("dotenv readers skip a FIFO layer without blocking", () => {
+	// A FIFO blocks `open(2)` until a writer appears; Bun's own autoload skips it.
+	async function probe(expression: string, setup: (dir: string) => void): Promise<unknown> {
+		const cwd = tempDir("gjc-env-fifo-");
+		const processCwd = tempDir("gjc-env-fifo-runner-");
+		setup(cwd);
+		const source = path.resolve(import.meta.dir, "../src/env-file.ts");
+		const script = path.join(processCwd, "fifo-probe.ts");
+		await Bun.write(
+			script,
+			`import { parseEnvFile, parseShellEnvFile, projectEnvSnapshot } from ${JSON.stringify(source)};\n` +
+				`const cwd = ${JSON.stringify(cwd)};\n` +
+				`console.log(JSON.stringify(${expression}));\n`,
+		);
+		const proc = Bun.spawn([process.execPath, "--no-env-file", script], {
+			cwd: processCwd,
+			// `bun test` sets NODE_ENV=test, which drops the `.env.local` layer.
+			env: { ...process.env, NODE_ENV: "development" },
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 5_000,
+			killSignal: "SIGKILL",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		return JSON.parse(stdout.trim());
+	}
+
+	for (const layer of [".env", ".env.local"]) {
+		test(`projectEnvSnapshot reports a FIFO ${layer} incomplete and keeps the other layers`, async () => {
+			if (process.platform === "win32") return;
+			const result = await probe("projectEnvSnapshot(cwd)", dir => {
+				Bun.spawnSync(["mkfifo", path.join(dir, layer)]);
+				fs.writeFileSync(path.join(dir, layer === ".env" ? ".env.local" : ".env"), "KEPT=1\n");
+			});
+			expect(result).toEqual({ values: { KEPT: "1" }, dynamic: {}, incomplete: true });
+		}, 10_000);
+	}
+
+	test("parseEnvFile and parseShellEnvFile return nothing for a FIFO", async () => {
+		if (process.platform === "win32") return;
+		const result = await probe('[parseEnvFile(cwd + "/.env"), parseShellEnvFile(cwd + "/.zshrc")]', dir => {
+			Bun.spawnSync(["mkfifo", path.join(dir, ".env")]);
+			Bun.spawnSync(["mkfifo", path.join(dir, ".zshrc")]);
+		});
+		expect(result).toEqual([{}, {}]);
 	}, 10_000);
 });
 

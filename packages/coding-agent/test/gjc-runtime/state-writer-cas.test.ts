@@ -10,6 +10,7 @@ import {
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
+import { readJson } from "../helpers/read-json";
 
 const tempRoots: string[] = [];
 
@@ -22,10 +23,6 @@ async function tempDir(): Promise<string> {
 afterAll(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
-
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
-}
 
 function sleep(ms: number): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, ms));

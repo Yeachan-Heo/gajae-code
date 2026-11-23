@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBlobsDir, getResidentCacheRootDir, getSidecarCacheRootDir, logger, TempDir } from "@gajae-code/utils";
+import { sweepResidentCacheRoot } from "../../src/session/blob-store";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -593,8 +594,7 @@ describe("SessionManager cold sidecar integration", () => {
 			const residentEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
 			const sidecarCacheRoot = getSidecarCacheRootDir(profileAgentDir);
 			const beforeReopen = fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0;
-			const sessionHash = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
-			const staleSidecar = path.join(sidecarCacheRoot, `s-${sessionHash}`);
+			const staleSidecar = path.join(sidecarCacheRoot, "i-crashed-sidecar");
 			fs.mkdirSync(sidecarCacheRoot, { recursive: true, mode: 0o700 });
 			fs.chmodSync(sidecarCacheRoot, 0o700);
 			fs.mkdirSync(staleSidecar, { mode: 0o700 });
@@ -622,9 +622,13 @@ describe("SessionManager cold sidecar integration", () => {
 				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
-				expect(fs.readdirSync(sidecarCacheRoot).length).toBeGreaterThan(beforeReopen);
-				expect(fs.readdirSync(sidecarCacheRoot).filter(entry => /^s-[a-f0-9]{32}$/.test(entry))).toHaveLength(1);
-				expect(JSON.parse(fs.readFileSync(path.join(staleSidecar, "owner.json"), "utf8"))).toMatchObject({
+				const ownedSidecars = fs
+					.readdirSync(sidecarCacheRoot)
+					.filter(entry => /^i-[A-Za-z0-9_-]+$/.test(entry) && entry !== path.basename(staleSidecar));
+				expect(ownedSidecars).toHaveLength(1);
+				expect(
+					JSON.parse(fs.readFileSync(path.join(sidecarCacheRoot, ownedSidecars[0], "owner.json"), "utf8")),
+				).toMatchObject({
 					pid: process.pid,
 				});
 				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
@@ -632,6 +636,8 @@ describe("SessionManager cold sidecar integration", () => {
 				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
 				await reopened?.close();
 			}
+			await sweepResidentCacheRoot(sidecarCacheRoot);
+			expect(fs.existsSync(staleSidecar)).toBe(false);
 			expect(fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0).toBe(beforeReopen);
 			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(residentEntriesBefore);
 			expect(
@@ -3283,7 +3289,12 @@ describe("branch-heavy retirement", () => {
 		}
 	}, 30_000);
 
-	it("activates a compacted cold branch without hydrating inactive history", async () => {
+	it.each([
+		"bounded",
+		"authoritative",
+		"indexed",
+		"missing-selected",
+	])("preserves a selected compacted cold branch during %s hydration", async hydration => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/bounded-branch-activation.jsonl";
 		const records = [
@@ -3376,6 +3387,54 @@ describe("branch-heavy retirement", () => {
 				currentCommitTransition: { kind: "rebuild", reason: "branch_activation_unpublished" },
 			});
 			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			const contextBefore = manager.buildSessionContext();
+			expect(manager.getLeafId()).toBe("a-compact");
+			expect(storage.readTextSync(commitPath)).toBe(commitBefore);
+			if (hydration === "authoritative" || hydration === "missing-selected") {
+				const transcriptBefore = storage.readTextSync(sessionFile);
+				if (hydration === "missing-selected") {
+					storage.writeTextSync(
+						sessionFile,
+						`${records
+							.filter(record => record.id !== "a-compact")
+							.map(record => JSON.stringify(record))
+							.join("\n")}\n`,
+					);
+				}
+				const rootOffset = Buffer.byteLength(`${JSON.stringify(records[0])}\n`);
+				const readRangeSync = storage.readRangeSync.bind(storage);
+				let faults = 0;
+				const rangeRead = vi.spyOn(storage, "readRangeSync").mockImplementation((filePath, offset, length) => {
+					if (filePath === sessionFile && offset === rootOffset && faults === 0) {
+						faults++;
+						throw new Error("injected_cold_ancestor_read_failure");
+					}
+					return readRangeSync(filePath, offset, length);
+				});
+				try {
+					if (hydration === "missing-selected") {
+						expect(() => manager.getBranch()).toThrow("cold_transcript_selected_leaf_missing");
+						expect(manager.getLeafId()).toBe("a-compact");
+						expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+					} else {
+						expect(manager.getBranch().map(entry => entry.id)).toEqual([
+							"root",
+							"a-kept",
+							"a-model",
+							"a-tail",
+							"a-compact",
+						]);
+						expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+					}
+					expect(faults).toBe(1);
+				} finally {
+					rangeRead.mockRestore();
+					if (hydration === "missing-selected") storage.writeTextSync(sessionFile, transcriptBefore);
+				}
+			} else if (hydration === "indexed") {
+				expect(manager.getEntriesForExport().at(-1)?.id).toBe("b-compact");
+				expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			}
 			expect(manager.getBranch().map(entry => entry.id)).toEqual([
 				"root",
 				"a-kept",
@@ -3383,15 +3442,58 @@ describe("branch-heavy retirement", () => {
 				"a-tail",
 				"a-compact",
 			]);
+			expect(manager.getLeafId()).toBe("a-compact");
+			expect(manager.buildSessionContext()).toEqual(contextBefore);
 			expect(manager.getLastModelChangeRole()).toBe("reviewer");
-			expect(storage.readTextSync(commitPath)).toBe(commitBefore);
-			manager.appendMessage({ role: "user", content: "persisted after activation", timestamp: 10_000 });
+			const appendedId = manager.appendMessage({
+				role: "user",
+				content: "persisted after activation",
+				timestamp: 10_000,
+			});
+			expect(manager.getEntry(appendedId)?.parentId).toBe("a-compact");
+			expect(manager.getBranch().map(entry => entry.id)).toEqual([
+				"root",
+				"a-kept",
+				"a-model",
+				"a-tail",
+				"a-compact",
+				appendedId,
+			]);
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
 			expect(manager.hotRetainedMessageCharsForTests()).toBeGreaterThan(2_500_000);
 		} finally {
 			await manager.close();
 		}
 	}, 20_000);
+
+	it("preserves a deliberately reset root cursor during authoritative hydration", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/null-cursor-hydration.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 1, childrenPerParent: 1 });
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"shadow",
+		);
+		try {
+			manager.resetLeaf();
+			expect(manager.getLeafId()).toBeNull();
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(true);
+			// Shadow sidecars remain enabled after resetLeaf without cold retirement.
+			expect(manager.getEntry("not-in-transcript")).toBeUndefined();
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(false);
+			expect(manager.getLeafId()).toBeNull();
+			expect(manager.getBranch()).toEqual([]);
+			expect(manager.buildSessionContext().messages).toEqual([]);
+			const appendedId = manager.appendMessage({ role: "user", content: "new root", timestamp: 10_000 });
+			expect(manager.getEntry(appendedId)?.parentId).toBeNull();
+			expect(manager.getBranch().map(entry => entry.id)).toEqual([appendedId]);
+		} finally {
+			await manager.close();
+		}
+	});
 
 	it("aborts ordinal prefetch before allocating a sparse interval beyond the fixed cap", async () => {
 		class IndexReadCountingStorage extends MemorySessionStorage {

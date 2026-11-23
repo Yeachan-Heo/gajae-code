@@ -19,6 +19,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import fc from "fast-check";
 import { safeRmSync } from "../../../../scripts/safe-cleanup";
+import { waitForCheck } from "../../../utils/test/helpers/wait-for";
 import type { SourceMeta } from "../../src/capability/types";
 import { clearConfigValueCache } from "../../src/config/resolve-config-value";
 import { MCPManager } from "../../src/runtime-mcp/manager";
@@ -55,14 +56,8 @@ async function exists(filePath: string): Promise<boolean> {
 	}
 }
 
-async function waitUntil(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await check()) return true;
-		await Bun.sleep(20);
-	}
-	return check();
-}
+const waitUntil = (check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> =>
+	waitForCheck(check, timeoutMs, { intervalMs: 20 });
 
 function restoreEnv(name: string, previous: string | undefined): void {
 	if (previous === undefined) delete process.env[name];

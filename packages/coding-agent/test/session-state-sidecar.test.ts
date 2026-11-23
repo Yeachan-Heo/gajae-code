@@ -48,6 +48,7 @@ import {
 } from "../src/gjc-runtime/tmux-owner-isolation";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import { coordinatorDurabilityAvailable } from "./helpers/issue-4545-gates";
+import { readJson } from "./helpers/read-json";
 
 // Dependency-conditional runner for the #4545 masking tests (#4459 semantics):
 // full strength once the durability module exists, visible skip before that.
@@ -148,10 +149,6 @@ afterEach(async () => {
 	else process.env[BASELINE_DIRTY_ENV] = ORIGINAL_BASELINE_DIRTY;
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
-
-async function readJson(file: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
-}
 
 /**
  * An intent whose later SIGTERM is an operator shutdown. Elsewhere the closer

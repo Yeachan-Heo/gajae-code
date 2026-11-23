@@ -1839,6 +1839,9 @@ describe("notify daemon-internal lightweight startup", () => {
 						daemonConstructed = true;
 					}
 					requestStop(): void {}
+					getStopCause() {
+						return undefined;
+					}
 					async run(): Promise<void> {}
 				} as never,
 			});
@@ -1883,6 +1886,9 @@ describe("notify daemon-internal lightweight startup", () => {
 					},
 					DaemonImpl: class {
 						requestStop(): void {}
+						getStopCause() {
+							return undefined;
+						}
 						async run(): Promise<void> {
 							daemonRan = true;
 						}

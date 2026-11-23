@@ -11,8 +11,8 @@ import {
 	type BrokerResponse,
 	normalizeBrokerInput,
 } from "../src/sdk/broker/broker";
+import type { ManagedScope } from "../src/sdk/session-readonly/scope";
 import {
-	type ManagedScope,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedGcScopeForRead,
 	resolveManagedScopeForWrite,

@@ -9,8 +9,9 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ProviderSafetyStopHintSession } from "@gajae-code/coding-agent/session/provider-safety-stop-hint";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const REFUSAL = "Refusal (reasoning_extraction): This request was blocked as it seems to violate restrictions.";
 
@@ -50,8 +51,7 @@ describe("AssistantMessageComponent provider safety stop hint (#4650)", () => {
 	beforeAll(async () => {
 		resetSettingsForTest();
 		await Settings.init({ inMemory: true, cwd: process.cwd() });
-		const themeInstance = await getThemeByName("red-claw");
-		if (!themeInstance) throw new Error("Failed to load test theme");
+		const themeInstance = await loadTestTheme();
 		setThemeInstance(themeInstance);
 	});
 

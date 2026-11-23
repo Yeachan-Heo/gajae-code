@@ -58,6 +58,7 @@ export const CURATED_TIER_LABELS = {
 	],
 	"openai-codex/gpt-6-sol": [{ tier: "strong", effort: "high", rank: 1 }],
 	"openai-codex/gpt-6.1-sol": [{ tier: "strong", effort: "high", rank: 2 }],
+	"openai-codex/gpt-6.2-sol": [{ tier: "strong", effort: "high", rank: 3 }],
 	"openai-codex/gpt-6.1-terra": [
 		{ tier: "fast", effort: "medium", rank: 1 },
 		{ tier: "balanced", effort: "high", rank: 1 },
@@ -91,12 +92,14 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/eu.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
+	"amazon-bedrock/global.anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/global.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
 	"amazon-bedrock/jp.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
+	"amazon-bedrock/us.anthropic.claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"amazon-bedrock/us.anthropic.claude-haiku-5-5": {
 		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
 	},
@@ -118,26 +121,48 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/us.anthropic.claude-sonnet-5-5": {
 		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
 	},
+	"anthropic/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
+	"cloudflare-ai-gateway/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
+	"github-copilot/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
 	"github-copilot/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
 	"google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon catalog addition (#6731); tier ordering not yet reviewed",
 	},
+	"kilo/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
 	"kilo/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
+	"opencode-zen/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
 	"opencode-zen/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
+	"openrouter/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
+	"openrouter/anthropic/claude-fable-5.2:batch": { rationale: "post-feature catalog addition; not yet curated" },
 	"openrouter/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
 	"openrouter/google/gemini-4-argon:batch": {
 		rationale: "Gemini 4 Argon batch provider catalog addition (#6731); not yet curated",
 	},
+	"venice/claude-fable-5-2": { rationale: "post-feature catalog addition; not yet curated" },
+	"vercel-ai-gateway/anthropic/claude-fable-5.2": { rationale: "post-feature catalog addition; not yet curated" },
+	"vercel-ai-gateway/anthropic/claude-fable-5.2-batch": {
+		rationale: "post-feature catalog addition; not yet curated",
+	},
+	"vercel-ai-gateway/anthropic/claude-fable-5.2-fast": { rationale: "post-feature catalog addition; not yet curated" },
 	"vercel-ai-gateway/google/gemini-4-argon": {
 		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
+	},
+	"google/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon catalog addition (#7745); tier ordering not yet reviewed",
+	},
+	"google-gemini-cli/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon provider catalog addition (#7745); not yet curated",
+	},
+	"google-vertex/gemini-4-carbon": {
+		rationale: "Gemini 4 Carbon provider catalog addition (#7745); not yet curated",
 	},
 	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
@@ -163,9 +188,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"amazon-bedrock/eu.amazon.nova-lite-v1:0": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"amazon-bedrock/eu.amazon.nova-micro-v1:0": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"amazon-bedrock/eu.amazon.nova-pro-v1:0": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"amazon-bedrock/eu.anthropic.claude-fable-5-1": {
-		rationale: "post-rebase catalog addition from dev; not yet curated",
-	},
 	"amazon-bedrock/eu.anthropic.claude-opus-5-5": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},
@@ -4938,9 +4960,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai-codex/gpt-5.4-nano": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
-	"openai-codex/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai-codex/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai-codex/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/codex-mini-latest": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4-turbo": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
@@ -4980,9 +4999,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-sol": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-terra": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
-	"openai/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
-	"openai/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/gpt-realtime-2.1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1-pro": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
@@ -6671,6 +6687,52 @@ export const TIER_MAP_SKIP_LIST = {
 	"zenmux/openai/gpt-6-astra": { rationale: "models.dev refresh addition; not yet curated" },
 	"zenmux/openai/gpt-6-sol": { rationale: "models.dev refresh addition; not yet curated" },
 	"zenmux/xiaomi/mimo-v2.6-pro": { rationale: "models.dev refresh addition; not yet curated" },
+	// GPT-6.2 Astra and Sol catalog additions
+	"kilo/openai/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-astra-fast": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-astra-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-sol-fast": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"kilo/openai/gpt-6.2-sol-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openai-codex/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openai/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openai/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"opencode-zen/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"opencode-zen/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-astra-pro": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-astra-pro:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-astra:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-sol-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"openrouter/openai/gpt-6.2-sol-pro:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"openrouter/openai/gpt-6.2-sol:batch": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"venice/openai-gpt-62-astra": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"venice/openai-gpt-62-astra-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"venice/openai-gpt-62-sol": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"venice/openai-gpt-62-sol-pro": { rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated" },
+	"vercel-ai-gateway/openai/gpt-6.2-astra": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"vercel-ai-gateway/openai/gpt-6.2-astra-fast": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"vercel-ai-gateway/openai/gpt-6.2-sol": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
+	"vercel-ai-gateway/openai/gpt-6.2-sol-fast": {
+		rationale: "GPT-6.2 catalog addition (2026-11-17 release); not yet curated",
+	},
 } as const satisfies TierMapSkipList;
 
 export const CURATED_TIER_MAP: AutoroutingCuratedTierMap = {
@@ -6680,7 +6742,7 @@ export const CURATED_TIER_MAP: AutoroutingCuratedTierMap = {
 	version: TIER_MAP_VERSION,
 };
 
-/** Canonical JSON uses sorted object keys and preserves array order. */
+/** Canonical JSON uses sorted object keys and preserves array order. `undefined`/function/symbol encode as the literal `undefined`; explicit undefined array entries become null, while sparse holes are skipped and produce invalid JSON. */
 export function canonicalJson(value: unknown): string {
 	if (value === null) return "null";
 	if (value === undefined) return "undefined";

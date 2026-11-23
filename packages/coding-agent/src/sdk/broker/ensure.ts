@@ -614,6 +614,18 @@ function brokerStartupFailureReason(marker: BrokerStartupFailureMarker | undefin
 	return marker.reason;
 }
 
+/** Returns a path-free version of the startup failure reason for API contexts. */
+function brokerStartupFailureReasonForApi(marker: BrokerStartupFailureMarker | undefined): string {
+	if (!marker) return "Detached SDK broker exited before publishing discovery.";
+	if (marker.cleanupCommand && marker.reason.endsWith(": ")) {
+		// Strip cleanup command which may contain sensitive paths
+		const baseReason = marker.reason;
+		// Return just the base reason without the cleanup command
+		return baseReason;
+	}
+	return marker.reason;
+}
+
 function brokerSpawnFailureError(spawnError: Error): Error {
 	return spawnError instanceof BrokerHopError
 		? spawnError
@@ -626,6 +638,20 @@ function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): s
 		return `SDK broker startup blocked by retained removal transition ${record.blockingLockPath}.`;
 	if (record.reason === "startup-lock-unavailable")
 		return `SDK broker startup could not acquire required lock ${record.blockingLockPath}.`;
+	if (record.reason === "startup-lock-refused")
+		return `SDK broker startup refused existing lock ${record.blockingLockPath} (${record.refusalCode}).`;
+	if (record.reason === "startup-deadline")
+		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
+	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
+}
+
+/** Returns a path-free version of the exit reason for API contexts. */
+function brokerStartupExitReasonForApi(record: BrokerStartupExitRecord | undefined): string | undefined {
+	if (!record) return undefined;
+	if (record.reason === "startup-lock-blocked") return `SDK broker startup blocked by retained removal transition.`;
+	if (record.reason === "startup-lock-unavailable") return `SDK broker startup could not acquire required lock.`;
+	if (record.reason === "startup-lock-refused")
+		return `SDK broker startup refused existing lock (${record.refusalCode}).`;
 	if (record.reason === "startup-deadline")
 		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
 	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
@@ -729,6 +755,7 @@ export interface BrokerStartupLockOptions {
 }
 
 const BROKER_TEST_SIGNAL_DIR_ENV = "GJC_SDK_TEST_BROKER_SIGNAL_DIR";
+const BROKER_SPAWN_ATTEMPT_NONCE_ENV = "GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE";
 /** Bound the project dotenv read. A FIFO or a larger file is incomplete and rejected. */
 const BROKER_SIGNAL_DOTENV_MAX_BYTES = 64 * 1024;
 
@@ -1605,8 +1632,12 @@ async function ensureBrokerOnce(
 		await clearBrokerStartupExitRecord(settings.agentDir);
 		await clearBrokerStartupFailureMarker(settings.agentDir);
 		const childSpawnedAt = Date.now();
+		// Generate a nonce to bind refusal records to this specific spawn attempt,
+		// preventing false attribution from foreign brokers with colliding PIDs.
+		const spawnAttemptNonce = (await import("node:crypto")).randomUUID();
 		const brokerArgs = [...command.args, "--agent-dir", settings.agentDir];
 		const env = brokerSpawnEnvironment(command, settings.env);
+		env[BROKER_SPAWN_ATTEMPT_NONCE_ENV] = spawnAttemptNonce;
 		let spawnResult: BrokerSpawnResult;
 		let spawnError: Error | undefined;
 		const launchMode = resolveBrokerLaunchMode(process.platform, initiator);
@@ -1751,7 +1782,11 @@ async function ensureBrokerOnce(
 					owner = registerBrokerOwner(settings.agentDir, child, realBrokerPid, childIncarnation);
 				}
 				const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
-				if (startupExitRecord?.pid === realBrokerPid && startupExitRecord.writtenAt >= childSpawnedAt) {
+				if (
+					startupExitRecord?.pid === realBrokerPid &&
+					startupExitRecord.spawnAttemptNonce === spawnAttemptNonce &&
+					startupExitRecord.writtenAt >= childSpawnedAt
+				) {
 					const discovered = await observeDiscovery();
 					if (discovered) return discovered;
 					brokerExitedBeforeDiscovery = true;
@@ -1762,6 +1797,7 @@ async function ensureBrokerOnce(
 					if (
 						marker?.pid === realBrokerPid &&
 						marker?.incarnation === childIncarnation &&
+						marker?.spawnAttemptNonce === spawnAttemptNonce &&
 						marker.writtenAt >= childSpawnedAt
 					) {
 						const discovered = await observeDiscovery();
@@ -1780,12 +1816,16 @@ async function ensureBrokerOnce(
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 		// Hops and committed trampolines may exit before the parent finishes polling.
 		// Failure records are attributed to the real broker pid, not the launcher.
+		// A marker only wins when it matches the exact spawned child's nonce, pid,
+		// incarnation, and time. This prevents false attribution from foreign brokers
+		// in shared agent directories with colliding PIDs.
 		const trustedMarker =
 			marker &&
 			childIncarnation !== undefined &&
 			realBrokerPid !== undefined &&
 			marker.pid === realBrokerPid &&
 			marker.incarnation === childIncarnation &&
+			marker.spawnAttemptNonce === spawnAttemptNonce &&
 			marker.writtenAt >= childSpawnedAt
 				? marker
 				: undefined;
@@ -1793,6 +1833,7 @@ async function ensureBrokerOnce(
 			startupExitRecord &&
 			realBrokerPid !== undefined &&
 			startupExitRecord.pid === realBrokerPid &&
+			startupExitRecord.spawnAttemptNonce === spawnAttemptNonce &&
 			startupExitRecord.writtenAt >= childSpawnedAt
 				? startupExitRecord
 				: undefined;
@@ -1857,14 +1898,27 @@ async function ensureBrokerOnce(
 		// still write a marker between the clear and this read; the pid binding
 		// rejects that marker instead of misattributing a foreign failure to this
 		// spawn's caller.
+		const isLockRefusal =
+			trustedStartupExitRecord?.reason === "startup-lock-refused" ||
+			(trustedStartupExitRecord === undefined && trustedMarker?.lockRefusalCode !== undefined);
+		const refusalCode =
+			trustedStartupExitRecord?.reason === "startup-lock-refused"
+				? trustedStartupExitRecord.refusalCode
+				: trustedMarker?.lockRefusalCode;
 		const failure = spawnError
 			? brokerSpawnFailureError(spawnError)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
 						...brokerStartupExitStatus(child.exitCode, child.signalCode, trustedStartupExitRecord, trustedMarker),
 						reason:
+							brokerStartupExitReasonForApi(trustedStartupExitRecord) ??
+							brokerStartupFailureReasonForApi(trustedMarker),
+						detailedReason:
 							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
+						detailedStderr: isLockRefusal && spawnLogTail.length > 0 ? spawnLogTail : undefined,
+						lockRefused: isLockRefusal,
+						refusalCode,
 					})
 				: discoveryError
 					? discoveryError

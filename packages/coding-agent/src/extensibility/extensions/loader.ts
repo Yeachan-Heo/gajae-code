@@ -130,7 +130,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
-	cycleThinkingLevel(): ThinkingLevel | undefined {
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -398,6 +398,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
+			expectedPromptHandle?: string | null;
 		},
 	): Promise<void> {
 		return Promise.resolve(this.runtime.sendUserMessage(content, options));
@@ -451,7 +452,7 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		this.runtime.setThinkingVisibility(visibility, persist);
 	}
 
-	cycleThinkingLevel(): ThinkingLevel | undefined {
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {
 		return this.runtime.cycleThinkingLevel();
 	}
 

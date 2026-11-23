@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import fc from "fast-check";
 import { type LspServerInfo, WelcomeComponent } from "../src/modes/components/welcome";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const OSC52 = "\x1b]52;c;";
 const OSC0 = "\x1b]0;";
@@ -12,8 +13,7 @@ const SEED = 697202610;
 const WIDE = 4000;
 
 beforeAll(async () => {
-	const loaded = await getThemeByName("red-claw");
-	if (!loaded) throw new Error("Failed to load red-claw theme");
+	const loaded = await loadTestTheme();
 	setThemeInstance(loaded);
 });
 

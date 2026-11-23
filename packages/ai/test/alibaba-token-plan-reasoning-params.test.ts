@@ -4,6 +4,7 @@ import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-complet
 import { streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
 import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model } from "@gajae-code/ai/types";
+import { createAbortedSignal } from "./helpers";
 
 const originalAlibabaTokenPlanApiKey = Bun.env.ALIBABA_TOKEN_PLAN_API_KEY;
 
@@ -19,12 +20,6 @@ const testContext: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: 0 }],
 };
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 function captureResponsesPayload(
 	model: Model<"openai-responses">,
 	reasoning: "medium" | "low" | "xhigh",
@@ -32,7 +27,7 @@ function captureResponsesPayload(
 	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 	streamOpenAIResponses(model, testContext, {
 		apiKey: "test-key",
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		reasoning,
 		reasoningSummary: "auto",
 		onPayload: payload => resolve(payload as Record<string, unknown>),
@@ -47,7 +42,7 @@ function captureCompletionsPayload(
 	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 	streamOpenAICompletions(model, testContext, {
 		apiKey: "test-key",
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		reasoning,
 		onPayload: payload => resolve(payload as Record<string, unknown>),
 	});

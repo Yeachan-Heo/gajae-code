@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PlanRequest, planTmuxOwnerIsolationSync } from "../../src/gjc-runtime/tmux-owner-isolation";
 import { resolveOwner } from "../../src/harness-control-plane/owner";
+import { readSessionState } from "../../src/harness-control-plane/storage";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
 import { createHarnessCliEnvWithFixtureBroker, type HarnessCliBrokerFixture } from "./cli-workspace-env";
+
+const trackedTemp = trackTempDirs();
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -101,6 +105,8 @@ async function createFakeTmuxBin(rootDir: string, options: { skipOwnerLaunch?: b
 		tmuxPath,
 		`#!/usr/bin/env bash
 	echo "$@" >> ${JSON.stringify(logPath)}
+	[ "${"$"}{1:-}" = "-u" ] || exit 9
+	shift
 	[ "${"$"}{1:-}" = "-L" ] || exit 9
 	[ "${"$"}#" -ge 3 ] || exit 9
 	socket="${"$"}2"
@@ -196,20 +202,32 @@ const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
 async function retireLiveFixtureOwner(): Promise<void> {
 	let owner = await resolveOwner(root, SID);
 	if (!owner.live) return;
-	const retired = await runHarness(["retire", "--session", SID]);
-	if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>).retired !== true)
-		throw new Error("Fixture owner retirement failed; preserving fixture roots for retry.");
-	for (let i = 0; i < 80 && owner.live; i++) {
+	// A test may have just received the successful response to `retire`; the owner
+	// persists lifecycle=retired before replying, but keeps its lease while its
+	// asynchronous transport shutdown runs. Do not send a second retire during that
+	// window: RuntimeOwner correctly rejects new requests with owner_stopping.
+	const state = await readSessionState(root, SID);
+	if (state?.lifecycle !== "retired") {
+		const retired = await runHarness(["retire", "--session", SID]);
+		if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>).retired !== true)
+			throw new Error(
+				`Fixture owner retirement failed (exit ${retired.code}; response ${JSON.stringify(retired.json)}); preserving fixture roots for retry.`,
+			);
+	}
+	for (let i = 0; i < 100 && owner.live; i++) {
 		await sleep(50);
 		owner = await resolveOwner(root, SID);
 	}
-	if (owner.live) throw new Error("Fixture owner remained live after retirement; preserving fixture roots for retry.");
+	if (owner.live)
+		throw new Error(
+			`Fixture owner remained live after retirement (pid ${owner.lease?.pid ?? "unknown"}; lifecycle ${(await readSessionState(root, SID))?.lifecycle ?? "unknown"}); preserving fixture roots for retry.`,
+		);
 }
 
 beforeEach(async () => {
 	// Short paths keep the AF_UNIX socket path under the sun_path limit.
-	root = await mkdtemp(path.join(tmpdir(), "h"));
-	workspace = await mkdtemp(path.join(tmpdir(), "hw"));
+	root = await trackedTemp.mkdtemp(path.join(tmpdir(), "h"));
+	workspace = await trackedTemp.mkdtemp(path.join(tmpdir(), "hw"));
 	cliEnv = await createHarnessCliEnvWithFixtureBroker(repoRoot, root);
 	tmuxCommand = await createFakeTmuxBin(root);
 
@@ -260,7 +278,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 				.split("\n")
 				.filter(call => Boolean(call) && call !== "-V" && call !== "--version");
 			expect(calls).not.toHaveLength(0);
-			expect(calls.filter(call => !call.startsWith(`-L ${socket} `))).toEqual([]);
+			expect(calls.filter(call => !call.startsWith(`-u -L ${socket} `))).toEqual([]);
 		};
 		await assertOnlyOwnerSocket();
 

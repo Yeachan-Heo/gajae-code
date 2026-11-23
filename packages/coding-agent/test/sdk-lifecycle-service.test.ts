@@ -747,6 +747,89 @@ describe("SessionLifecycleService", () => {
 			error: { code: "malformed_response" },
 		});
 	});
+	it("preserves a valid savedSession recap as a detached copy and keeps the old shape when absent", async () => {
+		const recap = {
+			schemaVersion: 1,
+			source: "model",
+			text: "로그인 리다이렉트 버그를 고쳤다",
+			sourceEntryId: "source-entry",
+			requestEntryId: "request-entry",
+			model: { provider: "test-provider", id: "test-model" },
+			generatedAt: "2026-11-02T07:12:00.000Z",
+			entryId: "recap-entry",
+		};
+		const expected = structuredClone(recap);
+		const { service } = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity, recap },
+			},
+		});
+		const target = { cwd: "/repo", resolveSessionId: "saved" };
+		const result = await service.list({ actor, capability: "session.list", target });
+		expect(result).toMatchObject({ ok: true, result: { savedSession: { id: "saved", recap: expected } } });
+		recap.text = "mutated after the fact";
+		recap.model.id = "mutated";
+		expect(result).toMatchObject({ ok: true, result: { savedSession: { recap: expected } } });
+
+		const { service: oldShape } = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
+			},
+		});
+		const absent = await oldShape.list({ actor, capability: "session.list", target });
+		expect(absent).toMatchObject({ ok: true, result: { savedSession: { id: "saved" } } });
+		if (!absent.ok || !("sessions" in absent.result)) throw new Error("Expected an exact session list response");
+		expect(absent.result.savedSession).not.toHaveProperty("recap");
+	});
+	it("rejects a present malformed savedSession recap as malformed_response", async () => {
+		const validRecap = {
+			schemaVersion: 1,
+			source: "model",
+			text: "로그인 리다이렉트 버그를 고쳤다",
+			sourceEntryId: "source-entry",
+			requestEntryId: "request-entry",
+			model: { provider: "test-provider", id: "test-model" },
+			generatedAt: "2026-11-02T07:12:00.000Z",
+			entryId: "recap-entry",
+		};
+		for (const recap of [
+			{ ...validRecap, source: "user" },
+			{ ...validRecap, extra: "field" },
+			{ ...validRecap, model: { ...validRecap.model, extra: true } },
+			{ ...validRecap, text: "가".repeat(121) },
+			{ ...validRecap, text: "line\nbreak" },
+			{ ...validRecap, generatedAt: "2026-11-02 07:12" },
+			{ ...validRecap, schemaVersion: 2 },
+			undefined,
+			null,
+			"recap",
+		]) {
+			const { service } = serviceWith({
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "saved" }],
+					warnings: [],
+					savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity, recap },
+				},
+			});
+			expect(
+				await service.list({
+					actor,
+					capability: "session.list",
+					target: { cwd: "/repo", resolveSessionId: "saved" },
+				}),
+			).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
+		}
+	});
 	it("rejects present malformed session.list savedSession identities", async () => {
 		for (const savedSession of [
 			undefined,

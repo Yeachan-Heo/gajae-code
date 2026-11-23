@@ -1,3 +1,0 @@
-### Fixed
-
-- On Unix, terminal probe replies no longer get echoed over the composer as `^[]11;rgb:…^G^[[?62c` after a screen lock, display sleep, or other stretch where the terminal stops reading output (#7373). Before every OSC 11 probe, raw mode was forced back on by cycling `setRawMode(false)` → `setRawMode(true)`. Each call waits in `tcsetattr(TCSADRAIN)` for queued output to drain. During the `false` step the tty sat in cooked mode with `ECHO` on, so replies that arrived while the backlog flushed were echoed by the kernel. The probe path now re-applies raw termios from the live tty state with `TCSANOW`, and only when a foreground child actually left it cooked. Windows still uses the `setRawMode` cycle.

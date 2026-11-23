@@ -1,4 +1,4 @@
-import type { Settings, SettingsLayer, SettingsPathResolution } from "../config/settings";
+import type { Settings, SettingsPathResolution } from "../config/settings";
 import {
 	type AnyUiMetadata,
 	getDefault,
@@ -35,7 +35,6 @@ export interface SettingCatalogItem {
 	mutation: {
 		/** This query never installs a writer or grants mutation authority. */
 		provided: false;
-		allowedLayers: SettingsLayer[];
 		/** Schema-declared editor ownership must be respected by a host. */
 		owner: "notification-atomic" | "unspecified";
 	};
@@ -112,7 +111,6 @@ export function getSettingsCatalog(settings: Settings): SettingsCatalog {
 			application: definition.application ? structuredClone(definition.application) : { kind: "unclassified" },
 			mutation: {
 				provided: false,
-				allowedLayers: [...resolution.allowedLayers],
 				owner: ui?.editing ?? "unspecified",
 			},
 		});

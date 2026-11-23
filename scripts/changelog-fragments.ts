@@ -473,7 +473,12 @@ async function releaseConsumedFragments(base: string, head: string): Promise<Set
 	const consumed = new Set<string>();
 	const tags = listed.text().split("\n").map(line => line.trim()).filter(tag => STABLE_RELEASE_TAG.test(tag));
 	for (const tag of tags) {
-		for (const file of await gitDiffPaths(`${tag}^1`, tag, "D")) {
+		// The release flow may fold fragments in commits before the tagged version bump
+		// (e.g. "normalize pending changelog sections"), so count every deletion the
+		// release line made since it forked from the PR base, not just the tag commit's.
+		const forked = await $`git merge-base ${tag} ${base}`.quiet().nothrow();
+		if (forked.exitCode !== 0) throw new Error(`git merge-base ${tag} ${base} failed: ${forked.stderr.toString().trim()}`);
+		for (const file of await gitDiffPaths(forked.text().trim(), tag, "D")) {
 			if (isFragmentPath(file)) consumed.add(file);
 		}
 	}

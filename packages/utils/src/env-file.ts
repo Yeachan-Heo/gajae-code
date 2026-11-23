@@ -78,30 +78,27 @@ function stripInlineDotenvComment(value: string): string {
  */
 export function parseShellEnvFile(filePath: string): Record<string, string> {
 	const result: Record<string, string> = {};
-	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) continue;
+	const content = readEnvFile(filePath).content;
+	if (content === undefined) return result;
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
 
-			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
-			if (!match) continue;
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
+		if (!match) continue;
 
-			const key = match[1];
-			if (!isValidEnvName(key)) continue;
+		const key = match[1];
+		if (!isValidEnvName(key)) continue;
 
-			let value = stripInlineShellComment(match[2] ?? "").trim();
-			if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-			if (/[$`]/.test(value)) continue;
-
-			result[key] = value;
+		let value = stripInlineShellComment(match[2] ?? "").trim();
+		if (value.endsWith(";")) value = value.slice(0, -1).trimEnd();
+		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+			value = value.slice(1, -1);
 		}
-	} catch {
-		// File doesn't exist or can't be read - return empty result
+		if (!isSafeEnvValue(value)) continue;
+		if (/[$`]/.test(value)) continue;
+
+		result[key] = value;
 	}
 
 	return result;
@@ -126,12 +123,9 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * conservative.
  */
 export function parseEnvFile(filePath: string): Record<string, string> {
-	try {
-		return parseEnvFileContent(fs.readFileSync(filePath, "utf-8"));
-	} catch {
-		// File doesn't exist or can't be read - return empty result
-		return {};
-	}
+	// A missing, unreadable, or non-regular file yields an empty result.
+	const content = readEnvFile(filePath).content;
+	return content === undefined ? {} : parseEnvFileContent(content);
 }
 
 /** Parse dotenv content that has already been read from a trusted file. */
@@ -307,13 +301,21 @@ export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	];
 }
 
-function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?: string; incomplete: boolean } {
+/**
+ * Read an env file only if it is a regular file. A FIFO or device file would block
+ * `readFileSync` until a writer appears (Bun's own dotenv autoload skips them), so
+ * the open is non-blocking and fstat rejects anything else before a read. A
+ * missing file is complete and empty; any other failure is `incomplete`.
+ * `maxFileBytes` additionally bounds the read.
+ */
+function readEnvFile(filePath: string, maxFileBytes?: number): { content?: string; incomplete: boolean } {
 	let fileDescriptor: number | undefined;
 	try {
-		// Non-blocking open lets fstat reject FIFOs and device files before any read.
 		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
 		const initialStat = fs.fstatSync(fileDescriptor);
-		if (!initialStat.isFile() || initialStat.size > maxFileBytes) return { incomplete: true };
+		if (!initialStat.isFile()) return { incomplete: true };
+		if (maxFileBytes === undefined) return { content: fs.readFileSync(fileDescriptor, "utf-8"), incomplete: false };
+		if (initialStat.size > maxFileBytes) return { incomplete: true };
 
 		const buffer = Buffer.allocUnsafe(maxFileBytes + 1);
 		let bytesRead = 0;
@@ -380,22 +382,13 @@ export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnaps
 	let incomplete = false;
 	for (const file of files) {
 		const filePath = path.join(cwd, file);
-		let content: string;
-		if (options.maxFileBytes === undefined) {
-			try {
-				content = fs.readFileSync(filePath, "utf-8");
-			} catch {
-				continue;
-			}
-		} else {
-			const boundedRead = readBoundedEnvFile(filePath, options.maxFileBytes);
-			if (boundedRead.incomplete) {
-				incomplete = true;
-				continue;
-			}
-			if (boundedRead.content === undefined) continue;
-			content = boundedRead.content;
+		const read = readEnvFile(filePath, options.maxFileBytes);
+		if (read.incomplete) {
+			incomplete = true;
+			continue;
 		}
+		if (read.content === undefined) continue;
+		const content = read.content;
 		const quoted = quotedDeclarationKeys(content);
 		const seen = new Set<string>();
 		for (const [rawKey, value] of Object.entries(parseEnvFileContent(content))) {
@@ -421,3 +414,189 @@ export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnaps
 	}
 	return incomplete ? { values, dynamic, incomplete: true } : { values, dynamic };
 }
+
+/** Bytes read from one dotenv layer for Python tool-bridge provenance. */
+export const PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES = 1024 * 1024;
+
+/** Names the Python prelude sends with each proxied tool call. */
+export const PROJECT_TOOL_BRIDGE_ENV_NAMES = [
+	"PI_TOOL_BRIDGE_URL",
+	"PI_TOOL_BRIDGE_CAPABILITY",
+	"PI_TOOL_BRIDGE_SESSION",
+] as const;
+
+/** `incomplete` refuses every live bridge value; ambiguous keys are not value-compared. */
+export interface ProjectToolBridgeProvenance {
+	literals: Record<string, readonly string[]>;
+	ambiguous: ReadonlySet<string>;
+	incomplete: boolean;
+}
+
+function bridgeKeyValue(parsed: Record<string, string>, key: string): string | undefined {
+	if (Object.hasOwn(parsed, key)) return parsed[key];
+	for (const [raw, value] of Object.entries(parsed)) {
+		if (canonicalEnvKey(raw) === key) return value;
+	}
+	return undefined;
+}
+
+function isBridgeEnvKey(key: string): boolean {
+	return (PROJECT_TOOL_BRIDGE_ENV_NAMES as readonly string[]).includes(key);
+}
+
+function unclosedQuote(value: string): '"' | "'" | undefined {
+	const trimmed = value.trim();
+	const opener = trimmed[0];
+	if (opener !== '"' && opener !== "'") return undefined;
+	return indexOfUnescapedCloser(trimmed, opener) === -1 ? opener : undefined;
+}
+
+function quoteClosesOnLine(line: string, opener: '"' | "'"): boolean {
+	return indexOfUnescapedCloser(opener + line, opener) !== -1;
+}
+
+/** For each line, whether a later line closes `opener`. One backward pass keeps the scan linear. */
+function laterQuoteCloser(lines: readonly string[], opener: '"' | "'"): boolean[] {
+	const later = new Array<boolean>(lines.length);
+	let seen = false;
+	for (let index = lines.length - 1; index >= 0; index--) {
+		later[index] = seen;
+		if (quoteClosesOnLine(lines[index] ?? "", opener)) seen = true;
+	}
+	return later;
+}
+
+function absorbBridgeLayer(content: string, literals: Record<string, string[]>, ambiguous: Set<string>): void {
+	const lines = content.split("\n");
+	const closesLater: Record<'"' | "'", boolean[]> = {
+		'"': laterQuoteCloser(lines, '"'),
+		"'": laterQuoteCloser(lines, "'"),
+	};
+	let open: '"' | "'" | undefined;
+	for (let index = 0; index < lines.length; index++) {
+		const rawLine = lines[index] ?? "";
+		if (open) {
+			// A physical line inside a quoted value is not its own declaration.
+			if (quoteClosesOnLine(rawLine, open)) open = undefined;
+			continue;
+		}
+		const trimmed = rawLine.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:)\s*([\s\S]*)$/.exec(trimmed);
+		if (!match?.[1]) continue;
+		const key = canonicalEnvKey(match[1]);
+		const comparable = stripInlineDotenvComment(match[2] ?? "");
+		const continued = unclosedQuote(comparable);
+		if (continued) {
+			if (isBridgeEnvKey(key)) ambiguous.add(key);
+			// Bun leaves an unclosed quote on this line and loads the next declaration.
+			// A quoted value continues across lines only when a closer exists later.
+			if (closesLater[continued][index]) open = continued;
+			continue;
+		}
+		if (!isBridgeEnvKey(key) || ambiguous.has(key)) continue;
+		if (rawValueDisagreesWithLineParser(comparable)) {
+			ambiguous.add(key);
+			continue;
+		}
+		const raw = bridgeKeyValue(parseEnvFileContent(`${match[1]}=${comparable}`), key);
+		if (raw !== undefined && projectDeclarationIsDynamic(raw)) {
+			ambiguous.add(key);
+			continue;
+		}
+		if (raw === undefined) continue;
+		const decoded = decodeEscapedProjectLiteral(raw);
+		const list = literals[key] ?? [];
+		if (!list.includes(decoded)) list.push(decoded);
+		literals[key] = list;
+	}
+}
+
+function nodeEnvDeclaration(content: string): { value?: string; ambiguous: boolean } {
+	const key = canonicalEnvKey("NODE_ENV");
+	if (quotedDeclarationKeys(content).has(key)) return { ambiguous: true };
+	const raw = bridgeKeyValue(parseEnvFileContent(content), key);
+	if (raw === undefined) return { ambiguous: false };
+	if (projectDeclarationIsDynamic(raw)) return { ambiguous: true };
+	return { value: decodeEscapedProjectLiteral(raw), ambiguous: false };
+}
+
+// Files Bun loads when the shell leaves NODE_ENV unset, any of which can assign it afterward.
+const BRIDGE_NODE_ENV_HINTS = [".env", ".env.local", ".env.development", ".env.development.local"] as const;
+
+function bridgeNodeEnvHint(
+	cwd: string,
+	dotenv: { content?: string; incomplete: boolean },
+): "development" | "live" | "incomplete" {
+	const live = process.env.NODE_ENV;
+	const normalized = live && /^[A-Za-z0-9_-]+$/.test(live) ? live : undefined;
+	let development = false;
+	for (const file of BRIDGE_NODE_ENV_HINTS) {
+		const read = file === ".env" ? dotenv : readEnvFile(path.join(cwd, file), PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES);
+		if (read.incomplete) return "incomplete";
+		if (read.content === undefined) continue;
+		const declared = nodeEnvDeclaration(read.content);
+		if (declared.ambiguous) development = true;
+		if (declared.value !== undefined && normalized !== undefined && declared.value === normalized) development = true;
+	}
+	return development ? "development" : "live";
+}
+
+function emptyBridgeProvenance(incomplete: boolean): ProjectToolBridgeProvenance {
+	return { literals: {}, ambiguous: new Set(PROJECT_TOOL_BRIDGE_ENV_NAMES), incomplete };
+}
+
+function collectProjectToolBridgeProvenance(cwd: string): ProjectToolBridgeProvenance {
+	const dotenvPath = path.join(cwd, ".env");
+	const dotenv = readEnvFile(dotenvPath, PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES);
+	if (dotenv.incomplete) return emptyBridgeProvenance(true);
+	const hint = bridgeNodeEnvHint(cwd, dotenv);
+	if (hint === "incomplete") return emptyBridgeProvenance(true);
+	const files = new Set(projectEnvLayerFiles(process.env.NODE_ENV));
+	if (hint === "development") {
+		for (const file of projectEnvLayerFiles(undefined)) files.add(file);
+	}
+	const literals: Record<string, string[]> = {};
+	const ambiguous = new Set<string>();
+	for (const file of files) {
+		const filePath = path.join(cwd, file);
+		const read = filePath === dotenvPath ? dotenv : readEnvFile(filePath, PROJECT_TOOL_BRIDGE_LAYER_MAX_BYTES);
+		if (read.incomplete) return emptyBridgeProvenance(true);
+		if (read.content !== undefined) absorbBridgeLayer(read.content, literals, ambiguous);
+	}
+	const frozen: Record<string, readonly string[]> = {};
+	for (const [key, values] of Object.entries(literals)) {
+		if (!ambiguous.has(key)) frozen[key] = values;
+	}
+	return { literals: frozen, ambiguous, incomplete: false };
+}
+
+const toolBridgeStartupCwd = process.cwd();
+let toolBridgeStartup: ProjectToolBridgeProvenance | undefined;
+
+function mergeBridgeProvenance(
+	startup: ProjectToolBridgeProvenance,
+	current: ProjectToolBridgeProvenance,
+): ProjectToolBridgeProvenance {
+	if (startup.incomplete || current.incomplete) return emptyBridgeProvenance(true);
+	const ambiguous = new Set<string>([...startup.ambiguous, ...current.ambiguous]);
+	const literals: Record<string, string[]> = {};
+	for (const side of [startup, current]) {
+		for (const [key, values] of Object.entries(side.literals)) {
+			if (ambiguous.has(key)) continue;
+			const list = literals[key] ?? [];
+			for (const value of values) if (!list.includes(value)) list.push(value);
+			literals[key] = list;
+		}
+	}
+	return { literals, ambiguous, incomplete: false };
+}
+
+/** Startup facts stay after chdir and are merged with the current cwd. An unread layer fails closed. */
+export function projectToolBridgeProvenance(cwd = process.cwd()): ProjectToolBridgeProvenance {
+	if (!toolBridgeStartup) toolBridgeStartup = collectProjectToolBridgeProvenance(toolBridgeStartupCwd);
+	if (cwd === toolBridgeStartupCwd) return toolBridgeStartup;
+	return mergeBridgeProvenance(toolBridgeStartup, collectProjectToolBridgeProvenance(cwd));
+}
+
+toolBridgeStartup = collectProjectToolBridgeProvenance(toolBridgeStartupCwd);

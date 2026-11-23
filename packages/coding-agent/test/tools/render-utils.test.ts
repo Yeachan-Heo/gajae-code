@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getThemeByName } from "@gajae-code/coding-agent/modes/theme/theme";
+
 import {
 	dedupeParseErrors,
 	formatCodeFrameLine,
@@ -12,6 +12,7 @@ import {
 	shortenPath,
 } from "@gajae-code/coding-agent/tools/render-utils";
 import { formatScreenshot as formatBrowserScreenshot } from "../../src/tools/browser/screenshot-format";
+import { loadTestTheme } from "../helpers/test-theme";
 
 describe("parse error formatting", () => {
 	it("deduplicates parse errors while preserving order", () => {
@@ -158,7 +159,7 @@ describe("formatScreenshot", () => {
 
 describe("formatDiagnostics", () => {
 	it("replaces tabs in rendered diagnostic text", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 
 		const formatted = formatDiagnostics(

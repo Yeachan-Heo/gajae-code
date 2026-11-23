@@ -81,11 +81,14 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
  * (https://developers.openai.com/api/docs/pricing). Generated policies apply the
  * public API pricing and freeform tool metadata.
  *
- * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
- * so the flagship remains the first Codex suggestion.
+ * Only the current flagship (GPT-6.2 Astra) carries `priority: 1`; every other
+ * row stays in default catalog order so the flagship remains the first Codex
+ * suggestion.
  */
 const CODEX_GPT6_MODELS: readonly { id: string; name: string; priority?: number }[] = [
-	{ id: "gpt-6-astra", name: "GPT-6 Astra", priority: 1 },
+	{ id: "gpt-6.2-astra", name: "GPT-6.2 Astra", priority: 1 },
+	{ id: "gpt-6.2-sol", name: "GPT-6.2 Sol" },
+	{ id: "gpt-6-astra", name: "GPT-6 Astra" },
 	{ id: "gpt-6-sol", name: "GPT-6 Sol" },
 	{ id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
 	{ id: "gpt-6.1-terra", name: "GPT-6.1 Terra" },
@@ -120,12 +123,18 @@ export function injectCodexGpt6Models(models: Model[]): void {
 const ULTRAFAST_TIER_MODEL_KEYS = new Set([
 	"openai/gpt-6-astra",
 	"openai/gpt-6.1-sol",
+	"openai/gpt-6.2-astra",
+	"openai/gpt-6.2-sol",
 	"openai-codex/gpt-6-astra",
 	"openai-codex/gpt-6.1-sol",
+	"openai-codex/gpt-6.2-astra",
+	"openai-codex/gpt-6.2-sol",
 	"github-copilot/gpt-6-astra",
 	"github-copilot/gpt-6.1-sol",
 	"opencode-zen/gpt-6-astra",
 	"opencode-zen/gpt-6.1-sol",
+	"opencode-zen/gpt-6.2-astra",
+	"opencode-zen/gpt-6.2-sol",
 ]);
 
 const ULTRAFAST_ONLY_PROVIDERS = new Set(["github-copilot", "opencode-zen"]);
@@ -153,6 +162,8 @@ const IMAGE_GENERATION_MODELS = [
 	{ id: "gpt-image-2", name: "GPT Image 2" },
 	{ id: "gpt-image-2.5-sunburst", name: "GPT Image 2.5 Sunburst" },
 	{ id: "gpt-image-2.5-flare", name: "GPT Image 2.5 Flare" },
+	{ id: "gpt-image-2.6-sunburst", name: "GPT Image 2.6 Sunburst" },
+	{ id: "gpt-image-2.6-flare", name: "GPT Image 2.6 Flare" },
 ] as const;
 
 function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" | "provider" | "baseUrl"> {
@@ -161,7 +172,7 @@ function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" |
 		name,
 		reasoning: false,
 		input: ["text"],
-		output: ["text", "image"],
+		output: ["image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
@@ -170,10 +181,17 @@ function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" |
 
 /**
  * Inject dedicated image generation models into providers that support them.
+ * Replaces existing models with corrected output definitions to ensure they
+ * are marked as image-only and excluded from ordinary chat selection.
  */
 export function injectImageGenerationModels(models: Model[]): void {
 	for (const { id, name } of IMAGE_GENERATION_MODELS) {
-		if (!models.some(m => m.provider === "openai" && m.id === id)) {
+		const existingIndex = models.findIndex(m => m.provider === "openai" && m.id === id);
+		if (existingIndex >= 0) {
+			// Preserve discovered entry and only enforce image-only capability
+			models[existingIndex].output = ["image"];
+		} else {
+			// Create synthetic entry for missing model
 			const openAIImageModel: Model<"openai-responses"> = {
 				...imageGenerationModelBase(id, name),
 				api: "openai-responses",
@@ -184,7 +202,12 @@ export function injectImageGenerationModels(models: Model[]): void {
 		}
 	}
 	for (const { id, name } of IMAGE_GENERATION_MODELS) {
-		if (!models.some(m => m.provider === "openai-codex" && m.id === id)) {
+		const existingIndex = models.findIndex(m => m.provider === "openai-codex" && m.id === id);
+		if (existingIndex >= 0) {
+			// Preserve discovered entry and only enforce image-only capability
+			models[existingIndex].output = ["image"];
+		} else {
+			// Create synthetic entry for missing model
 			const codexImageModel: Model<"openai-codex-responses"> = {
 				...imageGenerationModelBase(id, name),
 				api: "openai-codex-responses",
@@ -450,6 +473,84 @@ export function injectKiroModels(models: Model[]): void {
 		const existing = models.find(model => model.provider === "kiro" && model.id === metadata.id);
 		if (existing) {
 			Object.assign(existing, metadata);
+		} else {
+			models.push(metadata);
+		}
+	}
+}
+
+/**
+ * Bundle Gemini 4 Carbon models for google, google-gemini-cli, and google-vertex
+ * providers with per-transport specifications (context window, maxTokens, baseUrl).
+ *
+ * All variants support thinking with levels low, medium, and high.
+ * Per-transport limits from models.dev:
+ * - google (google-generative-ai): maxTokens 32768
+ * - google-gemini-cli: maxTokens 65536
+ * - google-vertex: maxTokens 65536
+ */
+export function injectGemini4CarbonModels(models: Model[]): void {
+	const carbonBase = {
+		id: "gemini-4-carbon",
+		name: "Gemini 4 Carbon",
+		contextWindow: 1_048_576,
+		cost: {
+			input: 2,
+			output: 10,
+			cacheRead: 0.1,
+			cacheWrite: 0,
+		},
+		input: ["text", "image" as const],
+		output: ["text" as const],
+		reasoning: true,
+		thinking: {
+			mode: "google-level" as const,
+			minLevel: "low" as const,
+			maxLevel: "high" as const,
+		},
+	};
+
+	const carbonModels: Model[] = [
+		{
+			...carbonBase,
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+			maxTokens: 32_768,
+		} as Model<"google-generative-ai">,
+		{
+			...carbonBase,
+			api: "google-gemini-cli",
+			provider: "google-gemini-cli",
+			baseUrl: "https://cloudcode-pa.googleapis.com",
+			maxTokens: 65_536,
+		} as Model<"google-gemini-cli">,
+		{
+			...carbonBase,
+			api: "google-vertex",
+			provider: "google-vertex",
+			baseUrl: "https://{location}-aiplatform.googleapis.com",
+			maxTokens: 65_536,
+		} as Model<"google-vertex">,
+	];
+
+	for (const metadata of carbonModels) {
+		const existing = models.find(model => model.provider === metadata.provider && model.id === metadata.id);
+		if (existing) {
+			// Update transport/capability specs but preserve discovered cost from models.dev.
+			// This ensures Dec 1+ price updates aren't overwritten by introductory rates.
+			existing.api = metadata.api;
+			existing.baseUrl = metadata.baseUrl;
+			existing.maxTokens = metadata.maxTokens;
+			existing.contextWindow = metadata.contextWindow;
+			existing.input = metadata.input;
+			existing.output = metadata.output;
+			existing.reasoning = metadata.reasoning;
+			existing.thinking = metadata.thinking;
+			// Preserve cost from discovery if it exists; only set if absent
+			if (!existing.cost || (existing.cost.input === 0 && existing.cost.output === 0)) {
+				existing.cost = metadata.cost;
+			}
 		} else {
 			models.push(metadata);
 		}
@@ -916,6 +1017,7 @@ async function generateModels() {
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);
+	injectGemini4CarbonModels(allModels);
 	// Re-apply models.dev fallback after injections to inherit context/token limits
 	// from models.dev for injected models that use UNK_CONTEXT_WINDOW and UNK_MAX_TOKENS.
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);

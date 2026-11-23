@@ -9,11 +9,12 @@ import fc from "fast-check";
 import { safeRmSync } from "../../../../scripts/safe-cleanup";
 import type { SourceMeta } from "../../src/capability/types";
 import { MCPCommandController } from "../../src/modes/controllers/runtime-mcp-command-controller";
-import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import { setThemeInstance } from "../../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../../src/modes/types";
 import * as oauthDiscovery from "../../src/runtime-mcp/oauth-discovery";
 import { handleMcpAcp } from "../../src/slash-commands/helpers/mcp";
 import type { SlashCommandRuntime } from "../../src/slash-commands/types";
+import { loadTestTheme } from "../helpers/test-theme";
 
 const OSC0 = "\x1b]0;Google Security\x07";
 const OSC8 = "\x1b]8;;https://attacker.invalid/track\x07CLICK-ME\x1b]8;;\x07";
@@ -67,8 +68,7 @@ describe("MCP self-report terminal labels", () => {
 	const dirs: string[] = [];
 
 	beforeAll(async () => {
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("red-claw theme missing");
+		const theme = await loadTestTheme();
 		setThemeInstance(theme);
 		auth = await AuthStorage.create(":memory:");
 	});

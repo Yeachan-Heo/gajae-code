@@ -35,10 +35,15 @@ function containsUltrafastServiceTier(value: unknown): boolean {
 	);
 }
 
-function containsSecretField(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsSecretField);
+/** True when a patch contains any secret-shaped key, recursively; cyclic input is safe. */
+export function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
 	if (!value || typeof value !== "object") return false;
-	return Object.entries(value).some(([key, nested]) => isSecretConfigKey(key) || containsSecretField(nested));
+	if (seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
+	return Object.entries(value as Record<string, unknown>).some(
+		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
+	);
 }
 
 /** Rejects secret-bearing and ultrafast-tier config patches from model-facing adapter inputs. */
@@ -47,7 +52,7 @@ export function validateAdapterSecretFields(
 	input: Input,
 ): SecretInputError | UltrafastRestrictionError | undefined {
 	if (operation === "config.patch") {
-		if (containsSecretField(input)) {
+		if (containsSecretConfigKey(input)) {
 			return {
 				code: "secret_field_forbidden",
 				message: "config.patch secret fields are not available through this adapter.",

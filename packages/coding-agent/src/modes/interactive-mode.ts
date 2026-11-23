@@ -123,7 +123,14 @@ import { shouldShowExtensionCommand } from "./slash-command-visibility";
 import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
-import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
+import {
+	getEditorTheme,
+	getSymbolTheme,
+	onTerminalAppearanceChange,
+	onTerminalAppearanceDemandChange,
+	onThemeChange,
+	theme,
+} from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
 	type ActivityIndicatorStopOptions,
@@ -774,6 +781,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			},
 		});
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribeCommittedSessionSwitch(() => {
+				if (this.#stopped) return;
+				return this.#applySwitchedSessionMode();
+			}),
+		);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
@@ -995,6 +1008,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Load initial todos
 		await this.#loadTodoList();
 		if (this.#stopped) return;
+
+		// Poll OSC 11 only while its answer can change the active theme. Registered before
+		// start() so the poll never runs during the awaits between start() and handler setup.
+		onTerminalAppearanceDemandChange(needed => {
+			this.ui.terminal.setAppearancePolling?.(needed);
+		});
 
 		// Start the UI
 		this.ui.start();
@@ -1749,6 +1768,30 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#goalModeController.handleSessionEvent(event);
 	}
 
+	/** Match the plan and goal controllers and the mode gate to the session a switch just committed. */
+	async #applySwitchedSessionMode(): Promise<void> {
+		const sessionContext = this.sessionManager.buildSessionContext();
+		const mode = sessionContext.mode;
+		this.#modeGate.exit("plan");
+		this.#planModeController.setEnabledForCompatibility(false);
+		this.#planModeController.setPausedForCompatibility(false);
+		this.#planModeController.setPlanFilePathForCompatibility(undefined);
+		try {
+			await this.#goalModeController.detachForSessionSwitch();
+			if (mode === "goal" || mode === "goal_paused")
+				await this.#goalModeController.restoreFromSession(sessionContext);
+			else if (mode === "plan" || mode === "plan_paused")
+				await this.#planModeController.restoreFromSession(sessionContext);
+		} finally {
+			const planActive = this.#planModeController.enabled || this.#planModeController.paused;
+			this.#updatePlanModeStatus(
+				planActive
+					? { enabled: this.#planModeController.enabled, paused: this.#planModeController.paused }
+					: undefined,
+			);
+		}
+	}
+
 	/** Restore mode state from session entries on resume. */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -2367,8 +2410,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleShareCommand();
 	}
 
-	handleCopyCommand(sub?: string) {
-		return this.#commandController.handleCopyCommand(sub);
+	handleCopyCommand() {
+		return this.#commandController.handleCopyCommand();
 	}
 
 	handleTodoCommand(args: string): Promise<void> {
@@ -2800,8 +2843,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#btwController.handleEscape();
 	}
 
-	cycleThinkingLevel(): void {
-		this.#inputController.cycleThinkingLevel();
+	handleBtwHandoff(): Promise<void> {
+		return this.#btwController.handoff();
+	}
+
+	cycleThinkingLevel(): Promise<void> {
+		return this.#inputController.cycleThinkingLevel();
 	}
 
 	cycleRoleModel(options?: { temporary?: boolean }): Promise<void> {

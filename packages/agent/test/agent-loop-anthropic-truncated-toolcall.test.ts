@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
-import type { AssistantMessageEventStream, Message, Model } from "@gajae-code/ai";
+import type { AssistantMessageEventStream, Model } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import { streamAnthropic } from "../../ai/src/providers/anthropic";
 import type { Context as LocalContext, Model as LocalModel } from "../../ai/src/types";
 import { agentLoop } from "../src/agent-loop";
 import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types";
+import { identityConverter } from "./helpers";
 
 const model: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -116,10 +117,6 @@ function textResponse(text: string): MockAnthropicEvent[] {
 		{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
 		{ type: "message_stop" },
 	];
-}
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
 afterEach(() => {

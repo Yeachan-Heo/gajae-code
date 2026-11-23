@@ -45,6 +45,7 @@ import type {
 	OAuthProvider,
 	OAuthProviderId,
 } from "./utils/oauth/types";
+import { isLoopbackHostname } from "./utils/parse-bind";
 import { isSqliteError } from "./utils/sqlite-errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +74,10 @@ export function extractStructuredApiKeyToken(apiKey: string): string | undefined
 export interface MCPOAuthBinding {
 	/** Exact HTTP(S) origin of the MCP resource endpoint. */
 	resourceOrigin: string;
-	/** Exact canonical HTTP(S) token endpoint used to create and refresh the credential. */
+	/**
+	 * Canonical token endpoint used to create and refresh the credential.
+	 * Cleartext http is accepted only for a loopback host. Every other host is https.
+	 */
 	tokenEndpoint: string;
 }
 
@@ -98,22 +102,74 @@ export function resolveMCPOAuthResourceOrigin(value: string): string | undefined
 	return resolveCanonicalHttpUrl(value)?.origin;
 }
 
-export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined {
-	return resolveCanonicalHttpUrl(value)?.href;
+/**
+ * Cleartext token traffic has no remote observer only on loopback. Special-purpose
+ * and every other non-loopback address are not a cleartext exception.
+ *
+ * `URL` serializes every IPv4-mapped IPv6 literal as `[::ffff:<hi>:<lo>]`, so that
+ * single shape is the only mapped form that can reach this predicate; an
+ * unnormalized mapped literal fails closed instead of being read as dotted IPv4.
+ */
+function cleartextTokenEndpointAllowed(hostname: string): boolean {
+	const normalized = hostname
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "")
+		.replace(/\.+$/, "");
+	if (isLoopbackHostname(normalized)) return true;
+	const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(normalized);
+	if (!mapped) return false;
+	const high = Number.parseInt(mapped[1] ?? "", 16);
+	const low = Number.parseInt(mapped[2] ?? "", 16);
+	return isLoopbackHostname(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
 }
 
+/**
+ * Canonical token endpoint with the cleartext policy applied. Configuration and
+ * every token-use boundary admit only this shape; see
+ * {@link isMCPOAuthBindingTransportAdmitted} for the binding form.
+ */
+export function resolveMCPOAuthTokenEndpoint(value: string): string | undefined {
+	const url = resolveCanonicalHttpUrl(value);
+	if (!url) return undefined;
+	if (url.protocol === "http:" && !cleartextTokenEndpointAllowed(url.hostname)) return undefined;
+	return url.href;
+}
+
+/**
+ * Persisted wire shape only: canonical http(s) URLs, no credentials, no fragment.
+ *
+ * A row written before the cleartext policy existed may carry a non-loopback HTTP
+ * token endpoint. Decoding must still accept its shape so one such row cannot
+ * invalidate the whole persisted or broker snapshot; the cleartext policy is
+ * applied separately at every token-use boundary.
+ */
 export function isCanonicalMCPOAuthBinding(binding: MCPOAuthBinding): boolean {
 	return (
 		resolveMCPOAuthResourceOrigin(binding.resourceOrigin) === binding.resourceOrigin &&
+		resolveCanonicalHttpUrl(binding.tokenEndpoint)?.href === binding.tokenEndpoint
+	);
+}
+
+/**
+ * Transport admission: the persisted wire shape plus the cleartext policy. A
+ * binding that fails here must never receive a refresh token, client secret, or
+ * authorization code, and must never be dispatched to an MCP server.
+ */
+export function isMCPOAuthBindingTransportAdmitted(binding: MCPOAuthBinding): boolean {
+	return (
+		isCanonicalMCPOAuthBinding(binding) &&
 		resolveMCPOAuthTokenEndpoint(binding.tokenEndpoint) === binding.tokenEndpoint
 	);
 }
 
-export function assertCanonicalMCPOAuthBinding(
+export function assertMCPOAuthBindingTransportAdmitted(
 	binding: MCPOAuthBinding | undefined,
 ): asserts binding is MCPOAuthBinding {
 	if (!binding || !isCanonicalMCPOAuthBinding(binding)) {
 		throw new Error("Invalid MCP OAuth credential binding");
+	}
+	if (!isMCPOAuthBindingTransportAdmitted(binding)) {
+		throw new Error("MCP OAuth token endpoint refused: cleartext HTTP is loopback-only");
 	}
 }
 
@@ -150,7 +206,7 @@ async function refreshBoundMCPOAuthCredential(
 	signal?: AbortSignal,
 ): Promise<OAuthCredentials> {
 	const binding = credential.mcpBinding;
-	assertCanonicalMCPOAuthBinding(binding);
+	assertMCPOAuthBindingTransportAdmitted(binding);
 	const params = new URLSearchParams({
 		grant_type: "refresh_token",
 		refresh_token: credential.refresh,
@@ -683,6 +739,18 @@ export interface CredentialDisabledEvent {
 }
 
 /**
+ * Event payload describing an OAuth authorization warning.
+ *
+ * This is used to surface OAuth-related warnings (e.g., account suspension risk)
+ * via a persistent event subscription rather than optional callbacks, ensuring
+ * SDK consumers always receive important warnings even without callback handlers.
+ */
+export interface OAuthWarningEvent {
+	provider: string;
+	message: string;
+}
+
+/**
  * How {@link AuthStorage} orders multiple healthy OAuth credentials of the same
  * provider:type pool when selecting one for a (new) session.
  *
@@ -1114,6 +1182,12 @@ const OAUTH_REFRESH_SKEW_MS = 60_000;
  * pathological detach-without-reattach loops can't grow memory unboundedly.
  */
 const MAX_PENDING_DISABLED_EVENTS = 32;
+/**
+ * Cap on the buffered OAuth warning backlog held while no handler is attached.
+ * OAuth warnings (e.g., account suspension risk) are critical for SDK consumers,
+ * so this is bounded to prevent unbounded memory growth in edge cases.
+ */
+const MAX_PENDING_OAUTH_WARNING_EVENTS = 16;
 /**
  * Cap on how many times an OAuth resolution may reload the credential store and
  * re-resolve after a failed refresh. Each retry exists to recover from a peer
@@ -1680,6 +1754,14 @@ export class AuthStorage {
 	 * but a process that runs without subscribers for a long time shouldn't grow this unboundedly).
 	 */
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
+	#oauthWarningListeners: Set<(event: OAuthWarningEvent) => void | Promise<void>> = new Set();
+	/**
+	 * Buffer for OAuth warning events fired while no listener is subscribed.
+	 * Drained (in insertion order) to the first listener that triggers the empty→non-empty
+	 * transition via {@link AuthStorage.onOAuthWarning}. Bounded at
+	 * {@link MAX_PENDING_OAUTH_WARNING_EVENTS}; oldest entries are dropped to keep memory predictable.
+	 */
+	#pendingOAuthWarningEvents: OAuthWarningEvent[] = [];
 	#generation = 1;
 	#providerGenerations = new Map<string, number>();
 	#providerConfigurationGenerations = new Map<string, number>();
@@ -2062,6 +2144,39 @@ export class AuthStorage {
 		}
 		return () => {
 			this.#credentialDisabledListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Subscribe to {@link OAuthWarningEvent}s. Multiple subscribers are supported and
+	 * each fires for every warning event; subscribers are invoked in registration order with
+	 * exceptions and async rejections isolated per-listener so a misbehaving subscriber
+	 * cannot break the warning path or starve the rest of the chain.
+	 *
+	 * If `oauth_warning` events were emitted while no listener was subscribed, they are
+	 * replayed (in insertion order) to the listener that triggers the empty→non-empty
+	 * transition. The drain is one-shot — listeners that subscribe after that no longer see
+	 * past events.
+	 *
+	 * Returns an unsubscribe function. The function is idempotent: calling it more than once
+	 * is a no-op. After every subscriber has unsubscribed, subsequent warning events buffer
+	 * again until the next subscribe.
+	 *
+	 * @param listener Callback invoked with each warning event. May be sync or async.
+	 * @returns A function that removes this listener from the subscriber set.
+	 */
+	onOAuthWarning(listener: (event: OAuthWarningEvent) => void | Promise<void>): () => void {
+		const wasEmpty = this.#oauthWarningListeners.size === 0;
+		this.#oauthWarningListeners.add(listener);
+		if (wasEmpty && this.#pendingOAuthWarningEvents.length > 0) {
+			const drained = this.#pendingOAuthWarningEvents;
+			this.#pendingOAuthWarningEvents = [];
+			for (const event of drained) {
+				this.#invokeOAuthWarningListener(listener, event);
+			}
+		}
+		return () => {
+			this.#oauthWarningListeners.delete(listener);
 		};
 	}
 
@@ -2479,6 +2594,20 @@ export class AuthStorage {
 		return this.#getCredentialSelector(provider, undefined, sessionId) !== undefined;
 	}
 
+	/**
+	 * Whether `key` is still a usable stored credential of `provider`: a literal stored API
+	 * key, or the access token of a stored, unexpired OAuth credential. Non-secret check for
+	 * callers that hold a key from an earlier peek and must not reuse it after a rotation.
+	 */
+	hasStoredCredentialKey(provider: string, key: string): boolean {
+		const now = Date.now();
+		return this.#getStoredCredentials(provider).some(({ credential }) =>
+			credential.type === "api_key"
+				? !credential.key.startsWith("!") && credential.key === key
+				: credential.access === key && Number.isFinite(credential.expires) && credential.expires > now,
+		);
+	}
+
 	/** Whether any runtime/session scope has a credential pin, including an unavailable hard pin. */
 	hasAnyCredentialPin(provider: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
@@ -2587,8 +2716,12 @@ export class AuthStorage {
 		return this.#storedApiKeyUsability(storageProvider, entry.credential.key);
 	}
 
-	/** Whether an enabled stored row is currently available outside quota backoff. */
-	isCredentialAvailable(provider: string, rowId: number): boolean {
+	/**
+	 * Whether an enabled stored row is currently available outside quota backoff.
+	 * Pass `modelId` when the caller knows the requested model so a backoff scoped
+	 * to another model does not hide the row; without it every backoff applies.
+	 */
+	isCredentialAvailable(provider: string, rowId: number, modelId?: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const entries = this.#getStoredCredentials(storageProvider);
 		const index = entries.findIndex(entry => entry.id === rowId);
@@ -2603,7 +2736,7 @@ export class AuthStorage {
 		const entry = entries[index];
 		return (
 			entry !== undefined &&
-			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index)
+			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index, modelId)
 		);
 	}
 
@@ -3129,8 +3262,8 @@ export class AuthStorage {
 	/**
 	 * Returns the block expiry for a credential, cleaning up expired entries.
 	 * A block recorded for one model only applies to that model; a block without a
-	 * model applies to the whole credential. `modelId` is the requested model, so
-	 * omitting it asks only about credential-wide blocks.
+	 * model applies to the whole credential. `modelId` is the requested model;
+	 * omitting it conservatively treats every live block, scoped or not, as applicable.
 	 */
 	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number, modelId?: string): number | undefined {
 		const backoffMap = this.#credentialBackoff.get(providerKey);
@@ -3153,7 +3286,7 @@ export class AuthStorage {
 		// A recorded scope may name a model or a model-family tier, so match a tier
 		// against the requested model id the same way limit scoping does.
 		const entryApplies = (entryModel: string): boolean => {
-			if (wanted === undefined) return false;
+			if (wanted === undefined) return true;
 			const scope = entryModel.toLowerCase();
 			if (scope === wanted) return true;
 			if (MODEL_FAMILY_TIERS.has(scope) && wanted.includes(scope)) return true;
@@ -3360,12 +3493,31 @@ export class AuthStorage {
 	): number | undefined {
 		const designatedIds = new Set<number>();
 		for (const { selector } of preferences) {
-			const credentialId = this.#findCredentialBySelector(provider, selector)?.id;
+			const credentialId = this.#findPreferredCredential(provider, selector)?.id;
 			if (credentialId === undefined) continue;
 			if (designatedIds.has(credentialId)) return credentialId;
 			designatedIds.add(credentialId);
 		}
 		return undefined;
+	}
+
+	/**
+	 * Row a configured preference designates. An `org:` preference names an organization id only, never a display name,
+	 * so removing one row cannot retarget it to another organization whose name equals that id. It designates the one
+	 * OAuth row of that organization; when a later login adds a second row of the same organization it designates
+	 * nothing, because a soft preference must never fail credential selection.
+	 */
+	#findPreferredCredential(provider: string, selector: AuthCredentialSelector): IndexedStoredCredential | undefined {
+		if (selector.kind !== "org") return this.#findCredentialBySelector(provider, selector);
+		const wanted = selector.value.trim().toLowerCase();
+		if (!wanted) return undefined;
+		const stored = this.#getStoredCredentials(provider);
+		const designated = stored.filter(
+			entry => entry.credential.type === "oauth" && entry.credential.organizationId?.trim().toLowerCase() === wanted,
+		);
+		if (designated.length !== 1) return undefined;
+		const [entry] = designated;
+		return { ...entry!, index: stored.indexOf(entry!) };
 	}
 
 	/**
@@ -3404,11 +3556,13 @@ export class AuthStorage {
 		const matched: Array<{ candidate: Candidate; maxUsedFraction: number | undefined }> = [];
 		const claimed = new Set<Candidate>();
 		for (const preference of preferences) {
+			const designated = this.#findPreferredCredential(provider, preference.selector);
+			if (!designated) continue;
 			const position = this.#findUsableOAuthCandidate(
 				provider,
 				providerKey,
 				candidates,
-				preference.selector,
+				{ kind: "id", value: String(designated.id) },
 				options?.modelId,
 			);
 			if (position < 0) continue;
@@ -3810,6 +3964,42 @@ export class AuthStorage {
 	): void {
 		const logListenerError = (error: unknown): void => {
 			logger.warn("onCredentialDisabled listener threw", { provider: event.provider, error: String(error) });
+		};
+		try {
+			const result = listener(event);
+			if (result && typeof (result as PromiseLike<void>).then === "function") {
+				(result as Promise<void>).catch(logListenerError);
+			}
+		} catch (error) {
+			logListenerError(error);
+		}
+	}
+
+	#emitOAuthWarning(event: OAuthWarningEvent): void {
+		if (this.#oauthWarningListeners.size === 0) {
+			// No subscribers — buffer for later replay. Cap the backlog so a process that runs
+			// without subscribers for a long time can't grow memory unboundedly; drop oldest
+			// under pressure.
+			if (this.#pendingOAuthWarningEvents.length >= MAX_PENDING_OAUTH_WARNING_EVENTS) {
+				this.#pendingOAuthWarningEvents.shift();
+			}
+			this.#pendingOAuthWarningEvents.push(event);
+			return;
+		}
+		// Snapshot before iteration so a listener that subscribes/unsubscribes during fan-out
+		// can't observe a partially-mutated set or receive an event it just registered for.
+		const listeners = [...this.#oauthWarningListeners];
+		for (const listener of listeners) {
+			this.#invokeOAuthWarningListener(listener, event);
+		}
+	}
+
+	#invokeOAuthWarningListener(
+		listener: (event: OAuthWarningEvent) => void | Promise<void>,
+		event: OAuthWarningEvent,
+	): void {
+		const logListenerError = (error: unknown): void => {
+			logger.warn("onOAuthWarning listener threw", { provider: event.provider, error: String(error) });
 		};
 		try {
 			const result = listener(event);
@@ -4236,6 +4426,30 @@ export class AuthStorage {
 				break;
 			}
 			case "google-gemini-cli": {
+				const warningMessage =
+					"⚠️  WARNING: Google may suspend accounts using Gemini subscription OAuth through third-party clients like this one. Consider using the Google provider (google) or Vertex AI (google-vertex) for direct API key authentication instead to avoid account suspension risk.";
+				// Emit warning via both event system (for SDK consumers without callbacks) and onProgress callback (for CLI/UI).
+				// IMPORTANT: Emit BEFORE calling login function to surface warning before OAuth URL is generated.
+				this.#emitOAuthWarning({ provider, message: warningMessage });
+				ctrl.onProgress?.(warningMessage);
+				// Require explicit confirmation before proceeding with OAuth.
+				if (ctrl.onConfirmWarning) {
+					// SDK path: use the dedicated confirmation callback
+					const confirmed = await ctrl.onConfirmWarning({ provider, message: warningMessage });
+					if (!confirmed) {
+						throw new Error("OAuth authorization was declined by user");
+					}
+				} else if (ctrl.onPrompt) {
+					// CLI/TUI path: use onPrompt to get explicit confirmation
+					const answer = await ctrl.onPrompt({
+						message: `${warningMessage}\n\nContinue with Gemini CLI OAuth authorization? (yes/no)`,
+						allowEmpty: false,
+					});
+					const confirmed = /^(yes|y)$/i.test(answer);
+					if (!confirmed) {
+						throw new Error("OAuth authorization was declined by user");
+					}
+				}
 				const { loginGeminiCli } = await import("./utils/oauth/google-gemini-cli");
 				credentials = await loginGeminiCli({
 					...ctrl,
@@ -5330,28 +5544,57 @@ export class AuthStorage {
 	/**
 	 * Backoff targets implied by an exhausted usage report: a credential-wide
 	 * until for limits that are not model-scoped, plus one entry per exhausted
-	 * model-scoped limit. A model-scoped limit must not take the whole credential
+	 * model-scoped limit must not take the whole credential
 	 * out of rotation for other models.
+	 *
+	 * An exhausted limit without a usable (future) reset still produces a target,
+	 * expiring at `fallbackUntilMs`, so a reset-less wide limit keeps blocking the
+	 * credential and a reset-less scoped limit stays confined to its model.
 	 */
 	#exhaustedLimitBlockTargets(
 		report: UsageReport,
 		nowMs: number,
+		fallbackUntilMs: number,
 	): { wideUntil?: number; scoped: Array<{ modelId: string; untilMs: number }> } {
 		let wideUntil: number | undefined;
+		let wideWithoutReset = false;
 		const scoped: Array<{ modelId: string; untilMs: number }> = [];
 		for (const limit of report.limits) {
 			if (!this.#isUsageLimitExhausted(limit)) continue;
 			const resetsAt = limit.window?.resetsAt;
-			if (!resetsAt || resetsAt <= nowMs) continue;
+			const usableReset = resetsAt !== undefined && resetsAt > nowMs ? resetsAt : undefined;
 			const scopeModel = limit.scope?.modelId?.trim();
 			const tier = limit.scope?.tier?.trim().toLowerCase();
 			if (!scopeModel && !(tier && MODEL_FAMILY_TIERS.has(tier))) {
-				wideUntil = wideUntil === undefined ? resetsAt : Math.min(wideUntil, resetsAt);
+				if (usableReset === undefined) wideWithoutReset = true;
+				else wideUntil = wideUntil === undefined ? usableReset : Math.min(wideUntil, usableReset);
 				continue;
 			}
-			scoped.push({ modelId: scopeModel ?? tier!, untilMs: resetsAt });
+			scoped.push({ modelId: scopeModel ?? tier!, untilMs: usableReset ?? fallbackUntilMs });
 		}
+		if (wideUntil === undefined && wideWithoutReset) wideUntil = fallbackUntilMs;
 		return wideUntil === undefined ? { scoped } : { wideUntil, scoped };
+	}
+
+	/**
+	 * Records the backoff implied by an exhausted usage report on one credential:
+	 * a credential-wide block only when a non-model-scoped limit is exhausted (or
+	 * nothing more specific is known), plus one block per exhausted scoped limit.
+	 */
+	#markExhaustedUsageBlocks(
+		providerKey: string,
+		credentialIndex: number,
+		report: UsageReport,
+		nowMs: number,
+		fallbackUntilMs: number,
+	): void {
+		const targets = this.#exhaustedLimitBlockTargets(report, nowMs, fallbackUntilMs);
+		if (targets.wideUntil !== undefined || targets.scoped.length === 0) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, targets.wideUntil ?? fallbackUntilMs);
+		}
+		for (const scoped of targets.scoped) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, scoped.untilMs, scoped.modelId);
+		}
 	}
 
 	async #getUsageReport(
@@ -5918,7 +6161,7 @@ export class AuthStorage {
 		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
 			const report = await this.#getUsageReport(provider, initial.credential, options);
 			if (report) {
-				const targets = this.#exhaustedLimitBlockTargets(report, Date.now());
+				const targets = this.#exhaustedLimitBlockTargets(report, Date.now(), blockedUntil);
 				if (targets.wideUntil !== undefined) {
 					reportHasWideLimit = true;
 					if (targets.wideUntil > blockedUntil) blockedUntil = targets.wideUntil;
@@ -5958,10 +6201,13 @@ export class AuthStorage {
 			};
 		}
 		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
-		// A report whose only exhausted limits are model-scoped must not take the
-		// whole credential out of rotation; the caller's retry-after backoff applies
-		// to those models instead.
-		if (!(scopedBlocks.length > 0 && !reportHasWideLimit)) {
+		// An exhausted wide limit in the report takes the whole credential out of
+		// rotation regardless of which model hit it. A report whose only exhausted
+		// limits are model-scoped must not; those scopes carry the backoff instead.
+		// Without report evidence the caller's retry-after applies to its model.
+		if (reportHasWideLimit) {
+			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
+		} else if (scopedBlocks.length === 0) {
 			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil, options?.modelId);
 		}
 		for (const scoped of scopedBlocks) {
@@ -6005,13 +6251,15 @@ export class AuthStorage {
 	 * exactly which leased credential failed (e.g. the auth-gateway leases a
 	 * concrete row without a session binding) so bookkeeping cannot land on the
 	 * wrong credential. The credential is never invalidated or marked suspect:
-	 * the block is a bounded backoff only. Returns false when no stored
-	 * credential matches the key.
+	 * the block is a bounded backoff only. `modelId` scopes the block to one
+	 * model so the credential keeps serving other models; omit it for
+	 * credential-wide failures such as quota or rate limits. Returns false when
+	 * no stored credential matches the key.
 	 */
 	async markUsageLimitReachedMatching(
 		provider: string,
 		apiKey: string,
-		options?: { retryAfterMs?: number },
+		options?: { retryAfterMs?: number; modelId?: string },
 	): Promise<boolean> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const stored = this.#getStoredCredentials(storageProvider);
@@ -6022,6 +6270,7 @@ export class AuthStorage {
 					this.#getProviderTypeKey(storageProvider, entry.credential.type),
 					index,
 					Date.now() + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs),
+					options?.modelId,
 				);
 				return true;
 			}
@@ -6175,15 +6424,9 @@ export class AuthStorage {
 			let blocked = blockedUntil !== undefined;
 			if (!blocked && usage && this.#isUsageLimitReached(usage, args.options?.modelId)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, args.options?.modelId);
-				blockedUntil = resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs;
-				const targets = this.#exhaustedLimitBlockTargets(usage, nowMs);
-				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-					for (const scoped of targets.scoped) {
-						this.#markCredentialBlocked(args.providerKey, selection.index, scoped.untilMs, scoped.modelId);
-					}
-				} else {
-					this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
-				}
+				const fallbackUntilMs = Date.now() + AuthStorage.#defaultBackoffMs;
+				blockedUntil = resetAtMs ?? fallbackUntilMs;
+				this.#markExhaustedUsageBlocks(args.providerKey, selection.index, usage, nowMs, fallbackUntilMs);
 				blocked = true;
 			}
 			// Rank on the windows that apply to the requested model so a limit scoped
@@ -6852,16 +7095,13 @@ export class AuthStorage {
 			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
 				const nowMs = Date.now();
-				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, options?.modelId);
-				const blockedUntil = resetAtMs ?? nowMs + AuthStorage.#defaultBackoffMs;
-				const targets = this.#exhaustedLimitBlockTargets(usage, nowMs);
-				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-					for (const scoped of targets.scoped) {
-						this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
-					}
-				} else {
-					this.#markCredentialBlocked(providerKey, selection.index, blockedUntil, options?.modelId);
-				}
+				this.#markExhaustedUsageBlocks(
+					providerKey,
+					selection.index,
+					usage,
+					nowMs,
+					nowMs + AuthStorage.#defaultBackoffMs,
+				);
 				return undefined;
 			}
 		}
@@ -6939,16 +7179,13 @@ export class AuthStorage {
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
 					const nowMs = Date.now();
-					const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, options?.modelId);
-					const blockedUntil = resetAtMs ?? nowMs + AuthStorage.#defaultBackoffMs;
-					const targets = this.#exhaustedLimitBlockTargets(usage, nowMs);
-					if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-						for (const scoped of targets.scoped) {
-							this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
-						}
-					} else {
-						this.#markCredentialBlocked(providerKey, selection.index, blockedUntil, options?.modelId);
-					}
+					this.#markExhaustedUsageBlocks(
+						providerKey,
+						selection.index,
+						usage,
+						nowMs,
+						nowMs + AuthStorage.#defaultBackoffMs,
+					);
 					return undefined;
 				}
 			}
@@ -7689,7 +7926,7 @@ export class AuthStorage {
 			if (target.credential.mcpBinding && remoteRefresh) {
 				// Remote (broker) stores refresh MCP-bound rows server-side; the
 				// server runs the guarded local path against its own row.
-				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
 				const refreshedCredential = await remoteRefresh(id, stale, mcpClient, signal);
 				if (
 					refreshedCredential.mcpBinding?.resourceOrigin !== target.credential.mcpBinding.resourceOrigin ||
@@ -7705,7 +7942,7 @@ export class AuthStorage {
 				// stale-snapshot guard, memo recording, and failure provenance.
 				// The outer #oauthRefreshInFlight map already single-flights
 				// concurrent public force callers per row.
-				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
 				refreshed = await this.#refreshOAuthCredentialUnshared(
 					provider as Provider,
 					stale,

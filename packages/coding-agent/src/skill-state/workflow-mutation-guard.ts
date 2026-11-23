@@ -152,6 +152,11 @@ const INTERPRETER_FILESYSTEM_REQUIRE_RE =
 	/\b(?:require|import|from)\s*(?:\(\s*)?(['"\x60])(?:node:)?(?:fs(?:\/promises)?|fs-extra|graceful-fs|child_process|fileutils|io|lfs)\1(?:\s*\))?/i;
 const INTERPRETER_NONLITERAL_REQUIRE_RE = /\brequire\s*(?:\(\s*(?!['"\x60])|\s+(?!['"\x60]))/i;
 const SHELL_DOT_SOURCE_RE = /(?:^|[;&|\n])\s*(?:(?:if|then|do)\s+)?\.\s+(?:["'$`]|[A-Za-z0-9_./~])/;
+/**
+ * Node/Bun flags that load a module before the scanned one-liner runs. The loaded
+ * module is never scanned, so planning fails closed on every spelling of them.
+ */
+const NODE_PRELOAD_FLAG_RE = /^(?:-r|--require|--import|--loader|--experimental-loader|--preload)(?:=|$)|^-r./;
 /** Executable Python source evaluation and dynamic imports make payloads opaque; compile() alone is inert. */
 const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
 	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
@@ -2162,13 +2167,33 @@ function collectInterpreterOneLinerWrites(
 			}
 		}
 		const options = interpreterCodeOptions(binary);
+		// An option-shaped word this scanner does not model may consume the next word as its
+		// value, including a literal `--` (Bun `--conditions --`), so a later `--` is not
+		// proof that option parsing ended.
+		let sawUnmodeledOption = false;
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
+			// The shell concatenates quoted spans, so `--im'port'=x` reaches Node as a preload
+			// flag, `-"-"` as the terminator, and `''--title` as that option: compare the
+			// dequoted word everywhere the shell's concatenation matters.
+			const flagWord = part.replace(/['"]/g, "");
 			// Module/debugger switches, including bundled -wM, run unscanned code.
 			if (binary === "perl" && /^-[^eEImMd]*[mMd]/.test(part)) {
 				targets.explicitMutation = true;
 				targets.unknown = true;
 				return;
+			}
+			// Node/Bun preload flags load a module the scanner never sees, so fail closed
+			// for every detached, attached, and equals-form spelling.
+			if (/^(?:node|bun)$/.test(binary)) {
+				// `--` ends Node/Bun option parsing and the remaining words are the program's
+				// own argv, unless an option this scanner cannot model came first.
+				if (flagWord === "--" && !sawUnmodeledOption) break;
+				if (NODE_PRELOAD_FLAG_RE.test(flagWord)) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+					return;
+				}
 			}
 			let rawScript: string | undefined;
 			const option = options.find(
@@ -2181,20 +2206,28 @@ function collectInterpreterOneLinerWrites(
 				const rawWord = words[index] ?? "";
 				rawScript = rawWord.startsWith("-") ? rawWord.slice(option.length) : part.slice(option.length);
 			} else {
-				const longOption = options.find(
+				const equalsFormOption = options.find(
 					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
 				);
-				if (!longOption) continue;
-				rawScript = words[index]?.slice(longOption.length + 1);
+				if (!equalsFormOption) {
+					// Words the shell still expands, substitutes, or globs (`$'...'`, `$(...)`,
+					// backticks, `*`, `?`, `[`) stay opaque here: keep scanning past a later `--`
+					// instead of assuming the shell produced a plain operand. Check the original shell word
+					// `words[index]` for unquoted glob characters, not the dequoted `flagWord`, so that quoted
+					// globs like `--require="[a-z]"` are treated as literal strings, not glob patterns.
+					const originalWord = words[index] ?? part;
+					if (
+						flagWord.startsWith("-") ||
+						hasUnquotedGlobCharacters(originalWord) ||
+						shellWordHasExpansion(originalWord)
+					) {
+						sawUnmodeledOption = true;
+					}
+					continue;
+				}
+				rawScript = words[index]?.slice(equalsFormOption.length + 1);
 			}
 			if (rawScript === undefined) continue;
-			// Node preload options (-r/--require) load external files that cannot be scanned,
-			// so fail closed when encountered.
-			if ((option === "-r" || option === "--require") && /^(?:node|bun)$/.test(binary)) {
-				targets.explicitMutation = true;
-				targets.unknown = true;
-				return;
-			}
 			const script = cleanInterpreterCodeWord(rawScript);
 			if (
 				script === undefined ||
@@ -2942,6 +2975,47 @@ function shellWordHasExpansion(word: string): boolean {
 		else if (character === "$" || character === "`") return true;
 	}
 	return quote !== null;
+}
+
+/**
+ * True when the word contains unquoted glob characters (`*`, `?`, `[`) that the shell
+ * would expand before the word reaches the binary. Quoted glob characters are literal
+ * and do not cause shell expansion.
+ */
+function hasUnquotedGlobCharacters(word: string): boolean {
+	let quote: "'" | '"' | null = null;
+	for (let index = 0; index < word.length; index++) {
+		const character = word[index] ?? "";
+		if (quote === "'") {
+			// Single-quoted strings: no escaping, everything is literal
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			// Double-quoted strings: backslash escaping applies
+			if (character === "\\") {
+				index++; // Skip the escaped character
+				continue;
+			}
+			if (character === '"') {
+				quote = null;
+			}
+			// Inside double quotes, glob chars are literal
+			continue;
+		}
+		// Outside quotes
+		if (character === "\\") {
+			index++; // Skip the escaped character
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+		} else if (character === "*" || character === "?" || character === "[") {
+			// Unquoted glob character
+			return true;
+		}
+	}
+	return false;
 }
 
 function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: boolean } {
@@ -3915,13 +3989,47 @@ function isAllowlistedPath(cwd: string, rawPath: string, sessionId?: string | nu
 	}
 	return head === "specs" || head === "plans";
 }
-function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
-	const segments = relativeGjcSegments(cwd, rawPath);
-	return segments?.[0] === ".gjc";
+/**
+ * Project skills (`.gjc/skills/<name>/...`) are user-authored definitions that skill
+ * discovery reads and no `gjc` CLI writes, so agent file tools may edit them. The
+ * `.gjc/skills` directory itself and every other `.gjc/**` path stay runtime-owned.
+ * Segments are already lexically normalized, so `.gjc/skills/../state/x` is `.gjc/state/x`.
+ * The real target must also stay inside the real skills root and outside every other
+ * real `.gjc/**` location, so a symlink (including a symlinked `.gjc/skills`) or a
+ * hardlink cannot redirect the write into workflow state.
+ */
+async function isAgentWritableGjcSkillPath(cwd: string, rawPath: string, segments: string[]): Promise<boolean> {
+	if (segments[0] !== ".gjc" || segments[1] !== "skills" || segments.length < 3) return false;
+	const { absolutePath, unknown } = resolveRawPath(cwd, rawPath);
+	if (unknown || !absolutePath) return false;
+	const gjcRoot = path.join(path.resolve(cwd), ".gjc");
+	const [realGjcRoot, realSkillsRoot, realTarget] = await Promise.all([
+		canonicalizeForContainment(gjcRoot),
+		canonicalizeForContainment(path.join(gjcRoot, "skills")),
+		canonicalizeForContainment(absolutePath),
+	]);
+	if (realTarget === realSkillsRoot || !isPathWithin(realSkillsRoot, realTarget)) return false;
+	const realGjcSkillsDir = path.join(realGjcRoot, "skills");
+	if (
+		isPathWithin(realGjcRoot, realTarget) &&
+		(realTarget === realGjcSkillsDir || !isPathWithin(realGjcSkillsDir, realTarget))
+	) {
+		return false;
+	}
+	return hasUnsharedFileTarget(cwd, rawPath);
 }
 
-function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): boolean {
-	return targets.paths.some(rawPath => isBlockedGjcPath(cwd, rawPath));
+async function isBlockedGjcPath(cwd: string, rawPath: string): Promise<boolean> {
+	const segments = relativeGjcSegments(cwd, rawPath);
+	if (segments?.[0] !== ".gjc") return false;
+	return !(await isAgentWritableGjcSkillPath(cwd, rawPath, segments));
+}
+
+async function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): Promise<boolean> {
+	for (const rawPath of targets.paths) {
+		if (await isBlockedGjcPath(cwd, rawPath)) return true;
+	}
+	return false;
 }
 
 function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets, sessionId?: string | null): boolean {
@@ -4141,9 +4249,9 @@ export async function assertWorkflowMutationRawPathsAllowed(input: {
 	guardContext?: WorkflowGuardContext;
 }): Promise<void> {
 	const targets: ExtractedTargets = { paths: input.rawPaths, unknown: input.rawPaths.length === 0 };
-	// Always-on `.gjc/**` runtime-owned block, ahead of forceOverride.
+	// Always-on `.gjc/**` runtime-owned block (except `.gjc/skills/<name>/**`), ahead of forceOverride.
 	// A deferred ast_edit apply must not reach `.gjc/**` either.
-	if (hasBlockedGjcTarget(input.cwd, targets)) {
+	if (await hasBlockedGjcTarget(input.cwd, targets)) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
 		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
 		throw new ToolError(`${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`);
@@ -4166,7 +4274,11 @@ export async function getWorkflowMutationDecision(
 ): Promise<WorkflowMutationDecision> {
 	if (!BLOCKED_TOOL_NAMES.has(input.tool.name)) return { blocked: false, targets: [] };
 	const targets = extractTargets(input.tool, input.args);
-	if (input.tool.name !== "bash" && input.enforceWorkflowState !== false && hasBlockedGjcTarget(input.cwd, targets)) {
+	if (
+		input.tool.name !== "bash" &&
+		input.enforceWorkflowState !== false &&
+		(await hasBlockedGjcTarget(input.cwd, targets))
+	) {
 		const stateSkill = firstBlockedWorkflowStateSkill(input.cwd, targets);
 		const command = stateSkill ? sanctionedWorkflowStateCommand(stateSkill) : "gjc <workflow-command>";
 		return {

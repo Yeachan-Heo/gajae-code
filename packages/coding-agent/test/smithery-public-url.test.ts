@@ -1,11 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { loadAllMCPConfigs } from "../src/runtime-mcp/config";
 import { usesPublicNetworkMcpFetch } from "../src/runtime-mcp/plugin-network-boundary";
 import { resolveSmitheryServerConfig } from "../src/runtime-mcp/smithery-registry";
 import type { MCPHttpServerConfig } from "../src/runtime-mcp/types";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 const qualifiedName = "@example/demo";
 const publicResolver = async () => ["1.1.1.1"];
@@ -37,7 +40,7 @@ describe("resolveSmitheryServerConfig", () => {
 	});
 
 	it("keeps the public-network flag when a saved HTTP config is loaded", async () => {
-		const dir = await mkdtemp(path.join(tmpdir(), "smithery-mcp-"));
+		const dir = await tempDirs.mkdtemp(path.join(tmpdir(), "smithery-mcp-"));
 		const configPath = path.join(dir, "mcp.json");
 		await writeFile(
 			configPath,
@@ -58,7 +61,7 @@ describe("resolveSmitheryServerConfig", () => {
 	});
 
 	it("keeps the public-network flag through the native .gjc/mcp.json loader", async () => {
-		const dir = await mkdtemp(path.join(tmpdir(), "smithery-native-"));
+		const dir = await tempDirs.mkdtemp(path.join(tmpdir(), "smithery-native-"));
 		const agentDir = path.join(dir, "agent");
 		await mkdir(path.join(dir, ".gjc"), { recursive: true });
 		await mkdir(agentDir, { recursive: true });

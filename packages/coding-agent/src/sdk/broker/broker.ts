@@ -9,22 +9,25 @@ import {
 	type NativeDirectoryTreeSnapshot,
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
-import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { logger, resolveEquivalentPath, resolveExistingEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import { FileLockAcquireError, withFileLock } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
+import { SessionManager } from "../../session/session-manager";
 import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
 } from "../../session/task-artifact-owner-codec";
-import { SdkClient, SdkClientError } from "../client";
+import { lifecycleFingerprint, lifecycleRequestIdentity, SdkClient, SdkClientError } from "../client";
 import {
 	BROKER_RUNTIME_ABORT_CAPABILITY_FIELD,
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 } from "../host/control/runtime-gate";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
+import { normalizeSdkRevisionInput, type SdkRevisionInput } from "../protocol/revision-contracts";
 import { canonicalServiceRootDigest } from "../service-artifact-paths";
 import {
 	type DirectoryMigrationPolicy,
@@ -35,6 +38,8 @@ import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
 	type SessionListSavedSessionOmission,
 	type SessionListSavedSessionOmissionDetailCode,
+	type SessionListSavedSessionRecap,
+	sessionListSavedSessionRecap,
 } from "../session-list";
 import {
 	type BrokerExitMode,
@@ -44,6 +49,7 @@ import {
 	type BrokerStopRequest,
 	writeBrokerExitRecord,
 } from "./broker-exit";
+import { canonicalJson } from "./canonical-json";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
@@ -68,24 +74,33 @@ import {
 	deriveLegacyTargetIdentity,
 	deriveScopedIdempotencyIdentity,
 	getBrokerIdentityKey,
+	MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH,
 } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
+	hasSessionLifecycleFailureEvidence,
+	hasSessionLifecycleReadiness,
+	hasSessionLifecycleStartupCommit,
 	isCanonicalSessionId,
+	type LifecycleFailureArtifact,
 	prepareSpawnChildHostLaunch,
+	processIncarnationForBroker,
 	readSessionLifecycleFailure,
+	supportsEphemeralSessions,
 	validateBrokerModelPresetSync,
 	writeEffectMarker,
 } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 	type TerminalReadBack,
 } from "./lifecycle-ledger";
 import { brokerLockHostIdentity } from "./lock-host-identity";
+import { type BrokerLockRefusalCode, BrokerLockRefusedError } from "./lock-refusal";
 import {
 	cancelManagedTasks,
 	createManagedDomainBinding,
@@ -117,7 +132,11 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
+import {
+	isProcessIncarnation,
+	observeProcessIncarnation,
+	type ProcessIncarnationObservation,
+} from "./process-incarnation";
 import {
 	armPublicationLivenessWatchdog,
 	disarmPublicationLivenessWatchdog,
@@ -149,6 +168,7 @@ import {
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
 	type SpawnLifecycleOwner,
+	type SpawnOwnerRecord,
 	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -278,6 +298,7 @@ export type BrokerErrorCode =
 	| "worktree_in_use"
 	| "incarnation_unavailable"
 	| "close_refused"
+	| "busy"
 	| "not_found"
 	| "live_session"
 	| "cleanup_pending"
@@ -445,20 +466,6 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.reconcile_uncertain",
 ]);
 
-/** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
-function lifecycleRequestIdentity(input: Record<string, unknown>): Record<string, unknown> {
-	const identity = { ...input };
-	delete identity.coordinatorSidecarSigningKey;
-	delete identity.coordinatorSidecarKeyId;
-	return identity;
-}
-
-function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
-	return createHash("sha256")
-		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
-		.digest("hex");
-}
-
 function publicLifecycleLookupInput(
 	input: Record<string, unknown>,
 ): { operation: "session.create"; target: Record<string, unknown> } | BrokerResponse {
@@ -527,7 +534,11 @@ export type SpawnQ26Reconciliation = {
 	acceptedAt?: number;
 };
 
-/** Exact registration a spawn waits for, bounded by the original readiness deadline. */
+/**
+ * Exact registration a spawn waits for, bounded by `deadlineAt`: the original
+ * semantic readiness deadline, or a later one for the single post-deadline
+ * recheck after the host published readiness.
+ */
 export interface SpawnRegistrationRequest {
 	childId: string;
 	cwd: string;
@@ -536,13 +547,44 @@ export interface SpawnRegistrationRequest {
 	owner: SpawnLifecycleOwner;
 	effectMarker: string;
 	deadlineAt: number;
+	/**
+	 * Set only for the post-deadline recheck. The host already registered and
+	 * published readiness, so the outcome can be decided before `deadlineAt`: the
+	 * wait ends as soon as `decided()` resolves true (a readable failure receipt,
+	 * or an owner that provably exited), including while waiting for the index lock.
+	 * A completed read showing the host's recorded row no longer matches stops the
+	 * index reads, and the refusal then waits for `decided()` or the bound, because
+	 * a rolling-back host unregisters before its failure receipt is readable.
+	 * Polled every {@link SPAWN_LATE_RECHECK_PROBE_MS}.
+	 */
+	recheck?: { decided: () => Promise<boolean> };
 }
+
+/**
+ * Why a spawn admission saw no matching registration:
+ * - `absent`: a completed index read near the deadline held no endpoint row for
+ *   the child, and no later attempt failed or was abandoned;
+ * - `mismatch`: an endpoint row for the child exists but fails the exact
+ *   identity, authority, or liveness predicate;
+ * - `inconclusive`: absence is unproven: no read completed near the deadline,
+ *   or a later attempt could not read the index in time (queue or lock wait, or
+ *   a read error);
+ * - `unconfirmed`: (flow driver only) a matching registration was observed after
+ *   the deadline, but readiness was not confirmed and no startup failure appeared.
+ */
+export type SpawnRegistrationMiss = "absent" | "mismatch" | "inconclusive" | "unconfirmed";
+
+export type SpawnRegistrationResult =
+	| { ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } }
+	| { ok: false; reason?: SpawnRegistrationMiss };
 
 /** Q26-only host control seam. It never receives or returns durable request material. */
 export interface SpawnPromptLayer {
-	awaitRegistration(
-		input: SpawnRegistrationRequest,
-	): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }>;
+	/**
+	 * May be called a second time, once, with a later deadline after a
+	 * non-mismatch miss when the host published readiness; must be idempotent.
+	 */
+	awaitRegistration(input: SpawnRegistrationRequest): Promise<SpawnRegistrationResult>;
 	dispatch(input: {
 		sessionId: string;
 		task: string;
@@ -580,7 +622,7 @@ function parseSpawnInput(
 	input: Record<string, unknown>,
 	idempotencyKey: string | undefined,
 ): SpawnAdmissionInput | BrokerResponse {
-	if (!idempotencyKey || idempotencyKey.length > 512)
+	if (!idempotencyKey || idempotencyKey.length > MAX_SPAWN_IDEMPOTENCY_KEY_LENGTH)
 		return error("invalid_input", "idempotencyKey is required for session.spawn");
 	const allowed = new Set([
 		"task",
@@ -669,6 +711,30 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 }
 
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
+/**
+ * Bound for the single post-deadline registration observation after the host
+ * published readiness. The largest observed overrun past the semantic deadline
+ * was about 8.7 s (macOS, the global session index lock held by another
+ * process), so 20 s covers it with more than 2x margin. No tighter bound exists
+ * in the code: the lock itself retries for up to 60 s, which is far too long
+ * to hold a spawn. 20 s stays well inside the budgets around it: a refused
+ * spawn still answers around 28 s after the claim plus release, far below the
+ * master CLI's 120 s spawn timeout, and the host applies no cutoff once its
+ * startup committed. The recheck ends early on a readable failure receipt or an
+ * owner that provably exited (OS-confirmed absence or a changed incarnation). A
+ * decisive mismatch row stops the index reads but still waits for one of those
+ * or the bound, since a rolling-back host unregisters before its receipt is
+ * readable. An owner the OS cannot query or whose incarnation cannot be read,
+ * or a row that fails only the read-time liveness check, keeps it open until it
+ * is decided or the bound passes.
+ */
+const SPAWN_LATE_REGISTRATION_RECHECK_MS = 20_000;
+/**
+ * How often the recheck asks whether its outcome is already decided. The early
+ * end only needs to beat the 20 s bound, and the OS observation is a
+ * synchronous native call, so it runs coarser than the index poll.
+ */
+const SPAWN_LATE_RECHECK_PROBE_MS = 250;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
 /** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
@@ -750,6 +816,26 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 	);
 }
 
+/**
+ * The spawning master to show on a listed row, or undefined. Spawn authority is
+ * keyed by session id, so the row's state root must also resolve to a canonical
+ * root the child's host registered in: an ambiguous row cannot say which root it
+ * describes, and a row from another root (the same id opened or resumed
+ * elsewhere) is not the spawned host. Either carries no spawning master rather
+ * than a wrong one. The recorded roots were resolved at registration; they are
+ * never re-resolved here, because a symlinked root retargeted since then would
+ * name a different directory.
+ */
+function spawnOwnerForRow(
+	session: IndexedSession,
+	owners: ReadonlyMap<string, SpawnOwnerRecord> | undefined,
+): string | undefined {
+	if (!isSessionAuthorityEligible(session)) return undefined;
+	const owner = owners?.get(session.sessionId);
+	if (owner === undefined || owner.stateRoots.size === 0) return undefined;
+	return owner.stateRoots.has(resolveEquivalentPath(session.locator.stateRoot)) ? owner.ownerSessionId : undefined;
+}
+
 /** Exact admission predicate for the child host row published after launch. */
 export function spawnRegistrationMatches(
 	candidate: IndexedSession,
@@ -773,6 +859,242 @@ export function spawnRegistrationMatches(
 		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(expected.cwd) &&
 		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(expected.stateRoot)
 	);
+}
+
+/**
+ * One locked index read for the exact child host registration, scoped to the
+ * awaited child so it probes only that child's rows. Throws when the read could
+ * not start before `readStartDeadlineAt` or failed.
+ */
+async function readSpawnHostRegistration(
+	index: SessionIndex,
+	input: SpawnRegistrationRequest,
+	readStartDeadlineAt: number,
+	signal: AbortSignal | undefined,
+): Promise<
+	| { kind: "match"; registration: SpawnHostRegistration & { lifecycleRequestId: string } }
+	| { kind: "mismatch"; decisive: boolean }
+	| { kind: "absent" }
+> {
+	await index.refresh({ readStartDeadlineAt, signal });
+	// The launch locator is authority: a same-id row registered by an
+	// unrelated workspace must never be adopted as this spawn's child.
+	const rows = index.listSessionIdentities(undefined, new Set([input.childId]));
+	const row = rows.find(candidate => spawnRegistrationMatches(candidate, input));
+	const incarnation = row?.hostIncarnation ?? row?.processIncarnation;
+	// An incarnation-less row is incomplete endpoint evidence; a partial pin
+	// previously just failed later at dispatch, so failing at registration keeps one boundary.
+	if (row && incarnation !== undefined) {
+		return {
+			kind: "match",
+			registration: {
+				sessionId: row.sessionId,
+				endpointGeneration: row.endpointGeneration,
+				pid: row.pid,
+				processIncarnation: incarnation,
+				lifecycleRequestId: input.effectMarker,
+				cwd: row.locator.cwd,
+				stateRoot: row.locator.stateRoot,
+			},
+		};
+	}
+	if (!rows.some(candidate => candidate.sessionId === input.childId && candidate.endpointGeneration > 0))
+		return { kind: "absent" };
+	// Row content is append-only, but `live` is projected at read time from an
+	// OS probe that can fail transiently, and from cross-root ambiguity that can
+	// resolve when the other root terminates. A row that fails only on `live`
+	// may match on the next read; any other mismatch (terminal, another pid,
+	// incarnation, request or locator) cannot.
+	return {
+		kind: "mismatch",
+		decisive: !rows.some(
+			candidate => !candidate.live && spawnRegistrationMatches({ ...candidate, live: true }, input),
+		),
+	};
+}
+
+/**
+ * Whether the spawned host's owner process provably exited: the OS confirms
+ * the pid is absent, or it now names a process with another incarnation.
+ * Every inconclusive observation (an unavailable addon, or a pid that cannot be
+ * opened or queried, which `Process.fromPid` reports as `null` on Windows) is
+ * not proof of exit.
+ */
+export function spawnOwnerProvablyExited(
+	pid: number,
+	expectedIncarnation: string,
+	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
+): boolean {
+	const observed = observe(pid);
+	if (observed.status === "absent") return true;
+	if (observed.status === "unknown") return false;
+	return observed.incarnation !== expectedIncarnation;
+}
+
+/** Resolve when `decided` settles or `deadlineAt` passes, without leaving a timer behind. */
+async function waitUntilDecidedOrDeadline(decided: Promise<void>, deadlineAt: number): Promise<void> {
+	const remaining = deadlineAt - Date.now();
+	if (remaining <= 0) return;
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([decided, new Promise<void>(resolve => (timer = setTimeout(resolve, remaining)))]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * Poll the session index for the exact child host registration.
+ *
+ * Each read must begin before `deadlineAt`; waiting in the index queue or on the
+ * machine-global lock never runs past it. A read that began in time is evaluated
+ * even when it completes after the deadline: discarding it would reject a host
+ * that registered in time only because the observer was slow. Admission still
+ * requires the full predicate against that read, including current liveness and
+ * incarnation, never just an early publication timestamp.
+ *
+ * A recheck (`input.recheck`) ends when its `decided()` probe turns true, so a
+ * host that rolled back or died is refused without waiting out the recheck
+ * bound. A decisive mismatch row stops the index reads, and the refusal then
+ * waits only for that probe (or the bound), because a rolling-back host
+ * unregisters before its failure receipt becomes readable.
+ */
+export async function awaitSpawnHostRegistration(
+	index: SessionIndex,
+	input: SpawnRegistrationRequest,
+): Promise<SpawnRegistrationResult> {
+	const deadline = input.deadlineAt;
+	const recheck = input.recheck;
+	// A child row seen once stays a mismatch: the index is append-only. Absence
+	// is time-dependent, so it is reported only when a completed read near the
+	// deadline saw no row and no later attempt failed or was abandoned;
+	// otherwise the observation is inconclusive.
+	let mismatchSeen = false;
+	let absentCompletedAt: number | undefined;
+	let failedSinceAbsent = false;
+	const miss = (): SpawnRegistrationMiss => {
+		if (mismatchSeen) return "mismatch";
+		if (
+			absentCompletedAt !== undefined &&
+			!failedSinceAbsent &&
+			absentCompletedAt >= deadline - 2 * SPAWN_HOST_REGISTRATION_POLL_MS
+		)
+			return "absent";
+		return "inconclusive";
+	};
+	// The probe runs beside the reads so it can also cut short a wait for the
+	// index lock held by another process; it never interrupts a read in progress.
+	const stop = new AbortController();
+	const decided = Promise.withResolvers<void>();
+	if (recheck)
+		void (async () => {
+			while (!stop.signal.aborted) {
+				let done = false;
+				try {
+					done = await recheck.decided();
+				} catch {
+					// An unreadable probe proves nothing; keep waiting within the bound.
+				}
+				if (done && !stop.signal.aborted) {
+					stop.abort(new Error("Spawn registration recheck outcome decided"));
+					decided.resolve();
+					return;
+				}
+				await Promise.race([Bun.sleep(SPAWN_LATE_RECHECK_PROBE_MS), decided.promise]);
+			}
+		})();
+	const ended = (): boolean => Date.now() >= deadline || stop.signal.aborted;
+	try {
+		for (;;) {
+			if (!Number.isSafeInteger(deadline) || ended()) return { ok: false, reason: miss() };
+			try {
+				const read = await readSpawnHostRegistration(index, input, deadline, recheck ? stop.signal : undefined);
+				if (read.kind === "match") return { ok: true, registration: read.registration };
+				if (read.kind === "mismatch") {
+					mismatchSeen = true;
+					// The host appended its row before it published readiness, so a row
+					// whose recorded content no longer matches cannot match on a later poll.
+					// Stop reading the index, but a host rolling back unregisters before it
+					// writes its failure receipt: wait (within the bound) for the probe to
+					// see that receipt or the owner exit, so the refusal reports the
+					// receipt rather than a timeout.
+					if (recheck && read.decisive) {
+						await waitUntilDecidedOrDeadline(decided.promise, deadline);
+						return { ok: false, reason: "mismatch" };
+					}
+				} else {
+					absentCompletedAt = Date.now();
+					failedSinceAbsent = false;
+				}
+			} catch {
+				// A queue or lock wait that reached the deadline or was cut short, or a transient read failure.
+				failedSinceAbsent = true;
+			}
+			if (ended()) return { ok: false, reason: miss() };
+			await Promise.race([
+				Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now())),
+				decided.promise,
+			]);
+		}
+	} finally {
+		stop.abort();
+		decided.resolve();
+	}
+}
+
+/**
+ * Host-side verdict for a registration the broker observed only after the
+ * semantic deadline. Past the deadline the readiness marker alone proves
+ * nothing: it becomes visible before the host's last cutoff check, and a host
+ * that loses that check revokes it and writes its failure receipt, possibly
+ * much later. Admission therefore needs the host's startup commit, which the
+ * host writes only after startup can no longer roll back, together with the
+ * owner and readiness markers naming this launch and the owner still being the
+ * same live process. A readable failure receipt always wins; a receipt that is
+ * present but unreadable or still being promoted is unknown evidence and
+ * blocks admission until it resolves or the wait ends.
+ *
+ * The commit is irreversible, so one observation suffices even when the broker
+ * observes it seconds late. `waitDeadlineAt` (termination start) bounds waiting
+ * for a verdict that has not appeared; at least one read is always taken. A
+ * host that never writes a commit (one that predates it, or whose write
+ * failed) stays unconfirmed: the late path fails closed.
+ */
+async function awaitLateSpawnHostVerdict(
+	stateRoot: string,
+	childId: string,
+	marker: { pid: number; incarnation: string; effectMarker: string },
+	waitDeadlineAt: number,
+	readIncarnation: (pid: number) => string | undefined,
+): Promise<{ kind: "ready" } | { kind: "failed"; failure: LifecycleFailureArtifact } | { kind: "unconfirmed" }> {
+	for (;;) {
+		const committed =
+			hasSessionLifecycleStartupCommit(stateRoot, childId, marker) &&
+			(await hasSessionLifecycleReadiness(stateRoot, childId, marker)) &&
+			readIncarnation(marker.pid) === marker.incarnation;
+		// Read the failure last, so a receipt written after the reads above wins.
+		const failure = await readSessionLifecycleFailure(stateRoot, childId, marker);
+		if (failure) return { kind: "failed", failure };
+		if (committed && !hasSessionLifecycleFailureEvidence(stateRoot, childId, marker)) return { kind: "ready" };
+		const remaining = waitDeadlineAt - Date.now();
+		if (remaining <= 0) return { kind: "unconfirmed" };
+		await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, remaining));
+	}
+}
+
+function spawnRegistrationMissMessage(reason: SpawnRegistrationMiss | undefined): string {
+	switch (reason) {
+		case "absent":
+			return "session.spawn child host did not register before the bounded admission deadline (no registration row was observed near the deadline)";
+		case "mismatch":
+			return "session.spawn child host registration did not match the launched host identity, authority, or liveness";
+		case "unconfirmed":
+			return "session.spawn child host registered but did not confirm readiness before the bounded admission deadline";
+		case "inconclusive":
+			return "session.spawn child host registration could not be observed before the bounded admission deadline (the session index could not be read in time)";
+		default:
+			return "session.spawn child host did not register before the bounded admission deadline";
+	}
 }
 
 /** Rebuilds the provider proof from durable authority facts only. */
@@ -859,7 +1181,23 @@ const BROKER_TASK_ARTIFACT_OWNER_CLEANUP_FIELDS = [
 ] as const;
 
 export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+	if (operation === "session.revise") {
+		const request = brokerSessionRevisionRequest(input);
+		return isBrokerResponse(request) ? request : { input: { ...request } };
+	}
+	if (operation !== "session.revise" && input.body !== undefined)
+		return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 	const normalized: Record<string, unknown> = { ...input };
+	if (
+		input.sourceEntryId !== undefined &&
+		(operation !== "session.fork" ||
+			(input.sourceEntryId !== null &&
+				(typeof input.sourceEntryId !== "string" ||
+					input.sourceEntryId.length === 0 ||
+					input.sourceEntryId.length > 128 ||
+					/[\u0000-\u001f\u007f]/u.test(input.sourceEntryId))))
+	)
+		return error("invalid_input", "sourceEntryId must select a bounded fork entry or null for the root.");
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
 	if (session.value !== undefined) {
@@ -962,17 +1300,6 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 	}
 	return { input: normalized };
 }
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 type TerminalPersistenceVerification =
 	| { kind: "unverified" }
 	| { kind: "verified" }
@@ -1016,6 +1343,7 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 		if (
 			key === BROKER_RUNTIME_ABORT_CAPABILITY_FIELD ||
 			key === BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD ||
+			key === BROKER_RUNTIME_REVISE_CAPABILITY_FIELD ||
 			key === "token" ||
 			key === "url" ||
 			(key === "endpoint" && nested !== null && typeof nested === "object")
@@ -1077,6 +1405,12 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 const BROKER_SESSION_CONTROL_FIELDS = new Set(["sessionId", "operation", "input", "confirm"]);
 const BROKER_SESSION_CONTROL_ABORT_FIELDS = new Set(["mode", "scope", "operator"]);
 const BROKER_SESSION_CONTROL_TIMEOUT_MS = 10_000;
+function brokerSessionRevisionRequest(input: Record<string, unknown>): SdkRevisionInput | BrokerResponse {
+	return (
+		normalizeSdkRevisionInput(input) ??
+		error("invalid_input", "session.revise requires bounded edit content or an exact revision selection.")
+	);
+}
 
 type BrokerSessionControlRequest = {
 	sessionId: string;
@@ -1207,6 +1541,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				worktree: lifecycleWorktreeTarget(input),
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
+				...(input.sourceEntryId === undefined ? {} : { sourceEntryId: input.sourceEntryId }),
 			};
 		case "session.resume":
 		case "session.delete":
@@ -1675,7 +2010,6 @@ type BrokerPublicationState =
 	| "heartbeat-ambiguous"
 	| "stopping";
 
-const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
@@ -1801,7 +2135,7 @@ export class Broker {
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
-			awaitRegistration: async input => await this.#awaitSpawnHostRegistration(input),
+			awaitRegistration: async input => await awaitSpawnHostRegistration(this.index, input),
 			dispatch: async input => await this.#dispatchSpawnPrompt(input),
 			reconcile: async input => await this.#reconcileSpawnPrompt(input),
 		};
@@ -2843,27 +3177,94 @@ export class Broker {
 				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle owner deadline expired");
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
 				if (Date.now() >= prep.semanticReadyDeadlineAt) throw new Error("Lifecycle marker deadline expired");
-				const registration = await this.#spawnPromptLayer.awaitRegistration({
+				const registrationRequest = {
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
 					owner: resolution.owner,
 					effectMarker: prep.effectMarker,
+				};
+				let registration = await this.#spawnPromptLayer.awaitRegistration({
+					...registrationRequest,
 					deadlineAt: prep.semanticReadyDeadlineAt,
 				});
+				// No row was observed in time, but the host published readiness, which it
+				// does only after registering and only before its cutoff. The observer was
+				// too slow, not the host: allow one bounded post-deadline observation.
+				// Readiness only gates this extra look (the host may still be writing its
+				// commit); admission below still needs the exact predicate on that fresh
+				// read and the late verdict, which requires the host's startup commit.
+				let firstMiss: SpawnRegistrationMiss | undefined;
+				const ownerAlive = (): boolean => processIncarnationForBroker(this, pid) === incarnation;
 				if (
-					!registration.ok ||
-					Date.now() >= prep.semanticReadyDeadlineAt ||
-					registration.registration.sessionId !== prep.childId ||
-					registration.registration.pid !== pid ||
-					registration.registration.processIncarnation !== incarnation ||
-					registration.registration.lifecycleRequestId !== prep.effectMarker ||
-					!Number.isSafeInteger(registration.registration.endpointGeneration) ||
-					registration.registration.endpointGeneration <= 0 ||
-					resolveEquivalentPath(registration.registration.cwd) !== resolveEquivalentPath(prep.cwd) ||
-					resolveEquivalentPath(registration.registration.stateRoot) !== resolveEquivalentPath(prep.stateRoot)
+					!registration.ok &&
+					registration.reason !== "mismatch" &&
+					ownerAlive() &&
+					(await hasSessionLifecycleReadiness(prep.stateRoot, prep.childId, marker)) &&
+					(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) === undefined
 				) {
-					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
+					firstMiss = registration.reason ?? "inconclusive";
+					registration = await this.#spawnPromptLayer.awaitRegistration({
+						...registrationRequest,
+						deadlineAt: Date.now() + SPAWN_LATE_REGISTRATION_RECHECK_MS,
+						// An owner that provably exited or a readable failure receipt already
+						// decides the refusal; do not hold the spawn (or keep polling a
+						// contended index) for the bound. Only the tri-state observer decides
+						// exit: an owner it cannot query (a Windows PID that fails to open is
+						// one) is uncertain, not death, and a receipt still being promoted is
+						// not yet readable (ending on it would misreport the failure as a
+						// timeout); both keep waiting.
+						recheck: {
+							decided: async () =>
+								spawnOwnerProvablyExited(pid, incarnation) ||
+								(await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker)) !== undefined,
+						},
+					});
+				}
+				const registrationMatches =
+					registration.ok &&
+					registration.registration.sessionId === prep.childId &&
+					registration.registration.pid === pid &&
+					registration.registration.processIncarnation === incarnation &&
+					registration.registration.lifecycleRequestId === prep.effectMarker &&
+					Number.isSafeInteger(registration.registration.endpointGeneration) &&
+					registration.registration.endpointGeneration > 0 &&
+					resolveEquivalentPath(registration.registration.cwd) === resolveEquivalentPath(prep.cwd) &&
+					resolveEquivalentPath(registration.registration.stateRoot) === resolveEquivalentPath(prep.stateRoot);
+				// The registration layer evaluates a read that began before the deadline
+				// even when it ends after it, so a slow observer no longer discards a
+				// host that registered in time. Registration is not readiness, though:
+				// past the deadline the host may already be rolling back, so a late
+				// observation is admitted only on the host's startup commit.
+				const lateVerdict =
+					registrationMatches && Date.now() >= prep.semanticReadyDeadlineAt
+						? await awaitLateSpawnHostVerdict(
+								prep.stateRoot,
+								prep.childId,
+								marker,
+								prep.terminationStartDeadlineAt,
+								pid => processIncarnationForBroker(this, pid),
+							)
+						: ({ kind: "ready" } as const);
+				// `!registration.ok` is implied by `!registrationMatches`; it is kept for type narrowing.
+				if (!registrationMatches || lateVerdict.kind !== "ready" || !registration.ok) {
+					const startupFailure =
+						lateVerdict.kind === "failed"
+							? lateVerdict.failure
+							: await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
+					const miss: SpawnRegistrationMiss | undefined = !registration.ok
+						? registration.reason
+						: registrationMatches
+							? "unconfirmed"
+							: "mismatch";
+					const recheckNote =
+						firstMiss === undefined
+							? ""
+							: ` (first observation: ${firstMiss}; the host published readiness, and a post-deadline recheck was taken)`;
+					if (startupFailure === undefined)
+						logger.warn(
+							`sdk broker: spawn child ${prep.childId} registration not admitted (${miss ?? "unknown"})${recheckNote}`,
+						);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
 					if (release === "closed" || release === "gone") {
 						const failure: SpawnSubstrateFailure = {
@@ -2871,7 +3272,7 @@ export class Broker {
 							code: startupFailure === undefined ? "child_registration_timeout" : "child_registration_failed",
 							message:
 								startupFailure === undefined
-									? "session.spawn child host did not register before the bounded admission deadline"
+									? spawnRegistrationMissMessage(miss) + recheckNote
 									: `session.spawn child host failed during ${startupFailure.phase}/${startupFailure.reason}`,
 						};
 						current = (
@@ -2905,7 +3306,16 @@ export class Broker {
 							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
 					);
 				}
+				if (firstMiss !== undefined)
+					logger.info(
+						`sdk broker: spawn child ${prep.childId} admitted by the post-deadline recheck (first observation: ${firstMiss})`,
+					);
 				pinnedRegistration = registration.registration;
+				// Taken now, while the registration is fresh, so attribution never depends
+				// on where a symlinked spelling points later.
+				// Same primitive as `spawnOwnerForRow`'s `resolveEquivalentPath`, minus its
+				// lexical fallback, so an unresolvable root is never recorded as canonical.
+				const stateRootIdentity = resolveExistingEquivalentPath(registration.registration.stateRoot);
 				const now = Date.now();
 				const proof = launched.proof;
 				const authorityRecord: SpawnAuthorityV1 = {
@@ -2927,6 +3337,7 @@ export class Broker {
 					endpointIncarnation: registration.registration.processIncarnation,
 					endpointCwd: registration.registration.cwd,
 					endpointStateRoot: registration.registration.stateRoot,
+					...(stateRootIdentity === undefined ? {} : { endpointStateRootIdentity: stateRootIdentity }),
 					closeState: "active",
 					createdAt: now,
 					updatedAt: now,
@@ -3513,52 +3924,6 @@ export class Broker {
 			});
 	}
 
-	async #awaitSpawnHostRegistration(input: {
-		childId: string;
-		cwd: string;
-		stateRoot: string;
-		owner: SpawnLifecycleOwner;
-		effectMarker: string;
-		deadlineAt: number;
-	}): Promise<{ ok: true; registration: SpawnHostRegistration & { lifecycleRequestId: string } } | { ok: false }> {
-		const deadline = input.deadlineAt;
-		for (;;) {
-			if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) return { ok: false };
-			try {
-				await this.index.refresh();
-				if (Date.now() >= deadline) return { ok: false };
-				// The launch locator is authority: a same-id row registered by an
-				// unrelated workspace must never be adopted as this spawn's child.
-				const row = this.index
-					.listSessionIdentities()
-					.find(candidate => spawnRegistrationMatches(candidate, input));
-				if (row) {
-					const incarnation = row.hostIncarnation ?? row.processIncarnation;
-					// An incarnation-less row is incomplete endpoint evidence; a partial pin
-					// previously just failed later at dispatch, so failing at registration keeps one boundary.
-					if (incarnation !== undefined) {
-						return {
-							ok: true,
-							registration: {
-								sessionId: row.sessionId,
-								endpointGeneration: row.endpointGeneration,
-								pid: row.pid,
-								processIncarnation: incarnation,
-								lifecycleRequestId: input.effectMarker,
-								cwd: row.locator.cwd,
-								stateRoot: row.locator.stateRoot,
-							},
-						};
-					}
-				}
-			} catch {
-				// A transient index read failure only delays the poll.
-			}
-			if (Date.now() >= deadline) return { ok: false };
-			await Bun.sleep(Math.min(SPAWN_HOST_REGISTRATION_POLL_MS, deadline - Date.now()));
-		}
-	}
-
 	/** One nonce-correlated frame exchange over a child host's authenticated endpoint. */
 	async #spawnChildExchange(input: {
 		sessionId: string;
@@ -3760,7 +4125,10 @@ export class Broker {
 	 * Routes session.close for a spawn-created child through its claim/authority
 	 * record. Non-spawn sessions fall through to the generic lifecycle path.
 	 */
-	async #maybeCloseSpawnChild(input: Record<string, unknown>): Promise<BrokerResponse | undefined> {
+	async #maybeCloseSpawnChild(
+		input: Record<string, unknown>,
+		idleHostExited?: IndexedSession,
+	): Promise<BrokerResponse | undefined> {
 		const store = this.#spawnAuthority;
 		// This runs BEFORE generic normalization, so it must resolve the same
 		// `id` alias that normalizeBrokerInput accepts. Reading only `sessionId`
@@ -3771,7 +4139,7 @@ export class Broker {
 		if (!store || !sessionId) return undefined;
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
-		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity, idleHostExited);
 		if (outcome === "closed") {
 			await this.#observeManagedNative(claim.lifecycleIdentity, "closed").catch(() => undefined);
 			return { ok: true, result: { code: "spawn_child_closed", sessionId } };
@@ -3786,7 +4154,10 @@ export class Broker {
 	 * substrate; identity mismatch retains durable uncertainty and never falls
 	 * back to name-only or PID-only cleanup. Repeated close replays safely.
 	 */
-	async #closeSpawnAuthority(lifecycleIdentity: string): Promise<"closed" | "uncertain" | "retained"> {
+	async #closeSpawnAuthority(
+		lifecycleIdentity: string,
+		idleHostExited?: IndexedSession,
+	): Promise<"closed" | "uncertain" | "retained"> {
 		const store = this.#spawnAuthority;
 		if (!store) return "retained";
 		try {
@@ -3866,15 +4237,30 @@ export class Broker {
 				// substrate close would refuse an already-gone identity. A managed substrate
 				// is closed only by its own successful close (the matching terminal verdict).
 				const headless = proof.substrateKind === "headless";
+				const pin = spawnPinFromAuthority(authority);
+				// Only the host-first idle-close path supplies this exact exit proof.
+				// Ordinary reap/close still requires the managed substrate's close verdict.
+				const exitedPinnedHost =
+					idleHostExited !== undefined &&
+					pin !== undefined &&
+					idleHostExited.sessionId === pin.sessionId &&
+					matchesSpawnPin(idleHostExited, pin);
 				let current =
 					verdict === "verified" && headless
 						? await this.#closeSpawnHostGracefully(authority, proof, provider)
 						: verdict;
-				if (current === "verified" || (!headless && current === "gone")) {
-					const closedSubstrate = await provider.close(proof);
-					if (!closedSubstrate.ok && !headless) return "retained";
+				if (current === "verified" || (!headless && current === "gone" && !exitedPinnedHost)) {
+					let closedSubstrate = false;
+					try {
+						closedSubstrate = (await provider.close(proof)).ok;
+					} catch (error) {
+						if (headless || !exitedPinnedHost) throw error;
+						// The managed owner can exit while close is running. Only this
+						// exact host-first proof permits reconciling a failed/throwing close.
+					}
+					if (!closedSubstrate && !headless && !exitedPinnedHost) return "retained";
 					current = await provider.verify(proof);
-					if (!closedSubstrate.ok && current !== "gone") return "retained";
+					if (!closedSubstrate && current !== "gone") return "retained";
 				}
 				if (current !== "gone") return "retained";
 			} else return "retained";
@@ -4397,20 +4783,24 @@ export class Broker {
 					const foreignHostOwner = !hostUnqualified && current.ownerHostId !== hostIdentity.ownerHostId;
 					let refusal: string;
 					let errorMessage: string;
+					let code: BrokerLockRefusalCode;
 					if (hostUnqualified) {
+						code = "host_unqualified";
 						refusal = `owner pid ${current.pid} has no host identity; automatic recovery is unsafe for shared agent directories. Stop every broker using this agent directory on all hosts, then follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
 						errorMessage = `Broker lock owner is host-unqualified (pid ${current.pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
 					} else if (foreignHostOwner) {
+						code = "foreign_host";
 						refusal = `owner pid ${current.pid} is attributed to another host; its liveness cannot be verified here`;
 						errorMessage = `Broker lock owner is attributed to a different host (pid ${current.pid}); refusing automatic recovery because its liveness cannot be verified from this host.`;
 					} else {
+						code = "live_owner";
 						refusal = `live pid ${current.pid} has published no discovery record`;
 						errorMessage = `Broker lock is held by a live owner (pid ${current.pid})`;
 					}
 					logger.warn(
 						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by ${refusal}`,
 					);
-					throw new Error(errorMessage);
+					throw new BrokerLockRefusedError(errorMessage, this.#lock, code, current.pid);
 				}
 				continue;
 			}
@@ -5230,16 +5620,38 @@ export class Broker {
 			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const request = brokerSessionControlRequest(input);
 		if (isBrokerResponse(request)) return request;
-		const target = `session.control\u0000${request.sessionId}`;
+		return this.#dispatchSessionControl(request.sessionId, "turn.abort", request.abortInput, idempotencyKey);
+	}
+	async #sessionRevise(input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (
+			typeof idempotencyKey !== "string" ||
+			idempotencyKey.length === 0 ||
+			/[\u0000-\u001f\u007f]/u.test(idempotencyKey) ||
+			new TextEncoder().encode(idempotencyKey).length > 128
+		)
+			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
+		const request = brokerSessionRevisionRequest(input);
+		if (isBrokerResponse(request)) return request;
+		const { sessionId, ...revision } = request;
+		return this.#dispatchSessionControl(sessionId, "session.revise", revision, idempotencyKey);
+	}
+	async #dispatchSessionControl(
+		sessionId: string,
+		operation: "turn.abort" | "session.revise",
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<BrokerResponse> {
+		const target = `session.control\u0000${sessionId}`;
 		const previous = this.#chains.get(target) ?? Promise.resolve();
-		let release!: () => void;
-		const current = new Promise<void>(resolve => (release = resolve));
+		const { promise: current, resolve: release } = Promise.withResolvers<void>();
 		const chain = previous.then(() => current);
 		this.#chains.set(target, chain);
 		await previous;
 		try {
-			const authority = await this.#sessionControlAuthority(request.sessionId);
+			const authority = await this.#sessionControlAuthority(sessionId);
 			if (isBrokerResponse(authority)) return authority;
+			if (operation === "session.revise" && authority.record.lifecycleRequestId === undefined)
+				return error("operation_prohibited", "Prompt revisions require a Broker-owned lifecycle session.");
 			let client: SdkClient;
 			try {
 				client = await SdkClient.connect(authority.endpoint.url as string, authority.endpoint.token as string, {
@@ -5252,16 +5664,17 @@ export class Broker {
 					: error("unavailable", "session endpoint is unavailable");
 			}
 			try {
-				const currentAuthority = await this.#sessionControlAuthority(request.sessionId);
+				const currentAuthority = await this.#sessionControlAuthority(sessionId);
 				if (isBrokerResponse(currentAuthority)) return currentAuthority;
 				if (!sameSessionControlAuthority(authority, currentAuthority))
 					return error("endpoint_stale", "session endpoint changed before control dispatch");
+				const capabilityField =
+					operation === "session.revise"
+						? BROKER_RUNTIME_REVISE_CAPABILITY_FIELD
+						: BROKER_RUNTIME_ABORT_CAPABILITY_FIELD;
 				const response = await client.control(
-					"turn.abort",
-					{
-						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.abortCapability,
-					},
+					operation,
+					{ ...input, [capabilityField]: authority.abortCapability },
 					{
 						confirm: true,
 						idempotencyKey,
@@ -5352,7 +5765,9 @@ export class Broker {
 			sessions: (scope === undefined
 				? [...result.sessions]
 				: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator))
-			).filter(session => resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			).filter(
+				session => !session.ephemeral && (resolveSessionId === undefined || session.sessionId === resolveSessionId),
+			),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
@@ -5369,7 +5784,7 @@ export class Broker {
 				...publicSession
 			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			const spawnOwner = spawnOwners?.get(session.sessionId);
+			const spawnOwner = spawnOwnerForRow(session, spawnOwners);
 			return {
 				...publicSession,
 				...(incarnation === undefined ? {} : { endpointIncarnation: incarnation }),
@@ -5475,7 +5890,11 @@ export class Broker {
 			this.#fence("suspect-unpublished");
 			return error("unavailable", "broker lock ownership is not held");
 		}
-		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
+		if (operation === "broker.status")
+			return Promise.resolve({
+				ok: true,
+				result: { ...this.status(), capabilities: { ephemeralSessions: supportsEphemeralSessions(this) } },
+			});
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
 				result => result as BrokerResponse,
@@ -5531,16 +5950,21 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		if (operation !== "session.revise" && input.body !== undefined)
+			return error("invalid_input", "body is supported only by session.revise, not lifecycle history operations.");
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
 		if (operation === "task.dag") return this.#handleManagedTaskDag(input, idempotencyKey);
-		if (operation === "session.close") {
+		if (operation === "session.close" && input.ifIdle !== undefined && typeof input.ifIdle !== "boolean")
+			return error("invalid_input", "ifIdle must be a boolean");
+		if (operation === "session.close" && input.ifIdle !== true) {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
 		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
+		if (operation === "session.revise") return this.#sessionRevise(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
 			if (isBrokerResponse(lookup)) return lookup;
@@ -5634,6 +6058,21 @@ export class Broker {
 							missingIdentityFields,
 						};
 					} else if (match.sessionId === resolveSessionId && nlink !== undefined && ctimeNs !== undefined) {
+						let recap: SessionListSavedSessionRecap | undefined;
+						try {
+							recap = sessionListSavedSessionRecap(
+								await SessionManager.readSessionRecapReadOnly(match.path, {
+									dev: match.identity.dev,
+									ino: match.identity.ino,
+									nlink,
+									size: match.identity.size,
+									mtimeNs: match.identity.mtimeNs,
+									ctimeNs,
+								}),
+							);
+						} catch {
+							recap = undefined;
+						}
 						savedSession = {
 							id: match.sessionId,
 							path: match.path,
@@ -5647,6 +6086,7 @@ export class Broker {
 								ctimeNs: ctimeNs.toString(),
 								sha256: match.identity.sha256,
 							},
+							...(recap === undefined ? {} : { recap }),
 						};
 					}
 				} else {
@@ -5715,17 +6155,17 @@ export class Broker {
 				? { closeAuthorityBound: true }
 				: {}),
 		};
+		// One key admits one request. Checked here and again atomically when the row is
+		// begun, because a concurrent request for another target holds another chain.
+		const conflictsWithKeyHolder = (holder: LifecycleLedgerEntry): boolean =>
+			!(
+				operation === "session.close" &&
+				(holder.intendedSessionId === input.sessionId || holder.resultSessionId === input.sessionId)
+			) &&
+			(holder.fingerprint !== fingerprint || holder.requestHash !== requestedRequestHash);
 		if (!this.ledger.get(identity)) {
 			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
-			const sameCloseSession =
-				operation === "session.close" &&
-				(matchingOperation?.intendedSessionId === input.sessionId ||
-					matchingOperation?.resultSessionId === input.sessionId);
-			if (
-				matchingOperation &&
-				!sameCloseSession &&
-				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
-			)
+			if (matchingOperation && conflictsWithKeyHolder(matchingOperation))
 				return error("idempotency_conflict", "idempotency key was used with a different request");
 			const matchingLegacy = matchingOperation;
 			if (matchingLegacy) {
@@ -5822,7 +6262,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, metadata);
+			const begun = await this.ledger.begin(identity, requestHash, metadata, conflictsWithKeyHolder);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				// Proven errors are immutable even when their response carries cleanup
@@ -5919,7 +6359,15 @@ export class Broker {
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
-			const response = outcome.response;
+			let response = outcome.response;
+			if (operation === "session.close" && !response.ok && response.error.code === "busy") {
+				await this.ledger.retryCloseRefusal(identity);
+				return response;
+			}
+			if (operation === "session.close" && input.ifIdle === true && response.ok) {
+				const spawnClose = await this.#maybeCloseSpawnChild(input, outcome.idleHostExited);
+				if (spawnClose && !spawnClose.ok) response = spawnClose;
+			}
 			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			// Record the refusal's own target session so the fence it may leave
 			// is scoped to that session. Without this, a session.delete refusal
@@ -5974,7 +6422,6 @@ export class Broker {
 				});
 				return uncertain;
 			}
-			terminalPersistenceHooksForTest.get(this)?.();
 			await outcome.deferredArtifactCleanup?.();
 			return response;
 		} finally {
@@ -5982,12 +6429,6 @@ export class Broker {
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
 	}
-}
-
-/** Test-only hook for simulating a process crash after terminal persistence verification. */
-export function setTerminalPersistenceHookForTest(broker: Broker, hook: (() => void) | undefined): void {
-	if (hook) terminalPersistenceHooksForTest.set(broker, hook);
-	else terminalPersistenceHooksForTest.delete(broker);
 }
 
 /** Test-only hook for shortening the bounded ambiguity deadline. */

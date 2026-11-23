@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
@@ -15,6 +15,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async/job-manager";
+import { BROKER_RUNTIME_REVISE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
 
 async function fixture(extensions: ExtensionFactory[] = [], parentTaskPrefix?: string) {
 	const temp = TempDir.createSync("@gjc-sdk-portable-");
@@ -90,6 +91,181 @@ function pendingMonitor(manager: AsyncJobManager, ownerId: string) {
 }
 
 describe("portable services through the real SDK factory", () => {
+	it("wires real noninteractive message, transcript, SDK and command actions before session start", async () => {
+		const runtimeErrors: unknown[] = [];
+		let transcriptText: string | undefined;
+		let controlResult: unknown;
+		let deniedLifecycle: unknown;
+		let commandResult: unknown;
+		const messagePersisted = Promise.withResolvers<void>();
+		const extension: ExtensionFactory = api => {
+			api.on("session_start", async (_event, ctx) => {
+				api.appendEntry("headless-start", { initialized: true });
+				api.sendMessage({
+					customType: "headless-message",
+					content: "headless message",
+					display: false,
+					attribution: "agent",
+				});
+				const transcript = ctx.getTranscript();
+				const user = transcript.find(entry => entry.role === "user");
+				if (user) transcriptText = ctx.getTranscriptBody(user.id);
+				controlResult = await ctx.sdkControl?.("permission_mode.set", { mode: "deny" });
+				try {
+					await ctx.sdkControl?.("session.new", {});
+				} catch (error) {
+					deniedLifecycle = error;
+				}
+			});
+			api.registerCommand("headless-probe", {
+				description: "Exercise initialized command context without provider work",
+				handler: async (_args, ctx) => {
+					await ctx.waitForIdle();
+					commandResult = await ctx.sdkControl?.("permission_mode.set", { mode: "prompt" });
+					api.appendEntry("headless-command", { completed: true });
+				},
+			});
+		};
+		const env = await fixture([extension]);
+		const { session } = env.result;
+		const manager = session.sessionManager;
+		manager.appendMessage({ role: "user", content: "persisted before headless initialization", timestamp: 1 });
+		const unsubscribe = session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "custom" &&
+				event.message.customType === "headless-message"
+			)
+				messagePersisted.resolve();
+		});
+		try {
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => runtimeErrors.push(error),
+				reportRuntimeError: error => runtimeErrors.push(error),
+			});
+			await Promise.race([messagePersisted.promise, Bun.sleep(1000)]);
+			expect(runtimeErrors).toEqual([]);
+			expect(transcriptText).toContain("persisted before headless initialization");
+			expect(controlResult).toEqual({ changed: true, mode: "deny" });
+			expect(session.sdkPermissionMode).toBe("deny");
+			expect(deniedLifecycle).toMatchObject({ code: "operation_prohibited" });
+			expect(manager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "custom", customType: "headless-start", data: { initialized: true } }),
+			);
+			expect(session.messages).toContainEqual(
+				expect.objectContaining({ role: "custom", customType: "headless-message", content: "headless message" }),
+			);
+			await session.prompt("/headless-probe");
+			expect(commandResult).toEqual({ changed: true, mode: "prompt" });
+			expect(session.sdkPermissionMode).toBe("prompt");
+			expect(manager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "custom", customType: "headless-command", data: { completed: true } }),
+			);
+			expect(session.isStreaming).toBe(false);
+			expect(runtimeErrors).toEqual([]);
+		} finally {
+			unsubscribe();
+			await env.dispose();
+		}
+	});
+	it("routes process-bound Broker revision selection through the real initialized context", async () => {
+		if (process.env.GJC_HEADLESS_REVISION_PROBE !== "1") {
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					"test",
+					import.meta.path,
+					"--test-name-pattern",
+					"routes process-bound Broker revision selection",
+				],
+				{
+					env: {
+						...process.env,
+						GJC_HEADLESS_REVISION_PROBE: "1",
+						GJC_LIFECYCLE_REQUEST_ID: "headless-selection-private-authority",
+					},
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ code, output: stdout + stderr }).toMatchObject({ code: 0 });
+			if (code !== 0) throw new Error(stdout + stderr);
+			return;
+		}
+		let selection: unknown;
+		let untrusted: unknown;
+		let originalUser = "";
+		const errors: unknown[] = [];
+		const env = await fixture([
+			api => {
+				api.on("session_start", async (_event, ctx) => {
+					const request = { sessionId: env.result.session.sessionId, entryId: originalUser, action: "select" };
+					try {
+						await ctx.sdkControl?.("session.revise", request);
+					} catch (error) {
+						untrusted = error;
+					}
+					selection = await ctx.sdkControl?.("session.revise", {
+						...request,
+						[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: process.env.GJC_LIFECYCLE_REQUEST_ID,
+					});
+				});
+			},
+		]);
+		const { session } = env.result;
+		const manager = session.sessionManager;
+		originalUser = manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		const assistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "retained answer" }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "fixture",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp: 2,
+		};
+		const originalLeaf = manager.appendMessage(assistant);
+		manager.resetLeaf();
+		manager.appendMessage({ role: "user", content: "replacement", timestamp: 3 });
+		manager.appendMessage({ ...assistant, timestamp: 4 });
+		session.agent.replaceMessages(manager.buildSessionContext().messages);
+		const entries = manager.getEntries();
+		try {
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => errors.push(error),
+				reportRuntimeError: error => errors.push(error),
+			});
+			expect(errors).toEqual([]);
+			expect(untrusted).toMatchObject({ code: "operation_prohibited" });
+			expect(selection).toEqual({
+				selected: true,
+				status: "selected",
+				sessionId: session.sessionId,
+				entryId: originalUser,
+				leafEntryId: originalLeaf,
+			});
+			expect(manager.getLeafId()).toBe(originalLeaf);
+			expect(manager.getEntries()).toEqual(entries);
+			expect(session.messages).toContainEqual(expect.objectContaining({ role: "user", content: "original" }));
+			expect(session.isStreaming).toBe(false);
+		} finally {
+			await env.dispose();
+		}
+	});
+
 	it("initializes extension context separately from tool UI and validates portable replies", async () => {
 		const ready = Promise.withResolvers<void>();
 		let answer: string | undefined;
@@ -204,17 +380,9 @@ describe("portable services through the real SDK factory", () => {
 			const owned = pendingMonitor(manager, env.owner);
 			const foreign = pendingMonitor(manager, "foreign-owner");
 			const sessionScoped = pendingMonitor(manager, sessionId);
-			const subscribe = spyOn(manager, "onChange");
-			let view: JobObservation;
-			try {
-				expect(subscribe).not.toHaveBeenCalled();
-				view = env.result.jobObservation!;
-				expect(view).toBeInstanceOf(JobObservation);
-				expect(env.result.jobObservation).toBe(view);
-				expect(subscribe).toHaveBeenCalledTimes(1);
-			} finally {
-				subscribe.mockRestore();
-			}
+			const view = env.result.jobObservation!;
+			expect(view).toBeInstanceOf(JobObservation);
+			expect(env.result.jobObservation).toBe(view);
 			expect(view.getSnapshot().jobs.map(job => job.id)).toEqual([owned.id]);
 			for (const target of [foreign, sessionScoped]) {
 				expect(() => view.getMonitorOutput(target)).toThrow(expect.objectContaining({ code: "not_found" }));
@@ -226,6 +394,44 @@ describe("portable services through the real SDK factory", () => {
 			expect(env.result.jobObservation).toBe(view);
 			expect(() => view.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
 			expect(AsyncJobManager.forEndpoint(sessionId)).toBeUndefined();
+		} finally {
+			await env.dispose();
+		}
+	});
+
+	it("tracks owned failure evidence separately from foreign job changes through the real factory", async () => {
+		const env = await fixture();
+		try {
+			const manager = AsyncJobManager.forEndpoint(env.result.session.sessionId)!;
+			const view = env.result.jobObservation!;
+			const original = view.getSnapshot().failureRevision;
+			const foreign = manager.register(
+				"bash",
+				"foreign failure",
+				async () => {
+					throw new Error("foreign failure");
+				},
+				{ ownerId: "foreign-owner" },
+			);
+			manager.acknowledgeDeliveries([foreign]);
+			await manager.waitForAll();
+			expect(view.getSnapshot().failureRevision).toBe(original);
+			expect(view.getSnapshot().jobs).toEqual([]);
+			const owned = manager.register(
+				"bash",
+				"owned failure",
+				async () => {
+					throw new Error("owned failure");
+				},
+				{ ownerId: env.owner },
+			);
+			manager.acknowledgeDeliveries([owned]);
+			await manager.waitForAll();
+			const snapshot = view.getSnapshot();
+			expect(snapshot.failureRevision).not.toBe(original);
+			expect(snapshot.jobs).toEqual([expect.objectContaining({ id: owned, status: "failed" })]);
+			await env.result.session.dispose();
+			expect(() => view.getSnapshot()).toThrow(expect.objectContaining({ code: "disposed" }));
 		} finally {
 			await env.dispose();
 		}

@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -414,7 +415,8 @@ export declare class Process {
    * Unlike [`Self::from_pid`] returning `null` (which conflates a confirmed-
    * dead pid with one that simply could not be queried), this keeps positive
    * OS-reported absence separate from every inconclusive outcome. It never
-   * signals, kills, reaps, waits on, or spawns any process.
+   * signals, kills, reaps, blocks waiting for, or spawns any process. Windows
+   * checks exit state with a zero-timeout wait on its own handle.
    */
   static observe(pid: number): NativeProcessObservation
   /** Operating-system process identifier for this process reference. */
@@ -686,7 +688,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_19_2(): void
+export declare function __piNativesV0_22_0(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -770,6 +772,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -930,6 +934,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */
@@ -2302,6 +2308,24 @@ export interface NativeExactUnlinkResult {
    * namespace mutation.
    */
   windowsErrorCode?: string
+  /**
+   * ACL failure details: offending principal (account name or SID string).
+   * Present only when code is `acl_present` on Windows exact-replace
+   * pre-mutation failures.
+   */
+  aclFailurePrincipal?: string
+  /**
+   * ACL failure detail: whether the offending ACE is inherited from a parent
+   * directory. Present only when code is `acl_present` on Windows
+   * exact-replace pre-mutation failures.
+   */
+  aclFailureInherited?: boolean
+  /**
+   * ACL failure detail: identifies which path failed ACL validation
+   * (`source` or `destination`). Present only when code is `acl_present` on
+   * Windows exact-replace pre-mutation failures.
+   */
+  aclFailureSide?: string
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */
@@ -2431,7 +2455,8 @@ export interface NativePermissionRepairResult {
  * - `"present"` — `incarnation` is the exact kernel-reported identity
  *   evidence.
  * - `"absent"` — the OS positively confirmed no process currently has this
- *   pid.
+ *   pid, or (Windows) that the process has exited while a handle still keeps
+ *   its object queryable.
  * - `"unknown"` — `reasonCode` explains why liveness could not be determined
  *   (e.g. an invalid pid, a permission denial, or a platform limitation); this
  *   is never proof of death.
@@ -2852,6 +2877,14 @@ export interface ReplyEvent {
   /** One-shot receipt binding this callback to the atomically claimed reply. */
   replyReceiptId: string
 }
+
+/**
+ * Re-assert the console code pages recorded before the first shell command.
+ *
+ * The Windows TUI calls this before each frame, because a background shell
+ * child sharing the console may have switched them (#7760). No-op elsewhere.
+ */
+export declare function restoreConsoleCodePagesForRender(): void
 
 /**
  * Retain the existing no-follow SDK publication objects after one-time

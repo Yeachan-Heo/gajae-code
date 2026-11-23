@@ -21,10 +21,6 @@ export function reportableReceipt({ text, artifactPath }: ReceiptSource): boolea
 	return Boolean(text?.trim() || artifactPath?.trim());
 }
 
-export function receiptStateForTerminal(source: ReceiptSource): Extract<ReceiptState, "present" | "missing"> {
-	return reportableReceipt(source) ? "present" : "missing";
-}
-
 /** Terminal receipt evidence is monotonic: present > missing > unknown. */
 export function reduceReceiptState(
 	existing: Exclude<ReceiptState, "absent"> | undefined,

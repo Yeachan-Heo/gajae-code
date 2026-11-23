@@ -196,6 +196,31 @@ signal.pause()
 	return bin;
 }
 
+async function pathExists(target: string) {
+	try {
+		await fs.lstat(target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Every entry under `dir` with its type, mode, link count and file bytes, for before/after comparison. */
+async function treeSnapshot(dir: string): Promise<string[]> {
+	const entries: string[] = [];
+	const visit = async (current: string) => {
+		for (const name of (await fs.readdir(current)).sort()) {
+			const entry = path.join(current, name);
+			const stat = await fs.lstat(entry);
+			const kind = stat.isSymbolicLink() ? `link:${await fs.readlink(entry)}` : stat.isDirectory() ? "dir" : `file:${stat.nlink}:${await Bun.file(entry).text()}`;
+			entries.push(`${path.relative(dir, entry)} ${(stat.mode & 0o7777).toString(8)} ${kind}`);
+			if (stat.isDirectory()) await visit(entry);
+		}
+	};
+	await visit(dir);
+	return entries;
+}
+
 async function waitFor(file: string, timeout = 5000) {
 	const end = Date.now() + timeout;
 	while (Date.now() < end) {
@@ -228,7 +253,7 @@ describe("gjc-session create public owner lifecycle", () => {
 		expect(detachedResult.exitCode).toBe(1); expect(detachedResult.stderr.toString()).toContain("could not determine branch");
 	});
 
-	test("names its default state directory through the physical workspace and keeps an explicit one as given", async () => {
+	test("names its default state directory through the physical workspace and keeps a physical explicit one as given", async () => {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-physical-state-"))); roots.push(root);
 		const dir = await worktree(root); const bin = await fixture(root);
 		const linked = path.join(root, "linked-worktree");
@@ -239,14 +264,20 @@ describe("gjc-session create public owner lifecycle", () => {
 		const firstStateDir = async (name: string, overrides: Record<string, string>) => {
 			const log = path.join(root, `${name}.log`);
 			sessions.push({ name, socket: `gjc-${name}` });
-			Bun.spawnSync(["bash", createScript, name, linked], { env: env({ GJC_BIN: bin, GJC_FIXTURE_ISOLATION_LOG: log, PATH: fakePath, ...overrides }), stdout: "pipe", stderr: "pipe" });
+			const result = Bun.spawnSync(["bash", createScript, name, linked], { env: env({ GJC_BIN: bin, GJC_FIXTURE_ISOLATION_LOG: log, PATH: fakePath, ...overrides }), stdout: "pipe", stderr: "pipe" });
+			if (!(await Bun.file(log).exists())) return { stderr: result.stderr.toString() };
 			const first = (await Bun.file(log).text()).split("\n").find(line => line.trim() !== "");
 			return (JSON.parse(first ?? "{}") as { state_dir?: string }).state_dir;
 		};
 		const defaultName = `physical-${Date.now()}`;
 		expect(await firstStateDir(defaultName, {})).toBe(path.join(dir, ".gjc-session-state", defaultName));
-		const explicit = path.join(linked, "explicit-state");
+		const explicit = path.join(root, "explicit-state");
 		expect(await firstStateDir(`explicit-${Date.now()}`, { GJC_SESSION_STATE_DIR: explicit })).toBe(explicit);
+		// An explicit path through a link is the caller's spelling, not a physical
+		// one, so it is refused before any protocol request or write.
+		const linkedExplicit = path.join(linked, "explicit-state");
+		expect(await firstStateDir(`linked-explicit-${Date.now()}`, { GJC_SESSION_STATE_DIR: linkedExplicit })).toEqual({ stderr: expect.stringContaining("unsafe owner lifecycle path") });
+		expect(await pathExists(path.join(dir, "explicit-state"))).toBe(false);
 	});
 
 	test("writes worktree baseline and public creation metadata before planning", async () => {
@@ -578,6 +609,7 @@ exit 1
 		await executable(
 			postmortem,
 			`#!/usr/bin/env bash
+gjc_session_require_private_path() { return 0; }
 gjc_session_publish_current_alias() { cp "$1" "$2"; }
 gjc_session_validate_raw_verdict() { return 0; }
 gjc_session_write_vanished_json() { : >"$1"; }
@@ -1094,4 +1126,164 @@ test("keeps owner status while exposing canonical-collision and alias publicatio
 	}
 }, 20_000);
 
+});
+
+describe("gjc-session owner lifecycle state tail refuses links", () => {
+	async function outsideTree(root: string) {
+		const outside = path.join(root, "outside");
+		await fs.mkdir(outside, { recursive: true });
+		await Bun.write(path.join(outside, "sentinel"), "KEEP-ME\n");
+		return outside;
+	}
+
+	test.each(["state-dir", "session-dir", "lifecycle-dir", "lock-hardlink", "lock-symlink", "lock-dangling-symlink"] as const)("refuses a linked %s before any write", async kind => {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), `gjc-tail-${kind}-`))); roots.push(root);
+			const dir = await worktree(root); const bin = await fixture(root); const outside = await outsideTree(root);
+			const name = `tail-${kind}-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+			const state = path.join(root, "state"); const lifecycle = path.join(state, name, "owner-lifecycle"); const lock = path.join(lifecycle, "generation.transition.lock");
+			if (kind === "state-dir") await fs.symlink(outside, state);
+			if (kind === "session-dir") { await fs.mkdir(state); await fs.symlink(outside, path.join(state, name)); }
+			if (kind === "lifecycle-dir") { await fs.mkdir(path.join(state, name), { recursive: true }); await fs.symlink(outside, lifecycle); }
+			if (kind.startsWith("lock-")) await fs.mkdir(lifecycle, { recursive: true });
+			if (kind === "lock-hardlink") await fs.link(path.join(outside, "sentinel"), lock);
+			if (kind === "lock-symlink") await fs.symlink(path.join(outside, "sentinel"), lock);
+			if (kind === "lock-dangling-symlink") await fs.symlink(path.join(outside, "created-through-link"), lock);
+			const before = await treeSnapshot(outside);
+			const log = path.join(root, "isolation.log");
+			const result = Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state, GJC_FIXTURE_ISOLATION_LOG: log }), stdout: "pipe", stderr: "pipe" });
+			expect({ kind, exitCode: result.exitCode }).toEqual({ kind, exitCode: 1 });
+			expect(result.stderr.toString()).toContain("unsafe owner lifecycle path");
+			expect(await treeSnapshot(outside)).toEqual(before);
+			expect(await Bun.file(log).exists()).toBe(false);
+	});
+
+	test.each(["lock-database-hardlink", "runner-symlink"] as const)("refuses a %s found after the exit trap is armed, and the trap writes nothing at the target", async kind => {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), `gjc-tail-trap-${kind}-`))); roots.push(root);
+			const dir = await worktree(root); const bin = await fixture(root); const outside = await outsideTree(root);
+			const name = `tail-trap-${kind}-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+			const state = path.join(root, "state"); const lifecycle = path.join(state, name, "owner-lifecycle");
+			await fs.mkdir(lifecycle, { recursive: true });
+			if (kind === "lock-database-hardlink") await fs.link(path.join(outside, "sentinel"), path.join(lifecycle, "owner-locks.sqlite"));
+			else await fs.symlink(path.join(outside, "sentinel"), path.join(state, "runner.sh"));
+			const before = await treeSnapshot(outside);
+			const result = Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }), stdout: "pipe", stderr: "pipe" });
+			expect({ kind, exitCode: result.exitCode }).toEqual({ kind, exitCode: 1 });
+			expect(result.stderr.toString()).toContain("unsafe owner lifecycle path");
+			expect(await treeSnapshot(outside)).toEqual(before);
+			// The trap still records the failure inside the private tail.
+			expect((await fs.readdir(lifecycle)).some(file => file.startsWith("creation-failed-"))).toBe(true);
+			expect(Bun.spawnSync(["tmux", "-L", `gjc-${name}`, "has-session", "-t", `=${name}`], { stdout: "pipe", stderr: "pipe" }).exitCode).not.toBe(0);
+	});
+
+	test("keeps late supervisor receipts out of a lifecycle directory swapped for a link", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tail-supervisor-"))); roots.push(root);
+		const dir = await worktree(root); const bin = await fixture(root, "direct", "exit 0"); const outside = await outsideTree(root);
+		const name = `tail-supervisor-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+		const state = path.join(root, "state"); const lifecycle = path.join(state, name, "owner-lifecycle");
+		expect(Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }) }).exitCode).toBe(0);
+		const generation = ((await Bun.file(path.join(lifecycle, "generation.json")).json()) as { generation: string }).generation;
+		// Let the session's own owner finish and finalize before the swap.
+		await waitFor(path.join(state, "final.json"));
+		const end = Date.now() + 5000;
+		while (Bun.spawnSync(["tmux", "-L", `gjc-${name}`, "has-session", "-t", `=${name}`], { stdout: "pipe", stderr: "pipe" }).exitCode === 0 && Date.now() < end) await Bun.sleep(50);
+		await fs.rename(lifecycle, path.join(state, name, "owner-lifecycle-moved"));
+		await fs.symlink(outside, lifecycle);
+		const before = await treeSnapshot(outside);
+		const owner = path.join(root, "owner-exit"); const finalizer = path.join(root, "finalizer-fail");
+		await executable(owner, "#!/usr/bin/env bash\nexit 23\n"); await executable(finalizer, "#!/usr/bin/env bash\nexit 24\n");
+		const supervisor = Bun.spawn(["python3", path.join(state, "supervisor.py")], { env: { ...process.env, GJC_SESSION_NAME: name, GJC_SESSION_WORKDIR: dir, GJC_SESSION_STATE_DIR: state, GJC_SESSION_OWNER_GENERATION: generation, GJC_TMUX_OWNER_SERVER_KEY: `gjc-${name}`, GJC_SESSION_GJC_BIN: owner, GJC_SESSION_POSTMORTEM_SH: postmortemScript, GJC_SESSION_RUNNER_SH: finalizer }, stdout: "pipe", stderr: "pipe" });
+		expect(await supervisor.exited).toBe(23);
+		expect(await new Response(supervisor.stderr).text()).toContain("failure publication status unavailable");
+		expect(await treeSnapshot(outside)).toEqual(before);
+		expect(await Bun.file(path.join(state, "finalization-failure.json")).exists()).toBe(false);
+	});
+
+	test("keeps the owner exit status when the supervisor's path check cannot finish", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tail-check-timeout-"))); roots.push(root);
+		const dir = await worktree(root); const bin = await fixture(root, "direct", "exit 0");
+		const name = `tail-check-timeout-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+		const state = path.join(root, "state");
+		expect(Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }) }).exitCode).toBe(0);
+		await waitFor(path.join(state, "final.json"));
+		const generation = ((await Bun.file(path.join(state, name, "owner-lifecycle", "generation.json")).json()) as { generation: string }).generation;
+		// The supervisor runs on an absolute interpreter; only the checker's `python3` hangs past its 3-second budget.
+		const python = Bun.which("python3"); if (!python) throw new Error("python3 not found");
+		await executable(path.join(root, "slow-bin", "python3"), "#!/usr/bin/env bash\nsleep 5\n");
+		const owner = path.join(root, "owner-exit"); const finalizer = path.join(root, "finalizer-fail");
+		await executable(owner, "#!/usr/bin/env bash\nexit 23\n"); await executable(finalizer, "#!/usr/bin/env bash\nexit 24\n");
+		const supervisor = Bun.spawn([python, path.join(state, "supervisor.py")], { env: { ...process.env, PATH: `${path.join(root, "slow-bin")}:${process.env.PATH ?? ""}`, GJC_SESSION_NAME: name, GJC_SESSION_WORKDIR: dir, GJC_SESSION_STATE_DIR: state, GJC_SESSION_OWNER_GENERATION: generation, GJC_TMUX_OWNER_SERVER_KEY: `gjc-${name}`, GJC_SESSION_GJC_BIN: owner, GJC_SESSION_POSTMORTEM_SH: postmortemScript, GJC_SESSION_RUNNER_SH: finalizer }, stdout: "pipe", stderr: "pipe" });
+		expect(await supervisor.exited).toBe(23);
+		expect(await new Response(supervisor.stderr).text()).toContain("failure publication status unavailable");
+	}, 20_000);
+
+	test("postmortem writers refuse a linked directory, lock database or leaf and create missing directories owner-only", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tail-postmortem-"))); roots.push(root);
+		const outside = await outsideTree(root);
+		await fs.mkdir(path.join(outside, "deep"));
+		const linked = path.join(root, "linked"); await fs.symlink(path.join(outside, "deep"), linked);
+		const session = "tail-postmortem"; const generation = "11111111-1111-4111-8111-111111111111";
+		const state = path.join(root, "state"); const lifecycle = path.join(state, session, "owner-lifecycle"); await fs.mkdir(lifecycle, { recursive: true });
+		const generationJson = path.join(lifecycle, "generation.json");
+		await Bun.write(generationJson, `${JSON.stringify({ schema_version: 1, session_id: session, generation })}\n`);
+		const canonical = path.join(lifecycle, `started-${generation}.json`);
+		await Bun.write(canonical, `${JSON.stringify({ schema_version: 1, kind: "started", session_id: session, owner_generation: generation })}\n`);
+		const run = (script: string, args: string[], extraEnv: Record<string, string> = {}) => Bun.spawnSync(["bash", "-c", `source "$1"; shift; ${script} "$@"`, "postmortem", postmortemScript, ...args], { env: { ...process.env, ...extraEnv }, stdout: "pipe", stderr: "pipe" });
+		const publish = (alias: string, extraEnv: Record<string, string> = {}, source = canonical) => run("gjc_session_publish_current_alias", [source, alias, generationJson, session, generation, "started"], extraEnv);
+		const expectRefused = (result: ReturnType<typeof run>, message = "unsafe owner lifecycle path") => {
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr.toString()).toContain(message);
+		};
+		const sentinelLinks = async () => (await fs.lstat(path.join(outside, "sentinel"))).nlink;
+		const outsideBefore = await treeSnapshot(outside);
+
+		// Linked directories, including `linked/..`: the kernel resolves it to
+		// `outside`, a lexical normalizer to `root`. Neither may receive the marker.
+		expectRefused(run("gjc_session_write_public_marker", [path.join(linked, "sub", "marker.json"), "started", session, generation]));
+		expectRefused(run("gjc_session_write_public_marker", [`${linked}/../marker.json`, "started", session, generation]));
+		expectRefused(run("gjc_session_write_vanished_json", [path.join(linked, "sub", "vanished.json"), session, root, "tmux_session_missing", "owner_lost", "failure", "false", "false", generation]));
+		expectRefused(publish(path.join(linked, "started.json")));
+		expect(await treeSnapshot(outside)).toEqual(outsideBefore);
+		expect(await pathExists(path.join(root, "marker.json"))).toBe(false);
+
+		// A hardlinked lock database, alone.
+		await fs.link(path.join(outside, "sentinel"), path.join(lifecycle, "owner-locks.sqlite"));
+		expectRefused(publish(path.join(state, "started.json")));
+		expect(await sentinelLinks()).toBe(2);
+		await fs.unlink(path.join(lifecycle, "owner-locks.sqlite"));
+
+		// With a plain database: a hardlinked marker or alias leaf is refused, not
+		// replaced (replacement would drop the target's link count).
+		await fs.mkdir(path.join(root, "hl"));
+		await fs.link(path.join(outside, "sentinel"), path.join(root, "hl", "marker.json"));
+		expectRefused(run("gjc_session_write_public_marker", [path.join(root, "hl", "marker.json"), "started", session, generation]));
+		expect(await sentinelLinks()).toBe(2);
+		await fs.link(path.join(outside, "sentinel"), path.join(root, "hl", "started.json"));
+		expectRefused(publish(path.join(root, "hl", "started.json")));
+		expect(await sentinelLinks()).toBe(3);
+		expect(await Bun.file(path.join(outside, "sentinel")).text()).toBe("KEEP-ME\n");
+
+		// Control: the same publication to a plain alias goes through.
+		expect(publish(path.join(state, "started.json")).exitCode).toBe(0);
+		expect(await Bun.file(path.join(state, "started.json")).json()).toMatchObject({ kind: "started", owner_generation: generation });
+
+		// A failed publication leaves a temporary name it did not create in place,
+		// whether it fails before its exclusive open or at it. sitecustomize pins the
+		// writer's pid so the temporary name is predictable.
+		const pinned = path.join(root, "pinned-pid"); await fs.mkdir(pinned);
+		await Bun.write(path.join(pinned, "sitecustomize.py"), "import os\nos.getpid = lambda: 4242\n");
+		const mismatched = path.join(lifecycle, "mismatched.json");
+		await Bun.write(mismatched, `${JSON.stringify({ schema_version: 1, kind: "started", session_id: "other", owner_generation: generation })}\n`);
+		await fs.link(path.join(outside, "sentinel"), path.join(state, "mismatch.json.4242.tmp"));
+		expectRefused(publish(path.join(state, "mismatch.json"), { PYTHONPATH: pinned }, mismatched), "invalid canonical identity");
+		expect(await sentinelLinks()).toBe(4);
+		await fs.link(path.join(outside, "sentinel"), path.join(state, "collide.json.4242.tmp"));
+		expectRefused(publish(path.join(state, "collide.json"), { PYTHONPATH: pinned }), "FileExistsError");
+		expect(await sentinelLinks()).toBe(5);
+		expect(await pathExists(path.join(state, "collide.json"))).toBe(false);
+		expect(await Bun.file(path.join(outside, "sentinel")).text()).toBe("KEEP-ME\n");
+
+		const fresh = path.join(root, "fresh", "a", "b");
+		expect(run("gjc_session_require_private_path", ["--create", fresh]).exitCode).toBe(0);
+		for (const created of [path.join(root, "fresh"), path.join(root, "fresh", "a"), fresh]) expect((await fs.stat(created)).mode & 0o777).toBe(0o700);
+	});
 });

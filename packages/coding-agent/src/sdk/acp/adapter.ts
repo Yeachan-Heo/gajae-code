@@ -1,16 +1,19 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
+import { MAX_IMAGE_INPUT_BYTES, MAX_PROMPT_IMAGE_CHUNK_BYTES } from "../../utils/image-limits";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import {
 	DEFAULT_SDK_REQUEST_TIMEOUT_MS,
 	type SdkClient,
 	SdkClientError,
 	type SdkDispatchContext,
+	type SdkRequestOptions,
 	type SdkSentRecord,
 } from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
+	isSessionLifecycleMutationOperation,
 	SessionLifecycleService,
 	type SessionReconcileUncertainTarget,
 	validateSessionReconcileUncertainTarget,
@@ -21,7 +24,7 @@ import {
 	validateAdapterSecretFields,
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
-import { OPERATIONS } from "../protocol/operation-registry";
+import { findOperation, OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
 import { ACP_SESSION_RECONNECT, SESSION_ABORT_TIMEOUT_MS } from "../session-reconnect";
 import type { SessionLifecycleMcpServer } from "./mcp";
@@ -136,6 +139,7 @@ function credentialFreeLifecycleMessage(error: unknown): string {
  * authority reason and the fact that the request is safely retryable.
  */
 const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
+	"ephemeral_unsupported",
 	"invalid_input",
 	"authentication_failed",
 	"unknown_model_profile",
@@ -219,17 +223,6 @@ const SESSION_GLOBALS: Record<string, string> = {
 	forkSession: "session.fork",
 	closeSession: "session.close",
 };
-
-function isLifecycleOperation(operation: string): boolean {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
-}
 
 /**
  * Pure ACP-to-SDK adapter. It deliberately owns neither an AgentSession nor an
@@ -328,6 +321,12 @@ export class AcpSdkAdapter {
 		this.#providersActivated = false;
 		if (attachment.isCurrent() && this.#providerActivationAuthorized)
 			void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
+	}
+
+	/** Returns the current SessionAttachment if it exists and is current, undefined otherwise. */
+	currentAttachment(): SessionAttachment | undefined {
+		if (this.#attachment?.isCurrent()) return this.#attachment;
+		return undefined;
 	}
 
 	revokeAttachment(attachment: SessionAttachment): void {
@@ -458,6 +457,9 @@ export class AcpSdkAdapter {
 		const invalid = validateRequiredPromptText("turn.prompt", {
 			text,
 			...(typeof params === "object" && Array.isArray(params.images) ? { images: params.images } : {}),
+			...(typeof params === "object" && params.stagedImages !== undefined
+				? { stagedImages: params.stagedImages }
+				: {}),
 		});
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
 		return await this.#requestSession({
@@ -466,6 +468,69 @@ export class AcpSdkAdapter {
 			input: { ...(typeof params === "object" ? params : {}), text },
 		});
 	}
+	/**
+	 * Upload one prompt image through the host-owned `turn.image.*` staging controls in
+	 * chunks below the SDK frame cap and return its one-shot staged ID. These controls are
+	 * GJC-private and stay prohibited on the generic `_gjc/sdk/control` passthrough; only
+	 * this adapter-owned prompt path may use them. A failed upload is discarded before the
+	 * error propagates, so no lease outlives this call except a finished, returned one.
+	 */
+	async stagePromptImage(image: { data: string; mimeType: string }, batchId: string): Promise<string> {
+		// This computes the decoded size without allocating the decoded buffer and accounts
+		// for padding. Noncanonical input may be conservatively overestimated.
+		const estimatedBytes = Buffer.byteLength(image.data, "base64");
+		if (estimatedBytes > MAX_IMAGE_INPUT_BYTES)
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				`Image exceeds the ${Math.floor(MAX_IMAGE_INPUT_BYTES / 1024 / 1024)} MiB size limit.`,
+			);
+		const bytes = Buffer.from(image.data, "base64");
+		const begun = object(
+			await this.#requestSession({
+				type: "control_request",
+				operation: "turn.image.begin",
+				input: {
+					mimeType: image.mimeType,
+					byteLength: bytes.length,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+					batchId,
+				},
+			}),
+		);
+		const id = begun?.id;
+		if (typeof id !== "string" || !id)
+			throw new AcpSdkAdapterError("invalid_response", "SDK turn.image.begin returned no upload ID.");
+		try {
+			for (let offset = 0, sequence = 0; offset < bytes.length; offset += MAX_PROMPT_IMAGE_CHUNK_BYTES, sequence++)
+				await this.#requestSession({
+					type: "control_request",
+					operation: "turn.image.append",
+					input: {
+						id,
+						sequence,
+						data: bytes.subarray(offset, offset + MAX_PROMPT_IMAGE_CHUNK_BYTES).toString("base64"),
+					},
+				});
+			await this.#requestSession({ type: "control_request", operation: "turn.image.finish", input: { id } });
+		} catch (error) {
+			await this.discardPromptImage(id);
+			throw error;
+		}
+		return id;
+	}
+
+	/** Best-effort release of a staged or unfinished upload; an already-consumed ID is a no-op. */
+	async discardPromptImage(id: string): Promise<void> {
+		try {
+			await this.#requestSession({ type: "control_request", operation: "turn.image.discard", input: { id } });
+		} catch (error) {
+			logger.debug("ACP staged prompt image discard did not apply", {
+				id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	/**
 	 * Ends the active turn with a C04 terminal abort. The default `scope:"turn"`
 	 * only stops the current turn, matching the SDK `turn.abort` default and
@@ -514,6 +579,7 @@ export class AcpSdkAdapter {
 		);
 	}
 	async query(query: string, input: JsonObject = {}, cursor?: string): Promise<unknown> {
+		this.#assertGenericDisposition("query", query);
 		return await this.#requestSession({
 			type: "query_request",
 			query,
@@ -574,17 +640,43 @@ export class AcpSdkAdapter {
 	}
 	async global(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
 		const result = await this.#lifecycleRequest(operation, input, idempotencyKey);
-		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
+		return isSessionLifecycleMutationOperation(operation) ? credentialFreeLifecycleResult(result) : result;
 	}
 	/** Uses lifecycle endpoint credentials only inside the ACP session owner. */
 	async lifecycle(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
-		if (!isLifecycleOperation(operation))
+		if (!isSessionLifecycleMutationOperation(operation))
 			throw new AcpSdkAdapterError("invalid_input", "ACP lifecycle requests must use a lifecycle operation.");
 		return await this.#lifecycleRequest(operation, input, idempotencyKey);
 	}
+	async #ephemeralCreateGeneration(options: SdkRequestOptions): Promise<number> {
+		let generation: number | undefined;
+		let response: unknown;
+		try {
+			response = await this.#client!.global(
+				"broker.status",
+				{},
+				{
+					...options,
+					get timeoutMs() {
+						return options.timeoutMs;
+					},
+					onDispatch: context => {
+						generation = context.generation;
+					},
+				},
+			);
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.transport || error.code !== "unknown_operation") throw error;
+			throw new AcpSdkAdapterError("ephemeral_unsupported", "The broker does not support ephemeral sessions.");
+		}
+		const capabilities = object(object(object(response)?.result)?.capabilities);
+		if (capabilities?.ephemeralSessions !== true || generation === undefined)
+			throw new AcpSdkAdapterError("ephemeral_unsupported", "The broker does not support ephemeral sessions.");
+		return generation;
+	}
 	async #lifecycleRequest(operation: string, input: JsonObject, idempotencyKey?: string): Promise<unknown> {
 		this.#assertGenericDisposition("global", operation);
-		if (isLifecycleOperation(operation) && !idempotencyKey)
+		if (isSessionLifecycleMutationOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
 		if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(input))
 			throw new AcpSdkAdapterError(
@@ -621,6 +713,8 @@ export class AcpSdkAdapter {
 		let sent = false;
 		let sentRecord: SdkSentRecord | undefined;
 		let uncertainty: SdkClientError | undefined;
+		const ephemeral = operation === "session.create" && input.ephemeral === true;
+		let ephemeralGeneration: number | undefined;
 		const deadlineFailure = () =>
 			uncertainty ??
 			(sent
@@ -642,8 +736,14 @@ export class AcpSdkAdapter {
 			get timeoutMs() {
 				return Math.max(0, deadline - Date.now());
 			},
-			beforeDispatch: () => {
+			beforeDispatch: (context: SdkDispatchContext) => {
 				if (Date.now() >= deadline) throw deadlineFailure();
+				// A successful probe authorizes only its exact transport generation, including replay.
+				if (ephemeral && (ephemeralGeneration === undefined || context.generation !== ephemeralGeneration))
+					throw new AcpSdkAdapterError(
+						"ephemeral_unsupported",
+						"Ephemeral session support was not verified on this broker connection.",
+					);
 			},
 			onDispatch: (context: SdkDispatchContext) => {
 				sent = true;
@@ -653,6 +753,16 @@ export class AcpSdkAdapter {
 		const expired = Promise.withResolvers<never>();
 		const timer = setTimeout(() => expired.reject(deadlineFailure()), budgetMs);
 		const recover = async () => {
+			if (ephemeral)
+				ephemeralGeneration = await this.#ephemeralCreateGeneration({
+					deadline,
+					get timeoutMs() {
+						return Math.max(0, deadline - Date.now());
+					},
+					beforeDispatch: () => {
+						if (Date.now() >= deadline) throw deadlineFailure();
+					},
+				});
 			try {
 				const result = await client.global(operation, input, options);
 				if (Date.now() >= deadline) throw deadlineFailure();
@@ -697,7 +807,7 @@ export class AcpSdkAdapter {
 		if (method === "_gjc/sdk/query")
 			return await this.sdkQuery(params as { query: string; input?: JsonObject; cursor?: string });
 		if (method === "_gjc/sdk/global") {
-			if (typeof params.operation === "string" && isLifecycleOperation(params.operation))
+			if (typeof params.operation === "string" && isSessionLifecycleMutationOperation(params.operation))
 				throw new AcpSdkAdapterError(
 					"operation_prohibited",
 					"ACP lifecycle operations are available only through typed session methods.",
@@ -709,7 +819,7 @@ export class AcpSdkAdapter {
 		if (method === "setModel") return await this.setModel(params);
 		const global = SESSION_GLOBALS[method];
 		if (global) {
-			if (!isLifecycleOperation(global)) return await this.global(global, params);
+			if (!isSessionLifecycleMutationOperation(global)) return await this.global(global, params);
 			const { idempotencyKey, ...input } = params;
 			return await this.global(global, input, typeof idempotencyKey === "string" ? idempotencyKey : undefined);
 		}
@@ -855,8 +965,18 @@ export class AcpSdkAdapter {
 		);
 	}
 
-	#assertGenericDisposition(kind: "control" | "global", sdkId: string): void {
-		const operation = OPERATIONS.find(candidate => candidate.kind === kind && candidate.sdkId === sdkId);
+	#assertGenericDisposition(kind: "control" | "global" | "query", sdkId: string): void {
+		const operation =
+			findOperation(kind, sdkId) ??
+			(kind === "query"
+				? OPERATIONS.find(
+						candidate =>
+							candidate.kind === "query" &&
+							(candidate.id === sdkId ||
+								(candidate.sdkId === "models.list/current" &&
+									["models.list", "models.current"].includes(sdkId))),
+					)
+				: undefined);
 		if (!operation) throw new AcpSdkAdapterError("unknown_operation", `Unknown SDK ${kind}: ${sdkId}`);
 		const disposition = operation.adapterDispositions.acp;
 		if (disposition === "prohibited")

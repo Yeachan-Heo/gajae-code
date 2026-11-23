@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
+import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
+import { rapidMlxModelManagerOptions } from "../src/provider-models/openai-compat";
 import {
 	detectDiscoveredApiFamily,
 	fetchOpenAICompatibleModels,
@@ -275,6 +277,7 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 		const fallback = "http://127.0.0.1:8080/v1";
 		const accepted = [
 			"http://localhost:8080/v1",
+			"http://localhost.:8080/v1",
 			"http://127.0.0.1:8080/v1",
 			"http://127.255.255.254:8080/v1",
 			"http://[::1]:8080/v1",
@@ -339,5 +342,65 @@ describe("detectDiscoveredApiFamily", () => {
 		expect(detectDiscoveredApiFamily({ id: "mistral-large", owned_by: "mistralai" })).toBeUndefined();
 		expect(detectDiscoveredApiFamily({ id: 123 })).toBeUndefined();
 		expect(detectDiscoveredApiFamily({})).toBeUndefined();
+	});
+});
+
+describe("Rapid-MLX model discovery", () => {
+	it("discovers served context windows through the keyless built-in descriptor", async () => {
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch(request) {
+				if (new URL(request.url).pathname.endsWith("/models")) {
+					return Response.json({
+						object: "list",
+						data: [{ id: "mlx-community/Qwen3.5-4B-MLX-4bit", context_window: 131072 }],
+					});
+				}
+				return new Response("Not found", { status: 404 });
+			},
+		});
+		// `fetch` is the only stack that carries HTTP_PROXY; a keyless loopback probe
+		// must reach the server without consulting it.
+		const ambientFetch = globalThis.fetch;
+		const ambientCalls: string[] = [];
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			ambientCalls.push(String(input));
+			return new Response("proxy answered", { status: 502 });
+		}) as typeof fetch;
+		try {
+			const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "rapid-mlx");
+			expect(descriptor?.allowUnauthenticated).toBe(true);
+			const models = await descriptor
+				?.createModelManagerOptions({ baseUrl: `http://127.0.0.1:${server.port}/v1` })
+				.fetchDynamicModels?.();
+			expect(models).toEqual([
+				expect.objectContaining({
+					provider: "rapid-mlx",
+					id: "mlx-community/Qwen3.5-4B-MLX-4bit",
+					baseUrl: `http://127.0.0.1:${server.port}/v1`,
+					contextWindow: 131072,
+				}),
+			]);
+			expect(ambientCalls).toEqual([]);
+		} finally {
+			globalThis.fetch = ambientFetch;
+			server.stop(true);
+		}
+	});
+
+	it("keeps authenticated discovery on loopback when given a remote endpoint", async () => {
+		const fetched: string[] = [];
+		global.fetch = (async (url: string | URL | Request) => {
+			fetched.push(String(url));
+			return new Response(JSON.stringify({ data: [{ id: "remote-model" }] }));
+		}) as typeof fetch;
+		await rapidMlxModelManagerOptions({
+			apiKey: "test-key",
+			baseUrl: "https://untrusted.example/v1",
+		}).fetchDynamicModels?.();
+		// The endpoint is rewritten to loopback and the bearer is sent over the direct
+		// transport: `fetch` would hand it to HTTP(S)_PROXY, and never sees the key.
+		expect(fetched).toEqual([]);
 	});
 });

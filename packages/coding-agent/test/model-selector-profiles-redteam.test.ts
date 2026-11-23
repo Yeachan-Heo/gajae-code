@@ -9,8 +9,10 @@ import {
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { PreparedProfileModelSelection } from "@gajae-code/coding-agent/session/agent-session";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -22,12 +24,7 @@ function normalizeRenderedText(text: string): string {
 		.trim();
 }
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 const defaultModel = model("provider-a", "default");
 const alternateModel = model("provider-a", "alternate");
@@ -57,7 +54,7 @@ function createRegistry(options: { profiles?: ModelProfileDefinition[]; missingC
 		getModelProfile: (name: string) => profiles.get(name),
 		getAvailableModelProfileNames: () => [...profiles.keys()],
 		getApiKeyForProvider: async () => (options.missingCredentials ? undefined : "key"),
-		getApiKey: async () => "key",
+		getApiKey: async (_model: Model, _credentialSessionId?: string) => "key",
 		isSelectorCircuitOpen: (_selector: string) => false,
 	};
 }
@@ -81,7 +78,7 @@ function createSelector(
 
 async function renderSelector(selector: ModelSelectorComponent): Promise<string> {
 	await Bun.sleep(10);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	return normalizeRenderedText(selector.render(240).join("\n"));
 }
 
@@ -98,6 +95,22 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		setCalls.push({ path: path as string, value });
 		return originalSet(path, value);
 	}) as typeof settings.set;
+	// "Set as default" writes through one atomic durable batch (ownership CAS plus the
+	// default/thinking patches) instead of settings.set + flushOrThrow, so the durable
+	// write has to be observed at the batch commit, not at the synchronous setter.
+	const committedWrites: Array<{ path: string; value: unknown }> = [];
+	const durableCommits = vi.fn();
+	const originalCommitAtomicBatchWithCurrent = settings.commitAtomicBatchWithCurrent.bind(settings);
+	settings.commitAtomicBatchWithCurrent = (async buildPatches => {
+		return originalCommitAtomicBatchWithCurrent(async current => {
+			const patches = await buildPatches(current);
+			for (const patch of patches) {
+				if (patch.op === "set") committedWrites.push({ path: patch.path, value: patch.value });
+			}
+			if (patches.length > 0) durableCommits();
+			return patches;
+		});
+	}) as typeof settings.commitAtomicBatchWithCurrent;
 	const overrideCalls: Array<{ path: string; value: unknown }> = [];
 	const originalOverride = settings.override.bind(settings);
 	settings.override = ((path: never, value: never) => {
@@ -122,6 +135,59 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			this.configuredChains[role] = entries;
 		},
+		disposed: false,
+		get sessionLifecycle() {
+			return Object.freeze({ generation: 0, transitioning: false, disposed: this.disposed });
+		},
+		async dispose() {
+			this.disposed = true;
+		},
+		activeModelProfile: undefined as string | undefined,
+		activatedModelProfile: undefined as string | undefined,
+		setActiveModelProfile(name: string | undefined, activatedByThisProcess = false) {
+			this.activeModelProfile = name;
+			this.activatedModelProfile = activatedByThisProcess ? name : undefined;
+		},
+		getActiveModelProfile(): string | undefined {
+			return this.activeModelProfile;
+		},
+		getActivatedModelProfile(): string | undefined {
+			return this.activatedModelProfile === this.activeModelProfile ? this.activeModelProfile : undefined;
+		},
+		resumeDefaultSelectors: [] as Array<string | undefined>,
+		recordResumeDefaultModel(selector: string | undefined) {
+			this.resumeDefaultSelectors.push(selector);
+		},
+		setThinkingLevel(level: ThinkingLevel | undefined) {
+			this.thinkingLevel = level;
+		},
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			signal?.throwIfAborted();
+			const apiKey = await this.modelRegistry.getApiKey(next, this.sessionId);
+			if (!apiKey) throw new Error(`No API key for ${next.provider}/${next.id}`);
+			return {
+				sessionId: this.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: this.model,
+				previousThinkingLevel: this.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection) {
+			selection.signal?.throwIfAborted();
+			if (this.model !== selection.previousModel || this.thinkingLevel !== selection.previousThinkingLevel)
+				throw new Error("Session changed while publishing profile");
+			this.model = selection.model;
+			this.thinkingLevel = selection.committedThinkingLevel;
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
@@ -140,7 +206,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	};
-	return { ctx, settings, session, flush, setCalls, overrideCalls };
+	return { ctx, settings, session, flush, setCalls, committedWrites, durableCommits, overrideCalls };
 }
 
 async function selectProfileThroughController(controller: SelectorController, setDefault = false): Promise<void> {
@@ -148,15 +214,15 @@ async function selectProfileThroughController(controller: SelectorController, se
 	const selector = (controller as unknown as { ctx: { editorContainer: { addChild: ReturnType<typeof vi.fn> } } }).ctx
 		.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 	await Bun.sleep(10);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	await selector.__testSelectProfile("profile-a", setDefault);
 	await Bun.sleep(0);
 }
 
 describe("model selector profile red-team", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 
 	test("empty profile catalog omits Profiles section and does not crash", async () => {
@@ -233,20 +299,26 @@ describe("model selector profile red-team", () => {
 		await selectProfileThroughController(new SelectorController(sessionOnly.ctx as never), false);
 
 		expect(sessionOnly.setCalls).not.toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(sessionOnly.committedWrites).not.toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(sessionOnly.durableCommits).not.toHaveBeenCalled();
 		expect(sessionOnly.settings.get("modelProfile.default")).toBe("old-profile");
 		expect(sessionOnly.ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
 
 		const persistent = createControllerContext();
 		await selectProfileThroughController(new SelectorController(persistent.ctx as never), true);
 
-		expect(persistent.setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
-		expect(persistent.setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(persistent.flush).toHaveBeenCalledTimes(1);
+		expect(persistent.setCalls).not.toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(persistent.committedWrites).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
+		expect(persistent.committedWrites).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
+		expect(persistent.durableCommits).toHaveBeenCalledTimes(1);
+		expect(persistent.flush).not.toHaveBeenCalled();
 		expect(persistent.ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 
 	test("activation credential error shows error and preserves active model, thinking, overrides, and default", async () => {
-		const { ctx, settings, session, overrideCalls, setCalls } = createControllerContext({ missingCredentials: true });
+		const { ctx, settings, session, overrideCalls, setCalls, committedWrites } = createControllerContext({
+			missingCredentials: true,
+		});
 		await selectProfileThroughController(new SelectorController(ctx as never), false);
 
 		expect(ctx.showError).toHaveBeenCalledWith(
@@ -259,6 +331,7 @@ describe("model selector profile red-team", () => {
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(overrideCalls).toEqual([]);
 		expect(setCalls).toEqual([]);
+		expect(committedWrites).toEqual([]);
 	});
 
 	test("profile names with unusual characters render without breaking the list", async () => {

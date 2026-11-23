@@ -15,6 +15,7 @@ import {
 } from "../../gjc-runtime/tmux-sessions";
 import { observeProcessIncarnation, processIncarnation } from "./process-incarnation";
 import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof, SpawnSubstrateProvider } from "./spawn-authority";
+import { isPositiveInteger, isTimestamp } from "./spawn-authority";
 
 export type SpawnMultiplexerSelection = "none" | "tmux" | "proof_failed";
 
@@ -137,14 +138,6 @@ function isNonEmptyString(value: unknown): value is string {
 /** An environment VALUE may be empty but is still length-bounded. */
 function isBoundedString(value: unknown): value is string {
 	return typeof value === "string" && value.length <= 4096;
-}
-
-function isPositiveInteger(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-function isTimestamp(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function validLaunchSpec(spec: SpawnSubstrateLaunchSpec, platform: NodeJS.Platform): boolean {

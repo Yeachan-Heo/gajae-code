@@ -6,8 +6,9 @@ import {
 	ModelSelectorComponent,
 	type ModelSelectorSelection,
 } from "@gajae-code/coding-agent/modes/components/model-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 function normalizeRenderedText(text: string): string {
 	return text
@@ -98,11 +99,7 @@ const codexPro: ModelProfileDefinition = {
 	source: "builtin",
 };
 
-let testTheme = await getThemeByName("red-claw");
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 function createRegistry(
 	authenticatedProviders: readonly string[],
@@ -174,7 +171,7 @@ function createSelector(
 
 async function rendered(selector: ModelSelectorComponent): Promise<string> {
 	await Bun.sleep(10);
-	installTestTheme();
+	setThemeInstance(testTheme);
 	return normalizeRenderedText(selector.render(260).join("\n"));
 }
 
@@ -182,7 +179,7 @@ async function rendered(selector: ModelSelectorComponent): Promise<string> {
 // with ANSI/whitespace normalized. Used to assert exact cursor placement after
 // preset list navigation.
 function cursorRowLabel(selector: ModelSelectorComponent): string | undefined {
-	installTestTheme();
+	setThemeInstance(testTheme);
 	const lines = selector.render(260).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
 	const cursorLine = lines.find(line => line.includes("❯"));
 	return cursorLine?.replace("❯", "").replace(/\s+/g, " ").trim();
@@ -323,8 +320,8 @@ describe("preset landing adversarial QA", () => {
 		expect(removedRegistry.getAvailable).toHaveBeenCalledTimes(1);
 	});
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 
 	test("Escape closes exactly one preset layer in order", async () => {
@@ -544,11 +541,11 @@ describe("preset landing adversarial QA", () => {
 		selector.refreshPresetProfiles("codex-opencodego");
 
 		const text = await rendered(selector);
-		expect(text).toContain("DEFAULT: openai-codex/gpt-6.1-sol");
+		expect(text).toContain("DEFAULT: openai-codex/gpt-6.2-sol");
 		expect(text).toContain("EXECUTOR: opencode-go/deepseek-v4-pro");
 		expect(text).toContain("PLANNER: opencode-go/kimi-k3");
 		expect(text).toContain("CRITIC: opencode-go/mimo-v2.5-pro");
-		expect(text).toContain("ARCHITECT: openai-codex/gpt-6.1-sol");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-6.2-sol");
 	});
 
 	test("#688 Down crossing a group boundary lands on the destination group header", async () => {

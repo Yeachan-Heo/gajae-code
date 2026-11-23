@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -176,6 +177,15 @@ export const FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS =
 /** Release retries cover transient handle denial and a competing exact-removal quarantine cleanup. */
 export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
 export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 25;
+/**
+ * Rolling back a publication that raced a predecessor's retirement renames the published
+ * directory, which a peer handle inside it refuses (STATUS_ACCESS_DENIED) until that
+ * handle closes. The generation is already published, so the refusal is retried briefly
+ * rather than abandoning it; a release has its own outer retry for the detach rename.
+ */
+export const FILE_LOCK_ROLLBACK_RETRY_ATTEMPTS = 12;
+const FILE_LOCK_ROLLBACK_RETRY_BASE_DELAY_MS = 10;
+const FILE_LOCK_ROLLBACK_RETRY_MAX_DELAY_MS = 200;
 const PROCESS_START_TIME_FORMAT = "utc-v1";
 
 type LocalLockState = {
@@ -208,6 +218,7 @@ export const FileLockTestHooks: {
 		quarantineName: string,
 	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
 	beforeDetachedLockCleanup?: (detachedPath: string) => boolean | Promise<boolean>;
+	afterLockDirectoryRetired?: (lockPath: string, transitionPath: string) => void | Promise<void>;
 	afterRemovalOwnerPublish?: (transitionPath: string) => void | Promise<void>;
 	afterRemovalTransitionMissing?: (transitionPath: string) => void | Promise<void>;
 	afterForeignTransitionMissing?: (transitionPath: string) => void | Promise<void>;
@@ -226,6 +237,7 @@ export const FileLockTestHooks: {
 	processIncarnation?: (pid: number) => string | null;
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 	nativeExactRemovalProbe?: () => boolean | Promise<boolean>;
+	nativeRestoreBinding?: () => typeof exactRestore;
 } = {};
 
 type FileLockAcquisitionRetryBudget = {
@@ -255,6 +267,32 @@ async function sleepFileLockRetry(delayMs: number, signal?: AbortSignal): Promis
 	} finally {
 		signal.removeEventListener("abort", onAbort);
 	}
+}
+
+/**
+ * Native STATUS_ACCESS_DENIED / STATUS_SHARING_VIOLATION from a lock operation: another
+ * process briefly holds a handle inside the tree. Contention, never an ownership verdict.
+ */
+export function isNativeLockContentionCode(code: string | undefined): code is "access_denied" | "sharing_violation" {
+	return code === "access_denied" || code === "sharing_violation";
+}
+
+/** Equal-jitter exponential backoff: half the step is fixed, half is random. */
+function fileLockContentionBackoffMs(attempt: number, baseMs: number, capMs: number): number {
+	const ceiling = Math.min(capMs, baseMs * 2 ** Math.min(attempt, 20));
+	return ceiling / 2 + Math.random() * (ceiling / 2);
+}
+
+/** A refusal that reports no detached, retained, or placeholder path moved nothing. */
+function isPreMutationNativeContention(result: NativeExactUnlinkResult): boolean {
+	return (
+		!result.ok &&
+		isNativeLockContentionCode(result.code) &&
+		result.detachedPath === undefined &&
+		result.retainedSuccessorPath === undefined &&
+		result.retainedPlaceholderPath === undefined &&
+		result.retainedUnknownPath === undefined
+	);
 }
 
 async function captureFileLockStagingRootIdentity(
@@ -897,75 +935,92 @@ const LOCK_INFO_OPEN_FLAGS =
  */
 type LockInfoObservation = { bytes: string; state: LockInfoPathState };
 
-async function readLockInfoObservation(lockPath: string): Promise<LockInfoObservation | null> {
-	const infoPath = path.join(lockPath, "info");
-	const initial = await lockInfoPathState(lockPath);
-	if (!initial) return null;
+/**
+ * Windows refuses to open or stat an `<lock>/info` that another process is deleting or
+ * retiring: EPERM/EACCES/EBUSY from open, EBADF from Bun's lstat. None of them is a
+ * verdict about the owner; the record is changing under the observer, which must observe
+ * again. On POSIX these codes are real permission failures.
+ */
+export function isLockInfoChangingError(error: unknown): boolean {
+	if (process.platform !== "win32") return false;
+	const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+	return code === "EPERM" || code === "EACCES" || code === "EBUSY" || code === "EBADF";
+}
 
-	let handle: fs.FileHandle | undefined;
+/**
+ * Open, validate, read, and close `info` without yielding. On Windows any open handle
+ * inside a lock directory makes the owner's rename of that directory fail with
+ * STATUS_ACCESS_DENIED, so the descriptor must never stay open across an await, where
+ * its lifetime would depend on this process's event-loop latency.
+ */
+function readLockInfoFileWithoutYielding(infoPath: string, expected: LockInfoFileState): Buffer | null {
+	const fd = fsSync.openSync(infoPath, LOCK_INFO_OPEN_FLAGS);
 	try {
-		handle = await fs.open(infoPath, LOCK_INFO_OPEN_FLAGS);
-		const opened = lockInfoFileState(await handle.stat({ bigint: true }));
-		const beforeRead = await lockInfoPathState(lockPath);
-		if (
-			!opened ||
-			!beforeRead ||
-			!sameLockInfoFileState(initial.file, opened) ||
-			!sameLockInfoPathState(initial, beforeRead)
-		)
-			return null;
+		const opened = lockInfoFileState(fsSync.fstatSync(fd, { bigint: true }));
+		if (!opened || !sameLockInfoFileState(expected, opened)) return null;
+		const bytes = fsSync.readFileSync(fd);
+		const afterRead = lockInfoFileState(fsSync.fstatSync(fd, { bigint: true }));
+		if (!afterRead || !sameLockInfoFileState(expected, afterRead)) return null;
+		return bytes;
+	} finally {
+		try {
+			fsSync.closeSync(fd);
+		} catch {
+			// A failed close cannot change bytes that were already read and validated.
+		}
+	}
+}
 
-		const bytes = await handle.readFile();
-		const afterRead = lockInfoFileState(await handle.stat({ bigint: true }));
+async function readLockInfoObservation(lockPath: string): Promise<LockInfoObservation | null> {
+	try {
+		const initial = await lockInfoPathState(lockPath);
+		if (!initial) return null;
+		const bytes = readLockInfoFileWithoutYielding(path.join(lockPath, "info"), initial.file);
+		if (!bytes) return null;
+		// The descriptor's file kept the initial identity throughout the read; the path
+		// must still name that same root and file afterwards.
 		const afterPath = await lockInfoPathState(lockPath);
-		if (
-			!afterRead ||
-			!afterPath ||
-			!sameLockInfoFileState(initial.file, afterRead) ||
-			!sameLockInfoPathState(initial, afterPath)
-		)
-			return null;
+		if (!afterPath || !sameLockInfoPathState(initial, afterPath)) return null;
 		return { bytes: bytes.toString("utf8"), state: afterPath };
 	} catch (error) {
 		if (isEnoent(error)) return null;
 		throw error;
-	} finally {
-		await handle?.close().catch(() => undefined);
+	}
+}
+
+/** One view of `info`; `changing` means the record was refused mid-removal. */
+type LockInfoPollObservation = LockInfoObservation | null | "changing";
+
+/**
+ * Observe `info`, reporting only the Windows lock-info-changing refusals as `changing`.
+ * Elsewhere EACCES/EPERM/EBUSY stay real failures, as they were for the callers that
+ * read `info` without a transient guard.
+ */
+async function observeLockInfoOrChanging(lockPath: string): Promise<LockInfoPollObservation> {
+	try {
+		return await readLockInfoObservation(lockPath);
+	} catch (error) {
+		if (isLockInfoChangingError(error)) return "changing";
+		throw error;
+	}
+}
+
+/**
+ * The acquire poll's observation. The poll already treated every transient release error
+ * as active contention on every platform (staleLockSnapshot, pendingLocalReleaseKey), so
+ * this keeps exactly that classification.
+ */
+async function observeLockInfoForPoll(lockPath: string): Promise<LockInfoPollObservation> {
+	try {
+		return await readLockInfoObservation(lockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return "changing";
+		throw error;
 	}
 }
 
 async function readLockInfoBytes(lockPath: string): Promise<string | null> {
 	return (await readLockInfoObservation(lockPath))?.bytes ?? null;
-}
-
-async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
-	let parsed: unknown;
-	try {
-		const bytes = await readLockInfoBytes(lockPath);
-		if (bytes === null) return null;
-		parsed = JSON.parse(bytes);
-	} catch (error) {
-		if (isEnoent(error) || error instanceof SyntaxError) return null;
-		throw error;
-	}
-
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, start_time_format, process_incarnation, timestamp, owner_host_id, owner_token } =
-		parsed as Partial<LockInfo>;
-	if (
-		typeof pid !== "number" ||
-		!Number.isInteger(pid) ||
-		pid <= 0 ||
-		typeof timestamp !== "number" ||
-		!Number.isFinite(timestamp) ||
-		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
-		(start_time_format !== undefined && (typeof start_time_format !== "string" || !start_time_format)) ||
-		(process_incarnation !== undefined && (typeof process_incarnation !== "string" || !process_incarnation)) ||
-		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id)) ||
-		(owner_token !== undefined && (typeof owner_token !== "string" || !owner_token))
-	)
-		return null;
-	return { pid, start_time, start_time_format, process_incarnation, timestamp, owner_host_id, owner_token };
 }
 
 function parseLockInfoBytes(bytes: string): LockInfo | null {
@@ -1127,6 +1182,16 @@ function fileLockRemovalTransitionPath(lockPath: string): string {
 	return derivedFileLockPath(lockPath, ".removing");
 }
 
+const HASHED_FILE_LOCK_REMOVAL_TRANSITION_NAME = /^\.gjc-lock-[0-9a-f]{64}\.removing$/u;
+
+/**
+ * @internal Whether a directory name is a lock's removal transition. It holds the retiring
+ * owner's record while that owner deletes it, so it never contains a lock.
+ */
+export function isFileLockRemovalTransitionName(name: string): boolean {
+	return name.endsWith(".lock.removing") || HASHED_FILE_LOCK_REMOVAL_TRANSITION_NAME.test(name);
+}
+
 /** Keep derived siblings bounded without changing the canonical lock identity. */
 function derivedFileLockPath(sourcePath: string, suffix: string): string {
 	const name = path.basename(sourcePath);
@@ -1268,10 +1333,14 @@ async function classifyFileLockRemovalTransition(
 			// unable to unlink its receipt. Prove the captured generation is absent
 			// before treating its still-live publisher PID as an active retirement.
 			if (await removalTransitionIsComplete(lockPath, transitionPath, recordedOwner))
-				return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) ? null : "active";
+				return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) === "removed"
+					? null
+					: "active";
 			if (ownerIsAlive(recordedOwner.owner) || ownerLiveness(recordedOwner.owner.pid) === "unknown") return "active";
-			return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) ? null : "active";
+			return (await removeRemovalRecord(recordPath, JSON.stringify(recordedOwner))) === "removed" ? null : "active";
 		}
+		// Windows refuses to stat a transition another process is deleting; it is still in flight.
+		if (isLockInfoChangingError(error)) return "active";
 		throw error;
 	}
 
@@ -1306,20 +1375,31 @@ async function classifyFileLockRemovalTransition(
 		if (!isEnoent(error)) return "active";
 	}
 
-	const observation = await readLockInfoObservation(transitionPath);
+	const observation = await observeLockInfoOrChanging(transitionPath);
+	// A retiring tree whose metadata is mid-removal is still being worked on.
+	if (observation === "changing") return "active";
 	if (!observation) {
 		try {
 			if (Date.now() - Number(transition.mtimeMs) >= orphanAgeMs && (await fs.readdir(transitionPath)).length === 0)
 				return "orphan_transition";
 		} catch (error) {
 			if (isEnoent(error)) return null;
+			if (isLockInfoChangingError(error)) return "active";
 			throw error;
 		}
 		return "active";
 	}
 	const info = parseLockInfoBytes(observation.bytes);
 	if (info) {
-		const stale = await staleLockSnapshot(transitionPath, 0, ownerHostId, previousOwnerHostIds, undefined, true);
+		const stale = await staleLockSnapshot(
+			transitionPath,
+			0,
+			ownerHostId,
+			previousOwnerHostIds,
+			undefined,
+			true,
+			observation,
+		);
 		return stale.stale ? "abandoned" : "active";
 	}
 
@@ -1343,15 +1423,22 @@ function isEmptyRemovalTransition(snapshot: NativeDirectoryTreeSnapshot, graceMs
 	return Number.isFinite(ageMs) && ageMs >= graceMs;
 }
 
-async function removeRemovalRecord(recordPath: string, expectedBytes: string): Promise<boolean> {
+/**
+ * `kept` means the record is not the expected one (or its unlink was refused) and stays;
+ * `changing` means Windows refused to open or stat it because another process is deleting
+ * it right now. That remover owns the outcome, so callers must treat it as contention.
+ */
+type RemovalRecordRemoval = "removed" | "kept" | "changing";
+
+async function removeRemovalRecord(recordPath: string, expectedBytes: string): Promise<RemovalRecordRemoval> {
 	try {
 		const stat = await fs.lstat(recordPath, { bigint: true });
 		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > BigInt(MAX_FILE_LOCK_REMOVAL_RECORD_BYTES))
-			return false;
+			return "kept";
 		const bytes = await readBoundedRemovalRecordBytes(recordPath);
-		if (!bytes || !sameRemovalRecordBytes(bytes.toString("utf8"), expectedBytes)) return false;
-		if ((await FileLockTestHooks.beforeRemovalRecordUnlink?.(recordPath)) === false) return false;
-		return exactUnlinkDirect(recordPath, {
+		if (!bytes || !sameRemovalRecordBytes(bytes.toString("utf8"), expectedBytes)) return "kept";
+		if ((await FileLockTestHooks.beforeRemovalRecordUnlink?.(recordPath)) === false) return "kept";
+		const unlinked = exactUnlinkDirect(recordPath, {
 			dev: canonicalLockDeviceId(stat.dev),
 			ino: canonicalLockFileId(stat.ino),
 			size: stat.size,
@@ -1361,9 +1448,11 @@ async function removeRemovalRecord(recordPath: string, expectedBytes: string): P
 			quarantineName: path.basename(
 				derivedFileLockPath(recordPath, `.retired.${crypto.randomBytes(12).toString("base64url")}`),
 			),
-		}).ok;
+		});
+		return unlinked.ok ? "removed" : "kept";
 	} catch (error) {
-		if (isEnoent(error)) return true;
+		if (isEnoent(error)) return "removed";
+		if (isLockInfoChangingError(error)) return "changing";
 		throw error;
 	}
 }
@@ -1387,7 +1476,7 @@ async function clearRemovalRecord(transitionPath: string): Promise<void> {
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
-	if (await removeRemovalRecord(recordPath, bytes)) localRemovalRecords.delete(recordPath);
+	if ((await removeRemovalRecord(recordPath, bytes)) === "removed") localRemovalRecords.delete(recordPath);
 }
 
 async function removalTransitionIsComplete(
@@ -1441,7 +1530,7 @@ async function clearCompletedLocalRemovalRecord(
 		!latest ||
 		latest.inFlight ||
 		!sameRemovalRecordBytes(latest.bytes, localRecord.bytes) ||
-		!(await removeRemovalRecord(recordPath, localRecord.bytes))
+		(await removeRemovalRecord(recordPath, localRecord.bytes)) !== "removed"
 	)
 		return false;
 	const afterRemoval = localRemovalRecords.get(recordPath);
@@ -1465,7 +1554,7 @@ async function clearCompletedForeignRemovalRecord(
 		))
 	)
 		return false;
-	return removeRemovalRecord(removalRecordPath(transitionPath), JSON.stringify(record));
+	return (await removeRemovalRecord(removalRecordPath(transitionPath), JSON.stringify(record))) === "removed";
 }
 
 async function publishRemovalRecord(
@@ -1550,8 +1639,10 @@ async function exactRemoveLockTree(
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
 		}
-		if (!(await removeRemovalRecord(recordPath, JSON.stringify(prior))))
-			return { ok: false, code: "identity_mismatch" };
+		const priorRecord = await removeRemovalRecord(recordPath, JSON.stringify(prior));
+		// Another process deleting the dead remover's record is contention, not a changed owner.
+		if (priorRecord === "changing") return { ok: false, code: "removal_record_busy" };
+		if (priorRecord === "kept") return { ok: false, code: "identity_mismatch" };
 	}
 	// A live remover still owns the sibling record, usually the previous lock
 	// generation whose tree is gone but whose record clear is still in flight.
@@ -1572,6 +1663,8 @@ async function exactRemoveLockTree(
 				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
 			)
 				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+			await FileLockTestHooks.afterLockDirectoryRetired?.(lockPath, transitionPath);
 			try {
 				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
 				// Handle returned transient failures (not thrown exceptions):
@@ -1592,6 +1685,32 @@ async function exactRemoveLockTree(
 				throw error;
 			}
 		}
+		const afterLockDirectoryRetired = FileLockTestHooks.afterLockDirectoryRetired;
+		if (!detachOnly && (afterLockDirectoryRetired || FileLockTestHooks.nativeQuarantineBindings === undefined)) {
+			const detached = bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, true);
+			if (!detached.ok) return detached;
+			if (
+				detached.code !== undefined ||
+				detached.detachedPath !== transitionPath ||
+				Object.keys(detached).some(key => key !== "ok" && key !== "detachedPath")
+			)
+				return { ok: false, code: "identity_mismatch", detachedPath: detached.detachedPath };
+			markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+			await afterLockDirectoryRetired?.(lockPath, transitionPath);
+			try {
+				const removeResult = bindings.exactRemoveDirectoryTree(transitionPath, snapshot, parentIdentity);
+				if (!removeResult.ok && isResultTransientFailure(removeResult)) {
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+					return { ...removeResult, detachedPath: transitionPath };
+				}
+				return removeResult;
+			} catch (error) {
+				if (isTransientReleaseError(error))
+					markLocalRemovalResumable(transitionPath, snapshot.rootDev, snapshot.rootIno);
+				throw error;
+			}
+		}
+		// Custom test bindings without phase-aware receipts keep their one-call removal behavior.
 		return bindings.exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
 	} finally {
 		markLocalRemovalCompleted(transitionPath, publishedRecordBytes);
@@ -1751,7 +1870,13 @@ async function adoptAbandonedFileLockRemovalTransition(
 	if (!abandonedTransitionPayloadIsAdoptable(snapshot)) return false;
 	const infoEntry = snapshot.entries.find(entry => entry.relativePath === "info");
 	if (infoEntry?.kind !== "file") return false;
-	const currentIdentity = await captureFileLockDirIdentity(transitionPath);
+	let currentIdentity: GenericFileLockDirIdentity | null;
+	try {
+		currentIdentity = await captureFileLockDirIdentity(transitionPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
 	if (!currentIdentity || !sameStableFileLockIdentity(currentIdentity, stale.identity)) return false;
 	if (
 		!nativeFileLockInfoMatchesStableIdentity(snapshot.rootDev, snapshot.rootIno, infoEntry, stale.identity) ||
@@ -1859,7 +1984,7 @@ async function rollbackPublishedFileLock(
 		// and checks the directory identity around a same-kind placeholder exchange.
 		const root = stagedSnapshot.entries.find(entry => entry.relativePath === "");
 		if (!root) throw new Error("File lock rollback snapshot has no root");
-		const rollback = exactRestore(lockPath, pendingPath, {
+		const restoreIdentity = {
 			dev: BigInt(stagedSnapshot.rootDev),
 			ino: BigInt(stagedSnapshot.rootIno),
 			parentDev: parentIdentity.dev,
@@ -1867,7 +1992,26 @@ async function rollbackPublishedFileLock(
 			size: BigInt(root.size),
 			mtimeNs: BigInt(root.mtimeNs),
 			directory: true,
-		});
+		};
+		const restore = FileLockTestHooks.nativeRestoreBinding?.() ?? exactRestore;
+		let rollback = restore(lockPath, pendingPath, restoreIdentity);
+		// A peer handle inside the published directory refuses the rename before anything
+		// moves (STATUS_ACCESS_DENIED / sharing violation). Retry only that pre-mutation
+		// refusal; exhaustion still fails closed with the real code.
+		for (
+			let attempt = 1;
+			attempt < FILE_LOCK_ROLLBACK_RETRY_ATTEMPTS && isPreMutationNativeContention(rollback);
+			attempt++
+		) {
+			await Bun.sleep(
+				fileLockContentionBackoffMs(
+					attempt - 1,
+					FILE_LOCK_ROLLBACK_RETRY_BASE_DELAY_MS,
+					FILE_LOCK_ROLLBACK_RETRY_MAX_DELAY_MS,
+				),
+			);
+			rollback = restore(lockPath, pendingPath, restoreIdentity);
+		}
 		const placeholder = rollback.retainedPlaceholderPath;
 		const retainedPlaceholder =
 			!rollback.ok &&
@@ -2181,6 +2325,8 @@ async function localLockKey(lockPath: string): Promise<string> {
 	try {
 		return normalizeLockKey(await fs.realpath(lockPath));
 	} catch (error) {
+		// Windows raises EBADF instead of ENOENT while another process releases the lock;
+		// isTransientReleaseError covers it, so key derivation falls back to the parent.
 		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
 	}
 	const parent = path.dirname(lockPath);
@@ -2515,7 +2661,7 @@ export async function removeFileLockDirForGc(
 		if (!isEnoent(error) && !isTransientReleaseError(error)) return "cleanup_failed";
 	}
 	const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
-	if (captured.code === "sharing_violation") throwTransientNativeResult(captured.code);
+	if (isNativeLockContentionCode(captured.code)) throwTransientNativeResult(captured.code);
 	if (!captured.ok || !captured.snapshot) return "owner_changed";
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (!infoEntry?.sha256) return "owner_changed";
@@ -2625,7 +2771,9 @@ export async function removeFileLockDirForGc(
 	const refusal: NodeJS.ErrnoException = new Error(
 		`Failed to remove file lock tree: ${removed.code ?? "unknown"}.`,
 	) as NodeJS.ErrnoException;
-	refusal.code = "EACCES";
+	// Handle contention keeps its native code; any other refusal keeps the historical
+	// EACCES classification so callers retry instead of stranding the owner.
+	refusal.code = isNativeLockContentionCode(removed.code) ? removed.code : "EACCES";
 	throw refusal;
 }
 
@@ -2741,33 +2889,27 @@ async function staleLockSnapshot(
 	// belong to a genuinely foreign process; only the two transition-specific callers
 	// below set this.
 	hostlessTransitionIsLocal = false,
+	// The acquire poll observes `info` once and shares it with its local-release lookup;
+	// other callers leave this undefined and observe here.
+	observed?: LockInfoPollObservation,
 ): Promise<LockStaleSnapshot> {
 	// Capture the root and info inode BEFORE asking whether the owner is stale. A later
 	// snapshot alone would let a copied successor inherit the stale verdict's authority.
-	let judgedIdentity: GenericFileLockDirIdentity | null = null;
-	try {
-		judgedIdentity = await captureFileLockDirIdentity(lockPath);
-	} catch (error) {
-		if (isTransientReleaseError(error)) return { stale: false };
-		throw error;
-	}
-	let info: LockInfo | null;
-	try {
-		info = await readLockInfo(lockPath);
-	} catch (error) {
-		// Windows can transiently deny reads of a just-created lock metadata file
-		// while another contender is publishing it. Treat that as active
-		// contention and retry rather than failing the caller or reaping by path.
-		if (isTransientReleaseError(error)) return { stale: false };
-		throw error;
-	}
+	// One observation supplies the owner bytes together with the identity they came from.
+	const judged = observed === undefined ? await observeLockInfoForPoll(lockPath) : observed;
+	// Windows can transiently deny reads of lock metadata while another contender
+	// publishes or retires it. Treat that as active contention and retry rather than
+	// failing the caller or reaping by path.
+	if (judged === "changing" || judged === null) return { stale: false };
+	const info = parseLockInfoBytes(judged.bytes);
 	if (!info) {
-		// This verdict can authorize cleanup only from a recorded owner generation.
-		// Windows acquisition has a separate age- and identity-bound path for a
-		// completely empty legacy directory; that path never treats it as a dead
-		// owner or claims the existing directory as a new lock.
+		// Ownerless empty directories block acquisition regardless of age or identity.
+		// Without a recorded owner, we cannot prove the owner is dead, so we fail closed
+		// to preserve mutual exclusion and prevent a paused publisher from resuming into
+		// a successor's already-published canonical lock.
 		return { stale: false };
 	}
+	const judgedIdentity = fileLockDirIdentityFromPathState(judged.state, judged.bytes);
 
 	// A host-qualified lock may only be reclaimed after proving that its owner is
 	// local. Foreign and malformed host-qualified records fail closed: PID values
@@ -2775,7 +2917,6 @@ async function staleLockSnapshot(
 	const foreignCheckHostId = hostlessTransitionIsLocal && info.owner_host_id === undefined ? undefined : ownerHostId;
 	if (lockRecordIsForeignHost(info, foreignCheckHostId, previousOwnerHostIds)) return { stale: false };
 	if (ownerIncarnationChanged(info, startTimeCache)) {
-		if (!judgedIdentity) return { stale: false };
 		let currentIdentity: GenericFileLockDirIdentity | null;
 		try {
 			currentIdentity = await captureFileLockDirIdentity(lockPath);
@@ -2793,7 +2934,6 @@ async function staleLockSnapshot(
 	if (ownerIsAlive(info, startTimeCache)) return { stale: false };
 	const liveness = ownerLiveness(info.pid);
 	if (liveness === "dead") {
-		if (!judgedIdentity) return { stale: false };
 		let currentIdentity: GenericFileLockDirIdentity | null;
 		try {
 			currentIdentity = await captureFileLockDirIdentity(lockPath);
@@ -3242,10 +3382,19 @@ async function tryAcquireLock(
 function isResultTransientFailure(result: { code?: string }): boolean {
 	const code = result.code;
 	return (
-		code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY" || code === "sharing_violation"
+		code === "EBUSY" ||
+		code === "EPERM" ||
+		code === "EACCES" ||
+		code === "ENOTEMPTY" ||
+		isNativeLockContentionCode(code)
 	);
 }
 
+/**
+ * Contention rather than a verdict. Includes the Windows-only lock-info-changing codes
+ * (EBADF from Bun's lstat of an entry another process is deleting), so every catch
+ * around a lock capture or release classifies a vanishing entry the same way.
+ */
 function isTransientReleaseError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
 	return (
@@ -3253,8 +3402,8 @@ function isTransientReleaseError(error: unknown): boolean {
 		code === "EPERM" ||
 		code === "EACCES" ||
 		code === "ENOTEMPTY" ||
-		code === "access_denied" ||
-		code === "sharing_violation"
+		isNativeLockContentionCode(code) ||
+		isLockInfoChangingError(error)
 	);
 }
 
@@ -3317,7 +3466,7 @@ async function quarantineReleasedLock(
 	const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
 	try {
 		captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
-		if (captured.code === "sharing_violation") throwTransientNativeResult(captured.code);
+		if (isNativeLockContentionCode(captured.code)) throwTransientNativeResult(captured.code);
 	} catch (error) {
 		if (isTransientReleaseError(error)) return false;
 		throw error;
@@ -3325,7 +3474,13 @@ async function quarantineReleasedLock(
 	if (!captured.ok || !captured.snapshot) return false;
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (!infoEntry?.sha256) return false;
-	const currentIdentity = await captureFileLockDirIdentity(nativeCapturePath);
+	let currentIdentity: GenericFileLockDirIdentity | null;
+	try {
+		currentIdentity = await captureFileLockDirIdentity(nativeCapturePath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
 	if (!currentIdentity || !sameStableFileLockIdentity(currentIdentity, expectedIdentity)) return false;
 	if (
 		!nativeFileLockInfoMatchesStableIdentity(
@@ -3436,17 +3591,16 @@ async function retryPendingLocalRelease(lockPath: string, knownKey?: string): Pr
 	}
 }
 
-async function pendingLocalReleaseKey(lockPath: string, localKey: string): Promise<string | undefined> {
+async function pendingLocalReleaseKey(
+	lockPath: string,
+	localKey: string,
+	observed?: LockInfoPollObservation,
+): Promise<string | undefined> {
 	const direct = localLockStates.get(localKey);
 	if (direct) return direct.status === "held" ? undefined : localKey;
-	let info: LockInfo | null;
-	try {
-		info = await readLockInfo(lockPath);
-	} catch (error) {
-		if (isTransientReleaseError(error)) return undefined;
-		throw error;
-	}
-	const ownerToken = info?.owner_token;
+	const current = observed === undefined ? await observeLockInfoForPoll(lockPath) : observed;
+	if (current === null || current === "changing") return undefined;
+	const ownerToken = parseLockInfoBytes(current.bytes)?.owner_token;
 	if (!ownerToken) return undefined;
 	for (const [key, state] of localLockStates) {
 		if (key !== localKey && state.status !== "held" && state.owner.owner_token === ownerToken) return key;
@@ -3538,12 +3692,11 @@ async function lockHolderDescription(
 				description: `blocked by retained removal transition ${fileLockRemovalTransitionPath(lockPath)}; retry the owning process cleanup or inspect the exact orphan manually; unproven transition ownership is never removed`,
 				isLive: false,
 			};
-		let info = await readLockInfo(lockPath);
-		let bytes: string | null = null;
-		if (!info) {
-			bytes = await readLockInfoBytes(lockPath);
-			info = bytes === null ? null : parseLockInfoBytes(bytes);
-		}
+		const observation = await observeLockInfoOrChanging(lockPath);
+		if (observation === "changing")
+			return { description: "held by an owner whose record is being replaced or removed", isLive: false };
+		const bytes = observation?.bytes ?? null;
+		const info = bytes === null ? null : parseLockInfoBytes(bytes);
 		if (info) {
 			// A lock record carrying a FOREIGN owner_host_id belongs to another
 			// machine (shared-volume topic registry): its pid is meaningful only
@@ -3600,8 +3753,8 @@ async function lockHolderDescription(
 			if ((await fs.readdir(lockPath)).length === 0) {
 				return {
 					description:
-						"held by an ownerless empty lock directory; inspect and remove this exact directory manually only after " +
-						`confirming no publisher remains: ${manualLockCleanupCommand(lockPath)}`,
+						"held by an ownerless empty lock directory; it blocks acquisition because the publisher may still be alive. Inspect and remove this exact directory manually only if certain no publisher is acquiring the lock: " +
+						`${manualLockCleanupCommand(lockPath)}`,
 					isLive: false,
 				};
 			}
@@ -3748,7 +3901,11 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			contentionObserved = true;
 			opts.onContended?.();
 		}
-		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey);
+		// One `info` observation per poll serves both the local-release lookup and the
+		// stale verdict: every extra open widens the window in which this waiter's handle
+		// blocks the owner's Windows release rename.
+		let pollObservation = await observeLockInfoForPoll(lockPath);
+		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey, pollObservation);
 		const localState = localLockStates.get(pendingKey ?? localKey);
 		if (pendingKey !== undefined && localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
 			try {
@@ -3758,6 +3915,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			} catch {
 				// Keep contending below. A failed local retry is not authority to steal a
 				// lock; the owner generation remains fenced until release succeeds.
+				pollObservation = await observeLockInfoForPoll(lockPath);
 			}
 		}
 		const stale = await staleLockSnapshot(
@@ -3766,6 +3924,8 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.ownerHostId,
 			opts.previousOwnerHostIds,
 			contentionStartTimes,
+			false,
+			pollObservation,
 		);
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
 		if (staleRemoval.removed) {

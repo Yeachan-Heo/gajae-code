@@ -2,6 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { canonicalJson } from "./canonical-json";
 
 export type SpawnClaimV2 = {
 	version: 2;
@@ -132,6 +133,15 @@ export type SpawnAuthorityV1 = {
 	/** Launch locator, so a colliding generation/pid in another workspace cannot pass. */
 	endpointCwd?: string;
 	endpointStateRoot?: string;
+	/**
+	 * Canonical (symlink-resolved) path of `endpointStateRoot`, taken when the
+	 * child host registered. Ownership attribution compares only this value: the
+	 * stored spelling is never re-resolved later, since a retargeted symlink would
+	 * then name another directory. Absent on rows written before it existed, and
+	 * when the root could not be resolved; such a row attributes the child to no
+	 * listed row.
+	 */
+	endpointStateRootIdentity?: string;
 	closeState: SpawnAuthorityCloseState;
 	orphanedAt?: number;
 	orphanRecoveredAt?: number;
@@ -140,6 +150,9 @@ export type SpawnAuthorityV1 = {
 	createdAt: number;
 	updatedAt: number;
 };
+
+/** The spawning master of one child session id and the canonical state roots its host registered in. */
+export type SpawnOwnerRecord = { ownerSessionId: string; stateRoots: ReadonlySet<string> };
 
 export type SpawnClaimTransition = {
 	claimId: string;
@@ -282,6 +295,7 @@ const AUTHORITY_KEYS = new Set([
 	"endpointIncarnation",
 	"endpointCwd",
 	"endpointStateRoot",
+	"endpointStateRootIdentity",
 	"closeState",
 	"orphanedAt",
 	"orphanRecoveredAt",
@@ -305,17 +319,6 @@ const TRANSITION_EDGES: Readonly<Record<SpawnClaimV2["state"], readonly SpawnCla
 	closed: [],
 };
 
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
-
 function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
 	return Object.keys(value).every(key => keys.has(key) && !FORBIDDEN_FIELD.test(key));
 }
@@ -324,11 +327,11 @@ function isOpaque(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= 512;
 }
 
-function isTimestamp(value: unknown): value is number {
+export function isTimestamp(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function isPositiveInteger(value: unknown): value is number {
+export function isPositiveInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
@@ -420,6 +423,7 @@ export function isSpawnAuthorityV1(value: unknown): value is SpawnAuthorityV1 {
 		(authority.endpointIncarnation === undefined || isOpaque(authority.endpointIncarnation)) &&
 		(authority.endpointCwd === undefined || isOpaque(authority.endpointCwd)) &&
 		(authority.endpointStateRoot === undefined || isOpaque(authority.endpointStateRoot)) &&
+		(authority.endpointStateRootIdentity === undefined || isOpaque(authority.endpointStateRootIdentity)) &&
 		(authority.nativeSessionId === undefined || isOpaque(authority.nativeSessionId)) &&
 		(authority.pid === undefined || isPositiveInteger(authority.pid)) &&
 		(authority.processIncarnation === undefined || isOpaque(authority.processIncarnation)) &&
@@ -567,6 +571,132 @@ function cloneClaim(claim: SpawnClaimV2): SpawnClaimV2 {
 	};
 }
 
+/** Caller-owned, in-memory replay state shared by the store and read-only inspection. */
+export interface SpawnAuthorityJournalState {
+	latest: Map<string, SpawnClaimV2>;
+	authorities: Map<string, SpawnAuthorityV1>;
+	managedKeyAliases: Map<string, Map<string, string>>;
+	managedIdentityBindings: Map<string, { aliasIdentities: string[]; controlRoot: string }>;
+}
+
+export function createSpawnAuthorityJournalState(): SpawnAuthorityJournalState {
+	return {
+		latest: new Map(),
+		authorities: new Map(),
+		managedKeyAliases: new Map(),
+		managedIdentityBindings: new Map(),
+	};
+}
+
+function claimIntegrity(key: Uint8Array, claim: SpawnClaimV2, authority?: SpawnAuthorityV1): string {
+	return createHmac("sha256", key)
+		.update(canonicalJson({ claim, ...(authority === undefined ? {} : { authority }) }))
+		.digest("hex");
+}
+
+function managedKeyReservationIntegrity(key: Uint8Array, reservation: ManagedKeyReservation): string {
+	const { integrity: _integrity, ...facts } = reservation;
+	return createHmac("sha256", key).update(canonicalJson(facts)).digest("hex");
+}
+
+function isManagedKeyReservation(value: unknown, key: Uint8Array): value is ManagedKeyReservation {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const row = value as Partial<ManagedKeyReservation>;
+	return (
+		Object.keys(row).every(
+			field =>
+				field === "version" ||
+				field === "kind" ||
+				field === "aliasIdentities" ||
+				field === "managedIdentity" ||
+				field === "controlRoot" ||
+				field === "integrity",
+		) &&
+		row.version === 1 &&
+		row.kind === "managed_key_reservation" &&
+		Array.isArray(row.aliasIdentities) &&
+		row.aliasIdentities.length > 0 &&
+		row.aliasIdentities.every(identity => typeof identity === "string" && /^[0-9a-f]{64}$/i.test(identity)) &&
+		new Set(row.aliasIdentities).size === row.aliasIdentities.length &&
+		canonicalJson(row.aliasIdentities) === canonicalJson([...row.aliasIdentities].sort()) &&
+		typeof row.managedIdentity === "string" &&
+		/^[0-9a-f]{64}$/i.test(row.managedIdentity) &&
+		typeof row.controlRoot === "string" &&
+		path.isAbsolute(row.controlRoot) &&
+		path.normalize(row.controlRoot) === row.controlRoot &&
+		typeof row.integrity === "string" &&
+		/^[0-9a-f]{64}$/i.test(row.integrity) &&
+		timingSafeEqual(
+			Buffer.from(row.integrity, "hex"),
+			Buffer.from(managedKeyReservationIntegrity(key, row as ManagedKeyReservation), "hex"),
+		)
+	);
+}
+
+function rememberManagedKeyReservation(state: SpawnAuthorityJournalState, reservation: ManagedKeyReservation): boolean {
+	const prior = state.managedIdentityBindings.get(reservation.managedIdentity);
+	if (
+		prior &&
+		(prior.controlRoot !== reservation.controlRoot ||
+			canonicalJson(prior.aliasIdentities) !== canonicalJson(reservation.aliasIdentities))
+	)
+		return false;
+	if (prior) return false;
+	state.managedIdentityBindings.set(reservation.managedIdentity, {
+		aliasIdentities: [...reservation.aliasIdentities],
+		controlRoot: reservation.controlRoot,
+	});
+	for (const alias of reservation.aliasIdentities) {
+		const roots = state.managedKeyAliases.get(alias) ?? new Map<string, string>();
+		const existingRoot = roots.get(reservation.managedIdentity);
+		if (existingRoot !== undefined && existingRoot !== reservation.controlRoot) return false;
+		roots.set(reservation.managedIdentity, reservation.controlRoot);
+		state.managedKeyAliases.set(alias, roots);
+	}
+	return true;
+}
+
+function isStoredClaim(value: unknown, key: Uint8Array): value is StoredClaim {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const row = value as Partial<StoredClaim>;
+	return (
+		Object.keys(row).every(
+			field => field === "version" || field === "claim" || field === "authority" || field === "integrity",
+		) &&
+		row.version === 1 &&
+		isSpawnClaimV2(row.claim) &&
+		(row.authority === undefined || isSpawnAuthorityV1(row.authority)) &&
+		(row.authority === undefined || matchingAuthority(row.claim, row.authority)) &&
+		typeof row.integrity === "string" &&
+		/^[0-9a-f]{64}$/i.test(row.integrity) &&
+		timingSafeEqual(
+			Buffer.from(row.integrity, "hex"),
+			Buffer.from(claimIntegrity(key, row.claim, row.authority), "hex"),
+		)
+	);
+}
+
+/** Replay one authenticated journal row into caller-owned memory, without filesystem effects. */
+export function replaySpawnAuthorityJournalRow(state: SpawnAuthorityJournalState, row: unknown, key: Uint8Array): void {
+	if (isManagedKeyReservation(row, key)) {
+		if (!rememberManagedKeyReservation(state, row))
+			throw new Error("Spawn authority journal managed key history is invalid.");
+		return;
+	}
+	if (!isStoredClaim(row, key)) throw new Error("Spawn authority journal contains invalid durable evidence.");
+	const prior = state.latest.get(row.claim.lifecycleIdentity);
+	if (prior && (prior.claimId !== row.claim.claimId || row.claim.updatedAt <= prior.updatedAt))
+		throw new Error("Spawn authority journal claim history is invalid.");
+	state.latest.set(row.claim.lifecycleIdentity, row.claim);
+	if (row.authority) state.authorities.set(row.claim.lifecycleIdentity, row.authority);
+	else state.authorities.delete(row.claim.lifecycleIdentity);
+}
+
+export function validateSpawnAuthorityJournalAliases(state: SpawnAuthorityJournalState): void {
+	for (const alias of state.managedKeyAliases.keys())
+		if (state.latest.has(alias)) throw new Error("Spawn authority journal aliases an ordinary claim.");
+}
+
 /**
  * Append-only source of spawn-effect authority. It deliberately records no request
  * input: the opaque identity and raw/canonical structural binding MACs are its
@@ -608,17 +738,26 @@ export class SpawnAuthorityStore {
 	}
 
 	/**
-	 * Spawning master per child session id. A child that more than one recorded
-	 * authority attributes to different owners is omitted: ownership is reported
-	 * only when the durable evidence names exactly one master.
+	 * Spawning master per child session id, with the canonical state roots the
+	 * child's host registered in. A child that more than one recorded authority
+	 * attributes to different owners is omitted: ownership is reported only when
+	 * the durable evidence names exactly one master. An authority without a
+	 * registration-time canonical root (pre-pin, or written before that field
+	 * existed) contributes no root, so on its own it attributes the child to no row.
 	 */
-	spawnOwnersByChild(): ReadonlyMap<string, string> {
-		const owners = new Map<string, string>();
+	spawnOwnersByChild(): ReadonlyMap<string, SpawnOwnerRecord> {
+		const owners = new Map<string, { ownerSessionId: string; stateRoots: Set<string> }>();
 		const conflicted = new Set<string>();
 		for (const authority of this.#authorities.values()) {
 			const prior = owners.get(authority.childId);
-			if (prior !== undefined && prior !== authority.ownerSessionId) conflicted.add(authority.childId);
-			else owners.set(authority.childId, authority.ownerSessionId);
+			if (prior !== undefined && prior.ownerSessionId !== authority.ownerSessionId) {
+				conflicted.add(authority.childId);
+				continue;
+			}
+			const entry = prior ?? { ownerSessionId: authority.ownerSessionId, stateRoots: new Set<string>() };
+			if (authority.endpointStateRootIdentity !== undefined)
+				entry.stateRoots.add(authority.endpointStateRootIdentity);
+			owners.set(authority.childId, entry);
 		}
 		for (const childId of conflicted) owners.delete(childId);
 		return owners;
@@ -637,6 +776,7 @@ export class SpawnAuthorityStore {
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
+			const state = this.#journalState();
 			for (const line of source.split("\n")) {
 				if (!line) continue;
 				let row: unknown;
@@ -645,25 +785,19 @@ export class SpawnAuthorityStore {
 				} catch {
 					throw new Error("Spawn authority journal contains malformed durable evidence.");
 				}
-				if (this.#isManagedKeyReservation(row)) {
-					const reservation = row as ManagedKeyReservation;
-					if (!this.#rememberManagedKeyReservation(reservation))
-						throw new Error("Spawn authority journal managed key history is invalid.");
-					continue;
-				}
-				if (!this.#isStoredClaim(row))
-					throw new Error("Spawn authority journal contains invalid durable evidence.");
-				const stored = row as StoredClaim;
-				const prior = this.#latest.get(stored.claim.lifecycleIdentity);
-				if (prior && (prior.claimId !== stored.claim.claimId || stored.claim.updatedAt <= prior.updatedAt))
-					throw new Error("Spawn authority journal claim history is invalid.");
-				this.#latest.set(stored.claim.lifecycleIdentity, stored.claim);
-				if (stored.authority) this.#authorities.set(stored.claim.lifecycleIdentity, stored.authority);
-				else this.#authorities.delete(stored.claim.lifecycleIdentity);
+				replaySpawnAuthorityJournalRow(state, row, this.#identityKey);
 			}
-			for (const alias of this.#managedKeyAliases.keys())
-				if (this.#latest.has(alias)) throw new Error("Spawn authority journal aliases an ordinary claim.");
+			validateSpawnAuthorityJournalAliases(state);
 		});
+	}
+
+	#journalState(): SpawnAuthorityJournalState {
+		return {
+			latest: this.#latest,
+			authorities: this.#authorities,
+			managedKeyAliases: this.#managedKeyAliases,
+			managedIdentityBindings: this.#managedIdentityBindings,
+		};
 	}
 
 	/**
@@ -703,9 +837,9 @@ export class SpawnAuthorityStore {
 				controlRoot,
 				integrity: "",
 			};
-			reservation.integrity = this.#managedKeyReservationIntegrity(reservation);
+			reservation.integrity = managedKeyReservationIntegrity(this.#identityKey, reservation);
 			await this.#appendRow(reservation);
-			this.#rememberManagedKeyReservation(reservation);
+			rememberManagedKeyReservation(this.#journalState(), reservation);
 			return true;
 		});
 	}
@@ -1050,99 +1184,11 @@ export class SpawnAuthorityStore {
 		}
 	}
 
-	#integrity(claim: SpawnClaimV2, authority?: SpawnAuthorityV1): string {
-		return createHmac("sha256", this.#identityKey)
-			.update(canonicalJson({ claim, ...(authority === undefined ? {} : { authority }) }))
-			.digest("hex");
-	}
-
-	#managedKeyReservationIntegrity(reservation: ManagedKeyReservation): string {
-		const { integrity: _integrity, ...facts } = reservation;
-		return createHmac("sha256", this.#identityKey).update(canonicalJson(facts)).digest("hex");
-	}
-
-	#isManagedKeyReservation(value: unknown): value is ManagedKeyReservation {
-		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-		const row = value as Partial<ManagedKeyReservation>;
-		return (
-			Object.keys(row).every(
-				key =>
-					key === "version" ||
-					key === "kind" ||
-					key === "aliasIdentities" ||
-					key === "managedIdentity" ||
-					key === "controlRoot" ||
-					key === "integrity",
-			) &&
-			row.version === 1 &&
-			row.kind === "managed_key_reservation" &&
-			Array.isArray(row.aliasIdentities) &&
-			row.aliasIdentities.length > 0 &&
-			row.aliasIdentities.every(identity => typeof identity === "string" && /^[0-9a-f]{64}$/i.test(identity)) &&
-			new Set(row.aliasIdentities).size === row.aliasIdentities.length &&
-			canonicalJson(row.aliasIdentities) === canonicalJson([...row.aliasIdentities].sort()) &&
-			typeof row.managedIdentity === "string" &&
-			/^[0-9a-f]{64}$/i.test(row.managedIdentity) &&
-			typeof row.controlRoot === "string" &&
-			path.isAbsolute(row.controlRoot) &&
-			path.normalize(row.controlRoot) === row.controlRoot &&
-			typeof row.integrity === "string" &&
-			/^[0-9a-f]{64}$/i.test(row.integrity) &&
-			timingSafeEqual(
-				Buffer.from(row.integrity, "hex"),
-				Buffer.from(this.#managedKeyReservationIntegrity(row as ManagedKeyReservation), "hex"),
-			)
-		);
-	}
-
-	#rememberManagedKeyReservation(reservation: ManagedKeyReservation): boolean {
-		const prior = this.#managedIdentityBindings.get(reservation.managedIdentity);
-		if (
-			prior &&
-			(prior.controlRoot !== reservation.controlRoot ||
-				canonicalJson(prior.aliasIdentities) !== canonicalJson(reservation.aliasIdentities))
-		)
-			return false;
-		if (prior) return false;
-		this.#managedIdentityBindings.set(reservation.managedIdentity, {
-			aliasIdentities: [...reservation.aliasIdentities],
-			controlRoot: reservation.controlRoot,
-		});
-		for (const alias of reservation.aliasIdentities) {
-			const roots = this.#managedKeyAliases.get(alias) ?? new Map<string, string>();
-			const existingRoot = roots.get(reservation.managedIdentity);
-			if (existingRoot !== undefined && existingRoot !== reservation.controlRoot) return false;
-			roots.set(reservation.managedIdentity, reservation.controlRoot);
-			this.#managedKeyAliases.set(alias, roots);
-		}
-		return true;
-	}
-
-	#isStoredClaim(value: unknown): value is StoredClaim {
-		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-		const row = value as Partial<StoredClaim>;
-		return (
-			Object.keys(row).every(
-				key => key === "version" || key === "claim" || key === "authority" || key === "integrity",
-			) &&
-			row.version === 1 &&
-			isSpawnClaimV2(row.claim) &&
-			(row.authority === undefined || isSpawnAuthorityV1(row.authority)) &&
-			(row.authority === undefined || matchingAuthority(row.claim, row.authority)) &&
-			typeof row.integrity === "string" &&
-			/^[0-9a-f]{64}$/i.test(row.integrity) &&
-			timingSafeEqual(
-				Buffer.from(row.integrity, "hex"),
-				Buffer.from(this.#integrity(row.claim, row.authority), "hex"),
-			)
-		);
-	}
-
 	async #append(claim: SpawnClaimV2, authority?: SpawnAuthorityV1): Promise<void> {
 		if (!isSpawnClaimV2(claim) || (authority !== undefined && !matchingAuthority(claim, authority)))
 			throw new Error("Refusing to persist invalid spawn authority evidence.");
 		const write: SpawnAuthorityDurableWrite = { claim, ...(authority === undefined ? {} : { authority }) };
-		const row: StoredClaim = { version: 1, ...write, integrity: this.#integrity(claim, authority) };
+		const row: StoredClaim = { version: 1, ...write, integrity: claimIntegrity(this.#identityKey, claim, authority) };
 		await this.#appendRow(row, write);
 		this.#latest.set(claim.lifecycleIdentity, claim);
 		if (authority) this.#authorities.set(claim.lifecycleIdentity, authority);

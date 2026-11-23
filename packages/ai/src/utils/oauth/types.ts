@@ -113,6 +113,11 @@ export interface OAuthController {
 	onProgress?(message: string): void;
 	onManualCodeInput?(): Promise<string>;
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
+	/**
+	 * Called when an OAuth provider requires explicit confirmation before proceeding.
+	 * Return true to confirm and proceed, false to abort the authorization.
+	 */
+	onConfirmWarning?(warning: { provider: string; message: string }): Promise<boolean>;
 	signal?: AbortSignal;
 	fetch?: typeof globalThis.fetch;
 }
