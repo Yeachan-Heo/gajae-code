@@ -1138,7 +1138,8 @@ For idle-only retirement, pass `target: { ...authority, ifIdle: true }` (or
 `ifIdle: true` in the broker `session.close` input). This is independent of the
 endpoint identity fence. The runtime synchronously checks its own turn,
 prompt-queue, continuation, foreground bash, side-question and owned async-job
-state, including side-turn credential preflight, then closes prompt admission
+state, including side-turn credential preflight and an in-flight session recap
+request, then closes prompt admission
 through disposal. New prompts, completion/continuation delivery, `/btw`, and
 IRC/background side turns are refused.
 If work is pending, the host stays running and returns `busy`, with lifecycle
@@ -1568,7 +1569,10 @@ masters in one scope can tell their own children (`self: true`) from each
 other's. `self` is an advisory display hint and grants no permission; nothing
 checks it before a lifecycle request. A row that does not come from the state
 root the spawned child registered in (an ambiguous session id, or the same id
-opened or resumed elsewhere) carries no `spawnedBy`.
+opened or resumed elsewhere) carries no `spawnedBy`. The Broker records that
+state root as a canonical (symlink-resolved) path when the child registers, so
+retargeting a symlinked state root later does not move the owner to another
+directory; a spawn recorded without that canonical root names no row.
 
 Master orchestration is broker-routed and best effort: scoped discovery via
 `gjc sdk search` (result-level scope envelopes, exact worktree/cwd identity,

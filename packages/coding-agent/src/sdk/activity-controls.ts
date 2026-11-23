@@ -4,7 +4,7 @@ import {
 	MCPServerControlError,
 	type MCPServerControlTarget,
 } from "../runtime-mcp/manager";
-import { collectSdkStoredSecrets } from "./credential-secrets";
+import { collectSdkStoredSecrets, maskStoredSecrets } from "./credential-secrets";
 import {
 	JobObservationError,
 	type JobObservationErrorCode,
@@ -181,25 +181,23 @@ function failure(error: unknown): ActivityControlError {
 	return new ActivityControlError("backend_failure");
 }
 
-function text(value: string, secrets: readonly string[], limit: number = ACTIVITY_CONTROL_LIMITS.fieldChars): string {
-	if (!secrets.length) return value.slice(0, limit);
-	// Inspect complete display fields before bounding them. Mask the union so an
-	// overlapping credential cannot hide another match and expose its remainder.
-	const masks = new Uint8Array(value.length);
-	for (const secret of secrets) {
-		if (!secret) continue;
-		for (let start = value.indexOf(secret); start !== -1; start = value.indexOf(secret, start + 1)) {
-			masks.fill(1, start, start + secret.length);
-		}
-	}
-	const parts: string[] = [];
-	for (let index = 0; index < value.length; ) {
-		const start = index;
-		const masked = masks[index];
-		while (index < value.length && masks[index] === masked) index++;
-		parts.push(masked ? "[REDACTED]" : value.slice(start, index));
-	}
-	return parts.join("").slice(0, limit);
+/** Upstream producers (for example bash job labels) cut long values and append one of these. */
+const TRUNCATION_MARKERS = ["...", "\u2026"] as const;
+/** A cut-off credential fragment shorter than this is left alone, so ordinary text is not masked. */
+const PARTIAL_SECRET_MIN_CHARS = 8;
+
+function text(value: string, secrets: readonly string[]): string {
+	// Inspect complete display fields before bounding them. A value already cut
+	// upstream may end in a credential's prefix, just before its marker.
+	if (!secrets.length) return value.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
+	const marker = TRUNCATION_MARKERS.find(candidate => value.endsWith(candidate));
+	const safe =
+		marker === undefined
+			? maskStoredSecrets(value, secrets, "[REDACTED]")
+			: maskStoredSecrets(value.slice(0, -marker.length), secrets, "[REDACTED]", {
+					trailingPartial: PARTIAL_SECRET_MIN_CHARS,
+				}) + marker;
+	return safe.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
 }
 
 function count(value: number): number {
@@ -433,17 +431,18 @@ export class ActivityControls {
 			let detail: ActivityDetail = { entry };
 			if (target.kind === "job" && entry.readable) {
 				const output = this.#view().getMonitorOutput(target);
-				const safe = text(
+				// The retained window can start inside a credential (oldest output is
+				// evicted) and a running job's output can end inside one.
+				const safe = maskStoredSecrets(
 					output,
 					collectSdkStoredSecrets(this.#session.modelRegistry.authStorage),
-					Number.MAX_SAFE_INTEGER,
+					"[REDACTED]",
+					{ leadingPartial: PARTIAL_SECRET_MIN_CHARS, trailingPartial: PARTIAL_SECRET_MIN_CHARS },
 				);
 				detail = {
 					entry,
 					output: safe.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars),
-					outputTruncated:
-						output.length > ACTIVITY_CONTROL_LIMITS.outputChars ||
-						safe.length > ACTIVITY_CONTROL_LIMITS.outputChars,
+					outputTruncated: safe.length > ACTIVITY_CONTROL_LIMITS.outputChars,
 				};
 			}
 			this.#assertCurrent();

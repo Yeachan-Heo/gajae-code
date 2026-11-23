@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
-import { AsyncJobManager, type SubagentRecord, type SubagentRunOutcome } from "../src/async/job-manager";
+import {
+	AsyncJobManager,
+	DEFAULT_JOB_OUTPUT_RETENTION_BYTES,
+	type SubagentRecord,
+	type SubagentRunOutcome,
+} from "../src/async/job-manager";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentRegistry } from "../src/registry/agent-registry";
@@ -819,6 +824,77 @@ describe("session-owned SDK activity controls", () => {
 		expect(f.controls.getActivitySnapshot().jobs[0]!.label).toBe("[REDACTED]");
 	});
 
+	test("a bash label cut upstream does not expose the stored key prefix before its marker", async () => {
+		const f = await fixture();
+		const key = `sk-ant-api03-${"Ab3dE6".repeat(11)}`;
+		await f.result.session.modelRegistry.authStorage.set("activity-bash-label", { type: "api_key", key });
+		// The same cut the bash tool applies to long commands before registering the job.
+		const bashLabel = (command: string) => (command.length > 120 ? `${command.slice(0, 117)}...` : command);
+		const command = `curl -sS https://api.anthropic.com/v1/messages -H "content-type: application/json" -H "x-api-key: ${key}" -d @req.json`;
+		const label = bashLabel(command);
+		expect(label.endsWith("...")).toBe(true);
+		const visible = label.slice(label.indexOf("sk-ant"), -3);
+		expect(key.startsWith(visible)).toBe(true);
+		monitor(f.manager, f.owner, label);
+		monitor(f.manager, f.owner, `${label.slice(0, -3)}\u2026`);
+		const labels = f.controls.getActivitySnapshot().jobs.map(row => row.label);
+		const prefix = label.slice(0, label.indexOf("sk-ant"));
+		expect(labels.sort()).toEqual([`${prefix}[REDACTED]...`, `${prefix}[REDACTED]\u2026`].sort());
+		expect(JSON.stringify(labels)).not.toContain(key.slice(0, 8));
+	});
+
+	test("a short ordinary fragment before a truncation marker stays visible", async () => {
+		const f = await fixture();
+		const key = "sk-ant-api03-activity-short-fragment";
+		await f.result.session.modelRegistry.authStorage.set("activity-short", { type: "api_key", key });
+		monitor(f.manager, f.owner, "deploy tasks...");
+		monitor(f.manager, f.owner, "notes sk-ant-...");
+		monitor(f.manager, f.owner, "notes sk-ant-a...");
+		const labels = f.controls
+			.getActivitySnapshot()
+			.jobs.map(row => row.label)
+			.sort();
+		// Seven matching characters are ordinary text; eight are treated as a cut-off credential.
+		expect(labels).toEqual(["deploy tasks...", "notes [REDACTED]...", "notes sk-ant-..."]);
+	});
+
+	test("monitor output masks credential fragments at both edges of the retained window", async () => {
+		const f = await fixture();
+		const key = "activity-window-edge-private-key";
+		await f.result.session.modelRegistry.authStorage.set("activity-window", { type: "api_key", key });
+		const job = monitor(f.manager, f.owner, "window edges");
+		// One chunk larger than the retention cap keeps only its newest bytes, so the
+		// window starts ten characters before the end of the credential.
+		f.manager.appendOutput(job.id, `${key}${"y".repeat(DEFAULT_JOB_OUTPUT_RETENTION_BYTES - 10)}`);
+		const entry = f.controls.getActivitySnapshot().jobs.find(row => row.label === "window edges")!;
+		const head = f.controls.getDetail({ ref: entry.ref });
+		expect(head.output?.startsWith(`[REDACTED]${"y".repeat(16)}`)).toBe(true);
+		expect(head.output).not.toContain(key.slice(-10));
+
+		const running = monitor(f.manager, f.owner, "streaming");
+		f.manager.appendOutput(running.id, `log line ${key.slice(0, 20)}`);
+		const streaming = f.controls.getActivitySnapshot().jobs.find(row => row.label === "streaming")!;
+		expect(f.controls.getDetail({ ref: streaming.ref })).toMatchObject({
+			output: "log line [REDACTED]",
+			outputTruncated: false,
+		});
+	});
+
+	test("monitor output is not reported truncated when only masking shortened it", async () => {
+		const f = await fixture();
+		const key = `activity-shrinking-private-${"k".repeat(80)}`;
+		await f.result.session.modelRegistry.authStorage.set("activity-shrink", { type: "api_key", key });
+		const job = monitor(f.manager, f.owner, "shrinking output");
+		const raw = `${"x".repeat(ACTIVITY_CONTROL_LIMITS.outputChars - 40)}${key}`;
+		expect(raw.length).toBeGreaterThan(ACTIVITY_CONTROL_LIMITS.outputChars);
+		f.manager.appendOutput(job.id, raw);
+		const entry = f.controls.getActivitySnapshot().jobs.find(row => row.label === "shrinking output")!;
+		expect(f.controls.getDetail({ ref: entry.ref })).toMatchObject({
+			output: `${"x".repeat(ACTIVITY_CONTROL_LIMITS.outputChars - 40)}[REDACTED]`,
+			outputTruncated: false,
+		});
+	});
+
 	test("folded evidence supplied by the facade remains observable without a retained backend job", async () => {
 		const f = await fixture();
 		const view = f.result.jobObservation!;
@@ -907,6 +983,23 @@ describe("session-owned SDK activity controls", () => {
 			await maintenance;
 		}
 		expect(f.controls.operateActivity({ ref }, "cancel")).toEqual({ cancelled: true });
+	});
+
+	test("an observation read during MCP admission does not retire bound activity controls", async () => {
+		const f = await fixture();
+		const job = monitor(f.manager, f.owner);
+		const ref = f.controls.getActivitySnapshot().jobs[0]!.ref;
+		const view = f.result.jobObservation;
+		await f.result.session.withMcpControlAdmission(f.result.session.sessionLifecycle.generation, async () => {
+			// Any client listing operations reads the factory job view mid-admission.
+			expect(getSdkClientControlOperations(f.result.session)).toContain("activity.cancel");
+			expect(f.result.jobObservation).toBe(view);
+			expect(f.controls.getActivitySnapshot().jobs.map(entry => entry.controls)).toEqual([[]]);
+		});
+		expect(f.result.jobObservation).toBe(view);
+		expect(f.controls.getActivitySnapshot().jobs[0]!.ref).toBe(ref);
+		expect(f.controls.operateActivity({ ref }, "cancel")).toEqual({ cancelled: true });
+		expect(job.abortController.signal.aborted).toBe(true);
 	});
 
 	test("dispose detaches subscriptions without disposing the shared observation or manager", async () => {

@@ -76,8 +76,9 @@ export class JobObservationError extends Error {
 }
 
 /**
- * Owner-scoped trusted-host facade. Factory views additionally fence mutations
- * to their captured native session lifecycle; standalone views retain host authority.
+ * Standalone trusted-host facade; not a session-installed SDK capability.
+ * An optional mutation guard runs immediately before each backend effect;
+ * the factory view uses it to refuse mutations during MCP control admission.
  * The host captures its registry owner here, never from a remote control request.
  */
 export class JobObservation {
@@ -86,7 +87,7 @@ export class JobObservation {
 	readonly #observer: JobsObserver;
 	readonly #taskControlScope: string;
 	readonly #unsubscribeFailures: () => void;
-	readonly #assertMutationAllowed?: () => void;
+	readonly #assertMutationAllowed: (() => void) | undefined;
 	#failureSignature = "";
 	#failureRevision = crypto.randomUUID();
 	#disposed = false;
@@ -132,12 +133,6 @@ export class JobObservation {
 
 	#assertActive(): void {
 		if (this.#disposed) throw new JobObservationError("disposed");
-	}
-
-	#assertMutable(): void {
-		this.#assertActive();
-		this.#assertMutationAllowed?.();
-		this.#assertActive();
 	}
 
 	/** Detached DTOs: mutations cannot change observer caches or backend records. */
@@ -199,12 +194,11 @@ export class JobObservation {
 
 	/** Refuses terminal/evicted jobs explicitly; never silently succeeds or cancels a successor. */
 	cancelMonitor(target: JobObservationTarget): true {
-		this.#assertMutable();
+		this.#assertActive();
 		const { id, generation } = target;
 		const job = this.#assertMonitor(id, generation);
 		if (job.status !== "running") throw new JobObservationError("already_terminal");
-		// Check after materializing target accessors and immediately before admission.
-		this.#assertMutable();
+		this.#assertMutationAllowed?.();
 		// cancel captures the live record synchronously, before invoking lifecycle callbacks.
 		if (!this.#manager.cancel(id, { ownerId: this.#ownerId })) throw new JobObservationError("not_found");
 		return true;
@@ -215,11 +209,12 @@ export class JobObservation {
 		action: "cancel" | "pause" | "resume",
 		message?: string,
 	): SubagentControlSuccess {
-		this.#assertMutable();
-		// Materialize untrusted accessors before the manager's final CAS, then
-		// recheck native session admission as well as facade disposal.
+		this.#assertActive();
+		// Materialize untrusted accessors before the manager's final CAS, and
+		// recheck disposal because a target getter can dispose this facade.
 		const { id, generation } = target;
-		this.#assertMutable();
+		this.#assertActive();
+		this.#assertMutationAllowed?.();
 		const result = this.#manager.controlOwnedSubagent(
 			this.#ownerId,
 			this.#taskControlScope,
@@ -251,13 +246,13 @@ export class JobObservation {
 
 	/** createdAt is the existing schedule identity token, not its changing nextFireAt. */
 	deleteCron(target: CronObservationTarget): true {
-		this.#assertMutable();
+		this.#assertActive();
 		const { id, createdAt } = target;
 		this.#assertActive();
 		const cron = listCronSnapshots(this.#ownerId).find(entry => entry.id === id);
 		if (!cron) throw new JobObservationError("not_found");
 		if (cron.createdAt !== createdAt) throw new JobObservationError("stale_generation");
-		this.#assertMutable();
+		this.#assertMutationAllowed?.();
 		// The real cron backend removes synchronously, notifying listeners only afterwards.
 		if (!deleteCronJobById(this.#ownerId, id)) throw new JobObservationError("not_found");
 		return true;
@@ -265,12 +260,12 @@ export class JobObservation {
 
 	/** No revision preserves the trusted overlay's unscoped ACK semantics. */
 	acknowledgeFailures(expectedRevision?: string): void {
-		this.#assertMutable();
+		this.#assertActive();
 		this.#refreshFailureRevision();
 		if (expectedRevision !== undefined && expectedRevision !== this.#failureRevision) {
 			throw new JobObservationError("stale_generation");
 		}
-		this.#assertMutable();
+		this.#assertMutationAllowed?.();
 		// No await or callbacks between the revision comparison and the observer's
 		// synchronous failure capture. Delivery state is never consumed here.
 		this.#observer.acknowledgeFailures();

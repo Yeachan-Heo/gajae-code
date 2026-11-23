@@ -1718,6 +1718,12 @@ export type SpawnChildHostLaunch = {
 	env: Readonly<Record<string, string>>;
 	effectMarker: string;
 	semanticReadyDeadlineAt: number;
+	/**
+	 * Broker-side bound for waiting on the host's own startup verdict after the
+	 * semantic deadline (the same convention termination scheduling uses). The
+	 * host does not promise its failure receipt by then.
+	 */
+	terminationStartDeadlineAt: number;
 };
 
 export function prepareSpawnChildHostLaunch(
@@ -1770,6 +1776,7 @@ export function prepareSpawnChildHostLaunch(
 		},
 		effectMarker,
 		semanticReadyDeadlineAt: deadlines.semanticReadyDeadlineAt,
+		terminationStartDeadlineAt: deadlines.terminationStartDeadlineAt,
 	};
 }
 
@@ -1778,6 +1785,8 @@ const lifecycleReadyPath = (root: string, id: string) => path.join(root, "sdk", 
 const lifecycleFailurePath = (root: string, id: string, effectMarker: string) =>
 	path.join(root, "sdk", `${id}.lifecycle.failure.${effectMarker}.json`);
 const lifecycleFailurePromotionPath = (failurePath: string) => `${failurePath}.promoting`;
+// No `.json` suffix: SDK endpoint scanners read every `*.json` in this directory.
+const lifecycleStartupCommitName = (id: string) => `${id}.lifecycle.committed`;
 type EffectMarker = { pid: number; effectMarker: string; incarnation: string };
 type ReadyAuthority = {
 	endpoint: Record<string, unknown>;
@@ -1804,7 +1813,7 @@ export function setProcessIncarnationForTest(
 	else processIncarnationReadersForTest.delete(broker);
 }
 
-function processIncarnationForBroker(broker: BrokerIndex, pid: number): string | undefined {
+export function processIncarnationForBroker(broker: BrokerIndex, pid: number): string | undefined {
 	const reader = processIncarnationReadersForTest.get(broker);
 	return reader ? reader(pid) : processIncarnation(pid);
 }
@@ -1987,6 +1996,8 @@ export async function reapDeadLifecycleMarkers(
 				}).ok
 			)
 				continue;
+			// The owner marker is what finds this id again; retire its commit first.
+			if (!retireLifecycleStartupCommit(directory, id, marker)) continue;
 			if (
 				!nativeLifecycle().exactUnlinkDirect(markerPath, {
 					...primary.identity,
@@ -2082,6 +2093,7 @@ async function retireExitedLifecycleMarkerPairImpl(
 			});
 			if (!removedReady.ok && removedReady.code !== "not_found") return false;
 		}
+		if (!retireLifecycleStartupCommit(directory, id, marker)) return false;
 		const removedMarker = nativeLifecycle().exactUnlinkDirect(markerPath, {
 			...primary.identity,
 			parentDev: directoryIdentity.dev,
@@ -2127,6 +2139,125 @@ export async function writeEffectMarker(root: string, id: string, marker: Effect
 	} finally {
 		await fs.rm(temporary, { force: true });
 	}
+}
+
+/**
+ * The host's irreversible startup commit. Unlike the readiness marker, which
+ * becomes visible before the host's last cutoff check and can still be revoked,
+ * the host writes this only after startup completed, when no startup rollback
+ * path can run any more. It names the owner and a digest of the lifecycle
+ * marker, never the marker itself: the marker doubles as the host's close
+ * capability, and a record left behind by a crash must not carry it.
+ */
+type LifecycleStartupCommit = { pid: number; incarnation: string; effectMarkerSha256: string };
+
+function lifecycleStartupCommit(owner: EffectMarker): LifecycleStartupCommit {
+	return {
+		pid: owner.pid,
+		incarnation: owner.incarnation,
+		effectMarkerSha256: createHash("sha256").update(owner.effectMarker).digest("hex"),
+	};
+}
+
+/** The commit file when it is an exact bounded regular file naming exactly `owner`. */
+function captureLifecycleStartupCommit(
+	directory: string,
+	id: string,
+	owner: EffectMarker,
+): { kind: "absent" } | { kind: "other" } | { kind: "owned"; capture: LifecycleFileCapture } {
+	const capture = captureLifecycleFile(path.join(directory, lifecycleStartupCommitName(id)), true, true);
+	if (!capture) return { kind: "absent" };
+	let value: unknown;
+	try {
+		value = parseLifecycleJson(capture.bytes);
+	} catch {
+		return { kind: "other" };
+	}
+	const expected = lifecycleStartupCommit(owner);
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return { kind: "other" };
+	const record = value as Record<string, unknown>;
+	return Object.keys(record).length === 3 &&
+		record.pid === expected.pid &&
+		record.incarnation === expected.incarnation &&
+		record.effectMarkerSha256 === expected.effectMarkerSha256
+		? { kind: "owned", capture }
+		: { kind: "other" };
+}
+
+/**
+ * Host side: record that startup committed. Call only after startup can no
+ * longer roll back. Written through an exclusive temp file and an atomic rename,
+ * so a reader never sees a partial record.
+ */
+export async function writeSessionLifecycleStartupCommit(
+	root: string,
+	id: string,
+	effectMarker: string,
+): Promise<void> {
+	const incarnation = processIncarnation(process.pid);
+	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
+	const directory = path.join(root, "sdk");
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const temporary = path.join(directory, `.${lifecycleStartupCommitName(id)}.${randomUUID()}.tmp`);
+	const handle = await fs.open(
+		temporary,
+		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+		0o600,
+	);
+	// The exclusive temp name is ours alone; remove it on every path, including
+	// a failed write, sync, or close before the rename.
+	try {
+		try {
+			await handle.writeFile(canonicalJson(lifecycleStartupCommit({ pid: process.pid, incarnation, effectMarker })));
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await fs.rename(temporary, path.join(directory, lifecycleStartupCommitName(id)));
+		await syncDirectory(directory);
+	} finally {
+		await fs.rm(temporary, { force: true });
+	}
+}
+
+/** Broker side: whether the host launched as `expected` committed its startup. */
+export function hasSessionLifecycleStartupCommit(root: string, id: string, expected: EffectMarker): boolean {
+	try {
+		return captureLifecycleStartupCommit(path.join(root, "sdk"), id, expected).kind === "owned";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Removes the startup commit only when it names exactly `owner`, by exact file
+ * identity. Returns false when an owned record could not be removed; a record
+ * naming another owner is left in place.
+ */
+function retireLifecycleStartupCommit(directory: string, id: string, owner: EffectMarker): boolean {
+	try {
+		const parent = lifecycleParentIdentity(directory);
+		if (!parent) return false;
+		const commit = captureLifecycleStartupCommit(directory, id, owner);
+		if (commit.kind !== "owned") return true;
+		const file = path.join(directory, lifecycleStartupCommitName(id));
+		const removed = nativeLifecycle().exactUnlinkDirect(file, {
+			...commit.capture.identity,
+			parentDev: BigInt(parent.dev),
+			parentIno: BigInt(parent.ino),
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(file)}`,
+		});
+		return removed.ok || removed.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+/** Host side: withdraw this process's startup commit during graceful shutdown. */
+export function removeSessionLifecycleStartupCommit(root: string, id: string, effectMarker: string): boolean {
+	const incarnation = processIncarnation(process.pid);
+	if (!incarnation) return false;
+	return retireLifecycleStartupCommit(path.join(root, "sdk"), id, { pid: process.pid, incarnation, effectMarker });
 }
 
 export class LifecycleReadinessCleanupError extends Error {
@@ -2396,7 +2527,7 @@ export interface LifecycleTranscriptEvidence {
 	identity: SessionLifecycleTranscriptIdentity;
 }
 
-type LifecycleFailureArtifact = EffectMarker &
+export type LifecycleFailureArtifact = EffectMarker &
 	SdkStartupFailure & {
 		rollback: SdkStartupRollbackResult;
 		transcript?: LifecycleTranscriptEvidence;
@@ -4589,6 +4720,43 @@ export async function readSessionLifecycleFailure(
 }
 
 /**
+ * Whether anything occupies the failure receipt path for `expected` or its
+ * promotion fence, readable or not. A receipt that is still being published or
+ * cannot be read is unknown evidence, not absence.
+ */
+export function hasSessionLifecycleFailureEvidence(root: string, id: string, expected: EffectMarker): boolean {
+	const failurePath = lifecycleFailurePath(root, id, expected.effectMarker);
+	for (const file of [failurePath, lifecycleFailurePromotionPath(failurePath)]) {
+		try {
+			fsSync.lstatSync(file);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Whether the owner marker and the readiness marker both name exactly
+ * `expected`. The host publishes readiness only before its semantic cutoff, but
+ * may revoke it if it loses that race, so readiness is evidence, not a commit:
+ * callers that need a verdict also require {@link hasSessionLifecycleStartupCommit}.
+ */
+export async function hasSessionLifecycleReadiness(root: string, id: string, expected: EffectMarker): Promise<boolean> {
+	const [effect, ready] = await Promise.all([
+		readEffectMarker(lifecycleMarkerPath(root, id)),
+		readEffectMarker(lifecycleReadyPath(root, id)),
+	]);
+	return (
+		effect !== undefined &&
+		ready !== undefined &&
+		sameEffectMarker(effect, expected) &&
+		sameEffectMarker(ready, expected)
+	);
+}
+
+/**
  * Read a failure artifact with startup-time fence reconciliation.
  * Called during startup/restart paths to recover from crashes during fence promotion.
  * Exposed for testing.
@@ -4664,16 +4832,7 @@ async function hasOwnedReadinessEvidence(
 		"alive"
 	)
 		return false;
-	const [effect, ready] = await Promise.all([
-		readEffectMarker(lifecycleMarkerPath(root, id)),
-		readEffectMarker(lifecycleReadyPath(root, id)),
-	]);
-	return (
-		effect !== undefined &&
-		ready !== undefined &&
-		sameEffectMarker(effect, expected) &&
-		sameEffectMarker(ready, expected)
-	);
+	return await hasSessionLifecycleReadiness(root, id, expected);
 }
 
 /**

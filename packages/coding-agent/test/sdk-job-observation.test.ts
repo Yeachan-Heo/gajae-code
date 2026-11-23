@@ -865,74 +865,84 @@ describe("owner-scoped SDK job observation", () => {
 		});
 	}
 
-	for (const action of ["monitor", "cron", "cancel", "pause", "resume"] as const) {
-		test(`real factory ${action} admission rechecks ownership after target getters`, async () => {
+	for (const readDuringTransition of [true, false]) {
+		test(`real factory non-MCP transition keeps pre-existing view semantics ${readDuringTransition ? "after a getter read" : "for a retained handle"}`, async () => {
 			const fixture = await observationFactory();
 			const { result, ownerId } = fixture;
 			const { session } = result;
-			const originalManager = session.sessionManager;
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			// Hold manual compaction open at its first await, inside the transition lease.
+			const abort = spyOn(session, "abort").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			let compaction: Promise<unknown> | undefined;
 			try {
+				const generation = session.sessionLifecycle.generation;
 				const capturedManager = AsyncJobManager.forEndpoint(session.sessionId)!;
-				const view = result.jobObservation!;
-				const monitorTarget = monitor(capturedManager, ownerId);
-				const cron = await createCron(ownerId, capturedManager);
-				const running = runningTask(capturedManager, "getter-pause", ownerId);
-				let pauses = 0;
-				capturedManager.registerLiveHandle("getter-pause", {
-					requestPause: () => {
-						pauses++;
-						running.gate.resolve({ kind: "paused" });
-					},
-					injectMessage: async () => {},
-				});
-				taskRecord(capturedManager, "getter-paused", ownerId);
-				let resumes = 0;
-				capturedManager.registerResumeDescriptor({ subagentId: "getter-paused", ownerId, data: {} }, id => {
-					resumes++;
-					return capturedManager.register("task", id, async () => "resumed", { ownerId });
-				});
-				const target =
-					action === "monitor"
-						? monitorTarget
-						: action === "cron"
-							? cron
-							: taskTarget(view, action === "pause" ? "getter-pause" : "getter-paused");
-				const untrusted = {
-					get id() {
-						session.sessionManager = SessionManager.inMemory(originalManager.getCwd());
-						return target.id;
-					},
-					generation: "generation" in target ? target.generation : "",
-					createdAt: cron.createdAt,
-				};
-				const mutate = () => {
-					if (action === "monitor") return view.cancelMonitor(untrusted);
-					if (action === "cron") return view.deleteCron(untrusted);
-					if (action === "pause") return view.pauseTask(untrusted);
-					if (action === "resume") return view.resumeTask(untrusted);
-					return view.cancelTask(untrusted);
-				};
-				expectCode(mutate, "stale_generation");
-				expect(capturedManager.getJob(monitorTarget.id)?.status).toBe("running");
-				expect(running.job.abortController.signal.aborted).toBe(false);
-				expect(running.record.status).toBe("running");
-				expect(capturedManager.getSubagentRecord("getter-paused")?.status).toBe("paused");
-				expect(pauses).toBe(0);
-				expect(resumes).toBe(0);
-				expect(
-					observe(capturedManager, ownerId)
-						.getSnapshot()
-						.crons.map(entry => entry.id),
-				).toContain(cron.id);
-				session.sessionManager = originalManager;
-				expect(result.jobObservation).toBe(view);
-				expectCode(() => view.getSnapshot(), "disposed");
+				const target = monitor(capturedManager, ownerId);
+				taskRecord(capturedManager, "compaction-owned", ownerId);
+				const predecessor = result.jobObservation!;
+				const oldTask = taskTarget(predecessor, "compaction-owned");
+				compaction = session.compact().catch(() => undefined);
+				await entered.promise;
+				expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: true });
+				if (readDuringTransition) {
+					expect(result.jobObservation).toBe(predecessor);
+					expectCode(() => predecessor.getSnapshot(), "disposed");
+					expectCode(() => predecessor.cancelMonitor(target), "disposed");
+					expectCode(() => predecessor.cancelTask(oldTask), "disposed");
+					expect(capturedManager.getJob(target.id)?.status).toBe("running");
+				} else {
+					// The mutation fence is MCP-only: an unread retained handle acts as before.
+					expect(predecessor.getSnapshot().tasks.map(task => task.id)).toEqual(["compaction-owned"]);
+					expect(predecessor.cancelMonitor(target)).toBe(true);
+				}
+				expect(capturedManager.getSubagentRecord("compaction-owned")?.status).toBe("paused");
+				release.resolve();
+				await compaction;
+				expect(session.sessionLifecycle).toMatchObject({ generation, transitioning: false });
+				const settled = result.jobObservation;
+				expect(settled).toBeDefined();
+				if (!settled) throw new Error("Expected settled same-owner observation");
+				if (readDuringTransition) {
+					expect(settled).not.toBe(predecessor);
+					expect(settled.cancelMonitor(target)).toBe(true);
+				} else {
+					expect(settled).toBe(predecessor);
+				}
+				expect(settled.cancelTask(taskTarget(settled, "compaction-owned"))).toBe(true);
 			} finally {
-				session.sessionManager = originalManager;
+				release.resolve();
+				await compaction;
+				abort.mockRestore();
 				await fixture.dispose();
 			}
 		});
 	}
+
+	test("real factory view mutations behave as before when no transition or identity change is in progress", async () => {
+		const fixture = await observationFactory();
+		const { result, ownerId } = fixture;
+		try {
+			const capturedManager = AsyncJobManager.forEndpoint(result.session.sessionId)!;
+			const view = result.jobObservation!;
+			const target = monitor(capturedManager, ownerId);
+			const cron = await createCron(ownerId, capturedManager);
+			taskRecord(capturedManager, "steady-owned", ownerId);
+			expect(view.cancelMonitor(target)).toBe(true);
+			expectCode(() => view.cancelMonitor(target), "already_terminal");
+			expect(view.deleteCron(cron)).toBe(true);
+			expectCode(() => view.deleteCron(cron), "not_found");
+			expect(view.cancelTask(taskTarget(view, "steady-owned"))).toBe(true);
+			view.acknowledgeFailures();
+			expect(result.jobObservation).toBe(view);
+			expect(view.getSnapshot().crons).toEqual([]);
+		} finally {
+			await fixture.dispose();
+		}
+	});
 
 	for (const disposeDuringTransition of [false, true]) {
 		test(`real factory maintenance observation never recreates a host-disposed view ${disposeDuringTransition ? "during transition" : "before transition"}`, async () => {
@@ -1032,8 +1042,6 @@ describe("owner-scoped SDK job observation", () => {
 						);
 					};
 				}
-				// Retained raw authority must notice the mismatch without a getter refresh.
-				expectCode(() => predecessor.acknowledgeFailures(), "stale_generation");
 				expect(result.jobObservation).toBe(predecessor);
 				expectCode(() => predecessor.getSnapshot(), "disposed");
 				restoreOwner();
@@ -1117,10 +1125,7 @@ describe("owner-scoped SDK job observation", () => {
 				taskRecord(capturedManager, "new-owned", ownerId);
 				taskRecord(capturedManager, "new-foreign", "foreign-owner");
 				expect(intermediate.getSnapshot().tasks.map(task => task.id)).toEqual(["new-owned"]);
-				const successorTarget = taskTarget(intermediate, "new-owned");
-				expectCode(() => predecessor.cancelTask(successorTarget), "disposed");
-				expect(capturedManager.getSubagentRecord("new-owned")?.status).toBe("paused");
-				expect(intermediate.cancelTask(successorTarget)).toBe(true);
+				expect(intermediate.cancelTask(taskTarget(intermediate, "new-owned"))).toBe(true);
 				const predecessorCalls = predecessorDispose.mock.calls.length;
 				const intermediateDispose = spyOn(intermediate, "dispose");
 				try {

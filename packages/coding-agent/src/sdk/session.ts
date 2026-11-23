@@ -6721,36 +6721,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					observationSuspended = false;
 				}
 				if (!jobObservation) {
-					// Capture this view's owner, not the mutable renewal state below.
-					const generation = observationGeneration;
-					const sessionManager = observationSessionManager;
-					const sessionId = observationSessionId;
-					const scope = observationScope;
-					const view: JobObservation = new JobObservation(observationManager, resolvedAgentId, () => {
-						const current = observationSession.sessionLifecycle;
-						if (current.disposed) {
-							cleanup();
-							throw new JobObservationError("disposed");
-						}
-						if (
-							current.generation !== generation ||
-							observationSession.sessionManager !== sessionManager ||
-							observationSession.sessionId !== sessionId ||
-							observationManager.getSubagentControlScope() !== scope ||
-							observationInvalidated
-						) {
-							if (jobObservation === view) observationInvalidated = true;
-							cleanup();
-							throw new JobObservationError("stale_generation");
-						}
-						if (current.transitioning) {
-							// MCP keeps the read view alive, never its mutation authority.
-							if (!observationSession.isMcpControlActive) {
-								if (jobObservation === view) observationSuspended = true;
-								cleanup();
-							}
-							throw new JobObservationError("session_transitioning");
-						}
+					// MCP admission keeps this view readable, never its mutation authority.
+					const view = new JobObservation(observationManager, resolvedAgentId, () => {
+						if (observationSession.isMcpControlActive) throw new JobObservationError("session_transitioning");
 					});
 					const disposeView = view.dispose.bind(view);
 					const unregisterDisposal = observationSession.registerToolSessionCleanup(() => cleanup());
