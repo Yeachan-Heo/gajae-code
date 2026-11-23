@@ -917,6 +917,66 @@ describe("managed session write protocol", () => {
 		expect(fullyRead).toContain(opened.path);
 		expect(fullyRead).toContain(source);
 	});
+	it("probes migration receipts independently of the number of v2 transcripts", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		const migratedSource = path.join(legacy, "2026-01-01_session-a.jsonl");
+		await fs.writeFile(migratedSource, transcript("session-a", cwd));
+		const unmigratedIds = ["session-e", "session-f", "session-g"];
+		for (const id of unmigratedIds)
+			await fs.writeFile(path.join(legacy, `2026-01-01_${id}.jsonl`), transcript(id, cwd));
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const writeV2 = async (ids: string[]) => {
+			for (const id of ids)
+				await fs.writeFile(path.join(scope.directoryPath, `2026-01-02_${id}.jsonl`), transcript(id, cwd), {
+					mode: 0o600,
+				});
+		};
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const listWithReceiptReads = () => {
+			const capture = vi.spyOn(sessionInspection, "captureManagedFileNoFollow");
+			try {
+				const result = listManagedCandidates(scope);
+				const reads = capture.mock.calls.filter(([pathname]) => path.dirname(pathname) === receipts).length;
+				return { result, reads };
+			} finally {
+				capture.mockRestore();
+			}
+		};
+		// Legacy sources with no v2 transcript cannot be coalesced, so no receipt is read.
+		expect(listWithReceiptReads().reads).toBe(0);
+		await writeV2(["session-b"]);
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("listing incomplete");
+		const legacyCandidate = listed.owned.find(candidate => candidate.path === migratedSource);
+		if (!legacyCandidate) throw new Error("legacy candidate missing");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error("migration failed");
+
+		// Unrelated v2 transcripts go from one to three (two to four counting the migrated one).
+		const fewV2 = listWithReceiptReads();
+		await writeV2(["session-c", "session-d"]);
+		const moreV2 = listWithReceiptReads();
+		const coalesced = moreV2.result;
+
+		if (coalesced.kind !== "complete") throw new Error("listing incomplete");
+		expect(
+			coalesced.owned.map(candidate => [candidate.sessionId, candidate.provenance, candidate.migrationState]).sort(),
+		).toEqual([
+			["session-a", "v2", "migrated_v2"],
+			["session-b", "v2", "native_v2"],
+			["session-c", "v2", "native_v2"],
+			["session-d", "v2", "native_v2"],
+			["session-e", "legacy", "legacy_unmigrated"],
+			["session-f", "legacy", "legacy_unmigrated"],
+			["session-g", "legacy", "legacy_unmigrated"],
+		]);
+		// A receipt is keyed by its legacy source and names one destination, so
+		// adding unrelated v2 transcripts must not add receipt reads.
+		expect(fewV2.reads).toBeGreaterThan(0);
+		expect(moreV2.reads).toBe(fewV2.reads);
+	});
 	it("publishes a committed managed inode with exactly one link", async () => {
 		const { scope } = await fixture();
 		await prepareManagedSessionScopeForWrite(scope);

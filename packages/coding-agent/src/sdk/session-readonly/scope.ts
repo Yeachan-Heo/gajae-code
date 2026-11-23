@@ -746,25 +746,30 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		}
 		const retired = owned.length > 0 ? retiredTargetKeys(scope) : new Set<string>();
 		const visible = owned.filter(candidate => !isRetiredIn(retired, candidate));
+		// A committed receipt is keyed by its legacy source alone and names exactly one
+		// destination path, and `receiptMatches` rejects every other destination. Read
+		// each source's receipt once instead of once per (source, v2 destination) pair.
+		const receiptDestinations = new Map<ManagedCandidate, string>();
+		const hasV2 = visible.some(candidate => candidate.provenance === "v2");
+		for (const source of hasV2 ? visible : []) {
+			if (source.provenance !== "legacy") continue;
+			const destinationPath = receiptDestinationPath(receiptPathFor(scope, source));
+			if (destinationPath !== undefined) receiptDestinations.set(source, destinationPath);
+		}
+		const migratedTo = (source: ManagedCandidate, destination: ManagedCandidate): boolean =>
+			source.provenance === "legacy" &&
+			destination.provenance === "v2" &&
+			receiptDestinations.get(source) === destination.path &&
+			receiptMatches(receiptPathFor(scope, source), source, destination, scope);
 		const active = visible.filter(
-			candidate =>
-				candidate.provenance === "v2" ||
-				!visible.some(
-					destination =>
-						destination.provenance === "v2" &&
-						receiptMatches(receiptPathFor(scope, candidate), candidate, destination, scope),
-				),
+			candidate => candidate.provenance === "v2" || !visible.some(destination => migratedTo(candidate, destination)),
 		);
 		return {
 			kind: "complete",
 			scope,
 			owned: active.map(candidate => {
 				if (candidate.provenance !== "v2") return candidate;
-				const migrated = visible.some(
-					source =>
-						source.provenance === "legacy" &&
-						receiptMatches(receiptPathFor(scope, source), source, candidate, scope),
-				);
+				const migrated = visible.some(source => migratedTo(source, candidate));
 				return migrated ? { ...candidate, migrationState: "migrated_v2" as const } : candidate;
 			}),
 			foreignCount,
@@ -818,6 +823,18 @@ export function receiptPathFor(
 	);
 }
 
+/** Destination path a readable receipt names, or `undefined` when the receipt cannot match any destination. */
+function receiptDestinationPath(receiptPath: string): string | undefined {
+	try {
+		const value: unknown = JSON.parse(captureManagedFileNoFollow(receiptPath).bytes.toString("utf8"));
+		if (!value || typeof value !== "object") return undefined;
+		const destinationPath = (value as { destination?: { path?: unknown } }).destination?.path;
+		return typeof destinationPath === "string" ? destinationPath : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function receiptMatches(
 	receiptPath: string,
 	source: ManagedCandidate,
@@ -863,10 +880,10 @@ export function receiptMatches(
 				tree?: unknown;
 			};
 		};
-		// A receipt is keyed by its source and names exactly one destination. The
-		// resume listing probes every (legacy source, v2 destination) pair, so reject
-		// on these cheap receipt fields before hashing both transcripts and walking
-		// the artifact manifest; the full conjunction below would be false anyway.
+		// A receipt is keyed by its source and names exactly one destination. Reject
+		// a pair the receipt does not describe on these cheap receipt fields before
+		// hashing both transcripts and walking the artifact manifest; the full
+		// conjunction below would be false anyway.
 		if (
 			record.destination?.path !== destination.path ||
 			record.source?.path !== source.path ||

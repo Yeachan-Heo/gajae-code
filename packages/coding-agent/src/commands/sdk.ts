@@ -52,6 +52,7 @@ import {
 	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
+	removeSessionLifecycleStartupCommit,
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
 	sessionHostAttachedClients,
@@ -59,6 +60,7 @@ import {
 	startBrokerDeadRegistrationSweep,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
+	writeSessionLifecycleStartupCommit,
 } from "../sdk/broker/lifecycle";
 import { type BrokerLockRefusalCode, BrokerLockRefusedError } from "../sdk/broker/lock-refusal";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
@@ -653,6 +655,7 @@ export async function runSessionHost(
 		openLifecycleSessionManager?: typeof openLifecycleSessionManager;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
+		writeSessionLifecycleStartupCommit?: typeof writeSessionLifecycleStartupCommit;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
 	} = {},
 ): Promise<void> {
@@ -665,6 +668,7 @@ export async function runSessionHost(
 	const openLifecycleSession = timing.openLifecycleSessionManager ?? openLifecycleSessionManager;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
+	const writeStartupCommit = timing.writeSessionLifecycleStartupCommit ?? writeSessionLifecycleStartupCommit;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
 	let constructionCleanupComplete = true;
@@ -1435,9 +1439,17 @@ export async function runSessionHost(
 	};
 	let unregisterHostPostmortem: (() => void) | undefined;
 	let sessionDisposalExit: Promise<void> | undefined;
+	let startupCommitWrite: Promise<void> | undefined;
 	const exitAfterSessionDisposal = async (reason?: "detached_idle", exitProcess = true): Promise<void> => {
 		let failure: SdkStartupFailure | undefined;
 		let ownsEndpoint = false;
+		if (startupCommitWrite) {
+			// Withdraw the commit only after it landed, so a stop that races the
+			// write cannot leave a record behind for a host that is going away.
+			await startupCommitWrite;
+			if (!removeSessionLifecycleStartupCommit(request.stateRoot, request.sessionId, effectMarker))
+				logger.warn("SDK host startup commit could not be withdrawn", { sessionId: request.sessionId });
+		}
 		const endpointCleanup = (async (): Promise<boolean> => {
 			let complete = await removeOwnedSessionEndpoint();
 			for (let attempt = 0; !complete && attempt < 20; attempt += 1) {
@@ -1613,6 +1625,17 @@ export async function runSessionHost(
 		}
 		throw error;
 	}
+	// Startup is committed: with `startupComplete` set, every startup rollback
+	// path is a no-op. Only now may the host say so durably. The broker requires
+	// this record before it admits a child it observed after the semantic
+	// deadline, because the readiness marker alone can still be revoked.
+	startupCommitWrite = writeStartupCommit(request.stateRoot, request.sessionId, effectMarker).catch(error => {
+		logger.warn("SDK host startup commit could not be published", {
+			sessionId: request.sessionId,
+			error: String(error),
+		});
+	});
+	await startupCommitWrite;
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and
 	// its failure must never take the session down.
