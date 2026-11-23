@@ -16,6 +16,9 @@ export const recovery = {
 	"recovery.deleteDiscards":
 		"Deleting also discards {count} unsent messages whose drafts were never restored. Copy their text first if you still need it.",
 	"recovery.copyAllText": "Copy all text",
+	"recovery.textsLabel": "Unsent messages",
+	"recovery.messageNumber": "Message {index} of {count}",
+	"recovery.copyBoundary": "--- Message {index} of {count} ---",
 	"recovery.openConversation": "Open conversation",
 	"recovery.copyText": "Copy text",
 	"recovery.copied": "Text copied.",

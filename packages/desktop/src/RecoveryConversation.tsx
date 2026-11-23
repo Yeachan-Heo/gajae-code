@@ -218,18 +218,34 @@ export function RecoveryCard({
 /**
  * Inside the Delete conversation confirmation: deleting also discards the conversation's
  * unrestored recovery records, so it says how many unsent messages go with it and offers their
- * text first, as an orphan card does. Renders nothing when there are none.
+ * text first, as an orphan card does. Several messages stay separate: each is its own numbered,
+ * selectable item, and Copy all text marks every boundary with a numbered line. Renders nothing
+ * when there are none.
  */
 export function DeleteRecoveryWarning({ texts, writer }: { texts: readonly string[]; writer?: ClipboardWriter }) {
-	const [textOpen, setTextOpen] = useState(false);
-	const joined = texts.join("\n\n");
-	const [copy, copyText] = useCopyText(joined, () => setTextOpen(true), writer);
-	if (texts.length === 0) return null;
-	const one = texts.length === 1;
+	const count = texts.length;
+	const one = count === 1;
+	const copied = one
+		? (texts[0] ?? "")
+		: texts.map((text, index) => `${t("recovery.copyBoundary", { index: index + 1, count })}\n${text}`).join("\n\n");
+	const [copy, copyText] = useCopyText(copied, () => {}, writer);
+	if (count === 0) return null;
 	return (
 		<div className="delete-recoveries">
-			<p>{one ? t("recovery.deleteDiscardsOne") : t("recovery.deleteDiscards", { count: texts.length })}</p>
-			<RecoveryText text={joined} open={textOpen} onToggle={setTextOpen} />
+			<p>{one ? t("recovery.deleteDiscardsOne") : t("recovery.deleteDiscards", { count })}</p>
+			<ol className="delete-recovery-texts" aria-label={t("recovery.textsLabel")}>
+				{texts.map((text, index) => (
+					// Texts have no identity of their own; their order is fixed while the dialog is open.
+					<li key={index}>
+						{!one && (
+							<span className="delete-recovery-number">
+								{t("recovery.messageNumber", { index: index + 1, count })}
+							</span>
+						)}
+						<pre className="recovery-text">{text}</pre>
+					</li>
+				))}
+			</ol>
 			<div className="recovery-card-actions">
 				<Button onClick={copyText}>{one ? t("recovery.copyText") : t("recovery.copyAllText")}</Button>
 			</div>

@@ -39,7 +39,7 @@ afterAll(async () => {
 
 declare global {
 	interface Window {
-		recoveryTest: { discards: string[]; theme(id: string): void };
+		recoveryTest: { discards: string[]; copies?: string[]; theme(id: string): void };
 	}
 }
 
@@ -203,12 +203,13 @@ async function deleteDialog(texts: string[], viewport = { width: 1000, height: 9
 					import { DeleteConversationConfirmation } from '/src/RecoveryConversation.tsx';
 					import { applyTheme } from '/src/themes.ts';
 					const h = React.createElement;
-					window.recoveryTest = { discards: [], theme: applyTheme };
+					const copies = [];
+					window.recoveryTest = { discards: [], copies, theme: applyTheme };
 					const root = document.createElement('div');
 					document.body.replaceChildren(root);
 					ReactDOM.createRoot(root).render(h(Modal, { title: 'Delete conversation', onClose: () => {} },
 						h(DeleteConversationConfirmation, { title: 'Fix the flaky test', texts: ${JSON.stringify(texts)}, disabled: false,
-							onDelete: () => {}, writer: () => Promise.resolve() })));
+							onDelete: () => {}, writer: text => { copies.push(text); return Promise.resolve(); } })));
 				`,
 			});
 			await page.waitForSelector("dialog[open] .delete-confirmation");
@@ -233,6 +234,59 @@ suite("Delete conversation dialog", () => {
 				if (sample!.ratio < 4.5) failures.push(`${theme}: ${sample!.ratio}`);
 			}
 			expect(failures).toEqual([]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("several unsent messages stay separate: each its own numbered, selectable item, copied with clear boundaries", async () => {
+		const texts = ["First paragraph.\n\nSecond paragraph of the same message.", "Second message", "Third message"];
+		const { context, page } = await deleteDialog(texts);
+		try {
+			const items = await page.$$eval("dialog[open] .delete-recoveries li", nodes =>
+				nodes.map(node => ({
+					number: node.querySelector(".delete-recovery-number")?.textContent ?? null,
+					text: node.querySelector(".recovery-text")?.textContent ?? null,
+					selectable: getComputedStyle(node.querySelector(".recovery-text")!).userSelect,
+				})),
+			);
+			expect(items).toEqual(
+				texts.map((text, index) => ({ number: `Message ${index + 1} of 3`, text, selectable: "text" })),
+			);
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("dialog[open] .delete-recoveries button")]
+					.find(button => button.textContent === "Copy all text")
+					?.click(),
+			);
+			await page.waitForSelector("dialog[open] .recovery-copy-status");
+			expect(await page.evaluate(() => window.recoveryTest.copies)).toEqual([
+				[
+					"--- Message 1 of 3 ---",
+					texts[0],
+					"",
+					"--- Message 2 of 3 ---",
+					texts[1],
+					"",
+					"--- Message 3 of 3 ---",
+					texts[2],
+				].join("\n"),
+			]);
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
+	test("a single unsent message is shown and copied as it is, without a number", async () => {
+		const { context, page } = await deleteDialog(["Only message\n  indented line"]);
+		try {
+			expect(await page.$("dialog[open] .delete-recovery-number")).toBeNull();
+			await page.evaluate(() =>
+				[...document.querySelectorAll<HTMLButtonElement>("dialog[open] .delete-recoveries button")]
+					.find(button => button.textContent === "Copy text")
+					?.click(),
+			);
+			await page.waitForSelector("dialog[open] .recovery-copy-status");
+			expect(await page.evaluate(() => window.recoveryTest.copies)).toEqual(["Only message\n  indented line"]);
 		} finally {
 			await closeComponentFixture(context, page);
 		}
