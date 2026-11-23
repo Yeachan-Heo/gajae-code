@@ -47,6 +47,12 @@ export interface PublicCommandFailureInput {
 	 */
 	partialResults?: readonly DaemonOperationResult[];
 	diagnostics?: readonly PublicCommandDiagnosticCode[];
+	/**
+	 * The failed request was a `session.close` lifecycle mutation. Set where the command path does
+	 * not say so (`sdk session raw global --op session.close`), so close refusals get the same
+	 * recovery guidance as `sdk session close`.
+	 */
+	sessionClose?: true;
 }
 export class PublicCommandFailure extends Error {
 	readonly input: PublicCommandFailureInput;
@@ -370,7 +376,9 @@ export function classifyPublicCommandFailure(
 			nextSteps.push(step("Wait for the existing restart to finish, then inspect status; do not restart again."));
 		const session = references.find(ref => ref.kind === "sessionId");
 		const operation = references.find(ref => ref.kind === "operationRef");
-		const isSessionClose = canonical[0] === "sdk" && canonical[1] === "session" && canonical[2] === "close";
+		const isSessionClose =
+			canonical[0] === "sdk" &&
+			((canonical[1] === "session" && canonical[2] === "close") || input.sessionClose === true);
 		const inspectArgv =
 			session && executableValue(session.value)
 				? ["sdk", "session", "inspect", session.value]
