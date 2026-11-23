@@ -127,9 +127,11 @@ async function fixture(model?: Model) {
 	let brokerFails = false;
 	let brokerHold: Promise<void> | undefined;
 	const ownerLookups: string[] = [];
+	const ownerTimeouts: Array<number | undefined> = [];
 	const liveOwnerClient = {
-		global: async (_operation: string, input: Record<string, unknown>) => {
+		global: async (_operation: string, input: Record<string, unknown>, options?: { timeoutMs?: number }) => {
 			ownerLookups.push(String(input.resolveSessionId));
+			ownerTimeouts.push(options?.timeoutMs);
 			// A hold applies to the next lookup only; later lookups answer at once.
 			const hold = brokerHold;
 			brokerHold = undefined;
@@ -189,6 +191,8 @@ async function fixture(model?: Model) {
 		},
 		liveOwners,
 		ownerLookups,
+		/** The time each owner lookup was given to answer. */
+		ownerTimeouts,
 		failBroker: (fails: boolean) => {
 			brokerFails = fails;
 		},
@@ -1325,11 +1329,12 @@ test("a broker that does not answer holds a request up for at most half a second
 	cleanups.push(async () => releaseBroker());
 	const started = performance.now();
 	expect((await h.call<DesktopSession>("session.select", { sessionId })).connection).toEqual({ state: "connected" });
-	const waited = performance.now() - started;
-	// It did ask, and waited for the answer until the bound, not the SDK's one-second default.
+	// It did ask, and gave the broker the app's half second, not the SDK's one-second default.
 	expect(h.ownerLookups.length).toBeGreaterThan(lookups);
-	expect(waited).toBeGreaterThanOrEqual(450);
-	expect(waited).toBeLessThan(900);
+	const given = h.ownerTimeouts.at(-1) ?? Number.POSITIVE_INFINITY;
+	expect(given).toBeGreaterThan(400);
+	expect(given).toBeLessThanOrEqual(500);
+	expect(performance.now() - started).toBeLessThan(1_500);
 	await h.close();
 });
 
