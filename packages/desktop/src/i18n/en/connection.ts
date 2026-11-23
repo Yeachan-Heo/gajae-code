@@ -18,11 +18,14 @@ export const connection = {
 	"connection.stillElsewhere":
 		"Another gjc process still has this conversation open. Close it there, then check again.",
 	"connection.confirmTitle": "Disconnect while it is working?",
+	"connection.confirmTitleQueued": "Disconnect with queued messages?",
 	"connection.confirmRunning": "Disconnecting stops the current turn, as Stop does.",
 	"connection.confirmQueuedOne": "1 queued message goes back to the message box.",
 	"connection.confirmQueued": "{count} queued messages go back to the message box.",
 	"connection.confirmKept": "The conversation and its history are kept. The terminal can continue it afterwards.",
 	"connection.confirmAction": "Stop and disconnect",
+	"connection.confirmActionQueued": "Disconnect",
+	"connection.showcaseOpenDialog": "Open the confirmation",
 	"connection.showcaseNav": "Conversation connection",
 	"connection.showcaseHeading": "Conversation connection · Disconnect, Connect and read-only states",
 	"connection.showcaseNote":

@@ -39,6 +39,14 @@ export function SessionConnectionNotice({
 	);
 }
 
+/**
+ * The Disconnect confirmation's dialog title. A running turn is stopped; with only queued
+ * messages nothing is working, and those messages simply go back to the message box.
+ */
+export function disconnectConfirmTitle(running: boolean): string {
+	return running ? t("connection.confirmTitle") : t("connection.confirmTitleQueued");
+}
+
 /** What a confirmed Disconnect stops; the conversation itself is always kept. */
 export function DisconnectConfirmation({
 	running,
@@ -62,8 +70,13 @@ export function DisconnectConfirmation({
 			<p className="muted">{t("connection.confirmKept")}</p>
 			<div className="actions">
 				<Button onClick={onCancel}>{t("support.cancel")}</Button>
-				<Button className="danger" disabled={pending} aria-busy={pending} onClick={onConfirm}>
-					{t("connection.confirmAction")}
+				<Button
+					className={running ? "danger" : "primary"}
+					disabled={pending}
+					aria-busy={pending}
+					onClick={onConfirm}
+				>
+					{running ? t("connection.confirmAction") : t("connection.confirmActionQueued")}
 				</Button>
 			</div>
 		</div>

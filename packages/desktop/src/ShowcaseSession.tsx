@@ -1,10 +1,10 @@
 import type { DesktopSession } from "@gajae-code/desktop-host/protocol";
-import type { ReactNode } from "react";
-import { SessionRow } from "./components";
+import { type ReactNode, useState } from "react";
+import { Button, Modal, SessionRow } from "./components";
 import { type DeliveryRecovery, recoveryNotice } from "./delivery-recovery";
 import { type MessageKey, t } from "./i18n";
 import { RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
-import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
+import { DisconnectConfirmation, disconnectConfirmTitle, SessionConnectionNotice } from "./SessionConnection";
 import { SessionConnectionBadge } from "./SessionConnectionMark";
 
 function State({ caption, narrow, children }: { caption: MessageKey; narrow?: boolean; children: ReactNode }) {
@@ -92,6 +92,32 @@ const row = (id: string, title: string, state: "connected" | "disconnected" | "e
 	connection: { state },
 });
 
+/** The Disconnect confirmation in the App's native dialog, opened from the showcase; it does nothing. */
+function ConfirmationDialog({ running, queued }: { running: boolean; queued: number }) {
+	const [open, setOpen] = useState(false);
+	const close = () => setOpen(false);
+	return (
+		<>
+			<div className="actions">
+				<Button className="disconnect-dialog-opener" onClick={() => setOpen(true)}>
+					{t("connection.showcaseOpenDialog")}
+				</Button>
+			</div>
+			{open && (
+				<Modal title={disconnectConfirmTitle(running)} onClose={close}>
+					<DisconnectConfirmation
+						running={running}
+						queued={queued}
+						pending={false}
+						onConfirm={close}
+						onCancel={close}
+					/>
+				</Modal>
+			)}
+		</>
+	);
+}
+
 /** The composer area around a connection notice, as the App lays it out. */
 function ComposerArea({ children }: { children: ReactNode }) {
 	return <div className="composer-area">{children}</div>;
@@ -142,10 +168,10 @@ function ShowcaseConnection() {
 					</div>
 				</State>
 				<State caption="connection.showcaseConfirm">
-					<DisconnectConfirmation running queued={2} pending={false} onConfirm={none} onCancel={none} />
+					<ConfirmationDialog running queued={2} />
 				</State>
 				<State caption="connection.showcaseConfirmQueued">
-					<DisconnectConfirmation running={false} queued={1} pending={false} onConfirm={none} onCancel={none} />
+					<ConfirmationDialog running={false} queued={1} />
 				</State>
 				<State caption="connection.showcaseNarrow" narrow>
 					<div className="showcase-session-rows">

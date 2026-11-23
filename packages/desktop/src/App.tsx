@@ -125,7 +125,7 @@ import { ProvidersSummary } from "./ProvidersPanel";
 import { ReasoningSelect } from "./ReasoningSelect";
 import { RecoveryCard, recoveryDiscardLabel } from "./RecoveryConversation";
 import { Select } from "./Select";
-import { DisconnectConfirmation, SessionConnectionNotice } from "./SessionConnection";
+import { DisconnectConfirmation, disconnectConfirmTitle, SessionConnectionNotice } from "./SessionConnection";
 import { connectionState, SessionConnectionBadge } from "./SessionConnectionMark";
 import { SessionHudPanel } from "./SessionHudPanel";
 import { hasSessionWorkContent, SessionWorkPanel } from "./SessionWorkPanel";
@@ -3237,7 +3237,7 @@ export default function App() {
 							mcp: t("shell.dialogMcp"),
 							"session-info": t("shell.sessionStatus"),
 							"session-actions": t("shell.conversationActions"),
-							disconnect: t("connection.confirmTitle"),
+							disconnect: disconnectConfirmTitle(disconnectAsk?.running ?? true),
 						}[dialog]
 					}
 					onClose={closeDialog}

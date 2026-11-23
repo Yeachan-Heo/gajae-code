@@ -107,4 +107,67 @@ suite("Session connection", () => {
 			await closeComponentFixture(context, page);
 		}
 	}, 60000);
+
+	test("the showcase opens each Disconnect confirmation as a real dialog: title, focus, Escape and focus return", async () => {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1200, height: 900 });
+			await page.goto(`${origin}/?showcase`);
+			await page.waitForSelector("#showcase-session-connection .disconnect-dialog-opener");
+			const openers = await page.$$eval("#showcase-session-connection .disconnect-dialog-opener", nodes => nodes.length);
+			expect(openers).toBe(2);
+			const seen: unknown[] = [];
+			for (const index of [0, 1]) {
+				// Opened from the keyboard, as a user would, so the opener holds focus to return to.
+				await page.evaluate(
+					position =>
+						document
+							.querySelectorAll<HTMLButtonElement>("#showcase-session-connection .disconnect-dialog-opener")
+							[position]!.focus(),
+					index,
+				);
+				await page.keyboard.press("Enter");
+				await page.waitForSelector("dialog[open] .disconnect-confirmation");
+				seen.push(
+					await page.evaluate(() => {
+						const dialog = document.querySelector("dialog[open]")!;
+						const probe = document.createElement("span");
+						probe.style.backgroundColor = "var(--card)";
+						document.body.append(probe);
+						const card = getComputedStyle(probe).backgroundColor;
+						probe.remove();
+						return {
+							title: dialog.querySelector("header h2")?.textContent,
+							actions: [...dialog.querySelectorAll(".disconnect-confirmation button")].map(button => button.textContent),
+							focus: document.activeElement?.classList.contains("modal-close") ?? false,
+							onCard: getComputedStyle(dialog).backgroundColor === card,
+						};
+					}),
+				);
+				await page.keyboard.press("Escape");
+				await page.waitForFunction(() => !document.querySelector("dialog[open]"));
+				expect(
+					await page.evaluate(
+						position =>
+							document.activeElement ===
+							document.querySelectorAll("#showcase-session-connection .disconnect-dialog-opener")[position],
+						index,
+					),
+				).toBe(true);
+			}
+			expect(seen).toEqual([
+				{
+					title: "Disconnect while it is working?",
+					actions: ["Cancel", "Stop and disconnect"],
+					focus: true,
+					onCard: true,
+				},
+				// Only queued messages go back: nothing is working, so nothing says it is.
+				{ title: "Disconnect with queued messages?", actions: ["Cancel", "Disconnect"], focus: true, onCard: true },
+			]);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
 });
