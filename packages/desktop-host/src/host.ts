@@ -432,6 +432,9 @@ const STILL_STOPPING = "The conversation is still stopping. Try Disconnect again
 /** A live process other than the app (usually a terminal) holds the transcript open. */
 const ELSEWHERE =
 	"Another gjc process, such as a terminal, has this conversation open, so the app shows it read-only. Close it there, then check again.";
+/** A released conversation is not deleted while the running broker cannot say whether a terminal has it. */
+const OWNER_UNCHECKED_DELETE =
+	"The app could not check whether a terminal has this conversation open, so it was not deleted. Try again in a moment.";
 /** The app must not remove a transcript another process may be writing. */
 const ELSEWHERE_DELETE =
 	"Another gjc process, such as a terminal, has this conversation open. Close it there before deleting it here.";
@@ -2969,13 +2972,22 @@ export class DesktopHost {
 						connectionGeneration: this.#connectionGeneration,
 					},
 				} satisfies DesktopActivityUpdate;
-			case "session.delete":
+			case "session.delete": {
 				// A released conversation may since have been opened by the terminal; never remove a
 				// transcript another process may be writing.
-				if (this.#elsewhere.has(metadata.id) || (await this.#ownedElsewhere(metadata)))
+				if (this.#elsewhere.has(metadata.id)) throw new Error(ELSEWHERE_DELETE);
+				// Deleting needs a definite answer: nobody has it open, or no broker runs (an interactive
+				// terminal starts one). A broker that runs but cannot answer may be hiding a terminal.
+				const owner = await this.#ownerAnswer(metadata);
+				if (owner.kind === "live") {
+					this.#elsewhere.add(metadata.id);
 					throw new Error(ELSEWHERE_DELETE);
+				}
+				if (owner.kind === "unknown" && owner.reason === "broker_unavailable")
+					throw new Error(OWNER_UNCHECKED_DELETE);
 				this.#readOnly.delete(metadata.id);
 				return this.#forgetMissingSession(metadata);
+			}
 			default:
 				throw this.#notWritable(metadata);
 		}
