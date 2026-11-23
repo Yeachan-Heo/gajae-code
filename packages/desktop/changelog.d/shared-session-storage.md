@@ -16,4 +16,4 @@
 
 ### Notes
 
-- Storage is shared; runtime ownership is not. Stop a conversation in one surface before continuing it in the other. The app still treats a terminal conversation it merely discovered as attach-only, and neither surface currently holds an exclusive writer lease for a transcript.
+- Storage is shared; runtime ownership is not. Neither surface holds an exclusive writer lease for a transcript: the app checks the SDK broker for another live owner before it writes, and Disconnect hands a conversation to the terminal. Stop or disconnect a conversation in one surface before continuing it in the other.
