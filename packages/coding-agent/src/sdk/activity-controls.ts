@@ -181,13 +181,23 @@ function failure(error: unknown): ActivityControlError {
 	return new ActivityControlError("backend_failure");
 }
 
-function redact(value: string, secrets: readonly string[]): string {
-	return secrets.length ? maskStoredSecrets(value, secrets, "[REDACTED]") : value;
-}
+/** Upstream producers (for example bash job labels) cut long values and append one of these. */
+const TRUNCATION_MARKERS = ["...", "\u2026"] as const;
+/** A cut-off credential fragment shorter than this is left alone, so ordinary text is not masked. */
+const PARTIAL_SECRET_MIN_CHARS = 8;
 
 function text(value: string, secrets: readonly string[]): string {
-	// Inspect complete display fields before bounding them.
-	return redact(value, secrets).slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
+	// Inspect complete display fields before bounding them. A value already cut
+	// upstream may end in a credential's prefix, just before its marker.
+	if (!secrets.length) return value.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
+	const marker = TRUNCATION_MARKERS.find(candidate => value.endsWith(candidate));
+	const safe =
+		marker === undefined
+			? maskStoredSecrets(value, secrets, "[REDACTED]")
+			: maskStoredSecrets(value.slice(0, -marker.length), secrets, "[REDACTED]", {
+					trailingPartial: PARTIAL_SECRET_MIN_CHARS,
+				}) + marker;
+	return safe.slice(0, ACTIVITY_CONTROL_LIMITS.fieldChars);
 }
 
 function count(value: number): number {
@@ -421,13 +431,18 @@ export class ActivityControls {
 			let detail: ActivityDetail = { entry };
 			if (target.kind === "job" && entry.readable) {
 				const output = this.#view().getMonitorOutput(target);
-				const safe = redact(output, collectSdkStoredSecrets(this.#session.modelRegistry.authStorage));
+				// The retained window can start inside a credential (oldest output is
+				// evicted) and a running job's output can end inside one.
+				const safe = maskStoredSecrets(
+					output,
+					collectSdkStoredSecrets(this.#session.modelRegistry.authStorage),
+					"[REDACTED]",
+					{ leadingPartial: PARTIAL_SECRET_MIN_CHARS, trailingPartial: PARTIAL_SECRET_MIN_CHARS },
+				);
 				detail = {
 					entry,
 					output: safe.slice(0, ACTIVITY_CONTROL_LIMITS.outputChars),
-					outputTruncated:
-						output.length > ACTIVITY_CONTROL_LIMITS.outputChars ||
-						safe.length > ACTIVITY_CONTROL_LIMITS.outputChars,
+					outputTruncated: safe.length > ACTIVITY_CONTROL_LIMITS.outputChars,
 				};
 			}
 			this.#assertCurrent();
