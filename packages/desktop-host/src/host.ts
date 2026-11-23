@@ -4681,20 +4681,23 @@ export class DesktopHost {
 		const refresh = (async () => {
 			do {
 				this.#workspaceRefreshAgain = false;
+				const projects = this.#catalog.projects.filter(project => !project.closed);
 				const changed = await Promise.all(
-					this.#catalog.projects
-						.filter(project => !project.closed)
-						.map(project =>
-							this.#withProject(project.path, () => this.#refreshProject(project)).catch(error => {
-								console.error(
-									`Desktop could not refresh a workspace's conversations: ${this.#diagnostic(error)}`,
-								);
-								return false;
-							}),
-						),
+					projects.map(project =>
+						this.#withProject(project.path, () => this.#refreshProject(project)).catch(error => {
+							console.error(`Desktop could not refresh a workspace's conversations: ${this.#diagnostic(error)}`);
+							return false;
+						}),
+					),
 				);
 				if (this.#closed) return;
-				if (changed.some(Boolean)) this.#publishShown();
+				// A workspace closed while it was re-listed has nothing to show; its close publishes.
+				if (
+					projects.some(
+						(project, index) => changed[index] && !project.closed && this.#catalog.projects.includes(project),
+					)
+				)
+					this.#publishShown();
 			} while (this.#workspaceRefreshAgain && !this.#closed);
 		})()
 			.catch(error => {
