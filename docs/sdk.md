@@ -1138,7 +1138,8 @@ For idle-only retirement, pass `target: { ...authority, ifIdle: true }` (or
 `ifIdle: true` in the broker `session.close` input). This is independent of the
 endpoint identity fence. The runtime synchronously checks its own turn,
 prompt-queue, continuation, foreground bash, side-question and owned async-job
-state, including side-turn credential preflight, then closes prompt admission
+state, including side-turn credential preflight and an in-flight session recap
+request, then closes prompt admission
 through disposal. New prompts, completion/continuation delivery, `/btw`, and
 IRC/background side turns are refused.
 If work is pending, the host stays running and returns `busy`, with lifecycle
