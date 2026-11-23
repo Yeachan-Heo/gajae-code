@@ -1524,6 +1524,34 @@ test("a schedule another conversation made is not counted as this conversation's
 	await h.close();
 });
 
+test("a Disconnect asked while the session is changing still sees its background work and keeps its job view", async () => {
+	const h = await controlledFixture();
+	const sessionId = h.session.id;
+	await h.call("prompt", { sessionId, text: "app turn" });
+	const result = h.created.at(-1)!;
+	const live = result.session;
+	const job = backgroundJob(h);
+	await h.call("session.select", { sessionId });
+	const view = result.jobObservation;
+	// The session is in the middle of a transition (as during /clear) when Disconnect is asked.
+	const lifecycle = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(live), "sessionLifecycle")!;
+	Object.defineProperty(live, "sessionLifecycle", {
+		configurable: true,
+		get: () => ({ ...lifecycle.get!.call(live), transitioning: true }),
+	});
+	let asked: DesktopDisconnectResult;
+	try {
+		asked = await h.call<DesktopDisconnectResult>("session.disconnect", { sessionId });
+	} finally {
+		delete (live as { sessionLifecycle?: unknown }).sessionLifecycle;
+	}
+	expect(asked).toEqual({ disconnected: false, confirm: { running: false, queued: 0, background: 1 } });
+	expect(job.running()).toBe(true);
+	// The activity card's job view was not retired by the question.
+	expect(result.jobObservation).toBe(view);
+	await h.close();
+});
+
 test("Disconnect asks before stopping background work, and a confirmed Disconnect stops it", async () => {
 	const h = await controlledFixture();
 	const sessionId = h.session.id;

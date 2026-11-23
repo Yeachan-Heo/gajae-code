@@ -576,6 +576,8 @@ interface LiveSession extends SessionCandidate {
 	 * receipt is written, so a release waits on these, not on `queued`.
 	 */
 	settling: Set<Promise<void>>;
+	/** Background work counted at the last read outside a transition (see `#backgroundWork`). */
+	backgroundSeen?: number;
 	/** The exclusive request in flight; settles after its receipt and final view are written. */
 	exclusiveDone?: Promise<void>;
 }
@@ -2866,6 +2868,9 @@ export class DesktopHost {
 	 * conversation's schedules and cannot say which are this one's.
 	 */
 	#backgroundWork(live: LiveSession): number {
+		// Reading the SDK's job view mid-transition retires it, and the SDK rebuilds it afterwards,
+		// which would leave the activity card on a stale view: use the count last read instead.
+		if (live.sdk.sessionLifecycle.transitioning) return live.backgroundSeen ?? 0;
 		let snapshot: JobObservationSnapshot | undefined;
 		try {
 			snapshot = live.factory.jobObservation?.getSnapshot();
@@ -2879,7 +2884,8 @@ export class DesktopHost {
 		// A running task is also listed as the job that runs it; count it once.
 		const taskJobs = new Set(tasks.flatMap(task => (task.currentJobId ? [task.currentJobId] : [])));
 		const jobs = snapshot.jobs.filter(job => job.status === "running" && !taskJobs.has(job.id));
-		return jobs.length + tasks.length;
+		live.backgroundSeen = jobs.length + tasks.length;
+		return live.backgroundSeen;
 	}
 	/**
 	 * Release the app's writer for one conversation without deleting it, so another surface (the
