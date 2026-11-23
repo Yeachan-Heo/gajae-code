@@ -10,6 +10,7 @@ import { PromptActionAutocompleteProvider } from "../modes/prompt-action-autocom
 import type { AgentSession } from "../session/agent-session";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../slash-commands/acp-builtins";
 import { lookupBuiltinSlashCommand } from "../slash-commands/builtin-registry";
+import { collectSdkStoredSecrets, markStoredSecrets, replaceMaskedRuns } from "./credential-secrets";
 import type { JobObservation } from "./job-observation";
 
 export const SDK_COMPOSER_LIMITS = {
@@ -214,6 +215,78 @@ function display(text: string, limit: number): string {
 	const sanitized = sanitizeDisplayLine(text).replace(/[\t\u2028\u2029]/g, " ");
 	const cutoff = Math.min(limit, sanitized.length);
 	return sanitized.slice(0, validCursor(sanitized, cutoff) ? cutoff : cutoff - 1);
+}
+
+/** Characters display normalization turns into a space rather than removing. */
+const SPACED_CONTROLS = /[\r\n]+|[\t\u2028\u2029]/g;
+/** Every non-ESC character sanitizeDisplayLine removes, plus the spaced controls. */
+const NON_ESC_CONTROLS = /[\x00-\x1A\x1C-\x1F\x7F-\x9F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\u2028\u2029]/g;
+
+function normalizeMetadata(value: string): string {
+	return sanitizeDisplayLine(value).replace(/[\t\u2028\u2029]/g, " ");
+}
+
+/** Display normalization, except spaced controls are removed so a credential split by them rejoins. */
+function compactMetadata(value: string): string {
+	return sanitizeDisplayLine(value.replace(SPACED_CONTROLS, ""));
+}
+
+/** Remove controls but keep ESC, so text that ANSI parsing would consume stays visible. */
+function withoutNonEscControls(value: string): string {
+	const wellFormed = value.toWellFormed();
+	return (wellFormed === value ? value : wellFormed.replaceAll("\ufffd", "")).replace(NON_ESC_CONTROLS, "");
+}
+
+function metadataDisplay(text: string, limit: number, secrets: readonly string[]): string {
+	// Normalize complete text and literals identically before a single overlap union:
+	// pre-masking could erase evidence of a control-obscured overlapping credential.
+	// Do not apply generic path redaction: cwd remains a trusted native path.
+	const literals = secrets.filter(Boolean);
+	if (!literals.length) return display(text, limit);
+	const sanitized = normalizeMetadata(text);
+	// ANSI parsing can consume part of a credential across its boundary, even one
+	// split by other controls. Strip those first, then match, then decide: withhold
+	// a transformed field rather than expose a suffix.
+	const stripped = text.includes("\x1b") ? withoutNonEscControls(text) : undefined;
+	const withheld = literals.some(secret => {
+		if (sanitized !== text && text.includes(secret)) return true;
+		if (stripped === undefined) return false;
+		const bare = withoutNonEscControls(secret);
+		return bare.length > 0 && stripped.includes(bare);
+	});
+	if (withheld) return "[REDACTED]".slice(0, limit);
+	const masks = new Uint8Array(sanitized.length);
+	markStoredSecrets(sanitized, literals.map(normalizeMetadata), masks);
+	// Tabs, line breaks and U+2028/2029 display as spaces, which would leave a
+	// credential split by them visible. Match a compact form in which they are
+	// removed, using a placeholder to map matches back to display positions.
+	let code = 0xe000;
+	while (text.includes(String.fromCharCode(code))) code++;
+	const placeholder = String.fromCharCode(code);
+	const placed = sanitizeDisplayLine(text.replace(SPACED_CONTROLS, placeholder));
+	const compactLiterals = literals.map(compactMetadata);
+	if (placed.replaceAll(placeholder, " ") === sanitized) {
+		const positions: number[] = [];
+		let compact = "";
+		for (let index = 0; index < placed.length; index++) {
+			if (placed[index] === placeholder) continue;
+			positions.push(index);
+			compact += placed[index];
+		}
+		const compactMasks = new Uint8Array(compact.length);
+		markStoredSecrets(compact, compactLiterals, compactMasks);
+		for (let index = 0; index < compact.length; index++) {
+			if (!compactMasks[index]) continue;
+			const next = compactMasks[index + 1] ? positions[index + 1]! : positions[index]!;
+			masks.fill(1, positions[index]!, next + 1);
+		}
+	} else if (compactLiterals.some(secret => secret.length > 0 && compactMetadata(text).includes(secret))) {
+		// The placeholder changed how ANSI parsing ran, so positions cannot be mapped.
+		return "[REDACTED]".slice(0, limit);
+	}
+	const masked = replaceMaskedRuns(sanitized, masks, "[REDACTED]");
+	const cutoff = Math.min(limit, masked.length);
+	return masked.slice(0, validCursor(masked, cutoff) ? cutoff : cutoff - 1);
 }
 
 /** Admission only: all token interpretation and replacements remain owned by the shared provider. */
@@ -578,22 +651,23 @@ export class SdkComposerObservation {
 		const profile = this.#session.getActiveModelProfile();
 		const name = this.#session.sessionName;
 		const thinkingLevel = this.#session.thinkingLevel;
+		const secrets = collectSdkStoredSecrets(this.#session.modelRegistry.authStorage);
 		const result: SdkSessionInfo = {
 			sessionId: this.#sessionId,
 			sessionGeneration: this.#generation,
-			...(name ? { name: display(name, SDK_COMPOSER_LIMITS.labelChars) } : {}),
-			cwd: display(this.#cwd, 4096),
+			...(name ? { name: metadataDisplay(name, SDK_COMPOSER_LIMITS.labelChars, secrets) } : {}),
+			cwd: metadataDisplay(this.#cwd, 4096, secrets),
 			...(model
 				? {
 						model: {
-							provider: display(model.provider, 256),
-							id: display(model.id, 512),
-							name: display(model.name, 256),
+							provider: metadataDisplay(model.provider, 256, secrets),
+							id: metadataDisplay(model.id, 512, secrets),
+							name: metadataDisplay(model.name, 256, secrets),
 							contextWindow: model.contextWindow,
 						},
 					}
 				: {}),
-			...(profile ? { modelProfile: display(profile, SDK_COMPOSER_LIMITS.labelChars) } : {}),
+			...(profile ? { modelProfile: metadataDisplay(profile, SDK_COMPOSER_LIMITS.labelChars, secrets) } : {}),
 			thinkingLevel: thinkingLevel ? display(thinkingLevel, SDK_COMPOSER_LIMITS.labelChars) : null,
 			streaming,
 			bashRunning,
@@ -604,7 +678,7 @@ export class SdkComposerObservation {
 				persisted: this.#manager.isPersisted(),
 			},
 			hud: {
-				branch: branch === null ? null : display(branch, SDK_COMPOSER_LIMITS.labelChars),
+				branch: branch === null ? null : metadataDisplay(branch, SDK_COMPOSER_LIMITS.labelChars, secrets),
 				jobs,
 				...(jobs === null
 					? {
