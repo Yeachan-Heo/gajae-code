@@ -175,3 +175,43 @@ test("a read during which another process appended is not reused, even when file
 	// The file changed while it was read, so the next check reads it again and sees the append.
 	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: foreign, held: own });
 });
+
+test("a read during which another process rewrote the file in place is not reused", async () => {
+	const { cwd, destination } = await store();
+	const app = SessionManager.create(cwd, destination);
+	cleanups.push(() => app.close().catch(() => {}));
+	const own = app.appendMessage(user("app turn"));
+	await app.ensureOnDisk();
+	await app.flush();
+	await settle();
+	const file = app.getSessionFile()!;
+	// A lagging filesystem clock makes the rewrite look settled, and its size is unchanged.
+	const now = Date.now();
+	const lagging = vi.spyOn(Date, "now").mockReturnValue(now + 60_000);
+	cleanups.push(async () => lagging.mockRestore());
+	const replacement = own.replace(/./, character => (character === "0" ? "1" : "0"));
+	const capture = SessionManager.prototype.captureCommittedSnapshot;
+	let rewritten = false;
+	const reads = vi.spyOn(SessionManager.prototype, "captureCommittedSnapshot").mockImplementation(async function (
+		this: SessionManager,
+	) {
+		const read = await capture.call(this);
+		if (!rewritten) {
+			// Same inode, same size, a different newest entry id, after the snapshot was read.
+			rewritten = true;
+			const text = await Bun.file(file).text();
+			const handle = await fs.open(file, "r+");
+			try {
+				await handle.write(text.replaceAll(own, replacement), 0, "utf8");
+			} finally {
+				await handle.close();
+			}
+		}
+		return read;
+	});
+	cleanups.push(async () => reads.mockRestore());
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: own, held: own });
+	expect(rewritten).toBe(true);
+	// Only the file's identity before and after the read tells it changed: the next check reads it again.
+	expect(await readEmbeddedTranscriptTail({ sessionManager: app })).toEqual({ committed: replacement, held: null });
+});
