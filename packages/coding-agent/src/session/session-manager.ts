@@ -25377,6 +25377,46 @@ export class SessionManager {
 	}
 
 	/**
+	 * Load an existing transcript as a detached in-memory snapshot for read-only
+	 * consumers such as standalone HTML export. Unlike {@link open}, this never
+	 * writes: no replay-metadata patch records (sanitation applies in memory
+	 * only), no version-migration rewrite, no session-memory sidecars or legacy
+	 * sidecar cleanup, no terminal breadcrumb, and no managed-store adoption.
+	 * Session memory stays `"off"`, so transcripts above the eager inspection cap
+	 * fail with {@link SessionTranscriptOversizedError}. Callers must not mutate
+	 * the returned manager; they only read from it and then `close()` it.
+	 */
+	static async openReadOnlySnapshot(
+		filePath: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionManager> {
+		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
+		const inspected = inspectResumeSessionFile(filePath, storage);
+		if ("kind" in inspected) {
+			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+			if (inspected.reason === "missing")
+				throw Object.assign(new Error(`ENOENT: no such file or directory, open '${filePath}'`), { code: "ENOENT" });
+			throw new Error(`Could not open session: ${inspected.reason}`);
+		}
+		const destination = explicitDestination(path.dirname(filePath));
+		const header = inspected.entries[0] as SessionHeader;
+		const manager = new SessionManager(
+			header.cwd || getProjectDir(),
+			destination.directory,
+			true,
+			storage,
+			destination,
+		);
+		manager.#sessionMemoryMode = "off";
+		// The entries are already migrated in memory; reporting no migration keeps
+		// close() from rewriting the source in the current format.
+		await manager.#hydrateExistingSession(filePath, inspected.entries, false, inspected.identity.sha256);
+		manager.#sanitizeLoadedOpenAIResponsesReplayMetadata();
+		manager.buildSessionContext();
+		return manager;
+	}
+
+	/**
 	 * Hydrate an existing predecessor transcript for recovery without taking any
 	 * write-capable action. The caller must retain the returned context and use
 	 * the explicit promotion seam only after its ownership-ready fence and writer
