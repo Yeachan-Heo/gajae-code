@@ -471,7 +471,11 @@ running it returns `broker_absent` after one file read even though registrations
 and a broker that fails or does not answer within `timeoutMs` (default 1 s) yields
 `broker_unavailable`. The answer is advisory: a process that opens the transcript after the
 check, or any process while no broker runs, is not seen, so keep relying on the store's
-compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop.
+compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop. A turn the session
+starts by itself, for example when background work it owns completes, is preceded by no
+embedding request, so no check can run before it writes. The refusal protects only the
+embedding's own appends: a terminal that appends from a position older than the embedding's
+last write starts a separate branch of the transcript instead of being refused.
 
 `initializeUI(options)` binds the host UI through SDK-owned extension initialization;
 embedders do not import terminal runtime initialization or completion providers.
