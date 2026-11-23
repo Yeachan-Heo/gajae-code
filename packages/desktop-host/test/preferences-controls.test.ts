@@ -10,7 +10,7 @@ import {
 	SdkPreferenceError,
 	Settings,
 } from "@gajae-code/coding-agent/sdk";
-import { createDesktopPreferencesController, DesktopPreferenceError } from "../src/preferences-controls";
+import { createDesktopPreferencesController } from "../src/preferences-controls";
 
 const provider = "desktop-preferences-fixture";
 const selector = (id: string) => `${provider}/${id}`;
@@ -389,7 +389,7 @@ describe("desktop SDK preferences delegation", () => {
 		expect(session.hasSessionAgentModelOverride("planner")).toBe(false);
 	});
 
-	test("retirement after a real global profile commit preserves its applied receipt without stale readback", async () => {
+	test("retirement after a real global profile commit still reports it applied, without stale readback", async () => {
 		const { controller, directory, agentDir, settings } = await fixture(true);
 		const selectProfile = SdkPreferenceControls.prototype.selectProfile;
 		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile").mockImplementation(async function (
@@ -401,19 +401,15 @@ describe("desktop SDK preferences delegation", () => {
 			controller.dispose();
 			return result;
 		});
-		let error: unknown;
-		try {
-			await controller.apply({ type: "profile.select", name: "desk-b", scope: "default" });
-		} catch (failure) {
-			error = failure;
-		}
-		expect(error).toBeInstanceOf(DesktopPreferenceError);
-		expect(error).toMatchObject({
-			code: "stale_preferences",
-			message: "The preference was applied, but current preferences could not be read. Refresh before retrying.",
+		// The change applied, so it is reported as applied; only the read-back state is missing.
+		expect(await controller.apply({ type: "profile.select", name: "desk-b", scope: "default" })).toEqual({
+			applied: "profile.select",
+			profileId: "desk-b",
+			scope: "default",
+			durability: "persisted",
+			preferences: null,
 			outcome: { scope: "global", applied: true, durability: "persisted", application: "session" },
 		});
-		expect(error).not.toHaveProperty("preferences");
 		expect(select).toHaveBeenCalledTimes(1);
 		expect(settings.getGlobal("modelProfile.default")).toBe("desk-b");
 		const reopened = await Settings.loadForScope({ cwd: directory, agentDir });
@@ -425,7 +421,7 @@ describe("desktop SDK preferences delegation", () => {
 		await expect(controller.read()).rejects.toThrow("Session preferences have been closed.");
 	});
 
-	test("post-application readback failures retain the native receipt without exposing backend errors", async () => {
+	test("a readback failure after an applied change reports it applied without exposing backend errors", async () => {
 		const { controller } = await fixture(true);
 		const selectModel = SdkPreferenceControls.prototype.selectModel;
 		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectModel").mockImplementation(async function (
@@ -439,20 +435,15 @@ describe("desktop SDK preferences delegation", () => {
 			});
 			return result;
 		});
-		let error: unknown;
-		try {
-			await controller.apply({ type: "role.set", role: "default", modelId: selector("nested/next") });
-		} catch (failure) {
-			error = failure;
-		}
-		expect(error).toBeInstanceOf(DesktopPreferenceError);
-		expect(error).toMatchObject({
-			code: "preference_failed",
+		const result = await controller.apply({ type: "role.set", role: "default", modelId: selector("nested/next") });
+		expect(result).toMatchObject({
+			applied: "role.set",
+			role: "default",
+			preferences: null,
 			outcome: { scope: "global", applied: true, durability: "persisted" },
 		});
-		expect(error).not.toHaveProperty("preferences");
-		expect(String(error)).not.toContain("private backend");
-		expect(JSON.stringify(error)).not.toContain("fixture-key");
+		expect(JSON.stringify(result)).not.toContain("private backend");
+		expect(JSON.stringify(result)).not.toContain("fixture-key");
 		expect(select).toHaveBeenCalledTimes(1);
 	});
 

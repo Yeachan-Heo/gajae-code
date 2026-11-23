@@ -14,6 +14,7 @@ import type {
 	DesktopModelRolePreference,
 	DesktopPreferenceAction,
 	DesktopPreferenceCapability,
+	DesktopPreferenceCommit,
 	DesktopPreferenceOutcome,
 	DesktopPreferenceResolution,
 	DesktopPreferenceResult,
@@ -57,7 +58,12 @@ export class DesktopPreferenceError extends Error {
 export interface DesktopPreferencesController {
 	listProfiles(): Promise<DesktopModelProfile[]>;
 	read(): Promise<DesktopPreferences>;
+	/** Commit a change, then read preferences back (`null` when the read fails after the change applied). */
 	apply(action: unknown): Promise<DesktopPreferenceResult>;
+	/** Commit a change without reading preferences back, so a caller can read outside its own lock. */
+	commit(action: unknown): Promise<DesktopPreferenceCommit>;
+	/** Read preferences after an applied change: `null` instead of an error, which would misreport it. */
+	readAfterCommit(): Promise<DesktopPreferences | null>;
 	/** Host-only scoped config seam; preserve SDK application/durability receipts verbatim. */
 	writeConfig(input: SdkWriteConfigInput): Promise<SdkWriteConfigResult>;
 	dispose(): void;
@@ -248,6 +254,74 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			}),
 		};
 	};
+	const commit = async (input: unknown): Promise<DesktopPreferenceCommit> => {
+		try {
+			assertCurrent();
+			const action = validateAction(input);
+			if (action.type === "sampling.set") throw new DesktopPreferenceError("unsupported_preference", SAMPLING_GAP);
+			if (action.type === "profile.select") {
+				const result = await controls.selectProfile({
+					name: action.name,
+					scope: action.scope === "default" ? "global" : "session",
+				});
+				return {
+					applied: action.type,
+					profileId: result.profileId,
+					scope: action.scope,
+					durability: requireAppliedPreference(result),
+					outcome: projectPreferenceOutcome(result),
+				};
+			}
+			if (action.role === "image") throw new DesktopPreferenceError("unsupported_preference", IMAGE_ROLE_GAP);
+			if (action.role === "default") {
+				if (action.modelId === null)
+					throw new DesktopPreferenceError("unsupported_preference", "The default model cannot be cleared.");
+				const separator = action.modelId.indexOf("/");
+				if (separator < 1 || separator === action.modelId.length - 1)
+					throw new DesktopPreferenceError("invalid_input", "Invalid model identity.");
+				const result = await controls.selectModel({
+					provider: action.modelId.slice(0, separator),
+					modelId: action.modelId.slice(separator + 1),
+					scope: "global",
+				});
+				return {
+					applied: action.type,
+					role: action.role,
+					scope: "default",
+					durability: requireAppliedPreference(result),
+					outcome: projectPreferenceOutcome(result),
+				};
+			}
+			const result = await controls.setRole({ role: action.role, modelId: action.modelId });
+			return {
+				applied: action.type,
+				role: action.role,
+				scope: "session",
+				durability: requireAppliedPreference(result),
+				outcome: projectPreferenceOutcome(result),
+			};
+		} catch (error) {
+			if (error instanceof SdkPreferenceError) {
+				const code =
+					error.code === "persistence_unavailable"
+						? "unsupported_preference"
+						: error.code === "secret_field_forbidden"
+							? "invalid_input"
+							: error.code;
+				throw new DesktopPreferenceError(code, error.message, undefined, { cause: error });
+			}
+			throw error;
+		}
+	};
+	const readAfterCommit = async (): Promise<DesktopPreferences | null> => {
+		try {
+			return await read();
+		} catch {
+			// The change is committed; a failed read (a closed controller, a session transition, a
+			// backend error) must neither turn it into a reported failure nor leak backend detail.
+			return null;
+		}
+	};
 	return {
 		listProfiles,
 		read,
@@ -259,83 +333,11 @@ export function createDesktopPreferencesController(session: Session): DesktopPre
 			disposed = true;
 			controls.dispose();
 		},
+		commit,
+		readAfterCommit,
 		async apply(input) {
-			let outcome: SdkPreferenceOutcome | undefined;
-			try {
-				assertCurrent();
-				const action = validateAction(input);
-				if (action.type === "sampling.set")
-					throw new DesktopPreferenceError("unsupported_preference", SAMPLING_GAP);
-				if (action.type === "profile.select") {
-					const result = await controls.selectProfile({
-						name: action.name,
-						scope: action.scope === "default" ? "global" : "session",
-					});
-					outcome = result;
-					return {
-						applied: action.type,
-						profileId: result.profileId,
-						scope: action.scope,
-						durability: requireAppliedPreference(result),
-						preferences: await read(),
-						outcome: projectPreferenceOutcome(result),
-					};
-				}
-				if (action.role === "image") throw new DesktopPreferenceError("unsupported_preference", IMAGE_ROLE_GAP);
-				if (action.role === "default") {
-					if (action.modelId === null)
-						throw new DesktopPreferenceError("unsupported_preference", "The default model cannot be cleared.");
-					const separator = action.modelId.indexOf("/");
-					if (separator < 1 || separator === action.modelId.length - 1)
-						throw new DesktopPreferenceError("invalid_input", "Invalid model identity.");
-					const result = await controls.selectModel({
-						provider: action.modelId.slice(0, separator),
-						modelId: action.modelId.slice(separator + 1),
-						scope: "global",
-					});
-					outcome = result;
-					return {
-						applied: action.type,
-						role: action.role,
-						scope: "default",
-						durability: requireAppliedPreference(result),
-						preferences: await read(),
-						outcome: projectPreferenceOutcome(result),
-					};
-				}
-				const result = await controls.setRole({ role: action.role, modelId: action.modelId });
-				outcome = result;
-				return {
-					applied: action.type,
-					role: action.role,
-					scope: "session",
-					durability: requireAppliedPreference(result),
-					preferences: await read(),
-					outcome: projectPreferenceOutcome(result),
-				};
-			} catch (error) {
-				if (outcome?.applied && outcome.durability !== "unknown") {
-					const stale =
-						(error instanceof DesktopPreferenceError || error instanceof SdkPreferenceError) &&
-						error.code === "stale_preferences";
-					throw new DesktopPreferenceError(
-						stale ? "stale_preferences" : "preference_failed",
-						"The preference was applied, but current preferences could not be read. Refresh before retrying.",
-						structuredClone(outcome),
-						{ cause: error },
-					);
-				}
-				if (error instanceof SdkPreferenceError) {
-					const code =
-						error.code === "persistence_unavailable"
-							? "unsupported_preference"
-							: error.code === "secret_field_forbidden"
-								? "invalid_input"
-								: error.code;
-					throw new DesktopPreferenceError(code, error.message, undefined, { cause: error });
-				}
-				throw error;
-			}
+			const committed = await commit(input);
+			return { ...committed, preferences: await readAfterCommit() };
 		},
 	};
 }

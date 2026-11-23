@@ -100,13 +100,13 @@ export interface DesktopPreferenceOutcome {
 	failureCode?: "preference_failed";
 }
 
-export type DesktopPreferenceResult =
+/** A preference change the SDK confirmed as applied, before preferences are read back. */
+export type DesktopPreferenceCommit =
 	| {
 			applied: "profile.select";
 			profileId: string;
 			scope: "session" | "default";
 			durability: "session" | "persisted";
-			preferences: DesktopPreferences;
 			outcome: DesktopPreferenceOutcome;
 	  }
 	| {
@@ -114,6 +114,12 @@ export type DesktopPreferenceResult =
 			role: DesktopModelRoleId;
 			scope: "session" | "default";
 			durability: "session" | "persisted";
-			preferences: DesktopPreferences;
 			outcome: DesktopPreferenceOutcome;
 	  };
+
+/**
+ * An applied preference change. `preferences` is the read-back state, or `null` when the change was
+ * applied but current preferences could not be read; the change still stands, so request
+ * `preferences.get` again instead of treating it as a failure.
+ */
+export type DesktopPreferenceResult = DesktopPreferenceCommit & { preferences: DesktopPreferences | null };

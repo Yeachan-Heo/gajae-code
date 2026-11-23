@@ -16,6 +16,7 @@ import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	createAgentSession,
+	SdkPreferenceControls,
 } from "@gajae-code/coding-agent/sdk";
 import { JobObservation } from "@gajae-code/coding-agent/sdk/job-observation";
 import {
@@ -982,7 +983,7 @@ describe("desktop activity and preferences over the real transport", () => {
 				sessionId: dto.id,
 				action: { type: "profile.select", name: "desktop-b", scope: "session" },
 			});
-			expect(preferences.preferences.profiles.find(profile => profile.id === "desktop-b")?.active).toBe(true);
+			expect(preferences.preferences?.profiles.find(profile => profile.id === "desktop-b")?.active).toBe(true);
 			expect(sdk.model?.id).toBe("next");
 			const pending = workflow(sdk, executionGate({ summary: `Fresh ${transition} gate` }));
 			const presentation = await ui.present(gateRef(await f.activity()));
@@ -1016,7 +1017,7 @@ describe("desktop activity and preferences over the real transport", () => {
 		});
 		expect(f.first.sdk.model?.id).toBe("next");
 		expect(f.first.sdk.getActiveModelProfile()).toBe("desktop-b");
-		expect(result.preferences.roles.find(role => role.id === "executor")?.model?.id).toBe("worker");
+		expect(result.preferences?.roles.find(role => role.id === "executor")?.model?.id).toBe("worker");
 		expect(second.sdk.model?.id).toBe("base");
 		expect(second.sdk.getActiveModelProfile()).toBeUndefined();
 		expect(f.first.sdk.settings.getGlobal("modelProfile.default")).toBe(beforeDefault);
@@ -1027,6 +1028,54 @@ describe("desktop activity and preferences over the real transport", () => {
 		).toBe(true);
 		for (const forbidden of [secret, endpoint, "model_mapping", "required_providers", "private system instructions"])
 			expect(JSON.stringify(f.frames)).not.toContain(forbidden);
+	});
+
+	test("preferences.apply reads back after releasing the session lock and reports an applied change as applied", async () => {
+		const f = await fixture();
+		const sessionId = f.first.dto.id;
+		const readProfiles = SdkPreferenceControls.prototype.readProfiles;
+		const held = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		let reads = 0;
+		vi.spyOn(SdkPreferenceControls.prototype, "readProfiles").mockImplementation(async function (
+			this: SdkPreferenceControls,
+		) {
+			reads += 1;
+			if (reads === 1) {
+				started.resolve();
+				await held.promise;
+			}
+			if (reads === 3) throw new Error("readback failed");
+			return readProfiles.call(this);
+		});
+		const switching = f.call<DesktopPreferenceResult>("preferences.apply", {
+			sessionId,
+			action: { type: "profile.select", name: "desktop-b", scope: "session" },
+		});
+		await started.promise;
+		// The profile switch committed and its readback is still waiting: the session is not
+		// locked, so another change is admitted instead of "Another operation is running".
+		expect(f.first.sdk.getActiveModelProfile()).toBe("desktop-b");
+		expect(
+			await f.call<DesktopPreferenceResult>("preferences.apply", {
+				sessionId,
+				action: { type: "role.set", role: "executor", modelId: `${provider}/worker` },
+			}),
+		).toMatchObject({ applied: "role.set" });
+		held.resolve();
+		expect(await switching).toMatchObject({
+			applied: "profile.select",
+			profileId: "desktop-b",
+			preferences: { profiles: expect.any(Array) },
+		});
+		// A readback that fails after a committed switch is not reported as a failed switch.
+		expect(
+			await f.call<DesktopPreferenceResult>("preferences.apply", {
+				sessionId,
+				action: { type: "profile.select", name: "desktop-a", scope: "session" },
+			}),
+		).toMatchObject({ applied: "profile.select", profileId: "desktop-a", preferences: null });
+		expect(f.first.sdk.getActiveModelProfile()).toBe("desktop-a");
 	});
 
 	test("durable default selection preserves manual intent; refused actions and credential failures retain committed state", async () => {
@@ -1076,7 +1125,7 @@ describe("desktop activity and preferences over the real transport", () => {
 			scope: "session",
 			durability: "session",
 		});
-		expect(selectedRole.preferences.roles.find(role => role.id === "executor")?.model?.id).toBe("worker");
+		expect(selectedRole.preferences?.roles.find(role => role.id === "executor")?.model?.id).toBe("worker");
 		expect(initialRole?.model?.id).toBe("base");
 		expect(f.first.sdk.model).toBe(roleModel);
 		expect(f.first.sdk.getActiveModelProfile()).toBe(roleProfile);
@@ -1095,7 +1144,7 @@ describe("desktop activity and preferences over the real transport", () => {
 			scope: "session",
 			durability: "session",
 		});
-		expect(clearedRole.preferences.roles.find(role => role.id === "executor")).toEqual(initialRole);
+		expect(clearedRole.preferences?.roles.find(role => role.id === "executor")).toEqual(initialRole);
 		expect(roleSettings.get("task.agentModelOverrides")).toEqual(roleOverrides);
 		expect(f.first.sdk.hasSessionAgentModelOverride("executor")).toBe(false);
 		expect(f.first.sdk.model).toBe(roleModel);
@@ -1143,13 +1192,13 @@ describe("desktop activity and preferences over the real transport", () => {
 			scope: "default",
 			durability: "persisted",
 		});
-		expect(persisted.preferences.profiles.find(profile => profile.id === "desktop-b")).toMatchObject({
+		expect(persisted.preferences?.profiles.find(profile => profile.id === "desktop-b")).toMatchObject({
 			active: true,
 			default: true,
 		});
 		expect(f.first.sdk.model?.id).toBe("next");
 		expect(f.first.sdk.getActiveModelProfile()).toBe("desktop-b");
-		expect(persisted.preferences.roles.find(role => role.id === "executor")?.model?.id).toBe("worker");
+		expect(persisted.preferences?.roles.find(role => role.id === "executor")?.model?.id).toBe("worker");
 		const ownership = readDurableModelProfileOwnership(settings);
 		expect(ownership).toEqual({
 			schemaVersion: 1,

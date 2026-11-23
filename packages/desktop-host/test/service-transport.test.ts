@@ -516,7 +516,7 @@ describe("desktop preference receipt transport", () => {
 			durability: "session",
 			application: "session",
 		});
-		expect(result.preferences.roles.find(role => role.id === "executor")).toMatchObject({
+		expect(result.preferences?.roles.find(role => role.id === "executor")).toMatchObject({
 			model: { id: "base", provider },
 		});
 		expect(f.first.sdk.hasSessionAgentModelOverride("executor")).toBe(true);
@@ -534,7 +534,7 @@ describe("desktop preference receipt transport", () => {
 			durability: "session",
 			application: "session",
 		});
-		expect(result.preferences.roles.find(role => role.id === "planner")?.canClear.reason).toBe(
+		expect(result.preferences?.roles.find(role => role.id === "planner")?.canClear.reason).toBe(
 			"No [redacted]-owned role choice is present.",
 		);
 	}, 30_000);
@@ -606,6 +606,18 @@ describe("desktop preference receipt transport", () => {
 		expect(f.first.manager.getConnection("server0")).toBeUndefined();
 		expect(f.first.manager.getConnection("server1")).toBeUndefined();
 		if (!nativeOutcome) throw new Error("The real SDK did not return its committed receipt");
+		if (failure === "retirement") {
+			// Only the readback failed: the committed change is reported as applied, never as a failure,
+			// and without fabricated preferences.
+			if (!response.ok) throw new Error(`An applied change was reported as failed: ${response.error}`);
+			expect(response.result).toMatchObject({
+				applied: "role.set",
+				role: "default",
+				preferences: null,
+				outcome: { scope: nativeOutcome.scope, applied: true, durability: nativeOutcome.durability },
+			});
+			return;
+		}
 		if (response.ok) throw new Error("Ancillary failure must not fabricate a successful readback");
 		expect(response.preferenceOutcome).toEqual({
 			scope: nativeOutcome.scope,

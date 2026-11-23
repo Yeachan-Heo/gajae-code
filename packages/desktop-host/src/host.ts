@@ -4017,9 +4017,9 @@ export class DesktopHost {
 			let outcome: SdkPreferenceOutcome | undefined;
 			let preferenceError: DesktopPreferenceError | undefined;
 			try {
-				const applied = await this.#exclusive(live, async () => {
+				const committed = await this.#exclusive(live, async () => {
 					try {
-						const result = await live.preferences.apply(params.action);
+						const result = await live.preferences.commit(params.action);
 						// Capture before #exclusive's ancillary persistence/publication can fail.
 						outcome = result.outcome;
 						return result;
@@ -4033,7 +4033,14 @@ export class DesktopHost {
 				});
 				// A profile selection replaces the live model, which the snapshot carries.
 				this.#publishSnapshot();
-				return applied;
+				// Read back outside the lock: availability can take credential checks, and a prompt
+				// must not be refused while they run. A failed read after the change applied is
+				// reported as `preferences: null`, never as a failed change.
+				const result: DesktopPreferenceResult = {
+					...committed,
+					preferences: await live.preferences.readAfterCommit(),
+				};
+				return result;
 			} catch (error) {
 				if (!outcome || error === preferenceError) throw error;
 				throw new DesktopPreferenceError(
