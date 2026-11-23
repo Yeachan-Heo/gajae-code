@@ -225,7 +225,6 @@ const states: Array<{ id: string; title: () => string; props: FixtureProps; narr
 		title: () => t("catalog.showcaseDisconnected"),
 		props: { edits: [["read", false]], saveBlocked: "disconnected" },
 	},
-	{ id: "unavailable", title: () => t("catalog.showcaseUnavailable"), props: { catalog: null, unavailable: true } },
 	{ id: "empty", title: () => t("catalog.showcaseEmpty"), props: { catalog: catalogOf([]) } },
 ];
 

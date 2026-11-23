@@ -5,8 +5,6 @@ export const catalog = {
 	"catalog.empty": "No tools are available.",
 	"catalog.invalid": "The tool list response format is invalid.",
 	"catalog.retry": "Try again",
-	"catalog.unavailable":
-		"Another gjc process owns this conversation, so its tools can't be listed or changed here. Manage them from that process.",
 	"catalog.searchLabel": "Search tools",
 	"catalog.searchPlaceholder": "Search by name or description",
 	"catalog.counts": "{active} active · {available} available",
@@ -52,7 +50,6 @@ export const catalog = {
 	"catalog.showcaseSearchChanged": "Tool search landed over unsaved changes",
 	"catalog.showcaseDiscoveryOff": "Tool search off",
 	"catalog.showcaseDisconnected": "Disconnected · Save waits",
-	"catalog.showcaseUnavailable": "Unavailable · another process owns the conversation",
 	"catalog.showcaseEmpty": "Empty registry",
 	"catalog.showcaseNavSearch": "Tool search results",
 	"catalog.showcaseSearchHeading": "Tool search results · expanded tool-search card body",

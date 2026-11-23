@@ -84,15 +84,6 @@ export function filterToolCatalog(tools: DesktopToolInfo[], query: string): Desk
 	});
 }
 
-/**
- * True when the Host refused `tools.list` because this conversation's SDK owner is another
- * process. The Host's refusal text is the only signal it sends (`#dispatchManaged` in
- * desktop-host `host.ts`), so this match is the one place that depends on it.
- */
-export function isToolCatalogUnsupported(message: string): boolean {
-	return message.includes("does not support desktop tools.list");
-}
-
 /** Ids of settled tool-search results in a transcript; a running or synthesized call row is not one yet. */
 export function toolSearchResultIds(messages: DesktopMessage[]): string[] {
 	return messages
@@ -164,8 +155,6 @@ export interface ToolCatalogPanelProps {
 	reading: boolean;
 	/** A `tools.set` save is in flight. */
 	saving: boolean;
-	/** The Host cannot list tools for this conversation. */
-	unavailable?: boolean;
 	/** The last read or save failure. */
 	error?: string;
 	/** Offer the retry action beside `error`: a read failed. */
@@ -194,7 +183,6 @@ export function ToolCatalogPanel({
 	catalog,
 	reading,
 	saving,
-	unavailable,
 	error,
 	onRetry,
 	notice,
@@ -224,12 +212,6 @@ export function ToolCatalogPanel({
 		);
 		(box ?? root.current?.querySelector<HTMLInputElement>(".model-search input"))?.focus();
 	}, [catalog]);
-	if (unavailable)
-		return (
-			<div className="tool-catalog">
-				<div className="empty model-empty tool-catalog-unavailable">{t("catalog.unavailable")}</div>
-			</div>
-		);
 	const dirty = edits.size;
 	const tools = catalog?.tools ?? [];
 	const matches = filterToolCatalog(tools, query);
@@ -435,7 +417,6 @@ export function ToolCatalogDialog({ session, connected, onClose }: ToolCatalogDi
 	const [catalog, setCatalog] = useState<ToolCatalog | null>(null);
 	const [reading, setReading] = useState(true);
 	const [saving, setSaving] = useState(false);
-	const [unavailable, setUnavailable] = useState(false);
 	const [error, setError] = useState<{ text: string; read: boolean } | null>(null);
 	const [notice, setNotice] = useState("");
 	const [edits, setEdits] = useState<ReadonlyMap<string, boolean>>(new Map());
@@ -476,9 +457,7 @@ export function ToolCatalogDialog({ session, connected, onClose }: ToolCatalogDi
 			});
 		} catch (failure) {
 			if (!current(owner)) return;
-			const text = failure instanceof Error ? failure.message : t("shell.requestFailed");
-			if (isToolCatalogUnsupported(text)) setUnavailable(true);
-			else setError({ text, read: true });
+			setError({ text: failure instanceof Error ? failure.message : t("shell.requestFailed"), read: true });
 		} finally {
 			if (current(owner)) setReading(false);
 			settle(owner);
@@ -553,7 +532,7 @@ export function ToolCatalogDialog({ session, connected, onClose }: ToolCatalogDi
 		if (fresh.length === 0) return;
 		for (const item of fresh) seen.current.add(item);
 		const owner = ownerRef.current;
-		if (!owner || !current(owner) || unavailable) return;
+		if (!owner || !current(owner)) return;
 		if (editsRef.current.size > 0) setSearchChanged(true);
 		else void read(owner);
 	}, [searchKey]);
@@ -564,7 +543,6 @@ export function ToolCatalogDialog({ session, connected, onClose }: ToolCatalogDi
 				catalog={catalog}
 				reading={reading}
 				saving={saving}
-				unavailable={unavailable}
 				error={error?.text}
 				onRetry={
 					error?.read

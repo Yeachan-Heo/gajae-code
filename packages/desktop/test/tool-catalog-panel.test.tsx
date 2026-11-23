@@ -5,7 +5,6 @@ import type { DesktopToolInfo } from "@gajae-code/desktop-host/tool-protocol";
 import {
 	editedToolNames,
 	filterToolCatalog,
-	isToolCatalogUnsupported,
 	parseToolList,
 	type ToolCatalog,
 	ToolCatalogPanel,
@@ -117,15 +116,6 @@ describe("tools.list answers", () => {
 			{ available: ["read"], active: [], discovery: { enabled: "yes" } },
 		])
 			expect(parseToolList(value)).toBeNull();
-	});
-
-	test("recognises only the Host's unsupported-owner refusal as unavailable", () => {
-		expect(
-			isToolCatalogUnsupported(
-				"The SDK owner does not support desktop tools.list. Use its original control surface.",
-			),
-		).toBe(true);
-		expect(isToolCatalogUnsupported("Tool registry unavailable")).toBe(false);
 	});
 });
 
@@ -254,7 +244,7 @@ describe("Tools dialog panel", () => {
 		expect(/<input[^>]*data-tool-name="read"[^>]*disabled/.test(saving)).toBe(true);
 	});
 
-	test("loading, failed, unavailable and empty-search states", () => {
+	test("loading, failed and empty-search states", () => {
 		const loading = render({ catalog: null, reading: true });
 		expect(loading).toContain("Loading tools…");
 		expect(loading).not.toContain("Save tools");
@@ -272,10 +262,6 @@ describe("Tools dialog panel", () => {
 		const refused = render({ error: "Another operation is running.", edits: new Map([["read", false]]) });
 		expect(saveButton(refused)).not.toContain("disabled");
 		expect(refused).not.toContain("Try again");
-		const unavailable = render({ catalog: null, unavailable: true });
-		expect(unavailable).toContain("Another gjc process owns this conversation");
-		expect(unavailable).not.toContain("Save tools");
-		expect(unavailable).not.toContain("error-banner");
 		const empty = render({ query: "  없는도구 " });
 		expect(empty).toContain("No tools match “없는도구”.");
 		expect(empty).not.toContain("data-tool-name");

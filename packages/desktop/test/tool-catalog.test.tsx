@@ -700,32 +700,6 @@ suite("Tools dialog", () => {
 		}
 	}, 30000);
 
-	test("a conversation owned by another process shows the catalog as unavailable", async () => {
-		const { context, page } = await fixture();
-		try {
-			await openTools(page);
-			const reads = await waitHeld(page, "tools.list", 1);
-			await page.evaluate(
-				ids => {
-					for (const id of ids)
-						window.navigationFixture.emit({
-							type: "response",
-							id,
-							ok: false,
-							error: "The SDK owner does not support desktop tools.list. Use its original control surface.",
-						});
-				},
-				reads.map(request => request.id),
-			);
-			await page.waitForSelector("dialog[open] .tool-catalog-unavailable");
-			expect(await read(page)).toMatchObject({ tools: [], errors: [], saveDisabled: true });
-			expect((await read(page)).text).toContain("Another gjc process owns this conversation");
-			expect((await read(page)).text).not.toContain("Save tools");
-		} finally {
-			await context.close();
-		}
-	}, 30000);
-
 	test("the showcase renders every Tools dialog and tool-search state without widening a 390 px page", async () => {
 		const context = await browser.createBrowserContext();
 		try {
@@ -783,7 +757,6 @@ suite("Tools dialog", () => {
 					"search-changed",
 					"discovery-off",
 					"disconnected",
-					"unavailable",
 					"empty",
 				].map(state => `showcase-tool-catalog-${state}`),
 			);

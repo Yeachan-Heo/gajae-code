@@ -43,7 +43,6 @@ import {
 	readEmbeddedTranscriptTail,
 	resolveManagedSessionScope,
 	restoreSessionView,
-	type SdkComposerCompletionResult,
 	type SdkComposerObservation,
 	type SdkPreferenceOutcome,
 	SdkRevisionError,
@@ -64,7 +63,7 @@ import type {
 } from "./activity-protocol";
 import { prepareDesktopAttachmentInput } from "./attachment-input";
 import { createDesktopBtwController, type DesktopBtwController } from "./btw-controls";
-import { DesktopComposerCompletion, projectDesktopCompletion, readDesktopCompletionInput } from "./composer-completion";
+import { DesktopComposerCompletion, readDesktopCompletionInput } from "./composer-completion";
 import { DeliveryJournal } from "./delivery-journal";
 import { prepareDesktopEnvironment } from "./environment-policy";
 import {
@@ -72,7 +71,6 @@ import {
 	DesktopGatePresentationError,
 	type DesktopGatePresenter,
 } from "./gate-presentation";
-import type { ManagedSession } from "./managed-session";
 import { createDesktopMcpController, type DesktopMcpController } from "./mcp-controls";
 import {
 	type AnchoredNotice,
@@ -680,9 +678,6 @@ export class DesktopHost {
 	#live = new Map<string, LiveSession>();
 	/** Publication tokens survive live-map removal without retaining disposed SDK owners. */
 	#viewOwners = new WeakMap<SavedSession, symbol>();
-	#managed = new Map<string, ManagedSession>();
-	#managedOpening = new Map<string, Promise<ManagedSession>>();
-	#managedProjectEpochs = new Map<string, number>();
 	/** Unpublished SDK ownership, retained until publication or proven disposal. */
 	#candidates = new Set<SessionCandidate>();
 	/** Retired publications remain owned even after their catalog/live entry is removed. */
@@ -1160,8 +1155,6 @@ export class DesktopHost {
 		return save;
 	}
 	#dto(metadata: SavedSession, messageBudget = 2_000_000): DesktopSession {
-		const managed = this.#managed.get(metadata.id);
-		if (managed) return managed.dto(messageBudget);
 		const live = this.#live.get(metadata.id);
 		const readOnly = live ? undefined : this.#readOnly.get(metadata.id);
 		const question = [...this.#questions.values()].find(item => item.question.sessionId === metadata.id)?.question;
@@ -2480,7 +2473,7 @@ export class DesktopHost {
 		}
 		return { handled: false, text: result.text ?? text, images: result.images ?? images };
 	}
-	#taskCompleted(sessionId: string, identity: ["local", string, number, string] | ["managed", number, string]): void {
+	#taskCompleted(sessionId: string, identity: ["local", string, number, string]): void {
 		if (this.#closed) return;
 		const id = JSON.stringify([this.#connectionGeneration, sessionId, ...identity]);
 		if (this.#completedTasks.has(id)) return;
@@ -4400,58 +4393,41 @@ export class DesktopHost {
 			project.id === metadata.projectId &&
 			!project.closed &&
 			project.path === cwd;
-		let rawText: string;
-		if (metadata.managed) {
-			const session = this.#managed.get(metadata.id);
-			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
-			const current = () =>
-				catalogCurrent() &&
-				!!session &&
-				this.#managed.get(metadata.id) === session &&
-				session.isAttached &&
-				session.controlGeneration === generation &&
-				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
-			if (!session || !current()) throw new Error("SDK owner changed. Select the conversation again.");
-			rawText = await session.copyText(entryId, generation);
-			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-		} else {
-			// Copy never opens an owner or takes the mutation lock, even during a run.
-			const live = this.#live.get(metadata.id);
-			if (!live) throw new Error("Session changed. Select the conversation again.");
-			const sdk = live.sdk;
-			const manager = sdk.sessionManager;
-			const file = manager.getSessionFile();
-			const managerId = manager.getSessionId();
-			const identityGeneration = manager.getSessionIdentityGeneration();
-			const sessionId = sdk.sessionId;
-			const current = () =>
-				catalogCurrent() &&
-				this.#live.get(metadata.id) === live &&
-				!this.#retiredLive.has(live) &&
-				!live.gateMutation &&
-				live.sdk === sdk &&
-				!sdk.sessionLifecycle.disposed &&
-				!sdk.sessionLifecycle.transitioning &&
-				sdk.sessionLifecycle.generation === generation &&
-				sdk.sessionId === sessionId &&
-				sdk.sessionManager === manager &&
-				manager.getSessionId() === managerId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				manager.getCwd() === cwd &&
-				manager.getSessionFile() === file &&
-				sdk.sessionFile === file;
-			if (!current()) throw new Error("Session changed. Select the conversation again.");
-			await this.#awaitStartup(live);
-			if (!current()) throw new Error("Session changed. Select the conversation again.");
-			if (!manager.getBranch().some(entry => entry.id === entryId))
-				throw new Error("The message is not on the active conversation branch.");
-			const entry = manager.getEntry(entryId);
-			const text = entry?.type === "message" ? copyableMessageText(entry.message) : undefined;
-			if (text === undefined) throw new Error("The message is no longer available for copying.");
-			rawText = text;
-		}
+		// Copy never opens an owner or takes the mutation lock, even during a run.
+		const live = this.#live.get(metadata.id);
+		if (!live) throw new Error("Session changed. Select the conversation again.");
+		const sdk = live.sdk;
+		const manager = sdk.sessionManager;
+		const file = manager.getSessionFile();
+		const managerId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const sessionId = sdk.sessionId;
+		const current = () =>
+			catalogCurrent() &&
+			this.#live.get(metadata.id) === live &&
+			!this.#retiredLive.has(live) &&
+			!live.gateMutation &&
+			live.sdk === sdk &&
+			!sdk.sessionLifecycle.disposed &&
+			!sdk.sessionLifecycle.transitioning &&
+			sdk.sessionLifecycle.generation === generation &&
+			sdk.sessionId === sessionId &&
+			sdk.sessionManager === manager &&
+			manager.getSessionId() === managerId &&
+			manager.getSessionIdentityGeneration() === identityGeneration &&
+			manager.getCwd() === cwd &&
+			manager.getSessionFile() === file &&
+			sdk.sessionFile === file;
+		if (!current()) throw new Error("Session changed. Select the conversation again.");
+		await this.#awaitStartup(live);
+		if (!current()) throw new Error("Session changed. Select the conversation again.");
+		if (!manager.getBranch().some(entry => entry.id === entryId))
+			throw new Error("The message is not on the active conversation branch.");
+		const entry = manager.getEntry(entryId);
+		const text = entry?.type === "message" ? copyableMessageText(entry.message) : undefined;
+		if (text === undefined) throw new Error("The message is no longer available for copying.");
 		// Redact the complete message once, before measuring the exact success frame.
-		const result = { text: this.#redact(rawText) };
+		const result = { text: this.#redact(text) };
 		const frame: DesktopFrame = { type: "response", id: request.id, ok: true, result };
 		if (Buffer.byteLength(JSON.stringify(frame), "utf8") + 1 > MAX_FRAME_BYTES)
 			throw new Error("The complete message exceeds the desktop copy frame limit (8 MiB).");
@@ -4461,26 +4437,6 @@ export class DesktopHost {
 	async #complete(params: Record<string, unknown>): Promise<DesktopCompletionResult> {
 		const input = readDesktopCompletionInput(params);
 		const metadata = this.#metadata(params);
-		if (metadata.managed) {
-			// A read of suggestions never opens/reconnects an owner on behalf of an old draft.
-			const session = this.#managed.get(metadata.id);
-			const project = this.#catalog.projects.find(item => item.id === metadata.projectId);
-			const epoch = this.#managedProjectEpochs.get(metadata.projectId) ?? 0;
-			const cwd = project?.path;
-			const current = () =>
-				!this.#closed &&
-				!!project &&
-				!project.closed &&
-				project.path === cwd &&
-				this.#managed.get(metadata.id) === session &&
-				session?.isAttached === true &&
-				session.controlGeneration === input.sessionGeneration &&
-				(this.#managedProjectEpochs.get(metadata.projectId) ?? 0) === epoch;
-			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-			const result = await session!.query("composer.complete", { text: input.text, cursor: input.cursor });
-			if (!current()) throw new Error("SDK owner changed. Select the conversation again.");
-			return this.#filterCompletions(projectDesktopCompletion(result as SdkComposerCompletionResult));
-		}
 		const live = this.#live.get(metadata.id);
 		if (!live || live.sdk.sessionLifecycle.generation !== input.sessionGeneration)
 			throw new Error("Session changed. Select the conversation again.");
@@ -4505,21 +4461,6 @@ export class DesktopHost {
 		// The close already owns the workspace's queue entry, so teardown must finish on a budget:
 		// an uncooperative abort would otherwise keep every later reopen of this folder waiting.
 		const deadline = AbortSignal.timeout(CLOSE_TEARDOWN_TIMEOUT_MS);
-		this.#managedProjectEpochs.set(projectId, (this.#managedProjectEpochs.get(projectId) ?? 0) + 1);
-		const managedOpening = [...this.#managedOpening.entries()].filter(
-			([id]) => this.#catalog.sessions.find(session => session.id === id)?.projectId === projectId,
-		);
-		for (const [id] of managedOpening) this.#managedOpening.delete(id);
-		await Promise.allSettled(managedOpening.map(([, opening]) => bounded(opening, deadline)));
-		for (const [id, session] of [...this.#managed]) {
-			if (this.#catalog.sessions.find(item => item.id === id)?.projectId !== projectId) continue;
-			this.#managed.delete(id);
-			try {
-				await bounded(session.close(), deadline);
-			} catch (error) {
-				console.error(`Desktop workspace could not detach SDK session ${id}: ${String(error)}`);
-			}
-		}
 		// A session that is still opening when the workspace closes must not stay live either:
 		// settling each in-flight open lets its publish path see the closed project and refuse.
 		const opening = [...this.#opening.entries()]
@@ -4742,11 +4683,10 @@ export class DesktopHost {
 	#publishShown(): DesktopSnapshot {
 		const snapshot = this.snapshot();
 		this.#emit({ type: "snapshot", snapshot });
-		// Every conversation that can be on screen: the app's own writers, read-only views, and
-		// conversations another surface owns that the app is attached to.
+		// Every conversation that can be on screen: the app's own writers and read-only views.
 		const shown = [
 			...[...this.#live.values()].map(live => live.metadata),
-			...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id) || this.#managed.has(session.id)),
+			...this.#catalog.sessions.filter(session => this.#readOnly.has(session.id)),
 		];
 		for (const metadata of shown) {
 			const row = snapshot.sessions.find(session => session.id === metadata.id);
@@ -5162,9 +5102,7 @@ export class DesktopHost {
 		await attempt(() => this.#cancelQuestions());
 		// A background workspace refresh saves the catalog; let it finish before teardown.
 		await this.#workspaceRefresh?.catch(() => {});
-		await Promise.allSettled([...this.#opening.values(), ...this.#managedOpening.values()]);
-		await Promise.allSettled([...this.#managed.values()].map(session => session.close()));
-		this.#managed.clear();
+		await Promise.allSettled([...this.#opening.values()]);
 		await attempt(() => this.#cancelQuestions());
 		await Promise.all([...this.#live.values()].map(live => attempt(() => live.sdk.abort())));
 		await Promise.allSettled([...this.#tasks]);
