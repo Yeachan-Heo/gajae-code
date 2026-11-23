@@ -318,6 +318,34 @@ suite("Delete conversation dialog", () => {
 		}
 	}, 30000);
 
+	test("in the minimum window the message list is the only scroller and Delete stays in view", async () => {
+		const texts = Array.from({ length: 3 }, (_, index) => `Unsent message ${index + 1}\n`.repeat(10).trim());
+		const { context, page } = await deleteDialog(texts, { width: 720, height: 520 });
+		try {
+			const layouts: Record<string, unknown> = {};
+			for (const size of [14, 20]) {
+				await page.evaluate(px => document.documentElement.style.setProperty("--text-size", `${px}px`), size);
+				layouts[`720x520@${size}`] = await page.evaluate(() => {
+					const dialog = document.querySelector("dialog[open]")!;
+					const frame = dialog.getBoundingClientRect();
+					const scrolls = (node: Element) =>
+						node.scrollHeight > node.clientHeight + 1 && /auto|scroll/u.test(getComputedStyle(node).overflowY);
+					const list = dialog.querySelector(".delete-recovery-texts")!;
+					const remove = dialog.querySelector("button.danger")!.getBoundingClientRect();
+					return {
+						scrollers: [dialog, ...dialog.querySelectorAll("*")].filter(scrolls).map(node => node.className),
+						listShowsALine: list.clientHeight >= 40,
+						deleteInView: remove.top >= frame.top && remove.bottom <= Math.min(frame.bottom, window.innerHeight),
+					};
+				});
+			}
+			const pinned = { scrollers: ["delete-recovery-texts"], listShowsALine: true, deleteInView: true };
+			expect(layouts).toEqual({ "720x520@14": pinned, "720x520@20": pinned });
+		} finally {
+			await closeComponentFixture(context, page);
+		}
+	}, 30000);
+
 	test("a single unsent message is shown and copied as it is, without a number", async () => {
 		const { context, page } = await deleteDialog(["Only message\n  indented line"]);
 		try {

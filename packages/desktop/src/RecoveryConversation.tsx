@@ -302,7 +302,7 @@ export function DeleteConversationConfirmation({
 	writer?: ClipboardWriter;
 }) {
 	return (
-		<>
+		<div className="delete-dialog">
 			<div className="delete-confirmation">
 				<p>{t("shell.deleteConversationConfirm", { title })}</p>
 				<p className="delete-warning">
@@ -314,6 +314,6 @@ export function DeleteConversationConfirmation({
 			<Button className="danger" disabled={disabled} onClick={onDelete}>
 				{t("shell.dialogDelete")}
 			</Button>
-		</>
+		</div>
 	);
 }
