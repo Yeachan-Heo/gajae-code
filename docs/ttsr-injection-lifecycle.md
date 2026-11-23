@@ -206,7 +206,29 @@ In the current runtime path:
 - a deferred prose reminder holds its rule names while follow-up admission is in flight and, once admitted, through the queued message itself; dropping the queued message (abort, `clearQueue`) leaves the rule eligible
 - `createAgentSession()` restores `existingSession.injectedTtsrRules` into `ttsrManager`
 
-Net effect: injected-rule suppression is persisted/restored across session reload/resume for the current branch path.
+### Interrupt reminder publication outcomes
+
+An interrupt retry publishes its hidden `ttsr-injection` custom message before touching live history. Its `details` carry `rules` and `messageCount`, the manager counter the rules are marked at; the durable entry and the live message share one payload. A legacy session appends the entry directly. A session that has armed shared publication goes through the admitted shared append, and the outcome decides what happens next:
+
+- **committed**: the retry runs. The reminder is appended to live history, and the rules are marked at `messageCount` and get a durable `ttsr_injection` marker. The marker is a separate write; in a shared session it is published in the background.
+- **rejected** (definite non-commit): this is the only outcome that permits an in-memory retry. A `warning` notice says the reminder could not be saved and the retry runs with it in memory only. The live message is appended and the rules are marked consumed in the live manager (so a `repeatMode: "once"` rule cannot interrupt-loop in this session), but no `ttsr_injection` marker is written. After reopen the rule is eligible again. If the retry was aborted, superseded, or the session was disposed while the append was pending, the retry just releases its claims.
+- **stale** (latched persistence, rewrite debt, uncommitted cursor): later shared writes cannot commit, so the retry stops, the session is disposed, and a `warning` notice names the reason and says the session must be reopened. Nothing is retried in memory and no marker is written.
+- **unknown** or an unclassified failure: the reminder may already be in the transcript, but that does not prove the model saw it. The retry stops, consumption is not persisted, and the session is disposed so a later prompt cannot get past the rule through another match path or repeat gap. The notice includes the attempted entry id when one is known.
+
+The stale and unknown fail-closed paths apply even when the retry was invalidated while the append was pending, because they describe this session's persistence state. A reminder that committed after its retry was invalidated is still delivered into live history (marked at its checkpoint, with no new marker) if that history is unchanged. Otherwise the session is disposed and must be reopened, so the reminder is neither skipped nor published twice.
+
+### Reconciliation from persisted reminder messages
+
+A committed reminder can outlive a missing `ttsr_injection` marker (for example, a background marker publication failed). While it constructs the session, after `createAgentSession()` has restored marker records and the counter, `AgentSession` reconciles consumption from the reminder messages themselves:
+
+- It walks `sessionManager.getBranch()`, the active leaf's ancestors including entries before compaction, and collects `custom_message` entries with `customType: "ttsr-injection"`. Sibling branches are not consulted, so their rules stay eligible.
+- It also reads `ttsr-injection` messages in live agent state. This keeps the evidence for in-memory sessions and for rejected in-memory retries, which have no durable entry.
+- For each rule it keeps the latest published `messageCount` checkpoint. If the newest checkpoint is ahead of the restored counter, the counter moves up to it so `after-gap` intervals count from the checkpoint. A rule is re-marked at its checkpoint only when it has no record or its record is older. Restored marker records are never re-marked at the current count, which would restart the gap.
+- A legacy entry without `messageCount` only proves delivery: it fills a missing record at the current count and never overrides an existing one.
+
+Reconciliation updates only `TtsrManager` state. It never re-appends reminder text, so a reminder that compaction removed from Agent context stays out of it.
+
+Net effect: injected-rule suppression is persisted/restored across session reload/resume for the current branch path, including reminders whose marker never published. A rejected in-memory retry suppresses the rule only in the live session.
 
 ## 8. Race boundaries and ordering guarantees
 
