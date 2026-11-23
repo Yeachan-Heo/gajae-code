@@ -130,6 +130,10 @@ export const shell = {
 	"shell.conversationName": "Conversation name",
 	"shell.deleteConversationConfirm": "Delete the conversation “{title}”?",
 	"shell.deleteConversationIrreversible": "This cannot be undone.",
+	"shell.dialogRemove": "Remove from list",
+	"shell.removeConversationConfirm": "Remove “{title}” from this list?",
+	"shell.removeConversationKeeps":
+		"Only the app's entry goes. Its transcript, if it still exists, is left as it is, and the terminal can still continue it.",
 	"shell.loadingTools": "Loading tools…",
 	"shell.noTools": "No tools are available.",
 	"shell.saveTools": "Save tools",

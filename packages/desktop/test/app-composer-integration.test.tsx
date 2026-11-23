@@ -3059,6 +3059,56 @@ suite("mounted composer delivery recovery", () => {
 		}
 	}, 30000);
 
+	test("a conversation the app cannot open replaces the composer with Remove, whose dialog keeps the transcript", async () => {
+		const { context, page } = await fixture();
+		try {
+			await select(page);
+			await page.evaluate(() =>
+				window.fixture.emit({
+					type: "session",
+					session: {
+						id: "a",
+						title: "Session A",
+						projectId: "p",
+						status: "idle",
+						starred: false,
+						imageInput: null,
+						operatorRunning: false,
+						controlGeneration: null,
+						messages: [],
+						connection: { state: "unavailable", reason: "outside" },
+					},
+				}),
+			);
+			await page.waitForSelector('.composer-area .connection-notice[data-state="unavailable"]');
+			expect(await page.$(".composer textarea")).toBeNull();
+			expect(await page.$eval(".toolbar-title .connection-badge", node => node.textContent)).toBe("Can't open here");
+			// The conversation actions offer no Connect for it.
+			await page.click('button[aria-label="Conversation actions menu"]');
+			await page.waitForSelector("dialog[open] .command-list");
+			const actions = await page.$$eval("dialog[open] .command-list button", nodes => nodes.map(node => node.textContent?.trim()));
+			expect(actions).not.toContain("Connect");
+			expect(actions).not.toContain("Disconnect from app");
+			await page.keyboard.press("Escape");
+			await page.waitForFunction(() => !document.querySelector("dialog[open]"));
+			// Remove opens the Delete confirmation, worded as removal that leaves the transcript alone.
+			await page.click(".connection-notice-action");
+			await page.waitForSelector("dialog[open] .delete-dialog");
+			const dialog = await page.$eval("dialog[open]", node => node.textContent ?? "");
+			expect(dialog).toContain("Remove “Session A” from this list?");
+			expect(dialog).toContain("Its transcript, if it still exists, is left as it is");
+			expect(dialog).not.toContain("cannot be undone");
+			await page.click("dialog[open] .delete-dialog .button.danger");
+			await page.waitForFunction(() => window.fixture.requests().some(request => request.method === "session.delete"));
+			const deletes = await page.evaluate(() =>
+				window.fixture.requests().filter(request => request.method === "session.delete").map(request => request.params),
+			);
+			expect(deletes).toEqual([{ sessionId: "a" }]);
+		} finally {
+			await closeFixture(context, page);
+		}
+	}, 30000);
+
 	test("the sidebar menu renames another conversation without selecting it", async () => {
 		const { context, page } = await fixture();
 		try {

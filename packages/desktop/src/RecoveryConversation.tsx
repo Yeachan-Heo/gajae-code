@@ -289,12 +289,15 @@ export function DeleteRecoveryWarning({ texts, writer }: { texts: readonly strin
  */
 export function DeleteConversationConfirmation({
 	title,
+	removeOnly = false,
 	texts,
 	disabled,
 	onDelete,
 	writer,
 }: {
 	title: string;
+	/** A row the app cannot open: removing it forgets the reference and leaves the transcript alone. */
+	removeOnly?: boolean;
 	/** The conversation's unrestored recovery texts, in the order they were sent. */
 	texts: readonly string[];
 	disabled: boolean;
@@ -304,15 +307,24 @@ export function DeleteConversationConfirmation({
 	return (
 		<div className="delete-dialog">
 			<div className="delete-confirmation">
-				<p>{t("shell.deleteConversationConfirm", { title })}</p>
-				<p className="delete-warning">
-					<TriangleAlert aria-hidden="true" />
-					<strong>{t("shell.deleteConversationIrreversible")}</strong>
-				</p>
+				{removeOnly ? (
+					<>
+						<p>{t("shell.removeConversationConfirm", { title })}</p>
+						<p>{t("shell.removeConversationKeeps")}</p>
+					</>
+				) : (
+					<>
+						<p>{t("shell.deleteConversationConfirm", { title })}</p>
+						<p className="delete-warning">
+							<TriangleAlert aria-hidden="true" />
+							<strong>{t("shell.deleteConversationIrreversible")}</strong>
+						</p>
+					</>
+				)}
 			</div>
 			<DeleteRecoveryWarning texts={texts} writer={writer} />
 			<Button className="danger" disabled={disabled} onClick={onDelete}>
-				{t("shell.dialogDelete")}
+				{t(removeOnly ? "shell.dialogRemove" : "shell.dialogDelete")}
 			</Button>
 		</div>
 	);

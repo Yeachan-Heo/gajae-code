@@ -726,6 +726,8 @@ export default function App() {
 	const session = snapshot?.sessions.find(item => item.id === selected);
 	/** The app writes the selected conversation itself; otherwise it is shown read-only. */
 	const writable = connectionState(session) === "connected";
+	/** The app cannot open this row at all: Delete only forgets it, and leaves its transcript alone. */
+	const removeOnly = connectionState(session) === "unavailable";
 	const sessionConnection = session ? connectionState(session) : undefined;
 	// A refusal about who writes this conversation goes stale when its connection changes: after
 	// Disconnect finishes, Connect, or "Check again" taking it back.
@@ -1369,8 +1371,8 @@ export default function App() {
 		} catch (error) {
 			const refusal = error instanceof DesktopRequestError ? error.connectionRefusal : undefined;
 			// The conversation's connection notice already says it is read-only (another process has it,
-			// or it is disconnected): a banner repeating that would only go stale.
-			if (refusal === "elsewhere" || refusal === "disconnected") return;
+			// it is disconnected, or the app cannot open it): a banner repeating that would only go stale.
+			if (refusal === "elsewhere" || refusal === "disconnected" || refusal === "unavailable") return;
 			// "Being disconnected" is not a connection state yet; it is shown until the state changes.
 			if (refusal && errorSessionId) connectionRefusals.current.set(scope, errorSessionId);
 			if (error instanceof DesktopRequestError)
@@ -3065,6 +3067,8 @@ export default function App() {
 										<SessionConnectionNotice
 											state={session.connection.state}
 											holder={session.connection.holder}
+											reason={session.connection.reason}
+											onRemove={() => setDialog("delete")}
 											pending={!connected || !!pending[connectionScope(session.id)]}
 											onConnect={() => connectSession(session.id)}
 										/>
@@ -3268,7 +3272,7 @@ export default function App() {
 						{
 							settings: t("shell.settings"),
 							fork: t("shell.dialogFork"),
-							delete: t("shell.dialogDelete"),
+							delete: t(removeOnly ? "shell.dialogRemove" : "shell.dialogDelete"),
 							goal: t("shell.dialogGoal"),
 							result: t("shell.dialogResult"),
 							"activity-detail": t("shell.dialogActivityDetail"),
@@ -3289,7 +3293,7 @@ export default function App() {
 					{notice && <p role="status">{notice}</p>}
 					{dialog === "session-actions" && (
 						<nav className="command-list" aria-label={t("shell.conversationActions")}>
-							{session?.connection && (
+							{session?.connection && session.connection.state !== "unavailable" && (
 								<Button
 									disabled={!connected || !!pending[connectionScope(selected)]}
 									onClick={() => {
@@ -3731,6 +3735,7 @@ export default function App() {
 					{dialog === "delete" && (
 						<DeleteConversationConfirmation
 							title={session?.title ?? ""}
+							removeOnly={removeOnly}
 							// Deleting drops the conversation's recovery records too; name every text that goes with them.
 							texts={recoveriesDroppedWithConversation(recoveries, selected).lost.map(item => item.text)}
 							disabled={!connected || !!pending[selected]}

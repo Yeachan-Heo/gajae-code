@@ -412,6 +412,8 @@ interface Discovery {
 	discovered: SavedSession[];
 	placed: Map<SavedSession, string>;
 	creationTimes: Map<string, number>;
+	/** An unplaced row's reason changed: only what it shows, nothing to save. */
+	unplacedChanged: boolean;
 }
 interface Catalog {
 	version: 1;
@@ -739,6 +741,8 @@ export class DesktopHost {
 	 * read as held by that process, not by a terminal. Cleared once an owner check answers otherwise.
 	 */
 	#leftoverBusy = new Set<string>();
+	/** Why each unplaced row an earlier build saved cannot open, from the last listing; never persisted. */
+	#unplaced = new Map<string, "outside" | "missing">();
 	/**
 	 * Disconnected rows the user asked to Connect while a terminal still had them. They read as
 	 * connected in this run, so the next select takes them, but stay released on disk until the
@@ -1302,13 +1306,17 @@ export class DesktopHost {
 			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error, errorOwner: live.errorOwner } : {}),
 			// A row not placed in the shared store yet has no transcript to connect to.
-			...(metadata.managed ? {} : { connection: this.#connectionDto(metadata) }),
+			connection: this.#connectionDto(metadata),
 		};
 	}
 	#connection(metadata: SavedSession): DesktopSessionConnection["state"] {
 		return metadata.disconnected ? "disconnected" : this.#elsewhere.has(metadata.id) ? "elsewhere" : "connected";
 	}
 	#connectionDto(metadata: SavedSession): DesktopSessionConnection {
+		if (metadata.managed) {
+			const reason = this.#unplaced.get(metadata.id);
+			return reason ? { state: "unavailable", reason } : { state: "unavailable" };
+		}
 		const state = this.#connection(metadata);
 		return state === "elsewhere" && this.#leftoverBusy.has(metadata.id)
 			? { state, holder: "earlier-app" }
@@ -1473,7 +1481,7 @@ export class DesktopHost {
 		// Every conversation in the shared store, whichever surface created it, opens the way the
 		// terminal opens its own transcripts, with no exclusivity the terminal itself does not
 		// provide; listing one grants nothing. A row not placed in the store yet has nothing to open.
-		if (metadata.managed) throw new Error(UNPLACED);
+		if (metadata.managed) throw new ConnectionRefusal("unavailable", UNPLACED);
 		// Every path that would open the app's own writer passes here; reads of a released
 		// conversation are answered from its transcript before they reach it.
 		if (!this.#writable(metadata)) throw this.#notWritable(metadata);
@@ -1626,7 +1634,10 @@ export class DesktopHost {
 		// Another request, or a workspace refresh, placed or removed it while the listing ran.
 		if (!metadata.managed) return "placed";
 		if (!this.#catalog.sessions.includes(metadata)) return "unlisted";
-		if (!file) return outside ? "outside" : "unlisted";
+		if (!file) {
+			this.#noteUnplaced(metadata, outside ? "outside" : "missing");
+			return outside ? "outside" : "unlisted";
+		}
 		const undo = this.#applyPlacement(metadata, file);
 		try {
 			await this.#save();
@@ -3491,16 +3502,18 @@ export class DesktopHost {
 			const metadata = this.#catalog.sessions.find(session => session.id === params.sessionId);
 			if (metadata?.managed) {
 				// A row an earlier build saved without a transcript path. Once the store's listing
-				// places it, it goes on below as an ordinary row. Until then nothing can read or open
-				// it, and deleting it only forgets the reference: the app never held that transcript.
+				// places it, it goes on below as an ordinary row. Until then nothing can read or open it.
+				// The app offers it only "Remove from list", which promises to leave the transcript
+				// alone: removing it forgets the reference, without placing it first, and does not
+				// release the identity, so a transcript the store lists again comes back as a row.
+				if (method === "session.delete") {
+					this.#unplaced.delete(metadata.id);
+					return this.#forgetMissingSession(this.#metadata(params), false);
+				}
 				const placement = await this.#place(this.#metadata(params));
-				if ((placement === "unlisted" || placement === "outside") && method === "session.delete")
-					// An inventory can come back empty without failing, so absence is not proof enough
-					// to release the identity: a transcript that is truly gone never lists again anyway.
-					return this.#forgetMissingSession(metadata, false);
 				if (placement === "unavailable") throw new Error(UNPLACED_UNCHECKED);
-				if (placement === "outside") throw new Error(UNPLACED_OUTSIDE);
-				if (placement === "unlisted") throw new Error(UNPLACED);
+				if (placement === "outside") throw new ConnectionRefusal("unavailable", UNPLACED_OUTSIDE);
+				if (placement === "unlisted") throw new ConnectionRefusal("unavailable", UNPLACED);
 			}
 		}
 		if (method === "auth.providers") {
@@ -4658,6 +4671,7 @@ export class DesktopHost {
 		const sessions = [...managed, ...desktop];
 		const discovered: SavedSession[] = [];
 		const placed = new Map<SavedSession, string>();
+		const outside = new Set<SavedSession>();
 		const creationTimes = new Map<string, number>();
 		const ids = new Set(this.#catalog.sessions.map(session => session.id));
 		const catalogRow = (session: (typeof sessions)[number]) =>
@@ -4686,6 +4700,7 @@ export class DesktopHost {
 			if (existing?.managed && existing.projectId === project.id && existing.id === session.id) {
 				const file = desktop.includes(session) ? undefined : await this.#sharedStorePath(session.path);
 				if (file) placed.set(existing, file);
+				else outside.add(existing);
 			}
 			if (
 				existing ||
@@ -4714,7 +4729,19 @@ export class DesktopHost {
 				createdAt,
 			});
 		}
-		return { discovered, placed, creationTimes };
+		// Why each of this workspace's unplaced rows cannot open, for its notice. Shown only, never saved.
+		let unplacedChanged = false;
+		for (const session of this.#catalog.sessions)
+			if (session.managed && session.projectId === project.id && !placed.has(session))
+				unplacedChanged =
+					this.#noteUnplaced(session, outside.has(session) ? "outside" : "missing") || unplacedChanged;
+		return { discovered, placed, creationTimes, unplacedChanged };
+	}
+	/** Records why an unplaced row cannot open; true when that changed what the row shows. */
+	#noteUnplaced(session: SavedSession, reason: "outside" | "missing"): boolean {
+		if (this.#unplaced.get(session.id) === reason) return false;
+		this.#unplaced.set(session.id, reason);
+		return true;
 	}
 	/** Gives a row an earlier build saved without a transcript path its place in the shared store. */
 	#applyPlacement(session: SavedSession, file: string): () => void {
@@ -4854,7 +4881,7 @@ export class DesktopHost {
 		const discovery = await this.#discoverProjectSessions(project);
 		if (this.#closed) return false;
 		const undo = this.#mergeDiscovered(project, discovery);
-		if (!undo) return false;
+		if (!undo) return discovery.unplacedChanged;
 		// Creation-time corrections alone are saved with the next catalog write; a new or placed row
 		// needs its own.
 		if (!discovery.discovered.length && !discovery.placed.size) return true;

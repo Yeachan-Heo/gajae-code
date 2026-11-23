@@ -677,17 +677,19 @@ test("a catalog saved by an earlier build keeps loading, and its terminal refere
 	await h.call("project.open", { path: h.projectDir });
 	await sdk.deleteEmbeddedSession(gone.file, { managed: true });
 	await h.restartOnEarlierCatalog([listed.id, gone.id]);
-	// Both rows load. Neither has a transcript path yet, so neither offers Disconnect or Connect.
+	// Both rows load. Neither has a transcript path yet, so neither can open: no reason is known
+	// before a listing has run.
 	expect(h.snapshot().sessions.map(session => [session.id, session.connection])).toEqual([
-		[listed.id, undefined],
-		[gone.id, undefined],
+		[listed.id, { state: "unavailable" }],
+		[gone.id, { state: "unavailable" }],
 	]);
 	await h.call("bootstrap");
 	await h.refreshed();
-	// The listing places the one whose transcript exists; the other stays a bare reference.
+	// The listing places the one whose transcript exists; the other stays a bare reference, now
+	// known to be missing.
 	expect(h.snapshot().sessions.map(session => [session.id, session.connection])).toEqual([
 		[listed.id, { state: "connected" }],
-		[gone.id, undefined],
+		[gone.id, { state: "unavailable", reason: "missing" }],
 	]);
 	const rows = await h.savedRows();
 	expect(rows.map(row => [row.id, row.sessionId, row.scope, row.managed, row.leftoverOwner])).toEqual([
@@ -735,10 +737,26 @@ test("an earlier build's reference to a transcript in the project's .gjc folder 
 	};
 	catalog.sessions.push({ id, projectId: project.id, title: "Project-local", starred: false, managed: true });
 	await h.restartWithCatalog(catalog);
+	expect(h.snapshot().sessions.map(session => session.connection)).toEqual([{ state: "unavailable" }]);
 	for (const method of ["session.select", "history.get"] as const)
 		await expect(h.call(method, { sessionId: id })).rejects.toThrow(
 			"its transcript is kept in the project's .gjc folder, outside the conversation store the app uses. Continue it in the terminal, or remove it from this list.",
 		);
+	// The row now says why, for its notice; the refusal is typed, so the app shows no banner for it.
+	expect(h.snapshot().sessions.map(session => session.connection)).toEqual([
+		{ state: "unavailable", reason: "outside" },
+	]);
+	const refused = crypto.randomUUID();
+	await expect(h.call("prompt", { sessionId: id, text: "here" }, refused)).rejects.toThrow(".gjc folder");
+	expect(h.frames.find(frame => frame.type === "response" && frame.id === refused)).toMatchObject({
+		connectionRefusal: "unavailable",
+	});
+	// A workspace refresh finds the same reason.
+	await h.call("bootstrap");
+	await h.refreshed();
+	expect(h.snapshot().sessions.map(session => session.connection)).toEqual([
+		{ state: "unavailable", reason: "outside" },
+	]);
 	// Removing it forgets the reference only; the terminal's transcript stays.
 	await h.call("session.delete", { sessionId: id });
 	expect(h.snapshot().sessions).toEqual([]);
@@ -760,7 +778,7 @@ test("selecting an earlier build's terminal reference places it at once, before 
 	]);
 });
 
-test("an earlier build's terminal reference is neither opened nor removed while the store cannot be listed", async () => {
+test("an earlier build's terminal reference is not opened while the store cannot be listed, and removing it keeps the transcript", async () => {
 	const h = await fixture();
 	const terminal = await h.persist("Listing unavailable");
 	await h.call("project.open", { path: h.projectDir });
@@ -768,23 +786,26 @@ test("an earlier build's terminal reference is neither opened nor removed while 
 	const listing = vi
 		.spyOn(sdk, "listEmbeddedProjectSessions")
 		.mockRejectedValue(new Error("Fixture inventory unavailable"));
-	for (const method of ["session.select", "session.delete"] as const)
-		await expect(h.call(method, { sessionId: terminal.id })).rejects.toThrow(
-			"could not look up this conversation's transcript",
-		);
-	expect(h.snapshot().sessions.map(session => session.id)).toEqual([terminal.id]);
-	listing.mockRestore();
-	// An inventory that comes back empty without failing proves nothing either: the reference can
-	// be removed, but the identity is not released, so the existing transcript is listed again.
-	vi.spyOn(sdk, "listEmbeddedProjectSessions").mockResolvedValueOnce({ managed: [], local: [] });
+	await expect(h.call("session.select", { sessionId: terminal.id })).rejects.toThrow(
+		"could not look up this conversation's transcript",
+	);
+	expect(h.snapshot().sessions.map(session => [session.id, session.connection])).toEqual([
+		[terminal.id, { state: "unavailable" }],
+	]);
+	// "Remove from list" promises to leave the transcript alone: it forgets the reference without
+	// needing the listing, and without releasing the identity.
+	const listed = listing.mock.calls.length;
 	await h.call("session.delete", { sessionId: terminal.id });
 	expect(h.snapshot().sessions).toEqual([]);
+	expect(listing.mock.calls.length).toBe(listed);
+	listing.mockRestore();
+	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
+	// The store still lists the transcript, so it comes back as an ordinary row.
 	await h.call("bootstrap");
 	await h.refreshed();
 	expect(h.snapshot().sessions.map(session => [session.id, session.connection])).toEqual([
 		[terminal.id, { state: "connected" }],
 	]);
-	expect(await Bun.file(terminal.file).text()).toBe(terminal.bytes);
 	expect(h.created).toHaveLength(0);
 });
 

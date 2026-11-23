@@ -233,6 +233,62 @@ suite("Session connection", () => {
 		}
 	}, 30000);
 
+	test("a conversation the app cannot open offers only Remove, worded for why it cannot open", async () => {
+		const { context, page } = await fixture();
+		try {
+			await mount(
+				page,
+				`import { SessionConnectionNotice } from '/src/SessionConnection.tsx';
+				import { SessionConnectionBadge, SessionConnectionMark } from '/src/SessionConnectionMark.tsx';`,
+				`window.removed = [];
+				const row = reason => ({ connection: reason ? { state: 'unavailable', reason } : { state: 'unavailable' } });
+				ReactDOM.createRoot(root).render(['outside', 'missing', undefined].map(reason =>
+					h('section', { key: String(reason), 'data-reason': String(reason) },
+						h(SessionConnectionNotice, {
+							state: 'unavailable',
+							reason,
+							pending: false,
+							onConnect: () => window.removed.push('connect:' + reason),
+							onRemove: () => window.removed.push(String(reason)),
+						}),
+						h(SessionConnectionBadge, { session: row(reason) }),
+						h(SessionConnectionMark, { session: row(reason) }))));`,
+			);
+			await page.waitForSelector('[data-reason="outside"] .connection-notice');
+			const read = (reason: string) =>
+				page.$eval(`[data-reason="${reason}"]`, node => ({
+					title: node.querySelector(".connection-notice strong")?.textContent,
+					body: node.querySelector(".connection-notice-text span")?.textContent ?? "",
+					actions: [...node.querySelectorAll(".connection-notice-action")].map(item => item.textContent),
+					badge: node.querySelector(".connection-badge")?.textContent,
+					mark: node.querySelector(".connection-mark")?.getAttribute("title"),
+				}));
+			expect(await read("outside")).toEqual({
+				title: "Kept in the project's .gjc folder",
+				body: "Its transcript is kept in the project's .gjc folder, outside the conversation store the app uses. Continue it in the terminal, or remove it from this list.",
+				actions: ["Remove from list"],
+				badge: "Can't open here",
+				mark: "can't be opened in the app",
+			});
+			expect(await read("missing")).toMatchObject({ title: "Transcript not found", actions: ["Remove from list"] });
+			expect((await read("missing")).body).toContain("may have been deleted or moved in the terminal");
+			expect(await read("undefined")).toMatchObject({
+				title: "Can't open this conversation here",
+				actions: ["Remove from list"],
+			});
+			for (const reason of ["outside", "missing", "undefined"])
+				await page.click(`[data-reason="${reason}"] .connection-notice-action`);
+			// Remove only: Connect is never offered or called.
+			expect(await page.evaluate(() => (window as unknown as { removed: string[] }).removed)).toEqual([
+				"outside",
+				"missing",
+				"undefined",
+			]);
+		} finally {
+			await context.close();
+		}
+	}, 30000);
+
 	test("both connection notices lay out alike at the app's composer widths: icon beside and level with the title", async () => {
 		const { context, page } = await fixture();
 		try {

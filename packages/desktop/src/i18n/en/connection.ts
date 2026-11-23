@@ -12,6 +12,18 @@ export const connection = {
 	"connection.markDisconnected": "not connected to the app",
 	"connection.markElsewhere": "in use in a terminal",
 	"connection.badgeLeftover": "In use by an earlier app session",
+	"connection.badgeUnavailable": "Can't open here",
+	"connection.markUnavailable": "can't be opened in the app",
+	"connection.unavailableTitle": "Can't open this conversation here",
+	"connection.unavailableBody":
+		"The app can't open this conversation here. Continue it in the terminal, or remove it from this list.",
+	"connection.outsideTitle": "Kept in the project's .gjc folder",
+	"connection.outsideBody":
+		"Its transcript is kept in the project's .gjc folder, outside the conversation store the app uses. Continue it in the terminal, or remove it from this list.",
+	"connection.missingTitle": "Transcript not found",
+	"connection.missingBody":
+		"Its transcript was not found in the shared conversation store. It may have been deleted or moved in the terminal. You can remove it from this list.",
+	"connection.remove": "Remove from list",
 	"connection.markLeftover": "in use by an earlier app session",
 	"connection.leftoverTitle": "In use by an earlier app session",
 	"connection.leftoverBody":
@@ -46,6 +58,10 @@ export const connection = {
 	"connection.showcaseElsewhere": "In use in a terminal · check again",
 	"connection.showcaseChecking": "Check pending",
 	"connection.showcaseLeftover": "In use by an earlier app session · busy background process",
+	"connection.showcaseOutside": "Can't open here · kept in the project's .gjc folder · Remove only",
+	"connection.showcaseMissing": "Can't open here · transcript not found · Remove only",
+	"connection.showcaseUnavailable": "Can't open here · not checked yet · Remove only",
+	"connection.showcaseRemove": "Remove from list confirmation · the transcript stays",
 	"connection.showcaseBadges": "Header badges",
 	"connection.showcaseRows": "Sidebar rows",
 	"connection.showcaseConfirm": "Disconnect confirmation · running turn and queued messages",

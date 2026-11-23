@@ -1,19 +1,22 @@
 import type { DesktopSession, DesktopSessionConnection } from "@gajae-code/desktop-host/protocol";
-import { SquareTerminal, Unplug } from "lucide-react";
+import { FileQuestionMark, SquareTerminal, Unplug } from "lucide-react";
 import { t } from "./i18n";
 
 export type ReadOnlyConnection = Exclude<DesktopSessionConnection["state"], "connected">;
 
 /**
- * The conversation's connection state. Only a row an earlier build saved without a transcript path,
- * not yet placed in the shared store, has none; it counts as connected here, and the Host answers
- * its requests with why it cannot be opened.
+ * The conversation's connection state. Every Host row carries one; a row an earlier build saved that
+ * the shared store cannot place is `unavailable`. A row without one counts as connected.
  */
 export function connectionState(session: Pick<DesktopSession, "connection"> | undefined) {
 	return session?.connection?.state ?? "connected";
 }
 
-export const connectionIcons = { disconnected: Unplug, elsewhere: SquareTerminal } as const;
+export const connectionIcons = {
+	disconnected: Unplug,
+	elsewhere: SquareTerminal,
+	unavailable: FileQuestionMark,
+} as const;
 
 /** A quiet header chip naming a read-only conversation's state; nothing for a connected one. */
 export function SessionConnectionBadge({ session }: { session: Pick<DesktopSession, "connection"> }) {
@@ -27,9 +30,11 @@ export function SessionConnectionBadge({ session }: { session: Pick<DesktopSessi
 			{t(
 				state === "disconnected"
 					? "connection.badgeDisconnected"
-					: leftover
-						? "connection.badgeLeftover"
-						: "connection.badgeElsewhere",
+					: state === "unavailable"
+						? "connection.badgeUnavailable"
+						: leftover
+							? "connection.badgeLeftover"
+							: "connection.badgeElsewhere",
 			)}
 		</span>
 	);
@@ -40,6 +45,7 @@ export function connectionMarkLabel(session: Pick<DesktopSession, "connection">)
 	const state = connectionState(session);
 	if (state === "connected") return "";
 	if (state === "disconnected") return t("connection.markDisconnected");
+	if (state === "unavailable") return t("connection.markUnavailable");
 	return t(session.connection?.holder === "earlier-app" ? "connection.markLeftover" : "connection.markElsewhere");
 }
 

@@ -1,69 +1,75 @@
 import { ChevronDown } from "lucide-react";
 import { useId, useState } from "react";
 import { Button } from "./components";
-import { t } from "./i18n";
+import { type MessageKey, t } from "./i18n";
 import { connectionIcons, type ReadOnlyConnection } from "./SessionConnectionMark";
 
 /**
  * Replaces the composer while the app does not write the conversation: what happened, and the one
  * action that changes it. A released conversation offers Connect; one another process has open
- * offers a re-check. The draft stays in the app's draft store and returns with the composer.
+ * offers a re-check; one the app cannot open at all (`unavailable`) offers only removal from the
+ * list. The draft stays in the app's draft store and returns with the composer.
  */
 export function SessionConnectionNotice({
 	state,
 	holder,
+	reason,
 	pending,
 	onConnect,
+	onRemove,
 }: {
 	state: ReadOnlyConnection;
 	/** With `elsewhere`: an earlier app session's background process holds it, not a terminal. */
 	holder?: "earlier-app";
+	/** With `unavailable`: why it cannot open, once a listing has said. */
+	reason?: "outside" | "missing";
 	pending: boolean;
 	onConnect: () => void;
+	/** With `unavailable`: remove it from the list (through the Delete confirmation). */
+	onRemove?: () => void;
 }) {
 	const Icon = connectionIcons[state];
 	const disconnected = state === "disconnected";
-	const idle = t(disconnected ? "connection.connect" : "connection.retry");
+	const unavailable = state === "unavailable";
+	const idle = unavailable ? t("connection.remove") : t(disconnected ? "connection.connect" : "connection.retry");
 	const busy = t(disconnected ? "connection.connecting" : "connection.checking");
-	const label = pending ? busy : idle;
-	// Every label either state can show reserves the button's width, so the two states' buttons, and
-	// so their layouts, match at any width and in any language.
-	const reserve = [
-		t("connection.connect"),
-		t("connection.connecting"),
-		t("connection.retry"),
-		t("connection.checking"),
-	]
-		.filter(text => text !== label)
-		.join("\n");
+	const label = pending && !unavailable ? busy : idle;
+	// Every label the Connect and Check again states can show reserves the button's width, so those
+	// states' buttons, and so their layouts, match at any width and in any language.
+	const reserve = unavailable
+		? ""
+		: [t("connection.connect"), t("connection.connecting"), t("connection.retry"), t("connection.checking")]
+				.filter(text => text !== label)
+				.join("\n");
 	const bodyId = useId();
 	const [expanded, setExpanded] = useState(false);
 	const details = expanded ? t("connection.hideDetails") : t("connection.showDetails");
-	const leftover = !disconnected && holder === "earlier-app";
+	const leftover = state === "elsewhere" && holder === "earlier-app";
+	const [title, body]: [MessageKey, MessageKey] = disconnected
+		? ["connection.disconnectedTitle", "connection.disconnectedBody"]
+		: unavailable
+			? reason === "outside"
+				? ["connection.outsideTitle", "connection.outsideBody"]
+				: reason === "missing"
+					? ["connection.missingTitle", "connection.missingBody"]
+					: ["connection.unavailableTitle", "connection.unavailableBody"]
+			: leftover
+				? ["connection.leftoverTitle", "connection.leftoverBody"]
+				: ["connection.elsewhereTitle", "connection.elsewhereBody"];
 	return (
-		<div className="connection-notice" role="status" data-state={state} data-expanded={expanded || undefined}>
+		<div
+			className="connection-notice"
+			role="status"
+			data-state={state}
+			data-reason={reason}
+			data-expanded={expanded || undefined}
+		>
 			{/* Icon and text wrap as one unit, so the icon never lands on a line of its own. */}
 			<div className="connection-notice-main">
 				<Icon className="connection-notice-icon" aria-hidden="true" />
 				<div className="connection-notice-text">
-					<strong>
-						{t(
-							disconnected
-								? "connection.disconnectedTitle"
-								: leftover
-									? "connection.leftoverTitle"
-									: "connection.elsewhereTitle",
-						)}
-					</strong>
-					<span id={bodyId}>
-						{t(
-							disconnected
-								? "connection.disconnectedBody"
-								: leftover
-									? "connection.leftoverBody"
-									: "connection.elsewhereBody",
-						)}
-					</span>
+					<strong>{t(title)}</strong>
+					<span id={bodyId}>{t(body)}</span>
 				</div>
 				{/* Shown only in short windows, where the explanation is folded away to keep the action in view. */}
 				<Button
@@ -81,13 +87,15 @@ export function SessionConnectionNotice({
 			<Button
 				className="primary connection-notice-action"
 				aria-disabled={pending || undefined}
-				aria-busy={pending || undefined}
+				aria-busy={(pending && !unavailable) || undefined}
 				onClick={() => {
-					if (!pending) onConnect();
+					if (pending) return;
+					if (unavailable) onRemove?.();
+					else onConnect();
 				}}
 			>
 				{/* The other labels reserve their width (as generated content, outside the accessible name). */}
-				<span className="connection-notice-label" data-reserve={reserve}>
+				<span className="connection-notice-label" data-reserve={reserve || undefined}>
 					{label}
 				</span>
 			</Button>

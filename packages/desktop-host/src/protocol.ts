@@ -255,12 +255,22 @@ export interface DesktopSession {
 /**
  * A request refused because the app does not write the conversation right now: it is released
  * (`disconnected`), being released (`disconnecting`), or another gjc process has it (`elsewhere`).
- * The session's `connection` state already says the first and last of these.
+ * `unavailable`: a row an earlier build saved that the shared store cannot place. The session's
+ * `connection` state already says all but `disconnecting`.
  */
-export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnecting";
+export type DesktopConnectionRefusal = "elsewhere" | "disconnected" | "disconnecting" | "unavailable";
 
 export interface DesktopSessionConnection {
-	state: "connected" | "disconnected" | "elsewhere";
+	/**
+	 * `unavailable`: a row an earlier build saved without a transcript path that the shared store
+	 * cannot place, so nothing can open it; it can only be removed from the list.
+	 */
+	state: "connected" | "disconnected" | "elsewhere" | "unavailable";
+	/**
+	 * Only with `unavailable`, once a listing has said why: the transcript is kept in the project's
+	 * `.gjc` folder, outside the store (`outside`), or was not found (`missing`).
+	 */
+	reason?: "outside" | "missing";
 	/**
 	 * Only with `elsewhere`: the process holding it is one an earlier version of the app started
 	 * (a background owner still busy with its work), not a terminal.

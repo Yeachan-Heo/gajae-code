@@ -1,4 +1,4 @@
-import type { DesktopSession } from "@gajae-code/desktop-host/protocol";
+import type { DesktopSession, DesktopSessionConnection } from "@gajae-code/desktop-host/protocol";
 import { type ReactNode, useState } from "react";
 import { Button, Modal, SessionRow } from "./components";
 import { type DeliveryRecovery, recoveryNotice } from "./delivery-recovery";
@@ -80,7 +80,7 @@ export function ShowcaseSessionNav() {
 }
 
 // Fixture rows only: nothing here is requested from the Host.
-const row = (id: string, title: string, state: "connected" | "disconnected" | "elsewhere"): DesktopSession => ({
+const row = (id: string, title: string, state: DesktopSessionConnection["state"]): DesktopSession => ({
 	id,
 	projectId: "p",
 	title,
@@ -165,6 +165,36 @@ function ShowcaseConnection() {
 						<SessionConnectionNotice state="elsewhere" pending onConnect={none} />
 					</ComposerArea>
 				</State>
+				<State caption="connection.showcaseOutside">
+					<ComposerArea>
+						<SessionConnectionNotice
+							state="unavailable"
+							reason="outside"
+							pending={false}
+							onConnect={none}
+							onRemove={none}
+						/>
+					</ComposerArea>
+				</State>
+				<State caption="connection.showcaseMissing">
+					<ComposerArea>
+						<SessionConnectionNotice
+							state="unavailable"
+							reason="missing"
+							pending={false}
+							onConnect={none}
+							onRemove={none}
+						/>
+					</ComposerArea>
+				</State>
+				<State caption="connection.showcaseUnavailable">
+					<ComposerArea>
+						<SessionConnectionNotice state="unavailable" pending={false} onConnect={none} onRemove={none} />
+					</ComposerArea>
+				</State>
+				<State caption="connection.showcaseRemove">
+					<DeleteDialog texts={[]} removeOnly />
+				</State>
 				<State caption="connection.showcaseBadges">
 					<div className="toolbar-title">
 						<h1>Fix the flaky test</h1>
@@ -174,12 +204,17 @@ function ShowcaseConnection() {
 						<h1>Release checklist</h1>
 						<SessionConnectionBadge session={row("b2", "", "elsewhere")} />
 					</div>
+					<div className="toolbar-title">
+						<h1>Workflow subagent run</h1>
+						<SessionConnectionBadge session={row("b3", "", "unavailable")} />
+					</div>
 				</State>
 				<State caption="connection.showcaseRows">
 					<div className="showcase-session-rows">
 						<SessionRow session={row("r1", "Connected conversation", "connected")} onSelect={none} />
 						<SessionRow session={row("r2", "Fix the flaky test", "disconnected")} selected onSelect={none} />
 						<SessionRow session={row("r3", "Release checklist", "elsewhere")} onSelect={none} />
+						<SessionRow session={row("r5", "Workflow subagent run", "unavailable")} onSelect={none} />
 					</div>
 				</State>
 				<State caption="connection.showcaseConfirm">
@@ -240,7 +275,7 @@ const deleteFixtures: Array<{ caption: MessageKey; texts: string[]; refuse?: boo
 const refuseCopy = () => Promise.reject(new Error("Design example: the clipboard refused the write."));
 
 /** The Delete conversation dialog, opened in the App's native dialog from fixture texts; it deletes nothing. */
-function DeleteDialog({ texts, refuse }: { texts: string[]; refuse?: boolean }) {
+function DeleteDialog({ texts, refuse, removeOnly }: { texts: string[]; refuse?: boolean; removeOnly?: boolean }) {
 	const [open, setOpen] = useState(false);
 	const close = () => setOpen(false);
 	return (
@@ -251,9 +286,10 @@ function DeleteDialog({ texts, refuse }: { texts: string[]; refuse?: boolean }) 
 				</Button>
 			</div>
 			{open && (
-				<Modal title={t("shell.dialogDelete")} onClose={close}>
+				<Modal title={t(removeOnly ? "shell.dialogRemove" : "shell.dialogDelete")} onClose={close}>
 					<DeleteConversationConfirmation
-						title="Fix the flaky test"
+						title={removeOnly ? "Workflow subagent run" : "Fix the flaky test"}
+						removeOnly={removeOnly}
 						texts={texts}
 						disabled={false}
 						onDelete={close}
