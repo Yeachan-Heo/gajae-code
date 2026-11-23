@@ -173,7 +173,7 @@ export function buildConversationTitleInputWithFallback(
 
 	// If live messages are empty (after compaction), try sessionManager entries
 	if (sessionManager) {
-		const entries = sessionManager.getEntries();
+		const entries = sessionManager.getBranch();
 		const persistedUserMessages = extractUserMessagesFromSessionEntries(entries);
 		result = formatUserMessagesForTitle(persistedUserMessages, obfuscateText);
 		if (result) return result;

@@ -61,7 +61,7 @@ describe("buildConversationTitleInput", () => {
 describe("buildConversationTitleInputWithFallback", () => {
 	it("returns undefined for truly empty session", () => {
 		const mockSessionManager = {
-			getEntries: () => [],
+			getBranch: () => [],
 		} as unknown as SessionManager;
 
 		expect(buildConversationTitleInputWithFallback([], mockSessionManager)).toBeUndefined();
@@ -70,7 +70,7 @@ describe("buildConversationTitleInputWithFallback", () => {
 
 	it("uses live user messages when available", () => {
 		const mockSessionManager = {
-			getEntries: () => [],
+			getBranch: () => [],
 		} as unknown as SessionManager;
 
 		expect(buildConversationTitleInputWithFallback([user("live message")], mockSessionManager)).toBe("live message");
@@ -85,7 +85,7 @@ describe("buildConversationTitleInputWithFallback", () => {
 		] as SessionMessageEntry[];
 
 		const mockSessionManager = {
-			getEntries: () => persistedEntries,
+			getBranch: () => persistedEntries,
 		} as unknown as SessionManager;
 
 		// Live context only has compaction summary, no user messages
@@ -102,7 +102,7 @@ describe("buildConversationTitleInputWithFallback", () => {
 
 	it("uses compaction summary when no user messages available", () => {
 		const mockSessionManager = {
-			getEntries: () => [],
+			getBranch: () => [],
 		} as unknown as SessionManager;
 
 		const liveMessages = [
@@ -125,7 +125,7 @@ describe("buildConversationTitleInputWithFallback", () => {
 		] as SessionMessageEntry[];
 
 		const mockSessionManager = {
-			getEntries: () => persistedEntries,
+			getBranch: () => persistedEntries,
 		} as unknown as SessionManager;
 
 		const liveMessages = [user("live user message"), { role: "assistant" } as AgentMessage];
@@ -143,7 +143,7 @@ describe("buildConversationTitleInputWithFallback", () => {
 		] as SessionMessageEntry[];
 
 		const mockSessionManager = {
-			getEntries: () => persistedEntries,
+			getBranch: () => persistedEntries,
 		} as unknown as SessionManager;
 
 		const liveMessages = [
