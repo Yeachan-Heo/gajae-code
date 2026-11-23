@@ -589,14 +589,17 @@ not settle earlier effects.
   restart notice names that directory, shell-quoted. Restart through the
   external supervisor for `gjc sdk broker run --agent-dir <dir>`. Restart a
   running on-demand broker with
-  `gjc doctor --fix --repair service.restart-owned` on its broker target, run
+  `gjc doctor --fix --repair service.restart-owned --target <id> --allow-risk service-interruption`,
+  using the broker target id that `gjc doctor --check service` reports, run
   with `GJC_CODING_AGENT_DIR` set to that directory (see [doctor](doctor.md));
   if none is running, the next `gjc sdk session`, `search` or `spawn` command
   run with `--agent-dir <dir>` (not attach-only) starts one. From a source
   checkout, `bun run restart:sdk-broker -- --agent-dir <dir>` also restarts it
   (the script is not part of installed builds). The attestation command never
-  restarts the broker, and refuses an agent directory that no broker can run
-  for (relative, control characters, or a leading `-`).
+  restarts the broker. It resolves `--agent-dir` against the current
+  directory and refuses a result that no broker can run for: one containing
+  control characters (including newlines), U+2028 or U+2029, or longer than
+  4096 characters.
   The broker itself never writes or derives this file. It honors a listed
   identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target

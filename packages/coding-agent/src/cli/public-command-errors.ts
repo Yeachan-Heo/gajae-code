@@ -101,7 +101,7 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	spawn_anchor_identity_unavailable:
 		"The original sdk/broker.identity is missing, invalid, or unreadable. Restore the original identity key before attesting spawn mirrors.",
 	spawn_anchor_attestation_invalid:
-		"The existing spawn-anchor attestation is malformed or unreadable. Preserve it and investigate before writing.",
+		"The existing spawn-anchor attestation is malformed, unreadable, larger than the lifecycle ledger byte bound, or lists an entry that is not a lowercase 64-character hex identity. Preserve it and investigate before writing.",
 	spawn_anchor_ledger_invalid:
 		"The lifecycle ledger is malformed, unsupported, unreadable, or past the bounds the broker applies when it opens it. No attestation was written.",
 	spawn_anchor_journal_invalid:

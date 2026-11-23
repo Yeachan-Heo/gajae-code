@@ -139,7 +139,7 @@ function expectFailureEnvelope(
 	expect(result.stdout).not.toMatch(/[a-f0-9]{64}/i);
 }
 
-async function dispatchInProcess(f: Fixture, flags: string[], failFirstOutput = false) {
+async function dispatchInProcess(f: Fixture, flags: string[], failFirstOutput = false, agentDir = f.agentDir) {
 	let stdout = "";
 	let stderr = "";
 	const out = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
@@ -157,7 +157,7 @@ async function dispatchInProcess(f: Fixture, flags: string[], failFirstOutput = 
 	const originalExitCode = process.exitCode ?? 0;
 	try {
 		process.exitCode = 0;
-		await dispatchPublicCommand(["broker", "attest-spawn-anchors", "--agent-dir", f.agentDir, ...flags], {
+		await dispatchPublicCommand(["broker", "attest-spawn-anchors", "--agent-dir", agentDir, ...flags], {
 			command: "sdk",
 			bin: "gjc",
 			version: "test",
@@ -820,7 +820,7 @@ describe("SDK spawn-anchor attestation", () => {
 				expect(notice).toContain(`next broker start for agent directory ${quoted}.`);
 				expect(notice).toContain(`your supervisor for gjc sdk broker run --agent-dir ${quoted}.`);
 				expect(notice).toContain(
-					`gjc doctor --fix --repair service.restart-owned on its broker target, run with GJC_CODING_AGENT_DIR set to ${quoted};`,
+					`gjc doctor --fix --repair service.restart-owned --target <broker target from gjc doctor --check service> --allow-risk service-interruption, run with GJC_CODING_AGENT_DIR set to ${quoted};`,
 				);
 				expect(notice).toContain(
 					`the next gjc sdk session, search or spawn command run with --agent-dir ${quoted} starts one.`,
@@ -839,6 +839,10 @@ describe("SDK spawn-anchor attestation", () => {
 		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o'neil\\gjc agent", "win32")).toContain(
 			"--agent-dir 'C:\\Users\\o''neil\\gjc agent'",
 		);
+		// PowerShell treats U+2018 through U+201B as single quotes too.
+		expect(spawnAnchorAttestationRestartNotice("C:\\Users\\o\u2019neil\u201b", "win32")).toContain(
+			"--agent-dir 'C:\\Users\\o\u2019\u2019neil\u201b\u201b'",
+		);
 	});
 
 	// Windows paths cannot contain a newline.
@@ -853,6 +857,14 @@ describe("SDK spawn-anchor attestation", () => {
 			await expect(
 				runSpawnAnchorAttestation({ agentDir: unsafe, evidence: [f.evidencePath], write: true }),
 			).rejects.toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+			// The real public boundary reports a usage refusal with exit 2.
+			const result = await dispatchInProcess(f, ["--evidence", f.evidencePath, "--write", "--json"], false, unsafe);
+			expect(result.code).toBe(2);
+			expect(JSON.parse(result.stdout)).toMatchObject({
+				ok: false,
+				command: ["sdk", "broker", "attest-spawn-anchors"],
+				error: { code: "usage", outcomeCertainty: "not-applied" },
+			});
 			expect(
 				await Bun.file(path.join(unsafe, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json")).exists(),
 			).toBe(false);
