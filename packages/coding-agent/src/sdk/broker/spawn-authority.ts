@@ -142,6 +142,9 @@ export type SpawnAuthorityV1 = {
 	updatedAt: number;
 };
 
+/** The spawning master of one child session id and the state roots its host registered in. */
+export type SpawnOwnerRecord = { ownerSessionId: string; stateRoots: ReadonlySet<string> };
+
 export type SpawnClaimTransition = {
 	claimId: string;
 	from: SpawnClaimV2["state"];
@@ -724,17 +727,24 @@ export class SpawnAuthorityStore {
 	}
 
 	/**
-	 * Spawning master per child session id. A child that more than one recorded
-	 * authority attributes to different owners is omitted: ownership is reported
-	 * only when the durable evidence names exactly one master.
+	 * Spawning master per child session id, with the state roots the child's host
+	 * registered in. A child that more than one recorded authority attributes to
+	 * different owners is omitted: ownership is reported only when the durable
+	 * evidence names exactly one master. A pre-pin authority records no state
+	 * root, so it attributes the child to no row.
 	 */
-	spawnOwnersByChild(): ReadonlyMap<string, string> {
-		const owners = new Map<string, string>();
+	spawnOwnersByChild(): ReadonlyMap<string, SpawnOwnerRecord> {
+		const owners = new Map<string, { ownerSessionId: string; stateRoots: Set<string> }>();
 		const conflicted = new Set<string>();
 		for (const authority of this.#authorities.values()) {
 			const prior = owners.get(authority.childId);
-			if (prior !== undefined && prior !== authority.ownerSessionId) conflicted.add(authority.childId);
-			else owners.set(authority.childId, authority.ownerSessionId);
+			if (prior !== undefined && prior.ownerSessionId !== authority.ownerSessionId) {
+				conflicted.add(authority.childId);
+				continue;
+			}
+			const entry = prior ?? { ownerSessionId: authority.ownerSessionId, stateRoots: new Set<string>() };
+			if (authority.endpointStateRoot !== undefined) entry.stateRoots.add(authority.endpointStateRoot);
+			owners.set(authority.childId, entry);
 		}
 		for (const childId of conflicted) owners.delete(childId);
 		return owners;
