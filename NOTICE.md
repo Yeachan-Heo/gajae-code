@@ -45,6 +45,12 @@ The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` sour
 - `crates/pi-natives/src/fd.rs`
 - `crates/pi-natives/src/workspace.rs`
 
+## Adapted Rust from oh-my-pi @ 31ffee51
+
+`crates/pi-natives/src/file_lock/{mod.rs,unix.rs}` are adapted from `crates/natives/src/file_lock/` in `can1357/oh-my-pi` at commit `31ffee513f27a01bba7d4dfbe12bae239cdc646a` (MIT), a per-row bump recorded in `docs/rust-porting-inventory.md`. Per-file headers record the local modifications.
+
+Copyright (c) 2025 Mario Zechner, 2025–2026 Can Bölük, and 2026 Stencil Labs, Inc.
+
 ## Notice history
 
 MuPDF.js under AGPL-3.0-or-later was removed from the PDF conversion path; version 0.17.6 was the last release that shipped it.

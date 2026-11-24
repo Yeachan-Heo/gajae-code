@@ -58,6 +58,7 @@ import {
 	logger,
 	parseJsonlLenient,
 	pathIsWithin,
+	postmortem,
 	resolveEquivalentPath,
 	Snowflake,
 	toError,
@@ -140,6 +141,12 @@ import {
 	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
+	type GraphSuccessorRefusal,
+	graphSuccessorRefusalMessage,
+	proveOwnCommittedGraph,
+	sanitizeLoadedSessionEntryReplayMetadata,
+} from "./internal/graph-successor-proof";
+import {
 	deleteManagedSessionCandidate,
 	isRecoverableOwnerOnlyModeDrift,
 	type ManagedCandidateWriteAuthority,
@@ -170,6 +177,7 @@ import {
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
 import {
+	ManagedSessionBusyError,
 	type ManagedSessionTransactionScope,
 	withManagedSessionTransaction,
 } from "./internal/managed-session-transaction";
@@ -2661,6 +2669,20 @@ export class SharedSessionMutationUnsupportedError extends Error {
 	}
 }
 
+export type { GraphSuccessorRefusal } from "./internal/graph-successor-proof";
+
+/** A refused graph successor that names the reason; still a shared-mutation refusal. */
+export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsupportedError {
+	constructor(
+		operation: string,
+		readonly reason: GraphSuccessorRefusal,
+	) {
+		super(operation);
+		this.message = graphSuccessorRefusalMessage(reason);
+		this.name = "GraphSuccessorUnavailableError";
+	}
+}
+
 /**
  * Typed near-limit rewrite outcome (follow-up to #4566).
  *
@@ -2760,6 +2782,31 @@ export class SessionTranscriptOversizedError extends Error {
 		super(SESSION_OVERSIZED_RECOVERY_MESSAGE);
 		this.name = "SessionTranscriptOversizedError";
 		this.size = size;
+	}
+}
+/**
+ * A transcript above the eager-load cap that the bounded session-memory loader cannot serve:
+ * branched, patch-bearing, uncompacted, pre-v5, or malformed. `reason` is the loader's fallback reason.
+ */
+export class SessionTranscriptBoundedOpenError extends Error {
+	readonly code = "bounded_open_unsupported";
+	readonly size: number;
+	readonly reason: string;
+
+	constructor(size: number, reason: string) {
+		super(`Session transcript is not eligible for bounded loading (${reason})`);
+		this.name = "SessionTranscriptBoundedOpenError";
+		this.size = size;
+		this.reason = reason;
+	}
+}
+/** The source of a bounded read-only snapshot was replaced or truncated after the snapshot opened. */
+export class SessionSnapshotSourceChangedError extends Error {
+	readonly code = "snapshot_source_changed";
+
+	constructor() {
+		super("Session transcript was replaced or truncated after the read-only snapshot opened");
+		this.name = "SessionSnapshotSourceChangedError";
 	}
 }
 /** Default synchronous session-context materialization budget (512 MiB). */
@@ -5979,14 +6026,6 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	return cloned;
 }
 
-/** Match eager-resume replay sanitation whenever an entry is loaded from a bounded sidecar path. */
-function sanitizeLoadedSessionEntryReplayMetadata(entry: SessionEntry): SessionEntry {
-	if (entry.type === "message" && entry.message.role === "assistant") {
-		entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
-	}
-	return entry;
-}
-
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
 	if (entry.type === "compaction") {
 		const cache = new Map<string, string>();
@@ -7980,6 +8019,8 @@ export class SessionManager {
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
 	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
 	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
+	/** Successors proven against the committed transcript. */
+	readonly #committedGraphSuccessors = new WeakSet<PreparedNewSessionState>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -7992,6 +8033,13 @@ export class SessionManager {
 	 * direct checks on fork, draft, artifact, blob, move, discard/delete, and state-restore methods.
 	 */
 	#readOnlySnapshot = false;
+	/** Private sidecar cache of a bounded read-only snapshot, set before its open; see {@link openReadOnlySnapshot}. */
+	#snapshotSidecarStore: EphemeralBlobStore | undefined;
+	#snapshotSidecarUnregister: (() => void) | undefined;
+	/** Once set, the sidecar root resolves to nothing (never the source). */
+	#snapshotSidecarsDisposed = false;
+	/** Bounded snapshot's source identity and validated size; the cold export scan stops there. */
+	#snapshotScanIdentity: { dev: bigint; ino: bigint; size: number } | undefined;
 	#strictResumeMutationPending = false;
 	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
@@ -9591,12 +9639,7 @@ export class SessionManager {
 		sessionFile: string,
 	): Promise<SessionStorageExclusiveLock | "published" | undefined> {
 		if (!this.#storage.acquireExclusiveLockSync) return undefined;
-		const sidecarRoot =
-			this.destination.kind === "managed"
-				? this.#managedSidecarRoot(sessionFile)
-				: sessionFile.endsWith(".jsonl")
-					? sessionFile.slice(0, -6)
-					: sessionFile;
+		const sidecarRoot = this.#sidecarRootFor(sessionFile);
 		if (!sidecarRoot) return undefined;
 		const lockPath = `${sidecarRoot}/.session-memory.spill.build-lock`;
 		const commitPath = `${sidecarRoot}/.session-memory.spill.commit`;
@@ -10436,12 +10479,7 @@ export class SessionManager {
 				throw new Error("Could not open session: unstable");
 		};
 		revalidateStrictResume();
-		const sidecarRoot =
-			this.destination.kind === "managed"
-				? this.#managedSidecarRoot(resolvedSessionFile)
-				: resolvedSessionFile.endsWith(".jsonl")
-					? resolvedSessionFile.slice(0, -6)
-					: resolvedSessionFile;
+		const sidecarRoot = this.#sidecarRootFor(resolvedSessionFile);
 		let transcriptSize: number | undefined;
 		try {
 			transcriptSize = this.#statSync(resolvedSessionFile).size;
@@ -11165,11 +11203,16 @@ export class SessionManager {
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
-		this.assertLegacyMutationAllowed("prepare fork");
+		this.#requireGraphSuccessorRoute("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
-		this.assertLegacyMutationAllowed("prepare fork");
+		const route = this.#requireGraphSuccessorRoute("prepare fork");
+		if (route === "committed") {
+			// Prove ownership before hydration can load peer entries as resident.
+			const owned = this.#proveOwnCommittedGraph([]);
+			if (typeof owned === "string") throw new GraphSuccessorUnavailableError("prepare fork", owned);
+		}
 		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
@@ -11187,12 +11230,13 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: sourceId,
 		};
-		const entries: FileEntry[] = [
-			header,
-			...materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
-				(entry): entry is SessionEntry => entry.type !== "session",
-			),
-		];
+		const sourceEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
+			(entry): entry is SessionEntry => entry.type !== "session",
+		);
+		// Prove before copying artifacts.
+		const proof = route === "committed" ? this.#proveOwnCommittedGraph(sourceEntries) : undefined;
+		if (typeof proof === "string") throw new GraphSuccessorUnavailableError("prepare fork", proof);
+		const entries: FileEntry[] = [header, ...sourceEntries];
 		const stage: PreparedNewSessionState = {
 			sessionId,
 			sessionFile,
@@ -11209,17 +11253,22 @@ export class SessionManager {
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
+		if (route === "committed") this.#committedGraphSuccessors.add(stage);
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
 			this.#assertPreparedGraphPublicationAllowed(stage);
-			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-			if (this.destination.kind === "managed") {
-				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
-					path.basename(sessionFile),
-					Buffer.from(content, "utf8"),
-				);
+			if (proof) {
+				await this.#publishCommittedGraphSuccessor(stage, sourceFile, proof, [], "prepare fork");
 			} else {
-				this.#storage.writeTextSync(sessionFile, content);
+				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
+				if (this.destination.kind === "managed") {
+					this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+						path.basename(sessionFile),
+						Buffer.from(content, "utf8"),
+					);
+				} else {
+					this.#storage.writeTextSync(sessionFile, content);
+				}
 			}
 		} catch (error) {
 			try {
@@ -11237,15 +11286,16 @@ export class SessionManager {
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
-		this.assertLegacyMutationAllowed("prepare branched session");
+		this.#requireGraphSuccessorRoute("prepare branched session");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
-		this.assertLegacyMutationAllowed("prepare branched session");
+		this.#requireGraphSuccessorRoute("prepare branched session");
 		const sourceId = this.#sessionId;
+		const sourceFile = this.#sessionFile;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
-		this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session", true);
+		const route = this.#requireGraphSuccessorRoute("prepare branched session", sourceId);
 		const timestamp = new Date().toISOString();
 		const sessionId = createSessionId();
 		const sessionFile = this.persist
@@ -11258,7 +11308,8 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
-			parentSession: this.persist ? this.#sessionFile : undefined,
+			// The committed route records the source id; the legacy route keeps the path.
+			parentSession: route === "committed" ? sourceId : this.persist ? this.#sessionFile : undefined,
 		};
 		const pathWithoutLabels = branchPath.filter(entry => entry.type !== "label");
 		const pathEntryIds = new Set(pathWithoutLabels.map(entry => entry.id));
@@ -11278,11 +11329,10 @@ export class SessionManager {
 			labelEntries.push(labelEntry);
 			labelParentId = labelEntry.id;
 		}
-		const entries: FileEntry[] = [
-			header,
-			...materializeResidentEntriesForReadSync(pathWithoutLabels, this.#residentBlobStores()),
-			...labelEntries,
-		];
+		const sourceEntries = materializeResidentEntriesForReadSync(pathWithoutLabels, this.#residentBlobStores());
+		const proof = route === "committed" ? this.#proveOwnCommittedGraph(sourceEntries) : undefined;
+		if (typeof proof === "string") throw new GraphSuccessorUnavailableError("prepare branched session", proof);
+		const entries: FileEntry[] = [header, ...sourceEntries, ...labelEntries];
 		const stage: PreparedNewSessionState = {
 			sessionId,
 			sessionFile,
@@ -11299,8 +11349,17 @@ export class SessionManager {
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
+		if (route === "committed") this.#committedGraphSuccessors.add(stage);
 		try {
-			if (sessionFile) {
+			if (proof) {
+				await this.#publishCommittedGraphSuccessor(
+					stage,
+					sourceFile,
+					proof,
+					labelEntries,
+					"prepare branched session",
+				);
+			} else if (sessionFile) {
 				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
 				if (this.destination.kind === "managed") {
 					this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
@@ -13712,6 +13771,35 @@ export class SessionManager {
 		const resolvedCandidate = path.resolve(candidate);
 		return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
 	}
+	/** Session-memory sidecar directory: snapshot cache, managed instance cache, or artifact dir. */
+	#sidecarRootFor(sessionFile: string | undefined): string | undefined {
+		if (this.#snapshotSidecarStore)
+			return this.#snapshotSidecarsDisposed ? undefined : this.#snapshotSidecarStore.dir;
+		if (this.destination.kind === "managed") return this.#managedSidecarRoot(sessionFile);
+		if (!sessionFile) return undefined;
+		return sessionFile.endsWith(".jsonl") ? sessionFile.slice(0, -6) : sessionFile;
+	}
+
+	/** Remove a bounded snapshot's private sidecar cache; idempotent. */
+	#disposeSnapshotSidecars(): void {
+		this.#snapshotSidecarUnregister?.();
+		this.#snapshotSidecarUnregister = undefined;
+		if (!this.#snapshotSidecarStore) return;
+		// Keep the store so the root never falls back to the source and the cold runtime stays cold.
+		this.#snapshotSidecarsDisposed = true;
+		this.#snapshotSidecarStore.dispose();
+	}
+
+	#disposeSnapshotSidecarsBestEffort(): void {
+		try {
+			this.#disposeSnapshotSidecars();
+		} catch (error) {
+			// The instance keeps its owner token, so a later sweep reaps it once this process exits.
+			const reason = error instanceof ResidentCacheTrustError ? error.reason : "cleanup_failed";
+			logger.warn("Failed to remove the read-only snapshot sidecar cache", { reason });
+		}
+	}
+
 	#managedSidecarRoot(sessionFile = this.#sessionFile): string | undefined {
 		if (this.destination.kind !== "managed" || !sessionFile || process.platform === "win32") return undefined;
 		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
@@ -13988,7 +14076,13 @@ export class SessionManager {
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
 	#resetSidecarRuntime(ineligible = false, preserveLegacySidecars = false): SessionMemorySidecarRuntime {
 		this.#sidecarBranchActivationDirty = false;
-		if (!preserveLegacySidecars && this.#sessionFile && this.destination.kind !== "managed") {
+		// A bounded snapshot never deletes beside the source.
+		if (
+			!preserveLegacySidecars &&
+			!this.#snapshotSidecarStore &&
+			this.#sessionFile &&
+			this.destination.kind !== "managed"
+		) {
 			for (const legacyPath of [
 				`${this.#sessionFile}.spill.idx`,
 				`${this.#sessionFile}.spill.tail`,
@@ -14005,12 +14099,7 @@ export class SessionManager {
 				}
 			}
 		}
-		const sidecarRoot =
-			this.destination.kind === "managed"
-				? this.#managedSidecarRoot()
-				: this.#sessionFile?.endsWith(".jsonl")
-					? this.#sessionFile.slice(0, -6)
-					: this.#sessionFile;
+		const sidecarRoot = this.#sidecarRootFor(this.#sessionFile);
 		this.#managedRangeExpectedDescriptor =
 			this.destination.kind === "managed" && this.#sessionFile
 				? (this.#managedDescriptorSnapshotOrNull() ?? undefined)
@@ -17876,6 +17965,14 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		try {
+			await this.#closeSession();
+		} finally {
+			this.#disposeSnapshotSidecarsBestEffort();
+		}
+	}
+
+	async #closeSession(): Promise<void> {
 		this.#beginArtifactClose();
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
@@ -17958,6 +18055,14 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		try {
+			return await this.#closeStrictSession();
+		} finally {
+			this.#disposeSnapshotSidecarsBestEffort();
+		}
+	}
+
+	async #closeStrictSession(): Promise<SessionManagerCloseOutcome> {
 		this.#beginArtifactClose();
 		this.#strictClosePending = true;
 		await this.closeCwdMoveAdmission();
@@ -20712,8 +20817,131 @@ export class SessionManager {
 
 	#assertPreparedGraphPublicationAllowed(stage: PreparedNewSessionState): void {
 		const sourceId = this.#preparedGraphSourceIds.get(stage);
-		if (sourceId !== undefined)
-			this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor", true);
+		if (sourceId === undefined) return;
+		if (this.#committedGraphSuccessors.has(stage)) {
+			// Adoption never writes the source; only an in-flight publication refuses.
+			if ((this.#activeSharedMutationSessionCounts.get(sourceId) ?? 0) > 0)
+				throw new GraphSuccessorUnavailableError("publish prepared graph successor", "publication-in-flight");
+			return;
+		}
+		this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor", true);
+	}
+
+	/** Why a fork or branch cannot be prepared now; non-throwing and write-free, for use before any effect. */
+	graphSuccessorRefusal(target: { leafId?: string; wholeSession?: boolean } = {}): GraphSuccessorRefusal | undefined {
+		let refusal: GraphSuccessorRefusal | undefined;
+		try {
+			if (target.leafId !== undefined && !this.#resolveEntry(target.leafId)) refusal = "unknown-entry";
+			else {
+				const route = this.#graphSuccessorRoute(this.#sessionId);
+				if (route !== "committed") refusal = route === "legacy" ? undefined : route;
+				else {
+					const entries =
+						target.wholeSession === true
+							? this.#fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session")
+							: target.leafId !== undefined
+								? this.#getCanonicalBranchClones(target.leafId).filter(entry => entry.type !== "label")
+								: [];
+					const proof = this.#proveOwnCommittedGraph(
+						materializeResidentEntriesForReadSync(entries, this.#residentBlobStores()),
+					);
+					if (typeof proof === "string") refusal = proof;
+				}
+			}
+		} catch (error) {
+			logger.warn("Graph successor probe failed", { error: toError(error).message });
+			refusal = "unreadable";
+		}
+		if (refusal) logger.debug("Graph successor unavailable", { sessionId: this.#sessionId, reason: refusal });
+		return refusal;
+	}
+
+	/** "legacy" without shared bars (admission unchanged), "committed" when only the bars refuse, else the refusal. */
+	#graphSuccessorRoute(sessionId: string): "legacy" | "committed" | GraphSuccessorRefusal {
+		const barred = this.#sharedAppendBarSessionIds.has(sessionId) || this.#sharedRewriteBarSessionIds.has(sessionId);
+		if (!barred) return "legacy";
+		if (
+			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0 ||
+			(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) > 0
+		)
+			return "publication-in-flight";
+		return this.destination.kind === "managed" && this.persist ? "committed" : "not-admitted";
+	}
+
+	/** The route for `operation` on the current session, throwing the refusal. */
+	#requireGraphSuccessorRoute(operation: string, sourceId = this.#sessionId): "legacy" | "committed" {
+		if (this.#sessionId !== sourceId) throw new GraphSuccessorUnavailableError(operation, "changed");
+		const route = this.#graphSuccessorRoute(sourceId);
+		if (route === "legacy") {
+			this.assertLegacyMutationAllowed(operation);
+			return route;
+		}
+		if (route === "committed") return route;
+		throw new GraphSuccessorUnavailableError(operation, route);
+	}
+
+	/** {@link proveOwnCommittedGraph} over this opener's committed transcript; read-only. */
+	#proveOwnCommittedGraph(
+		sourceEntries: readonly SessionEntry[],
+	): { lines: string[]; digest: string } | GraphSuccessorRefusal {
+		const sessionFile = this.#sessionFile;
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (this.destination.kind !== "managed" || !this.persist || !sessionFile || !readSnapshot) return "not-admitted";
+		// A cold-retired view cannot prove ownership: its resident ids are incomplete.
+		if (this.#coldSidecarActive()) return "large-session";
+		let bytes: Uint8Array;
+		try {
+			bytes = readSnapshot(sessionFile).bytes;
+		} catch {
+			return "unreadable";
+		}
+		// A scratch store: blob refs are content hashes the committed lines already hold.
+		const scratch = new MemoryBlobStore();
+		return proveOwnCommittedGraph({
+			bytes,
+			sessionId: this.#sessionId,
+			ownIds: new Set(this.#residentEntryIds()),
+			sourceEntries,
+			serialize: entry => prepareEntryForPersistenceSync(entry, scratch),
+			onMismatch: entryId => logger.warn("Committed session entry differs from the resident entry", { entryId }),
+		});
+	}
+
+	/** Publish a proven successor; under the source's lease only the proven digest is re-checked. */
+	async #publishCommittedGraphSuccessor(
+		stage: PreparedNewSessionState,
+		sourceFile: string | undefined,
+		proof: { lines: string[]; digest: string },
+		addedEntries: readonly FileEntry[],
+		operation: string,
+	): Promise<void> {
+		const sourceId = this.#preparedGraphSourceIds.get(stage);
+		const sessionFile = stage.sessionFile;
+		this.#refreshManagedTranscriptRelocation();
+		if (!sourceId || !sourceFile || !sessionFile || this.#sessionFile !== sourceFile)
+			throw new GraphSuccessorUnavailableError(operation, "changed");
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sourceFile));
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		const lines = [JSON.stringify(stage.header), ...proof.lines];
+		for (const entry of addedEntries)
+			lines.push(JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore)));
+		try {
+			await withManagedSessionTransaction({ locksDirectory, sessionId: sourceId }, async scope => {
+				scope.assertOwned();
+				if (this.#sessionFile !== sourceFile) throw new GraphSuccessorUnavailableError(operation, "changed");
+				this.#requireGraphSuccessorRoute(operation, sourceId);
+				if (this.#committedDigestSync(sourceFile) !== proof.digest)
+					throw new GraphSuccessorUnavailableError(operation, "changed");
+				scope.assertOwned();
+				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+					path.basename(sessionFile),
+					Buffer.from(`${lines.join("\n")}\n`, "utf8"),
+				);
+			});
+		} catch (error) {
+			if (error instanceof ManagedSessionBusyError) throw new GraphSuccessorUnavailableError(operation, "busy");
+			throw error;
+		}
 	}
 
 	#assertDiscardTranscriptAllowed(bytes: Buffer): void {
@@ -22249,7 +22477,10 @@ export class SessionManager {
 
 	visitEntriesForExport(visitor: (entry: SessionEntry) => void): void {
 		if (this.#coldSidecarActive() && this.#sessionFile) {
-			const size = this.#statSync(this.#sessionFile).size;
+			// A bounded snapshot exports exactly the bytes validated at open.
+			const size = this.#snapshotScanIdentity
+				? this.#assertSnapshotSourceRetained(this.#snapshotScanIdentity)
+				: this.#statSync(this.#sessionFile).size;
 			const failure = scanTranscriptLinesBounded(
 				this.#boundedReadStorage(),
 				this.#sessionFile,
@@ -22278,6 +22509,7 @@ export class SessionManager {
 				},
 			);
 			if (failure) throw new Error(`export_transcript_scan_failed:${failure}`);
+			if (this.#snapshotScanIdentity) this.#assertSnapshotSourceRetained(this.#snapshotScanIdentity);
 			return;
 		}
 		const cache = new Map<string, string>();
@@ -22294,6 +22526,14 @@ export class SessionManager {
 			);
 		}
 	}
+	/** Returns the snapshot's validated size; throws if the source was replaced or truncated. */
+	#assertSnapshotSourceRetained(identity: { dev: bigint; ino: bigint; size: number }): number {
+		const current = this.#statSync(this.#sessionFile!);
+		if (current.dev !== identity.dev || current.ino !== identity.ino || current.size < identity.size)
+			throw new SessionSnapshotSourceChangedError();
+		return identity.size;
+	}
+
 	getEntriesForExport(): SessionEntry[] {
 		this.#ensureFullHotView();
 		const cache = new Map<string, string>();
@@ -25470,8 +25710,13 @@ export class SessionManager {
 	 * only), no version-migration rewrite, no session-memory sidecars or legacy
 	 * sidecar cleanup, and no managed-store adoption. Shared content-addressed blobs
 	 * and the process resident cache under the agent dir may still be written, as
-	 * on every load. Session memory stays `"off"`, so transcripts above the eager
-	 * inspection cap fail with {@link SessionTranscriptOversizedError}.
+	 * on every load.
+	 *
+	 * Above the eager cap (up to {@link BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES}, not on
+	 * Windows) it uses the bounded loader, with sidecars in a private owner-only
+	 * sidecar-cache instance that close, a failed open and shutdown remove. Only
+	 * linear, compacted v5 transcripts without patches qualify; others fail with
+	 * {@link SessionTranscriptBoundedOpenError}. Export reads only the validated prefix.
 	 *
 	 * The returned manager ({@link isReadOnlySnapshot}) throws `read_only_snapshot` from:
 	 * transcript appends and edits, rename and star, branch and leaf changes, rewrite,
@@ -25498,6 +25743,19 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionManager> {
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
+		let sourceStat: SessionStorageStat | undefined;
+		try {
+			sourceStat = storage.statSync(filePath);
+		} catch {
+			// A missing or unreadable source is reported by the strict inspection below.
+		}
+		if (
+			sourceStat !== undefined &&
+			sourceStat.size > eagerHydrationMaxBytes() &&
+			storage instanceof FileSessionStorage &&
+			process.platform !== "win32"
+		)
+			return SessionManager.#openBoundedReadOnlySnapshot(filePath, storage, sourceStat);
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
@@ -25524,9 +25782,81 @@ export class SessionManager {
 		return manager;
 	}
 
+	/** Bounded first-open without `#initSessionFile` (no breadcrumb, eager fallback, or file creation). */
+	static async #openBoundedReadOnlySnapshot(
+		filePath: string,
+		storage: FileSessionStorage,
+		sourceStat: SessionStorageStat,
+	): Promise<SessionManager> {
+		const size = sourceStat.size;
+		if (size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(size);
+		const inspected = inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		if (!inspected.ok) {
+			if (inspected.error.reason === "oversized")
+				throw new SessionTranscriptOversizedError(inspected.error.size ?? 0);
+			if (inspected.error.reason === "missing")
+				throw Object.assign(new Error(`ENOENT: no such file or directory, open '${filePath}'`), { code: "ENOENT" });
+			throw new Error(`Could not open session: ${inspected.error.reason}`);
+		}
+		const destination = explicitDestination(path.dirname(filePath));
+		const manager = new SessionManager(
+			inspected.inspection.cwd ?? getProjectDir(),
+			destination.directory,
+			true,
+			storage,
+			destination,
+		);
+		manager.#sessionMemoryMode = "enabled";
+		try {
+			const instanceDir = openVerifiedResidentCacheInstanceDir(
+				getSidecarCacheRootDir(manager.#residentCacheProfileAgentDir()),
+			);
+			manager.#snapshotSidecarStore = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+			// Adopted instances are outside the resident-cache exit sweep.
+			manager.#snapshotSidecarUnregister = postmortem.register("session-snapshot-sidecars", () =>
+				manager.#disposeSnapshotSidecarsBestEffort(),
+			);
+			if (!(await manager.#tryBoundedFirstOpen(filePath)))
+				throw new SessionTranscriptBoundedOpenError(
+					size,
+					manager.#lazyReopenFallbackReason ?? "bounded_first_open_failed",
+				);
+			// The open validated `tail.transcriptSize` bytes of the pre-open inode.
+			const opened = manager.#statSync(filePath);
+			const validatedSize = manager.#sidecarRuntime?.tail.transcriptSize;
+			if (
+				validatedSize === undefined ||
+				opened.dev !== sourceStat.dev ||
+				opened.ino !== sourceStat.ino ||
+				opened.size < validatedSize
+			)
+				throw new SessionTranscriptBoundedOpenError(size, "bounded_first_open_descriptor_changed");
+			manager.#snapshotScanIdentity = { dev: sourceStat.dev, ino: sourceStat.ino, size: validatedSize };
+			manager.buildSessionContext();
+		} catch (error) {
+			manager.#readOnlySnapshot = true;
+			try {
+				await manager.close();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[toError(error), toError(cleanupError)],
+					"Rejected read-only snapshot cleanup failed",
+				);
+			}
+			throw error;
+		}
+		manager.#readOnlySnapshot = true;
+		return manager;
+	}
+
 	/** True for a manager from {@link SessionManager.openReadOnlySnapshot}; see that method for what it refuses. */
 	isReadOnlySnapshot(): boolean {
 		return this.#readOnlySnapshot;
+	}
+
+	/** A read-only snapshot above the eager cap, which reads its source lazily while exporting. */
+	isBoundedReadOnlySnapshot(): boolean {
+		return this.#readOnlySnapshot && this.#snapshotScanIdentity !== undefined;
 	}
 
 	/**
