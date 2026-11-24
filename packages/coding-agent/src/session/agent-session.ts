@@ -28882,7 +28882,13 @@ export class AgentSession {
 		if (contextWindow <= 0) return;
 		// F6: non-disableable emergency floor — compact before OOM even when token-based
 		// compaction is disabled or its threshold is set too high (weak-hardware protection).
-		const emergencyReason = emergencyCompactionReason(this.#resourceSampler());
+		const sample = this.#resourceSampler();
+		// Shared compaction only appends a summary entry and never rewrites the transcript,
+		// so the transcript-size floor cannot shrink the file there: it would add a summary
+		// call and a compaction entry to every prompt and reach the managed cap sooner.
+		const emergencyReason = emergencyCompactionReason(
+			this.#usesSharedSessionPublication() ? { ...sample, transcriptFileBytes: undefined } : sample,
+		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
 			await this.#runAutoCompaction("overflow", false, false, {
