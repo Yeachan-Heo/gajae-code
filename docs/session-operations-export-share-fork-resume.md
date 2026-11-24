@@ -78,7 +78,7 @@ Behavior details:
 - Missing input file surfaces as `File not found: <path>`.
 - This path does not create an `AgentSession` and does not mutate any running session.
 - Export never writes to the transcript, its artifact directory, the managed session store, or the terminal breadcrumb: no patch records, migration rewrite, session-memory sidecars, or managed-store copy. Load-time replay-metadata sanitation applies in memory only. Shared content-addressed blobs and the resident cache under the agent dir may still be written, as on any load.
-- Transcripts above the 128 MiB eager-load limit fail with `Session transcript is too large to export`.
+- A transcript above the 128 MiB eager-load limit (up to about 2 GiB) opens through the bounded session-memory loader. Its sidecar files and build lock go to a private owner-only directory under the agent dir's sidecar cache, never beside the source. `close()`, a failed open and process shutdown remove that directory, and the HTML streams from the transcript. The bounded loader serves only linear, current-version (v5) transcripts that contain a compaction and no `header_patch` or `entry_patch` records. Any other transcript above 128 MiB fails with `Session transcript is too large to export in full ... and cannot be streamed (<reason>)`, and one above the bounded limit fails with `Session transcript is too large to export`.
 - A transcript caught mid-append (a torn last line or a size change during the read) fails to export rather than exporting a prefix.
 
 ### `/dump` (interactive clipboard export)

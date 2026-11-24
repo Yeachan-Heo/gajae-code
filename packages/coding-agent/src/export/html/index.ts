@@ -5,8 +5,10 @@ import type { AgentState } from "@gajae-code/agent-core";
 import { APP_NAME, isCredentialKey, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import {
+	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	RESUME_TRANSCRIPT_MAX_BYTES,
 	SessionManager,
+	SessionTranscriptBoundedOpenError,
 	SessionTranscriptOversizedError,
 } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
@@ -362,15 +364,23 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	await assertExportDoesNotAliasSource(inputPath, outputPath);
 
 	// Another process may be writing this session: export reads a detached snapshot and
-	// never writes to the transcript or its artifact directory.
+	// never writes to the transcript or its artifact directory. Transcripts above the
+	// eager-load cap stream from sidecars kept in a private cache that close() removes.
 	let sm: SessionManager;
 	try {
 		sm = await SessionManager.openReadOnlySnapshot(inputPath);
 	} catch (err) {
 		if (isEnoent(err)) throw new Error(`File not found: ${inputPath}`);
-		if (err instanceof SessionTranscriptOversizedError)
+		if (err instanceof SessionTranscriptOversizedError) {
+			// Windows has no bounded loader, so the eager cap is its limit.
+			const limit = process.platform === "win32" ? RESUME_TRANSCRIPT_MAX_BYTES : BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES;
 			throw new Error(
-				`Session transcript is too large to export (${err.size} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes): ${inputPath}`,
+				`Session transcript is too large to export (${err.size} bytes; limit ${limit} bytes): ${inputPath}`,
+			);
+		}
+		if (err instanceof SessionTranscriptBoundedOpenError)
+			throw new Error(
+				`Session transcript is too large to export in full (${err.size} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes) and cannot be streamed (${err.reason}); only linear, compacted transcripts without patch records can be: ${inputPath}`,
 			);
 		throw err;
 	}

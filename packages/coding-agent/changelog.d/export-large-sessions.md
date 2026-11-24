@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc --export` can export transcripts larger than 128 MiB again, up to the 2 GiB session-memory limit, without writing anything to the source. Their session-memory sidecars are built in a private cache directory under the agent dir, which is removed when the export finishes, fails or is interrupted. Before, export either refused these transcripts or built sidecars in the session's artifact directory (in the managed store for default-store sessions) and left them there, so only the first export succeeded. As before, only linear, compacted transcripts without patch records can be exported at this size. Any other transcript is refused with an error that names the reason.
