@@ -973,7 +973,8 @@ describe("InputController keybinding setup", () => {
 
 		await expect(editor.onSubmit?.("steer while taken over")).resolves.toBeUndefined();
 
-		expect(ctx.showError).toHaveBeenCalledWith(mismatch.message);
+		expect(ctx.showError).toHaveBeenCalledWith(mismatch.operatorMessage);
+		expect(ctx.showError).not.toHaveBeenCalledWith(mismatch.message);
 		expect(ctx.locallySubmittedUserSignatures.has("steer while taken over\u00000")).toBe(false);
 	});
 
@@ -1284,6 +1285,25 @@ describe("InputController keybinding setup", () => {
 		// behind, otherwise the next attempt with the same text would silently
 		// suppress the editor-clear protection that was meant for the failed call.
 		expect(ctx.locallySubmittedUserSignatures.has("doomed submit\u00000")).toBe(false);
+	});
+
+	it("renders the operator message when the queue shortcut is refused on a stuck session", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
+		spies.prompt.mockImplementationOnce(async () => {
+			throw mismatch;
+		});
+		editor.setText("queued on a stuck session");
+		const controller = new InputController(ctx);
+
+		expect(await controller.actionRegistry.execute("app.message.followUp")).toBe(false);
+
+		expect(ctx.showError).toHaveBeenCalledWith(
+			`Action app.message.followUp execution failed: ${mismatch.operatorMessage}`,
+		);
+		expect(ctx.showError).not.toHaveBeenCalledWith(expect.stringContaining(mismatch.message));
 	});
 
 	it("removes the signature when a streaming follow-up rejects", async () => {

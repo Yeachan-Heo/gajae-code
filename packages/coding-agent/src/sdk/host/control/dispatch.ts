@@ -3,6 +3,7 @@ import {
 	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
+import { findOperatorMessage } from "../../../session/operator-error-message";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
@@ -492,7 +493,10 @@ function errorResponse(id: string, row: Operation, error: unknown): ControlRespo
 	if (code === "unknown_gate") return failure(id, "resource_gone", message);
 	if (code === "invalid_input" || /invalid input/i.test(message))
 		return failure(id, "invalid_input", message, undefined, details);
-	return failure(id, "internal", "Control operation failed.", undefined, details);
+	// Operator messages are fixed, path-free text that names the recovery (for example a
+	// transcript another process changed), so they replace the opaque fallback text
+	// while the code stays `internal`.
+	return failure(id, "internal", findOperatorMessage(error) ?? "Control operation failed.", undefined, details);
 }
 
 async function execute(surface: ControlSurface, row: Operation, request: ControlRequest): Promise<ControlResponse> {
