@@ -294,7 +294,9 @@ try {
 	const ownersHome = createIsolatedTempDir("gjc-test-owners-");
 	const slots = globalThis as unknown as Record<symbol, { homeOverride?: string } | undefined>;
 	const ownershipHooksKey = Symbol.for("gajae-code.session-ownership.test-hooks.v1");
-	slots[ownershipHooksKey] = { ...slots[ownershipHooksKey], homeOverride: ownersHome };
+	// Fill the slot in place: a module loaded earlier may already hold this object.
+	const slot = (slots[ownershipHooksKey] ??= {});
+	slot.homeOverride = ownersHome;
 } catch (error) {
 	cleanupAfterInitializationFailure(
 		new Error(`Test session-ownership isolation failed; refusing to claim sessions in the live home: ${String(error)}`),
