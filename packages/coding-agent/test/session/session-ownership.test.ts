@@ -16,6 +16,7 @@ import { logger } from "@gajae-code/utils";
 import * as ownership from "../../src/session/session-ownership";
 // @ts-expect-error -- Bun loads a query-suffixed specifier as a second instance of the module.
 import * as ownershipCopy from "../../src/session/session-ownership.ts?copy=2";
+import { assertRuntimeLockDirectoryUnchanged, prepareRuntimeLockDirectory } from "../../src/session/session-storage";
 
 const {
 	claimSessionOwner,
@@ -391,6 +392,53 @@ describe.if(supported)("the owners directory fails closed like the append lock",
 		const message = (refused as InstanceType<typeof SessionOwnershipError>).operatorMessage;
 		expect(message).toStartWith("gjc could not check safely whether another process has this session open");
 		expect(message).not.toContain(home);
+		// The trusted home need not be `~`, so the message never names it that way.
+		expect(message).not.toContain("~");
+		expect(message).toContain(".gjc/runtime in your home directory");
+	});
+
+	it.if(process.getuid?.() !== 0)("a probe reports a filesystem refusal as I/O, as a claim does", async () => {
+		(await claimed("s14")).release();
+		const runtime = path.join(home, ".gjc", "runtime");
+		await fs.chmod(runtime, 0o000);
+		try {
+			expect(await probeSessionOwner("s14")).toEqual({
+				state: "unknown",
+				reason: "failed",
+				code: "owners_directory_io",
+			});
+		} finally {
+			await fs.chmod(runtime, 0o700);
+		}
+	});
+
+	it("accepts only a single lower-case segment as a lock namespace name", () => {
+		for (const name of ["", "..", "../owners", "a/b", "Owners", ".hidden", "x".repeat(65)])
+			expect(() => prepareRuntimeLockDirectory(name, home)).toThrow(TypeError);
+		expect(prepareRuntimeLockDirectory("session-owners", home).path).toBe(sessionOwnersDirectory());
+	});
+
+	it("names each namespace in its directory errors, keeping the append-lock text", async () => {
+		const owners = prepareRuntimeLockDirectory("session-owners", home);
+		const appendLocks = prepareRuntimeLockDirectory("append-locks", home);
+		const causeOf = (run: () => void): string => {
+			try {
+				run();
+			} catch (error) {
+				return String((error as Error).cause);
+			}
+			throw new Error("expected a refusal");
+		};
+		for (const directory of [owners.path, appendLocks.path]) {
+			await fs.rm(directory, { recursive: true });
+			await fs.symlink(home, directory);
+		}
+		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(owners.directories, "c", "session-owner"))).toBe(
+			`Error: Unsafe session-owner directory: ${owners.path}`,
+		);
+		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(appendLocks.directories))).toBe(
+			`Error: Unsafe append-lock directory: ${appendLocks.path}`,
+		);
 	});
 });
 

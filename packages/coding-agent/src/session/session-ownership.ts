@@ -119,7 +119,7 @@ export class SessionOwnershipError extends Error {
 	readonly code: string;
 	readonly errno: string | undefined;
 	readonly operatorMessage =
-		"gjc could not check safely whether another process has this session open, so it was not opened for writing. Check that ~/.gjc/runtime belongs to you and is writable.";
+		"gjc could not check safely whether another process has this session open, so it was not opened for writing. Check that .gjc/runtime in your home directory belongs to you and is writable.";
 
 	constructor(code: string, options?: { cause?: unknown; errno?: string }) {
 		super(`session_ownership_failed: ${code}`, options);
@@ -178,7 +178,7 @@ function inspectOwnersDirectory(): string | undefined {
 
 function assertOwnersDirectoryUnchanged(directory: RuntimeLockDirectory): void {
 	try {
-		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed");
+		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed", "session-owner");
 	} catch (error) {
 		throw new SessionOwnershipError("owners_directory_changed", { cause: error });
 	}
@@ -510,7 +510,8 @@ export async function claimSessionOwner(
 	}
 }
 
-type OwnersDirectoryState = "present" | "missing" | "unsafe";
+/** `present`, `missing`, or the code of the failure that refused the directory. */
+type OwnersDirectoryState = "present" | "missing" | { readonly failed: string };
 
 async function probeOne(owners: string, state: OwnersDirectoryState, sessionId: string): Promise<SessionOwnerProbe> {
 	const current = registry();
@@ -520,7 +521,7 @@ async function probeOne(owners: string, state: OwnersDirectoryState, sessionId: 
 	const own = current.entries.get(sidecar);
 	if (own) return { state: "held", self: true, holder: selfHolder(own) };
 	if (state === "missing") return { state: "free" };
-	if (state === "unsafe") return { state: "unknown", reason: "failed", code: "owners_directory_unsafe" };
+	if (typeof state === "object") return { state: "unknown", reason: "failed", code: state.failed };
 	if (current.unavailable !== undefined) return { state: "unknown", reason: "unavailable", code: current.unavailable };
 	const result = await backend().probe(sidecar, NATIVE_BUDGET_MS);
 	switch (result.state) {
@@ -555,7 +556,7 @@ export async function probeSessionOwners(sessionIds: readonly string[]): Promise
 		state = inspectOwnersDirectory() === undefined ? "missing" : "present";
 	} catch (error) {
 		logger.warn("Session owners directory failed its checks", { error: String(error) });
-		state = "unsafe";
+		state = { failed: directoryFailure(error).code };
 	}
 	for (let start = 0; start < ids.length; start += PROBE_CONCURRENCY) {
 		const batch = ids.slice(start, start + PROBE_CONCURRENCY);

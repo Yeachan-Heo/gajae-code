@@ -124,9 +124,17 @@ interface AppendLockTarget {
 	readonly directories: readonly DirectoryIdentity[];
 }
 
-function realDirectoryIdentity(pathname: string): DirectoryIdentity {
+/** A lock namespace name: one lower-case path segment, so it can never leave `runtime`. */
+const RUNTIME_LOCK_DIRECTORY_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/** `append-locks` → `append-lock`: the noun error text uses for a namespace's directories. */
+function runtimeLockDirectoryLabel(name: string): string {
+	return name.endsWith("s") ? name.slice(0, -1) : name;
+}
+
+function realDirectoryIdentity(pathname: string, label = "append-lock"): DirectoryIdentity {
 	const stat = fs.lstatSync(pathname, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe append-lock directory: ${pathname}`);
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe ${label} directory: ${pathname}`);
 	return { path: pathname, dev: stat.dev, ino: stat.ino };
 }
 
@@ -138,11 +146,12 @@ function realDirectoryIdentity(pathname: string): DirectoryIdentity {
 export function assertRuntimeLockDirectoryUnchanged(
 	directories: readonly DirectoryIdentity[],
 	code = "append_lock_root_changed",
+	label = "append-lock",
 ): void {
 	for (const expected of directories) {
 		let current: DirectoryIdentity;
 		try {
-			current = realDirectoryIdentity(expected.path);
+			current = realDirectoryIdentity(expected.path, label);
 		} catch (error) {
 			throw new Error(`${code}: ${expected.path}`, { cause: error });
 		}
@@ -166,6 +175,7 @@ export function prepareRuntimeLockDirectory(
 	name: string,
 	trustedHome: string = getTrustedHomeDir(),
 ): RuntimeLockDirectory {
+	if (!RUNTIME_LOCK_DIRECTORY_NAME.test(name)) throw new TypeError(`Invalid runtime lock directory name: ${name}`);
 	const home = canonicalPathSync(trustedHome);
 	assertAppendLockHomeNotSharedWritable(home);
 	const gjcRoot = path.join(home, ".gjc");
@@ -182,7 +192,11 @@ export function prepareRuntimeLockDirectory(
 	ensureManagedDirectory(gjcRoot, undefined, policy);
 	ensureManagedDirectory(appendLockRuntimeRoot, undefined, policy);
 	ensureManagedDirectory(lockRoot, undefined, policy);
-	return { path: lockRoot, directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(realDirectoryIdentity) };
+	const label = runtimeLockDirectoryLabel(name);
+	return {
+		path: lockRoot,
+		directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(directory => realDirectoryIdentity(directory, label)),
+	};
 }
 
 function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
