@@ -151,6 +151,7 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
@@ -5168,6 +5169,8 @@ export class AgentSession {
 			this.#handoffTransitionActive ||
 			this.#cancelAndSubmitInProgress ||
 			this.#sessionWorkLease.isHeld() ||
+			// A detached recap still holds an open provider request until its handle clears.
+			this.#recapController !== undefined ||
 			(manager?.getRunningJobs(ownerFilter).length ?? 0) > 0
 		) {
 			throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
@@ -7291,6 +7294,14 @@ export class AgentSession {
 					{ deliverAs: message.deliverAs },
 				);
 			},
+		});
+
+		// Restore goal mode state from the saved session branch during initialization.
+		// Schedule it to run after construction so we can call onThreadResumed.
+		queueMicrotask(() => {
+			if (!this.#isDisposed) {
+				void this.#restoreGoalModeStateFromBranch();
+			}
 		});
 
 		// Always subscribe to agent events for internal handling
@@ -9930,9 +9941,9 @@ export class AgentSession {
 	#cancelPendingSessionRecap(): void {
 		this.#recapEpoch++;
 		this.#terminalRecapContext = undefined;
-		const controller = this.#recapController;
-		this.#recapController = undefined;
-		controller?.abort();
+		// Keep the handle until the detached chain settles (its finally clears it): an aborted
+		// recap can still be finishing an append, and idle close must count it as busy.
+		this.#recapController?.abort();
 	}
 
 	/** Cancel a pending recap and forget the request of the turn in progress. */
@@ -16471,6 +16482,11 @@ export class AgentSession {
 		});
 	}
 
+	/** MCP control admission fences mutations but does not replace the session's read identity. */
+	get isMcpControlActive(): boolean {
+		return this.#sessionTransitionKind === "mcp-control" && !this.#handoffTransitionActive;
+	}
+
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;
@@ -20942,6 +20958,57 @@ export class AgentSession {
 			phase.tasks = phase.tasks.filter(t => t.status !== "completed" && t.status !== "abandoned");
 		}
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
+	}
+
+	/**
+	 * Restore goal mode state from the saved session branch during initialization.
+	 * When a session is resumed from a saved state, the goal mode information is
+	 * stored in the branch's mode_change entries, but it is not automatically
+	 * applied to the agent session. This function restores it.
+	 *
+	 * Mirrors the interactive goal-mode-controller: calls onThreadResumed() to set
+	 * up the accounting baseline, and respects explicit empty tool selection.
+	 */
+	async #restoreGoalModeStateFromBranch(): Promise<void> {
+		const sessionContext = this.buildDisplaySessionContext();
+		const mode = sessionContext.mode;
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		if (!savedGoal) return;
+
+		// When an SDK session explicitly requests zero tools (--no-tools), the goal
+		// tool is excluded to honor that contract. In this case, do not enable the goal
+		// to avoid automatic continuation with no way to interact with it.
+		const goalToolAvailable = this.getActiveToolNames().includes("goal");
+		const isExplicitEmpty = this.isExplicitEmptyToolSelection();
+		if (!goalToolAvailable && isExplicitEmpty) {
+			return;
+		}
+
+		// Set the initial goal state, preserving terminal states for completed/dropped goals
+		if (savedGoal.status === "complete") {
+			// A completed goal must be disabled and in exiting mode
+			this.setGoalModeState({ enabled: false, mode: "exiting", reason: "completed", goal: savedGoal });
+		} else if (savedGoal.status === "dropped") {
+			// A dropped goal should not be restored as active
+			return;
+		} else if (savedGoal.status === "paused") {
+			// A paused goal is disabled but remains in active mode
+			this.setGoalModeState({ enabled: false, mode: "active", goal: savedGoal });
+		} else {
+			// An active goal is enabled in active mode (or mode_change persisted it as "goal")
+			this.setGoalModeState({ enabled: true, mode: "active", goal: savedGoal });
+		}
+
+		// Call onThreadResumed to set up the accounting baseline, just like the
+		// interactive goal-mode-controller does (see goal-mode-controller.ts:298).
+		// This ensures token accounting is properly initialized for active goals.
+		// For terminal goals (complete/dropped), this call is benign and maintains consistency.
+		// onThreadResumed already commits the state; do not reapply a stale paused
+		// state if the goal was resumed via operateGoal() while this restore was pending.
+		await this.#goalRuntime.onThreadResumed();
 	}
 
 	async #compactionStateSnapshot(
@@ -31241,6 +31308,11 @@ export class AgentSession {
 		// Without this the message carries no transport facts and would fall
 		// through to "unknown", which is admitted for bounded retry (#5627).
 		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
+		// Gemini reasoning-summary header runaway is deterministic for the submitted
+		// context: replaying the identical conversation re-triggers the identical
+		// runaway, so an auto-retry loop can never succeed and only re-bills the
+		// full context on every attempt.
+		if (message.errorCode === GEMINI_HEADER_RUNAWAY_ERROR_CODE) return "terminal";
 		// A 2xx body in the wrong protocol replays identically; its embedded body text
 		// (e.g. "HTTP 503") must not be reparsed as a transient failure.
 		if (message.errorCode === PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE) return "terminal";

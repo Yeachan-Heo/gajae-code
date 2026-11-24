@@ -312,18 +312,41 @@ request identity and is closed by a new lifecycle operation. Pass
 
 `--if-idle` passes `ifIdle: true` to the existing broker operation. The runtime
 atomically checks streaming and pending turns, prompt queues, running owned
-async jobs, foreground bash, and side questions (including credential lookup),
-then fences prompt admission until shutdown. Prompt continuations, completion
-delivery, `/btw`, and IRC/background side turns cannot start after that fence. A busy host
-returns `busy` without closing or signalling it and remains usable. Retry the
+async jobs, foreground bash, side questions (including credential lookup), and
+an in-flight session recap request, then fences prompt admission until shutdown.
+`--if-idle` combined with a JSON input whose `ifIdle` is anything other than
+`true` is rejected as a usage error before the broker is contacted. Prompt
+continuations, completion delivery, `/btw`, and IRC/background side turns
+cannot start after that fence. A busy host returns `busy` without closing or
+signalling it and remains usable. Retry the
 same key after it becomes idle: `busy` retains the request binding but is not a
-terminal ledger result. The default derived key includes the idle-only mode so
+terminal ledger result. The error's recovery step says the same (inspect, wait,
+rerun the same close) for `gjc sdk session close` and for
+`gjc sdk session raw global --op session.close`; it never recommends steering.
+The default derived key includes the idle-only mode so
 it cannot collide with an ordinary forced close. An unsupported or unreachable
 runtime refuses idle-fenced close rather than falling back to process signals.
 Once close is accepted, runtime teardown proceeds even if the close response is
 dropped or rejected. The caller can still receive a refused/uncertain outcome
 when that acknowledgement is lost. Managed spawn cleanup accepts an already-gone
 substrate only with the exact pinned host-exit proof; identity mismatch stays refused.
+
+An idle-fenced close settles a spawned child's spawn authority only after the
+generic close has proven that the host exited. It skips the early
+spawn-authority path that an ordinary close takes, so a spawned child that is
+no longer indexed by the broker gets the generic lifecycle `not_found` and its
+spawn authority stays active: `--if-idle` cannot retire it, and repeating it
+with the same key only replays that refusal. `gjc sdk session close` itself
+looks the session up through the broker and refuses an unindexed session with
+`not_found` before sending any close request. To
+recover, first confirm that the child should stop (it no longer appears in
+`gjc sdk session list`, so use the master's own record of the spawn), then
+send an ordinary close (no `ifIdle`) with a new key, for example
+`gjc sdk session raw global --op session.close --idempotency-key <new-key>
+--json-input '{"sessionId":"<childId>"}'`. That path routes through the spawn
+authority and closes only an exactly re-proven substrate, but it performs no
+idle check. Children orphaned by master loss are also reaped automatically (see
+the spawn section below).
 
 `busy` and an unindexed session's `not_found` are public refusal codes with
 `outcomeCertainty: "not-applied"`. `busy` is retryable, while `not_found` is not.
@@ -333,7 +356,10 @@ Generic lifecycle `not_found` failures retain `outcomeCertainty: "unknown"`.
 authority and using a new key. It can arise during generation revalidation
 after close dispatch or shutdown escalation, so the code alone does not prove
 that nothing happened. Unlike `busy`, resetting it would discard effect
-uncertainty. Without `--if-idle`, forced-close behavior is unchanged.
+uncertainty. The exception is a session whose indexed row has no live endpoint
+authority: `gjc sdk session close` reports `endpoint_stale` with
+`outcomeCertainty: "not-applied"` because it refused before sending any close.
+Without `--if-idle`, forced-close behavior is unchanged.
 
 ### retire
 
@@ -555,7 +581,13 @@ not settle earlier effects.
   reads the ledger and optional spawn-authority journal without opening or
   changing either store. It requires the existing original broker identity key
   and never creates one. Malformed state or an unreadable/malformed existing
-  attestation fails without writing. A failure before rename leaves the previous
+  attestation fails without writing. The ledger must also fit the bounds the
+  broker applies when it opens it (64 MiB, 10,000 rows, 8 MiB per row by
+  default), because the broker refuses to open a ledger past them, so an
+  attestation computed from it would never load. An
+  existing attestation must fit the same 64 MiB bound and list only lowercase
+  64-character hex identities; any other entry is refused rather than
+  republished, and a union that would exceed the bound is not written. A failure before rename leaves the previous
   attestation unchanged; failure of directory synchronization after rename reports
   an unknown publication outcome rather than claiming that nothing was written.
   Evidence scanning recursively reads regular
@@ -579,9 +611,24 @@ not settle earlier effects.
   and `4|session.spawn|<caller-key>|`. Those operation-specific inputs prove a
   spawn mirror, not a create, close or delete request. Current claim mirrors and
   already-attested identities are excluded. Unproven rows stay fenced. The file
-  takes effect at the next broker start: restart through the external supervisor
-  for `gjc sdk broker run`, or use `bun run restart:sdk-broker` for an on-demand
-  broker. The attestation command never restarts the broker.
+  takes effect at the next broker start for the same agent directory; the
+  restart notice names that directory, shell-quoted (on Windows the notice
+  quotes for PowerShell and says so; cmd.exe needs its own quoting). Restart
+  through the external supervisor for `gjc sdk broker run --agent-dir <dir>`.
+  To restart a
+  running on-demand broker, set `GJC_CODING_AGENT_DIR` to that directory for
+  both `gjc doctor --check service`, which reports its broker target id, and
+  `gjc doctor --fix --repair service.restart-owned --target <id> --allow-risk service-interruption --yes`
+  (see [doctor](doctor.md));
+  if none is running, the next `gjc sdk session`, `search` or `spawn` command
+  run with `--agent-dir <dir>` starts one, unless `GJC_SDK_BROKER_AUTOSTART=0`
+  or `--attach-only` makes that command attach-only. From a source
+  checkout, `bun run restart:sdk-broker -- --agent-dir <dir>` also restarts it
+  (the script is not part of installed builds). The attestation command never
+  restarts the broker. It resolves `--agent-dir` against the current
+  directory and refuses a result that no broker can run for: one containing
+  control characters (including newlines), U+2028 or U+2029, or longer than
+  4096 characters.
   The broker itself never writes or derives this file. It honors a listed
   identity only while that identity's entire
   history is a single unkeyed, unmarked `accepted` row with no session target
@@ -822,7 +869,14 @@ id that more than one state root with an unterminated registration claims
 (`gjc sdk session list` and `inspect` rows mark it `ambiguous: true`) and a
 host in another state root that reuses the id after the child stopped. Search
 and snapshot rows carry no ambiguity marker, so a missing `spawnedBy` there
-does not say why. When
+does not say why. The listed row's state root, resolved when the list is
+built, is compared with the canonical (symlink-resolved) path the Broker
+recorded when the child registered; the recorded spelling is never
+re-resolved later, so a symlinked state root that is retargeted afterwards
+does not carry the owner to another directory. A spawn authority recorded
+without that canonical root (a pre-pin spawn, one whose state root could not be
+resolved at registration, or one recorded by an older Broker, including a child
+still running across the upgrade) attributes the child to no row. When
 the command runs inside a master session's Bash tool, `spawnedBy.self` is
 `true` for that master's own children and `false` for another master's; the Bash
 tool in a non-master session never passes an inherited owner id through, so

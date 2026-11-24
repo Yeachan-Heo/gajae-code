@@ -1,10 +1,11 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support } from "../../../scripts/host-detect";
 import { type NativeBuildProfile, recordDiagnosticArtifactDigest } from "./diagnostic-artifact-manifest";
 import { assertRequiredSymbols } from "./embed-guard";
-import { generateEnumExports } from "./gen-enums";
+import { generateEnumExports, readRegularFileNoFollow, refuseIfTempGone, writeReplacingDestination } from "./gen-enums";
 import { resolveCargoToolchainPath } from "./rust-toolchain-path";
 
 const repoRoot = path.join(import.meta.dir, "../../..");
@@ -60,6 +61,13 @@ async function cleanupStaleTemps(dir: string): Promise<void> {
 		const entries = await fs.readdir(dir);
 		for (const entry of entries) {
 			if (entry.includes(".tmp.") || entry.includes(".old.") || entry.includes(".new.")) {
+				const pid = Number(entry.match(/\.(?:tmp|old|new)\.(\d+)(?:\.|$)/)?.[1]);
+				try {
+					if (Number.isInteger(pid) && pid > 0) process.kill(pid, 0);
+					if (Number.isInteger(pid) && pid > 0) continue;
+				} catch (err) {
+					if ((err as NodeJS.ErrnoException).code === "EPERM") continue;
+				}
 				await fs.unlink(path.join(dir, entry)).catch(() => {});
 			}
 		}
@@ -69,21 +77,36 @@ async function cleanupStaleTemps(dir: string): Promise<void> {
 }
 
 async function installBinary(src: string, dest: string): Promise<void> {
-	const tempPath = `${dest}.tmp.${process.pid}`;
-
-	await fs.copyFile(src, tempPath);
+	let tempPath: string | undefined;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const candidate = `${dest}.tmp.${process.pid}.${crypto.randomUUID()}`;
+		try {
+			// Exclusive create: an existing name, including a planted symlink, is left untouched.
+			await fs.copyFile(src, candidate, fs.constants.COPYFILE_EXCL);
+			tempPath = candidate;
+			break;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+			throw new Error(`Failed to install ${path.basename(dest)}: ${(err as Error).message}`);
+		}
+	}
+	if (!tempPath) {
+		throw new Error(`Failed to install ${path.basename(dest)}: could not create an exclusive temporary file`);
+	}
+	const created = tempPath;
 
 	try {
 		// Atomic rename - works even if dest is loaded on Linux/macOS (old inode stays valid)
-		await fs.rename(tempPath, dest);
-	} catch {
+		await fs.rename(created, dest);
+	} catch (renameErr) {
+		await refuseIfTempGone(created, dest, renameErr);
 		// On Windows, loaded DLLs cannot be overwritten via rename
 		// Try delete-then-rename as fallback
 		try {
 			await fs.unlink(dest);
 		} catch (unlinkErr) {
 			if ((unlinkErr as NodeJS.ErrnoException).code !== "ENOENT") {
-				await fs.unlink(tempPath).catch(() => {});
+				await fs.unlink(created).catch(() => {});
 				const isWindows = process.platform === "win32";
 				throw new Error(
 					`Cannot replace ${path.basename(dest)}${isWindows ? " (file may be in use - close any running processes)" : ""}: ${(unlinkErr as Error).message}`,
@@ -91,9 +114,9 @@ async function installBinary(src: string, dest: string): Promise<void> {
 			}
 		}
 		try {
-			await fs.rename(tempPath, dest);
+			await fs.rename(created, dest);
 		} catch (finalErr) {
-			await fs.unlink(tempPath).catch(() => {});
+			await fs.unlink(created).catch(() => {});
 			throw new Error(`Failed to install ${path.basename(dest)}: ${(finalErr as Error).message}`);
 		}
 	}
@@ -180,11 +203,12 @@ export function resolveNativeBuildOutputPaths(
 	return { buildOutputDirPrefix, canonicalAddonFilename, canonicalAddonPath };
 }
 
-async function installGeneratedBindings(outputDir: string): Promise<void> {
+export async function installGeneratedBindings(outputDir: string): Promise<void> {
 	const sourcePath = path.join(outputDir, "index.d.ts");
 	const destPath = path.join(nativeDir, "index.d.ts");
 	try {
-		await fs.copyFile(sourcePath, destPath);
+		const text = await fs.readFile(sourcePath, "utf8");
+		await writeReplacingDestination(destPath, text);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to install generated index.d.ts: ${message}`);
@@ -193,17 +217,17 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 
 async function normalizeGeneratedDeclarationSpacing(): Promise<void> {
 	const declarationPath = path.join(nativeDir, "index.d.ts");
-	const bindings = await Bun.file(declarationPath).text();
+	const bindings = readRegularFileNoFollow(declarationPath);
 	const normalized = bindings.replace(
 		/(^export declare class ComputerController \{[\s\S]*?^\}\n)(\/\*\*\n \* Long-lived macOS appearance observer\.)/m,
 		"$1\n$2",
 	);
-	if (normalized !== bindings) await Bun.write(declarationPath, normalized);
+	if (normalized !== bindings) await writeReplacingDestination(declarationPath, normalized);
 }
 
 async function ensurePublishDiagnosticDeclaration(): Promise<void> {
 	const declarationPath = path.join(nativeDir, "index.d.ts");
-	const bindings = await Bun.file(declarationPath).text();
+	const bindings = readRegularFileNoFollow(declarationPath);
 	if (bindings.includes("export interface NativePublishDiagnostic")) return;
 	if (!bindings.includes("diagnostic: NativePublishDiagnostic"))
 		throw new Error("napi build did not generate the native publish diagnostic reference");
@@ -223,7 +247,7 @@ export interface NativePublishDiagnostic {
   syncFailures?: Array<NativePublishSyncFailure>
 }
 `;
-	await Bun.write(declarationPath, `${bindings.trimEnd()}\n${declaration}`);
+	await writeReplacingDestination(declarationPath, `${bindings.trimEnd()}\n${declaration}`);
 }
 
 const requiredGeneratedBindingSymbols = [

@@ -65,6 +65,7 @@ export type JobObservationErrorCode =
 	| "not_found"
 	| "stale_generation"
 	| "read_only"
+	| "session_transitioning"
 	| "already_terminal";
 
 export class JobObservationError extends Error {
@@ -76,6 +77,8 @@ export class JobObservationError extends Error {
 
 /**
  * Standalone trusted-host facade; not a session-installed SDK capability.
+ * An optional mutation guard runs immediately before each backend effect;
+ * the factory view uses it to refuse mutations during MCP control admission.
  * The host captures its registry owner here, never from a remote control request.
  */
 export class JobObservation {
@@ -84,17 +87,19 @@ export class JobObservation {
 	readonly #observer: JobsObserver;
 	readonly #taskControlScope: string;
 	readonly #unsubscribeFailures: () => void;
+	readonly #assertMutationAllowed: (() => void) | undefined;
 	#failureSignature = "";
 	#failureRevision = crypto.randomUUID();
 	#disposed = false;
 
-	constructor(manager: AsyncJobManager, ownerId: string) {
+	constructor(manager: AsyncJobManager, ownerId: string, assertMutationAllowed?: () => void) {
 		// The cron store reserves this key for unowned legacy schedules.
 		if (typeof ownerId !== "string" || !ownerId.trim() || ownerId !== ownerId.trim() || ownerId === "__legacy__") {
 			throw new JobObservationError("invalid_owner");
 		}
 		this.#manager = manager;
 		this.#ownerId = ownerId;
+		this.#assertMutationAllowed = assertMutationAllowed;
 		this.#taskControlScope = manager.getSubagentControlScope();
 		this.#observer = new JobsObserver(manager, ownerId);
 		this.#refreshFailureRevision();
@@ -193,6 +198,7 @@ export class JobObservation {
 		const { id, generation } = target;
 		const job = this.#assertMonitor(id, generation);
 		if (job.status !== "running") throw new JobObservationError("already_terminal");
+		this.#assertMutationAllowed?.();
 		// cancel captures the live record synchronously, before invoking lifecycle callbacks.
 		if (!this.#manager.cancel(id, { ownerId: this.#ownerId })) throw new JobObservationError("not_found");
 		return true;
@@ -208,6 +214,7 @@ export class JobObservation {
 		// recheck disposal because a target getter can dispose this facade.
 		const { id, generation } = target;
 		this.#assertActive();
+		this.#assertMutationAllowed?.();
 		const result = this.#manager.controlOwnedSubagent(
 			this.#ownerId,
 			this.#taskControlScope,
@@ -245,6 +252,7 @@ export class JobObservation {
 		const cron = listCronSnapshots(this.#ownerId).find(entry => entry.id === id);
 		if (!cron) throw new JobObservationError("not_found");
 		if (cron.createdAt !== createdAt) throw new JobObservationError("stale_generation");
+		this.#assertMutationAllowed?.();
 		// The real cron backend removes synchronously, notifying listeners only afterwards.
 		if (!deleteCronJobById(this.#ownerId, id)) throw new JobObservationError("not_found");
 		return true;
@@ -257,6 +265,7 @@ export class JobObservation {
 		if (expectedRevision !== undefined && expectedRevision !== this.#failureRevision) {
 			throw new JobObservationError("stale_generation");
 		}
+		this.#assertMutationAllowed?.();
 		// No await or callbacks between the revision comparison and the observer's
 		// synchronous failure capture. Delivery state is never consumed here.
 		this.#observer.acknowledgeFailures();

@@ -1330,13 +1330,16 @@ export class ModelSelectorComponent extends Container {
 		return formatModelSelectorValue(`${this.#currentModel.provider}/${this.#currentModel.id}`, thinkingLevel);
 	}
 
-	#resolveProfileModelSelector(value: ModelSelectorValue | undefined): string | string[] | undefined {
+	#resolveProfileModelSelector(
+		value: ModelSelectorValue | undefined,
+		scopedCatalog: () => Model[],
+	): string | string[] | undefined {
 		const resolvedSelectors: string[] = [];
 		for (const configuredSelector of normalizeModelSelectorValue(value)) {
 			if (isInheritedRoleSelector(configuredSelector)) continue;
 			const selectors = resolveConfiguredModelPatterns(configuredSelector, this.#settings);
 			for (const selector of selectors.length > 0 ? selectors : [configuredSelector]) {
-				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
+				const resolved = resolveModelRoleValue(selector, scopedCatalog(), {
 					settings: this.#settings,
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
@@ -1368,6 +1371,7 @@ export class ModelSelectorComponent extends Container {
 
 	#buildCustomModelProfileSnapshot(): ModelProfileConfig {
 		const modelMapping: ModelProfileConfig["model_mapping"] = {};
+		const scopedCatalog = this.#scopedCatalogReader();
 		// Prefer the session's configured default chain so fallback tails are
 		// never dropped from the snapshot; the live model only replaces the head.
 		if (this.#configuredDefaultChain && this.#configuredDefaultChain.length > 0) {
@@ -1380,7 +1384,7 @@ export class ModelSelectorComponent extends Container {
 				modelMapping.default = currentModelSelector;
 			} else {
 				const defaultRole = this.#settings.getModelRole("default");
-				const defaultSelector = this.#resolveProfileModelSelector(defaultRole);
+				const defaultSelector = this.#resolveProfileModelSelector(defaultRole, scopedCatalog);
 				if (defaultSelector) modelMapping.default = defaultSelector;
 			}
 		}
@@ -1388,13 +1392,27 @@ export class ModelSelectorComponent extends Container {
 		const agentOverrides = this.#settings.get("task.agentModelOverrides");
 		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 			if (role === "default") continue;
-			const selector = this.#resolveProfileModelSelector(agentOverrides[role]);
+			const selector = this.#resolveProfileModelSelector(agentOverrides[role], scopedCatalog);
 			if (selector) modelMapping[role] = selector;
 		}
 
 		return {
 			required_providers: deriveRequiredProviders(modelMapping),
 			model_mapping: modelMapping,
+		};
+	}
+
+	/**
+	 * `getAll(sessionId)` re-merges and re-finalizes the credential-scoped catalog
+	 * on every call. A caller that resolves several selectors in one synchronous
+	 * pass reads it at most once through this reader; the copy belongs to that
+	 * pass alone and is never stored on the selector.
+	 */
+	#scopedCatalogReader(): () => Model[] {
+		let models: Model[] | undefined;
+		return () => {
+			models ??= this.#modelRegistry.getAll(this.#authSessionId);
+			return models;
 		};
 	}
 
@@ -2247,10 +2265,11 @@ export class ModelSelectorComponent extends Container {
 		this.#listContainer.addChild(
 			new Text(theme.fg("muted", `  Preset preview: ${getModelProfilePresentation(profile).displayName}`), 0, 0),
 		);
+		const scopedCatalog = this.#scopedCatalogReader();
 		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
 			const selector = profile.modelMapping[role];
 			if (!selector) continue;
-			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
+			const resolved = resolveModelRoleValue(selector, scopedCatalog(), {
 				settings: this.#settings,
 				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,

@@ -2353,7 +2353,8 @@ async function resolveCloseAuthority(
 		typeof row.endpointIncarnation !== "string" ||
 		!/^[a-f0-9]{64}$/u.test(row.endpointIncarnation)
 	)
-		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} has no live endpoint authority.`, 1);
+		// Refused while resolving authority: no close request was sent and no key was bound.
+		throw sdkPublicFailure("session_unavailable", { sessionId }, "pre-send");
 	return { endpointGeneration: row.endpointGeneration, endpointIncarnation: row.endpointIncarnation };
 }
 
@@ -2441,10 +2442,15 @@ async function runRawGlobal(
 			throw failure;
 		}
 	} catch (error) {
-		throw normalizeSessionFailure(error, {
+		const failure = normalizeSessionFailure(error, {
 			...args,
 			sessionId: typeof input.sessionId === "string" ? input.sessionId : args.sessionId,
 		});
+		// The raw global command path does not name the operation; carry it so a busy or stale
+		// close gets close guidance (wait and retry the same key) instead of steering advice.
+		throw operation === "session.close"
+			? new PublicCommandFailure({ ...failure.input, sessionClose: true })
+			: failure;
 	}
 	return response;
 }
@@ -2548,6 +2554,8 @@ export async function runSdkSessionCli(
 			const input = await inputFromArgs(args);
 			if (input.sessionId !== undefined && input.sessionId !== sessionId)
 				throw new SdkSessionCliError("invalid_input", "Close sessionId does not match the selected session.", 2);
+			if (args.ifIdle && Object.hasOwn(input, "ifIdle") && input.ifIdle !== true)
+				throw new SdkSessionCliError("invalid_input", "--if-idle conflicts with the JSON input ifIdle value.", 2);
 			const secretError = validateAdapterSecretFields("session.close", input);
 			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 			const lifecycle = deps.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);

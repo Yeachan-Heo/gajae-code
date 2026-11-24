@@ -69,6 +69,11 @@ export function deriveSpawnAnchorIdentities(key: Uint8Array, callerKey: string):
 	];
 }
 
+/** Shape of every identity {@link deriveSpawnAnchorIdentities} can produce: a lowercase hex HMAC-SHA256 digest. */
+export function isSpawnAnchorIdentity(value: unknown): value is string {
+	return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
 /** Native identity for an idempotency key reserved inside one managed control root. */
 export async function deriveScopedIdempotencyIdentity(
 	agentDir: string,
