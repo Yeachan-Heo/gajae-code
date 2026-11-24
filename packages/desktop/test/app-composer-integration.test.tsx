@@ -4003,11 +4003,16 @@ suite("mounted composer delivery recovery", () => {
 			// A 656 px column (the reviewed width), the minimum 720 px window (456 px beside the open sidebar),
 			// and a 390 px window, where the open sidebar leaves the column 126 px.
 			for (const [width, columnWidth] of [[920, 656], [720, 456], [390, 126]] as const) {
+				const wasNarrow = await page.evaluate(() => window.matchMedia("(max-width: 759px)").matches);
 				await page.setViewport({ width, height: 900 });
-				// Below 760 px the shell collapses the sidebar to its rail when its layout listener runs,
-				// and whether that has happened yet after a viewport change is a race. This case measures
-				// the tightest column, beside the open sidebar, so keep reopening the sidebar (as a user
-				// would) until the column has this viewport's width.
+				// Crossing below 760 px collapses the sidebar to its rail, but only once the shell's media
+				// listener runs, a frame or more after the viewport changes. Until then the still-open
+				// sidebar already leaves the column at this viewport's width, so a check made in that gap
+				// passes and the collapse can land just before the measurement below. Wait for the collapse
+				// first, so what is measured is the settled layout.
+				if (width < 760 && !wasNarrow) await page.waitForSelector(".desktop-sidebar[data-compact]");
+				// This case measures the tightest column, beside the open sidebar, so keep reopening the
+				// sidebar (as a user would) until the column has this viewport's width.
 				await page.waitForFunction(
 					expected => {
 						document.querySelector<HTMLButtonElement>('button[aria-label="Expand sidebar"]')?.click();
