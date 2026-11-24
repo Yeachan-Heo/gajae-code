@@ -58,6 +58,7 @@ import {
 	logger,
 	parseJsonlLenient,
 	pathIsWithin,
+	postmortem,
 	resolveEquivalentPath,
 	Snowflake,
 	toError,
@@ -2760,6 +2761,31 @@ export class SessionTranscriptOversizedError extends Error {
 		super(SESSION_OVERSIZED_RECOVERY_MESSAGE);
 		this.name = "SessionTranscriptOversizedError";
 		this.size = size;
+	}
+}
+/**
+ * A transcript above the eager-load cap that the bounded session-memory loader cannot serve:
+ * branched, patch-bearing, uncompacted, pre-v5, or malformed. `reason` is the loader's fallback reason.
+ */
+export class SessionTranscriptBoundedOpenError extends Error {
+	readonly code = "bounded_open_unsupported";
+	readonly size: number;
+	readonly reason: string;
+
+	constructor(size: number, reason: string) {
+		super(`Session transcript is not eligible for bounded loading (${reason})`);
+		this.name = "SessionTranscriptBoundedOpenError";
+		this.size = size;
+		this.reason = reason;
+	}
+}
+/** The source of a bounded read-only snapshot was replaced or truncated after the snapshot opened. */
+export class SessionSnapshotSourceChangedError extends Error {
+	readonly code = "snapshot_source_changed";
+
+	constructor() {
+		super("Session transcript was replaced or truncated after the read-only snapshot opened");
+		this.name = "SessionSnapshotSourceChangedError";
 	}
 }
 /** Default synchronous session-context materialization budget (512 MiB). */
@@ -7992,6 +8018,13 @@ export class SessionManager {
 	 * direct checks on fork, draft, artifact, blob, move, discard/delete, and state-restore methods.
 	 */
 	#readOnlySnapshot = false;
+	/** Private sidecar cache of a bounded read-only snapshot, set before its open; see {@link openReadOnlySnapshot}. */
+	#snapshotSidecarStore: EphemeralBlobStore | undefined;
+	#snapshotSidecarUnregister: (() => void) | undefined;
+	/** Once set, the sidecar root resolves to nothing (never the source). */
+	#snapshotSidecarsDisposed = false;
+	/** Bounded snapshot's source identity and validated size; the cold export scan stops there. */
+	#snapshotScanIdentity: { dev: bigint; ino: bigint; size: number } | undefined;
 	#strictResumeMutationPending = false;
 	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
@@ -9591,12 +9624,7 @@ export class SessionManager {
 		sessionFile: string,
 	): Promise<SessionStorageExclusiveLock | "published" | undefined> {
 		if (!this.#storage.acquireExclusiveLockSync) return undefined;
-		const sidecarRoot =
-			this.destination.kind === "managed"
-				? this.#managedSidecarRoot(sessionFile)
-				: sessionFile.endsWith(".jsonl")
-					? sessionFile.slice(0, -6)
-					: sessionFile;
+		const sidecarRoot = this.#sidecarRootFor(sessionFile);
 		if (!sidecarRoot) return undefined;
 		const lockPath = `${sidecarRoot}/.session-memory.spill.build-lock`;
 		const commitPath = `${sidecarRoot}/.session-memory.spill.commit`;
@@ -10436,12 +10464,7 @@ export class SessionManager {
 				throw new Error("Could not open session: unstable");
 		};
 		revalidateStrictResume();
-		const sidecarRoot =
-			this.destination.kind === "managed"
-				? this.#managedSidecarRoot(resolvedSessionFile)
-				: resolvedSessionFile.endsWith(".jsonl")
-					? resolvedSessionFile.slice(0, -6)
-					: resolvedSessionFile;
+		const sidecarRoot = this.#sidecarRootFor(resolvedSessionFile);
 		let transcriptSize: number | undefined;
 		try {
 			transcriptSize = this.#statSync(resolvedSessionFile).size;
@@ -13712,6 +13735,35 @@ export class SessionManager {
 		const resolvedCandidate = path.resolve(candidate);
 		return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
 	}
+	/** Session-memory sidecar directory: snapshot cache, managed instance cache, or artifact dir. */
+	#sidecarRootFor(sessionFile: string | undefined): string | undefined {
+		if (this.#snapshotSidecarStore)
+			return this.#snapshotSidecarsDisposed ? undefined : this.#snapshotSidecarStore.dir;
+		if (this.destination.kind === "managed") return this.#managedSidecarRoot(sessionFile);
+		if (!sessionFile) return undefined;
+		return sessionFile.endsWith(".jsonl") ? sessionFile.slice(0, -6) : sessionFile;
+	}
+
+	/** Remove a bounded snapshot's private sidecar cache; idempotent. */
+	#disposeSnapshotSidecars(): void {
+		this.#snapshotSidecarUnregister?.();
+		this.#snapshotSidecarUnregister = undefined;
+		if (!this.#snapshotSidecarStore) return;
+		// Keep the store so the root never falls back to the source and the cold runtime stays cold.
+		this.#snapshotSidecarsDisposed = true;
+		this.#snapshotSidecarStore.dispose();
+	}
+
+	#disposeSnapshotSidecarsBestEffort(): void {
+		try {
+			this.#disposeSnapshotSidecars();
+		} catch (error) {
+			// The instance keeps its owner token, so a later sweep reaps it once this process exits.
+			const reason = error instanceof ResidentCacheTrustError ? error.reason : "cleanup_failed";
+			logger.warn("Failed to remove the read-only snapshot sidecar cache", { reason });
+		}
+	}
+
 	#managedSidecarRoot(sessionFile = this.#sessionFile): string | undefined {
 		if (this.destination.kind !== "managed" || !sessionFile || process.platform === "win32") return undefined;
 		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
@@ -13988,7 +14040,13 @@ export class SessionManager {
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
 	#resetSidecarRuntime(ineligible = false, preserveLegacySidecars = false): SessionMemorySidecarRuntime {
 		this.#sidecarBranchActivationDirty = false;
-		if (!preserveLegacySidecars && this.#sessionFile && this.destination.kind !== "managed") {
+		// A bounded snapshot never deletes beside the source.
+		if (
+			!preserveLegacySidecars &&
+			!this.#snapshotSidecarStore &&
+			this.#sessionFile &&
+			this.destination.kind !== "managed"
+		) {
 			for (const legacyPath of [
 				`${this.#sessionFile}.spill.idx`,
 				`${this.#sessionFile}.spill.tail`,
@@ -14005,12 +14063,7 @@ export class SessionManager {
 				}
 			}
 		}
-		const sidecarRoot =
-			this.destination.kind === "managed"
-				? this.#managedSidecarRoot()
-				: this.#sessionFile?.endsWith(".jsonl")
-					? this.#sessionFile.slice(0, -6)
-					: this.#sessionFile;
+		const sidecarRoot = this.#sidecarRootFor(this.#sessionFile);
 		this.#managedRangeExpectedDescriptor =
 			this.destination.kind === "managed" && this.#sessionFile
 				? (this.#managedDescriptorSnapshotOrNull() ?? undefined)
@@ -17876,6 +17929,14 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		try {
+			await this.#closeSession();
+		} finally {
+			this.#disposeSnapshotSidecarsBestEffort();
+		}
+	}
+
+	async #closeSession(): Promise<void> {
 		this.#beginArtifactClose();
 		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
@@ -17958,6 +18019,14 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		try {
+			return await this.#closeStrictSession();
+		} finally {
+			this.#disposeSnapshotSidecarsBestEffort();
+		}
+	}
+
+	async #closeStrictSession(): Promise<SessionManagerCloseOutcome> {
 		this.#beginArtifactClose();
 		this.#strictClosePending = true;
 		await this.closeCwdMoveAdmission();
@@ -22249,7 +22318,10 @@ export class SessionManager {
 
 	visitEntriesForExport(visitor: (entry: SessionEntry) => void): void {
 		if (this.#coldSidecarActive() && this.#sessionFile) {
-			const size = this.#statSync(this.#sessionFile).size;
+			// A bounded snapshot exports exactly the bytes validated at open.
+			const size = this.#snapshotScanIdentity
+				? this.#assertSnapshotSourceRetained(this.#snapshotScanIdentity)
+				: this.#statSync(this.#sessionFile).size;
 			const failure = scanTranscriptLinesBounded(
 				this.#boundedReadStorage(),
 				this.#sessionFile,
@@ -22278,6 +22350,7 @@ export class SessionManager {
 				},
 			);
 			if (failure) throw new Error(`export_transcript_scan_failed:${failure}`);
+			if (this.#snapshotScanIdentity) this.#assertSnapshotSourceRetained(this.#snapshotScanIdentity);
 			return;
 		}
 		const cache = new Map<string, string>();
@@ -22294,6 +22367,14 @@ export class SessionManager {
 			);
 		}
 	}
+	/** Returns the snapshot's validated size; throws if the source was replaced or truncated. */
+	#assertSnapshotSourceRetained(identity: { dev: bigint; ino: bigint; size: number }): number {
+		const current = this.#statSync(this.#sessionFile!);
+		if (current.dev !== identity.dev || current.ino !== identity.ino || current.size < identity.size)
+			throw new SessionSnapshotSourceChangedError();
+		return identity.size;
+	}
+
 	getEntriesForExport(): SessionEntry[] {
 		this.#ensureFullHotView();
 		const cache = new Map<string, string>();
@@ -25470,8 +25551,13 @@ export class SessionManager {
 	 * only), no version-migration rewrite, no session-memory sidecars or legacy
 	 * sidecar cleanup, and no managed-store adoption. Shared content-addressed blobs
 	 * and the process resident cache under the agent dir may still be written, as
-	 * on every load. Session memory stays `"off"`, so transcripts above the eager
-	 * inspection cap fail with {@link SessionTranscriptOversizedError}.
+	 * on every load.
+	 *
+	 * Above the eager cap (up to {@link BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES}, not on
+	 * Windows) it uses the bounded loader, with sidecars in a private owner-only
+	 * sidecar-cache instance that close, a failed open and shutdown remove. Only
+	 * linear, compacted v5 transcripts without patches qualify; others fail with
+	 * {@link SessionTranscriptBoundedOpenError}. Export reads only the validated prefix.
 	 *
 	 * The returned manager ({@link isReadOnlySnapshot}) throws `read_only_snapshot` from:
 	 * transcript appends and edits, rename and star, branch and leaf changes, rewrite,
@@ -25498,6 +25584,19 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionManager> {
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
+		let sourceStat: SessionStorageStat | undefined;
+		try {
+			sourceStat = storage.statSync(filePath);
+		} catch {
+			// A missing or unreadable source is reported by the strict inspection below.
+		}
+		if (
+			sourceStat !== undefined &&
+			sourceStat.size > eagerHydrationMaxBytes() &&
+			storage instanceof FileSessionStorage &&
+			process.platform !== "win32"
+		)
+			return SessionManager.#openBoundedReadOnlySnapshot(filePath, storage, sourceStat);
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
@@ -25524,9 +25623,81 @@ export class SessionManager {
 		return manager;
 	}
 
+	/** Bounded first-open without `#initSessionFile` (no breadcrumb, eager fallback, or file creation). */
+	static async #openBoundedReadOnlySnapshot(
+		filePath: string,
+		storage: FileSessionStorage,
+		sourceStat: SessionStorageStat,
+	): Promise<SessionManager> {
+		const size = sourceStat.size;
+		if (size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(size);
+		const inspected = inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		if (!inspected.ok) {
+			if (inspected.error.reason === "oversized")
+				throw new SessionTranscriptOversizedError(inspected.error.size ?? 0);
+			if (inspected.error.reason === "missing")
+				throw Object.assign(new Error(`ENOENT: no such file or directory, open '${filePath}'`), { code: "ENOENT" });
+			throw new Error(`Could not open session: ${inspected.error.reason}`);
+		}
+		const destination = explicitDestination(path.dirname(filePath));
+		const manager = new SessionManager(
+			inspected.inspection.cwd ?? getProjectDir(),
+			destination.directory,
+			true,
+			storage,
+			destination,
+		);
+		manager.#sessionMemoryMode = "enabled";
+		try {
+			const instanceDir = openVerifiedResidentCacheInstanceDir(
+				getSidecarCacheRootDir(manager.#residentCacheProfileAgentDir()),
+			);
+			manager.#snapshotSidecarStore = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+			// Adopted instances are outside the resident-cache exit sweep.
+			manager.#snapshotSidecarUnregister = postmortem.register("session-snapshot-sidecars", () =>
+				manager.#disposeSnapshotSidecarsBestEffort(),
+			);
+			if (!(await manager.#tryBoundedFirstOpen(filePath)))
+				throw new SessionTranscriptBoundedOpenError(
+					size,
+					manager.#lazyReopenFallbackReason ?? "bounded_first_open_failed",
+				);
+			// The open validated `tail.transcriptSize` bytes of the pre-open inode.
+			const opened = manager.#statSync(filePath);
+			const validatedSize = manager.#sidecarRuntime?.tail.transcriptSize;
+			if (
+				validatedSize === undefined ||
+				opened.dev !== sourceStat.dev ||
+				opened.ino !== sourceStat.ino ||
+				opened.size < validatedSize
+			)
+				throw new SessionTranscriptBoundedOpenError(size, "bounded_first_open_descriptor_changed");
+			manager.#snapshotScanIdentity = { dev: sourceStat.dev, ino: sourceStat.ino, size: validatedSize };
+			manager.buildSessionContext();
+		} catch (error) {
+			manager.#readOnlySnapshot = true;
+			try {
+				await manager.close();
+			} catch (cleanupError) {
+				throw new AggregateError(
+					[toError(error), toError(cleanupError)],
+					"Rejected read-only snapshot cleanup failed",
+				);
+			}
+			throw error;
+		}
+		manager.#readOnlySnapshot = true;
+		return manager;
+	}
+
 	/** True for a manager from {@link SessionManager.openReadOnlySnapshot}; see that method for what it refuses. */
 	isReadOnlySnapshot(): boolean {
 		return this.#readOnlySnapshot;
+	}
+
+	/** A read-only snapshot above the eager cap, which reads its source lazily while exporting. */
+	isBoundedReadOnlySnapshot(): boolean {
+		return this.#readOnlySnapshot && this.#snapshotScanIdentity !== undefined;
 	}
 
 	/**
