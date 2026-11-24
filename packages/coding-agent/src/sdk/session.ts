@@ -219,6 +219,7 @@ import {
 	loadProjectContextFilesResult as loadContextFilesResultInternal,
 } from "../system-prompt";
 import { AgentOutputManager } from "../task/output-manager";
+import { SessionTaskPool } from "../task/task-pool";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	isMCPBridgeTool,
@@ -3143,6 +3144,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		};
 
+		// Create the session-global task concurrency pool
+		const taskPool = new SessionTaskPool(settings, settings.get("task.maxConcurrency") ?? 1);
+
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -3657,6 +3661,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getArtifactsDir,
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,
 		);
+		toolSession.getTaskPool = () => taskPool;
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time(
