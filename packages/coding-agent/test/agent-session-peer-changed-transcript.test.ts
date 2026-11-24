@@ -513,6 +513,16 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(memoryMessages(harness.session.messages)).toContain("toolResult:tool ok");
 	});
 
+	it("refuses a context clear on a stuck session before resetting the agent", async () => {
+		const harness = await setup();
+		const latched = await latch(harness);
+		const memoryBefore = memoryMessages(harness.session.messages);
+
+		expect(await settle(harness.session.clearContext())).toBe(latched);
+
+		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
+	});
+
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
 		const harness = await setup();
 		await harness.session.prompt("second");

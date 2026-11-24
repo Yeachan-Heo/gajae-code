@@ -22659,6 +22659,9 @@ export class AgentSession {
 		// root through the common admitted control publication before resetting anything
 		// (#7824); a legacy session keeps the legacy refusal. Adoption while the turn is
 		// aborted refuses before the reset rather than switching protocols mid-clear.
+		// A transcript that already refuses writes is refused before the agent reset,
+		// which would otherwise drop the in-memory history and then fail at the flush.
+		this.#assertTranscriptAcceptsTurn();
 		const operation = "clear context";
 		const assertMode = this.#controlPublicationModeFence(operation);
 		const sharedPublication = this.#usesSharedSessionPublication();

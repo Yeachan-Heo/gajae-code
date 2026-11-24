@@ -1374,7 +1374,7 @@ export class CommandController {
 			);
 			this.ctx.ui.requestRender();
 		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Move failed: ${operatorErrorMessage(err, String(err))}`);
 		}
 	}
 
