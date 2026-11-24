@@ -98,8 +98,10 @@ describe("graph successors after root shared append", () => {
 	it("prepares a whole-session fork without touching the source", async () => {
 		const { manager, file, sourceId, p1, r1, p2, r2 } = await twoSharedPrompts();
 		const artifacts = file.slice(0, -6);
-		await fs.mkdir(artifacts, { recursive: true });
-		await Bun.write(path.join(artifacts, "1.bash.log"), "tool output");
+		// Owner-only, as the managed artifact store creates them; Linux managed storage
+		// refuses to snapshot a group- or world-readable tree.
+		await fs.mkdir(artifacts, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifacts, "1.bash.log"), "tool output", { mode: 0o600 });
 		const bytes = await bytesAt(file);
 		expect(manager.graphSuccessorRefusal({ wholeSession: true })).toBeUndefined();
 		const stage = await manager.prepareFork();

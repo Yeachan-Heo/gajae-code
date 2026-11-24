@@ -971,8 +971,10 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 		await canonicalMessage(f, "second shared prompt");
 		const sourceId = f.manager.getSessionId();
 		const artifacts = f.file.slice(0, -6);
-		await fs.mkdir(artifacts, { recursive: true });
-		await Bun.write(path.join(artifacts, "sentinel.log"), "artifact");
+		// Owner-only, as the managed artifact store creates them; Linux managed storage
+		// refuses to snapshot a group- or world-readable tree.
+		await fs.mkdir(artifacts, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifacts, "sentinel.log"), "artifact", { mode: 0o600 });
 		const bytes = await Bun.file(f.file).bytes();
 		expect(await f.session.fork()).toBe(true);
 		const forkFile = f.manager.getSessionFile()!;
