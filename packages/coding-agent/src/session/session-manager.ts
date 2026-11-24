@@ -95,6 +95,7 @@ import {
 } from "../sdk/session-readonly/inspection";
 import {
 	applySessionListHeaderPatch,
+	isMetadataOnlySession,
 	readSessionListPrefix,
 	readSessionListTrailingPatches,
 	readSessionMetadata,
@@ -25063,7 +25064,8 @@ export class SessionManager {
 			listing.owned.filter(candidate => !isStagedSessionPath(candidate.path)).map(candidate => candidate.path),
 			storage,
 		);
-		return mergeSessionInventories(managed, await collectProjectSessions(cwd, storage));
+		const merged = mergeSessionInventories(managed, await collectProjectSessions(cwd, storage));
+		return merged.filter(session => !isMetadataOnlySession(session));
 	}
 
 	/**
@@ -25078,10 +25080,11 @@ export class SessionManager {
 	): Promise<SessionInfo[]> {
 		if (!sessionDir) return await SessionManager.listManagedForResumePickerReadOnly(cwd, undefined, storage);
 		try {
-			return await collectSessionsFromFiles(
+			const sessions = await collectSessionsFromFiles(
 				storage.listFilesSync(sessionDir, "*.jsonl").filter(file => !isStagedSessionPath(file)),
 				storage,
 			);
+			return sessions.filter(session => !isMetadataOnlySession(session));
 		} catch {
 			return [];
 		}

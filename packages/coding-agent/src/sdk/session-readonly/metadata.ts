@@ -28,10 +28,17 @@ export interface SessionMetadata {
 	size: number;
 	firstMessage: string;
 	allMessagesText: string;
+	/** True if the session has startup metadata entries but no user/assistant messages. */
+	isMetadataOnly?: boolean;
 }
 
 /** Native callers retain their own recap enrichment and picker identity association. */
 export type SessionMetadataEnricher = (session: SessionMetadata, stats: SessionStorageStat) => Promise<void>;
+
+/** Pure predicate: true if the session is metadata-only (startup config with no conversation). */
+export function isMetadataOnlySession(session: SessionMetadata): boolean {
+	return session.isMetadataOnly === true;
+}
 
 function extractTextFromContent(content: Message["content"]): string {
 	if (typeof content === "string") return content;
@@ -387,9 +394,17 @@ async function collectSessionFromFile(
 		let firstMessage = "";
 		const allMessages: string[] = [];
 		let shortSummary: string | undefined;
+		let hasStartupMetadata = false;
 		for (let i = 1; i < entries.length; i++) {
 			const entry = entries[i] as { type?: string; message?: Message; shortSummary?: string };
 			if (entry.type === "compaction" && typeof entry.shortSummary === "string") shortSummary = entry.shortSummary;
+			// Detect startup metadata entries like model_change, thinking_level_change, etc.
+			if (
+				typeof entry.type === "string" &&
+				/^(model_change|thinking_level_change|provider_change|endpoint_change)$/.test(entry.type)
+			) {
+				hasStartupMetadata = true;
+			}
 			if (entry.type === "message" && entry.message) {
 				parsedMessageCount++;
 				if (entry.message.role === "user" || entry.message.role === "assistant") {
@@ -404,6 +419,7 @@ async function collectSessionFromFile(
 		firstMessage ||= extractFirstUserMessageFromPrefix(content) ?? "";
 		const messageCount = Math.max(parsedMessageCount, countMessageMarkers(content));
 		const stats = storage.statSync(file);
+		const messageCountIsEstimate = stats.size > SESSION_LIST_PREFIX_BYTES;
 		const session: SessionMetadata = {
 			path: file,
 			id: header.id,
@@ -414,10 +430,11 @@ async function collectSessionFromFile(
 			created: new Date(header.timestamp ?? ""),
 			modified: stats.mtime,
 			messageCount,
-			messageCountIsEstimate: stats.size > SESSION_LIST_PREFIX_BYTES,
+			messageCountIsEstimate,
 			size: stats.size,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
+			isMetadataOnly: hasStartupMetadata && messageCount === 0 && !messageCountIsEstimate ? true : undefined,
 		};
 		if (enrich) await enrich(session, stats);
 		return session;

@@ -273,6 +273,14 @@ function sanitizableSessionText(id: string): string {
 	return `${JSON.stringify(header)}\n${JSON.stringify(message)}\n`;
 }
 
+/** Session with only header and startup metadata (model_change, thinking_level_change, etc.), no user/assistant messages. */
+function metadataOnlySessionText(id: string): string {
+	const header = { type: "session", id, timestamp: new Date(0).toISOString(), cwd: "/cwd", version: 3 };
+	const modelChange = { type: "model_change", model: { provider: "openai", id: "gpt-4" }, timestamp: 0 };
+	const thinkingChange = { type: "thinking_level_change", level: "extended", timestamp: 0 };
+	return `${JSON.stringify(header)}\n${JSON.stringify(modelChange)}\n${JSON.stringify(thinkingChange)}\n`;
+}
+
 describe("SessionManager read-only resume", () => {
 	it("keeps strict managed read resolution fail-closed on ACL verification failure", () => {
 		const root = makeTempDir();
@@ -1062,8 +1070,8 @@ describe("SessionManager read-only resume", () => {
 		const cwd = makeTempDir();
 		const legacyName = `--${path
 			.resolve(cwd)
-			.replace(/^[/\\]/, "")
-			.replace(/[/\\:]/g, "-")}--`;
+			.replace(/^[\/\\]/, "")
+			.replace(/[\/\\:]/g, "-")}--`;
 		const legacyPath = path.join(getSessionsDir(), legacyName, "legacy.jsonl");
 		const explicitPath = "/explicit/current.jsonl";
 		storage.writeTextSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
@@ -1074,6 +1082,23 @@ describe("SessionManager read-only resume", () => {
 		expect(defaults).toEqual([]);
 		expect(await SessionManager.listForResumePickerReadOnly(cwd, "/explicit", storage)).toHaveLength(1);
 		expect(storage.writes).toBe(0);
+	});
+
+	it("excludes metadata-only sessions (header + startup config) from resume listing", async () => {
+		const storage = new WriteTrackingStorage();
+		const sessionDir = makeTempDir();
+		const metadataOnlyPath = path.join(sessionDir, "metadata-only.jsonl");
+		const normalPath = path.join(sessionDir, "normal.jsonl");
+
+		// Create a metadata-only session with only header and startup metadata entries
+		storage.writeTextSync(metadataOnlyPath, metadataOnlySessionText("metadata-only-id"));
+		// Create a normal session with actual conversation
+		storage.writeTextSync(normalPath, sessionText("normal-id", "user"));
+
+		const listed = await SessionManager.listForResumePickerReadOnly("/cwd", sessionDir, storage);
+		// Should only list the normal session, not the metadata-only one
+		expect(listed).toHaveLength(1);
+		expect(listed[0]?.id).toBe("normal-id");
 	});
 });
 
