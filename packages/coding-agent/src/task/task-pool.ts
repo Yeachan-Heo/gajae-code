@@ -56,15 +56,20 @@ export class SessionTaskPool {
 
 	/**
 	 * Acquire a concurrency slot.
-	 * All tasks acquire from the shared pool to enforce the session-wide limit.
-	 * Deadlock is avoided because: when a task spawns nested children, the parent
-	 * is no longer waiting (it's executing); children acquire after the parent
-	 * is in progress, not before the parent has acquired.
-	 * @param _taskDepth The nesting depth of this task (0 = top-level, 1+ = nested) [unused, kept for API compatibility]
+	 * Top-level tasks (depth 0) acquire from the shared pool to enforce the session-wide limit.
+	 * Nested tasks (depth > 0) are exempt and do not acquire, allowing them to proceed without
+	 * competing with their ancestors for limited slots. This prevents deadlock where a parent
+	 * waits for a child that cannot proceed due to slot exhaustion.
+	 * @param taskDepth The nesting depth of this task (0 = top-level, 1+ = nested)
 	 * @param signal Optional abort signal to cancel acquisition
 	 * @returns Information about whether a slot was acquired
 	 */
-	async acquire(_taskDepth: number, signal?: AbortSignal): Promise<{ acquiredSlot: boolean }> {
+	async acquire(taskDepth: number, signal?: AbortSignal): Promise<{ acquiredSlot: boolean }> {
+		// Nested tasks do not acquire slots to prevent deadlock
+		if (taskDepth > 0) {
+			return { acquiredSlot: false };
+		}
+
 		this.resizeIfNeeded();
 		await this.#semaphore.acquire(signal);
 		return { acquiredSlot: true };

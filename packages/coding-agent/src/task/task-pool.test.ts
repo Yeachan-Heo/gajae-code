@@ -90,4 +90,26 @@ describe("SessionTaskPool", () => {
 		pool.release(slot2);
 		pool.release(slot3);
 	});
+
+	it("nested tasks do not acquire slots to prevent deadlock", async () => {
+		const settings = createMockSettings({ "task.maxConcurrency": 1 });
+		const pool = new SessionTaskPool(settings, 1);
+
+		// Parent task at depth 0 acquires the slot
+		const parentSlot = await pool.acquire(0);
+		expect(parentSlot.acquiredSlot).toBe(true);
+
+		// Nested task at depth 1 should not need to acquire (depth > 0 is exempt)
+		const nestedSlot = await pool.acquire(1);
+		expect(nestedSlot.acquiredSlot).toBe(false);
+
+		// Another nested task should also not acquire
+		const nestedSlot2 = await pool.acquire(2);
+		expect(nestedSlot2.acquiredSlot).toBe(false);
+
+		// Release the parent slot
+		pool.release(parentSlot);
+		pool.release(nestedSlot);
+		pool.release(nestedSlot2);
+	});
 });
