@@ -38,6 +38,10 @@ export interface GithubReleaseLookupOptions {
 	webOrigin?: string;
 	timeoutMs?: number;
 	useAmbientToken?: boolean;
+	/** Skip releases that don't have this binary asset. */
+	requiredBinaryAsset?: string;
+	/** Callback to log when a release is skipped due to missing asset. */
+	onSkippedRelease?: (tag: string, version: string) => void;
 }
 
 /** A GitHub REST response that failed, carrying the status the caller must branch on. */
@@ -64,10 +68,28 @@ interface GithubReleaseJson {
 	draft?: unknown;
 	prerelease?: unknown;
 	html_url?: unknown;
+	assets?: unknown[];
+}
+
+interface GithubReleaseAsset {
+	name?: unknown;
 }
 
 export function isSafeReleaseTag(tag: string): boolean {
 	return TAG_RE.test(tag) && !tag.includes("..") && !tag.includes("/");
+}
+
+/**
+ * Check if a release has a binary asset matching the given name.
+ */
+export function releaseHasBinaryAsset(release: GithubReleaseJson, assetName: string): boolean {
+	if (!Array.isArray(release.assets)) return false;
+	for (const asset of release.assets) {
+		if (typeof asset !== "object" || asset === null) continue;
+		const record = asset as GithubReleaseAsset;
+		if (record.name === assetName) return true;
+	}
+	return false;
 }
 
 export function versionFromTag(tag: string): string {
@@ -204,6 +226,84 @@ export async function fetchGithubChannelRelease(options: GithubReleaseLookupOpti
 			"The nightly channel has no published GitHub prerelease yet; it is populated by the scheduled nightly workflow.",
 		);
 	}
+
+	// For stable releases, when checking for binary assets, fetch multiple releases
+	// to find one with the required asset. If not checking for assets, use the
+	// traditional /releases/latest endpoint.
+	if (options.requiredBinaryAsset) {
+		try {
+			const fetchImpl = options.fetchImpl ?? fetch;
+			const timeoutMs = options.timeoutMs ?? 20_000;
+			const token = options.useAmbientToken ? readToken(options.lookupEnv) : undefined;
+			let page = 1;
+			let hasNextPage = true;
+
+			while (hasNextPage) {
+				const listUrl = `${apiOrigin}/repos/${RELEASE_REPO}/releases?per_page=50&page=${page}`;
+				const response = await fetchImpl(listUrl, {
+					headers: githubReleaseHeaders(token),
+					signal: AbortSignal.timeout(timeoutMs),
+					redirect: "follow",
+				});
+
+				if (!response.ok) {
+					throw new GithubApiStatusError(listUrl, response.status);
+				}
+
+				const payload = await response.json();
+				if (!Array.isArray(payload)) {
+					throw new Error(`${listUrl} did not return a release list`);
+				}
+
+				// Check if there's a next page by looking at the Link header
+				const linkHeader = response.headers.get("link");
+				hasNextPage = linkHeader?.includes('rel="next"') ?? false;
+
+				for (const entry of payload) {
+					if (typeof entry !== "object" || entry === null) continue;
+					const record = entry as GithubReleaseJson;
+					if (record.draft === true || record.prerelease === true) continue;
+					const tag = typeof record.tag_name === "string" ? record.tag_name : "";
+					if (!isSafeReleaseTag(tag)) continue;
+					const version = versionFromTag(tag);
+					if (!STABLE_VERSION_RE.test(version)) continue;
+
+					// Check if this release has the required asset
+					if (!releaseHasBinaryAsset(record, options.requiredBinaryAsset)) {
+						if (options.onSkippedRelease) {
+							options.onSkippedRelease(tag, version);
+						}
+						continue;
+					}
+
+					return {
+						tag,
+						version,
+						channel,
+						htmlUrl: typeof record.html_url === "string" ? record.html_url : undefined,
+						warnings: [],
+					};
+				}
+
+				page++;
+			}
+
+			// If we get here, no release with the asset was found after paginating through all releases
+			throw new Error(
+				`The stable channel has no published release with the ${options.requiredBinaryAsset} asset yet`,
+			);
+		} catch (error) {
+			if (error instanceof GithubApiStatusError && error.isRateLimited) {
+				// When checking for assets, rate-limit is a hard error because we cannot fall back
+				// to web lookups without losing the asset predicate.
+				throw new Error(
+					`${error.message} during binary asset verification. ${TOKEN_HINT}. Install updates using the npm registry (bun install -g gajae-code@latest) or wait for rate-limit reset.`,
+				);
+			}
+			throw error;
+		}
+	}
+
 	const url = `${apiOrigin}/repos/${RELEASE_REPO}/releases/latest`;
 	try {
 		return parseRelease(await readGithubJson(url, options), "stable");
