@@ -65,6 +65,7 @@ describe("AgentSession on a transcript another process changed", () => {
 	const cleanups: Array<() => Promise<unknown> | unknown> = [];
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		tempDir?.removeSync();
 		tempDir = undefined;
@@ -274,6 +275,82 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(newFile).not.toBe(harness.file);
 		expect(transcriptMessages(await Bun.file(newFile).text())).toContain("user:after new");
 		expect(await Bun.file(harness.file).text()).toBe(peerTranscript);
+	});
+
+	it.each([
+		"a malformed /resume target",
+		"a failed /resume adoption",
+		"a failed /new",
+		"a failed /fork",
+	])("leaves the stuck session as it was after %s, and a later /resume still recovers", async kind => {
+		const harness = await setup();
+		const latched = await latch(harness);
+		const peerTranscript = await Bun.file(harness.file).text();
+		let transition: Promise<unknown>;
+		if (kind === "a malformed /resume target") {
+			const malformed = path.join(path.dirname(harness.file), "2026-01-01T00-00-00-000Z_malformed.jsonl");
+			await Bun.write(malformed, "not json\n");
+			transition = harness.session.switchSession(malformed);
+		} else if (kind === "a failed /resume adoption") {
+			vi.spyOn(harness.writerA, "setSessionFile").mockRejectedValueOnce(new Error("adoption failed"));
+			transition = harness.session.switchSession(harness.file);
+		} else if (kind === "a failed /new") {
+			vi.spyOn(harness.writerA, "prepareNewSession").mockRejectedValueOnce(new Error("prepare failed"));
+			transition = harness.session.newSession();
+		} else {
+			vi.spyOn(harness.writerA, "prepareBranchedSession").mockRejectedValueOnce(new Error("branch failed"));
+			const firstUser = harness.writerA
+				.getBranch()
+				.find(entry => entry.type === "message" && entry.message.role === "user");
+			if (!firstUser) throw new Error("Expected the first user entry");
+			transition = harness.session.branch(firstUser.id);
+		}
+		expect(await settle(transition)).toBeInstanceOf(Error);
+
+		const before = harness.counts();
+		expect(await settle(harness.session.prompt("still stuck"))).toBe(latched);
+		expect(harness.counts()).toEqual(before);
+		expect(harness.session.sessionManager.getSessionFile()).toBe(harness.file);
+		expect(await Bun.file(harness.file).text()).toBe(peerTranscript);
+
+		expect(await harness.session.switchSession(harness.file)).toBe(true);
+		await harness.session.prompt("after resume");
+		expect(transcriptMessages(await Bun.file(harness.file).text())).toContain("user:after resume");
+	});
+
+	it("refuses turns up front after any other latched write failure, without promising a recovery", async () => {
+		const harness = await setup();
+		const failure = new Error("uncertain write");
+		const append = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+			.mockImplementation(() => {
+				throw failure;
+			});
+		expect(await settle(harness.session.prompt("write fails"))).toBeInstanceOf(Error);
+		append.mockRestore();
+		expect(harness.writerA.getLatchedPersistenceFailure()).toBe(failure);
+		const before = harness.counts();
+		const memoryBefore = memoryMessages(harness.session.messages);
+
+		expect(await settle(harness.session.prompt("again"))).toBe(failure);
+		expect(
+			await settle(
+				harness.session.promptCustomMessage({
+					customType: "probe",
+					content: "hidden turn",
+					display: false,
+					attribution: "agent",
+				}),
+			),
+		).toBe(failure);
+		expect(await settle(harness.session.continuePersistedHistory())).toBe(failure);
+		expect(operatorErrorMessage(failure)).toBe("uncertain write");
+
+		expect(harness.counts()).toEqual(before);
+		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
+		// Reload the transcript so disposal does not report the uncertain write.
+		await harness.writerA.recoverPersistenceFailure();
+		expect(harness.writerA.getLatchedPersistenceFailure()).toBeUndefined();
 	});
 
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {

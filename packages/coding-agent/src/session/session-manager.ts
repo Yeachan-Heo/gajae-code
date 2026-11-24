@@ -13146,6 +13146,16 @@ export class SessionManager {
 		return false;
 	}
 
+	/**
+	 * The persistence failure that every later append rethrows before writing, if one is
+	 * latched: a {@link ManagedAppendIdentityMismatchError} after another process changed
+	 * the transcript, or an earlier write failure. Near-limit outcomes are not latched.
+	 */
+	getLatchedPersistenceFailure(): Error | undefined {
+		if (!this.persist || !this.#sessionFile) return undefined;
+		return this.#persistError;
+	}
+
 	/** Ownership loss remains observable even when an agent event listener aborts the turn. */
 	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;

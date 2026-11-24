@@ -5142,17 +5142,18 @@ export class AgentSession {
 
 	/**
 	 * Refuse a new turn before any effect once this session's transcript is known to
-	 * refuse writes: another process changed it and the managed append fence latched
-	 * {@link ManagedAppendIdentityMismatchError}. Without this the turn is admitted,
-	 * acceptance hooks run and the first append fails; a hidden custom-message turn
-	 * even resolved with unsaved entries in memory. The typed error carries the
-	 * operator message that names the recovery (reopen or fork).
+	 * refuse writes. The manager has latched a persistence failure that its next append
+	 * would rethrow before writing: usually {@link ManagedAppendIdentityMismatchError}
+	 * after another process changed the transcript, whose operator message names the
+	 * recovery (reopen or fork). Without this the turn is admitted, acceptance hooks run
+	 * and the first append fails; a hidden custom-message turn even resolved with
+	 * unsaved entries in memory.
 	 *
 	 * The refuse-before-the-model ordering follows the approach in #7843.
 	 */
 	#assertTranscriptAcceptsTurn(): void {
-		const fenced = this.sessionManager.getAppendIdentityMismatch();
-		if (fenced) throw fenced;
+		const latched = this.sessionManager.getLatchedPersistenceFailure();
+		if (latched) throw latched;
 	}
 
 	/**
