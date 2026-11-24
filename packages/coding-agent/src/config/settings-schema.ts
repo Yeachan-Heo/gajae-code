@@ -4563,6 +4563,14 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 			});
 			continue;
 		}
+		if (path === "session.ownership" || path.startsWith("session.ownership.")) {
+			issues.push({
+				path,
+				detail:
+					"Session ownership settings need operator consent: use gjc config set or the config file, not config.patch.",
+			});
+			continue;
+		}
 		if (NOTIFICATION_BINDING_PATCH_PATHS.has(path as SettingPath)) {
 			issues.push({
 				path,
