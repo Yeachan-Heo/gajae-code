@@ -39,9 +39,11 @@ import { isSdkComposerObservationOperation } from "../../sdk/composer-observatio
 
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
 import {
+	BROKER_LIFECYCLE_OPERATIONS,
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
 	hasBrokerRuntimeReviseCapability,
+	prohibitBrokerLifecycleOperation,
 } from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
@@ -127,23 +129,6 @@ const EXTENSION_COMMAND_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"compact",
 	"switchSession",
 ]);
-
-const BROKER_LIFECYCLE_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.close",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.delete",
-]);
-
-function prohibitBrokerLifecycleOperation(operation: string): never {
-	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
-		code: "operation_prohibited",
-	});
-}
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
