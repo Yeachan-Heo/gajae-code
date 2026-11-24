@@ -146,10 +146,19 @@ describe("AgentSession on a transcript another process changed", () => {
 		};
 	}
 
-	/** B appends, then A's next prompt hits the append fence and latches it. */
+	/**
+	 * Two writers on one managed session: B appends, then A prompts. A's first append
+	 * hits the fence and latches it, before any model call or tool run.
+	 */
 	async function latch(harness: Harness): Promise<ManagedAppendIdentityMismatchError> {
 		await harness.appendFromB("from B");
-		expect(await settle(harness.session.prompt("latches"))).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		harness.setScript("tool");
+		const before = harness.counts();
+		const refusal = await settle(harness.session.prompt("latches"));
+		expect(refusal).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		expect(operatorErrorMessage(refusal)).toBe((refusal as ManagedAppendIdentityMismatchError).operatorMessage);
+		expect(harness.counts()).toEqual(before);
+		harness.setScript("text");
 		const latched = harness.writerA.getAppendIdentityMismatch();
 		if (!latched) throw new Error("Expected the append fence to latch");
 		return latched;
