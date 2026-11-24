@@ -364,6 +364,14 @@ describe("MonitorTool", () => {
 			resetTerminalAbortRegistriesForTests();
 		});
 
+		async function waitUntil(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+			const deadline = Date.now() + timeoutMs;
+			while (!condition()) {
+				if (Date.now() > deadline) throw new Error("condition not reached");
+				await new Promise(resolve => setTimeout(resolve, 10));
+			}
+		}
+
 		async function settle(): Promise<void> {
 			await manager.waitForAll();
 			// The delivery loop runs after the terminal transition; give an
@@ -458,14 +466,15 @@ describe("MonitorTool", () => {
 			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;
 			const result = expectText(
 				await tool.execute("call-quiet", {
-					command: "printf 'ALIVE\\n'; sleep 0.6",
+					command: "printf 'ALIVE\\n'; sleep 1.5",
 					kind: "poll",
 					description: "quiet owned tail",
 					persistent: true,
 				}),
 			);
 			const generation = manager.getJob(result.details.taskId)!.generation;
-			await new Promise(resolve => setTimeout(resolve, 400));
+			await waitUntil(() => steered.length === 1);
+			expect(manager.getJob(result.details.taskId)?.status).toBe("running");
 			// The debounced line is out and the job still runs: the registration stays.
 			expect(steered).toHaveLength(1);
 			expect(lookupOwnedRegistration(result.details.taskId, generation, "test-session")).toBeDefined();
@@ -506,14 +515,15 @@ describe("MonitorTool", () => {
 			const tool = MonitorTool.createIf(session)!;
 			const result = expectText(
 				await tool.execute("call-held", {
-					command: "printf 'ALIVE\\n'; sleep 0.6",
+					command: "printf 'ALIVE\\n'; sleep 1.5",
 					kind: "poll",
 					description: "held tail",
 					persistent: true,
 				}),
 			);
 			const generation = manager.getJob(result.details.taskId)!.generation;
-			await new Promise(resolve => setTimeout(resolve, 400));
+			await waitUntil(() => held.length === 1);
+			expect(manager.getJob(result.details.taskId)?.status).toBe("running");
 			expect(held).toHaveLength(1);
 			registerTerminalTurnScope({ lineageIdHash: "lineage-h", promptAttemptEpoch: 9 });
 			await settle();
