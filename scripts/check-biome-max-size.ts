@@ -146,11 +146,16 @@ export function matchesBiomeIncludes(relativePath: string, includes: readonly st
 	return included;
 }
 
-/** Returns the size limit Biome applies to a path: the last matching override, else the config limit. */
+/**
+ * Returns the size limit Biome applies to a path: the last matching override,
+ * else the config limit. Biome applies no override that lacks `includes`, so an
+ * empty list never matches here (unlike `files.includes`, where it means all).
+ */
 export function effectiveMaxSize(relativePath: string, settings: BiomeSizeSettings): number {
 	let limit = settings.maxSize;
 	for (const override of settings.overrides) {
-		if (matchesBiomeIncludes(relativePath, override.includes)) limit = override.maxSize;
+		if (override.includes.length > 0 && matchesBiomeIncludes(relativePath, override.includes))
+			limit = override.maxSize;
 	}
 	return limit;
 }

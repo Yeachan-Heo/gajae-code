@@ -88,6 +88,17 @@ describe("checkBiomeMaxSize", () => {
 		expect(result.oversized.map(entry => [entry.path, entry.limit])).toEqual([["src/hand.ts", 1000]]);
 	});
 
+	test("ignores an override without includes, which Biome does not apply", async () => {
+		const result = await check({
+			"biome.json": rootConfig(
+				{ maxSize: 1000, includes: ["src/**/*.ts"] },
+				{ overrides: [{ files: { maxSize: 10000 } }] },
+			),
+			"src/big.ts": "x".repeat(5000),
+		});
+		expect(result.oversized.map(entry => [entry.path, entry.limit])).toEqual([["src/big.ts", 1000]]);
+	});
+
 	test("checks files under a nested biome.json against that config's limit", async () => {
 		const result = await check({
 			"biome.json": rootConfig({ maxSize: 1000, includes: ["src/**/*.ts", "!vendor/**"] }),
