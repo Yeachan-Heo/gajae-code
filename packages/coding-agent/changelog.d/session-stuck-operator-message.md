@@ -9,3 +9,4 @@
 - Keybinding actions that fail with a session refusal, such as the queue/follow-up shortcut on a stuck session, show the operator message instead of the raw code.
 - A context clear on a stuck session is refused before it resets the conversation, and `/move` failures show the operator message.
 - A resume rejected during startup, before anything ran in the session, keeps the accurate "this resume did not run" message.
+- Turns started without a typed prompt on a stuck session are refused before the system prompt build, recall or `before_agent_start` hooks: the auto-continue prompt, hidden next-turn deliveries, `cancelAndSubmit`, and extension `sendMessage(…, { triggerTurn: true })`. The extension send now reports the failure instead of resolving as a success.

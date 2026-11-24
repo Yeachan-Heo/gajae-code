@@ -18591,6 +18591,10 @@ export class AgentSession {
 			workflowIntentDiff?: WorkflowIntentDiff;
 		},
 	): Promise<void> {
+		// Every turn ends up here, including the auto-continue prompt, hidden next-turn
+		// deliveries, sendCustomMessage with triggerTurn and cancelAndSubmit. Refuse a
+		// stuck transcript before the system prompt build, recall and before_agent_start.
+		this.#assertTranscriptAcceptsTurn();
 		this.#assertNoHandoffTransition();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
@@ -20214,6 +20218,7 @@ export class AgentSession {
 					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
 						skipPostPromptRecoveryWait: true,
 					});
+					this.#throwLatchedAppendRejection(undefined);
 				} finally {
 					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
 					// The direct idle admission bypasses onFollowUpConsumed:
@@ -20268,6 +20273,7 @@ export class AgentSession {
 				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
 					skipPostPromptRecoveryWait: true,
 				});
+				this.#throwLatchedAppendRejection(undefined);
 			} finally {
 				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
 				// The direct idle admission bypasses onFollowUpConsumed:

@@ -8,6 +8,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import { initializeExtensions } from "@gajae-code/coding-agent/modes/runtime-init";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { operatorErrorMessage } from "@gajae-code/coding-agent/session/operator-error-message";
@@ -41,6 +42,8 @@ interface Harness {
 const COMPACTION_HOOK_SOURCE = [
 	"export default function(pi) {",
 	'\tpi.registerCommand("r5-status", { handler: async () => { globalThis.__r5StatusRuns = (globalThis.__r5StatusRuns ?? 0) + 1; } });',
+	'\tpi.registerCommand("r5-trigger", { handler: async () => { pi.sendMessage({ customType: "r5", content: "triggered turn", display: false }, { triggerTurn: true }); } });',
+	'\tpi.on("before_agent_start", async () => { globalThis.__r5BeforeAgentStart = (globalThis.__r5BeforeAgentStart ?? 0) + 1; });',
 	'\tpi.on("session_before_compact", async event => ({',
 	"\t\tcompaction: {",
 	'\t\t\tsummary: "hook summary",',
@@ -521,6 +524,29 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(await settle(harness.session.clearContext())).toBe(latched);
 
 		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
+	});
+
+	it("refuses a turn an extension command triggers on a stuck session before before_agent_start", async () => {
+		const harness = await setup({ withHooks: true });
+		const sendErrors: Error[] = [];
+		await initializeExtensions(harness.session, {
+			reportSendError: (_action, error) => sendErrors.push(error),
+			reportRuntimeError: () => {},
+		});
+		const latched = await latch(harness);
+		const hooks = globalThis as { __r5BeforeAgentStart?: number };
+		hooks.__r5BeforeAgentStart = 0;
+		const before = harness.counts();
+		const memoryBefore = memoryMessages(harness.session.messages);
+
+		await harness.session.prompt("/r5-trigger");
+		for (let attempt = 0; attempt < 200 && sendErrors.length === 0; attempt++) await Bun.sleep(5);
+
+		expect(sendErrors).toEqual([latched]);
+		expect(hooks.__r5BeforeAgentStart).toBe(0);
+		expect(harness.counts()).toEqual(before);
+		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
+		delete hooks.__r5BeforeAgentStart;
 	});
 
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
