@@ -13150,6 +13150,7 @@ export class SessionManager {
 	 * The persistence failure that every later append rethrows before writing, if one is
 	 * latched: a {@link ManagedAppendIdentityMismatchError} after another process changed
 	 * the transcript, or an earlier write failure. Near-limit outcomes are not latched.
+	 * @internal
 	 */
 	getLatchedPersistenceFailure(): Error | undefined {
 		if (!this.persist || !this.#sessionFile) return undefined;
@@ -17772,6 +17773,7 @@ export class SessionManager {
 	 * fence rejected those appends before writing any byte and managed appends are
 	 * synchronous, so nothing is left to flush; rethrowing would trap the operator in a
 	 * session whose only recovery is to leave it. Every other flush failure still throws.
+	 * @internal
 	 */
 	async flushBeforeLeaving(): Promise<void> {
 		try {
