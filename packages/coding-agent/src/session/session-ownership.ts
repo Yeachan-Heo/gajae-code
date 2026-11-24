@@ -312,6 +312,8 @@ interface SessionOwnerRegistry {
 	readonly pending: Map<string, Promise<void>>;
 	/** Set once a lock call reports `unavailable`: claims are off for this process. */
 	unavailable: string | undefined;
+	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
+	counters?: Map<SessionOwnershipCounter, number>;
 }
 
 /** Versioned, so two copies of this module in one realm share one registry (design §2.5). */
@@ -328,16 +330,35 @@ function registry(): SessionOwnerRegistry {
 }
 
 /**
- * Test-only: forget the `unavailable` latch and drop any claim a test leaked, unlocking it, then
+ * Test-only: forget the `unavailable` latch and the counters, and drop any claim a test leaked, unlocking it, then
  * throw if one was leaked. The registry is clean either way, so one leak fails one test only.
  */
 export function resetSessionOwnershipForTests(): void {
 	const current = registry();
 	current.unavailable = undefined;
+	current.counters?.clear();
 	const leaked = [...current.entries.values()];
 	current.entries.clear();
 	for (const entry of leaked) entry.lock.release();
 	if (leaked.length > 0) throw new Error(`${leaked.length} session claim(s) were never released`);
+}
+
+/** Events counted for the observe phase (design §2.9). In-process only until the stats step lands. */
+export type SessionOwnershipCounter = "release_after_deferred_timeout" | "session_write_without_claim";
+
+export function countSessionOwnershipEvent(name: SessionOwnershipCounter): void {
+	const current = registry();
+	current.counters ??= new Map();
+	current.counters.set(name, (current.counters.get(name) ?? 0) + 1);
+}
+
+/** A snapshot of this process's counts; a name never counted reads 0. */
+export function sessionOwnershipCounters(): Readonly<Record<SessionOwnershipCounter, number>> {
+	const counters = registry().counters;
+	return {
+		release_after_deferred_timeout: counters?.get("release_after_deferred_timeout") ?? 0,
+		session_write_without_claim: counters?.get("session_write_without_claim") ?? 0,
+	};
 }
 
 function markUnavailable(code: string | undefined): string {
