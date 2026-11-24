@@ -94,6 +94,10 @@ describe("AgentSession on a transcript another process changed", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		// Counters the test extension writes; cleared here so a failed assertion cannot leak them.
+		const extensionGlobals = globalThis as { __r5StatusRuns?: number; __r5BeforeAgentStart?: number };
+		delete extensionGlobals.__r5StatusRuns;
+		delete extensionGlobals.__r5BeforeAgentStart;
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		tempDir?.removeSync();
 		tempDir = undefined;
@@ -469,7 +473,6 @@ describe("AgentSession on a transcript another process changed", () => {
 
 		expect(runs.__r5StatusRuns).toBe(1);
 		expect(harness.counts()).toEqual(before);
-		delete runs.__r5StatusRuns;
 	});
 
 	it("refuses a skill on a stuck session before resolving it", async () => {
@@ -547,7 +550,6 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(hooks.__r5BeforeAgentStart).toBe(0);
 		expect(harness.counts()).toEqual(before);
 		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
-		delete hooks.__r5BeforeAgentStart;
 	});
 
 	it("reports an extension command's stuck-session write failure with the operator message", async () => {
