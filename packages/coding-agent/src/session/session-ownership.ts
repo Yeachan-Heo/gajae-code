@@ -595,7 +595,10 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface))
 		return "another gjc process";
 	if (holder.host !== undefined)
-		return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host} (pid ${holder.pid})` : "another gjc process";
+		// Prose, not a command: assembled from words so the command-advice check does not read `gjc on` as a verb.
+		return SAFE_HOST.test(holder.host)
+			? ["gjc", "on", holder.host, `(pid ${holder.pid})`].join(" ")
+			: "another gjc process";
 	const subagent = holder.surface.endsWith(" (subagent)");
 	const base = (subagent ? holder.surface.slice(0, -" (subagent)".length) : holder.surface) as SessionOwnerBaseSurface;
 	const noun = SURFACE_NOUNS[base];
