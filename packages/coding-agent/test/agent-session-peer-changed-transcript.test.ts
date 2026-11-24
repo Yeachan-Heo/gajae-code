@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { z } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
@@ -8,6 +8,7 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { operatorErrorMessage } from "@gajae-code/coding-agent/session/operator-error-message";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
@@ -43,6 +44,10 @@ function transcriptMessages(text: string): string[] {
 				? [describeMessage(entry.message.role, entry.message.content)]
 				: [];
 		});
+}
+
+function memoryMessages(messages: readonly AgentMessage[]): string[] {
+	return messages.map(message => describeMessage(message.role, (message as { content?: unknown }).content));
 }
 
 async function settle<T>(promise: Promise<T>): Promise<unknown> {
@@ -145,6 +150,74 @@ describe("AgentSession on a transcript another process changed", () => {
 		if (!latched) throw new Error("Expected the append fence to latch");
 		return latched;
 	}
+
+	it("refuses a prompt on the stuck writer before the model or any tool runs", async () => {
+		const harness = await setup();
+		const latched = await latch(harness);
+		harness.setScript("tool");
+		const before = harness.counts();
+		const transcriptBefore = await Bun.file(harness.file).text();
+		const memoryBefore = memoryMessages(harness.session.messages);
+		const events: string[] = [];
+		const unsubscribe = harness.session.subscribe(event => events.push(event.type));
+
+		const refusal = await settle(harness.session.prompt("run the probe tool"));
+		unsubscribe();
+
+		expect(refusal).toBe(latched);
+		expect(operatorErrorMessage(refusal)).toContain("/resume");
+		expect(operatorErrorMessage(refusal)).toContain("/fork");
+		expect(harness.counts()).toEqual(before);
+		expect(events).toEqual([]);
+		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
+		expect(await Bun.file(harness.file).text()).toBe(transcriptBefore);
+	});
+
+	it("refuses hidden custom-message turns, continuation and queued input instead of resolving silently", async () => {
+		const harness = await setup();
+		const latched = await latch(harness);
+		const before = harness.counts();
+		const memoryBefore = memoryMessages(harness.session.messages);
+
+		expect(
+			await settle(
+				harness.session.promptCustomMessage({
+					customType: "probe",
+					content: "hidden turn",
+					display: false,
+					attribution: "agent",
+				}),
+			),
+		).toBe(latched);
+		expect(await settle(harness.session.continuePersistedHistory())).toBe(latched);
+		expect(await settle(harness.session.followUp("queued follow-up"))).toBe(latched);
+		expect(await settle(harness.session.steer("queued steer"))).toBe(latched);
+
+		expect(harness.counts()).toEqual(before);
+		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
+	});
+
+	it("reports a mid-turn peer write with the operator message and keeps the turn in memory", async () => {
+		const harness = await setup();
+		harness.setScript("tool");
+		harness.onToolRun(async () => {
+			harness.onToolRun(undefined);
+			await harness.appendFromB("from B mid-turn");
+		});
+
+		const refusal = await settle(harness.session.prompt("use the tool"));
+
+		expect(refusal).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		expect(operatorErrorMessage(refusal)).toBe((refusal as ManagedAppendIdentityMismatchError).operatorMessage);
+		expect(harness.counts().toolRuns).toBe(1);
+		const memory = memoryMessages(harness.session.messages);
+		expect(memory).toContain("user:use the tool");
+		expect(memory).toContain("assistant:tool:probe");
+		expect(memory).toContain("toolResult:tool ok");
+		const transcript = transcriptMessages(await Bun.file(harness.file).text());
+		expect(transcript).toContain("user:from B mid-turn");
+		expect(transcript).not.toContain("toolResult:tool ok");
+	});
 
 	it("recovers after /resume of the same session and keeps both writers' entries", async () => {
 		const harness = await setup();

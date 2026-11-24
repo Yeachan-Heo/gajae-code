@@ -98,7 +98,7 @@ it.each(["startup", "user", "provider"])("reports a real resume rejection at %s"
 			code: 1,
 			stdout: "",
 			stderr:
-				"Session was resumed by another process; this resume did not run. Retry, or resume a different session.\n",
+				"Another process changed this session's transcript, so this process stopped saving to it. To continue, reopen the session with /resume (or gjc --resume), or fork it with /fork (or gjc --fork).\n",
 		});
 		expect(requests).toBe(requestsBeforeLoser + (phase === "provider" ? 1 : 0));
 		expect((await crashFile.exists()) ? await crashFile.text() : "").toBe(crashes);

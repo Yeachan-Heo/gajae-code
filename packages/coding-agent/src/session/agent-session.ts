@@ -5141,6 +5141,32 @@ export class AgentSession {
 	}
 
 	/**
+	 * Refuse a new turn before any effect once this session's transcript is known to
+	 * refuse writes: another process changed it and the managed append fence latched
+	 * {@link ManagedAppendIdentityMismatchError}. Without this the turn is admitted,
+	 * acceptance hooks run and the first append fails; a hidden custom-message turn
+	 * even resolved with unsaved entries in memory. The typed error carries the
+	 * operator message that names the recovery (reopen or fork).
+	 *
+	 * The refuse-before-the-model ordering follows the approach in #7843.
+	 */
+	#assertTranscriptAcceptsTurn(): void {
+		const fenced = this.sessionManager.getAppendIdentityMismatch();
+		if (fenced) throw fenced;
+	}
+
+	/**
+	 * A peer write detected mid-turn latches the mismatch at the failed append, and
+	 * agent-core turns that listener failure into an aborted run. Report the typed
+	 * refusal at the public boundary instead of a provider-level abort or a silent
+	 * success; the turn's messages stay in memory.
+	 */
+	#throwLatchedAppendRejection(): void {
+		const appendRejection = this.sessionManager.getAppendIdentityMismatch();
+		if (appendRejection) throw appendRejection;
+	}
+
+	/**
 	 * Flush the predecessor before `/resume`, `/new` or `/fork` replaces it.
 	 *
 	 * A transcript another process changed latches {@link ManagedAppendIdentityMismatchError}
@@ -16305,6 +16331,7 @@ export class AgentSession {
 
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
+		this.#assertTranscriptAcceptsTurn();
 		this.#assertExternalSessionIngress();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
@@ -16373,6 +16400,7 @@ export class AgentSession {
 				continuationSdkRunToken === undefined ? "full" : "publication",
 			);
 		}
+		this.#throwLatchedAppendRejection();
 	}
 
 	buildDisplaySessionContext(): SessionContext {
@@ -17989,11 +18017,7 @@ export class AgentSession {
 				observer ? { ...options, onRunAccepted: notifyRunAccepted } : options,
 				releaseStartupPromptWaiter,
 			);
-			// Agent-core converts listener failures into an aborted response. Keep a
-			// rejected persistence fence typed at the public prompt boundary instead
-			// of reporting the misleading provider-level "Request was aborted".
-			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
-			if (appendRejection) throw appendRejection;
+			this.#throwLatchedAppendRejection();
 		} finally {
 			if (observedLogicalRunId !== undefined) {
 				const observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
@@ -18043,6 +18067,7 @@ export class AgentSession {
 			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		this.#assertTranscriptAcceptsTurn();
 		if (options?.synthetic !== true && options?.attribution !== "agent") {
 			invalidateSessionTitleGeneration(this.sessionManager);
 		}
@@ -18450,6 +18475,7 @@ export class AgentSession {
 		const internalOptions: InternalCustomMessageOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
 			: undefined;
+		this.#assertTranscriptAcceptsTurn();
 		this.#assertExternalSessionIngress();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
@@ -18542,6 +18568,7 @@ export class AgentSession {
 			},
 			options?.preflightSignal,
 		);
+		this.#throwLatchedAppendRejection();
 	}
 
 	async #promptWithMessage(
@@ -19278,6 +19305,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		this.#assertTranscriptAcceptsTurn();
 		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
@@ -19307,6 +19335,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		this.#assertTranscriptAcceptsTurn();
 		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
