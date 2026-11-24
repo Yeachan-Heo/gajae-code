@@ -243,6 +243,9 @@ function readRecord(recordPath: string): OwnerRecord | undefined {
 	try {
 		const stat = fs.fstatSync(fd);
 		if (!stat.isFile() || stat.size > RECORD_MAX_BYTES) return undefined;
+		// Only this user's gjc writes records here; anything else is not a label to show.
+		const uid = process.getuid?.();
+		if (uid !== undefined && stat.uid !== uid) return undefined;
 		const buffer = Buffer.alloc(stat.size);
 		const read = fs.readSync(fd, buffer, 0, buffer.byteLength, 0);
 		return parseRecord(buffer.subarray(0, read).toString("utf8"));
