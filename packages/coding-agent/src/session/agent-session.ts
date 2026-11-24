@@ -151,8 +151,8 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
-import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -11108,7 +11108,6 @@ export class AgentSession {
 		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
 	}
 
-
 	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
 	 * The claim stays provisional until #settlePerToolTtsrDelivery sees the
@@ -11233,7 +11232,7 @@ export class AgentSession {
 	#reconcileTtsrConsumptionFromMessages(): void {
 		// A committed reminder can outlive its missing ttsr_injection marker and be compacted out
 		// of Agent context. Reconcile consumption without restoring the reminder text (#7838).
-		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
+		if (!this.#ttsrManager?.getSettings().enabled) {
 			return;
 		}
 		// Latest published checkpoint per rule. A legacy entry without one only proves the rule
@@ -15853,7 +15852,8 @@ export class AgentSession {
 		sessionContext: SessionContext,
 		fence?: SessionViewRestoreFence,
 	): Promise<void> {
-		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (fence && !fence.isCurrent())
+			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive(fence);
@@ -24865,7 +24865,12 @@ export class AgentSession {
 	async #setSharedSessionDefaultModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
+		options: {
+			signal?: AbortSignal;
+			shouldMutate?: () => boolean;
+			onMutationStarted?: () => void;
+			cause?: ModelChangeCause;
+		},
 	): Promise<void> {
 		const operation = "set session model";
 		const assertMode = this.#controlPublicationModeFence(operation);
@@ -33008,7 +33013,8 @@ export class AgentSession {
 			// However, enforce the concurrency Retry-After deadline before allowing
 			// same-selector rotation/retry: if a deadline exists for this selector,
 			// advance instead of retrying before the deadline.
-			const deadlineMs = failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			const deadlineMs =
+				failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
 			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
 				// Deadline not yet reached; advance instead of retrying
 				outcome = controller.advance() ? "advance" : "exhausted";
@@ -36287,8 +36293,7 @@ export class AgentSession {
 		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
 		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
-		const previousHasExplicitActiveToolSelectionForContext =
-			this.#committedHasExplicitActiveToolSelectionForContext;
+		const previousHasExplicitActiveToolSelectionForContext = this.#committedHasExplicitActiveToolSelectionForContext;
 		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
 			? [...this.#committedExplicitMCPToolSelectionForContext]
 			: undefined;
@@ -36409,8 +36414,7 @@ export class AgentSession {
 					if (authorityOurs()) {
 						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
 						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-						this.#explicitMCPToolSelectionPersistsForContext =
-							previousExplicitMCPToolSelectionPersistsForContext;
+						this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
 						this.#commitExplicitMCPToolSelectionAuthority();
 					}
 					// Prompt before tools: the tool observer may publish prompt state of
