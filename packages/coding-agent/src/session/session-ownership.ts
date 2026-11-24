@@ -475,7 +475,10 @@ async function probeOne(owners: string, state: OwnersDirectoryState, sessionId: 
 		}
 		default: {
 			const reason = result.reason ?? FileLockFailure.Failed;
-			if (reason === FileLockFailure.Unavailable) markUnavailable(result.code);
+			// Only an unsupported platform proves a claim would fail too: on macOS the probe is an
+			// F_GETLK query while a claim is flock(2), so a probe's ENOTSUP says nothing about claims.
+			if (reason === FileLockFailure.Unavailable && result.code === "unsupported_platform")
+				markUnavailable(result.code);
 			return { state: "unknown", reason, code: result.code };
 		}
 	}

@@ -320,7 +320,7 @@ describe("narrow fail-open", () => {
 		expect(warnings).toEqual(["Session ownership is unavailable; claims are off for this process"]);
 	});
 
-	it("an unavailable probe also turns claims off", async () => {
+	it("a probe turns claims off only for an unsupported platform", async () => {
 		await fs.mkdir(path.join(home, ".gjc", "runtime", "session-owners"), { recursive: true, mode: 0o700 });
 		const calls = backend(() => ({ status: FileLockAcquireStatus.Acquired }), {
 			state: FileLockProbeState.Unknown,
@@ -333,6 +333,24 @@ describe("narrow fail-open", () => {
 			reason: "unavailable",
 		});
 		expect(calls.acquire).toBe(0);
+	});
+
+	it("a probe's ENOTSUP or timeout leaves claims on", async () => {
+		await fs.mkdir(path.join(home, ".gjc", "runtime", "session-owners"), { recursive: true, mode: 0o700 });
+		for (const [reason, code] of [
+			[FileLockFailure.Unavailable, "ENOTSUP"],
+			[FileLockFailure.TimedOut, "timed_out"],
+		] as const) {
+			const calls = backend(() => ({ status: FileLockAcquireStatus.Held }), {
+				state: FileLockProbeState.Unknown,
+				reason,
+				code,
+			});
+			expect(await probeSessionOwner("f7")).toEqual({ state: "unknown", reason, code });
+			expect(await claimSessionOwner("f7", { surface: "terminal" })).toEqual({ status: "held", holder: undefined });
+			expect(calls.acquire).toBe(1);
+		}
+		expect(warnings).toEqual([]);
 	});
 
 	it.if(supported)("timed_out skips that one claim and the next claim tries again", async () => {
