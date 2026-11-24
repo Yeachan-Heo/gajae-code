@@ -17,6 +17,7 @@ import { cssColorOrFallback } from "./css-color";
 import {
 	createHtmlExportTempFile,
 	openExistingHtmlExportOutput,
+	openHtmlExportDestination,
 	removeHtmlExportTempFile,
 } from "./html-export-destination";
 import { TEMPLATE } from "./template.generated";
@@ -185,15 +186,45 @@ function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): 
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
-interface HtmlExportDescriptors {
-	source: number | undefined;
-	temp: { path: string; fd: number };
-}
-
 async function openHtmlExportDescriptors(
 	sourcePath: string | undefined,
 	outputPath: string,
-): Promise<HtmlExportDescriptors> {
+): Promise<{ source: number | undefined; destination: number }> {
+	let source: number | undefined;
+	let destination: number | undefined;
+	try {
+		if (sourcePath) {
+			try {
+				source = syncFs.openSync(sourcePath, HTML_EXPORT_SOURCE_OPEN_FLAGS);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			await assertExportDoesNotAliasSource(sourcePath, outputPath);
+		}
+		destination = openHtmlExportDestination(outputPath);
+		if (source !== undefined) {
+			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
+			const destinationIdentity = syncFs.fstatSync(destination, { bigint: true });
+			if (sameFileIdentity(sourceIdentity, destinationIdentity))
+				throw new Error("HTML export output must not overwrite the source transcript");
+		}
+		syncFs.ftruncateSync(destination, 0);
+		return { source, destination };
+	} catch (error) {
+		if (destination !== undefined) syncFs.closeSync(destination);
+		if (source !== undefined) syncFs.closeSync(source);
+		throw error;
+	}
+}
+
+/**
+ * Like {@link openHtmlExportDescriptors}, but opens a sibling temp file to write instead of the
+ * output, which is only opened (never written) to compare its identity with the source.
+ */
+async function openAtomicHtmlExportDescriptors(
+	sourcePath: string | undefined,
+	outputPath: string,
+): Promise<{ source: number | undefined; temp: { path: string; fd: number } }> {
 	let source: number | undefined;
 	let existing: number | undefined;
 	let temp: { path: string; fd: number } | undefined;
@@ -227,10 +258,16 @@ async function openHtmlExportDescriptors(
 	}
 }
 
-/**
- * Streams the export into an owner-only sibling temp file and renames it over `outputPath` only
- * once complete, so a failed or interrupted export leaves any previous file at the path intact.
- */
+/** A regular file, or nothing yet: a temp file renamed over it replaces it without side effects. */
+function isRegularOrMissingOutput(outputPath: string): boolean {
+	try {
+		return syncFs.lstatSync(outputPath).isFile();
+	} catch (error) {
+		if (isEnoent(error)) return true;
+		throw error;
+	}
+}
+
 async function writeSessionHtml(
 	sm: SessionManager,
 	state: AgentState | undefined,
@@ -243,20 +280,12 @@ async function writeSessionHtml(
 	const markerOffset = themedTemplate.indexOf(marker);
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
-	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
-	const tempPath = descriptors.temp.path;
-	const removeTemp = (): void => removeHtmlExportTempFile(tempPath);
-	const unregisterTempCleanup = postmortem.register("html-export-temp", removeTemp);
-	let tempOpen = true;
-	let published = false;
-	const sink = Bun.file(descriptors.temp.fd).writer();
-	let sinkEnded = false;
-	const encoder = new Base64StreamEncoder();
-	const writeEncoded = (value: string): void => {
-		const encoded = encoder.write(value);
-		if (encoded) sink.write(encoded);
-	};
-	try {
+	const writePayload = (sink: Bun.FileSink): void => {
+		const encoder = new Base64StreamEncoder();
+		const writeEncoded = (value: string): void => {
+			const encoded = encoder.write(value);
+			if (encoded) sink.write(encoded);
+		};
 		sink.write(themedTemplate.slice(0, markerOffset));
 		writeEncoded(`{"header":${sessionEmbedJson(sm.getHeader())},"entries":[`);
 		let first = true;
@@ -275,6 +304,42 @@ async function writeSessionHtml(
 		const final = encoder.finish();
 		if (final) sink.write(final);
 		sink.write(themedTemplate.slice(markerOffset + marker.length));
+	};
+	// A bounded snapshot streams its transcript while writing and can fail midway, so it writes a
+	// temp file and renames it over a regular (or missing) output, keeping any previous export.
+	// Every other export writes the output in place, as before.
+	if (sm.isBoundedReadOnlySnapshot() && isRegularOrMissingOutput(outputPath)) {
+		await writeSessionHtmlAtomically(sourcePath, outputPath, writePayload);
+		return;
+	}
+	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
+	const sink = Bun.file(descriptors.destination).writer();
+	try {
+		writePayload(sink);
+		await sink.end();
+	} catch (error) {
+		await sink.end();
+		throw error;
+	} finally {
+		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
+		syncFs.closeSync(descriptors.destination);
+	}
+}
+
+async function writeSessionHtmlAtomically(
+	sourcePath: string | undefined,
+	outputPath: string,
+	writePayload: (sink: Bun.FileSink) => void,
+): Promise<void> {
+	const descriptors = await openAtomicHtmlExportDescriptors(sourcePath, outputPath);
+	const tempPath = descriptors.temp.path;
+	const unregisterTempCleanup = postmortem.register("html-export-temp", () => removeHtmlExportTempFile(tempPath));
+	let tempOpen = true;
+	let published = false;
+	const sink = Bun.file(descriptors.temp.fd).writer();
+	let sinkEnded = false;
+	try {
+		writePayload(sink);
 		sinkEnded = true;
 		await sink.end();
 		tempOpen = false;
@@ -289,7 +354,7 @@ async function writeSessionHtml(
 		if (tempOpen) syncFs.closeSync(descriptors.temp.fd);
 		if (!published) {
 			try {
-				removeTemp();
+				removeHtmlExportTempFile(tempPath);
 			} catch {
 				// Never mask the export failure; the temp file is an owner-only dot file beside the output.
 			}

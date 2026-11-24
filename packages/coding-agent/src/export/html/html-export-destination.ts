@@ -4,8 +4,21 @@ import * as path from "node:path";
 import { hasFsCode, isEnoent } from "@gajae-code/utils";
 
 const NOFOLLOW = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+const HTML_EXPORT_DESTINATION_OPEN_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT | NOFOLLOW;
 const HTML_EXPORT_TEMP_OPEN_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW;
 const HTML_EXPORT_EXISTING_OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | NOFOLLOW;
+
+/** Owner-only HTML export. A replaced file is locked down on the opened descriptor. */
+export function openHtmlExportDestination(outputPath: string): number {
+	const fd = fs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o600);
+	try {
+		fs.fchmodSync(fd, 0o600);
+		return fd;
+	} catch (error) {
+		fs.closeSync(fd);
+		throw error;
+	}
+}
 
 /**
  * Owner-only sibling of `outputPath` that an export is written to and then renamed over the

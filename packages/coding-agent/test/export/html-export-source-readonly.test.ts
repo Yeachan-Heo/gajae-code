@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -336,6 +336,44 @@ describePosix("standalone HTML export through the bounded loader leaves its sour
 		expect(fs.existsSync(outputPath)).toBe(false);
 	});
 
+	it("keeps an existing output when a bounded export fails midway through its scan", async () => {
+		const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
+		const outputDir = makeTempDir("output");
+		const outputPath = path.join(outputDir, "export.html");
+		fs.writeFileSync(outputPath, "previous good export", { mode: 0o600 });
+		const outputBefore = snapshotTree(outputDir)["export.html"];
+		forceBoundedSnapshot();
+		const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+		const visit = snapshot.visitEntriesForExport.bind(snapshot);
+		// Emit every entry, then fail: the page is already partly written when the scan breaks.
+		const spy = vi.spyOn(snapshot, "visitEntriesForExport").mockImplementation(visitor => {
+			visit(visitor);
+			throw new Error("scan failed midway");
+		});
+		let refusal: string | undefined;
+		try {
+			refusal = await rejectionMessage(() => exportSessionToHtml(snapshot, undefined, { outputPath }));
+		} finally {
+			spy.mockRestore();
+			await snapshot.close();
+		}
+		expect(refusal).toBe("scan failed midway");
+		expect(snapshotTree(outputDir)["export.html"]).toEqual(outputBefore);
+		expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
+	});
+
+	it.skipIf(process.platform !== "darwin")(
+		"opens a non-regular target in place, as every other export does",
+		async () => {
+			const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
+			forceBoundedSnapshot();
+			// Same outcome as the eager path below: the in-place open's fchmod, not a temp file under /dev.
+			expect(await rejectionMessage(() => exportFromFile(sessionFile, { outputPath: "/dev/null" }))).toBe(
+				"EPERM: operation not permitted, fchmod",
+			);
+		},
+	);
+
 	const changedAfterOpen: ReadonlyArray<{ name: string; change: (sessionFile: string) => void }> = [
 		{
 			name: "replaced by a rename",
@@ -421,6 +459,38 @@ describePosix("standalone HTML export through the bounded loader leaves its sour
 			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 		});
 	}
+});
+
+describe("standalone and live HTML exports below the eager cap write the output in place", () => {
+	it("keeps the existing output's inode for an eager snapshot and a live session", async () => {
+		const content = staleReplayTranscript();
+		const { sessionFile } = seedSource(content);
+		const outputDir = makeTempDir("output");
+		const outputPath = path.join(outputDir, "export.html");
+		fs.writeFileSync(outputPath, "previous export", { mode: 0o600 });
+		const inode = fs.statSync(outputPath).ino;
+
+		await exportFromFile(sessionFile, { outputPath });
+		expect(fs.statSync(outputPath).ino).toBe(inode);
+		expect(fs.readFileSync(outputPath, "utf8")).toBe(await referenceHtml(content));
+
+		const live = await SessionManager.open(sessionFile, undefined, undefined, "copy-retain", "off");
+		try {
+			await exportSessionToHtml(live, undefined, { outputPath });
+		} finally {
+			await live.close();
+		}
+		expect(fs.statSync(outputPath).ino).toBe(inode);
+		expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
+	});
+
+	it.skipIf(process.platform !== "darwin")("opens a character device target in place, as before", async () => {
+		const { sessionFile } = seedSource(staleReplayTranscript());
+		// Unchanged behaviour: macOS refuses the owner-only fchmod on /dev/null, so this export fails there.
+		expect(await rejectionMessage(() => exportFromFile(sessionFile, { outputPath: "/dev/null" }))).toBe(
+			"EPERM: operation not permitted, fchmod",
+		);
+	});
 });
 
 describe("standalone HTML export side effects outside the source", () => {

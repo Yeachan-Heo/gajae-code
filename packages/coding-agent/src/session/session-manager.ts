@@ -25646,6 +25646,11 @@ export class SessionManager {
 		return this.#readOnlySnapshot;
 	}
 
+	/** A read-only snapshot above the eager cap, which reads its source lazily while exporting. */
+	isBoundedReadOnlySnapshot(): boolean {
+		return this.#readOnlySnapshot && this.#snapshotScanIdentity !== undefined;
+	}
+
 	/**
 	 * Hydrate an existing predecessor transcript for recovery without taking any
 	 * write-capable action. The caller must retain the returned context and use
