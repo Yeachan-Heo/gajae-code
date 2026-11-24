@@ -611,6 +611,7 @@ import type {
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
+	GraphSuccessorUnavailableError,
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
 	getSessionMessageObservationId,
@@ -620,7 +621,6 @@ import {
 	SessionManager,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
-	GraphSuccessorUnavailableError,
 	SharedSessionMutationUnsupportedError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
