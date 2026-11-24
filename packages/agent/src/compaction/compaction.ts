@@ -345,7 +345,7 @@ const EMERGENCY_RETAINED_MEMORY_BYTES = 128 * 1024 * 1024;
 const DIAGNOSTIC_RETAINED_MEMORY_BYTES = 64 * 1024 * 1024;
 const EMERGENCY_TUI_CHAT_CHILDREN = 1000;
 const DIAGNOSTIC_TUI_CHAT_CHILDREN = 700;
-const EMERGENCY_TRANSCRIPT_FILE_BYTES = 48 * 1024 * 1024; // 48 MiB (75% of the 64 MiB managed cap)
+const EMERGENCY_TRANSCRIPT_FILE_BYTES = 48 * 1024 * 1024; // 48 MiB (37.5% of the 128 MiB managed cap)
 let retainedMemoryDiagnosticActive = false;
 let tuiChatChildrenDiagnosticActive = false;
 

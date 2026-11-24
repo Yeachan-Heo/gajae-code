@@ -478,6 +478,45 @@ export async function findSparedSdkBrokerPidsBounded(
 	}
 }
 
+/** Process operations {@link signalOwnedProcessAlone} needs, injectable for tests. */
+export type SignalOwnedProcessDeps = {
+	/** Current kernel incarnation of a pid, or undefined when it is gone or unreadable. */
+	incarnationOf: (pid: number) => string | undefined;
+	/** Raw signal by pid; throws when delivery fails. */
+	killPid: (pid: number, signal: NodeJS.Signals) => void;
+};
+
+/**
+ * SIGKILL one owned process without touching its descendants, and only while `pid`
+ * still names the incarnation that was recorded as owned.
+ *
+ * The only caller is darwin cleanup when a broker is spared. Darwin has no atomic
+ * "signal iff start time matches" primitive, so `signalRoot` fails closed there
+ * today; it is tried first so this picks up an identity-bound signal if the platform
+ * ever gains one. The fallback re-reads the incarnation right before a raw `kill(2)`.
+ * That is the same check-then-kill race the native `killTree` accepts per node on
+ * darwin (slightly wider here because of the JS and napi hop), and narrower than
+ * `killTree`'s unchecked process-group signal, which this path replaces. The
+ * `signalRoot` rule against raw-pid fallback covers broker retirement, where failing
+ * closed just spares the broker; here failing closed would leak an owned process.
+ * Returns whether a signal was delivered.
+ */
+export function signalOwnedProcessAlone(
+	owned: Pick<NativeProcess, "pid" | "incarnation" | "signalRoot">,
+	deps: SignalOwnedProcessDeps,
+): boolean {
+	try {
+		if (owned.signalRoot(9)) return true;
+	} catch {}
+	if (deps.incarnationOf(owned.pid) !== owned.incarnation) return false;
+	try {
+		deps.killPid(owned.pid, "SIGKILL");
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function readPublishedSdkBroker(agentDir: string): Promise<{ pid: number; incarnation: string } | null> {
 	// Loaded lazily so guardian startup does not pull in the SDK discovery modules; it
 	// only runs at cleanup when an owned process has the broker launch argv.
@@ -666,10 +705,10 @@ export async function runBashShellGuardian(): Promise<void> {
 					// killTree walks ppid descendants, so on a non-spared ancestor (for example
 					// the darwin launch trampoline) it would still reach the spared broker.
 					// Darwin ownership already lists every descendant, so signal each one alone.
-					if (Process.fromPid(owned.pid)?.incarnation !== owned.incarnation) continue;
-					try {
-						process.kill(owned.pid, "SIGKILL");
-					} catch {}
+					signalOwnedProcessAlone(owned, {
+						incarnationOf: pid => Process.fromPid(pid)?.incarnation,
+						killPid: (pid, signal) => process.kill(pid, signal),
+					});
 				}
 			}
 			darwinTracker?.close();
