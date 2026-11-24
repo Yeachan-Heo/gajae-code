@@ -179,6 +179,14 @@ describe.if(supported)("session ownership across processes", () => {
 			await rewrite({ sessionId: "another-session" });
 			expect(await probeSessionOwner("p4")).toEqual({ state: "held", self: false, holder: undefined });
 
+			// A live pid without an incarnation is only "uncertain", never proof of the holder.
+			await rewrite({ processIncarnation: null });
+			expect(await probeSessionOwner("p4")).toEqual({ state: "held", self: false, holder: undefined });
+
+			// A host name that is not a plain host name never reaches a phrase.
+			await rewrite({ host: "evil host/../x", pid: exited.pid });
+			expect(await probeSessionOwner("p4")).toEqual({ state: "held", self: false, holder: undefined });
+
 			await Bun.write(recordPath("p4"), "not json");
 			expect(await probeSessionOwner("p4")).toEqual({ state: "held", self: false, holder: undefined });
 

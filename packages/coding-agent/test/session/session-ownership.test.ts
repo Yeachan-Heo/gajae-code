@@ -228,6 +228,31 @@ describe.if(supported)("claim, probe and release", () => {
 		expect(await probeSessionOwner("abc")).toMatchObject({ state: "held", self: true });
 	});
 
+	it("a batch probe answers every id, sixteen lock calls at a time", async () => {
+		await fs.mkdir(sessionOwnersDirectory(), { recursive: true, mode: 0o700 });
+		const ids = Array.from({ length: 40 }, (_, index) => `b${index}`);
+		const heldKeys = new Set(ids.filter((_, index) => index % 3 === 0).map(id => sessionOwnerKey(id)));
+		let inFlight = 0;
+		let peak = 0;
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => ({ status: FileLockAcquireStatus.Held }),
+			probe: async sidecar => {
+				inFlight += 1;
+				peak = Math.max(peak, inFlight);
+				await Bun.sleep(1);
+				inFlight -= 1;
+				const key = path.basename(sidecar, ".session-owner");
+				return { state: heldKeys.has(key) ? FileLockProbeState.Held : FileLockProbeState.Free };
+			},
+		};
+		const results = await probeSessionOwners(ids);
+		expect(peak).toBe(16);
+		expect([...results.keys()]).toEqual(ids);
+		for (const [index, id] of ids.entries()) {
+			expect(results.get(id)?.state).toBe(index % 3 === 0 ? "held" : "free");
+		}
+	});
+
 	it("a probe reports this process's own claim even when the owners directory is gone", async () => {
 		await claimed("s8");
 		const moved = path.join(home, "moved-owners");
