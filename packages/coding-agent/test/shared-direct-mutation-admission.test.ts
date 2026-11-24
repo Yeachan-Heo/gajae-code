@@ -96,7 +96,7 @@ function resident(manager: SessionManager) {
 
 describe("early direct shared mutation admission", () => {
 	it("refuses each direct mutation before resident, cursor, header, blob, or disk effects", async () => {
-		const { a, destination, file, root, custom, kept, compaction, sibling, own } = await shared();
+		const { a, destination, file, root, custom, assistant, kept, compaction, sibling, own } = await shared();
 		const message = a.getEntries().find(entry => entry.id === root);
 		const customMessage = a.getEntries().find(entry => entry.id === custom);
 		if (message?.type !== "message" || customMessage?.type !== "custom_message") throw new Error("missing seeds");
@@ -118,7 +118,6 @@ describe("early direct shared mutation admission", () => {
 			() => a.applyEntryMessageUpdates([{ ...message, message: user("new payload ".repeat(100_000)) }]),
 			() => a.applyCustomMessageEntryUpdates([{ ...customMessage, content: "changed", details: { value: 2 } }]),
 			() => a.evictCompactedContent(kept, compaction),
-			() => a.sanitizeLoadedOpenAIResponsesReplayMetadata(),
 			() => a.branchWithSummary(root, "forbidden summary"),
 		];
 		for (const mutate of mutations) {
@@ -129,6 +128,14 @@ describe("early direct shared mutation admission", () => {
 			expect(prepare).not.toHaveBeenCalled();
 			expect(applied).not.toHaveBeenCalled();
 		}
+		// In-memory sanitization of replay metadata should work on shared sessions without requiring admission
+		// (it doesn't persist changes). The sanitization succeeds and updates memory, but file bytes remain unchanged
+		const sanitized = a.sanitizeLoadedOpenAIResponsesReplayMetadata();
+		expect(sanitized).toBe(true);
+		const afterSanitize = a.getEntries().find(e => e.id === assistant);
+		if (afterSanitize?.type !== "message" || afterSanitize.message.role !== "assistant") throw new Error("missing assistant");
+		expect(afterSanitize.message.providerPayload).toBeUndefined();
+		expect(await fs.readFile(file)).toEqual(bytes);
 		put.mockRestore();
 		SessionManagerTestHooks.beforeEntryResidentPreparation = undefined;
 		// Navigation is local, not a transcript mutation.
@@ -195,5 +202,88 @@ describe("early direct shared mutation admission", () => {
 		if (entry?.type !== "message" || entry.message.role !== "assistant") throw new Error("missing assistant");
 		expect(entry.message.providerPayload).toBeUndefined();
 		expect(await fs.readFile(file)).toEqual(bytes);
+	});
+
+	it("resumes a shared managed session with stale replay metadata without throwing", async () => {
+		const directory = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-managed-replay-"));
+		roots.push(directory);
+		const cwd = path.join(directory, "workspace");
+		const agentDir = path.join(directory, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+
+		// Create session with managed destination
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const a = SessionManager.create(cwd, destination);
+		managers.push(a);
+
+		// Add entries including one with stale replay metadata
+		const userMsg = a.appendMessage(user("test message"));
+		const assistantMsgId = a.appendMessage({
+			...replayMessage(),
+			providerPayload: replayMessage().providerPayload,
+		});
+		await a.ensureOnDisk();
+		await a.flush();
+
+		const sessionFile = a.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		// Verify that the replay metadata exists before creating shared state
+		const beforeAssistant = a.getEntries().find(e => e.id === assistantMsgId);
+		if (beforeAssistant?.type !== "message" || beforeAssistant.message.role !== "assistant")
+			throw new Error("missing assistant");
+		expect(beforeAssistant.message.providerPayload).toBeDefined();
+		const beforeBytes = await fs.readFile(sessionFile);
+
+		// Open a sibling manager to create shared state
+		const b = await SessionManager.open(sessionFile, destination);
+		managers.push(b);
+
+		// Make both managers append using the sharing API to create shared mutation state
+		const siblingMsg = await b.appendMessageSharingSession(user("sibling from b"));
+		if (siblingMsg.kind !== "committed") throw new Error("sibling append failed");
+		const ownMsg = await a.appendMessageSharingSession(user("own from a"));
+		if (ownMsg.kind !== "committed") throw new Error("own append failed");
+
+		// Verify shared state is established
+		expect(a.getEntries().some(entry => entry.id === siblingMsg.id)).toBe(false);
+
+		// Close manager B
+		await b.closeStrict();
+		managers.pop();
+
+		// Close manager A
+		await a.closeStrict();
+		managers.pop();
+
+		// Resume the shared managed session - this should NOT throw
+		let resumed: SessionManager;
+		try {
+			resumed = await SessionManager.open(sessionFile, destination);
+			managers.push(resumed);
+		} catch (error) {
+			if (error instanceof Error && error.message.includes("Shared session mutation")) {
+				throw new Error(`Resume threw shared mutation error: ${error.message}`);
+			}
+			throw error;
+		}
+
+		// Verify that the replay metadata was sanitized in memory
+		const resumedAssistant = resumed.getEntries().find(e => e.id === assistantMsgId);
+		if (resumedAssistant?.type !== "message" || resumedAssistant.message.role !== "assistant")
+			throw new Error("missing assistant after resume");
+		expect(resumedAssistant.message.providerPayload).toBeUndefined();
+
+		// Verify that the replay metadata was in the file before resume
+		expect(beforeBytes.toString()).toContain("openaiResponsesHistory");
+		// After resume, verify that in-memory sanitization worked
+		// but that the file bytes reflect that replay metadata sanitization patches
+		// were NOT persisted (managed destination behavior)
+		const afterBytes = await fs.readFile(sessionFile);
+		expect(afterBytes.toString()).toContain("sibling from b");
+		// The original replay metadata payload should still be in the file
+		// (because managed destination doesn't persist the sanitization patches)
+		expect(afterBytes.toString()).toContain("openaiResponsesHistory");
 	});
 });
