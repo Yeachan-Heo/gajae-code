@@ -25,7 +25,7 @@ Pick by how many notifications you need:
 
 ## Output
 
-Returns `Monitor started · task <task_id>` plus a task entry visible via `job({list: true})`. Persistent notifications contain the latest line and the count of earlier coalesced lines; terminal completion flushes the newest pending line. A clean exit (status 0) after at least one notification normally sends no separate completion notice, so print a final status line if you need to know the script finished. A non-zero exit, a timeout, or an exit with no stdout line still sends the background-job completion result.
+Returns `Monitor started · task <task_id>` plus a task entry visible via `job({list: true})`. Persistent notifications contain the latest line and the count of earlier coalesced lines; terminal completion flushes the newest pending line. A clean exit (status 0) after at least one notification ends with a monitor notification saying it exited (code 0), in place of the background-job completion result. A non-zero exit, a timeout, or an exit with no stdout line sends the background-job completion result instead.
 
 ## Cancellation
 
