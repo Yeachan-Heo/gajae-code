@@ -504,6 +504,73 @@ describe("update-cli release lookup", () => {
 			}),
 		).rejects.toThrow("GITHUB_TOKEN");
 	});
+
+	it("skips stable releases without the binary asset for the current platform", async () => {
+		const requested: string[] = [];
+		const skipped: Array<{ tag: string; version: string }> = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: "stable",
+			requiredBinaryAsset: "gjc-linux-x64",
+			onSkippedRelease: (tag, version) => skipped.push({ tag, version }),
+			fetchImpl: async url => {
+				requested.push(String(url));
+				// Return multiple releases: v9.9.9 without the asset, v9.9.8 with it
+				return new Response(
+					JSON.stringify([
+						{
+							tag_name: "v9.9.9",
+							draft: false,
+							prerelease: false,
+							assets: [{ name: "gjc-darwin-arm64" }, { name: "gjc-windows-x64.exe" }],
+						},
+						{
+							tag_name: "v9.9.8",
+							draft: false,
+							prerelease: false,
+							assets: [{ name: "gjc-linux-x64" }, { name: "gjc-darwin-arm64" }],
+						},
+					]),
+					{ status: 200 },
+				);
+			},
+		});
+
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50");
+		expect(skipped).toEqual([{ tag: "v9.9.9", version: "9.9.9" }]);
+		expect(release.tag).toBe("v9.9.8");
+		expect(release.version).toBe("9.9.8");
+		expect(release.warnings).toEqual(["release v9.9.9 has no asset for gjc-linux-x64 yet"]);
+	});
+
+	it("throws when no stable releases have the required binary asset", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				channel: "stable",
+				requiredBinaryAsset: "gjc-linux-x64",
+				fetchImpl: async () =>
+					new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.9",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-darwin-arm64" }],
+							},
+							{
+								tag_name: "v9.9.8",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-windows-x64.exe" }],
+							},
+						]),
+						{ status: 200 },
+					),
+			}),
+		).rejects.toThrow("no published release with the gjc-linux-x64 asset yet");
+	});
 });
 
 describe("update-cli install target detection", () => {
