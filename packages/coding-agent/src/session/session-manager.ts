@@ -22707,7 +22707,10 @@ export class SessionManager {
 
 	async #sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist(): Promise<boolean> {
 		const patches = this.#sanitizeLoadedOpenAIResponsesReplayMetadata();
-		if (!this.isManagedDestination()) await this.#persistPatches(patches);
+		if (!this.isManagedDestination()) {
+			if (patches.length > 0) this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
+			await this.#persistPatches(patches);
+		}
 		return patches.length > 0;
 	}
 
@@ -22717,7 +22720,6 @@ export class SessionManager {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitizedMessage === entry.message) continue;
-			this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
 			entry.message = sanitizedMessage;
 			patches.push({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
 		}
