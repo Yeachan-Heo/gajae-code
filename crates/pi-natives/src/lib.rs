@@ -35,6 +35,7 @@ pub mod doctor_link;
 
 pub mod edit;
 pub mod fd;
+pub mod file_lock;
 pub mod fs_cache;
 pub mod glob;
 pub mod glob_util;
