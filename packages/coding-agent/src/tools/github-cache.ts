@@ -86,6 +86,12 @@ function protectDbFiles(dbPath: string): void {
 	chmodIfExists(`${dbPath}-shm`, 0o600);
 }
 
+/** Derives the v5 cache path; always distinct from `basePath`, whatever extension the override uses. */
+export function versionedCachePath(basePath: string): string {
+	const ext = path.extname(basePath);
+	return ext ? `${basePath.slice(0, -ext.length)}-v5${ext}` : `${basePath}-v5`;
+}
+
 export function openDb(): Database | null {
 	if (cachedDb) return cachedDb;
 	if (openAttempted) return null;
@@ -94,7 +100,7 @@ export function openDb(): Database | null {
 		// Use versioned namespace for v5+ cache to isolate from legacy writers.
 		// This prevents pre-v5 processes from repopulating the cache with unscrubbed data.
 		const basePath = getGithubCacheDbPath();
-		const dbPath = basePath.replace(/\.db$/, "-v5.db");
+		const dbPath = versionedCachePath(basePath);
 		const legacyDbPath = basePath; // Old path without -v5 suffix
 
 		// The legacy cache may hold unscrubbed diffs, and an older process can recreate it at any time,

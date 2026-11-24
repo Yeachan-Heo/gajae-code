@@ -21,6 +21,7 @@ import {
 	putCached,
 	resetForTests as resetCacheForTests,
 	resetForTests,
+	versionedCachePath,
 } from "@gajae-code/coding-agent/tools/github-cache";
 import * as git from "@gajae-code/coding-agent/utils/git";
 
@@ -1137,6 +1138,32 @@ describe("Credential scrubbing in cached data", () => {
 			expect(openDb()).not.toBeNull();
 			expect(await fs.stat(legacyPath).catch(() => null)).toBeNull();
 			expect(await fs.stat(`${legacyPath}-wal`).catch(() => null)).toBeNull();
+		});
+
+		it("derives a distinct v5 path for every override extension", () => {
+			expect(versionedCachePath("/c/github-cache.db")).toBe("/c/github-cache-v5.db");
+			expect(versionedCachePath("/c/cache.sqlite")).toBe("/c/cache-v5.sqlite");
+			expect(versionedCachePath("/c/cache")).toBe("/c/cache-v5");
+		});
+
+		it("keeps the active cache when the override does not end in .db", async () => {
+			const override = path.join(tempDir, "cache.sqlite");
+			process.env.GJC_GITHUB_CACHE_DB = override;
+			resetForTests();
+			putCached({
+				repo: TEST_REPO,
+				kind: "issue",
+				number: 5,
+				includeComments: false,
+				payload: "p",
+				rendered: "r",
+				sourceUrl: "u",
+				fetchedAt: Date.now(),
+			});
+			resetForTests();
+			expect(openDb()).not.toBeNull();
+			expect(await fs.stat(versionedCachePath(override)).catch(() => null)).not.toBeNull();
+			expect(getCached(TEST_REPO, "issue", 5, false)).not.toBeNull();
 		});
 
 		it("disables the cache when the legacy cache cannot be removed", async () => {
