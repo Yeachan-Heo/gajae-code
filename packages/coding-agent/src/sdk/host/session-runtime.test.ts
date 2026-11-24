@@ -11335,6 +11335,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		let abortCalls = 0;
 		let publicationFailed = false;
 		let correlation: { commandId?: string; turnId?: string } = {};
+		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
+		const publicationAttempted = Promise.withResolvers<void>();
+		const recoveryRetired = Promise.withResolvers<void>();
 		try {
 			harness = await invocationHarness("deadline-stop-publication-loss", cwd, {
 				settings: {
@@ -11346,6 +11349,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					await neverSettlingPromise();
 				},
 				terminalAbortSeams: {
+					onDeadlineRecoveryCheckpointForTests: checkpoint => {
+						recoveryCheckpoints.push(checkpoint);
+						if (checkpoint.stage === "publication-result") publicationAttempted.resolve();
+						if (checkpoint.stage === "deadline-recovery-retired") recoveryRetired.resolve();
+					},
 					getTerminalTurnEpoch: () => epoch,
 					getActivePromptHandle: () => "deadline-publication-loss-run",
 					pendingToolExecutions: () => [],
@@ -11377,15 +11385,21 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(accepted.ok).toBe(true);
 			correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			await harness.emit("agent_start");
-			const abortDeadline = Date.now() + 2_000;
-			while (abortCalls === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
-			expect(abortCalls).toBe(1);
-			const publicationDeadline = Date.now() + 2_000;
-			while (!publicationFailed && Date.now() < publicationDeadline) await Bun.sleep(10);
+			await publicationAttempted.promise;
+			expect(abortCalls, JSON.stringify(recoveryCheckpoints)).toBe(1);
 			expect(publicationFailed).toBe(true);
+			expect(recoveryCheckpoints.map(checkpoint => checkpoint.stage)).toEqual([
+				"terminalization-start",
+				"terminalization-result",
+				"publication-start",
+				"note-transition-start",
+				"note-transition-before-persist",
+				"note-transition-persisted",
+				"publication-result",
+			]);
 			// The ring append is authoritative even when this immediate broadcast
 			// fails; the deadline must reconcile it once without appending a duplicate.
-			await Bun.sleep(150);
+			await recoveryRetired.promise;
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
 				status: "failed",
 				error: { code: "prompt_deadline_exceeded" },
