@@ -10,6 +10,7 @@ import {
 	parseOwnershipRecord,
 	retainOwnedProcess,
 	sdkBrokerAgentDirFromArgs,
+	signalOwnedProcessAlone,
 } from "../src/exec/bash-shell-guardian";
 
 type ProcessDouble = { pid: number; incarnation: string; children: () => NativeProcess[] };
@@ -525,6 +526,67 @@ describe("bash-shell-guardian", () => {
 			);
 			expect(spared.size).toBe(0);
 			expect(Date.now() - started).toBeLessThan(1_000);
+		});
+	});
+
+	describe("signalOwnedProcessAlone", () => {
+		const ownedRef = (signalRoot: () => boolean) => ({ pid: 10, incarnation: "b", signalRoot });
+
+		it("uses the identity-bound native signal when the platform delivers it", () => {
+			const kills: number[] = [];
+			const delivered = signalOwnedProcessAlone(
+				ownedRef(() => true),
+				{
+					incarnationOf: () => {
+						throw new Error("must not re-read identity");
+					},
+					killPid: pid => kills.push(pid),
+				},
+			);
+			expect(delivered).toBe(true);
+			expect(kills).toEqual([]);
+		});
+
+		it("falls back to a raw kill only while the recorded incarnation still holds", () => {
+			const kills: Array<[number, string]> = [];
+			const deps = { killPid: (pid: number, signal: string) => kills.push([pid, signal]) };
+			expect(
+				signalOwnedProcessAlone(
+					ownedRef(() => false),
+					{ ...deps, incarnationOf: () => "b" },
+				),
+			).toBe(true);
+			expect(kills).toEqual([[10, "SIGKILL"]]);
+
+			expect(
+				signalOwnedProcessAlone(
+					ownedRef(() => false),
+					{ ...deps, incarnationOf: () => "reused" },
+				),
+			).toBe(false);
+			expect(
+				signalOwnedProcessAlone(
+					ownedRef(() => false),
+					{ ...deps, incarnationOf: () => undefined },
+				),
+			).toBe(false);
+			expect(kills).toHaveLength(1);
+		});
+
+		it("treats a throwing native signal as unsupported and a failed raw kill as undelivered", () => {
+			const throwing = ownedRef(() => {
+				throw new Error("unsupported");
+			});
+			let attempts = 0;
+			const delivered = signalOwnedProcessAlone(throwing, {
+				incarnationOf: () => "b",
+				killPid: () => {
+					attempts += 1;
+					throw new Error("ESRCH");
+				},
+			});
+			expect(delivered).toBe(false);
+			expect(attempts).toBe(1);
 		});
 	});
 });
