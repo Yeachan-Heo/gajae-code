@@ -43,6 +43,8 @@ export interface BiomeSizeSettings {
 export interface BiomeConfigScope {
 	/** Repository-relative directory of the config; "" for the root. */
 	dir: string;
+	/** Repository-relative path of the config file itself. */
+	configPath: string;
 	settings: BiomeSizeSettings;
 }
 
@@ -191,7 +193,7 @@ export async function checkBiomeMaxSize(options: CheckBiomeMaxSizeOptions): Prom
 	const rootSettings = parseBiomeSizeSettings(await Bun.file(path.join(options.root, "biome.json")).text(), {
 		configPath: "biome.json",
 	});
-	const scopes: BiomeConfigScope[] = [{ dir: "", settings: rootSettings }];
+	const scopes: BiomeConfigScope[] = [{ dir: "", configPath: "biome.json", settings: rootSettings }];
 	for (const candidate of candidates) {
 		const dir = configDir(candidate);
 		if (dir === "" || !CONFIG_FILE_NAMES.has(path.posix.basename(candidate))) continue;
@@ -199,6 +201,7 @@ export async function checkBiomeMaxSize(options: CheckBiomeMaxSizeOptions): Prom
 		if (!(await file.exists())) continue;
 		scopes.push({
 			dir,
+			configPath: candidate,
 			settings: parseBiomeSizeSettings(await file.text(), {
 				configPath: candidate,
 				rootMaxSize: rootSettings.maxSize,
@@ -224,7 +227,7 @@ export async function checkBiomeMaxSize(options: CheckBiomeMaxSizeOptions): Prom
 				path: candidate,
 				size: file.size,
 				limit,
-				config: scope.dir === "" ? "biome.json" : `${scope.dir}/biome.json`,
+				config: scope.configPath,
 			});
 		}
 	}

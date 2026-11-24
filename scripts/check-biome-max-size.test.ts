@@ -99,6 +99,17 @@ describe("checkBiomeMaxSize", () => {
 		expect(result.oversized.map(entry => [entry.path, entry.limit])).toEqual([["src/big.ts", 1000]]);
 	});
 
+	test("labels a nested biome.jsonc with its real file name", async () => {
+		const result = await check({
+			"biome.json": rootConfig({ maxSize: 1000, includes: ["src/**/*.ts"] }),
+			"vendor/biome.jsonc": JSON.stringify({ root: false, files: { maxSize: 2000 } }),
+			"vendor/src/big.ts": "x".repeat(2001),
+		});
+		expect(result.oversized).toEqual([
+			{ path: "vendor/src/big.ts", size: 2001, limit: 2000, config: "vendor/biome.jsonc" },
+		]);
+	});
+
 	test("checks files under a nested biome.json against that config's limit", async () => {
 		const result = await check({
 			"biome.json": rootConfig({ maxSize: 1000, includes: ["src/**/*.ts", "!vendor/**"] }),
