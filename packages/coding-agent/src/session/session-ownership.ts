@@ -378,8 +378,11 @@ class Claim implements SessionOwnerClaim {
 		const entry = this.#entry;
 		entry.holders -= 1;
 		if (entry.holders > 0) return;
+		const entries = registry().entries;
+		// A test reset dropped and unlocked this entry; the sidecar may now name a newer claim.
+		if (entries.get(this.#sidecar) !== entry) return;
 		// Synchronous from here to the unlock, so no claim in this process can meet its own lock.
-		registry().entries.delete(this.#sidecar);
+		entries.delete(this.#sidecar);
 		// Remove the record before the lock, so a successor's record is never removed; leave a
 		// record whose nonce is not ours.
 		if (readRecord(entry.recordPath)?.claimNonce === entry.nonce) {

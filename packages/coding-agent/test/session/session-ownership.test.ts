@@ -87,6 +87,18 @@ describe("test isolation", () => {
 		expect(await probeSessionOwner("leak")).toEqual({ state: "free" });
 		expect(() => resetSessionOwnershipForTests()).not.toThrow();
 	});
+
+	it.if(supported)("releasing a claim the reset dropped leaves a newer claim of that session alone", async () => {
+		const leaked = await claimSessionOwner("leak2", { surface: "terminal" });
+		if (leaked.status !== "claimed") throw new Error("expected a claim");
+		expect(() => resetSessionOwnershipForTests()).toThrow("1 session claim(s) were never released");
+		const newer = await claimed("leak2", "sdk");
+		expect(newer.shared).toBe(false);
+		leaked.claim.release();
+		expect(await probeSessionOwner("leak2")).toMatchObject({ state: "held", self: true, holder: { surface: "sdk" } });
+		expect(await probeFileLock(ownersPath("leak2", ".session-owner"))).toEqual({ state: FileLockProbeState.Held });
+		expect(await readJson(ownersPath("leak2", ".owner.json"))).toMatchObject({ surface: "sdk" });
+	});
 });
 
 describe("sessionOwnerKey", () => {
