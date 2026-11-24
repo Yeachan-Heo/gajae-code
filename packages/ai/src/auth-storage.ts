@@ -1111,7 +1111,8 @@ const USAGE_CACHE_PREFIX = "usage_cache:";
  * Argon / Claude-GPT quota pools; schema 1 rows carry window `default` with
  * per-model labels and pool nothing.
  */
-const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2 };
+// openai-codex 2: reports carry the ChatGPT workspace id as `orgId`, so cached reports without it are not reused.
+const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2, "openai-codex": 2 };
 
 function usageReportSchemaTag(provider: string): string {
 	const version = USAGE_REPORT_SCHEMA_VERSIONS[provider];
@@ -5366,8 +5367,8 @@ export class AuthStorage {
 		const email = this.#getUsageReportMetadataValue(report, "email");
 		if (email) identifiers.push(`email:${email.toLowerCase()}`);
 		if (report.provider === "openai-codex" || report.provider === "anthropic") {
-			// One Anthropic account can sign in to several organizations; each has its own limits.
-			const orgId = report.provider === "anthropic" ? this.#getUsageReportMetadataValue(report, "orgId") : undefined;
+			// One account can sign in to several Anthropic organizations or ChatGPT workspaces; each has its own limits.
+			const orgId = this.#getUsageReportMetadataValue(report, "orgId");
 			if (orgId) return identifiers.map(identifier => `${report.provider}:${identifier}|org:${orgId}`.toLowerCase());
 			return identifiers.map(identifier => `${report.provider}:${identifier.toLowerCase()}`);
 		}

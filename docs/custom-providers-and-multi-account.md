@@ -104,6 +104,7 @@ gjc accounts pin anthropic id:42 --persistent
 gjc accounts pin anthropic --clear --persistent
 gjc accounts prefer anthropic low-cost@example.com shared@example.com=75
 gjc accounts prefer anthropic --clear
+gjc accounts prefer openai-codex 'org:Acme Team' org:Personal
 gjc accounts logout anthropic --account me@example.com
 gjc accounts logout anthropic --all
 ```
@@ -115,6 +116,8 @@ gjc accounts logout anthropic --all
 - `logout` requires exactly one of `--account <id|email>` or `--all`; it removes only OAuth rows from the local store. It never removes API-key source rows, and it refuses to mutate a broker-backed store.
 
 API-key rows remain visible and checkable so operators can see which source is selected, but they are not part of OAuth account pooling, cannot be pinned by `gjc accounts pin`, and cannot be removed by `gjc accounts logout`.
+
+One login can hold several OAuth rows, one per organization, with the same email. For Anthropic the organization is the Claude organization the login was bound to. For OpenAI Codex it is the ChatGPT workspace: run `/login` (or the device login) once per workspace and choose that workspace on the OpenAI sign-in page. Each row records the workspace id (`chatgpt_account_id`) as its organization id, so re-logging in to a workspace, or importing a Codex CLI `auth.json`, replaces only that workspace's row, and each row reports its own usage limits. At login gjc also looks up the workspace name (`Personal` for the personal workspace) and lists the row as `email (workspace name)`; the lookup is best-effort and is not repeated on token refresh, so a row whose lookup failed, or that was stored or imported without one, lists by email only and is chosen with `org:<workspace-id>` until the next login to that workspace. Choose or order the rows with `org:<id or name>`. `gjc accounts prefer` follows the rule above: with one Codex row it stores the email, and when several workspaces share the email it stores the workspace's `account:<workspace-id>` (the workspace id is also the account id).
 
 ### `gjc accounts --json` output and failure contract
 

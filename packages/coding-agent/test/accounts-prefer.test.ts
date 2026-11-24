@@ -28,7 +28,7 @@ function oauth(email: string, accountId: string, organizationId?: string) {
 	};
 }
 
-async function preferJson(selectors: string[] | undefined, clear = false): Promise<PreferJson> {
+async function preferJson(selectors: string[] | undefined, clear = false, provider = "anthropic"): Promise<PreferJson> {
 	const chunks: string[] = [];
 	const original = process.stdout.write.bind(process.stdout);
 	process.stdout.write = ((chunk: Uint8Array | string): boolean => {
@@ -37,7 +37,7 @@ async function preferJson(selectors: string[] | undefined, clear = false): Promi
 	}) as typeof process.stdout.write;
 	const priorExitCode = process.exitCode;
 	try {
-		await runAccountsCommand({ action: "prefer", provider: "anthropic", selectors, flags: { json: true, clear } });
+		await runAccountsCommand({ action: "prefer", provider, selectors, flags: { json: true, clear } });
 	} finally {
 		process.stdout.write = original as typeof process.stdout.write;
 		process.exitCode = priorExitCode ?? 0;
@@ -371,6 +371,53 @@ describe("gjc accounts prefer", () => {
 
 			expect(result).toEqual({ ok: true, provider: "anthropic", cleared: true } as never);
 			expect(await writtenPreferences()).toEqual({});
+		},
+		CLI_TIMEOUT_MS,
+	);
+
+	it(
+		"orders the ChatGPT workspaces of one Codex login by workspace name, stored as workspace ids",
+		async () => {
+			// A Codex login stores one row per ChatGPT workspace: the workspace id is both the account id and the
+			// organization id, and only the email is shared.
+			const workspace = (id: string, name: string) => ({
+				...oauth("me@example.com", id),
+				access: `access-${id}`,
+				refresh: `refresh-${id}`,
+				organizationId: id,
+				organizationName: name,
+			});
+			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+			let teamId: number;
+			let personalId: number;
+			try {
+				store.upsertAuthCredentialForProvider("openai-codex", workspace("ws-team", "Acme Team"));
+				store.upsertAuthCredentialForProvider("openai-codex", workspace("ws-personal", "Personal"));
+				const rows = store.listAuthCredentials("openai-codex");
+				expect(rows).toHaveLength(2);
+				teamId = rows.find(
+					row => row.credential.type === "oauth" && row.credential.organizationId === "ws-team",
+				)!.id;
+				personalId = rows.find(row => row.id !== teamId)!.id;
+			} finally {
+				store.close();
+			}
+
+			const result = await preferJson(["org:Personal", "org:acme team=80"], false, "openai-codex");
+
+			const entries = ["account:ws-personal", { "account:ws-team": 80 }];
+			expect(result).toEqual({ ok: true, provider: "openai-codex", preferences: entries } as never);
+			expect(await writtenPreferences()).toEqual({ "openai-codex": entries });
+			const preferences = (await resolveStartupAuthConfig(agentDir)).credentialPreferences["openai-codex"] ?? [];
+			const storage = await discoverAuthStorage(agentDir);
+			try {
+				expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+				expect(
+					preferences.map(({ selector }) => storage.resolveOAuthPinTarget("openai-codex", selector).credentialId),
+				).toEqual([personalId, teamId]);
+			} finally {
+				storage.close();
+			}
 		},
 		CLI_TIMEOUT_MS,
 	);
