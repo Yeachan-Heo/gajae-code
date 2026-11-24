@@ -167,6 +167,13 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// Line sends whose sendCustomMessage has not settled yet (waiting for queue
 		// admission, or running the idle turn they started).
 		let unsettledSends = 0;
+		// A line notification the session rejected (e.g. during a handoff): the
+		// line never reached the agent, so the job's own completion must stay.
+		let lineDeliveryFailed = false;
+		// The exit went out as non-waking next-turn context. A line send that was
+		// still in flight then and is rejected afterwards would leave the agent
+		// with neither the line nor a wake, so the exit is re-reported as a wake.
+		let silentExitSent = false;
 		// Count of notification *sends* (not live queue depth): once it exceeds the
 		// cap, each new send first purges older queued notifications for this task,
 		// keeping the queue bounded and latest-biased.
@@ -255,9 +262,15 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			const registration = generation ? lookupOwnedRegistration(jobId, generation, endpointId) : undefined;
 			if (registration) unregisterOwnedRegistration(registration);
 		};
-		const sendNotification = (line: string | undefined, jobId: string, count: number, exit?: "wake" | "silent") => {
+		const sendNotification = (
+			line: string | undefined,
+			jobId: string,
+			count: number,
+			exit?: "wake" | "silent",
+			afterClose = false,
+		) => {
 			const exited = exit !== undefined;
-			if (controller.closed) return;
+			if (controller.closed && !afterClose) return;
 			if (line !== undefined) lastSent = { line, count };
 			const notificationId = `${jobId}:${sequence}`;
 			const suffix = count > 0 ? `\n(+${count} earlier lines)` : "";
@@ -350,6 +363,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 							error: error instanceof Error ? error.message : String(error),
 						});
 					});
+				silentExitSent = true;
 				retireRegistrationAfterSilentExit(jobId);
 				return;
 			}
@@ -360,6 +374,13 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 					logger.warn("Monitor task-notification delivery failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});
+					if (exited) return;
+					lineDeliveryFailed = true;
+					if (silentExitSent) {
+						silentExitSent = false;
+						sequence += 1;
+						sendNotification(line, jobId, count, "wake", true);
+					}
 				})
 				.finally(() => {
 					if (!exited) unsettledSends -= 1;
@@ -391,12 +412,13 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				// own exit notification (sendExitNotification), so the job's async-result
 				// would wake the agent a second time for the same exit (#7993). Every
 				// other exit keeps the async-result because it is then the only exit
-				// report: failures, timeouts, no stdout line, no custom-message router,
-				// and clients that defer agent-initiated turns (a task-notification
-				// there does not wake the agent).
+				// report: failures, timeouts, no stdout line, a rejected line send, no
+				// custom-message router, and clients that defer agent-initiated turns (a
+				// task-notification there does not wake the agent).
 				shouldAcknowledgeCompletion: () => {
 					completionAcknowledged =
 						deliveredFirstLine &&
+						!lineDeliveryFailed &&
 						!controller.closed &&
 						this.session.sendCustomMessage !== undefined &&
 						this.session.getClientBridge?.()?.deferAgentInitiatedTurns !== true;

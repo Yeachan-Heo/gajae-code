@@ -641,6 +641,67 @@ describe("MonitorTool", () => {
 			expect(purges).toBe(0);
 		});
 
+		it("keeps the async-result when the session rejected a line notification", async () => {
+			const sent: Steered[] = [];
+			const session = createSession(settings);
+			// Handoff-guard shape: the session refuses the waking line send.
+			session.sendCustomMessage = (async (msg: Steered, options?: unknown) => {
+				if ((options as { triggerTurn?: boolean } | undefined)?.triggerTurn) {
+					throw new Error("handoff transition in progress");
+				}
+				sent.push({ ...msg, options });
+			}) as typeof session.sendCustomMessage;
+			const tool = MonitorTool.createIf(session)!;
+			const result = expectText(
+				await tool.execute("call", {
+					command: "printf 'ALIVE\\n'; sleep 1.5",
+					kind: "poll",
+					description: "rejected line",
+					persistent: true,
+				}),
+			);
+			await settle();
+
+			expect(manager.getJob(result.details.taskId)?.status).toBe("completed");
+			expect(exitNotifications(sent)).toEqual([]);
+			expect(completions).toEqual([result.details.taskId]);
+		});
+
+		it("re-reports the exit as a wake when a line send in flight at a silent exit is rejected", async () => {
+			const release = Promise.withResolvers<void>();
+			const sent: Steered[] = [];
+			let lineSends = 0;
+			const session = createSession(settings);
+			// The first waking send stays in flight past the exit, then is rejected.
+			session.sendCustomMessage = (async (msg: Steered, options?: unknown) => {
+				const waking = (options as { triggerTurn?: boolean } | undefined)?.triggerTurn === true;
+				if (waking && lineSends++ === 0) {
+					await release.promise;
+					throw new Error("handoff transition in progress");
+				}
+				sent.push({ ...msg, options });
+			}) as typeof session.sendCustomMessage;
+			const tool = MonitorTool.createIf(session)!;
+			const result = expectText(
+				await tool.execute("call", {
+					command: "printf 'DEPLOY OK\\n'; sleep 1.5",
+					kind: "poll",
+					description: "late rejection",
+					persistent: true,
+				}),
+			);
+			await settle();
+			expect(sent.map(entry => entry.options)).toEqual([SILENT]);
+
+			release.resolve();
+			await waitUntil(() => sent.length === 2);
+			expect(sent[1]!.options).toEqual(WAKE);
+			expect(sent[1]!.content).toContain("DEPLOY OK");
+			expect(sent[1]!.content).toContain(EXIT_MARKER);
+			expect(completions).toEqual([]);
+			expect(manager.getJob(result.details.taskId)?.status).toBe("completed");
+		});
+
 		it("keeps the async-result when the monitor fails after delivering lines", async () => {
 			const steered: Steered[] = [];
 			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;

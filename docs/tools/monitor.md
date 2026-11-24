@@ -42,7 +42,9 @@ Each newline-terminated stdout line is appended to the manager-owned cursor. Per
    - when every line was already delivered, the exit is sent with `deliverAs: "nextTurn"`, `triggerTurn: false`, `origin: "external"`: it does not wake the agent and is added as context to its next turn. It carries no owned envelope, so the monitor retires the owned registration itself unless a line send is still in flight (that line is settled by `AgentSession` on delivery);
    - automatic retention eviction does not purge it, since it is the only report of the exit. An explicit post-eviction `job` cancel still purges it.
 
-   A non-zero exit, a timeout, an exit with no stdout line, a session without a custom-message router, or a client that defers agent-initiated turns (ACP) sends no exit notification and keeps the ordinary `async-result` delivery, because it is then the only report or wake for the exit.
+   - if a line send that was still in flight at a silent exit is rejected afterwards, the exit is re-reported as a waking follow-up carrying that line.
+
+   A non-zero exit, a timeout, an exit with no stdout line, a line notification the session rejected (for example during a handoff), a session without a custom-message router, or a client that defers agent-initiated turns (ACP) sends no exit notification and keeps the ordinary `async-result` delivery, because it is then the only report or wake for the exit.
 
 ## Errors
 
