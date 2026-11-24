@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-24
+
+### Fixed
+
+- Keep a live native-build temporary file, and keep the existing index when a rename fails for a reason other than a Windows file-in-use error. A missing or regular `index.js` or `index.d.ts` is written in place without a temporary file or rename: an existing file keeps its inode, mode, owner, and ACL, and a missing one is created with mode 0644 (subject to umask). Temp and rename are used only for a symlink or another non-regular destination. An existing index is truncated only after the opened file is confirmed to be the one that was checked. A symlinked `index.js` or declaration is not read, so a linked private file is never copied into a new index.
+
+- When installing generated native bindings, replace a destination symlink instead of following it. An existing regular index file is updated in place.
+
+- Report Windows `STATUS_ACCESS_DENIED` (`0xC0000022`) as `access_denied` instead of `owner_mismatch` from tree snapshots, exact tree removal and detach, exact unlink and restore, and the exact-replace rename. NTFS refuses to rename a directory while another process holds a handle on one of its children, so a lock directory whose `info` file is being read returned a permanent-looking owner failure for what is transient contention. Callers of `exactReplacePath` and `exactRestore` that matched `owner_mismatch` for a denied open or rename now receive `access_denied`. The owner-only security APIs still report a denied open as `owner_mismatch`, so managed-session repair routing and the skip for foreign-owner tmux state keep their behavior.
+- A tree snapshot whose child open fails reports that first failure (for example `sharing_violation` or `access_denied`) instead of the directory reopen's `io_error`.
+
+- On Windows, `Process.observe` reports a process that has exited as `absent` even while a handle to it is still open, by checking the handle's exit state with a zero-timeout wait. It previously reported such a process as `present`, so `gjc sdk` commands failed to clean up a broker that had already exited on a lock failure and hid the lock failure behind a cleanup error.
+- On Windows, `Process.observe` no longer needs termination rights to report `present`; a live process that denies termination access but allows query and synchronize access is now `present` with its incarnation instead of `unknown`.
+
 ## [0.22.0] - 2026-11-19
 
 ## [0.21.1] - 2026-11-17
