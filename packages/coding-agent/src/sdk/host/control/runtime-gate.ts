@@ -45,6 +45,7 @@ export function prohibitBrokerLifecycleOperation(operation: string): never {
 		code: "operation_prohibited",
 	});
 }
+
 export const BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD = "__gjcBrokerCloseCapability";
 /** Private field carried only on the Broker-authorized terminal-abort request. */
 export const BROKER_RUNTIME_ABORT_CAPABILITY_FIELD = "__gjcBrokerAbortCapability";

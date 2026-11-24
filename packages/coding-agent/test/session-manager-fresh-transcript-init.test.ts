@@ -1,8 +1,9 @@
 /**
  * Opening a transcript path that has no session yet initializes a fresh session at that
- * exact path: a single header line whose id is the manager's id. Covers the explicit
- * eager open, the bounded (session-memory) open and a staged attempt, which all reach
- * the fresh-transcript branch of `#initSessionFile`.
+ * exact path: a single header line whose id is the manager's id. Covers the explicit open
+ * with and without session memory, and a staged attempt, which all reach the
+ * fresh-transcript branch of `#initSessionFile`. A missing file is never admitted to the
+ * bounded (sidecar) path, so session memory only changes which caller routes it there.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
@@ -49,7 +50,7 @@ describe("fresh transcript initialization at a missing path", () => {
 		expectFreshTranscript(manager, file);
 	});
 
-	it("bounded open writes one header for the new session id", async () => {
+	it("open with session memory enabled writes the same single header", async () => {
 		const file = path.join(makeTempDir(), "missing-bounded.jsonl");
 		const manager = await SessionManager.open(file, undefined, new FileSessionStorage(), "copy-retain", "enabled");
 		managers.push(manager);
