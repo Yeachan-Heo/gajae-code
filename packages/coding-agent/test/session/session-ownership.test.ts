@@ -483,12 +483,12 @@ describe("SessionHeldError", () => {
 		expect(error.code).toBe("session_held");
 		expect(error.holder).toEqual({ surface: "terminal", pid: 4242 });
 		expect(error.operatorMessage).toBe(
-			"Session 3f9a1c2e is open for writing in another terminal (pid 4242). Only one process can write a session at a time.",
+			"Session 3f9a1c2e is open for writing in another terminal (pid 4242). Only one process can write a session at a time. Close it there, or fork it to continue in a copy.",
 		);
 
 		const unsafe = new SessionHeldError(`${home}/session.jsonl`);
 		expect(unsafe.operatorMessage).toBe(
-			"This session is open for writing in another gjc process. Only one process can write a session at a time.",
+			"This session is open for writing in another gjc process. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.",
 		);
 		expect(unsafe.operatorMessage).not.toContain(home);
 	});
@@ -505,6 +505,17 @@ describe("SessionHeldError", () => {
 		expect(phrase("terminal (subagent)")).toBe("a subagent of another terminal (pid 7)");
 		expect(phrase("terminal", "build-box")).toBe("gjc on build-box (pid 7)");
 		expect(sessionOwnerHolderPhrase(undefined)).toBe("another gjc process");
+	});
+
+	it("never renders a malformed holder a caller built", () => {
+		const malformed = [
+			{ surface: "terminal", pid: 7, host: "evil host/../x" },
+			{ surface: "root shell" as ownership.SessionOwnerSurface, pid: 7 },
+			{ surface: "terminal", pid: -1 },
+			{ surface: "terminal", pid: 1.5 },
+		] satisfies ownership.SessionOwnerHolder[];
+		for (const holder of malformed) expect(sessionOwnerHolderPhrase(holder)).toBe("another gjc process");
+		expect(new SessionHeldError("s", malformed[0]).operatorMessage).not.toContain("evil");
 	});
 });
 

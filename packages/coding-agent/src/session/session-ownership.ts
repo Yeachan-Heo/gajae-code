@@ -557,10 +557,15 @@ const SURFACE_NOUNS: Record<SessionOwnerBaseSurface, string> = {
 	sdk: "an application using the gjc SDK",
 };
 
-/** How a holder is named to a person (design §3.4). */
+/**
+ * How a holder is named to a person (design §3.4). The holder is checked again here, because a
+ * caller may build one: anything malformed reads as "another gjc process", never as raw text.
+ */
 export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined): string {
-	if (!holder) return "another gjc process";
-	if (holder.host !== undefined) return `gjc on ${holder.host} (pid ${holder.pid})`;
+	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface))
+		return "another gjc process";
+	if (holder.host !== undefined)
+		return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host} (pid ${holder.pid})` : "another gjc process";
 	const subagent = holder.surface.endsWith(" (subagent)");
 	const base = (subagent ? holder.surface.slice(0, -" (subagent)".length) : holder.surface) as SessionOwnerBaseSurface;
 	const noun = SURFACE_NOUNS[base];
@@ -584,6 +589,6 @@ export class SessionHeldError extends Error {
 		this.holder = holder;
 		// Only a safe id is quoted, shortened as the CLI shows it; any other id may hold any text.
 		const subject = SAFE_ID.test(sessionId) ? `Session ${sessionId.slice(0, 8)}` : "This session";
-		this.operatorMessage = `${subject} is open for writing in ${sessionOwnerHolderPhrase(holder)}. Only one process can write a session at a time.`;
+		this.operatorMessage = `${subject} is open for writing in ${sessionOwnerHolderPhrase(holder)}. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
 	}
 }
