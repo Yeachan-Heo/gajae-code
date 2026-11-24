@@ -71,10 +71,10 @@ function staleReplayTranscript(): string {
 }
 
 /** A linear, compacted v5 transcript that an enabled session-memory open can serve from sidecars. */
-function coldEligibleTranscript(): string {
+function coldEligibleTranscript(retired = 2_000): string {
 	const records: Record<string, unknown>[] = [header("readonly-cold")];
 	let parentId: string | null = null;
-	for (let index = 0; index < 2_000; index++) {
+	for (let index = 0; index < retired; index++) {
 		const id = `cold-${index}`;
 		records.push(userEntry(id, parentId, `cold-${index}-${"x".repeat(512)}`, index));
 		parentId = id;
@@ -233,6 +233,9 @@ function newSidecarCacheInstances(before: readonly string[]): string[] {
 	return sidecarCacheInstances().filter(name => !before.includes(name));
 }
 
+/** Enough retired history for a bounded open while keeping its 37-row mutation table cheap. */
+const SMALL_COLD_ENTRIES = 8;
+
 /** Route every non-empty transcript through the bounded loader, as one above 128 MiB is. */
 function forceBoundedSnapshot(): void {
 	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
@@ -287,11 +290,72 @@ describe("standalone HTML export leaves its source untouched", () => {
 	}
 });
 
-// Windows has no bounded loader, so the bounded-mode cases below are POSIX-only.
+// Windows lacks the owner-only private sidecar cache, so the bounded-mode cases below are POSIX-only.
 const describePosix = describe.skipIf(process.platform === "win32");
 const itPosix = it.skipIf(process.platform === "win32");
 
 describePosix("standalone HTML export through the bounded loader leaves its source untouched", () => {
+	const appendedAfterOpen: ReadonlyArray<{ name: string; bytes: string }> = [
+		{
+			name: "a complete message line",
+			bytes: `${JSON.stringify(userEntry("appended", "compaction", "appended after open", 9_999))}\n`,
+		},
+		{ name: "a torn line", bytes: '{"type":"message","id":"torn","parentId":"compaction","timest' },
+		{ name: "a header_patch", bytes: `${JSON.stringify({ type: "header_patch", patch: { title: "Later" } })}\n` },
+	];
+	for (const append of appendedAfterOpen) {
+		it(`exports exactly the opened transcript when ${append.name} is appended after the open`, async () => {
+			const content = coldEligibleTranscript(SMALL_COLD_ENTRIES);
+			const reference = await referenceHtml(content);
+			const { sessionFile } = seedSource(content);
+			forceBoundedSnapshot();
+			const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+			const outputPath = path.join(makeTempDir("output"), "export.html");
+			try {
+				fs.appendFileSync(sessionFile, append.bytes);
+				await exportSessionToHtml(snapshot, undefined, { outputPath });
+			} finally {
+				await snapshot.close();
+			}
+			expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
+		});
+	}
+
+	const changedAfterOpen: ReadonlyArray<{ name: string; change: (sessionFile: string) => void }> = [
+		{
+			name: "replaced by a rename",
+			change: sessionFile => {
+				const replacement = `${sessionFile}.replacement`;
+				fs.writeFileSync(replacement, coldEligibleTranscript(SMALL_COLD_ENTRIES + 1), { mode: 0o600 });
+				fs.renameSync(replacement, sessionFile);
+			},
+		},
+		{ name: "truncated", change: sessionFile => fs.truncateSync(sessionFile, 64) },
+	];
+	for (const variant of changedAfterOpen) {
+		it(`refuses a source ${variant.name} after the open and keeps the previous export`, async () => {
+			const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
+			const outputDir = makeTempDir("output");
+			const outputPath = path.join(outputDir, "export.html");
+			fs.writeFileSync(outputPath, "previous good export", { mode: 0o600 });
+			const outputBefore = snapshotTree(outputDir);
+			forceBoundedSnapshot();
+			const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+			let refusal: string | undefined;
+			try {
+				variant.change(sessionFile);
+				refusal = await rejectionMessage(() => exportSessionToHtml(snapshot, undefined, { outputPath }));
+			} finally {
+				await snapshot.close();
+			}
+			expect(refusal).toBe("Session transcript was replaced or truncated after the read-only snapshot opened");
+			// The previous export is neither truncated nor replaced, and no temp file is left beside it
+			// (the directory itself changes: the temp file was created and removed there).
+			expect(snapshotTree(outputDir)["export.html"]).toEqual(outputBefore["export.html"]);
+			expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
+		});
+	}
+
 	it("matches the eager export for a transcript inside the managed session store", async () => {
 		const content = coldEligibleTranscript();
 		const reference = await referenceHtml(content);
@@ -612,13 +676,13 @@ describe("read-only session snapshot", () => {
 			// A cold snapshot cannot capture its state, so restoreState gets one from an eager snapshot
 			// of a copy; the read-only guard runs before the state is examined.
 			const stateFile = path.join(makeTempDir("state"), "session.jsonl");
-			fs.writeFileSync(stateFile, coldEligibleTranscript(), { mode: 0o600 });
+			fs.writeFileSync(stateFile, coldEligibleTranscript(SMALL_COLD_ENTRIES), { mode: 0o600 });
 			const stateSource = await SessionManager.openReadOnlySnapshot(stateFile);
 			const instancesBefore = sidecarCacheInstances();
 			forceBoundedSnapshot();
 			try {
 				await assertSnapshotRefusesMutations(
-					coldEligibleTranscript(),
+					coldEligibleTranscript(SMALL_COLD_ENTRIES),
 					"readonly-cold",
 					"kept",
 					snapshot => {

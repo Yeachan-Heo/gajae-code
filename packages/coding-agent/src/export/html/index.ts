@@ -2,18 +2,23 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
-import { APP_NAME, isCredentialKey, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
+import { APP_NAME, isCredentialKey, isEnoent, postmortem, redactCrashSecrets } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import {
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	RESUME_TRANSCRIPT_MAX_BYTES,
 	SessionManager,
+	SessionSnapshotSourceChangedError,
 	SessionTranscriptBoundedOpenError,
 	SessionTranscriptOversizedError,
 } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
 import { cssColorOrFallback } from "./css-color";
-import { openHtmlExportDestination } from "./html-export-destination";
+import {
+	createHtmlExportTempFile,
+	openExistingHtmlExportOutput,
+	removeHtmlExportTempFile,
+} from "./html-export-destination";
 import { TEMPLATE } from "./template.generated";
 
 export interface ExportOptions {
@@ -180,12 +185,18 @@ function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): 
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
+interface HtmlExportDescriptors {
+	source: number | undefined;
+	temp: { path: string; fd: number };
+}
+
 async function openHtmlExportDescriptors(
 	sourcePath: string | undefined,
 	outputPath: string,
-): Promise<{ source: number | undefined; destination: number }> {
+): Promise<HtmlExportDescriptors> {
 	let source: number | undefined;
-	let destination: number | undefined;
+	let existing: number | undefined;
+	let temp: { path: string; fd: number } | undefined;
 	try {
 		if (sourcePath) {
 			try {
@@ -195,22 +206,31 @@ async function openHtmlExportDescriptors(
 			}
 			await assertExportDoesNotAliasSource(sourcePath, outputPath);
 		}
-		destination = openHtmlExportDestination(outputPath);
-		if (source !== undefined) {
+		existing = openExistingHtmlExportOutput(outputPath);
+		if (source !== undefined && existing !== undefined) {
 			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
-			const destinationIdentity = syncFs.fstatSync(destination, { bigint: true });
-			if (sameFileIdentity(sourceIdentity, destinationIdentity))
+			const existingIdentity = syncFs.fstatSync(existing, { bigint: true });
+			if (sameFileIdentity(sourceIdentity, existingIdentity))
 				throw new Error("HTML export output must not overwrite the source transcript");
 		}
-		syncFs.ftruncateSync(destination, 0);
-		return { source, destination };
+		temp = createHtmlExportTempFile(outputPath);
+		return { source, temp };
 	} catch (error) {
-		if (destination !== undefined) syncFs.closeSync(destination);
+		if (temp !== undefined) {
+			syncFs.closeSync(temp.fd);
+			removeHtmlExportTempFile(temp.path);
+		}
 		if (source !== undefined) syncFs.closeSync(source);
 		throw error;
+	} finally {
+		if (existing !== undefined) syncFs.closeSync(existing);
 	}
 }
 
+/**
+ * Streams the export into an owner-only sibling temp file and renames it over `outputPath` only
+ * once complete, so a failed or interrupted export leaves any previous file at the path intact.
+ */
 async function writeSessionHtml(
 	sm: SessionManager,
 	state: AgentState | undefined,
@@ -224,7 +244,13 @@ async function writeSessionHtml(
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
 	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
-	const sink = Bun.file(descriptors.destination).writer();
+	const tempPath = descriptors.temp.path;
+	const removeTemp = (): void => removeHtmlExportTempFile(tempPath);
+	const unregisterTempCleanup = postmortem.register("html-export-temp", removeTemp);
+	let tempOpen = true;
+	let published = false;
+	const sink = Bun.file(descriptors.temp.fd).writer();
+	let sinkEnded = false;
 	const encoder = new Base64StreamEncoder();
 	const writeEncoded = (value: string): void => {
 		const encoded = encoder.write(value);
@@ -249,13 +275,26 @@ async function writeSessionHtml(
 		const final = encoder.finish();
 		if (final) sink.write(final);
 		sink.write(themedTemplate.slice(markerOffset + marker.length));
+		sinkEnded = true;
 		await sink.end();
+		tempOpen = false;
+		syncFs.closeSync(descriptors.temp.fd);
+		syncFs.renameSync(tempPath, outputPath);
+		published = true;
 	} catch (error) {
-		await sink.end();
+		if (!sinkEnded) await sink.end();
 		throw error;
 	} finally {
 		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
-		syncFs.closeSync(descriptors.destination);
+		if (tempOpen) syncFs.closeSync(descriptors.temp.fd);
+		if (!published) {
+			try {
+				removeTemp();
+			} catch {
+				// Never mask the export failure; the temp file is an owner-only dot file beside the output.
+			}
+		}
+		unregisterTempCleanup();
 	}
 }
 
@@ -355,6 +394,15 @@ export async function exportSessionToHtml(
 	return outputPath;
 }
 
+/**
+ * Bounded-open refusals caused by a concurrent writer rather than the transcript's shape: the
+ * descriptor moved during the scan, or the last line was still being written.
+ */
+const BOUNDED_OPEN_CHANGED_REASONS: ReadonlySet<string> = new Set([
+	"bounded_first_open_descriptor_changed",
+	"bounded_scan_unterminated",
+]);
+
 /** Export session file to HTML (standalone). */
 export async function exportFromFile(inputPath: string, options?: ExportOptions | string): Promise<string> {
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
@@ -372,22 +420,33 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	} catch (err) {
 		if (isEnoent(err)) throw new Error(`File not found: ${inputPath}`);
 		if (err instanceof SessionTranscriptOversizedError) {
-			// Windows has no bounded loader, so the eager cap is its limit.
+			// Windows lacks the owner-only private sidecar cache, so the eager cap is its limit.
 			const limit = process.platform === "win32" ? RESUME_TRANSCRIPT_MAX_BYTES : BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES;
 			throw new Error(
 				`Session transcript is too large to export (${err.size} bytes; limit ${limit} bytes): ${inputPath}`,
 			);
 		}
-		if (err instanceof SessionTranscriptBoundedOpenError)
+		if (err instanceof SessionTranscriptBoundedOpenError) {
+			if (BOUNDED_OPEN_CHANGED_REASONS.has(err.reason))
+				throw new Error(
+					`Session transcript changed while it was being read (${err.reason}); retry when the session is idle: ${inputPath}`,
+				);
 			throw new Error(
 				`Session transcript is too large to export in full (${err.size} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes) and cannot be streamed (${err.reason}); only linear, compacted transcripts without patch records can be: ${inputPath}`,
 			);
+		}
 		throw err;
 	}
 
 	try {
 		await writeSessionHtml(sm, undefined, outputPath, opts.themeName);
 		return outputPath;
+	} catch (err) {
+		if (err instanceof SessionSnapshotSourceChangedError)
+			throw new Error(
+				`Session transcript was replaced or truncated while it was being exported; retry when the session is idle: ${inputPath}`,
+			);
+		throw err;
 	} finally {
 		await sm.close();
 	}
