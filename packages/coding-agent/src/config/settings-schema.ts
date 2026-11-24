@@ -479,6 +479,15 @@ export const SETTINGS_SCHEMA = {
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
 	},
+	// Single-owner session claims. Global-only: a project file must not lower or raise it.
+	// Hidden from the UI while the claims are wired in; `off` makes no claim and no lock call.
+	"session.ownership": {
+		type: "enum",
+		// Kept equal to SESSION_OWNERSHIP_MODES (a test checks); listed here so the schema imports nothing new.
+		values: ["off", "observe", "enforce"] as const,
+		default: "off",
+		description: "Whether this process claims the sessions it writes so another process cannot write them.",
+	},
 	"workspaceTree.mode": {
 		type: "enum",
 		values: ["eager", "lazy"] as const,

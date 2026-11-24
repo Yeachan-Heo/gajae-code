@@ -141,6 +141,8 @@
 		"./session/sdk-run-capability.js": null,
 		"./session/session-ownership": null,
 		"./session/session-ownership.js": null,
+		"./session/session-ownership-mode": null,
+		"./session/session-ownership-mode.js": null,
 		"./extensibility/extensions/function-hooks-internal": null,
 		"./extensibility/extensions/function-hooks-internal.js": null,
 		"./sdk": {

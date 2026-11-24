@@ -95,6 +95,16 @@
 					],
 					"default": "copy-retain"
 				},
+				"ownership": {
+					"type": "string",
+					"enum": [
+						"off",
+						"observe",
+						"enforce"
+					],
+					"description": "Whether this process claims the sessions it writes so another process cannot write them.",
+					"default": "off"
+				},
 				"resumeModelBehavior": {
 					"type": "string",
 					"enum": [
