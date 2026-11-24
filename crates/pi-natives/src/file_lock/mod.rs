@@ -321,29 +321,23 @@ mod tests {
 	#[test]
 	fn a_lock_acquired_past_its_budget_is_released() {
 		let _window = super::platform::tests::spawn_window();
-		let dir = std::env::temp_dir().join(format!("gjc-file-lock-late-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).expect("create temp dir");
-		let path = dir
-			.join("s.session-owner")
-			.to_str()
-			.expect("utf-8")
-			.to_owned();
+		let dir = super::platform::tests::TempDir::new("late");
+		let path = dir.path("s.session-owner");
 		let runtime = runtime();
 		let (sender, dropped) = mpsc::channel();
 		let late = path.clone();
 		let outcome = runtime.block_on(bounded(Duration::from_millis(20), move || {
 			std::thread::sleep(Duration::from_millis(200));
-			let lock = super::platform::try_acquire(&super::lock_path(&late)?)?;
+			let lock = super::platform::try_acquire(&late)?;
 			Ok((lock.expect("free"), DropSignal(sender)))
 		}));
 		assert_eq!(outcome.map(|_| ()).expect_err("times out").kind, FileLockFailure::TimedOut);
 		dropped
 			.recv_timeout(Duration::from_secs(10))
 			.expect("the late lock is dropped once the call finishes");
-		let probe = super::platform::probe(&super::lock_path(&path).expect("path"));
+		let probe = super::platform::probe(&path);
 		assert!(!probe.expect("probe"), "a lock taken past its budget stays held");
 		drop(runtime);
-		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[test]

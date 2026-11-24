@@ -24,6 +24,10 @@ use std::{
 use super::{Fault, FileLockFailure};
 
 const SIDECAR_MODE: libc::c_uint = 0o600;
+const OWNER_ONLY: libc::mode_t = 0o600;
+/// How often an acquire retries when the sidecar vanishes between its
+/// exclusive create and its plain open.
+const CREATE_ATTEMPTS: usize = 8;
 
 #[cfg(target_os = "linux")]
 #[allow(
@@ -195,30 +199,42 @@ fn last_errno() -> i32 {
 /// special file, then require a regular, single-link file owned by this user
 /// with no group or other permission bits. `Ok(None)` means a probe found no
 /// sidecar. Every error here fails closed.
+///
+/// An acquire creates the sidecar with `O_EXCL`, so it knows when this call
+/// made the file; only then does it set mode 0600 on the descriptor, because
+/// `O_CREAT` honours the umask and an umask that clears owner bits would leave
+/// a sidecar no later acquire can open.
 fn open_sidecar(path: &CStr, create: bool) -> Result<Option<File>, Fault> {
-	let access = if create {
-		libc::O_RDWR | libc::O_CREAT
+	let base = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+	let file = if create {
+		let flags = base | libc::O_RDWR;
+		let mut opened = None;
+		for _ in 0..CREATE_ATTEMPTS {
+			match open_raw(path, flags | libc::O_CREAT | libc::O_EXCL) {
+				Ok(file) => {
+					// SAFETY: `file` owns a live descriptor for the duration of the call.
+					if unsafe { libc::fchmod(file.as_raw_fd(), OWNER_ONLY) } != 0 {
+						return Err(failed("fchmod", last_errno()));
+					}
+					opened = Some(file);
+				},
+				Err(libc::EEXIST) => match open_raw(path, flags) {
+					Ok(file) => opened = Some(file),
+					Err(libc::ENOENT) => continue,
+					Err(errno) => return Err(failed("open", errno)),
+				},
+				Err(errno) => return Err(failed("open", errno)),
+			}
+			break;
+		}
+		opened.ok_or_else(|| failed("open", libc::ENOENT))?
 	} else {
-		libc::O_RDONLY
+		match open_raw(path, base | libc::O_RDONLY) {
+			Ok(file) => file,
+			Err(libc::ENOENT) => return Ok(None),
+			Err(errno) => return Err(failed("open", errno)),
+		}
 	};
-	let flags = access | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-	let fd = loop {
-		// SAFETY: `path` is NUL-terminated; the mode is read only with O_CREAT.
-		let fd = unsafe { libc::open(path.as_ptr(), flags, SIDECAR_MODE) };
-		if fd >= 0 {
-			break fd;
-		}
-		let errno = last_errno();
-		if errno == libc::EINTR {
-			continue;
-		}
-		if errno == libc::ENOENT && !create {
-			return Ok(None);
-		}
-		return Err(failed("open", errno));
-	};
-	// SAFETY: `fd` is a fresh descriptor that nothing else owns.
-	let file = unsafe { File::from_raw_fd(fd) };
 	let metadata = file
 		.metadata()
 		.map_err(|error| failed("fstat", error.raw_os_error().unwrap_or(libc::EIO)))?;
@@ -252,6 +268,22 @@ fn open_sidecar(path: &CStr, create: bool) -> Result<Option<File>, Fault> {
 		));
 	}
 	Ok(Some(file))
+}
+
+/// `open(2)` retrying `EINTR`; returns the opened file or the errno.
+fn open_raw(path: &CStr, flags: libc::c_int) -> Result<File, i32> {
+	loop {
+		// SAFETY: `path` is NUL-terminated; the mode is read only with O_CREAT.
+		let fd = unsafe { libc::open(path.as_ptr(), flags, SIDECAR_MODE) };
+		if fd >= 0 {
+			// SAFETY: `fd` is a fresh descriptor that nothing else owns.
+			return Ok(unsafe { File::from_raw_fd(fd) });
+		}
+		let errno = last_errno();
+		if errno != libc::EINTR {
+			return Err(errno);
+		}
+	}
 }
 
 /// Run a whole-file `fcntl` lock command, retrying `EINTR`; returns the
@@ -314,10 +346,10 @@ pub(crate) mod tests {
 	}
 
 	/// A private directory removed on drop.
-	struct TempDir(PathBuf);
+	pub(crate) struct TempDir(pub(crate) PathBuf);
 
 	impl TempDir {
-		fn new(label: &str) -> Self {
+		pub(crate) fn new(label: &str) -> Self {
 			let nonce = SystemTime::now()
 				.duration_since(UNIX_EPOCH)
 				.expect("system clock")
@@ -328,7 +360,7 @@ pub(crate) mod tests {
 			Self(dir)
 		}
 
-		fn path(&self, name: &str) -> CString {
+		pub(crate) fn path(&self, name: &str) -> CString {
 			c_path(&self.0.join(name))
 		}
 	}
@@ -501,6 +533,7 @@ pub(crate) mod tests {
 	/// acquire is still refused.
 	#[test]
 	fn a_shared_holder_reads_as_free_to_the_probe() {
+		let _window = spawn_window();
 		let dir = TempDir::new("shared");
 		let path = dir.path("s.session-owner");
 		drop(acquire(&path));
@@ -513,6 +546,42 @@ pub(crate) mod tests {
 		assert_eq!(unsafe { libc::flock(shared.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
 		assert!(!probe(&path).expect("probe"), "the probe met a shared holder");
 		assert!(try_acquire(&path).expect("acquire").is_none(), "exclusive acquire is refused");
+	}
+
+	const UMASK_CHILD_ENV: &str = "GJC_FILE_LOCK_UMASK_CHILD";
+
+	/// An umask that clears owner bits must not leave a sidecar that later
+	/// acquires cannot open. The umask is process-wide, so the body runs in a
+	/// re-executed copy of this test binary.
+	#[test]
+	fn a_sidecar_created_under_a_restrictive_umask_stays_usable() {
+		if let Some(dir) = std::env::var_os(UMASK_CHILD_ENV) {
+			let dir = PathBuf::from(dir);
+			let path = c_path(&dir.join("s.session-owner"));
+			// SAFETY: umask has no preconditions; this process runs only this test.
+			unsafe { libc::umask(0o277) };
+			drop(acquire(&path));
+			let mode = std::fs::metadata(dir.join("s.session-owner"))
+				.expect("stat")
+				.mode();
+			assert_eq!(mode & 0o777, 0o600, "the creator sets 0600 despite the umask");
+			drop(acquire(&path));
+			return;
+		}
+		let _window = spawn_window();
+		let dir = TempDir::new("umask");
+		let name = module_path!()
+			.split_once("::")
+			.map_or(module_path!(), |(_, rest)| rest);
+		let test = format!("{name}::a_sidecar_created_under_a_restrictive_umask_stays_usable");
+		let output = Command::new(std::env::current_exe().expect("test binary"))
+			.args(["--exact", &test, "--test-threads=1"])
+			.env(UMASK_CHILD_ENV, &dir.0)
+			.output()
+			.expect("run the umask child");
+		let stdout = String::from_utf8_lossy(&output.stdout);
+		assert!(output.status.success(), "umask child failed: {stdout}");
+		assert!(stdout.contains("1 passed"), "umask child ran no test: {stdout}");
 	}
 
 	#[test]
