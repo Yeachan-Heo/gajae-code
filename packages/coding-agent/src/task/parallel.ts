@@ -103,6 +103,7 @@ export class Semaphore {
 	async acquire(): Promise<void> {
 		// Unlimited: always acquire immediately
 		if (this.#max === null) {
+			this.#current++; // Track active count even in unlimited mode
 			return;
 		}
 
@@ -116,14 +117,15 @@ export class Semaphore {
 	}
 
 	release(): void {
-		// Unlimited: nothing to release
+		// Unlimited: decrement the active count we incremented in acquire
 		if (this.#max === null) {
+			this.#current--;
 			return;
 		}
 
 		const next = this.#queue.shift();
 		if (next) {
-			next();
+			next(); // This will trigger acquire() in the waiter, incrementing #current
 		} else {
 			this.#current--;
 		}
@@ -138,6 +140,7 @@ export class Semaphore {
 		if (newMax === null || newMax === 0) {
 			this.#max = null; // Switch to unlimited
 			// Wake all queued waiters since we're now unlimited
+			// Don't clear #current; we're just changing the limit mode
 			while (this.#queue.length > 0) {
 				const resolve = this.#queue.shift();
 				if (resolve) resolve();
@@ -150,6 +153,8 @@ export class Semaphore {
 		// If currently unlimited, convert to limited
 		if (this.#max === null) {
 			this.#max = normalized;
+			// Keep #current as-is; it represents actual holders
+			// If #current > normalized, new acquires will block until releases bring it down
 			return;
 		}
 
@@ -157,9 +162,9 @@ export class Semaphore {
 		this.#max = normalized;
 
 		// If growing, wake waiters to fill new slots.
-		// Don't modify current; waiters are already counted in the queue.
-		// When we resolve their promise, their acquire() will return and
-		// they'll be holding their slot (already represented in current).
+		// Count the actual available slots: (new max) - (current holders)
+		// This ensures the acquiring waiter will increment #current when resume,
+		// but only if there's actual capacity.
 		if (normalized > oldMax) {
 			const availableSlots = normalized - this.#current;
 			for (let i = 0; i < availableSlots && this.#queue.length > 0; i++) {
