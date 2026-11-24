@@ -27690,6 +27690,9 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		// Compaction runs hooks and a summarization model before its append; a transcript
+		// that already refuses writes would spend both and then fail.
+		this.#assertTranscriptAcceptsTurn();
 		const sharedCompaction = this.#usesSharedSessionPublication();
 		const invocationManager = this.sessionManager;
 		const invocationSessionId = invocationManager.getSessionId();
@@ -28085,6 +28088,9 @@ export class AgentSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		// Handoff generates its document with a model call and then flushes this
+		// transcript; a transcript that already refuses writes would spend the call and fail.
+		this.#assertTranscriptAcceptsTurn();
 		const entries = this.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 

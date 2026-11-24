@@ -1611,8 +1611,7 @@ export class CommandController {
 			if (outcome === "cancelled") {
 				this.ctx.showError("Compaction cancelled");
 			} else {
-				const message = error instanceof Error ? error.message : String(error);
-				this.ctx.showError(`Compaction failed: ${message}`);
+				this.ctx.showError(`Compaction failed: ${operatorErrorMessage(error, String(error))}`);
 			}
 		} finally {
 			compactingLoader.stop();
@@ -1689,7 +1688,7 @@ export class CommandController {
 			if (message === "Handoff cancelled" || (error instanceof Error && error.name === "AbortError")) {
 				this.ctx.showError("Handoff cancelled");
 			} else {
-				this.ctx.showError(`Handoff failed: ${message}`);
+				this.ctx.showError(`Handoff failed: ${operatorErrorMessage(error, message)}`);
 			}
 			// The failure is non-destructive: the current session is unchanged. If the
 			// document was already generated, preserve it on the clipboard for retry.

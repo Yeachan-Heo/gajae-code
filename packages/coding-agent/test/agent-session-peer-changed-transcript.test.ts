@@ -6,11 +6,13 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { operatorErrorMessage } from "@gajae-code/coding-agent/session/operator-error-message";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
 import {
 	ManagedAppendIdentityMismatchError,
 	ManagedSessionDescendantStore,
@@ -27,7 +29,25 @@ interface Harness {
 	setScript(script: Script): void;
 	counts(): { modelCalls: number; toolRuns: number };
 	onToolRun(hook: (() => Promise<void>) | undefined): void;
+	/** Extension events emitted to the hook runner (only with `withHooks`). */
+	hookEvents: string[];
+	modelRegistry: ModelRegistry;
 }
+
+/** A compaction hook that short-circuits the summary, so compaction needs no model. */
+const COMPACTION_HOOK_SOURCE = [
+	"export default function(pi) {",
+	'\tpi.on("session_before_compact", async event => ({',
+	"\t\tcompaction: {",
+	'\t\t\tsummary: "hook summary",',
+	"\t\t\tshortSummary: undefined,",
+	"\t\t\tfirstKeptEntryId: event.preparation.firstKeptEntryId,",
+	"\t\t\ttokensBefore: event.preparation.tokensBefore,",
+	"\t\t\tdetails: {},",
+	"\t\t},",
+	"\t}));",
+	"}",
+].join("\n");
 
 function describeMessage(role: string, content: unknown): string {
 	if (typeof content === "string") return `${role}:${content}`;
@@ -71,7 +91,7 @@ describe("AgentSession on a transcript another process changed", () => {
 		tempDir = undefined;
 	});
 
-	async function setup(): Promise<Harness> {
+	async function setup(options?: { withHooks?: boolean }): Promise<Harness> {
 		tempDir = TempDir.createSync("@gjc-stuck-refusal-");
 		const root = tempDir.path();
 		const auth = await AuthStorage.create(path.join(root, "auth.db"));
@@ -113,13 +133,28 @@ describe("AgentSession on a transcript another process changed", () => {
 		});
 		const destination = () => SessionManager.managedDestination(root, path.join(root, "agent"));
 		const writerA = SessionManager.create(root, destination());
-		const settings = Settings.isolated({ "compaction.enabled": false });
+		const settings = Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 10 });
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const modelRegistry = new ModelRegistry(auth);
+		const hookEvents: string[] = [];
+		let extensionRunner: ExtensionRunner | undefined;
+		if (options?.withHooks) {
+			const extensionPath = path.join(getProjectAgentDir(root), "extensions", "compaction-hook.ts");
+			await Bun.write(extensionPath, COMPACTION_HOOK_SOURCE);
+			const loaded = await loadExtensions([extensionPath], root);
+			extensionRunner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, writerA, modelRegistry);
+			const emit = extensionRunner.emit.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "emit").mockImplementation(async event => {
+				hookEvents.push(event.type);
+				return await emit(event);
+			});
+		}
 		const session = new AgentSession({
 			agent,
 			sessionManager: writerA,
 			settings,
-			modelRegistry: new ModelRegistry(auth),
+			modelRegistry,
+			...(extensionRunner ? { extensionRunner } : {}),
 		});
 		cleanups.push(() => session.dispose());
 		await session.prompt("first");
@@ -143,6 +178,8 @@ describe("AgentSession on a transcript another process changed", () => {
 			onToolRun: hook => {
 				toolHook = hook;
 			},
+			hookEvents,
+			modelRegistry,
 		};
 	}
 
@@ -360,6 +397,44 @@ describe("AgentSession on a transcript another process changed", () => {
 		// Reload the transcript so disposal does not report the uncertain write.
 		await harness.writerA.recoverPersistenceFailure();
 		expect(harness.writerA.getLatchedPersistenceFailure()).toBeUndefined();
+	});
+
+	it("refuses /compact on a stuck session before any compaction hook or model call", async () => {
+		const harness = await setup({ withHooks: true });
+		// Enough history that compaction has a cut point and would reach its hook.
+		for (const turn of ["second", "third", "fourth"]) await harness.session.prompt(`${turn} ${"x".repeat(400)}`);
+		const latched = await latch(harness);
+		const transcriptBefore = await Bun.file(harness.file).text();
+		const apiKey = vi.spyOn(harness.modelRegistry, "getApiKey").mockResolvedValue(undefined);
+		harness.hookEvents.length = 0;
+		const before = harness.counts();
+
+		const refusal = await settle(harness.session.compact());
+
+		expect(refusal).toBe(latched);
+		expect(operatorErrorMessage(refusal)).toContain("/resume");
+		expect(harness.hookEvents.filter(type => type.includes("compact"))).toEqual([]);
+		expect(apiKey).not.toHaveBeenCalled();
+		expect(harness.counts()).toEqual(before);
+		expect(await Bun.file(harness.file).text()).toBe(transcriptBefore);
+	});
+
+	it("refuses /handoff on a stuck session before any hook or handoff model call", async () => {
+		const harness = await setup({ withHooks: true });
+		const latched = await latch(harness);
+		const transcriptBefore = await Bun.file(harness.file).text();
+		// A handoff resolves the API key immediately before its generation call.
+		const apiKey = vi.spyOn(harness.modelRegistry, "getApiKey").mockResolvedValue(undefined);
+		harness.hookEvents.length = 0;
+
+		const refusal = await settle(harness.session.handoff());
+
+		expect(refusal).toBe(latched);
+		expect(operatorErrorMessage(refusal)).toContain("/resume");
+		expect(harness.hookEvents).toEqual([]);
+		expect(apiKey).not.toHaveBeenCalled();
+		expect(harness.session.sessionManager.getSessionFile()).toBe(harness.file);
+		expect(await Bun.file(harness.file).text()).toBe(transcriptBefore);
 	});
 
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
