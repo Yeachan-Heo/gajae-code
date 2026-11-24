@@ -126,6 +126,7 @@
         "@gajae-code/utils": "workspace:*",
       },
       "devDependencies": {
+        "@babel/parser": "catalog:",
         "@types/bun": "catalog:",
         "typescript": "catalog:",
       },
