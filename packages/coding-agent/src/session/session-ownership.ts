@@ -25,6 +25,7 @@ import {
 import { getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
+import { type SessionOwnershipTestHookSlot, sessionOwnershipTestHookSlot } from "./session-ownership-mode";
 import {
 	assertAppendLockHomeNotSharedWritable,
 	assertNoReparsePath,
@@ -91,14 +92,15 @@ export interface SessionOwnerLockBackend {
 	probe(sidecar: string, timeoutMs: number): Promise<FileLockProbeResult>;
 }
 
-/** Test-only seams. Code, not environment, so a project `.env` cannot reach them. */
-export const SessionOwnershipTestHooks: {
-	/** Trusted home for this process's claims and probes. */
-	homeOverride?: string;
+/**
+ * Test-only seams. Code, not environment, so a project `.env` cannot reach them. One object per
+ * process (see {@link sessionOwnershipTestHookSlot}), shared by every copy of this module.
+ */
+export const SessionOwnershipTestHooks: SessionOwnershipTestHookSlot & {
 	lockBackend?: SessionOwnerLockBackend;
 	/** Runs after a record's temp file is written and before it is renamed into place. */
 	beforeRecordPublish?: () => void;
-} = {};
+} = sessionOwnershipTestHookSlot();
 
 const nativeBackend: SessionOwnerLockBackend = {
 	tryAcquire: (sidecar, timeoutMs) => tryAcquireFileLock(sidecar, timeoutMs),

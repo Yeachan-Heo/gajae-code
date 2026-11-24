@@ -280,6 +280,26 @@ if (logIsolation.action === "isolate") {
 // Propagate the selected value so a nested preload can distinguish a pin it
 // inherited from its parent from a value the child explicitly supplied.
 process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
+
+// Isolate session ownership claims for every test process. A claim locks a file
+// under `<trusted home>/.gjc/runtime/session-owners`, and the trusted home is the
+// operator's real home unless the runner changed HOME, so a test claim would
+// otherwise land in, and block, the operator's live sessions. The ownership
+// modules read this from a code-only `globalThis` slot, never from an environment
+// variable a project `.env` could set; filling the slot here needs no import, so
+// packages that never load the ownership modules pay one mkdir.
+//
+// FAIL CLOSED, as above: without a temp home, claims would use the live one.
+try {
+	const ownersHome = createIsolatedTempDir("gjc-test-owners-");
+	const slots = globalThis as unknown as Record<symbol, { homeOverride?: string } | undefined>;
+	const ownershipHooksKey = Symbol.for("gajae-code.session-ownership.test-hooks.v1");
+	slots[ownershipHooksKey] = { ...slots[ownershipHooksKey], homeOverride: ownersHome };
+} catch (error) {
+	cleanupAfterInitializationFailure(
+		new Error(`Test session-ownership isolation failed; refusing to claim sessions in the live home: ${String(error)}`),
+	);
+}
 //
 // Recursive-deletion boundary (issue #4794). An operator's real home was
 // destroyed by test cleanup activity; this preload now installs a
