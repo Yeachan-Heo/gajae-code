@@ -1,3 +1,0 @@
-### Fixed
-
-- `gjc sdk search`, `gjc sdk session list`, and the master peer snapshot show a `spawnedBy` owner (and therefore `self: true`) only on a row from the state root the spawned child's host registered in. Spawn authority is keyed by session id alone, so a session id claimed by more than one state root, or reused by another host after the child stopped, could otherwise name a master that never spawned that row. The master-mode guidance and SDK docs now state that `spawnedBy.self` is an advisory display hint that grants no permission: nothing checks it before send, steer, interrupt, or close.
