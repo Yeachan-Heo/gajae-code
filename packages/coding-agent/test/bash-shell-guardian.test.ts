@@ -6,6 +6,7 @@ import {
 	createDarwinAncestryTracker,
 	extendOwnedDarwinAncestry,
 	findSparedSdkBrokerPids,
+	findSparedSdkBrokerPidsBounded,
 	parseOwnershipRecord,
 	retainOwnedProcess,
 	sdkBrokerAgentDirFromArgs,
@@ -469,6 +470,61 @@ describe("bash-shell-guardian", () => {
 				},
 			);
 			expect(spared.size).toBe(0);
+		});
+	});
+
+	describe("findSparedSdkBrokerPidsBounded", () => {
+		const broker = {
+			pid: 10,
+			incarnation: "b",
+			args: () => ["/bin/gjc", "sdk", "broker-internal", "--agent-dir", "/agent"],
+		};
+		const published = async () => ({ pid: 10, incarnation: "b" });
+
+		it("spares the published broker when the lookup completes in time", async () => {
+			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				readDiscovery: published,
+				lineage: () => new Set([10, 11]),
+				incarnationOf: () => "b",
+			});
+			expect([...spared].sort()).toEqual([10, 11]);
+		});
+
+		it("spares nothing when the lineage walk throws", async () => {
+			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				readDiscovery: published,
+				lineage: () => {
+					throw new Error("proc_listallpids failed");
+				},
+				incarnationOf: () => "b",
+			});
+			expect(spared.size).toBe(0);
+		});
+
+		it("spares nothing when the discovery read throws synchronously", async () => {
+			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				readDiscovery: () => {
+					throw new Error("sync failure");
+				},
+				lineage: () => new Set([10]),
+				incarnationOf: () => "b",
+			});
+			expect(spared.size).toBe(0);
+		});
+
+		it("spares nothing when the discovery read stalls past the timeout", async () => {
+			const started = Date.now();
+			const spared = await findSparedSdkBrokerPidsBounded(
+				[broker],
+				{
+					readDiscovery: () => new Promise(() => {}),
+					lineage: () => new Set([10]),
+					incarnationOf: () => "b",
+				},
+				50,
+			);
+			expect(spared.size).toBe(0);
+			expect(Date.now() - started).toBeLessThan(1_000);
 		});
 	});
 });

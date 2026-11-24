@@ -1291,6 +1291,10 @@ describe("executeBash", () => {
 			expect(isAlive(hostPid)).toBe(true);
 		} finally {
 			await shell.close();
+			for (const file of [hostFile, strayFile]) {
+				const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+				if (text) survivors.push(Number.parseInt(text, 10));
+			}
 			for (const pid of survivors) {
 				try {
 					process.kill(pid, "SIGKILL");

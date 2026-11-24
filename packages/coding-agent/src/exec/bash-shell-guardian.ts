@@ -437,7 +437,9 @@ export async function findSparedSdkBrokerPids(
 		}
 		const agentDir = sdkBrokerAgentDirFromArgs(args);
 		if (!agentDir) continue;
-		const discovery = await deps.readDiscovery(agentDir).catch(() => null);
+		const discovery = await Promise.resolve()
+			.then(() => deps.readDiscovery(agentDir))
+			.catch(() => null);
 		if (discovery?.pid !== processRef.pid || discovery.incarnation !== processRef.incarnation) continue;
 		// The lineage walk reads the root by bare pid, so only trust it if the broker
 		// still holds the same incarnation afterwards.
@@ -448,9 +450,37 @@ export async function findSparedSdkBrokerPids(
 	return spared;
 }
 
+/** Upper bound on the broker lookup so a stalled discovery read cannot stall cleanup. */
+export const SPARED_SDK_BROKER_LOOKUP_TIMEOUT_MS = 1_000;
+
+/**
+ * {@link findSparedSdkBrokerPids} that cannot weaken cleanup: any throw, or a lookup
+ * that outlives `timeoutMs`, spares nothing, so every owned process is killed as before.
+ */
+export async function findSparedSdkBrokerPidsBounded(
+	owned: Iterable<Pick<NativeProcess, "pid" | "incarnation" | "args">>,
+	deps: SparedSdkBrokerDeps,
+	timeoutMs = SPARED_SDK_BROKER_LOOKUP_TIMEOUT_MS,
+): Promise<Set<number>> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<Set<number>>(resolve => {
+		timer = setTimeout(() => resolve(new Set()), timeoutMs);
+	});
+	try {
+		return await Promise.race([
+			Promise.resolve()
+				.then(() => findSparedSdkBrokerPids(owned, deps))
+				.catch(() => new Set<number>()),
+			timeout,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function readPublishedSdkBroker(agentDir: string): Promise<{ pid: number; incarnation: string } | null> {
-	// Loaded lazily: the discovery module pulls in the native addon, which the guardian
-	// must not load before ownership records are authenticated.
+	// Loaded lazily so guardian startup does not pull in the SDK discovery modules; it
+	// only runs at cleanup when an owned process has the broker launch argv.
 	const { readBrokerDiscovery } = await import("../sdk/broker/discovery");
 	// A stale heartbeat does not make the published broker any less shared; liveness
 	// and incarnation are still checked against the kernel.
@@ -621,7 +651,7 @@ export async function runBashShellGuardian(): Promise<void> {
 				}
 				trackingOk = (await scanOwnership()) && trackingOk;
 				const spared = darwinTracker
-					? await findSparedSdkBrokerPids(ownedProcesses.values(), {
+					? await findSparedSdkBrokerPidsBounded(ownedProcesses.values(), {
 							readDiscovery: readPublishedSdkBroker,
 							lineage: pid => darwinTracker.lineage(pid),
 							incarnationOf: pid => Process.fromPid(pid)?.incarnation,
@@ -629,7 +659,17 @@ export async function runBashShellGuardian(): Promise<void> {
 					: undefined;
 				for (const owned of ownedProcesses.values()) {
 					if (spared?.has(owned.pid)) continue;
-					owned.killTree(9);
+					if (!spared?.size) {
+						owned.killTree(9);
+						continue;
+					}
+					// killTree walks ppid descendants, so on a non-spared ancestor (for example
+					// the darwin launch trampoline) it would still reach the spared broker.
+					// Darwin ownership already lists every descendant, so signal each one alone.
+					if (Process.fromPid(owned.pid)?.incarnation !== owned.incarnation) continue;
+					try {
+						process.kill(owned.pid, "SIGKILL");
+					} catch {}
 				}
 			}
 			darwinTracker?.close();
