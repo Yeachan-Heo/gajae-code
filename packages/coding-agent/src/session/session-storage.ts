@@ -63,7 +63,7 @@ import {
 } from "./task-artifact-owner-retirement";
 
 const newlineBuffer = Buffer.from("\n", "utf8");
-function canonicalPathSync(value: string): string {
+export function canonicalPathSync(value: string): string {
 	try {
 		return fs.realpathSync.native(value);
 	} catch {
@@ -93,7 +93,7 @@ function transcriptLockIdentity(transcriptPath: string): string {
  * writable without the sticky bit, or group-writable through a group other than the user's
  * primary group. (Windows profile DACLs grant only the user, SYSTEM, and Administrators.)
  */
-function assertAppendLockHomeNotSharedWritable(home: string): void {
+export function assertAppendLockHomeNotSharedWritable(home: string): void {
 	if (process.platform === "win32") return;
 	const stat = fs.statSync(home);
 	const uid = process.getuid?.();
@@ -894,7 +894,7 @@ export function writeExplicitOwnerOnlyTextSync(pathname: string, content: string
 }
 
 /** Reject a symlink/junction/reparse component before a storage path is created or opened. */
-function assertNoReparsePath(pathname: string): void {
+export function assertNoReparsePath(pathname: string): void {
 	const resolved = path.resolve(pathname);
 	const parsed = path.parse(resolved);
 	let current = parsed.root;
