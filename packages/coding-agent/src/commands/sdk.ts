@@ -136,13 +136,13 @@ export async function lifecycleArgs(
  * How long a session host tolerates losing the broker it was launched under
  * before treating itself as orphaned.
  *
- * A host is reachable only through its own broker: routing lives in the broker
- * process and a replacement broker never adopts hosts from an earlier
- * incarnation, so a host that outlives its broker is stranded no matter how
- * healthy the agent directory looks afterwards. The grace still has to outlast
- * a restart-shaped gap, because a broker that is merely slow to republish must
- * never cost a live host — but it must stay finite, or every crashed or
- * torn-down broker leaks a detached multi-hundred-megabyte host forever.
+ * Brokers route through the agent directory's session index and the host's
+ * endpoint file, not through per-broker state, so a replacement broker for the
+ * same agent directory reaches a host its predecessor launched. The window
+ * therefore only runs while no live broker is published at all. It still has to
+ * outlast a restart-shaped gap, because a broker that is merely slow to
+ * republish must never cost a live host, but it must stay finite, or every
+ * broker that is gone for good leaks a detached multi-hundred-megabyte host.
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
@@ -229,31 +229,35 @@ function brokerPublicationIdentity(observation: unknown): string | null {
 }
 
 /**
- * Resolves only once the broker this host was launched under has been
- * unobservable for the full grace window.
+ * Resolves only once no live broker has been published for the agent directory
+ * for the full grace window, and the host is not doing session work.
  *
- * The first identifiable publication pins that broker. A later publication from
- * a different incarnation is a replacement, and a replacement cannot route to
- * this host — observing one is evidence of being stranded, not of being alive —
- * so it accrues against the bound instead of resetting it. Only the pinned
- * broker reappearing resets the window. An unreadable or unidentifiable
+ * Any identifiable publication resets the window, including one from a
+ * replacement incarnation: the replacement routes through the shared session
+ * index, so it can still reach this host. An unreadable or unidentifiable
  * publication is not proof of orphanhood but accrues against the same bound.
+ *
+ * `readWorkLease` reports whether the host's session-work lease is held. A turn
+ * in flight is never cut short by broker absence: the window keeps accruing, but
+ * the host only exits once the lease is released. Its result does not depend on
+ * a broker, and the bound still applies the moment the work ends.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
 	agentDir: string;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	readDiscovery?: (agentDir: string) => Promise<unknown>;
+	readWorkLease?: () => boolean;
 	graceMs?: number;
 	pollMs?: number;
 }): Promise<void> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
 	const readDiscovery = deps.readDiscovery ?? readBrokerDiscovery;
+	const readWorkLease = deps.readWorkLease ?? (() => false);
 	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
 	let absentSince: number | null = null;
-	let ownBroker: string | null = null;
 	for (;;) {
 		let live: unknown = null;
 		try {
@@ -261,13 +265,11 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} catch {
 			// Transient read failures are ambiguity, not proof of orphanhood.
 		}
-		const identity = brokerPublicationIdentity(live);
-		if (identity !== null && (ownBroker === null || identity === ownBroker)) {
-			ownBroker ??= identity;
+		if (brokerPublicationIdentity(live) !== null) {
 			absentSince = null;
 		} else {
 			absentSince ??= now();
-			if (now() - absentSince >= graceMs) return;
+			if (now() - absentSince >= graceMs && !readWorkLease()) return;
 		}
 		await sleep(pollMs);
 	}
@@ -1658,7 +1660,7 @@ export async function runSessionHost(
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
 	const reapReason = await Promise.race([
-		watchSessionHostBrokerLiveness({ agentDir }).then(() => undefined),
+		watchSessionHostBrokerLiveness({ agentDir, readWorkLease: sessionHostWorkLeaseActive }).then(() => undefined),
 		watchSessionHostClientAttachment({
 			readAttachedClients: sessionHostAttachedClients,
 			readWorkLease: sessionHostWorkLeaseActive,
