@@ -11,6 +11,7 @@
  *
  * A leaf module: Settings imports it to supply the setting, so it imports nothing from config.
  */
+import { logger } from "@gajae-code/utils";
 import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 
@@ -87,15 +88,54 @@ const LAUNCH_CWD = ((): string | undefined => {
 	}
 })();
 
-function readTrustedOverride(): string | undefined {
-	if (LAUNCH_CWD === undefined) return undefined;
+/** The override as read once for this process: the trusted value, or why the variable was ignored. */
+interface OverrideRead {
+	readonly value: string | undefined;
+	readonly ignored?: "project_env" | "unreadable";
+}
+
+function readOverride(): OverrideRead {
+	const raw = process.env[SESSION_OWNERSHIP_ENV];
+	if (raw === undefined || raw.trim() === "") return { value: undefined };
+	if (LAUNCH_CWD === undefined) return { value: undefined, ignored: "unreadable" };
 	try {
-		return trustedSessionOwnershipOverride(process.env, projectEnvSnapshot(LAUNCH_CWD));
+		const value = trustedSessionOwnershipOverride(process.env, projectEnvSnapshot(LAUNCH_CWD));
+		return value === undefined ? { value, ignored: "project_env" } : { value };
 	} catch {
-		return undefined;
+		return { value: undefined, ignored: "unreadable" };
 	}
 }
-let cachedOverride: { readonly value: string | undefined } | undefined;
+
+let cachedOverride: OverrideRead | undefined;
+let reportedOverride = false;
+
+/** An ignored override fails quietly for the user, so say why once, at debug level. */
+function reportIgnoredOverride(read: OverrideRead, configured: SessionOwnershipMode, effective: SessionOwnershipMode) {
+	if (reportedOverride) return;
+	let reason: string | undefined;
+	if (read.ignored === "project_env") reason = "it was set by the project .env, not the operator";
+	else if (read.ignored === "unreadable") reason = "the project .env could not be checked";
+	else if (read.value !== undefined) {
+		const requested = parseMode(read.value.trim().toLowerCase());
+		if (requested === undefined) reason = "its value is not off, observe or enforce";
+		else if (effective === configured && requested !== configured) reason = "it can only lower the configured mode";
+	}
+	if (reason === undefined) return;
+	reportedOverride = true;
+	logger.debug(`${SESSION_OWNERSHIP_ENV} ignored: ${reason}`, { configured });
+}
+
+/** Test-only: forget the cached override, so a test can change the environment. */
+export function resetSessionOwnershipModeForTests(): void {
+	cachedOverride = undefined;
+	reportedOverride = false;
+}
+
+/** Test-only: whether this process has read `GJC_SESSION_OWNERSHIP` since the last reset. */
+export function sessionOwnershipOverrideWasRead(): boolean {
+	return cachedOverride !== undefined;
+}
+
 let settingSource: (() => unknown) | undefined;
 
 /** Settings supplies the global-only `session.ownership.mode` value. Without a source the default applies. */
@@ -116,7 +156,11 @@ export function sessionOwnershipMode(): SessionOwnershipMode {
 	} catch {
 		setting = undefined;
 	}
-	if (resolveSessionOwnershipMode(setting, undefined) === "off") return "off";
-	cachedOverride ??= { value: readTrustedOverride() };
-	return resolveSessionOwnershipMode(setting, cachedOverride.value);
+	const configured = resolveSessionOwnershipMode(setting, undefined);
+	// `off` is the kill switch: it returns before the environment is read at all.
+	if (configured === "off") return "off";
+	cachedOverride ??= readOverride();
+	const effective = resolveSessionOwnershipMode(setting, cachedOverride.value);
+	reportIgnoredOverride(cachedOverride, configured, effective);
+	return effective;
 }

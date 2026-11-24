@@ -1,17 +1,20 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { YAML } from "bun";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { SETTINGS_SCHEMA } from "../../src/config/settings-schema";
 import {
 	DEFAULT_SESSION_OWNERSHIP_MODE,
+	resetSessionOwnershipModeForTests,
 	resolveSessionOwnershipMode,
 	SESSION_OWNERSHIP_MODES,
 	type SessionOwnershipMode,
 	sessionOwnershipMode,
+	sessionOwnershipOverrideWasRead,
 	sessionOwnershipTestHookSlot,
 	trustedSessionOwnershipOverride,
 } from "../../src/session/session-ownership-mode";
@@ -24,15 +27,23 @@ async function tempRoot(): Promise<string> {
 	return root;
 }
 
-// An operator override in the runner's environment would lower the modes these tests expect.
+// The override is read once per process, so each test starts with it unset and unread.
 const operatorOverride = process.env.GJC_SESSION_OWNERSHIP;
+let debugLines: string[] = [];
 
 beforeEach(() => {
 	delete process.env.GJC_SESSION_OWNERSHIP;
+	resetSessionOwnershipModeForTests();
+	debugLines = [];
+	vi.spyOn(logger, "debug").mockImplementation(message => {
+		debugLines.push(message);
+	});
 });
 
 afterEach(async () => {
 	resetSettingsForTest();
+	resetSessionOwnershipModeForTests();
+	vi.restoreAllMocks();
 	if (operatorOverride === undefined) delete process.env.GJC_SESSION_OWNERSHIP;
 	else process.env.GJC_SESSION_OWNERSHIP = operatorOverride;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -170,4 +181,95 @@ describe("the session.ownership.mode setting", () => {
 		await initSettings({}, { session: { ownership: { mode: "enforce" } } });
 		expect(sessionOwnershipMode()).toBe("off");
 	});
+});
+
+describe("GJC_SESSION_OWNERSHIP at run time", () => {
+	async function userMode(mode: SessionOwnershipMode) {
+		const root = await tempRoot();
+		await fs.mkdir(path.join(root, "agent"), { recursive: true });
+		await Bun.write(path.join(root, "agent", "config.yml"), YAML.stringify({ session: { ownership: { mode } } }));
+		return Settings.init({ cwd: root, agentDir: path.join(root, "agent") });
+	}
+
+	it("off returns before the environment is read at all", async () => {
+		process.env.GJC_SESSION_OWNERSHIP = "enforce";
+		await userMode("off");
+		expect(sessionOwnershipMode()).toBe("off");
+		expect(sessionOwnershipOverrideWasRead()).toBe(false);
+		expect(debugLines).toEqual([]);
+		resetSettingsForTest();
+		await userMode("observe");
+		expect(sessionOwnershipMode()).toBe("observe");
+		expect(sessionOwnershipOverrideWasRead()).toBe(true);
+	});
+
+	it("an operator override lowers the mode", async () => {
+		process.env.GJC_SESSION_OWNERSHIP = "off";
+		await userMode("enforce");
+		expect(sessionOwnershipMode()).toBe("off");
+		expect(debugLines).toEqual([]);
+	});
+
+	it("a request to raise the mode, or an invalid value, is ignored with one debug line", async () => {
+		process.env.GJC_SESSION_OWNERSHIP = "enforce";
+		await userMode("observe");
+		expect(sessionOwnershipMode()).toBe("observe");
+		expect(sessionOwnershipMode()).toBe("observe");
+		expect(debugLines).toEqual(["GJC_SESSION_OWNERSHIP ignored: it can only lower the configured mode"]);
+
+		resetSettingsForTest();
+		resetSessionOwnershipModeForTests();
+		debugLines = [];
+		process.env.GJC_SESSION_OWNERSHIP = "disabled";
+		await userMode("enforce");
+		expect(sessionOwnershipMode()).toBe("enforce");
+		expect(debugLines).toEqual(["GJC_SESSION_OWNERSHIP ignored: its value is not off, observe or enforce"]);
+	});
+
+	it("in a real process, a project .env cannot lower the mode, and the operator's value can", async () => {
+		const root = await tempRoot();
+		const project = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(project, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await Bun.write(path.join(project, ".env"), "GJC_SESSION_OWNERSHIP=off\n");
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ session: { ownership: { mode: "enforce" } } }),
+		);
+		const script = path.join(root, "print-mode.ts");
+		const src = path.join(import.meta.dir, "../../src");
+		await Bun.write(
+			script,
+			[
+				`import { Settings } from ${JSON.stringify(path.join(src, "config/settings.ts"))};`,
+				`import { sessionOwnershipMode } from ${JSON.stringify(path.join(src, "session/session-ownership-mode.ts"))};`,
+				`await Settings.init({ cwd: process.cwd(), agentDir: ${JSON.stringify(agentDir)} });`,
+				"console.log('MODE=' + sessionOwnershipMode());",
+				"process.exit(0);",
+			].join("\n"),
+		);
+		const run = async (operator: string | undefined) => {
+			const env: Record<string, string> = {
+				PATH: process.env.PATH ?? "/usr/bin:/bin",
+				HOME: root,
+				TMPDIR: root,
+				GJC_CODING_AGENT_DIR: agentDir,
+				XDG_CONFIG_HOME: path.join(root, "xdg"),
+				XDG_STATE_HOME: path.join(root, "xdg"),
+				XDG_DATA_HOME: path.join(root, "xdg"),
+				XDG_CACHE_HOME: path.join(root, "xdg"),
+				GJC_LOG_DIR: path.join(root, "logs"),
+			};
+			if (operator !== undefined) env.GJC_SESSION_OWNERSHIP = operator;
+			const child = Bun.spawn([process.execPath, script], { cwd: project, env, stdout: "pipe", stderr: "pipe" });
+			const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+			await child.exited;
+			return out.match(/MODE=(\w+)/)?.[1] ?? `no mode (exit ${child.exitCode}): ${err.slice(0, 300)}`;
+		};
+		// Bun copies the project .env into process.env; that value must not count.
+		expect(await run(undefined)).toBe("enforce");
+		// The operator's own value differs from the project's, so it counts.
+		expect(await run("observe")).toBe("observe");
+	}, 60_000);
 });
