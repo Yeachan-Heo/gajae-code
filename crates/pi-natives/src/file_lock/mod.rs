@@ -27,6 +27,11 @@ use std::{ffi::CString, time::Duration};
 
 use napi_derive::napi;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "unix.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
 	use std::ffi::CStr;
 
@@ -308,6 +313,30 @@ mod tests {
 		dropped
 			.recv_timeout(Duration::from_secs(10))
 			.expect("the late output is dropped once the call finishes");
+		drop(runtime);
+	}
+
+	/// A real lock taken after the budget is released once its call finishes.
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	#[test]
+	fn a_lock_acquired_past_its_budget_is_released() {
+		let _window = super::platform::tests::spawn_window();
+		let dir = super::platform::tests::TempDir::new("late");
+		let path = dir.path("s.session-owner");
+		let runtime = runtime();
+		let (sender, dropped) = mpsc::channel();
+		let late = path.clone();
+		let outcome = runtime.block_on(bounded(Duration::from_millis(20), move || {
+			std::thread::sleep(Duration::from_millis(200));
+			let lock = super::platform::try_acquire(&late)?;
+			Ok((lock.expect("free"), DropSignal(sender)))
+		}));
+		assert_eq!(outcome.map(|_| ()).expect_err("times out").kind, FileLockFailure::TimedOut);
+		dropped
+			.recv_timeout(Duration::from_secs(10))
+			.expect("the late lock is dropped once the call finishes");
+		let probe = super::platform::probe(&path);
+		assert!(!probe.expect("probe"), "a lock taken past its budget stays held");
 		drop(runtime);
 	}
 
