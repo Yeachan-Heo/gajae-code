@@ -596,7 +596,7 @@ describe("SessionHeldError", () => {
 		expect(phrase("acp-host")).toBe("an ACP session host (pid 7)");
 		expect(phrase("sdk")).toBe("an application using the gjc SDK (pid 7)");
 		expect(phrase("terminal (subagent)")).toBe("a subagent of another terminal (pid 7)");
-		expect(phrase("terminal", "build-box")).toBe("gjc on build-box (pid 7)");
+		expect(phrase("terminal", "build-box")).toBe("a gjc process on build-box (pid 7)");
 		expect(sessionOwnerHolderPhrase(undefined)).toBe("another gjc process");
 	});
 
