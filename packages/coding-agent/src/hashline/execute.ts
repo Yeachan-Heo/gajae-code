@@ -11,6 +11,7 @@ import type { ToolSession } from "../tools";
 import { assertEditableFileContent, assertEditableFileName } from "../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
+import { writeFileTextInsideActiveWorkspace } from "../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
 import { formatFullAnchorRequirement, HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
@@ -284,13 +285,9 @@ async function executeHashlineSection(
 		sourcePath,
 		bom + restoreLineEndings(result.lines, originalEnding),
 	);
-	const diagnostics = await writethrough(
-		absolutePath,
-		finalContent,
-		signal,
-		Bun.file(absolutePath),
-		batchRequest,
-		dst => (dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined),
+	await writeFileTextInsideActiveWorkspace(absolutePath, finalContent);
+	const diagnostics = await writethrough(absolutePath, finalContent, signal, undefined, batchRequest, dst =>
+		dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined,
 	);
 	invalidateFsScanAfterWrite(absolutePath);
 	// The post-edit content is the freshest, most authoritative "model view"

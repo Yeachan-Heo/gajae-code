@@ -7,7 +7,7 @@ import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { FileWriteNotPublishedError, writeFileAtomically } from "../tools/atomic-file-write";
-import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { formatPathRelativeToCwd, getActiveWorkspaceConfinement, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -759,12 +759,23 @@ export async function writethroughNoop(
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
-	if (file !== undefined) {
-		await file.write(content);
-		return undefined;
-	}
-	await writeFileAtomically(dst, content);
+	await publishWritethroughContent(dst, content, file);
 	return undefined;
+}
+
+/**
+ * Publish writethrough bytes. A `--confine` session writes through a
+ * descriptor-pinned walk beneath its root, so a parent swapped for a symlink
+ * after the tool's path check cannot redirect the write outside that root.
+ */
+async function publishWritethroughContent(dst: string, content: string, file?: BunFile): Promise<void> {
+	const confinement = getActiveWorkspaceConfinement();
+	if (confinement) {
+		await confinement.writeFile(dst, content);
+		return;
+	}
+	if (file !== undefined) await file.write(content);
+	else await writeFileAtomically(dst, content);
 }
 
 interface PendingWritethrough {
@@ -938,8 +949,7 @@ async function runLspWritethrough(
 	let publishedContent = false;
 	const writeContent = async (value: string) => {
 		try {
-			if (file !== undefined) await file.write(value);
-			else await writeFileAtomically(dst, value);
+			await publishWritethroughContent(dst, value, file);
 			publishedContent = true;
 		} catch (error) {
 			if (error instanceof FileWriteNotPublishedError) {

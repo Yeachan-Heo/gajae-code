@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { isEnoent, isRecord } from "@gajae-code/utils";
+import { readFileTextInsideActiveWorkspace } from "../tools/path-utils";
 
 export type NotebookCellType = "code" | "markdown" | "raw";
 
@@ -89,7 +90,9 @@ function validateNotebook(value: unknown, displayPath: string): NotebookDocument
 
 export async function readNotebookDocument(absolutePath: string, displayPath: string): Promise<NotebookDocument> {
 	try {
-		return validateNotebook(await Bun.file(absolutePath).json(), displayPath);
+		// Use descriptor-pinned I/O when in a confined workspace to prevent TOCTOU attacks
+		const text = await readFileTextInsideActiveWorkspace(absolutePath);
+		return validateNotebook(JSON.parse(text), displayPath);
 	} catch (error) {
 		if (isEnoent(error)) throw new Error(`File not found: ${displayPath}`);
 		if (error instanceof SyntaxError) throw new Error(`Invalid JSON in notebook: ${displayPath}`);

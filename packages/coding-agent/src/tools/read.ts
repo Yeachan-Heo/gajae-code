@@ -69,8 +69,10 @@ import {
 	stripOutputNotice,
 } from "./output-meta";
 import {
+	assertRealpathInsideActiveWorkspace,
 	expandPath,
 	formatPathRelativeToCwd,
+	getActiveWorkspaceConfinement,
 	resolveReadPath,
 	splitInternalUrlSel,
 	splitPathAndSel,
@@ -519,6 +521,18 @@ function expandRangeWithContext(
 	};
 }
 
+async function readConfinedText(filePath: string): Promise<string> {
+	const confinement = getActiveWorkspaceConfinement();
+	if (!confinement) return Bun.file(filePath).text();
+	return (await confinement.readFile(filePath)).toString("utf8");
+}
+
+async function openReadHandle(filePath: string): Promise<fs.FileHandle> {
+	const confinement = getActiveWorkspaceConfinement();
+	if (!confinement) return fs.open(filePath, "r");
+	return confinement.openFile(filePath);
+}
+
 export async function streamLinesFromFile(
 	filePath: string,
 	startLine: number,
@@ -848,7 +862,7 @@ export async function streamLinesFromFile(
 	setupLineState();
 
 	try {
-		fileHandle = await fs.open(filePath, "r");
+		fileHandle = await openReadHandle(filePath);
 		while (true) {
 			throwIfAborted(signal);
 			const { bytesRead } = await fileHandle.read(bufferChunk, 0, bufferChunk.length, null);
@@ -1509,6 +1523,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const candidates = parseArchivePathCandidates(readPath);
 		for (const candidate of candidates) {
 			let absolutePath = resolveReadPath(candidate.archivePath, this.session.cwd);
+			await assertRealpathInsideActiveWorkspace(absolutePath);
 			let suffixResolution: { from: string; to: string } | undefined;
 
 			try {
@@ -1530,6 +1545,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (retryStat.isDirectory()) continue;
 
 					absolutePath = suffixMatch.absolutePath;
+					await assertRealpathInsideActiveWorkspace(absolutePath);
 					suffixResolution = { from: candidate.archivePath, to: suffixMatch.displayPath };
 					return {
 						absolutePath,
@@ -1551,6 +1567,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const candidates = parseSqlitePathCandidates(readPath);
 		for (const candidate of candidates) {
 			let absolutePath = resolveReadPath(candidate.sqlitePath, this.session.cwd);
+			await assertRealpathInsideActiveWorkspace(absolutePath);
 			let suffixResolution: { from: string; to: string } | undefined;
 
 			try {
@@ -1576,6 +1593,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (!(await isSqliteFile(suffixMatch.absolutePath))) continue;
 
 					absolutePath = suffixMatch.absolutePath;
+					await assertRealpathInsideActiveWorkspace(absolutePath);
 					suffixResolution = { from: candidate.sqlitePath, to: suffixMatch.displayPath };
 					return {
 						absolutePath,
@@ -2049,7 +2067,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// Directional multi-range reads use the same materialized window oracle as
 		// ACP so each block has identical bytes, anchors, and cache entries.
 		if (direction !== "head") {
-			const diskText = await Bun.file(absolutePath).text();
+			const diskText = await readConfinedText(absolutePath);
 			const result = this.#buildInMemoryMultiRangeResult(diskText, ranges, {
 				details: { resolvedPath: absolutePath, suffixResolution },
 				sourcePath: absolutePath,
@@ -2477,10 +2495,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					code = await bridgePromise;
 				} catch (error) {
 					if (isClientAuthorityDenial(error)) throw error;
-					code = await Bun.file(absolutePath).text();
+					code = await readConfinedText(absolutePath);
 				}
 			} else {
-				code = await Bun.file(absolutePath).text();
+				code = await readConfinedText(absolutePath);
 			}
 			throwIfAborted(signal);
 			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
@@ -2779,6 +2797,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const parsed = parseSel(localTarget.sel);
 
 		let absolutePath = resolveReadPath(localReadPath, this.session.cwd);
+		await assertRealpathInsideActiveWorkspace(absolutePath);
 		let suffixResolution: { from: string; to: string } | undefined;
 
 		let isDirectory = false;
@@ -2804,6 +2823,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						try {
 							const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
 							absolutePath = suffixMatch.absolutePath;
+							await assertRealpathInsideActiveWorkspace(absolutePath);
 							fileSize = retryStat.size;
 							isDirectory = retryStat.isDirectory();
 							suffixResolution = { from: localReadPath, to: suffixMatch.displayPath };
