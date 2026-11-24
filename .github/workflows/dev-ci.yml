@@ -4,7 +4,10 @@ on:
   push:
     branches: [dev]
   pull_request:
-    branches: [dev]
+    # Trigger on stacked PRs (base branch != main) and native PRs (base branch = dev).
+    # Upper-stack PRs target lower PR branches; lower PR branches are excluded from main CI (ci.yml)
+    # so each stacked layer relies on dev-ci to validate against the cumulative integration base.
+    branches-ignore: [main]
     types: [opened, edited, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
@@ -114,6 +117,62 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Resolve the effective base for stacked PRs. For native PRs (base.ref == dev),
+  # the effective base is the event base. For stacked PRs (base.ref != dev), the
+  # effective base is the current dev tip, and the PR must contain it (cumulative
+  # integration validation). Outputs effective_base_ref and effective_base_sha for
+  # downstream jobs to override event-provided values for stacked PR scenarios.
+  resolve-effective-base:
+    name: Resolve effective base for stacked PRs
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      effective_base_ref: ${{ steps.resolve.outputs.effective_base_ref }}
+      effective_base_sha: ${{ steps.resolve.outputs.effective_base_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Resolve effective base for stacked PR
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_ref='${{ github.event.pull_request.base.ref }}'
+          base_sha='${{ github.event.pull_request.base.sha }}'
+          head_sha='${{ github.event.pull_request.head.sha }}'
+          
+          if [ "$base_ref" = "dev" ]; then
+            # Native PR targeting dev: use event base as-is
+            echo "effective_base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+            echo "effective_base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          else
+            # Stacked PR targeting a lower PR branch: validate against current dev
+            if ! git fetch --no-tags origin dev:refs/remotes/origin/dev-integration; then
+              echo "::error::Could not fetch current dev integration base from origin."
+              exit 1
+            fi
+            dev_sha="$(git rev-parse refs/remotes/origin/dev-integration)"
+            
+            # Verify this PR head contains the current dev (cumulative stack validation)
+            if ! git merge-base --is-ancestor "$dev_sha" "$head_sha"; then
+              status=$?
+              if [ "$status" -eq 1 ]; then
+                echo "::error::Stacked PR head does not contain current dev integration base ($dev_sha). Rebase the stack onto dev."
+              else
+                echo "::error::Could not verify stacked PR head contains dev (merge-base exit $status)."
+              fi
+              exit 1
+            fi
+            
+            echo "effective_base_ref=dev" >> "$GITHUB_OUTPUT"
+            echo "effective_base_sha=$dev_sha" >> "$GITHUB_OUTPUT"
+          fi
+
   # Planner: resolve changed-path relevance and the affected task plan once, then
   # fan the plan out into per-task shards. Emits the matrix, has_tasks/has_native
   # flags, and the resolved changed paths so every downstream job reuses this
@@ -123,7 +182,7 @@ jobs:
     # A PR body/title edit without a base change changes no code, so the DAG is
     # skipped for it.
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
-
+    needs: [resolve-effective-base]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -142,7 +201,8 @@ jobs:
       plan_source_sha: ${{ steps.plan.outputs.plan_source_sha }}
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+      GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
+      GITHUB_BASE_REF: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_ref) || (github.event_name == 'workflow_dispatch' && inputs.base_ref) || github.ref_name }}
       CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -266,14 +326,14 @@ jobs:
 
   telegram-daemon-generation:
     name: Telegram daemon generation guard
-    needs: [affected-plan]
+    needs: [affected-plan, resolve-effective-base]
     if: ${{ needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_protected_daemon_decl == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     env:
-      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+      GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
       GITHUB_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.event_name == 'workflow_dispatch' && inputs.base_ref || github.ref_name }}
+      BASE_REF: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_ref) || (github.event_name == 'workflow_dispatch' && inputs.base_ref) || github.ref_name }}
       HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
       BASE_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.event_name == 'workflow_dispatch' && inputs.base_repository || github.repository }}
       HEAD_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
@@ -898,7 +958,7 @@ jobs:
   # runtime download the prebuilt artifact instead of rebuilding it.
   affected-shards:
     name: Affected path validation / ${{ matrix.key }}
-    needs: [affected-plan, affected-native]
+    needs: [affected-plan, affected-native, resolve-effective-base]
     if: ${{ always() && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
     runs-on: ubuntu-22.04
     # Broad push-mode coding-agent/root test shards can need up to 90 minutes, but
@@ -987,7 +1047,7 @@ jobs:
         env:
           AFFECTED_TASK_KEY: ${{ matrix.key }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-          GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+          GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
         run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
       - name: Write shard completion receipt
         run: |
@@ -1182,13 +1242,14 @@ jobs:
   gjc-state-gates-relevance:
     name: gjc-state-gates / relevance
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
+    needs: [resolve-effective-base]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
       relevant: ${{ steps.relevance.outputs.relevant }}
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+      GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -1263,7 +1324,7 @@ jobs:
     name: gjc-state-gates / ${{ matrix.group }}
     # Inherit dispatch/metadata-edit filtering from the successful relevance job.
     if: ${{ needs.gjc-state-gates-relevance.result == 'success' && needs.gjc-state-gates-relevance.outputs.relevant == 'true' }}
-    needs: [gjc-state-gates-relevance, gjc-state-gates-native]
+    needs: [gjc-state-gates-relevance, gjc-state-gates-native, resolve-effective-base]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     strategy:
@@ -1272,7 +1333,7 @@ jobs:
         group: [static, runtime, integrity, read]
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+      GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
