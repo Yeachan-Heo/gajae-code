@@ -94,6 +94,14 @@ function sidecarCacheInstances(): string[] {
 }
 
 /**
+ * Instances created since `before`. Opening an instance schedules a sweep that may reap an older
+ * stale one, so assertions only ever look at what is new.
+ */
+function newSidecarCacheInstances(before: readonly string[]): string[] {
+	return sidecarCacheInstances().filter(name => !before.includes(name));
+}
+
+/**
  * Streams a linear v5 transcript of user/assistant turns to just past `targetBytes`, then a
  * compaction and a kept suffix: the shape the bounded loader serves. Returns the entry ids.
  */
@@ -156,6 +164,7 @@ let generated: { ids: string[]; leafId: string };
 let childScript: string;
 
 beforeAll(async () => {
+	if (process.platform === "win32") return;
 	workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-export-large-")));
 	sourceDir = path.join(workDir, "source");
 	fs.mkdirSync(sourceDir, { mode: 0o700 });
@@ -176,7 +185,8 @@ afterAll(() => {
 	if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
 });
 
-describe("standalone HTML export of a transcript above the eager-load cap", () => {
+// Windows has no bounded loader: export there still refuses transcripts above the eager cap.
+describe.skipIf(process.platform === "win32")("standalone HTML export of a transcript above the eager-load cap", () => {
 	it("exports every entry with bounded memory and leaves the source and caches untouched", async () => {
 		const transcriptBytes = fs.statSync(sessionFile).size;
 		expect(transcriptBytes).toBeGreaterThan(RESUME_TRANSCRIPT_MAX_BYTES);
@@ -199,7 +209,7 @@ describe("standalone HTML export of a transcript above the eager-load cap", () =
 		expect(snapshotTree(sourceDir)).toEqual(before);
 		expect(snapshotTreeIfPresent(getSessionsDir())).toEqual(managedBefore);
 		expect(snapshotTreeIfPresent(getTerminalSessionsDir())).toEqual(breadcrumbsBefore);
-		expect(sidecarCacheInstances()).toEqual(instancesBefore);
+		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 
 		const html = fs.readFileSync(outputPath, "utf8");
 		const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1] ?? "";
@@ -231,7 +241,7 @@ describe("standalone HTML export of a transcript above the eager-load cap", () =
 			if (chunk.done) break;
 			output += new TextDecoder().decode(chunk.value);
 		}
-		const heldInstances = sidecarCacheInstances().length - instancesBefore.length;
+		const heldInstances = newSidecarCacheInstances(instancesBefore).length;
 		child.kill("SIGINT");
 		const exitCode = await child.exited;
 
@@ -246,7 +256,7 @@ describe("standalone HTML export of a transcript above the eager-load cap", () =
 			interrupted: true,
 		});
 		expect(output).not.toContain("maxRssKiB");
-		expect(sidecarCacheInstances()).toEqual(instancesBefore);
+		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 		expect(snapshotTree(sourceDir)).toEqual(before);
 	}, 300_000);
 });

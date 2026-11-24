@@ -225,6 +225,14 @@ function sidecarCacheInstances(): string[] {
 	return fs.existsSync(root) ? fs.readdirSync(root).filter(name => name.startsWith("i-")) : [];
 }
 
+/**
+ * Instances created since `before`. Opening an instance schedules a sweep that may reap an older
+ * stale one, so assertions only ever look at what is new.
+ */
+function newSidecarCacheInstances(before: readonly string[]): string[] {
+	return sidecarCacheInstances().filter(name => !before.includes(name));
+}
+
 /** Route every non-empty transcript through the bounded loader, as one above 128 MiB is. */
 function forceBoundedSnapshot(): void {
 	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
@@ -279,7 +287,35 @@ describe("standalone HTML export leaves its source untouched", () => {
 	}
 });
 
-describe("standalone HTML export through the bounded loader leaves its source untouched", () => {
+// Windows has no bounded loader, so the bounded-mode cases below are POSIX-only.
+const describePosix = describe.skipIf(process.platform === "win32");
+const itPosix = it.skipIf(process.platform === "win32");
+
+describePosix("standalone HTML export through the bounded loader leaves its source untouched", () => {
+	it("matches the eager export for a transcript inside the managed session store", async () => {
+		const content = coldEligibleTranscript();
+		const reference = await referenceHtml(content);
+		const projectDir = path.join(getSessionsDir(), "--export-bounded-probe--");
+		fs.mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+		try {
+			const sessionFile = path.join(projectDir, "session.jsonl");
+			fs.writeFileSync(sessionFile, content, { mode: 0o600 });
+			fs.writeFileSync(`${sessionFile}.spill.idx`, "decoy legacy sidecar", { mode: 0o600 });
+			const managedBefore = snapshotTree(getSessionsDir());
+			const instancesBefore = sidecarCacheInstances();
+			const outputPath = path.join(makeTempDir("output"), "export.html");
+			forceBoundedSnapshot();
+
+			await exportFromFile(sessionFile, { outputPath });
+
+			expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
+			expect(snapshotTree(getSessionsDir())).toEqual(managedBefore);
+			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+		} finally {
+			fs.rmSync(projectDir, { recursive: true, force: true });
+		}
+	});
+
 	for (const fixture of FIXTURES) {
 		it(`${fixture.bounded ? "matches the eager export" : "refuses"} without touching the source (${fixture.name})`, async () => {
 			const content = fixture.build();
@@ -303,13 +339,13 @@ describe("standalone HTML export through the bounded loader leaves its source un
 			expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
 			expect(snapshotTree(sourceDir)).toEqual(before);
 			expect(snapshotTreeIfPresent(getSessionsDir())).toEqual(managedBefore);
-			expect(sidecarCacheInstances()).toEqual(instancesBefore);
+			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 		});
 	}
 });
 
 describe("standalone HTML export side effects outside the source", () => {
-	it("refuses a transcript above the eager-load limit that the bounded loader cannot read", async () => {
+	itPosix("refuses a transcript above the eager-load limit that the bounded loader cannot read", async () => {
 		const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized")]));
 		// Sparse: past the header line the file is NUL bytes, which the bounded scan rejects.
 		fs.truncateSync(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES + 1);
@@ -323,10 +359,10 @@ describe("standalone HTML export side effects outside the source", () => {
 
 		expect(snapshotTree(sourceDir)).toEqual(before);
 		expect(fs.existsSync(outputPath)).toBe(false);
-		expect(sidecarCacheInstances()).toEqual(instancesBefore);
+		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 	});
 
-	it("refuses a transcript above the bounded-load limit without reading it", async () => {
+	itPosix("refuses a transcript above the bounded-load limit without reading it", async () => {
 		const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized-bounded")]));
 		// Sparse: the size check runs on stat before any read.
 		fs.truncateSync(sessionFile, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1);
@@ -340,7 +376,7 @@ describe("standalone HTML export side effects outside the source", () => {
 
 		expect(snapshotTree(sourceDir, false)).toEqual(before);
 		expect(fs.existsSync(outputPath)).toBe(false);
-		expect(sidecarCacheInstances()).toEqual(instancesBefore);
+		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 	});
 
 	it("does not repoint this terminal's --continue breadcrumb at the exported session", async () => {
@@ -570,35 +606,39 @@ describe("read-only session snapshot", () => {
 		await assertSnapshotRefusesMutations(staleReplayTranscript(), "readonly-stale-replay", "user");
 	});
 
-	it("refuses the guarded mutations on a bounded snapshot and leaves the source untouched", async () => {
-		// A cold snapshot cannot capture its state, so restoreState gets one from an eager snapshot
-		// of a copy; the read-only guard runs before the state is examined.
-		const stateFile = path.join(makeTempDir("state"), "session.jsonl");
-		fs.writeFileSync(stateFile, coldEligibleTranscript(), { mode: 0o600 });
-		const stateSource = await SessionManager.openReadOnlySnapshot(stateFile);
-		const instancesBefore = sidecarCacheInstances();
-		forceBoundedSnapshot();
-		try {
-			await assertSnapshotRefusesMutations(
-				coldEligibleTranscript(),
-				"readonly-cold",
-				"kept",
-				snapshot => {
-					const stats = snapshot.getSessionMemoryStats();
-					expect({ succeeded: stats.lazyReopenSucceeded, cold: stats.coldRetirementActive }).toEqual({
-						succeeded: true,
-						cold: true,
-					});
-					// The open snapshot holds exactly one private sidecar cache.
-					expect(sidecarCacheInstances()).toHaveLength(instancesBefore.length + 1);
-				},
-				stateSource,
-			);
-		} finally {
-			await stateSource.close();
-		}
-		expect(sidecarCacheInstances()).toEqual(instancesBefore);
-	}, 30_000);
+	itPosix(
+		"refuses the guarded mutations on a bounded snapshot and leaves the source untouched",
+		async () => {
+			// A cold snapshot cannot capture its state, so restoreState gets one from an eager snapshot
+			// of a copy; the read-only guard runs before the state is examined.
+			const stateFile = path.join(makeTempDir("state"), "session.jsonl");
+			fs.writeFileSync(stateFile, coldEligibleTranscript(), { mode: 0o600 });
+			const stateSource = await SessionManager.openReadOnlySnapshot(stateFile);
+			const instancesBefore = sidecarCacheInstances();
+			forceBoundedSnapshot();
+			try {
+				await assertSnapshotRefusesMutations(
+					coldEligibleTranscript(),
+					"readonly-cold",
+					"kept",
+					snapshot => {
+						const stats = snapshot.getSessionMemoryStats();
+						expect({ succeeded: stats.lazyReopenSucceeded, cold: stats.coldRetirementActive }).toEqual({
+							succeeded: true,
+							cold: true,
+						});
+						// The open snapshot holds exactly one private sidecar cache.
+						expect(newSidecarCacheInstances(instancesBefore)).toHaveLength(1);
+					},
+					stateSource,
+				);
+			} finally {
+				await stateSource.close();
+			}
+			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+		},
+		30_000,
+	);
 
 	it("leaves normally opened sessions writable", async () => {
 		const { sessionFile } = seedSource(staleReplayTranscript());
