@@ -5147,7 +5147,9 @@ export class AgentSession {
 	 * after another process changed the transcript, whose operator message names the
 	 * recovery (reopen or fork). Without this the turn is admitted, acceptance hooks run
 	 * and the first append fails; a hidden custom-message turn even resolved with
-	 * unsaved entries in memory.
+	 * unsaved entries in memory. This covers only a session already known to be stuck:
+	 * the first turn after a peer write still runs skill resolution, extension and
+	 * custom command dispatch and title invalidation, and is refused at its first append.
 	 *
 	 * The refuse-before-the-model ordering follows the approach in #7843.
 	 */
