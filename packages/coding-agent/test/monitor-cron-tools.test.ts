@@ -702,6 +702,42 @@ describe("MonitorTool", () => {
 			expect(manager.getJob(result.details.taskId)?.status).toBe("completed");
 		});
 
+		it("retries an exit report the session refuses as busy until ingress reopens", async () => {
+			let busy = false;
+			let refusals = 0;
+			const sent: Steered[] = [];
+			const session = createSession(settings);
+			// Session-transition shape (compaction, handoff): ingress refuses with code "busy".
+			session.sendCustomMessage = (async (msg: Steered, options?: unknown) => {
+				if (busy) {
+					refusals += 1;
+					throw Object.assign(new Error("session transition in progress"), { code: "busy" });
+				}
+				sent.push({ ...msg, options });
+			}) as typeof session.sendCustomMessage;
+			const tool = MonitorTool.createIf(session)!;
+			const result = expectText(
+				await tool.execute("call", {
+					command: "printf 'ALIVE\\n'; sleep 1.5",
+					kind: "poll",
+					description: "busy session",
+					persistent: true,
+				}),
+			);
+			await waitUntil(() => sent.length === 1);
+			// The line was admitted; a transition starts before the command exits.
+			busy = true;
+			await settle();
+			await waitUntil(() => refusals >= 2);
+			expect(exitNotifications(sent)).toEqual([]);
+			busy = false;
+			await waitUntil(() => exitNotifications(sent).length === 1);
+
+			expect(sent.at(-1)!.options).toEqual(SILENT);
+			expect(completions).toEqual([]);
+			expect(manager.getJob(result.details.taskId)?.status).toBe("completed");
+		}, 15_000);
+
 		it("keeps the async-result when the monitor fails after delivering lines", async () => {
 			const steered: Steered[] = [];
 			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;

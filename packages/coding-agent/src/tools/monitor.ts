@@ -56,6 +56,10 @@ const MAX_PENDING_MONITOR_NOTIFICATIONS = 3;
 const MONITOR_NOTIFICATION_LINE_MAX_BYTES = 16 * 1024;
 const MONITOR_NOTIFICATION_LINE_MAX_LINES = 20;
 const PERSISTENT_MONITOR_DEBOUNCE_MS = 250;
+const EXIT_DELIVERY_RETRY_INITIAL_DELAY_MS = 250;
+const EXIT_DELIVERY_RETRY_MAX_DELAY_MS = 5_000;
+// Session transitions such as compaction can hold ingress for minutes.
+const EXIT_DELIVERY_RETRY_WINDOW_MS = 30 * 60_000;
 // Monitor jobs run through the Bash pipeline, which clamps explicit timeouts to
 // the Bash ceiling. The schema stays aligned with the upstream parity fixture, so
 // the ceiling is enforced here: reject instead of silently running a shorter job.
@@ -174,6 +178,12 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// still in flight then and is rejected afterwards would leave the agent
 		// with neither the line nor a wake, so the exit is re-reported as a wake.
 		let silentExitSent = false;
+		// An explicit cancel or post-eviction purge: no exit report may be
+		// re-sent or retried after the user dropped this monitor's notifications.
+		let explicitlyPurged = false;
+		// Generation of the exited job, so a late exit report still finds the owned
+		// registration after the job record is evicted.
+		let terminalGeneration: string | undefined;
 		// Count of notification *sends* (not live queue depth): once it exceeds the
 		// cap, each new send first purges older queued notifications for this task,
 		// keeping the queue bounded and latest-biased.
@@ -211,6 +221,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				return;
 			}
 			controller.closed = true;
+			if (mode === "purge") explicitlyPurged = true;
 			if (!persistent || (mode === "evict" && completionAcknowledged)) return;
 			return this.session.purgeQueuedCustomMessages?.(isMonitorMessage);
 		};
@@ -233,7 +244,11 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			latestLine = undefined;
 			coalescedCount = 0;
 			flushScheduled = false;
-			if (line === undefined && lastSent) {
+			terminalGeneration = manager.getJob(currentJobId)?.generation;
+			// A line rejected after the ack decided (between run() returning and
+			// onTerminal) never reached the agent: the exit carries it as a wake.
+			if (line === undefined && lineDeliveryFailed && lastSent) ({ line, count } = lastSent);
+			else if (line === undefined && lastSent) {
 				// Count removals through the predicate: the returned totals omit
 				// messages held in the deferred SDK follow-up store.
 				let taken = 0;
@@ -297,7 +312,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			// ordinary. The standalone generation is NOT persisted — it lives in
 			// the envelope, which INTERNAL_DETAILS_FIELDS strips (review threads
 			// P1/P2).
-			const generation = manager.getJob(jobId)?.generation;
+			const generation = manager.getJob(jobId)?.generation ?? (exited ? terminalGeneration : undefined);
 			// Build the envelope from the RETAINED registration (which carries the
 			// complete lineage tuple), not the tool-call binding: the binding map
 			// is separately bounded and can evict a long-lived monitor's entry,
@@ -356,35 +371,63 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			if (exit === "silent") {
 				// A background producer's context, not a continuation of the
 				// current turn: a terminal abort keeps it for the next turn.
-				void this.session
-					.sendCustomMessage(message, { triggerTurn: false, deliverAs: "nextTurn", origin: "external" })
-					.catch(error => {
-						logger.warn("Monitor exit notification delivery failed", {
-							error: error instanceof Error ? error.message : String(error),
-						});
-					});
+				deliverExit(message, { triggerTurn: false, deliverAs: "nextTurn", origin: "external" });
 				silentExitSent = true;
 				retireRegistrationAfterSilentExit(jobId);
 				return;
 			}
-			if (!exited) unsettledSends += 1;
+			if (exited) {
+				deliverExit(message, { triggerTurn: true, deliverAs: "followUp" });
+				return;
+			}
+			unsettledSends += 1;
 			void this.session
 				.sendCustomMessage(message, { triggerTurn: true, deliverAs: "followUp" })
 				.catch(error => {
 					logger.warn("Monitor task-notification delivery failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});
-					if (exited) return;
 					lineDeliveryFailed = true;
-					if (silentExitSent) {
+					if (silentExitSent && !explicitlyPurged) {
+						// The exit went out without a wake, assuming this line reached
+						// the agent. Replace it with a waking exit that carries the line.
 						silentExitSent = false;
+						this.session.purgeQueuedCustomMessages?.(
+							m => isMonitorMessage(m) && (m.details as { exitCode?: number } | undefined)?.exitCode === 0,
+						);
 						sequence += 1;
 						sendNotification(line, jobId, count, "wake", true);
 					}
 				})
 				.finally(() => {
-					if (!exited) unsettledSends -= 1;
+					unsettledSends -= 1;
 				});
+		};
+		// The job's async-result is already acknowledged, so the exit report must
+		// survive the transient refusals the yield queue would have waited out: a
+		// session transition (compaction, handoff, session switch) or
+		// cancel-and-submit rejects with code "busy". Retry those with backoff;
+		// give up on any other error (disposal, closed admission), where the
+		// async-result would have been dropped as well.
+		const deliverExit = (
+			message: Parameters<NonNullable<ToolSession["sendCustomMessage"]>>[0],
+			options: NonNullable<Parameters<NonNullable<ToolSession["sendCustomMessage"]>>[1]>,
+		) => {
+			const deadline = Date.now() + EXIT_DELIVERY_RETRY_WINDOW_MS;
+			const attempt = (delayMs: number) => {
+				if (explicitlyPurged || !this.session.sendCustomMessage) return;
+				this.session.sendCustomMessage(message, options).catch(error => {
+					const busy = (error as { code?: unknown } | undefined)?.code === "busy";
+					if (busy && !explicitlyPurged && Date.now() + delayMs <= deadline) {
+						setTimeout(() => attempt(Math.min(delayMs * 2, EXIT_DELIVERY_RETRY_MAX_DELAY_MS)), delayMs).unref();
+						return;
+					}
+					logger.warn("Monitor exit notification delivery failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			};
+			attempt(EXIT_DELIVERY_RETRY_INITIAL_DELAY_MS);
 		};
 		const schedulePersistentNotification = (line: string) => {
 			latestLine = line;
