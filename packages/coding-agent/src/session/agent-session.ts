@@ -5162,11 +5162,12 @@ export class AgentSession {
 	 * A peer write detected mid-turn latches the mismatch at the failed append, and
 	 * agent-core turns that listener failure into an aborted run. Report the typed
 	 * refusal at the public boundary instead of a provider-level abort or a silent
-	 * success; the turn's messages stay in memory.
+	 * success; the turn's messages stay in memory. Only a latch set during this call is
+	 * reported: a command that started no turn on an already-stuck session succeeded.
 	 */
-	#throwLatchedAppendRejection(): void {
+	#throwLatchedAppendRejection(latchedAtEntry: Error | undefined): void {
 		const appendRejection = this.sessionManager.getAppendIdentityMismatch();
-		if (appendRejection) throw appendRejection;
+		if (appendRejection && appendRejection !== latchedAtEntry) throw appendRejection;
 	}
 
 	#assertSessionAdmissionOpen(): void {
@@ -16386,7 +16387,7 @@ export class AgentSession {
 				continuationSdkRunToken === undefined ? "full" : "publication",
 			);
 		}
-		this.#throwLatchedAppendRejection();
+		this.#throwLatchedAppendRejection(undefined);
 	}
 
 	buildDisplaySessionContext(): SessionContext {
@@ -16673,6 +16674,8 @@ export class AgentSession {
 			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		// A skill always starts a turn; refuse before claiming its epoch or running preflight.
+		this.#assertTranscriptAcceptsTurn();
 		const internalOptions = {
 			...options,
 			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
@@ -17968,6 +17971,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const latchedAtEntry = this.sessionManager.getAppendIdentityMismatch();
 		this.#btwPrefixLedger.clear();
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		const observer = options?.onRunAccepted;
@@ -18003,7 +18007,7 @@ export class AgentSession {
 				observer ? { ...options, onRunAccepted: notifyRunAccepted } : options,
 				releaseStartupPromptWaiter,
 			);
-			this.#throwLatchedAppendRejection();
+			this.#throwLatchedAppendRejection(latchedAtEntry);
 		} finally {
 			if (observedLogicalRunId !== undefined) {
 				const observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
@@ -18053,7 +18057,6 @@ export class AgentSession {
 			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
-		this.#assertTranscriptAcceptsTurn();
 		if (options?.synthetic !== true && options?.attribution !== "agent") {
 			invalidateSessionTitleGeneration(this.sessionManager);
 		}
@@ -18113,6 +18116,11 @@ export class AgentSession {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+
+		// Extension and custom commands that do not start a turn have returned above, so a
+		// stuck session can still run them (status commands, or commands that open another
+		// session). Everything from here on starts a turn: refuse it before admission.
+		this.#assertTranscriptAcceptsTurn();
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
@@ -18554,7 +18562,7 @@ export class AgentSession {
 			},
 			options?.preflightSignal,
 		);
-		this.#throwLatchedAppendRejection();
+		this.#throwLatchedAppendRejection(undefined);
 	}
 
 	async #promptWithMessage(

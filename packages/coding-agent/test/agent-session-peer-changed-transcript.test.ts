@@ -34,9 +34,13 @@ interface Harness {
 	modelRegistry: ModelRegistry;
 }
 
-/** A compaction hook that short-circuits the summary, so compaction needs no model. */
+/**
+ * A compaction hook that short-circuits the summary, so compaction needs no model,
+ * and a `/r5-status` command that starts no turn and counts its runs.
+ */
 const COMPACTION_HOOK_SOURCE = [
 	"export default function(pi) {",
+	'\tpi.registerCommand("r5-status", { handler: async () => { globalThis.__r5StatusRuns = (globalThis.__r5StatusRuns ?? 0) + 1; } });',
 	'\tpi.on("session_before_compact", async event => ({',
 	"\t\tcompaction: {",
 	'\t\t\tsummary: "hook summary",',
@@ -435,6 +439,78 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(apiKey).not.toHaveBeenCalled();
 		expect(harness.session.sessionManager.getSessionFile()).toBe(harness.file);
 		expect(await Bun.file(harness.file).text()).toBe(transcriptBefore);
+	});
+
+	it("refuses a stuck prompt before preflight acceptance is reported", async () => {
+		const harness = await setup();
+		const latched = await latch(harness);
+		const onPreflightAccepted = vi.fn();
+		const onRunAccepted = vi.fn();
+
+		const refusal = await settle(harness.session.prompt("not accepted", { onPreflightAccepted, onRunAccepted }));
+
+		expect(refusal).toBe(latched);
+		expect(onPreflightAccepted).not.toHaveBeenCalled();
+		expect(onRunAccepted).not.toHaveBeenCalled();
+	});
+
+	it("still runs an extension command that starts no turn on a stuck session", async () => {
+		const harness = await setup({ withHooks: true });
+		await latch(harness);
+		const runs = globalThis as { __r5StatusRuns?: number };
+		runs.__r5StatusRuns = 0;
+		const before = harness.counts();
+
+		await harness.session.prompt("/r5-status");
+
+		expect(runs.__r5StatusRuns).toBe(1);
+		expect(harness.counts()).toEqual(before);
+		delete runs.__r5StatusRuns;
+	});
+
+	it("refuses a skill on a stuck session before resolving it", async () => {
+		const harness = await setup();
+		const latched = await latch(harness);
+
+		expect(await settle(harness.session.invokeSkill("no-such-skill"))).toBe(latched);
+	});
+
+	it("reports a mid-turn peer write from a custom-message turn instead of resolving", async () => {
+		const harness = await setup();
+		harness.setScript("tool");
+		harness.onToolRun(async () => {
+			harness.onToolRun(undefined);
+			await harness.appendFromB("from B mid-turn");
+		});
+
+		const refusal = await settle(
+			harness.session.promptCustomMessage({
+				customType: "probe",
+				content: "hidden turn",
+				display: false,
+				attribution: "agent",
+			}),
+		);
+
+		expect(refusal).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		expect(harness.counts().toolRuns).toBe(1);
+		expect(memoryMessages(harness.session.messages)).toContain("toolResult:tool ok");
+	});
+
+	it("reports a mid-turn peer write from a continuation instead of resolving", async () => {
+		const harness = await setup();
+		harness.session.agent.appendMessage({ role: "user", content: "continue me", timestamp: Date.now() });
+		harness.setScript("tool");
+		harness.onToolRun(async () => {
+			harness.onToolRun(undefined);
+			await harness.appendFromB("from B mid-turn");
+		});
+
+		const refusal = await settle(harness.session.continuePersistedHistory());
+
+		expect(refusal).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		expect(harness.counts().toolRuns).toBe(1);
+		expect(memoryMessages(harness.session.messages)).toContain("toolResult:tool ok");
 	});
 
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
