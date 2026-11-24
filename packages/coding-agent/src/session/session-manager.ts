@@ -13147,6 +13147,17 @@ export class SessionManager {
 		return false;
 	}
 
+	/**
+	 * The persistence failure that every later append rethrows before writing, if one is
+	 * latched: a {@link ManagedAppendIdentityMismatchError} after another process changed
+	 * the transcript, or an earlier write failure. Near-limit outcomes are not latched.
+	 * @internal
+	 */
+	getLatchedPersistenceFailure(): Error | undefined {
+		if (!this.persist || !this.#sessionFile) return undefined;
+		return this.#persistError;
+	}
+
 	/** Ownership loss remains observable even when an agent event listener aborts the turn. */
 	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
@@ -17752,6 +17763,25 @@ export class SessionManager {
 			}
 		});
 		if (this.#persistError) throw this.#persistError;
+	}
+
+	/**
+	 * {@link flush} for a caller that is leaving this transcript: `/resume`, `/new`,
+	 * `/fork` or shutdown.
+	 *
+	 * Once another process changes a managed transcript, the append fence latches
+	 * {@link ManagedAppendIdentityMismatchError} and every later flush rethrows it. The
+	 * fence rejected those appends before writing any byte and managed appends are
+	 * synchronous, so nothing is left to flush; rethrowing would trap the operator in a
+	 * session whose only recovery is to leave it. Every other flush failure still throws.
+	 * @internal
+	 */
+	async flushBeforeLeaving(): Promise<void> {
+		try {
+			await this.flush();
+		} catch (error) {
+			if (error === undefined || error !== this.getAppendIdentityMismatch()) throw error;
+		}
 	}
 
 	#releaseClosedSessionState(): void {
