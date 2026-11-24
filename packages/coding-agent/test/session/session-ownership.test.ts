@@ -77,7 +77,7 @@ afterEach(async () => {
 describe("sessionOwnerKey", () => {
 	it("keeps a safe id and hashes anything else, independent of any path", () => {
 		expect(sessionOwnerKey("0193f1aa-7b2c_4d")).toBe("0193f1aa-7b2c_4d");
-		for (const id of ["../escape", "a b", "x".repeat(129), "h-0193f1aa", "/tmp/s.jsonl"]) {
+		for (const id of ["../escape", "a b", "x".repeat(129), "h-0193f1aa", "/tmp/s.jsonl", "AbC"]) {
 			const key = sessionOwnerKey(id);
 			expect(key).toMatch(/^h-[0-9a-f]{32}$/);
 			expect(sessionOwnerKey(id)).toBe(key);
@@ -177,6 +177,21 @@ describe.if(supported)("claim, probe and release", () => {
 		claim.release();
 		expect(await readJson(recordPath)).toMatchObject({ claimNonce: "someone-else" });
 		expect(await probeSessionOwner("s3")).toEqual({ state: "free" });
+	});
+
+	it("ids that differ only in case are separate sessions, even on a case-insensitive volume", async () => {
+		const upper = await claimed("AbC");
+		// Before keys folded case, this was "held" by the AbC claim's own sidecar.
+		expect((await claimed("abc")).shared).toBe(false);
+		expect(await probeSessionOwners(["AbC", "abc"])).toEqual(
+			new Map([
+				["AbC", expect.objectContaining({ state: "held", self: true })],
+				["abc", expect.objectContaining({ state: "held", self: true })],
+			]),
+		);
+		upper.release();
+		expect(await probeSessionOwner("AbC")).toEqual({ state: "free" });
+		expect(await probeSessionOwner("abc")).toMatchObject({ state: "held", self: true });
 	});
 
 	it("a probe reports this process's own claim even when the owners directory is gone", async () => {

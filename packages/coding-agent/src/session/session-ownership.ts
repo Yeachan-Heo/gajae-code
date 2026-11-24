@@ -36,6 +36,8 @@ const RECORD_MAX_BYTES = 4096;
 const NATIVE_BUDGET_MS = 2_000;
 const PROBE_CONCURRENCY = 16;
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** Keys must not differ only in case: macOS volumes are case-insensitive by default. */
+const PLAIN_KEY = /^[a-z0-9_-]{1,128}$/;
 const SAFE_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
 const SAFE_VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
 
@@ -114,12 +116,14 @@ export class SessionOwnershipError extends Error {
 // =============================================================================
 
 /**
- * The sidecar key for a session id: the id itself when it is a safe file name, otherwise
- * `h-<hash>`. Safe ids starting with `h-` are hashed too, so no id can name another's sidecar.
+ * The sidecar key for a session id: the id itself when it is a lower-case safe file name,
+ * otherwise `h-<hash>`. Ids with upper case are hashed so two ids differing only in case never
+ * share a sidecar on a case-insensitive volume; ids starting with `h-` are hashed so no id can
+ * name another's sidecar.
  */
 export function sessionOwnerKey(sessionId: string): string {
 	if (sessionId.length === 0) throw new TypeError("session id must not be empty");
-	if (SAFE_ID.test(sessionId) && !sessionId.startsWith("h-")) return sessionId;
+	if (PLAIN_KEY.test(sessionId) && !sessionId.startsWith("h-")) return sessionId;
 	return `h-${createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 32)}`;
 }
 
