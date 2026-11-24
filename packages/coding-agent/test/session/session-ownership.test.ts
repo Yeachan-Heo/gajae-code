@@ -278,6 +278,31 @@ describe.if(supported)("the owners directory fails closed like the append lock",
 		expect(await Bun.file(path.join(elsewhere, "runtime")).exists()).toBe(false);
 	});
 
+	it("releases and refuses when the owners directory is swapped during the acquire", async () => {
+		const owners = sessionOwnersDirectory();
+		const old = `${owners}.old`;
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				const result = await tryAcquireFileLock(sidecar, timeoutMs);
+				await fs.rename(owners, old);
+				await fs.mkdir(owners, { mode: 0o700 });
+				return result;
+			},
+			probe: probeFileLock,
+		};
+		const refused = await claimSessionOwner("s11", { surface: "terminal" }).catch((error: unknown) => error);
+		expect(refused).toBeInstanceOf(SessionOwnershipError);
+		expect((refused as InstanceType<typeof SessionOwnershipError>).code).toBe("owners_directory_changed");
+		// The lock taken in the swapped-out directory is released, and no record names this process.
+		expect(await probeFileLock(path.join(old, `${sessionOwnerKey("s11")}.session-owner`))).toEqual({
+			state: FileLockProbeState.Free,
+		});
+		expect(await Bun.file(path.join(old, `${sessionOwnerKey("s11")}.owner.json`)).exists()).toBe(false);
+		delete SessionOwnershipTestHooks.lockBackend;
+		expect(await probeSessionOwner("s11")).toEqual({ state: "free" });
+		expect((await claimed("s11")).shared).toBe(false);
+	});
+
 	it("refuses a home other users can write", async () => {
 		await fs.chmod(home, 0o777);
 		await expect(claimSessionOwner("s6", { surface: "terminal" })).rejects.toBeInstanceOf(SessionOwnershipError);

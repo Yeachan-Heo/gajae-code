@@ -25,8 +25,14 @@ import {
 import { getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
-import { ensureManagedDirectory } from "./internal/managed-session-storage";
-import { assertAppendLockHomeNotSharedWritable, assertNoReparsePath, canonicalPathSync } from "./session-storage";
+import {
+	assertAppendLockHomeNotSharedWritable,
+	assertNoReparsePath,
+	assertRuntimeLockDirectoryUnchanged,
+	canonicalPathSync,
+	prepareRuntimeLockDirectory,
+	type RuntimeLockDirectory,
+} from "./session-storage";
 
 const SIDECAR_SUFFIX = ".session-owner";
 const RECORD_SUFFIX = ".owner.json";
@@ -135,20 +141,7 @@ export function sessionOwnersDirectory(): string {
 	return path.join(trustedHome(), ".gjc", "runtime", "session-owners");
 }
 
-/** Create and verify the owners directory with the append lock's checks; throws (fail closed). */
-function prepareOwnersDirectory(): string {
-	const home = trustedHome();
-	assertAppendLockHomeNotSharedWritable(home);
-	const gjcRoot = path.join(home, ".gjc");
-	const runtimeRoot = path.join(gjcRoot, "runtime");
-	const owners = path.join(runtimeRoot, "session-owners");
-	assertNoReparsePath(owners);
-	const policy = process.platform === "win32" ? "windows-existing-verify-first" : "default";
-	for (const directory of [gjcRoot, runtimeRoot, owners]) ensureManagedDirectory(directory, undefined, policy);
-	return owners;
-}
-
-/** The same checks without creating anything; `undefined` when no claim was ever made here. */
+/** The append lock's checks without creating anything; `undefined` when no claim was ever made here. */
 function inspectOwnersDirectory(): string | undefined {
 	const home = trustedHome();
 	assertAppendLockHomeNotSharedWritable(home);
@@ -161,6 +154,14 @@ function inspectOwnersDirectory(): string | undefined {
 		throw error;
 	}
 	return owners;
+}
+
+function assertOwnersDirectoryUnchanged(directory: RuntimeLockDirectory): void {
+	try {
+		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed");
+	} catch (error) {
+		throw new SessionOwnershipError("owners_directory_changed", { cause: error });
+	}
 }
 
 // =============================================================================
@@ -381,12 +382,13 @@ export async function claimSessionOwner(
 	const current = registry();
 	if (current.unavailable !== undefined)
 		return { status: "skipped", reason: "unavailable", code: current.unavailable };
-	let owners: string;
+	let directory: RuntimeLockDirectory;
 	try {
-		owners = prepareOwnersDirectory();
+		directory = prepareRuntimeLockDirectory("session-owners", trustedHome());
 	} catch (error) {
 		throw new SessionOwnershipError("owners_directory_unsafe", { cause: error });
 	}
+	const owners = directory.path;
 	const sidecar = path.join(owners, `${key}${SIDECAR_SUFFIX}`);
 	for (;;) {
 		const held = current.entries.get(sidecar);
@@ -401,10 +403,19 @@ export async function claimSessionOwner(
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
 	try {
+		assertOwnersDirectoryUnchanged(directory);
 		const result = await backend().tryAcquire(sidecar, NATIVE_BUDGET_MS);
 		switch (result.status) {
 			case FileLockAcquireStatus.Acquired: {
 				if (!result.lock) throw new SessionOwnershipError("acquired_without_lock");
+				// A swap during the acquire would leave this lock in a directory other processes no
+				// longer see; release it and refuse, as the append lock does.
+				try {
+					assertOwnersDirectoryUnchanged(directory);
+				} catch (error) {
+					result.lock.release();
+					throw error;
+				}
 				const entry: RegistryEntry = {
 					sessionId,
 					surface: request.surface,
