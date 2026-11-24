@@ -73,6 +73,13 @@ const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
 
+/**
+ * Operator text for a fence rejection during startup, before this process ran anything
+ * in the session: the resume itself did not happen, so there is nothing to recover.
+ */
+export const RESUME_REJECTED_OPERATOR_MESSAGE =
+	"Session was resumed by another process; this resume did not run. Retry, or resume a different session.";
+
 /** A pre-mutation append fence rejection: no bytes from this append were written. */
 export class ManagedAppendIdentityMismatchError extends Error {
 	readonly code = "managed_append_identity_mismatch";

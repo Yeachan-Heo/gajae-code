@@ -88,6 +88,10 @@ import {
 } from "./sdk/broker/session-index";
 import type { ResumeSessionIdentity } from "./sdk/session-readonly/storage";
 import type { AgentSession } from "./session/agent-session";
+import {
+	ManagedAppendIdentityMismatchError,
+	RESUME_REJECTED_OPERATOR_MESSAGE,
+} from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { findOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
@@ -773,7 +777,12 @@ export async function applyStartupModelProfiles(args: StartupModelProfileArgs): 
 
 async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
 	const message = error instanceof Error ? error.message : String(error);
-	const operatorMessage = findOperatorMessage(error);
+	// Startup model profiles are applied before anything ran in the resumed session, so
+	// a fence rejection here means this resume itself did not happen.
+	const operatorMessage =
+		error instanceof ManagedAppendIdentityMismatchError
+			? RESUME_REJECTED_OPERATOR_MESSAGE
+			: findOperatorMessage(error);
 	process.stderr.write(operatorMessage ? `${operatorMessage}\n` : `${chalk.red(`Error: ${message}`)}\n`);
 	await args.session.dispose();
 	process.exit(1);
