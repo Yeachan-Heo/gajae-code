@@ -106,10 +106,16 @@ export function assertAppendLockHomeNotSharedWritable(home: string): void {
 	}
 }
 
-interface DirectoryIdentity {
+export interface DirectoryIdentity {
 	readonly path: string;
 	readonly dev: bigint;
 	readonly ino: bigint;
+}
+
+/** A prepared `<home>/.gjc/runtime/<name>` lock directory plus the identities of `.gjc`, `runtime` and itself. */
+export interface RuntimeLockDirectory {
+	readonly path: string;
+	readonly directories: readonly DirectoryIdentity[];
 }
 
 /** A prepared append-lock path plus the identities of `.gjc`, `runtime`, and `append-locks`. */
@@ -129,26 +135,42 @@ function realDirectoryIdentity(pathname: string): DirectoryIdentity {
  * so a principal able to rename entries in `.gjc` cannot redirect a writer to a fresh,
  * empty lock directory and enter the critical section beside another writer.
  */
-function assertAppendLockTargetUnchanged(target: AppendLockTarget): void {
-	for (const expected of target.directories) {
+export function assertRuntimeLockDirectoryUnchanged(
+	directories: readonly DirectoryIdentity[],
+	code = "append_lock_root_changed",
+): void {
+	for (const expected of directories) {
 		let current: DirectoryIdentity;
 		try {
 			current = realDirectoryIdentity(expected.path);
 		} catch (error) {
-			throw new Error(`append_lock_root_changed: ${expected.path}`, { cause: error });
+			throw new Error(`${code}: ${expected.path}`, { cause: error });
 		}
 		if (current.dev !== expected.dev || current.ino !== expected.ino) {
-			throw new Error(`append_lock_root_changed: ${expected.path}`);
+			throw new Error(`${code}: ${expected.path}`);
 		}
 	}
 }
 
-function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
-	const home = canonicalPathSync(getTrustedHomeDir());
+function assertAppendLockTargetUnchanged(target: AppendLockTarget): void {
+	assertRuntimeLockDirectoryUnchanged(target.directories);
+}
+
+/**
+ * Create `<trusted home>/.gjc/runtime/<name>` for kernel or exclusive-file locks, with the
+ * checks every lock namespace shares, and capture its directories' identities for
+ * {@link assertRuntimeLockDirectoryUnchanged}. Throws (fails closed) on a home other users can
+ * write, a reparse component, or a directory whose owner-only mode or ACL does not verify.
+ */
+export function prepareRuntimeLockDirectory(
+	name: string,
+	trustedHome: string = getTrustedHomeDir(),
+): RuntimeLockDirectory {
+	const home = canonicalPathSync(trustedHome);
 	assertAppendLockHomeNotSharedWritable(home);
 	const gjcRoot = path.join(home, ".gjc");
 	const appendLockRuntimeRoot = path.join(gjcRoot, "runtime");
-	const lockRoot = path.join(appendLockRuntimeRoot, "append-locks");
+	const lockRoot = path.join(appendLockRuntimeRoot, name);
 	// No component below the trusted home may be a reparse point, including `.gjc`,
 	// which ensureManagedDirectory would otherwise create through recursively.
 	assertNoReparsePath(lockRoot);
@@ -160,12 +182,17 @@ function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
 	ensureManagedDirectory(gjcRoot, undefined, policy);
 	ensureManagedDirectory(appendLockRuntimeRoot, undefined, policy);
 	ensureManagedDirectory(lockRoot, undefined, policy);
+	return { path: lockRoot, directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(realDirectoryIdentity) };
+}
+
+function prepareAppendLockTarget(transcriptPath: string): AppendLockTarget {
+	const directory = prepareRuntimeLockDirectory("append-locks");
 	return {
 		lockPath: path.join(
-			lockRoot,
+			directory.path,
 			`gjc-${createHash("sha256").update(transcriptLockIdentity(transcriptPath)).digest("hex")}.append-lock`,
 		),
-		directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(realDirectoryIdentity),
+		directories: directory.directories,
 	};
 }
 
