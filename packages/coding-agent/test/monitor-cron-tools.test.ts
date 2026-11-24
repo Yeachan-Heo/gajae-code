@@ -28,7 +28,7 @@ import { MonitorTool } from "../src/tools/monitor";
 
 interface SessionOptions {
 	agentId?: string | null;
-	steered?: Array<{ customType: string; content: string; details?: unknown }>;
+	steered?: Array<{ customType: string; content: string; details?: unknown; options?: unknown }>;
 	settings?: Settings;
 }
 
@@ -42,8 +42,16 @@ function createSession(settings: Settings, options: SessionOptions = {}): ToolSe
 		getSessionSpawns: () => null,
 		getSessionId: () => "test-session",
 		getAgentId: () => agentId,
-		sendCustomMessage: async (msg: { customType: string; content: string; details?: unknown }) => {
-			options.steered?.push({ customType: msg.customType, content: msg.content, details: msg.details });
+		sendCustomMessage: async (
+			msg: { customType: string; content: string; details?: unknown },
+			sendOptions?: unknown,
+		) => {
+			options.steered?.push({
+				customType: msg.customType,
+				content: msg.content,
+				details: msg.details,
+				options: sendOptions,
+			});
 		},
 		purgeQueuedCustomMessages: () => ({
 			agentSteering: 0,
@@ -344,7 +352,9 @@ describe("MonitorTool", () => {
 	});
 
 	describe("completion delivery after a natural exit (#7993)", () => {
-		type Steered = { customType: string; content: string; details?: unknown };
+		type Steered = { customType: string; content: string; details?: unknown; options?: unknown };
+		const WAKE = { triggerTurn: true, deliverAs: "followUp" };
+		const SILENT = { triggerTurn: false, deliverAs: "nextTurn", origin: "external" };
 		const EXIT_MARKER = "exited (code 0)";
 		let completions: string[];
 
@@ -406,6 +416,8 @@ describe("MonitorTool", () => {
 			expect(exitNotifications(steered)).toHaveLength(1);
 			expect(steered.at(-1)!.content).toContain(EXIT_MARKER);
 			expect((steered.at(-1)!.details as { exitCode?: number }).exitCode).toBe(0);
+			if (steered.at(-1)!.content.includes("<monitor-output>")) expect(steered.at(-1)!.options).toEqual(WAKE);
+			else expect(steered.at(-1)!.options).toEqual(SILENT);
 			expect(completions).toEqual([]);
 			expect(manager.getDeliveryState().pendingJobIds).toEqual([]);
 		});
@@ -426,7 +438,7 @@ describe("MonitorTool", () => {
 			expect(completions).toEqual([]);
 		});
 
-		it("a clean exit with nothing pending still tells the model the monitor ended", async () => {
+		it("a clean exit after every line was delivered queues the exit for the next turn without waking", async () => {
 			const steered: Steered[] = [];
 			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;
 			const result = expectText(
@@ -443,8 +455,10 @@ describe("MonitorTool", () => {
 			await settle();
 
 			expect(steered).toHaveLength(2);
+			expect(steered[0]!.options).toEqual(WAKE);
 			expect(steered[1]!.content).toContain(EXIT_MARKER);
 			expect(steered[1]!.content).not.toContain("<monitor-output>");
+			expect(steered[1]!.options).toEqual(SILENT);
 			expect(completions).toEqual([]);
 		});
 
@@ -532,22 +546,15 @@ describe("MonitorTool", () => {
 			expect(held[0]!.content).toContain(EXIT_MARKER);
 		});
 
-		it("sends the exit notification after the job is terminal, carrying the owned envelope", async () => {
+		it("a silent exit carries no owned envelope and retires the registration itself", async () => {
 			bindToolLineage("call-owned", {
 				lineageIdHash: "lineage-m",
 				promptAttemptEpoch: 3,
 				endpointGeneration: 1,
 				endpointId: "test-session",
 			});
-			const statusAtSend: Array<string | undefined> = [];
 			const steered: Steered[] = [];
-			const session = createSession(settings, { steered });
-			const record = session.sendCustomMessage!;
-			session.sendCustomMessage = (async (msg: Steered, opts?: unknown) => {
-				statusAtSend.push(manager.getJob((msg.details as { taskId: string }).taskId)?.status);
-				return record(msg as never, opts as never);
-			}) as typeof session.sendCustomMessage;
-			const tool = MonitorTool.createIf(session)!;
+			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;
 			const result = expectText(
 				await tool.execute("call-owned", {
 					command: "printf 'ALIVE\\n'; sleep 1.5",
@@ -557,16 +564,51 @@ describe("MonitorTool", () => {
 				}),
 			);
 			const generation = manager.getJob(result.details.taskId)!.generation;
+			await waitUntil(() => steered.length === 1);
+			// The line went out while the job ran: it carries the envelope, and the
+			// registration stays because the job is not terminal yet.
+			expect((steered[0]!.details as { ownedCompletions?: unknown[] }).ownedCompletions).toHaveLength(1);
+			expect(lookupOwnedRegistration(result.details.taskId, generation, "test-session")).toBeDefined();
 			await settle();
 
 			expect(completions).toEqual([]);
-			expect(statusAtSend).toEqual(["running", "completed"]);
-			const envelopes = (steered[1]!.details as { ownedCompletions?: Array<{ registration: { jobId: string } }> })
-				.ownedCompletions;
-			expect(envelopes?.map(envelope => envelope.registration.jobId)).toEqual([result.details.taskId]);
-			// AgentSession settles a post-terminal envelope on delivery; the monitor
-			// itself leaves the registration alone.
+			expect(steered[1]!.options).toEqual(SILENT);
+			expect((steered[1]!.details as { ownedCompletions?: unknown[] }).ownedCompletions).toBeUndefined();
+			expect(lookupOwnedRegistration(result.details.taskId, generation, "test-session")).toBeUndefined();
+		});
+
+		it("keeps the registration on a silent exit while a line send is still unsettled", async () => {
+			bindToolLineage("call-busy", {
+				lineageIdHash: "lineage-b",
+				promptAttemptEpoch: 4,
+				endpointGeneration: 1,
+				endpointId: "test-session",
+			});
+			const release = Promise.withResolvers<void>();
+			const sent: Steered[] = [];
+			const session = createSession(settings);
+			// Idle-path shape: a waking send settles only after the turn it started.
+			session.sendCustomMessage = (async (msg: Steered, options?: unknown) => {
+				sent.push({ ...msg, options });
+				if ((options as { triggerTurn?: boolean } | undefined)?.triggerTurn) await release.promise;
+			}) as typeof session.sendCustomMessage;
+			const tool = MonitorTool.createIf(session)!;
+			const result = expectText(
+				await tool.execute("call-busy", {
+					command: "printf 'ALIVE\\n'; sleep 1.5",
+					kind: "poll",
+					description: "busy turn",
+					persistent: true,
+				}),
+			);
+			const generation = manager.getJob(result.details.taskId)!.generation;
+			await settle();
+
+			expect(sent.map(entry => entry.options)).toEqual([WAKE, SILENT]);
+			expect(completions).toEqual([]);
+			// AgentSession settles the in-flight line's envelope when its turn ends.
 			expect(lookupOwnedRegistration(result.details.taskId, generation, "test-session")).toBeDefined();
+			release.resolve();
 		});
 
 		it("does not purge the exit notification when the job is evicted right after the exit", async () => {

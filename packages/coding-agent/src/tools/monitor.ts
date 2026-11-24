@@ -4,7 +4,7 @@ import * as z from "zod/v4";
 import { AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
 import monitorDescription from "../prompts/tools/monitor.md" with { type: "text" };
 import { truncateTail } from "../session/streaming-output";
-import { lookupOwnedRegistration } from "../session/terminal-abort";
+import { lookupOwnedRegistration, unregisterOwnedRegistration } from "../session/terminal-abort";
 import { escapeXmlAttribute } from "../utils/xml-escape";
 import { BashTool } from "./bash";
 import type { ToolSession } from "./index";
@@ -164,6 +164,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// The newest line already sent, so an exit notification can take over a
 		// line notification that is still queued instead of waking a second time.
 		let lastSent: { line: string; count: number } | undefined;
+		// Line sends whose sendCustomMessage has not settled yet (waiting for queue
+		// admission, or running the idle turn they started).
+		let unsettledSends = 0;
 		// Count of notification *sends* (not live queue depth): once it exceeds the
 		// cap, each new send first purges older queued notifications for this task,
 		// keeping the queue bounded and latest-biased.
@@ -205,11 +208,14 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			return this.session.purgeQueuedCustomMessages?.(isMonitorMessage);
 		};
 		// The job's own async-result was acknowledged, so this notification is the
-		// only report that the command exited (#7993). It carries the newest
-		// pending line, or takes over the last line notification if that one is
-		// still queued, so a clean exit still wakes the agent once. It is sent
-		// after the job is terminal, so AgentSession settles its owned envelope on
-		// delivery like any post-terminal completion.
+		// only report that the command exited (#7993). Two cases:
+		// - a line is still pending, or a line notification is still queued: the
+		//   exit rides on that line and wakes the agent once. It is sent after the
+		//   job is terminal, so AgentSession settles its owned envelope on delivery
+		//   like any post-terminal completion.
+		// - every line was already delivered: the agent has acted on the output, so
+		//   the exit alone must not wake it again. It is queued as hidden next-turn
+		//   context instead.
 		const sendExitNotification = () => {
 			if (flushTimer) {
 				clearTimeout(flushTimer);
@@ -233,9 +239,24 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				if (taken > 0) ({ line, count } = { line: lastSent.line, count: lastSent.count + taken - 1 });
 			}
 			sequence += 1;
-			sendNotification(line, currentJobId, count, true);
+			sendNotification(line, currentJobId, count, line === undefined ? "silent" : "wake");
 		};
-		const sendNotification = (line: string | undefined, jobId: string, count: number, exited = false) => {
+		// A silent exit carries no owned envelope: it never wakes the agent, and when
+		// the session is idle the next-turn path appends it to history directly,
+		// where no envelope is ever settled. Nothing else settles the registration
+		// then, so it is retired here, as a `job` poll that consumes a terminal job
+		// does. A line send still in flight lands after the exit and is settled by
+		// AgentSession on delivery, so the registration stays for it. (If that send
+		// is rejected instead, the tuple stays until endpoint teardown; retrying here
+		// could retire it under a line that was queued but not yet delivered.)
+		const retireRegistrationAfterSilentExit = (jobId: string) => {
+			if (unsettledSends > 0) return;
+			const generation = manager.getJob(jobId)?.generation;
+			const registration = generation ? lookupOwnedRegistration(jobId, generation, endpointId) : undefined;
+			if (registration) unregisterOwnedRegistration(registration);
+		};
+		const sendNotification = (line: string | undefined, jobId: string, count: number, exit?: "wake" | "silent") => {
+			const exited = exit !== undefined;
 			if (controller.closed) return;
 			if (line !== undefined) lastSent = { line, count };
 			const notificationId = `${jobId}:${sequence}`;
@@ -273,7 +294,8 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			// sessions have monitors with the same manager-local job id, and an
 			// endpoint-less fallback scan could attach a foreign session's
 			// registration (review thread P2).
-			const registration = generation ? lookupOwnedRegistration(jobId, generation, endpointId) : undefined;
+			const registration =
+				generation && exit !== "silent" ? lookupOwnedRegistration(jobId, generation, endpointId) : undefined;
 			const ownedCompletion = registration
 				? {
 						lineageIdHash: registration.lineageIdHash,
@@ -311,15 +333,36 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				});
 				return;
 			}
+			const message = {
+				customType: "task-notification",
+				content,
+				display: false,
+				attribution: "agent" as const,
+				details,
+			};
+			if (exit === "silent") {
+				// A background producer's context, not a continuation of the
+				// current turn: a terminal abort keeps it for the next turn.
+				void this.session
+					.sendCustomMessage(message, { triggerTurn: false, deliverAs: "nextTurn", origin: "external" })
+					.catch(error => {
+						logger.warn("Monitor exit notification delivery failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+				retireRegistrationAfterSilentExit(jobId);
+				return;
+			}
+			if (!exited) unsettledSends += 1;
 			void this.session
-				.sendCustomMessage(
-					{ customType: "task-notification", content, display: false, attribution: "agent", details },
-					{ triggerTurn: true, deliverAs: "followUp" },
-				)
+				.sendCustomMessage(message, { triggerTurn: true, deliverAs: "followUp" })
 				.catch(error => {
 					logger.warn("Monitor task-notification delivery failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});
+				})
+				.finally(() => {
+					if (!exited) unsettledSends -= 1;
 				});
 		};
 		const schedulePersistentNotification = (line: string) => {

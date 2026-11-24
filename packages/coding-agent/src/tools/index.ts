@@ -459,7 +459,12 @@ export interface ToolSession {
 	 *  tool to dispatch another skill prompt same-turn after recording a handoff. */
 	sendCustomMessage?(
 		message: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			/** Hidden next-turn provenance: "external" (background producer) survives a terminal abort. */
+			origin?: "turn" | "external";
+		},
 	): Promise<void>;
 	/** Get the active OpenTelemetry config so subagent dispatch can forward
 	 *  the parent's tracer/hooks with the subagent's own identity stamped. */
