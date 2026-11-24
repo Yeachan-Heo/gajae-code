@@ -5140,6 +5140,23 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Flush the predecessor before `/resume`, `/new` or `/fork` replaces it.
+	 *
+	 * A transcript another process changed latches {@link ManagedAppendIdentityMismatchError}
+	 * and every later flush rethrows it. The fence rejected those appends before writing any
+	 * byte and managed appends are synchronous, so nothing is left to flush; leaving the
+	 * transcript is the recovery, and rethrowing here would trap the session. Any other
+	 * flush failure still aborts the transition.
+	 */
+	async #flushPredecessorForTransition(): Promise<void> {
+		try {
+			await this.sessionManager.flush();
+		} catch (error) {
+			if (error !== this.sessionManager.getAppendIdentityMismatch()) throw error;
+		}
+	}
+
 	#assertSessionAdmissionOpen(): void {
 		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
 			throw this.#sessionAdmissionBusyError();
@@ -22381,7 +22398,7 @@ export class AgentSession {
 			this.#rebindProviderSessionState(new Map());
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
-			if (!options?.drop) await this.sessionManager.flush();
+			if (!options?.drop) await this.#flushPredecessorForTransition();
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
 			const prepared = await this.sessionManager.prepareNewSession(options);
@@ -22464,7 +22481,7 @@ export class AgentSession {
 			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId))) {
 				throw new Error("Owned async deliveries did not settle before session replacement.");
 			}
-			if (!options?.drop) await this.sessionManager.flush();
+			if (!options?.drop) await this.#flushPredecessorForTransition();
 
 			if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) {
 				throw new Error("Owned async jobs did not settle before session replacement.");
@@ -22909,7 +22926,7 @@ export class AgentSession {
 			await this.#settleBtwForSessionTransition();
 
 			// Flush current session to ensure all entries are written
-			await this.sessionManager.flush();
+			await this.#flushPredecessorForTransition();
 
 			const boundedColdForkEligible =
 				this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined;
@@ -35332,7 +35349,7 @@ export class AgentSession {
 
 			await this.#settleBtwForSessionTransition();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
-			await this.sessionManager.flush();
+			await this.#flushPredecessorForTransition();
 			const previousSessionState = await this.sessionManager.captureRollbackState();
 			const previousSessionAgentModelOverrides = this.getSessionAgentModelOverrideState();
 			let stagedSessionAgentModelRevision: number | undefined;
@@ -36100,7 +36117,7 @@ export class AgentSession {
 			await this.#settleBtwForSessionTransition();
 
 			// Flush pending writes before preparing the successor.
-			await this.sessionManager.flush();
+			await this.#flushPredecessorForTransition();
 			const prepared = selectedEntry.parentId
 				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId)
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
