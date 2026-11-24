@@ -251,9 +251,11 @@ function verifiedHolder(record: OwnerRecord | undefined, sessionId: string): Ses
 	if (!record || record.sessionId !== sessionId) return undefined;
 	const gjcVersion = SAFE_VERSION.test(record.gjcVersion) ? record.gjcVersion : undefined;
 	const base = { surface: record.surface, pid: record.pid, gjcVersion, claimedAt: record.claimedAt };
-	if (record.host !== os.hostname()) return SAFE_HOST.test(record.host) ? { ...base, host: record.host } : undefined;
-	if (observeProcess(record.pid, record.processIncarnation ?? undefined) !== "alive") return undefined;
-	return base;
+	// A live pid with a matching start incarnation is this host's process even if the host name
+	// changed since the record was written (macOS renames hosts with the network).
+	if (observeProcess(record.pid, record.processIncarnation ?? undefined) === "alive") return base;
+	if (record.host === os.hostname() || !SAFE_HOST.test(record.host)) return undefined;
+	return { ...base, host: record.host };
 }
 
 // =============================================================================
@@ -475,7 +477,7 @@ async function probeOne(owners: string | undefined, sessionId: string): Promise<
 
 /**
  * Report, for each id, whether a live process holds it, without taking anything. Three-valued:
- * destructive operations need `free`. Never throws for an id, and never creates the directory.
+ * destructive operations need `free`. Throws only for an empty id, and never creates the directory.
  */
 export async function probeSessionOwners(sessionIds: readonly string[]): Promise<Map<string, SessionOwnerProbe>> {
 	const ids = [...new Set(sessionIds)];

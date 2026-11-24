@@ -180,11 +180,17 @@ describe.if(supported)("session ownership across processes", () => {
 			expect(await probeSessionOwner("p4")).toEqual({ state: "held", self: false, holder: undefined });
 
 			// Another host's pid cannot be checked here; the host itself is the label.
-			await rewrite({ host: "build-box.example" });
+			await rewrite({ host: "build-box.example", pid: exited.pid });
 			expect(await probeSessionOwner("p4")).toMatchObject({
 				state: "held",
-				holder: { surface: "app", pid: holder.child.pid, host: "build-box.example" },
+				holder: { surface: "app", pid: exited.pid, host: "build-box.example" },
 			});
+
+			// A live local holder stays local after the host is renamed.
+			await rewrite({ host: "renamed-host.example" });
+			const renamed = await probeSessionOwner("p4");
+			expect(renamed).toMatchObject({ state: "held", holder: { surface: "app", pid: holder.child.pid } });
+			expect(renamed.state === "held" && renamed.holder?.host).toBeUndefined();
 
 			await rewrite({});
 			expect(await probeSessionOwner("p4")).toMatchObject({ holder: { surface: "app", pid: holder.child.pid } });
