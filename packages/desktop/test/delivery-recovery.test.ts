@@ -1,13 +1,39 @@
-import { expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, test } from "bun:test";
 import {
 	DESKTOP_ATTACHMENT_REQUEST_BYTES,
 	desktopAttachmentJsonBytes,
 } from "@gajae-code/desktop-host/attachment-protocol";
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import type { Browser, Page } from "puppeteer-core";
 import { DesktopLocalRequestError, validateDesktopRequest } from "../src/bridge";
 import type * as Recovery from "../src/delivery-recovery";
 import { type DeliveryRecovery, recoveriesDroppedWithConversation, recoveryNotice } from "../src/delivery-recovery";
 import { browserPath } from "./component-fixture";
+import { startViteBrowser, VITE_BROWSER_SETUP_TIMEOUT_MS, type ViteBrowser } from "./vite-browser";
+
+const port = 16000 + Math.floor(Math.random() * 20000);
+const origin = `http://127.0.0.1:${port}`;
+let vite: ViteBrowser | undefined;
+let browser: Browser;
+
+beforeAll(async () => {
+	if (!browserPath) return;
+	// The browser test loads the showcase; pay its first render here, not inside the test's limit.
+	vite = await startViteBrowser(port, {
+		warmUp: async warming => {
+			const context = await warming.createBrowserContext();
+			try {
+				const page = await context.newPage();
+				await page.goto(`${origin}/?showcase`, { waitUntil: "networkidle0", timeout: 60000 });
+			} finally {
+				await context.close();
+			}
+		},
+	});
+	browser = vite.browser;
+}, VITE_BROWSER_SETUP_TIMEOUT_MS);
+afterAll(async () => {
+	await vite?.close();
+});
 
 test("recovery notices distinguish actionable outcomes from routine bookkeeping", () => {
 	const entry: DeliveryRecovery = {
@@ -138,29 +164,10 @@ async function injectRecovery(page: Page): Promise<void> {
 test.skipIf(!browserPath)(
 	"delivery and restored draft commit atomically and survive reload",
 	async () => {
-		const port = 36000 + Math.floor(Math.random() * 20000);
-		const origin = `http://127.0.0.1:${port}`;
-		const server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
-			cwd: `${import.meta.dir}/..`,
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-		let browser: Browser | undefined;
+		// A fresh context keeps this origin's IndexedDB isolated from the warm-up page.
+		const context = await browser.createBrowserContext();
 		try {
-			for (let i = 0; i < 100; i++) {
-				try {
-					if ((await fetch(origin)).ok) break;
-				} catch {
-					/* starting */
-				}
-				await Bun.sleep(100);
-			}
-			if (!browserPath) return;
-			browser = await puppeteer.launch({
-				executablePath: browserPath,
-				headless: true,
-			});
-			const page = await browser.newPage();
+			const page = await context.newPage();
 			await page.goto(`${origin}/?showcase`);
 			await injectRecovery(page);
 			await page.evaluate(async () => {
@@ -201,9 +208,7 @@ test.skipIf(!browserPath)(
 			]);
 			expect(result.drafts).toEqual([{ sessionId: "s", text: "sent\n\nnew", attachments: [] }]);
 		} finally {
-			await browser?.close();
-			server.kill();
-			await server.exited;
+			await context.close();
 		}
 	},
 	30000,
