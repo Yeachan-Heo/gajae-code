@@ -9,15 +9,33 @@
 
 const MAX_CAUSE_DEPTH = 8;
 
+function ownOperatorMessage(error: Error): string | undefined {
+	const operatorMessage = (error as { operatorMessage?: unknown }).operatorMessage;
+	return typeof operatorMessage === "string" && operatorMessage.trim().length > 0 ? operatorMessage : undefined;
+}
+
 /**
- * The `operatorMessage` of `error` or of the nearest error in its `cause` chain, so a
- * wrapper that keeps the persistence error as its cause still renders the operator text.
+ * Operator text for `error`: its own `operatorMessage`, or the nearest one in its `cause`
+ * chain.
+ *
+ * A wrapper that only re-raises the persistence error (same message or the same machine
+ * code) renders the operator text alone. A wrapper with its own message, such as a failed
+ * rollback or an invariant failure that happened while handling the refusal, keeps that
+ * message first so the operator text cannot hide the real failure.
  */
 export function findOperatorMessage(error: unknown): string | undefined {
-	let current: unknown = error;
-	for (let depth = 0; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth++) {
-		const operatorMessage = (current as { operatorMessage?: unknown }).operatorMessage;
-		if (typeof operatorMessage === "string" && operatorMessage.trim().length > 0) return operatorMessage;
+	if (!(error instanceof Error)) return undefined;
+	const own = ownOperatorMessage(error);
+	if (own) return own;
+	let current: unknown = error.cause;
+	for (let depth = 1; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth++) {
+		const operatorMessage = ownOperatorMessage(current);
+		if (operatorMessage) {
+			const code = (current as { code?: unknown }).code;
+			const outer = error.message.trim();
+			if (outer.length === 0 || outer === current.message || outer === code) return operatorMessage;
+			return `${outer}${/[.!?]$/.test(outer) ? "" : "."} ${operatorMessage}`;
+		}
 		current = current.cause;
 	}
 	return undefined;

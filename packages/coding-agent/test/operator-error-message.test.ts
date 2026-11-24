@@ -14,11 +14,24 @@ describe("operatorErrorMessage", () => {
 		expect(operatorErrorMessage(mismatch)).toBe(mismatch.operatorMessage);
 	});
 
-	it("finds the operator text through a wrapper's cause chain", () => {
+	it("renders a pure re-raise of the persistence error as the operator text alone", () => {
 		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
-		const wrapped = new Error("outer", { cause: new Error("middle", { cause: mismatch }) });
-		expect(findOperatorMessage(wrapped)).toBe(mismatch.operatorMessage);
-		expect(operatorErrorMessage(wrapped)).toBe(mismatch.operatorMessage);
+		const reraised = new Error(mismatch.message, { cause: mismatch });
+		const byCode = new Error("managed_append_identity_mismatch", { cause: new Error("middle", { cause: mismatch }) });
+		expect(findOperatorMessage(reraised)).toBe(mismatch.operatorMessage);
+		expect(operatorErrorMessage(byCode)).toBe(mismatch.operatorMessage);
+	});
+
+	it("keeps a wrapper's own failure in front of the operator text", () => {
+		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
+		// session-manager: an invariant failure while rolling back a refused append.
+		const invariant = new Error("Session append rollback lost resident ordering.", { cause: mismatch });
+		// session-manager: a failed managed-move rollback after a refused write.
+		const rollback = new Error("Failed to rollback managed move: EIO", { cause: mismatch });
+		expect(operatorErrorMessage(invariant)).toBe(
+			`Session append rollback lost resident ordering. ${mismatch.operatorMessage}`,
+		);
+		expect(operatorErrorMessage(rollback)).toBe(`Failed to rollback managed move: EIO. ${mismatch.operatorMessage}`);
 	});
 
 	it("keeps ordinary messages and each site's non-Error fallback", () => {
