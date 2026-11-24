@@ -43,7 +43,7 @@ Each newline-terminated stdout line is appended to the manager-owned cursor. Per
    - automatic retention eviction does not purge it, since it is the only report of the exit. An explicit post-eviction `job` cancel still purges it.
 
    - if a line send that was still in flight at a silent exit is rejected afterwards, the exit is re-reported as a waking follow-up carrying that line.
-   - an exit report the session refuses with code `busy` (a session transition such as compaction, handoff or session switch, or cancel-and-submit) is retried with backoff (250 ms doubling to 5 s, for up to 30 minutes), since the acknowledged `async-result` would otherwise have waited in the yield queue. Other errors (disposal, closed admission) drop it, as they would drop the `async-result`. An explicit cancel or post-eviction purge stops retries and re-sends.
+   - an exit report the session refuses with code `busy` (a session transition such as compaction, handoff or session switch, or cancel-and-submit) is retried with backoff (250 ms doubling to 5 s, for up to 30 minutes), since the acknowledged `async-result` would otherwise have waited in the yield queue. Other errors, a disposed session, or a session identity change (clear, new or switched session, handoff) drop it, as they would drop the `async-result`. An explicit cancel or post-eviction purge stops retries and re-sends.
 
    A non-zero exit, a timeout, an exit with no stdout line, a line notification the session rejected (for example during a handoff), a session without a custom-message router, or a client that defers agent-initiated turns (ACP) sends no exit notification and keeps the ordinary `async-result` delivery, because it is then the only report or wake for the exit.
 

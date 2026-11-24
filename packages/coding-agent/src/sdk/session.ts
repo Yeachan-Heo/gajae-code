@@ -3545,6 +3545,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
 			getSdkPermissionProvider: () => session?.getSdkPermissionProvider(),
 			getClientBridge: () => session?.clientBridge,
+			isSessionDisposed: () => session?.isDisposed ?? false,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),

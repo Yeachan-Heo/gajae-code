@@ -738,6 +738,45 @@ describe("MonitorTool", () => {
 			expect(manager.getJob(result.details.taskId)?.status).toBe("completed");
 		}, 15_000);
 
+		it("stops retrying a busy-refused exit report once the session is disposed or replaced", async () => {
+			for (const end of ["disposed", "replaced"] as const) {
+				let busy = false;
+				let refusals = 0;
+				let disposed = false;
+				let sessionId = "test-session";
+				const sent: Steered[] = [];
+				const session = createSession(settings);
+				session.getSessionId = () => sessionId;
+				session.isSessionDisposed = () => disposed;
+				session.sendCustomMessage = (async (msg: Steered, options?: unknown) => {
+					if (busy) {
+						refusals += 1;
+						throw Object.assign(new Error("session admission closed"), { code: "busy" });
+					}
+					sent.push({ ...msg, options });
+				}) as typeof session.sendCustomMessage;
+				const tool = MonitorTool.createIf(session)!;
+				await tool.execute("call", {
+					command: "printf 'ALIVE\\n'; sleep 1.2",
+					kind: "poll",
+					description: `retry stops when ${end}`,
+					persistent: true,
+				});
+				await waitUntil(() => sent.length === 1);
+				busy = true;
+				await settle();
+				await waitUntil(() => refusals >= 1);
+				if (end === "disposed") disposed = true;
+				else sessionId = "successor-session";
+				const seen = refusals;
+				busy = false;
+				await new Promise(resolve => setTimeout(resolve, 900));
+
+				expect(refusals).toBe(seen);
+				expect(exitNotifications(sent)).toEqual([]);
+			}
+		}, 20_000);
+
 		it("keeps the async-result when the monitor fails after delivering lines", async () => {
 			const steered: Steered[] = [];
 			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;

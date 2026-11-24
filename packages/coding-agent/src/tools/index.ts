@@ -401,6 +401,8 @@ export interface ToolSession {
 	getSdkPermissionProvider?: () => ClientBridge["requestPermission"];
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
+	/** True once the owning session is disposed; background retries stop then. */
+	isSessionDisposed?: () => boolean;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
 	getCompactContext?: () => string;
 	/** Get cached todo phases for this session. */

@@ -407,18 +407,28 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// survive the transient refusals the yield queue would have waited out: a
 		// session transition (compaction, handoff, session switch) or
 		// cancel-and-submit rejects with code "busy". Retry those with backoff;
-		// give up on any other error (disposal, closed admission), where the
-		// async-result would have been dropped as well.
+		// give up on any other error, on disposal, or on a session identity change,
+		// where the async-result would have been dropped as well.
 		const deliverExit = (
 			message: Parameters<NonNullable<ToolSession["sendCustomMessage"]>>[0],
 			options: NonNullable<Parameters<NonNullable<ToolSession["sendCustomMessage"]>>[1]>,
 		) => {
 			const deadline = Date.now() + EXIT_DELIVERY_RETRY_WINDOW_MS;
+			// An identity transition (clear, new or switched session, handoff) drops
+			// the old session's async-results; a disposed session also refuses with
+			// "busy". The exit report follows the same rules instead of retrying.
+			const sessionId = this.session.getSessionId?.();
+			const abandoned = () =>
+				explicitlyPurged ||
+				!this.session.sendCustomMessage ||
+				this.session.isSessionDisposed?.() === true ||
+				this.session.getSessionId?.() !== sessionId;
 			const attempt = (delayMs: number) => {
-				if (explicitlyPurged || !this.session.sendCustomMessage) return;
-				this.session.sendCustomMessage(message, options).catch(error => {
+				const send = this.session.sendCustomMessage;
+				if (!send || abandoned()) return;
+				send.call(this.session, message, options).catch(error => {
 					const busy = (error as { code?: unknown } | undefined)?.code === "busy";
-					if (busy && !explicitlyPurged && Date.now() + delayMs <= deadline) {
+					if (busy && !abandoned() && Date.now() + delayMs <= deadline) {
 						setTimeout(() => attempt(Math.min(delayMs * 2, EXIT_DELIVERY_RETRY_MAX_DELAY_MS)), delayMs).unref();
 						return;
 					}
