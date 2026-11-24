@@ -469,6 +469,8 @@ export const openaiCodexUsageProvider: UsageProvider = {
 				limitReached: parsed?.limitReached,
 				email,
 				accountId,
+				// The ChatGPT workspace id; one login can hold a credential per workspace, each with its own limits.
+				...(accountId ? { orgId: accountId } : {}),
 			},
 			raw: parsed?.raw ?? payload,
 		};
