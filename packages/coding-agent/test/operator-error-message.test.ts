@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { TempDir } from "@gajae-code/utils";
 import { acpRequestFailure } from "../src/modes/acp/acp-agent";
+import { SessionSdkHost } from "../src/sdk/host";
 import { type ControlSurface, dispatchControl } from "../src/sdk/host/control";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
@@ -81,5 +83,44 @@ describe("operator text on SDK and ACP surfaces", () => {
 			data?: Record<string, unknown>;
 		};
 		expect(failure.data).toEqual({ code: "busy", details: "busy now" });
+	});
+
+	it("sends the operator text in an SDK host error frame and keeps the error code", async () => {
+		const tempDir = TempDir.createSync("@gjc-sdk-host-error-frame-");
+		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const sent: Array<Record<string, unknown>> = [];
+		const host = new SessionSdkHost({
+			sessionId: "error-frame",
+			stateRoot: tempDir.path(),
+			token: "token",
+			sendFrame: (_connectionId, frame) => {
+				sent.push(frame);
+				return "written";
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			control: () => {
+				throw mismatch;
+			},
+		});
+		try {
+			await host.start();
+			receive("client", { type: "control_request", id: "c1", operation: "turn.prompt", input: { text: "hi" } });
+			for (let attempt = 0; attempt < 50 && sent.length === 0; attempt++) await Bun.sleep(1);
+			expect(sent).toEqual([
+				{
+					type: "control_response",
+					id: "c1",
+					ok: false,
+					error: { code: "managed_append_identity_mismatch", message: mismatch.operatorMessage },
+				},
+			]);
+		} finally {
+			await host.stop();
+			tempDir.removeSync();
+		}
 	});
 });
