@@ -8,9 +8,18 @@ import type { Settings } from "../../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../../extensibility/custom-tools/types";
 import type { AuthStorage } from "../../../session/auth-storage";
 import { TaskTool } from "../../../task";
+import type { SessionTaskPool } from "../../../task/task-pool";
 import type { TaskParams } from "../../../task/types";
 import type { ToolSession } from "../../../tools";
 import { getFilePriority } from "./git-file-diff";
+
+// Context holder for the session's task pool during tool execution.
+// Set by the agent when the session is initialized and used by analyze-files.
+let sessionTaskPoolContext: SessionTaskPool | undefined;
+
+export function setAnalyzeFilesTaskPoolContext(pool: SessionTaskPool | undefined): void {
+	sessionTaskPoolContext = pool;
+}
 
 const analyzeFileSchema = z.object({
 	files: z.array(z.string().describe("file path")).min(1),
@@ -34,12 +43,14 @@ function buildToolSession(
 		settings: Settings;
 		spawns: string;
 	},
+	getTaskPool?: () => SessionTaskPool | undefined,
 ): ToolSession {
 	return {
 		cwd: options.cwd,
 		hasUI: false,
 		getSessionFile: () => ctx.sessionManager.getSessionFile() ?? null,
 		getSessionSpawns: () => options.spawns,
+		getTaskPool,
 		settings: options.settings,
 		authStorage: options.authStorage,
 		modelRegistry: options.modelRegistry,
@@ -53,6 +64,7 @@ export function createAnalyzeFileTool(options: {
 	settings: Settings;
 	spawns: string;
 	state: CommitAgentState;
+	getTaskPool?: () => SessionTaskPool | undefined;
 }): CustomTool<typeof analyzeFileSchema> {
 	return {
 		name: "analyze_files",
@@ -60,7 +72,9 @@ export function createAnalyzeFileTool(options: {
 		description: "Spawn quick_task agents to analyze files.",
 		parameters: analyzeFileSchema,
 		async execute(toolCallId, params, onUpdate, ctx, signal) {
-			const toolSession = buildToolSession(ctx, options);
+			// Use the context-provided pool or fall back to options if provided
+			const getTaskPool = options.getTaskPool || (() => sessionTaskPoolContext);
+			const toolSession = buildToolSession(ctx, options, getTaskPool);
 			const taskTool = await TaskTool.create(toolSession);
 			const numstat = options.state.overview?.numstat ?? [];
 			const tasks = params.files.map((file, index) => {

@@ -14,6 +14,7 @@ import agentUserPrompt from "./prompts/session-user.md" with { type: "text" };
 import agentSystemPrompt from "./prompts/system.md" with { type: "text" };
 import type { CommitAgentState } from "./state";
 import { createCommitTools } from "./tools";
+import { setAnalyzeFilesTaskPoolContext } from "./tools/analyze-file";
 
 export interface CommitAgentInput {
 	cwd: string;
@@ -74,6 +75,8 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		promptTemplates: [],
 		slashCommands: [],
 	});
+	// Set the task pool context for analyze-files tool
+	setAnalyzeFilesTaskPoolContext(session.getTaskPool?.());
 	let toolCalls = 0;
 	let messageCount = 0;
 	let isThinking = false;

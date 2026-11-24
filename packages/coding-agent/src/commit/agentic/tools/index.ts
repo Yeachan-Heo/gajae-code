@@ -3,6 +3,7 @@ import type { ModelRegistry } from "../../../config/model-registry";
 import type { Settings } from "../../../config/settings";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import type { AuthStorage } from "../../../session/auth-storage";
+import type { SessionTaskPool } from "../../../task/task-pool";
 import { createAnalyzeFileTool } from "./analyze-file";
 import { createGitFileDiffTool } from "./git-file-diff";
 import { createGitHunkTool } from "./git-hunk";
@@ -21,6 +22,7 @@ export interface CommitToolOptions {
 	state: CommitAgentState;
 	changelogTargets: string[];
 	enableAnalyzeFiles?: boolean;
+	getTaskPool?: () => SessionTaskPool | undefined;
 }
 
 export function createCommitTools(options: CommitToolOptions): Array<CustomTool<any, any>> {
@@ -40,6 +42,7 @@ export function createCommitTools(options: CommitToolOptions): Array<CustomTool<
 				settings: options.settings,
 				spawns: options.spawns,
 				state: options.state,
+				getTaskPool: options.getTaskPool,
 			}),
 		);
 	}

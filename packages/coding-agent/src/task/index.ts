@@ -1343,47 +1343,59 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
-						const result = await this.#executeSync(
-							descriptor.toolCallId,
-							{ ...descriptor.params, tasks: [resumedTask] },
-							runSignal,
-							undefined,
-							[descriptor.task.id],
-							forkSeeds,
-							{
-								runMode: message ? "message" : "resume",
-								resumeMessage: message,
-								asyncJobManager: manager,
-								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
-								suppressRoiReconciliation: true,
-								...(descriptor.durableOutputAllowed === true
-									? { persistence: descriptor.artifactPersistence }
-									: {
-											persistence: {
-												effectiveArtifactsDir: undefined,
-												parentArtifactManager: undefined,
-											},
-										}),
-							},
-						);
-						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
-						const rawSingleResult = result.details?.results[0];
-						const singleResult = rawSingleResult
-							? {
-									...rawSingleResult,
-									duplicateDisposition: (() => {
-										const initial = descriptor.initialDisposition;
-										const current = admission.disposition;
-										if (!initial) return current;
-										if (!current) return initial;
-										return {
-											action: current.action,
-											predecessorIds: [...new Set([...initial.predecessorIds, ...current.predecessorIds])],
-										};
-									})(),
-								}
-							: rawSingleResult;
-						return subagentRunOutcomeFromSingleResult(finalText, singleResult);
+						// Acquire pool slot for resumed task execution (at depth 0 - top-level resume)
+						const slotInfo = taskPool ? await taskPool.acquire(0) : { acquiredSlot: false };
+						if (runSignal.aborted) {
+							if (taskPool) taskPool.release(slotInfo);
+							throw new Error("Aborted before execution");
+						}
+						try {
+							const result = await this.#executeSync(
+								descriptor.toolCallId,
+								{ ...descriptor.params, tasks: [resumedTask] },
+								runSignal,
+								undefined,
+								[descriptor.task.id],
+								forkSeeds,
+								{
+									runMode: message ? "message" : "resume",
+									resumeMessage: message,
+									asyncJobManager: manager,
+									sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
+									suppressRoiReconciliation: true,
+									...(descriptor.durableOutputAllowed === true
+										? { persistence: descriptor.artifactPersistence }
+										: {
+												persistence: {
+													effectiveArtifactsDir: undefined,
+													parentArtifactManager: undefined,
+												},
+											}),
+								},
+							);
+							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
+							const rawSingleResult = result.details?.results[0];
+							const singleResult = rawSingleResult
+								? {
+										...rawSingleResult,
+										duplicateDisposition: (() => {
+											const initial = descriptor.initialDisposition;
+											const current = admission.disposition;
+											if (!initial) return current;
+											if (!current) return initial;
+											return {
+												action: current.action,
+												predecessorIds: [
+													...new Set([...initial.predecessorIds, ...current.predecessorIds]),
+												],
+											};
+										})(),
+									}
+								: rawSingleResult;
+							return subagentRunOutcomeFromSingleResult(finalText, singleResult);
+						} finally {
+							if (taskPool) taskPool.release(slotInfo);
+						}
 					},
 					{
 						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,

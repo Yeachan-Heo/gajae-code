@@ -85,17 +85,27 @@ export async function mapWithConcurrencyLimit<T, R>(
 
 /**
  * Simple counting semaphore for limiting concurrency across independently-scheduled async work.
+ * Supports in-place resizing while preserving active permits and queued waiters.
  */
 export class Semaphore {
-	#max: number;
+	#max: number | null; // null = unlimited
 	#current = 0;
 	#queue: Array<() => void> = [];
 
-	constructor(max: number) {
-		this.#max = Math.max(1, max);
+	constructor(max: number | null) {
+		if (max === null || max === 0) {
+			this.#max = null; // unlimited
+		} else {
+			this.#max = Math.max(1, max);
+		}
 	}
 
 	async acquire(): Promise<void> {
+		// Unlimited: always acquire immediately
+		if (this.#max === null) {
+			return;
+		}
+
 		if (this.#current < this.#max) {
 			this.#current++;
 			return;
@@ -106,11 +116,58 @@ export class Semaphore {
 	}
 
 	release(): void {
+		// Unlimited: nothing to release
+		if (this.#max === null) {
+			return;
+		}
+
 		const next = this.#queue.shift();
 		if (next) {
 			next();
 		} else {
 			this.#current--;
 		}
+	}
+
+	/**
+	 * Resize the semaphore limit while preserving existing permits and waiters.
+	 * When shrinking: existing holders drain naturally, new acquires blocked if over limit.
+	 * When growing: queued waiters are woken to fill new slots.
+	 */
+	setMax(newMax: number | null): void {
+		if (newMax === null || newMax === 0) {
+			this.#max = null; // Switch to unlimited
+			// Wake all queued waiters since we're now unlimited
+			while (this.#queue.length > 0) {
+				const resolve = this.#queue.shift();
+				if (resolve) resolve();
+			}
+			return;
+		}
+
+		const normalized = Math.max(1, newMax);
+
+		// If currently unlimited, convert to limited
+		if (this.#max === null) {
+			this.#max = normalized;
+			return;
+		}
+
+		const oldMax = this.#max;
+		this.#max = normalized;
+
+		// If growing, wake waiters to fill new slots.
+		// Don't modify current; waiters are already counted in the queue.
+		// When we resolve their promise, their acquire() will return and
+		// they'll be holding their slot (already represented in current).
+		if (normalized > oldMax) {
+			const availableSlots = normalized - this.#current;
+			for (let i = 0; i < availableSlots && this.#queue.length > 0; i++) {
+				const resolve = this.#queue.shift();
+				if (resolve) resolve();
+			}
+		}
+		// If shrinking: nothing to do. Existing holders drain naturally.
+		// New acquires will be blocked if current >= normalized.
 	}
 }

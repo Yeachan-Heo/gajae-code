@@ -80,43 +80,72 @@ describe("SessionTaskPool concurrency enforcement", () => {
 		pool.release(task3Slot);
 	});
 
-	it("should not enforce limits on nested tasks (taskDepth > 0)", async () => {
+	it("should enforce limits on all tasks including nested (taskDepth > 0)", async () => {
+		// All tasks now acquire from the same pool, regardless of depth
+		// This ensures the session-wide maxConcurrency is honored
 		// Top-level task acquires
 		const slot0 = await pool.acquire(0);
 		expect(slot0.acquiredSlot).toBe(true);
 
-		// Nested task should bypass acquire and return immediately
+		// Nested task also acquires from pool
 		const slot1 = await pool.acquire(1);
-		expect(slot1.acquiredSlot).toBe(false);
+		expect(slot1.acquiredSlot).toBe(true);
 
-		// Deeply nested task should also bypass
-		const slot2 = await pool.acquire(2);
-		expect(slot2.acquiredSlot).toBe(false);
+		// At limit now (2), so next acquire should block
+		let slot2Acquired = false;
+		const slot2Promise = pool.acquire(2).then(() => {
+			slot2Acquired = true;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(slot2Acquired).toBe(false);
+
+		// Release nested task's slot
+		pool.release(slot1);
+		await slot2Promise;
+		expect(slot2Acquired).toBe(true);
 
 		// Cleanup
 		pool.release(slot0);
-		pool.release(slot1);
-		pool.release(slot2);
+		pool.release(await pool.acquire(2));
 	});
 
-	it("should handle nested tasks without deadlock", async () => {
-		// Simulate a parent task that spawns nested child tasks
+	it("should handle nested tasks while respecting pool limits", async () => {
+		// Parent task acquires
 		const parentSlot = await pool.acquire(0);
 		expect(parentSlot.acquiredSlot).toBe(true);
 
-		// Parent should be able to spawn nested children without blocking
-		const childSlots = await Promise.all([pool.acquire(1), pool.acquire(1), pool.acquire(1)]);
+		// Try to acquire 3 nested tasks (only 1 slot available since parent holds 1)
+		const child1 = await pool.acquire(1);
+		expect(child1.acquiredSlot).toBe(true);
+		// Now at limit (2), so more children block
 
-		// All children should have been able to proceed
-		for (const slot of childSlots) {
-			expect(slot.acquiredSlot).toBe(false); // Nested, so no slot acquired
-		}
+		let child2Acquired = false;
+		const child2Promise = pool.acquire(1).then(slot => {
+			child2Acquired = true;
+			return slot;
+		});
+
+		let child3Acquired = false;
+		const child3Promise = pool.acquire(1).then(slot => {
+			child3Acquired = true;
+			return slot;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(child2Acquired).toBe(false);
+		expect(child3Acquired).toBe(false);
+
+		// Release child1
+		pool.release(child1);
+		const child2 = await child2Promise;
+		expect(child2Acquired).toBe(true);
 
 		// Cleanup
 		pool.release(parentSlot);
-		for (const slot of childSlots) {
-			pool.release(slot);
-		}
+		pool.release(child2);
+		const child3 = await child3Promise;
+		pool.release(child3);
 	});
 
 	it("should respect runtime changes to maxConcurrency on new acquires", async () => {
@@ -179,24 +208,32 @@ describe("SessionTaskPool concurrency enforcement", () => {
 	});
 
 	it("should release only slots that were actually acquired", async () => {
-		// Top-level acquires a slot
+		// All tasks now acquire slots; test validates release tracking
 		const topLevelSlot = await pool.acquire(0);
 		expect(topLevelSlot.acquiredSlot).toBe(true);
 
-		// Nested doesn't acquire
 		const nestedSlot = await pool.acquire(1);
-		expect(nestedSlot.acquiredSlot).toBe(false);
+		expect(nestedSlot.acquiredSlot).toBe(true);
 
-		// Releasing nested should be a no-op
+		// Both slots are in use (at limit of 2)
+		// Try to acquire third
+		let thirdAcquired = false;
+		const thirdPromise = pool.acquire(0).then(() => {
+			thirdAcquired = true;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(thirdAcquired).toBe(false);
+
+		// Release nested slot
 		pool.release(nestedSlot);
-
-		// We should still be able to acquire one more top-level slot
-		const anotherSlot = await pool.acquire(0);
-		expect(anotherSlot.acquiredSlot).toBe(true);
+		// Now third should acquire
+		await thirdPromise;
+		expect(thirdAcquired).toBe(true);
 
 		// Cleanup
 		pool.release(topLevelSlot);
-		pool.release(anotherSlot);
+		pool.release(await pool.acquire(0));
 	});
 
 	it("should maintain separate acquire/release tracking for different tasks", async () => {
@@ -225,5 +262,211 @@ describe("SessionTaskPool concurrency enforcement", () => {
 
 	afterEach(() => {
 		// No explicit cleanup needed for the pool
+	});
+});
+
+describe("SessionTaskPool resizing with active permits and waiters", () => {
+	let pool: SessionTaskPool;
+	let settings: MockSettings;
+
+	beforeEach(() => {
+		settings = new MockSettings({ "task.maxConcurrency": 2 });
+		pool = new SessionTaskPool(settings as never, 2);
+	});
+
+	it("should preserve permits and waiters when resizing with live holders", async () => {
+		// Acquire 2 slots (at limit)
+		const slot1 = await pool.acquire(0);
+		const slot2 = await pool.acquire(0);
+		expect(slot1.acquiredSlot).toBe(true);
+		expect(slot2.acquiredSlot).toBe(true);
+
+		// Queue a waiter
+		let waiter3Acquired = false;
+		const waiter3Promise = pool.acquire(0).then(() => {
+			waiter3Acquired = true;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(waiter3Acquired).toBe(false);
+
+		// Resize: increase limit to 3
+		settings.set("task.maxConcurrency", 3);
+
+		// Trigger resize by acquiring
+		// (resizeIfNeeded is called in acquire)
+		const slot3 = await pool.acquire(0);
+		// The waiter should have been woken by the resize
+		await waiter3Promise;
+		expect(waiter3Acquired).toBe(true);
+		expect(slot3.acquiredSlot).toBe(true);
+
+		// Cleanup
+		pool.release(slot1);
+		pool.release(slot2);
+		pool.release(slot3);
+	});
+
+	it("should correctly shrink limit while preserving existing holders", async () => {
+		// Acquire 2 slots with limit 2
+		const slot1 = await pool.acquire(0);
+		const slot2 = await pool.acquire(0);
+		expect(slot1.acquiredSlot).toBe(true);
+		expect(slot2.acquiredSlot).toBe(true);
+
+		// Shrink limit to 1
+		settings.set("task.maxConcurrency", 1);
+
+		// Existing holders should still be valid
+		pool.release(slot1);
+		pool.release(slot2);
+
+		// New acquires should respect new limit
+		const newSlot1 = await pool.acquire(0);
+		expect(newSlot1.acquiredSlot).toBe(true);
+
+		let newSlot2Acquired = false;
+		const newSlot2Promise = pool.acquire(0).then(slot => {
+			newSlot2Acquired = true;
+			return slot;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(newSlot2Acquired).toBe(false);
+
+		pool.release(newSlot1);
+		const newSlot2 = await newSlot2Promise;
+		expect(newSlot2Acquired).toBe(true);
+		pool.release(newSlot2);
+	});
+});
+
+describe("SessionTaskPool unlimited setting", () => {
+	let pool: SessionTaskPool;
+	let settings: MockSettings;
+
+	beforeEach(() => {
+		settings = new MockSettings({ "task.maxConcurrency": 0 });
+		pool = new SessionTaskPool(settings as never, 0);
+	});
+
+	it("should allow unlimited tasks when maxConcurrency is 0", async () => {
+		// Acquire many slots without blocking
+		const slots: Array<{ acquiredSlot: boolean }> = [];
+		for (let i = 0; i < 100; i++) {
+			const slot = await pool.acquire(0);
+			slots.push(slot);
+			expect(slot.acquiredSlot).toBe(true);
+		}
+
+		// All should acquire immediately without blocking
+		expect(slots).toHaveLength(100);
+		for (const slot of slots) {
+			pool.release(slot);
+		}
+	});
+
+	it("should switch to unlimited when resized from limited", async () => {
+		const limitedSettings = new MockSettings({ "task.maxConcurrency": 2 });
+		const limitedPool = new SessionTaskPool(limitedSettings as never, 2);
+
+		// Acquire 2 slots (at limit)
+		const slot1 = await limitedPool.acquire(0);
+		const slot2 = await limitedPool.acquire(0);
+		expect(slot1.acquiredSlot).toBe(true);
+		expect(slot2.acquiredSlot).toBe(true);
+
+		// Try third - should block
+		let slot3Acquired = false;
+		const slot3Promise = limitedPool.acquire(0).then(() => {
+			slot3Acquired = true;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(slot3Acquired).toBe(false);
+
+		// Switch to unlimited
+		limitedSettings.set("task.maxConcurrency", 0);
+
+		// Try another acquire - should trigger resize and wake waiting slot3
+		const slot4 = await limitedPool.acquire(0);
+		expect(slot4.acquiredSlot).toBe(true);
+
+		// Waiter should be woken by resize
+		await slot3Promise;
+		expect(slot3Acquired).toBe(true);
+
+		limitedPool.release(slot1);
+		limitedPool.release(slot2);
+		limitedPool.release(slot4);
+	});
+});
+
+describe("SessionTaskPool nested tasks acquire from same pool", () => {
+	let pool: SessionTaskPool;
+	let settings: MockSettings;
+
+	beforeEach(() => {
+		settings = new MockSettings({ "task.maxConcurrency": 2 });
+		pool = new SessionTaskPool(settings as never, 2);
+	});
+
+	it("should enforce concurrency limit for nested tasks at depth > 0", async () => {
+		// Top-level task acquires
+		const slot0 = await pool.acquire(0);
+		expect(slot0.acquiredSlot).toBe(true);
+
+		// Nested task also acquires (now they can with removed depth check)
+		const slot1 = await pool.acquire(1);
+		expect(slot1.acquiredSlot).toBe(true);
+
+		// Limit reached (2), third task should block
+		let slot2Acquired = false;
+		const slot2Promise = pool.acquire(0).then(() => {
+			slot2Acquired = true;
+		});
+
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(slot2Acquired).toBe(false);
+
+		// Release nested task's slot
+		pool.release(slot1);
+
+		// Now third should acquire
+		await slot2Promise;
+		expect(slot2Acquired).toBe(true);
+
+		pool.release(slot0);
+		pool.release(await pool.acquire(0));
+	});
+
+	it("should stay within limit for nested batch execution", async () => {
+		const acquiredCount: number[] = [];
+		let maxConcurrent = 0;
+		let currentlyRunning = 0;
+
+		const runTaskSimulation = async (depth: number, _id: string): Promise<void> => {
+			const slot = await pool.acquire(depth);
+			currentlyRunning++;
+			acquiredCount.push(currentlyRunning);
+			maxConcurrent = Math.max(maxConcurrent, currentlyRunning);
+
+			// Simulate work
+			await new Promise(resolve => setTimeout(resolve, 10));
+
+			currentlyRunning--;
+			pool.release(slot);
+		};
+
+		// Run 4 tasks concurrently: mix of depth 0 and 1
+		await Promise.all([
+			runTaskSimulation(0, "task0"),
+			runTaskSimulation(1, "task1"),
+			runTaskSimulation(0, "task2"),
+			runTaskSimulation(1, "task3"),
+		]);
+
+		// Max concurrent should not exceed 2 (the pool limit)
+		expect(maxConcurrent).toBeLessThanOrEqual(2);
 	});
 });
