@@ -95,6 +95,23 @@ export function openDb(): Database | null {
 		// This prevents pre-v5 processes from repopulating the cache with unscrubbed data.
 		const basePath = getGithubCacheDbPath();
 		const dbPath = basePath.replace(/\.db$/, "-v5.db");
+		const legacyDbPath = basePath; // Old path without -v5 suffix
+
+		// On first open of v5 namespace, remove legacy cache to ensure no old unscubbed data persists
+		if (!fs.existsSync(dbPath) && fs.existsSync(legacyDbPath)) {
+			try {
+				fs.rmSync(legacyDbPath);
+				fs.rmSync(`${legacyDbPath}-wal`, { force: true });
+				fs.rmSync(`${legacyDbPath}-shm`, { force: true });
+				logger.debug("github cache: removed legacy unscrubbed cache on v5 upgrade", {
+					path: legacyDbPath,
+				});
+			} catch (err) {
+				logger.debug("github cache: failed to remove legacy cache", { err: String(err) });
+				// Continue anyway; not fatal if cleanup fails
+			}
+		}
+
 		ensureParentDir(dbPath);
 		const db = new Database(dbPath);
 		db.run(`

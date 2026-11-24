@@ -1005,5 +1005,77 @@ describe("unified diff scrubber", () => {
 			// Line count preserved
 			expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
 		});
+
+		it("[P2] bracket in string literal across lines doesn't affect bracket tracking", () => {
+			// Issue: When a string contains a bracket character, the bracket tracker must not
+			// count it as part of the credential container structure.
+			// Test case: Properly closed JSON container with multi-line string containing "["
+			// The key point: the '[' inside the string should not change our bracket depth tracking.
+			const diff = [
+				...HEADER,
+				"@@ -1,6 +1,6 @@",
+				" config: {",
+				' "secret_key": "value_with_bracket_[inside',
+				" and_continuation_across_lines",
+				' still_in_string",',
+				' "normal_field": "value"',
+				" }",
+				"",
+			].join("\n");
+
+			const scrubbed = scrubUnifiedDiff(diff);
+
+			// All content inside the { } container should be redacted
+			// Including the secret_key's value with bracket inside
+			expect(scrubbed).not.toContain("value_with_bracket_[inside");
+			expect(scrubbed).not.toContain("and_continuation_across_lines");
+			expect(scrubbed).not.toContain("still_in_string");
+
+			// But the structure markers must be preserved
+			expect(scrubbed).toContain("config: {");
+			expect(scrubbed).toContain("}");
+
+			// Line count preserved
+			expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+		});
+
+		it("[P2] large diff projection performance (20k lines under time budget)", () => {
+			// Issue: The projection index search was quadratic (O(n²)).
+			// Solution: Track indices in forward pass or precompute mapping.
+			// Test: 20k-line diff completes in reasonable time (< 500ms)
+			const lines: string[] = [
+				"diff --git a/large b/large",
+				"index 1111111..2222222 100644",
+				"--- a/large",
+				"+++ b/large",
+				"@@ -1,10001 +1,10001 @@",
+			];
+
+			// Add 10k context lines
+			for (let i = 0; i < 10000; i += 1) {
+				lines.push(` line_${i}_context`);
+			}
+
+			// Add 5k deleted and 5k added (symmetric)
+			lines.push("@@ -10001,10001 +10001,10001 @@");
+			for (let i = 0; i < 5000; i += 1) {
+				lines.push(`-deleted_line_${i}`);
+			}
+			for (let i = 0; i < 5000; i += 1) {
+				lines.push(`+added_line_${i}`);
+			}
+
+			const diff = lines.join("\n");
+			const startTime = Date.now();
+			const scrubbed = scrubUnifiedDiff(diff);
+			const elapsed = Date.now() - startTime;
+
+			// Should complete in reasonable time (< 500ms for 20k lines)
+			// This catches quadratic behavior and excessive cloning
+			expect(elapsed).toBeLessThan(500);
+
+			// Line count preserved
+			expect(scrubbed.split("\n")).toHaveLength(diff.split("\n").length);
+		});
 	});
 });

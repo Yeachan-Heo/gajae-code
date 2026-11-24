@@ -6,6 +6,7 @@
  * `git.github.json` / `git.github.text` mocks between cases.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +18,7 @@ import {
 	getOrFetchView,
 	openDb,
 	putCached,
+	resetForTests,
 	resetForTests as resetCacheForTests,
 } from "@gajae-code/coding-agent/tools/github-cache";
 import * as git from "@gajae-code/coding-agent/utils/git";
@@ -1062,6 +1064,63 @@ describe("Credential scrubbing in cached data", () => {
 
 			// Old file may not exist since v5 uses a separate namespace
 			// This is the desired behavior: v5 readers/writers are isolated
+		});
+
+		it("[P2] legacy cache is removed on first v5 open (migration safety)", async () => {
+			// Issue: When v5 first opens, it should remove the legacy cache to ensure
+			// that no pre-v5 process can repopulate it with unscrubbed data.
+
+			const baseDbPath = process.env.GJC_GITHUB_CACHE_DB!;
+			const legacyPath = baseDbPath;
+			const v5Path = baseDbPath.replace(/\.db$/, "-v5.db");
+
+			// Reset so we can test the cleanup logic
+			resetForTests();
+
+			// Delete the v5 database to simulate a fresh upgrade
+			await fs.rm(v5Path, { force: true });
+			await fs.rm(`${v5Path}-wal`, { force: true });
+			await fs.rm(`${v5Path}-shm`, { force: true });
+
+			// Create a legacy database with some data to simulate a pre-v5 state
+			const legacyDb = new Database(legacyPath);
+			legacyDb.run(`
+				CREATE TABLE IF NOT EXISTS github_view_cache (
+					auth_key TEXT,
+					repo TEXT,
+					kind TEXT,
+					number INTEGER,
+					fetched_at INTEGER,
+					payload TEXT
+				)
+			`);
+			legacyDb
+				.prepare("INSERT INTO github_view_cache VALUES (?, ?, ?, ?, ?, ?)")
+				.run(TEST_AUTH_KEY, TEST_REPO, "issue", 999, Date.now(), '{"title":"unscrubbed-legacy-data"}');
+			legacyDb.close();
+
+			// Verify legacy file exists before upgrade
+			const legacyExistsBefore = await fs.stat(legacyPath).catch(() => null);
+			expect(legacyExistsBefore).not.toBeNull();
+
+			// Now open the v5 cache - it should remove the legacy file
+			const v5Db = openDb();
+			expect(v5Db).not.toBeNull();
+
+			// Verify that the legacy file was removed
+			const legacyExistsAfter = await fs.stat(legacyPath).catch(() => null);
+			expect(legacyExistsAfter).toBeNull();
+
+			// Verify that v5 database exists and has the new schema
+			const v5Exists = await fs.stat(v5Path).catch(() => null);
+			expect(v5Exists).not.toBeNull();
+
+			// Verify the new table exists
+			if (v5Db) {
+				const tables = v5Db.query("SELECT name FROM sqlite_master WHERE type='table'").all();
+				const tableNames = (tables as Array<{ name: string }>).map(t => t.name);
+				expect(tableNames).toContain("github_view_cache_v50");
+			}
 		});
 	});
 });

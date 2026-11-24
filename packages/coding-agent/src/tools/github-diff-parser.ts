@@ -368,6 +368,12 @@ interface HunkState {
 	bracketStack: string[]; // Track opening bracket types to validate matching
 	inPemBlock: boolean; // Track if we're inside a PEM block
 	inYamlBlockScalar?: boolean; // Track if we're in a YAML block scalar (terminated by dedent or end of hunk)
+	// Independent tracking for old-side (deleted) and new-side (added) projections
+	// This handles asymmetric containers where old side is deeper than new side
+	oldSideBracketDepth?: number; // Old-side (context+deleted) bracket depth
+	oldSideBracketStack?: string[]; // Old-side bracket stack
+	newSideBracketDepth?: number; // New-side (context+added) bracket depth
+	newSideBracketStack?: string[]; // New-side bracket stack
 }
 
 /**
@@ -623,7 +629,58 @@ function redactAccumulatedContentWithState(
 	// we track the old-side state which carries forward to the next hunk.
 	const outputState: HunkState = { ...inputState };
 
-	// Helper to update bracket stack based on a character
+	// Helper to update bracket stack based on a line of text, with quote-awareness.
+	// Brackets inside quoted strings are not counted as container brackets.
+	// Returns [newDepth, inStringAtEnd] to track multi-line strings.
+	const processBracketsQuoteAware = (
+		stack: string[],
+		text: string,
+		depth: number,
+		inStringAtStart: boolean,
+	): [number, boolean] => {
+		let inString = inStringAtStart;
+		let stringDelimiter = "";
+		let localDepth = depth;
+
+		for (let i = 0; i < text.length; i += 1) {
+			const char = text[i];
+
+			// Handle escape sequences in strings
+			if (inString && char === "\\" && i + 1 < text.length) {
+				i += 1; // Skip the escaped character
+				continue;
+			}
+
+			// Handle string delimiters
+			if (!inString && (char === '"' || char === "'")) {
+				inString = true;
+				stringDelimiter = char;
+				continue;
+			} else if (inString && char === stringDelimiter) {
+				inString = false;
+				stringDelimiter = "";
+				continue;
+			}
+
+			// Only track brackets when not inside a string
+			if (!inString) {
+				if (char === "[" || char === "{") {
+					stack.push(char);
+					localDepth += 1;
+				} else if (char === "]" && stack.length > 0 && stack[stack.length - 1] === "[") {
+					stack.pop();
+					localDepth = Math.max(0, localDepth - 1);
+				} else if (char === "}" && stack.length > 0 && stack[stack.length - 1] === "{") {
+					stack.pop();
+					localDepth = Math.max(0, localDepth - 1);
+				}
+			}
+		}
+
+		return [localDepth, inString];
+	};
+
+	// Legacy helper for backward compatibility in existing code paths
 	const updateBracketStack = (stack: string[], char: string, depth: number): number => {
 		if (char === "[" || char === "{") {
 			stack.push(char);
@@ -646,8 +703,10 @@ function redactAccumulatedContentWithState(
 
 	// Build state for OLD projection (context + deleted lines)
 	const oldProjectionStateAtLine: number[] = [];
-	let oldProjDepth = inputState.bracketDepth;
-	const oldProjStack: string[] = [...inputState.bracketStack];
+	let oldProjDepth = inputState.oldSideBracketDepth ?? inputState.bracketDepth;
+	const oldProjStack: string[] = [...(inputState.oldSideBracketStack ?? inputState.bracketStack)];
+
+	let oldInString = false; // Track if we're in a string at line end for multi-line string continuation
 
 	for (let i = 0; i < lineInfos.length; i += 1) {
 		const originalInfo = lineInfos[i];
@@ -656,30 +715,24 @@ function redactAccumulatedContentWithState(
 		oldProjectionStateAtLine.push(oldProjDepth);
 
 		if (prefix === " " || prefix === "-") {
-			if (prefix === " ") {
-				const oldIdx = oldProjectionIndices.indexOf(i);
-				if (oldIdx >= 0) {
-					const originalContent = oldProjectionLines[oldIdx];
-					for (const char of originalContent) {
-						oldProjDepth = updateBracketStack(oldProjStack, char, oldProjDepth);
-					}
-				}
-			} else if (prefix === "-") {
-				const oldIdx = oldProjectionIndices.indexOf(i);
-				if (oldIdx >= 0) {
-					const originalContent = oldProjectionLines[oldIdx];
-					for (const char of originalContent) {
-						oldProjDepth = updateBracketStack(oldProjStack, char, oldProjDepth);
-					}
-				}
+			const oldIdx = oldProjectionIndices.indexOf(i);
+			if (oldIdx >= 0) {
+				const originalContent = oldProjectionLines[oldIdx];
+				[oldProjDepth, oldInString] = processBracketsQuoteAware(
+					oldProjStack,
+					originalContent,
+					oldProjDepth,
+					oldInString,
+				);
 			}
 		}
 	}
 
 	// Build state for NEW projection (context + added lines)
 	const newProjectionStateAtLine: number[] = [];
-	let newProjDepth = inputState.bracketDepth;
-	const newProjStack: string[] = [...inputState.bracketStack];
+	let newProjDepth = inputState.newSideBracketDepth ?? inputState.bracketDepth;
+	const newProjStack: string[] = [...(inputState.newSideBracketStack ?? inputState.bracketStack)];
+	let newInString = false; // Track if we're in a string at line end for multi-line string continuation
 
 	for (let i = 0; i < lineInfos.length; i += 1) {
 		const originalInfo = lineInfos[i];
@@ -688,44 +741,15 @@ function redactAccumulatedContentWithState(
 		newProjectionStateAtLine.push(newProjDepth);
 
 		if (prefix === " " || prefix === "+") {
-			if (prefix === " ") {
-				const newIdx = newProjectionIndices.indexOf(i);
-				if (newIdx >= 0) {
-					const originalContent = newProjectionLines[newIdx];
-					for (const char of originalContent) {
-						if (char === "[" || char === "{") {
-							newProjStack.push(char);
-							newProjDepth += 1;
-						} else if ((char === "]" || char === "}") && newProjStack.length > 0) {
-							if (
-								(char === "]" && newProjStack[newProjStack.length - 1] === "[") ||
-								(char === "}" && newProjStack[newProjStack.length - 1] === "{")
-							) {
-								newProjStack.pop();
-								newProjDepth = Math.max(0, newProjDepth - 1);
-							}
-						}
-					}
-				}
-			} else if (prefix === "+") {
-				const newIdx = newProjectionIndices.indexOf(i);
-				if (newIdx >= 0) {
-					const originalContent = newProjectionLines[newIdx];
-					for (const char of originalContent) {
-						if (char === "[" || char === "{") {
-							newProjStack.push(char);
-							newProjDepth += 1;
-						} else if ((char === "]" || char === "}") && newProjStack.length > 0) {
-							if (
-								(char === "]" && newProjStack[newProjStack.length - 1] === "[") ||
-								(char === "}" && newProjStack[newProjStack.length - 1] === "{")
-							) {
-								newProjStack.pop();
-								newProjDepth = Math.max(0, newProjDepth - 1);
-							}
-						}
-					}
-				}
+			const newIdx = newProjectionIndices.indexOf(i);
+			if (newIdx >= 0) {
+				const originalContent = newProjectionLines[newIdx];
+				[newProjDepth, newInString] = processBracketsQuoteAware(
+					newProjStack,
+					originalContent,
+					newProjDepth,
+					newInString,
+				);
 			}
 		}
 	}
@@ -738,10 +762,11 @@ function redactAccumulatedContentWithState(
 		});
 	}
 
-	let oldBracketDepth = inputState.bracketDepth;
-	const oldBracketStack: string[] = [...inputState.bracketStack];
-	let newBracketDepth = inputState.bracketDepth;
-	const newBracketStack: string[] = [...inputState.bracketStack];
+	// Initialize with independent states if available, otherwise use the shared state
+	let oldBracketDepth = inputState.oldSideBracketDepth ?? inputState.bracketDepth;
+	const oldBracketStack: string[] = [...(inputState.oldSideBracketStack ?? inputState.bracketStack)];
+	let newBracketDepth = inputState.newSideBracketDepth ?? inputState.bracketDepth;
+	const newBracketStack: string[] = [...(inputState.newSideBracketStack ?? inputState.bracketStack)];
 
 	// Helper to check if a line looks like it's part of a data structure (JSON/YAML key-value pairs)
 	// vs. plain text comment or label. Lines with quotes or colons are likely structure data.
@@ -757,6 +782,9 @@ function redactAccumulatedContentWithState(
 	// (containers opened in previous hunks or opened in this hunk but not closed)
 	// We track bracket depth and stack separately for each projection since they can be asymmetric
 	// Asymmetric containers: if old side is deeper, redact new side too for safety
+	let oldInStringTrack = false; // Track string state across lines in final pass
+	let newInStringTrack = false; // Track string state across lines in final pass
+
 	for (let i = 0; i < lineInfos.length; i += 1) {
 		const info = result[i]; // The corresponding redacted line info
 		const originalInfo = lineInfos[i];
@@ -790,9 +818,12 @@ function redactAccumulatedContentWithState(
 				}
 
 				// Update bracket depth and stack for next line, tracking old-side independently
-				for (const char of originalContent) {
-					oldBracketDepth = updateBracketStack(oldBracketStack, char, oldBracketDepth);
-				}
+				[oldBracketDepth, oldInStringTrack] = processBracketsQuoteAware(
+					oldBracketStack,
+					originalContent,
+					oldBracketDepth,
+					oldInStringTrack,
+				);
 			}
 		}
 
@@ -806,30 +837,38 @@ function redactAccumulatedContentWithState(
 				const isOnlyStructure = /^[\s[\]{}:,.]*$/.test(info.content);
 				const isStructureData = looksLikeStructureData(info.content);
 
-				// Redact if inside container at START of line AND (looks like structure data OR doesn't look like plain text)
-				// BUT preserve lines that are only whitespace and structure, or plain text words
+				// Redact if:
+				// 1. Inside container at START of line AND looks like structure data, OR
+				// 2. Inside a multi-line string at START of line (oldInStringTrack=true)
+				// Also skip purely structural lines and already-redacted content
 				if (
-					startDepths.oldDepth > 0 &&
 					info.content !== "" &&
 					!isOnlyStructure &&
-					isStructureData &&
-					!info.content.includes("«redacted")
+					!info.content.includes("«redacted") &&
+					((startDepths.oldDepth > 0 && isStructureData) || // Inside container + looks like structure
+						oldInStringTrack) // Inside a multi-line string continuation
 				) {
 					info.content = "«redacted»";
 				}
 
 				// Update bracket depth and stack for old-side
-				for (const char of originalContent) {
-					oldBracketDepth = updateBracketStack(oldBracketStack, char, oldBracketDepth);
-				}
+				[oldBracketDepth, oldInStringTrack] = processBracketsQuoteAware(
+					oldBracketStack,
+					originalContent,
+					oldBracketDepth,
+					oldInStringTrack,
+				);
 			}
 			if (newIdx >= 0) {
 				const originalContent = newProjectionLines[newIdx];
 
 				// Also update bracket depth for new-side projection (tracked separately, not carried forward)
-				for (const char of originalContent) {
-					newBracketDepth = updateBracketStack(newBracketStack, char, newBracketDepth);
-				}
+				[newBracketDepth, newInStringTrack] = processBracketsQuoteAware(
+					newBracketStack,
+					originalContent,
+					newBracketDepth,
+					newInStringTrack,
+				);
 			}
 		}
 
@@ -861,17 +900,25 @@ function redactAccumulatedContentWithState(
 				}
 
 				// Update bracket depth for next line (new side only, not carried forward)
-				for (const char of originalContent) {
-					newBracketDepth = updateBracketStack(newBracketStack, char, newBracketDepth);
-				}
+				[newBracketDepth, newInStringTrack] = processBracketsQuoteAware(
+					newBracketStack,
+					originalContent,
+					newBracketDepth,
+					newInStringTrack,
+				);
 			}
 		}
 	}
 
-	// Update output state based on final new-side bracket depth and stack
-	// (the new side's state carries forward to the next hunk since new side = final file state)
+	// Update output state with both old and new projection states carried forward
+	// Old-side state (context + deleted) persists to detect asymmetric containers in next hunk
+	// New-side state (context + added) is the final file state for redaction
 	outputState.bracketStack = newBracketStack;
 	outputState.bracketDepth = newBracketDepth;
+	outputState.oldSideBracketStack = oldBracketStack;
+	outputState.oldSideBracketDepth = oldProjDepth;
+	outputState.newSideBracketStack = newBracketStack;
+	outputState.newSideBracketDepth = newBracketDepth;
 	if (newBracketDepth > 0) {
 		outputState.inCredentialValue = true;
 	} else {
