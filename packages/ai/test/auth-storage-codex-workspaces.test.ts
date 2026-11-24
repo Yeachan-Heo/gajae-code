@@ -382,5 +382,36 @@ describe("AuthStorage openai-codex workspaces", () => {
 				[legacyId, TEAM.id, TEAM.name],
 			]);
 		});
+
+		it("adds the carried name without rolling back a peer's newer token rotation", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			// Another process commits a newer token pair right after this process's refresh lease completes and before
+			// the refreshed credential is applied in memory.
+			const peer = await SqliteAuthCredentialStore.open(dbPath);
+			const peerAccess = codexAccessToken(TEAM.id, "peer");
+			const completeLease = store.completeOAuthRefreshLease.bind(store);
+			store.completeOAuthRefreshLease = (lease, credential) => {
+				const completed = completeLease(lease, credential);
+				if (completed) {
+					peer.updateAuthCredential(legacyId, {
+						...credential,
+						access: peerAccess,
+						refresh: "refresh-peer",
+						organizationId: TEAM.id,
+					});
+				}
+				return completed;
+			};
+			try {
+				await refreshLegacy(legacyId, TEAM.id);
+			} finally {
+				peer.close();
+			}
+
+			const persisted = stored().find(row => row.id === legacyId)?.credential;
+			expect([persisted?.access, persisted?.refresh]).toEqual([peerAccess, "refresh-peer"]);
+			expect([persisted?.organizationId, persisted?.organizationName]).toEqual([TEAM.id, TEAM.name]);
+		});
 	});
 });

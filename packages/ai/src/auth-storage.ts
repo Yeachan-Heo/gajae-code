@@ -552,6 +552,11 @@ export interface AuthCredentialStore {
 		targets: readonly CredentialRemovalTarget[],
 	): AuthCredentialHardRemovalResult;
 	updateAuthCredential(id: number, credential: AuthCredential): void;
+	/**
+	 * Atomically adds a display name to the active OAuth row `id` when it belongs to `organizationId` and has no name.
+	 * Every other stored field, tokens included, is left as the row currently holds it.
+	 */
+	setOAuthOrganizationNameIfUnset?(id: number, organizationId: string, organizationName: string): boolean;
 	deleteAuthCredential(id: number, disabledCause: string): void;
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
 	tryDisableAuthCredentialIfRevision?(id: number, expectedRevision: number, disabledCause: string): boolean;
@@ -3839,11 +3844,16 @@ export class AuthStorage {
 			throw new Error("Credential authority changed during refresh");
 		}
 		const named = this.#withDuplicateOrganizationName(provider, entries, target.id, credential);
-		// A refresh lease already persisted the refreshed tokens, but not a name carried over from a pruned duplicate.
-		const nameCarried = named !== credential;
+		if (!this.#store.refreshSnapshot) {
+			if (persist) {
+				this.#store.updateAuthCredential(target.id, named);
+			} else if (named !== credential && named.type === "oauth" && named.organizationId && named.organizationName) {
+				// The refresh lease already persisted the tokens, and a peer may have rotated them since. Add only the
+				// carried name to the row as it is now; rewriting the whole row could roll back a newer token pair.
+				this.#store.setOAuthOrganizationNameIfUnset?.(target.id, named.organizationId, named.organizationName);
+			}
+		}
 		credential = named;
-		if ((persist || nameCarried) && !this.#store.refreshSnapshot)
-			this.#store.updateAuthCredential(target.id, credential);
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
@@ -9148,6 +9158,29 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		if (provider) {
 			this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
 		}
+	}
+
+	setOAuthOrganizationNameIfUnset(id: number, organizationId: string, organizationName: string): boolean {
+		const update = this.#db.transaction(() => {
+			const row = this.#withStatement(
+				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				statement => statement.get(id) as AuthRow | undefined,
+			);
+			if (!row) return false;
+			const credential = deserializeCredential(row);
+			if (
+				credential?.type !== "oauth" ||
+				credential.organizationId !== organizationId ||
+				credential.organizationName?.trim()
+			) {
+				return false;
+			}
+			const serialized = serializeCredential(row.provider, { ...credential, organizationName });
+			if (!serialized) return false;
+			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
+			return true;
+		});
+		return update.immediate();
 	}
 
 	deleteAuthCredential(id: number, disabledCause: string): void {
