@@ -9657,6 +9657,9 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 	disposePriorAnswerSource();
 });
 
+// session_start spawns a real SDK broker for the isolated agent dir; that cold
+// start alone is about 2 s on a lightly loaded machine, so the default 5 s
+// test budget leaves no headroom under parallel load.
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
 	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
@@ -9810,7 +9813,7 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = previousNotifications;
 	}
-});
+}, 20_000);
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
 	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);
