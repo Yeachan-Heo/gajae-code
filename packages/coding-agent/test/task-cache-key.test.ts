@@ -74,7 +74,11 @@ const openAuthStorages: AuthStorage[] = [];
  * is the only thing that can still release the handle in that case.
  */
 function releaseTrackedAuthStorages(): void {
-	while (openAuthStorages.length > 0) openAuthStorages.pop()?.close();
+	while (openAuthStorages.length > 0) {
+		const storage = openAuthStorages.pop();
+		// close() is idempotent; a real close failure should surface in teardown.
+		storage?.close();
+	}
 }
 
 async function createSession(
@@ -273,6 +277,7 @@ describe("task fork-context provider identity", () => {
 			const tempDir = tempDirs.pop();
 			if (!tempDir) continue;
 			const modelCacheClosed = closeModelCache(path.join(tempDir, "models.db"));
+			releaseTrackedAuthStorages();
 			if (!fs.existsSync(tempDir)) continue;
 			try {
 				await removeTempTree(tempDir);
