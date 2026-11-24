@@ -288,8 +288,6 @@ async function runInstaller(
 	return { exitCode, stdout, stderr };
 }
 
-}
-
 async function runPipedInstaller(
 	args: string[],
 	env: Record<string, string> = {},

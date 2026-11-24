@@ -112,6 +112,9 @@ cleanup() {
 }
 
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
 # Bash's job-spec kill blocks SIGCHLD and skips exited pipeline members. A saved
 # PID is only a wait-status key, never signal authority. There is exactly one

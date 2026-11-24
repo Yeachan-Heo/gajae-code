@@ -6,7 +6,6 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { logger, VERSION } from "@gajae-code/utils";
 import { lcgUnit } from "../../utils/test/helpers/prng";
-import { runCli } from "../src/cli";
 import * as installActivation from "../src/cli/install-activation";
 import {
 	buildActivationRecord,
@@ -16,7 +15,7 @@ import {
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
 
-import type { BinaryReplacementOptions, BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
+import type { BinaryReplacementOptions, BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	ActivationRetryCandidateRepointError,
 	assertSupportedLinuxLibcForTest,
@@ -108,8 +107,6 @@ describe("verified binary invocation formatting", () => {
 			"'/my bin/O'\\''Brien/‘’‚‛;$HOME`id`/gjc'",
 		);
 	});
-});
-
 });
 
 describe("update-cli recovery command surface", () => {
