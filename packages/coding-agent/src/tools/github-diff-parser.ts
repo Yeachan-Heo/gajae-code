@@ -680,21 +680,6 @@ function redactAccumulatedContentWithState(
 		return [localDepth, inString];
 	};
 
-	// Legacy helper for backward compatibility in existing code paths
-	const updateBracketStack = (stack: string[], char: string, depth: number): number => {
-		if (char === "[" || char === "{") {
-			stack.push(char);
-			return depth + 1;
-		} else if (char === "]" && stack.length > 0 && stack[stack.length - 1] === "[") {
-			stack.pop();
-			return Math.max(0, depth - 1);
-		} else if (char === "}" && stack.length > 0 && stack[stack.length - 1] === "{") {
-			stack.pop();
-			return Math.max(0, depth - 1);
-		}
-		return depth;
-	};
-
 	// Pre-calculate bracket depths for both projections independently
 	// OLD PROJECTION: based on context + deleted lines only
 	// NEW PROJECTION: based on context + added lines only

@@ -97,18 +97,22 @@ export function openDb(): Database | null {
 		const dbPath = basePath.replace(/\.db$/, "-v5.db");
 		const legacyDbPath = basePath; // Old path without -v5 suffix
 
-		// On first open of v5 namespace, remove legacy cache to ensure no old unscubbed data persists
-		if (!fs.existsSync(dbPath) && fs.existsSync(legacyDbPath)) {
+		// The legacy cache may hold unscrubbed diffs, and an older process can recreate it at any time,
+		// so remove it on every open. If removal fails, disable the cache rather than run alongside it.
+		const legacyPaths = [legacyDbPath, `${legacyDbPath}-wal`, `${legacyDbPath}-shm`];
+		if (legacyPaths.some(p => fs.existsSync(p))) {
 			try {
-				fs.rmSync(legacyDbPath);
-				fs.rmSync(`${legacyDbPath}-wal`, { force: true });
-				fs.rmSync(`${legacyDbPath}-shm`, { force: true });
-				logger.debug("github cache: removed legacy unscrubbed cache on v5 upgrade", {
-					path: legacyDbPath,
-				});
+				for (const p of legacyPaths) fs.rmSync(p, { force: true });
 			} catch (err) {
-				logger.debug("github cache: failed to remove legacy cache", { err: String(err) });
-				// Continue anyway; not fatal if cleanup fails
+				logger.warn("github cache: failed to remove legacy unscrubbed cache; cache disabled", {
+					path: legacyDbPath,
+					err: String(err),
+				});
+				return null;
+			}
+			if (legacyPaths.some(p => fs.existsSync(p))) {
+				logger.warn("github cache: legacy unscrubbed cache still present; cache disabled", { path: legacyDbPath });
+				return null;
 			}
 		}
 

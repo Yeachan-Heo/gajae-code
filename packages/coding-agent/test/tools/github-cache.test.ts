@@ -5,8 +5,9 @@
  * Each test isolates `GJC_GITHUB_CACHE_DB` to a temp file and clears
  * `git.github.json` / `git.github.text` mocks between cases.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+
 import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -18,8 +19,8 @@ import {
 	getOrFetchView,
 	openDb,
 	putCached,
-	resetForTests,
 	resetForTests as resetCacheForTests,
+	resetForTests,
 } from "@gajae-code/coding-agent/tools/github-cache";
 import * as git from "@gajae-code/coding-agent/utils/git";
 
@@ -1120,6 +1121,36 @@ describe("Credential scrubbing in cached data", () => {
 				const tables = v5Db.query("SELECT name FROM sqlite_master WHERE type='table'").all();
 				const tableNames = (tables as Array<{ name: string }>).map(t => t.name);
 				expect(tableNames).toContain("github_view_cache_v50");
+			}
+		});
+
+		it("removes a legacy cache recreated after the v5 cache exists", async () => {
+			const legacyPath = process.env.GJC_GITHUB_CACHE_DB!;
+			resetForTests();
+			expect(openDb()).not.toBeNull();
+
+			// An older process recreates the legacy file after v5 is already in place.
+			resetForTests();
+			await fs.writeFile(legacyPath, "unscrubbed-legacy-data");
+			await fs.writeFile(`${legacyPath}-wal`, "");
+
+			expect(openDb()).not.toBeNull();
+			expect(await fs.stat(legacyPath).catch(() => null)).toBeNull();
+			expect(await fs.stat(`${legacyPath}-wal`).catch(() => null)).toBeNull();
+		});
+
+		it("disables the cache when the legacy cache cannot be removed", async () => {
+			const legacyPath = process.env.GJC_GITHUB_CACHE_DB!;
+			resetForTests();
+			// A directory at the legacy path cannot be removed without `recursive`, so cleanup fails.
+			await fs.rm(legacyPath, { force: true });
+			await fs.mkdir(legacyPath);
+			await fs.writeFile(`${legacyPath}/keep`, "x");
+			try {
+				expect(openDb()).toBeNull();
+			} finally {
+				await fs.rm(legacyPath, { recursive: true, force: true });
+				resetForTests();
 			}
 		});
 	});
