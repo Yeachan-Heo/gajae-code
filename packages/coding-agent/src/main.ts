@@ -93,7 +93,7 @@ import {
 	RESUME_REJECTED_OPERATOR_MESSAGE,
 } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
-import { findOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
+import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
 	resolveResumableSession,
@@ -782,7 +782,7 @@ async function exitForStartupModelProfileError(args: StartupModelProfileArgs, er
 	const operatorMessage =
 		error instanceof ManagedAppendIdentityMismatchError
 			? RESUME_REJECTED_OPERATOR_MESSAGE
-			: findOperatorMessage(error);
+			: composeOperatorMessage(error);
 	process.stderr.write(operatorMessage ? `${operatorMessage}\n` : `${chalk.red(`Error: ${message}`)}\n`);
 	await args.session.dispose();
 	process.exit(1);

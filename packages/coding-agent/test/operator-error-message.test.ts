@@ -65,6 +65,37 @@ describe("operator text on SDK and ACP surfaces", () => {
 		});
 	});
 
+	it("never leaks a wrapper's own message or paths on the SDK and ACP boundaries", async () => {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === "turn.prompt");
+		if (!row) throw new Error("Missing turn.prompt operation");
+		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
+		const wrapper = new Error("Failed to rollback managed move: EACCES /home/someone/private/file", {
+			cause: mismatch,
+		});
+		const surface = {
+			prompt: () => {
+				throw wrapper;
+			},
+		} as unknown as ControlSurface;
+
+		const response = await dispatchControl(surface, row, {
+			id: "wrapped",
+			operation: "turn.prompt",
+			input: { text: "x" },
+		});
+		const acp = acpRequestFailure(Object.assign(wrapper, { code: "internal_rollback" })) as Error & {
+			data?: Record<string, unknown>;
+		};
+
+		expect(response.error).toEqual({ code: "internal", message: "Control operation failed." });
+		expect(findOperatorMessage(wrapper)).toBeUndefined();
+		expect(acp.data?.operatorMessage).toBeUndefined();
+		// Local surfaces still show both the real failure and the recovery.
+		expect(operatorErrorMessage(wrapper)).toBe(
+			`Failed to rollback managed move: EACCES /home/someone/private/file. ${mismatch.operatorMessage}`,
+		);
+	});
+
 	it("keeps the opaque SDK fallback for errors without operator text", async () => {
 		const row = OPERATIONS.find(candidate => candidate.sdkId === "turn.prompt");
 		if (!row) throw new Error("Missing turn.prompt operation");
