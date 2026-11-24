@@ -233,6 +233,9 @@ function newSidecarCacheInstances(before: readonly string[]): string[] {
 	return sidecarCacheInstances().filter(name => !before.includes(name));
 }
 
+/** Per-test timeout for bounded opens, which build sidecars and can exceed 5 s on a loaded runner. */
+const BOUNDED_TEST_TIMEOUT_MS = 30_000;
+
 /** Enough retired history for a bounded open while keeping its 37-row mutation table cheap. */
 const SMALL_COLD_ENTRIES = 8;
 
@@ -304,63 +307,75 @@ describePosix("standalone HTML export through the bounded loader leaves its sour
 		{ name: "a header_patch", bytes: `${JSON.stringify({ type: "header_patch", patch: { title: "Later" } })}\n` },
 	];
 	for (const append of appendedAfterOpen) {
-		it(`exports exactly the opened transcript when ${append.name} is appended after the open`, async () => {
-			const content = coldEligibleTranscript(SMALL_COLD_ENTRIES);
-			const reference = await referenceHtml(content);
-			const { sessionFile } = seedSource(content);
-			forceBoundedSnapshot();
-			const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
-			const outputPath = path.join(makeTempDir("output"), "export.html");
-			try {
-				fs.appendFileSync(sessionFile, append.bytes);
-				await exportSessionToHtml(snapshot, undefined, { outputPath });
-			} finally {
-				await snapshot.close();
-			}
-			expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
-		});
+		it(
+			`exports exactly the opened transcript when ${append.name} is appended after the open`,
+			async () => {
+				const content = coldEligibleTranscript(SMALL_COLD_ENTRIES);
+				const reference = await referenceHtml(content);
+				const { sessionFile } = seedSource(content);
+				forceBoundedSnapshot();
+				const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+				const outputPath = path.join(makeTempDir("output"), "export.html");
+				try {
+					fs.appendFileSync(sessionFile, append.bytes);
+					await exportSessionToHtml(snapshot, undefined, { outputPath });
+				} finally {
+					await snapshot.close();
+				}
+				expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
+			},
+			BOUNDED_TEST_TIMEOUT_MS,
+		);
 	}
 
-	it("names both causes of an incomplete last line met during the open", async () => {
-		const { sourceDir, sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES).slice(0, -1));
-		const before = snapshotTree(sourceDir);
-		const outputPath = path.join(makeTempDir("output"), "export.html");
-		forceBoundedSnapshot();
+	it(
+		"names both causes of an incomplete last line met during the open",
+		async () => {
+			const { sourceDir, sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES).slice(0, -1));
+			const before = snapshotTree(sourceDir);
+			const outputPath = path.join(makeTempDir("output"), "export.html");
+			forceBoundedSnapshot();
 
-		const refusal = await rejectionMessage(() => exportFromFile(sessionFile, { outputPath }));
+			const refusal = await rejectionMessage(() => exportFromFile(sessionFile, { outputPath }));
 
-		expect(refusal).toContain(
-			"Session transcript's last line is incomplete (bounded_scan_unterminated): it is still being written, so retry when the session is idle, or an earlier write was interrupted, which retrying does not fix",
-		);
-		expect(snapshotTree(sourceDir)).toEqual(before);
-		expect(fs.existsSync(outputPath)).toBe(false);
-	});
+			expect(refusal).toContain(
+				"Session transcript's last line is incomplete (bounded_scan_unterminated): it is still being written, so retry when the session is idle, or an earlier write was interrupted, which retrying does not fix",
+			);
+			expect(snapshotTree(sourceDir)).toEqual(before);
+			expect(fs.existsSync(outputPath)).toBe(false);
+		},
+		BOUNDED_TEST_TIMEOUT_MS,
+	);
 
-	it("keeps an existing output when a bounded export fails midway through its scan", async () => {
-		const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
-		const outputDir = makeTempDir("output");
-		const outputPath = path.join(outputDir, "export.html");
-		fs.writeFileSync(outputPath, "previous good export", { mode: 0o600 });
-		const outputBefore = snapshotTree(outputDir)["export.html"];
-		forceBoundedSnapshot();
-		const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
-		const visit = snapshot.visitEntriesForExport.bind(snapshot);
-		// Emit every entry, then fail: the page is already partly written when the scan breaks.
-		const spy = vi.spyOn(snapshot, "visitEntriesForExport").mockImplementation(visitor => {
-			visit(visitor);
-			throw new Error("scan failed midway");
-		});
-		let refusal: string | undefined;
-		try {
-			refusal = await rejectionMessage(() => exportSessionToHtml(snapshot, undefined, { outputPath }));
-		} finally {
-			spy.mockRestore();
-			await snapshot.close();
-		}
-		expect(refusal).toBe("scan failed midway");
-		expect(snapshotTree(outputDir)["export.html"]).toEqual(outputBefore);
-		expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
-	});
+	it(
+		"keeps an existing output when a bounded export fails midway through its scan",
+		async () => {
+			const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
+			const outputDir = makeTempDir("output");
+			const outputPath = path.join(outputDir, "export.html");
+			fs.writeFileSync(outputPath, "previous good export", { mode: 0o600 });
+			const outputBefore = snapshotTree(outputDir)["export.html"];
+			forceBoundedSnapshot();
+			const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+			const visit = snapshot.visitEntriesForExport.bind(snapshot);
+			// Emit every entry, then fail: the page is already partly written when the scan breaks.
+			const spy = vi.spyOn(snapshot, "visitEntriesForExport").mockImplementation(visitor => {
+				visit(visitor);
+				throw new Error("scan failed midway");
+			});
+			let refusal: string | undefined;
+			try {
+				refusal = await rejectionMessage(() => exportSessionToHtml(snapshot, undefined, { outputPath }));
+			} finally {
+				spy.mockRestore();
+				await snapshot.close();
+			}
+			expect(refusal).toBe("scan failed midway");
+			expect(snapshotTree(outputDir)["export.html"]).toEqual(outputBefore);
+			expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
+		},
+		BOUNDED_TEST_TIMEOUT_MS,
+	);
 
 	it.skipIf(process.platform !== "darwin")(
 		"opens a non-regular target in place, as every other export does",
@@ -372,6 +387,7 @@ describePosix("standalone HTML export through the bounded loader leaves its sour
 				"EPERM: operation not permitted, fchmod",
 			);
 		},
+		BOUNDED_TEST_TIMEOUT_MS,
 	);
 
 	const changedAfterOpen: ReadonlyArray<{ name: string; change: (sessionFile: string) => void }> = [
@@ -386,79 +402,143 @@ describePosix("standalone HTML export through the bounded loader leaves its sour
 		{ name: "truncated", change: sessionFile => fs.truncateSync(sessionFile, 64) },
 	];
 	for (const variant of changedAfterOpen) {
-		it(`refuses a source ${variant.name} after the open and keeps the previous export`, async () => {
-			const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
-			const outputDir = makeTempDir("output");
-			const outputPath = path.join(outputDir, "export.html");
-			fs.writeFileSync(outputPath, "previous good export", { mode: 0o600 });
-			const outputBefore = snapshotTree(outputDir);
-			forceBoundedSnapshot();
-			const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
-			let refusal: string | undefined;
-			try {
-				variant.change(sessionFile);
-				refusal = await rejectionMessage(() => exportSessionToHtml(snapshot, undefined, { outputPath }));
-			} finally {
-				await snapshot.close();
-			}
-			expect(refusal).toBe("Session transcript was replaced or truncated after the read-only snapshot opened");
-			// The previous export is neither truncated nor replaced, and no temp file is left beside it
-			// (the directory itself changes: the temp file was created and removed there).
-			expect(snapshotTree(outputDir)["export.html"]).toEqual(outputBefore["export.html"]);
-			expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
-		});
+		it(
+			`refuses a source ${variant.name} after the open and keeps the previous export`,
+			async () => {
+				const { sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
+				const outputDir = makeTempDir("output");
+				const outputPath = path.join(outputDir, "export.html");
+				fs.writeFileSync(outputPath, "previous good export", { mode: 0o600 });
+				const outputBefore = snapshotTree(outputDir);
+				forceBoundedSnapshot();
+				const snapshot = await SessionManager.openReadOnlySnapshot(sessionFile);
+				let refusal: string | undefined;
+				try {
+					variant.change(sessionFile);
+					refusal = await rejectionMessage(() => exportSessionToHtml(snapshot, undefined, { outputPath }));
+				} finally {
+					await snapshot.close();
+				}
+				expect(refusal).toBe("Session transcript was replaced or truncated after the read-only snapshot opened");
+				// The previous export is neither truncated nor replaced, and no temp file is left beside it
+				// (the directory itself changes: the temp file was created and removed there).
+				expect(snapshotTree(outputDir)["export.html"]).toEqual(outputBefore["export.html"]);
+				expect(fs.readdirSync(outputDir)).toEqual(["export.html"]);
+			},
+			BOUNDED_TEST_TIMEOUT_MS,
+		);
 	}
 
-	it("matches the eager export for a transcript inside the managed session store", async () => {
-		const content = coldEligibleTranscript();
-		const reference = await referenceHtml(content);
-		const projectDir = path.join(getSessionsDir(), "--export-bounded-probe--");
-		fs.mkdirSync(projectDir, { recursive: true, mode: 0o700 });
-		try {
-			const sessionFile = path.join(projectDir, "session.jsonl");
-			fs.writeFileSync(sessionFile, content, { mode: 0o600 });
-			fs.writeFileSync(`${sessionFile}.spill.idx`, "decoy legacy sidecar", { mode: 0o600 });
-			const managedBefore = snapshotTree(getSessionsDir());
-			const instancesBefore = sidecarCacheInstances();
-			const outputPath = path.join(makeTempDir("output"), "export.html");
-			forceBoundedSnapshot();
+	it(
+		"matches the eager export for a transcript inside the managed session store",
+		async () => {
+			const content = coldEligibleTranscript();
+			const reference = await referenceHtml(content);
+			const projectDir = path.join(getSessionsDir(), "--export-bounded-probe--");
+			fs.mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+			try {
+				const sessionFile = path.join(projectDir, "session.jsonl");
+				fs.writeFileSync(sessionFile, content, { mode: 0o600 });
+				fs.writeFileSync(`${sessionFile}.spill.idx`, "decoy legacy sidecar", { mode: 0o600 });
+				const managedBefore = snapshotTree(getSessionsDir());
+				const instancesBefore = sidecarCacheInstances();
+				const outputPath = path.join(makeTempDir("output"), "export.html");
+				forceBoundedSnapshot();
 
-			await exportFromFile(sessionFile, { outputPath });
+				await exportFromFile(sessionFile, { outputPath });
 
-			expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
-			expect(snapshotTree(getSessionsDir())).toEqual(managedBefore);
-			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
-		} finally {
-			fs.rmSync(projectDir, { recursive: true, force: true });
-		}
-	});
+				expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
+				expect(snapshotTree(getSessionsDir())).toEqual(managedBefore);
+				expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+			} finally {
+				fs.rmSync(projectDir, { recursive: true, force: true });
+			}
+		},
+		BOUNDED_TEST_TIMEOUT_MS,
+	);
 
 	for (const fixture of FIXTURES) {
-		it(`${fixture.bounded ? "matches the eager export" : "refuses"} without touching the source (${fixture.name})`, async () => {
-			const content = fixture.build();
-			const reference = await referenceHtml(content);
-			const { sourceDir, sessionFile } = seedSource(content);
-			const before = snapshotTree(sourceDir);
-			const managedBefore = snapshotTreeIfPresent(getSessionsDir());
-			const instancesBefore = sidecarCacheInstances();
-			const outputPath = path.join(makeTempDir("output"), "export.html");
-			forceBoundedSnapshot();
+		it(
+			`${fixture.bounded ? "matches the eager export" : "refuses"} without touching the source (${fixture.name})`,
+			async () => {
+				const content = fixture.build();
+				const reference = await referenceHtml(content);
+				const { sourceDir, sessionFile } = seedSource(content);
+				const before = snapshotTree(sourceDir);
+				const managedBefore = snapshotTreeIfPresent(getSessionsDir());
+				const instancesBefore = sidecarCacheInstances();
+				const outputPath = path.join(makeTempDir("output"), "export.html");
+				forceBoundedSnapshot();
 
-			const outcome = await rejectionMessage(() => exportFromFile(sessionFile, { outputPath }));
+				const outcome = await rejectionMessage(() => exportFromFile(sessionFile, { outputPath }));
 
-			if (fixture.bounded) {
-				expect(outcome).toBeUndefined();
-				expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
-			} else {
-				expect(outcome).toContain("cannot be streamed (bounded_scan_");
-				expect(fs.existsSync(outputPath)).toBe(false);
-			}
-			expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
-			expect(snapshotTree(sourceDir)).toEqual(before);
-			expect(snapshotTreeIfPresent(getSessionsDir())).toEqual(managedBefore);
-			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
-		});
+				if (fixture.bounded) {
+					expect(outcome).toBeUndefined();
+					expect(fs.readFileSync(outputPath, "utf8")).toBe(reference);
+				} else {
+					expect(outcome).toContain("cannot be streamed (bounded_scan_");
+					expect(fs.existsSync(outputPath)).toBe(false);
+				}
+				expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
+				expect(snapshotTree(sourceDir)).toEqual(before);
+				expect(snapshotTreeIfPresent(getSessionsDir())).toEqual(managedBefore);
+				expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+			},
+			BOUNDED_TEST_TIMEOUT_MS,
+		);
 	}
+});
+
+/** Opens a bounded snapshot of argv[2] in a child process and waits to be interrupted. */
+const HOLD_SNAPSHOT_SCRIPT = `import { SessionManager, SessionManagerTestHooks } from ${JSON.stringify(
+	path.resolve(import.meta.dir, "../../src/session/session-manager.ts"),
+)};
+SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+await SessionManager.openReadOnlySnapshot(process.argv[2]);
+process.stdout.write("ready\\n");
+await Bun.sleep(120_000);
+process.stdout.write("not interrupted\\n");
+`;
+
+describePosix("bounded read-only snapshot in a separate process", () => {
+	it(
+		"removes its private sidecar cache when interrupted with SIGINT",
+		async () => {
+			const { sourceDir, sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES));
+			const script = path.join(makeTempDir("child"), "hold-snapshot.ts");
+			fs.writeFileSync(script, HOLD_SNAPSHOT_SCRIPT);
+			const before = snapshotTree(sourceDir);
+			const instancesBefore = sidecarCacheInstances();
+			const child = Bun.spawn([process.execPath, script, sessionFile], {
+				env: process.env,
+				stdout: "pipe",
+				stderr: "ignore",
+			});
+			const reader = child.stdout.getReader();
+			let output = "";
+			while (!output.includes("ready")) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+				output += new TextDecoder().decode(chunk.value);
+			}
+			const heldInstances = newSidecarCacheInstances(instancesBefore).length;
+			child.kill("SIGINT");
+			const exitCode = await child.exited;
+			for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read())
+				output += new TextDecoder().decode(chunk.value);
+
+			// The exit code depends on which SIGINT handler exits first (postmortem's 130, or the LSP
+			// client's 0); either way the child stops before its sleep ends and the cache is gone.
+			expect({ output, heldInstances, interrupted: [0, 130].includes(exitCode) }).toEqual({
+				output: "ready\n",
+				heldInstances: 1,
+				interrupted: true,
+			});
+			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+			expect(snapshotTree(sourceDir)).toEqual(before);
+		},
+		BOUNDED_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("standalone and live HTML exports below the eager cap write the output in place", () => {
@@ -494,39 +574,47 @@ describe("standalone and live HTML exports below the eager cap write the output 
 });
 
 describe("standalone HTML export side effects outside the source", () => {
-	itPosix("refuses a transcript above the eager-load limit that the bounded loader cannot read", async () => {
-		const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized")]));
-		// Sparse: past the header line the file is NUL bytes, which the bounded scan rejects.
-		fs.truncateSync(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES + 1);
-		const before = snapshotTree(sourceDir);
-		const instancesBefore = sidecarCacheInstances();
-		const outputPath = path.join(makeTempDir("output"), "export.html");
+	itPosix(
+		"refuses a transcript above the eager-load limit that the bounded loader cannot read",
+		async () => {
+			const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized")]));
+			// Sparse: past the header line the file is NUL bytes, which the bounded scan rejects.
+			fs.truncateSync(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES + 1);
+			const before = snapshotTree(sourceDir);
+			const instancesBefore = sidecarCacheInstances();
+			const outputPath = path.join(makeTempDir("output"), "export.html");
 
-		await expect(exportFromFile(sessionFile, { outputPath })).rejects.toThrow(
-			`Session transcript is too large to export in full (${RESUME_TRANSCRIPT_MAX_BYTES + 1} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes) and cannot be streamed (bounded_scan_`,
-		);
+			await expect(exportFromFile(sessionFile, { outputPath })).rejects.toThrow(
+				`Session transcript is too large to export in full (${RESUME_TRANSCRIPT_MAX_BYTES + 1} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes) and cannot be streamed (bounded_scan_`,
+			);
 
-		expect(snapshotTree(sourceDir)).toEqual(before);
-		expect(fs.existsSync(outputPath)).toBe(false);
-		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
-	});
+			expect(snapshotTree(sourceDir)).toEqual(before);
+			expect(fs.existsSync(outputPath)).toBe(false);
+			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+		},
+		BOUNDED_TEST_TIMEOUT_MS,
+	);
 
-	itPosix("refuses a transcript above the bounded-load limit without reading it", async () => {
-		const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized-bounded")]));
-		// Sparse: the size check runs on stat before any read.
-		fs.truncateSync(sessionFile, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1);
-		const before = snapshotTree(sourceDir, false);
-		const instancesBefore = sidecarCacheInstances();
-		const outputPath = path.join(makeTempDir("output"), "export.html");
+	itPosix(
+		"refuses a transcript above the bounded-load limit without reading it",
+		async () => {
+			const { sourceDir, sessionFile } = seedSource(jsonl([header("readonly-oversized-bounded")]));
+			// Sparse: the size check runs on stat before any read.
+			fs.truncateSync(sessionFile, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1);
+			const before = snapshotTree(sourceDir, false);
+			const instancesBefore = sidecarCacheInstances();
+			const outputPath = path.join(makeTempDir("output"), "export.html");
 
-		await expect(exportFromFile(sessionFile, { outputPath })).rejects.toThrow(
-			`Session transcript is too large to export (${BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1} bytes; limit ${BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES} bytes)`,
-		);
+			await expect(exportFromFile(sessionFile, { outputPath })).rejects.toThrow(
+				`Session transcript is too large to export (${BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1} bytes; limit ${BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES} bytes)`,
+			);
 
-		expect(snapshotTree(sourceDir, false)).toEqual(before);
-		expect(fs.existsSync(outputPath)).toBe(false);
-		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
-	});
+			expect(snapshotTree(sourceDir, false)).toEqual(before);
+			expect(fs.existsSync(outputPath)).toBe(false);
+			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
+		},
+		BOUNDED_TEST_TIMEOUT_MS,
+	);
 
 	it("does not repoint this terminal's --continue breadcrumb at the exported session", async () => {
 		const previous = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE };
@@ -786,7 +874,7 @@ describe("read-only session snapshot", () => {
 			}
 			expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 		},
-		30_000,
+		BOUNDED_TEST_TIMEOUT_MS,
 	);
 
 	it("leaves normally opened sessions writable", async () => {
