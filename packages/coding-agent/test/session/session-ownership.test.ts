@@ -417,6 +417,18 @@ describe("narrow fail-open", () => {
 		expect(warnings).toEqual(["Session ownership is unavailable; claims are off for this process"]);
 	});
 
+	it("claims waiting on an acquire that finds the platform unavailable do not ask again", async () => {
+		const calls = backend(async () => {
+			await Bun.sleep(5);
+			return { status: FileLockAcquireStatus.Unavailable, code: "ENOLCK" };
+		});
+		const results = await Promise.all(
+			Array.from({ length: 3 }, () => claimSessionOwner("f8", { surface: "terminal" })),
+		);
+		for (const result of results) expect(result).toMatchObject({ status: "skipped", reason: "unavailable" });
+		expect(calls.acquire).toBe(1);
+	});
+
 	it("a probe turns claims off only for an unsupported platform", async () => {
 		await fs.mkdir(path.join(home, ".gjc", "runtime", "session-owners"), { recursive: true, mode: 0o700 });
 		const calls = backend(() => ({ status: FileLockAcquireStatus.Acquired }), {

@@ -429,6 +429,9 @@ export async function claimSessionOwner(
 		if (!pending) break;
 		await pending;
 	}
+	// The acquire waited on may have found the platform unavailable.
+	if (current.unavailable !== undefined)
+		return { status: "skipped", reason: "unavailable", code: current.unavailable };
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
 	try {
