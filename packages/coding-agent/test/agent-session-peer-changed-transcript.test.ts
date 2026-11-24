@@ -589,6 +589,18 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(memoryMessages(harness.session.messages)).toContain("toolResult:tool ok");
 	});
 
+	it("refuses a stuck prompt before it takes session admission", async () => {
+		const harness = await setup();
+		const latched = await latch(harness);
+		// Session admission holds a model-registry consumer lease; the prompt-level check
+		// refuses before it, so workflow-intent and abort-unwind work never starts.
+		const lease = vi.spyOn(harness.modelRegistry, "withConsumerLease");
+
+		expect(await settle(harness.session.prompt("not admitted"))).toBe(latched);
+
+		expect(lease).not.toHaveBeenCalled();
+	});
+
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
 		const harness = await setup();
 		await harness.session.prompt("second");
