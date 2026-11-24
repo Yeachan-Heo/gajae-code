@@ -868,7 +868,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.keybindings.setDisplayContext(this.#keyDisplayContext);
 
 		// Register session manager flush for signal handlers (SIGINT, SIGTERM, SIGHUP)
-		this.#cleanupUnsubscribe = postmortem.register("session-manager-flush", () => this.sessionManager.flush());
+		this.#cleanupUnsubscribe = postmortem.register("session-manager-flush", () =>
+			this.sessionManager.flushBeforeLeaving(),
+		);
 
 		// Tear down subprocess-spawning tools (browser Chrome, Python eval kernel) on a
 		// signal kill (SIGINT/SIGTERM/SIGHUP) so they aren't reparented to PID 1 (#698).
@@ -1970,8 +1972,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.promptSuggestion.clear();
 		this.#btwController.dispose();
 
-		// Flush pending session writes before shutdown.
-		await this.sessionManager.flush();
+		// Flush pending session writes before shutdown. A transcript another process
+		// changed has nothing left to flush and must not turn /quit into a crash.
+		await this.sessionManager.flushBeforeLeaving();
 		try {
 			await this.sessionManager.saveDraft(draftText);
 		} catch (err) {

@@ -151,8 +151,8 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
-import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -584,6 +584,7 @@ import {
 	ttsrPromptFields,
 	wrapUntrustedContent,
 } from "./messages";
+import { operatorErrorMessage } from "./operator-error-message";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import type { SessionRecapAppendResult, SessionRecapInput } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
@@ -5139,6 +5140,36 @@ export class AgentSession {
 		return Object.assign(new AgentBusyError("Agent session admission is busy due to same-session reentrancy."), {
 			code: "busy",
 		});
+	}
+
+	/**
+	 * Refuse a new turn before any effect once this session's transcript is known to
+	 * refuse writes. The manager has latched a persistence failure that its next append
+	 * would rethrow before writing: usually {@link ManagedAppendIdentityMismatchError}
+	 * after another process changed the transcript, whose operator message names the
+	 * recovery (reopen or fork). Without this the turn is admitted, acceptance hooks run
+	 * and the first append fails; a hidden custom-message turn even resolved with
+	 * unsaved entries in memory. This covers only a session already known to be stuck:
+	 * the first turn after a peer write still runs skill resolution, extension and
+	 * custom command dispatch and title invalidation, and is refused at its first append.
+	 *
+	 * The refuse-before-the-model ordering follows the approach in #7843.
+	 */
+	#assertTranscriptAcceptsTurn(): void {
+		const latched = this.sessionManager.getLatchedPersistenceFailure();
+		if (latched) throw latched;
+	}
+
+	/**
+	 * A peer write detected mid-turn latches the mismatch at the failed append, and
+	 * agent-core turns that listener failure into an aborted run. Report the typed
+	 * refusal at the public boundary instead of a provider-level abort or a silent
+	 * success; the turn's messages stay in memory. Only a latch set during this call is
+	 * reported: a command that started no turn on an already-stuck session succeeded.
+	 */
+	#throwLatchedAppendRejection(latchedAtEntry: Error | undefined): void {
+		const appendRejection = this.sessionManager.getAppendIdentityMismatch();
+		if (appendRejection && appendRejection !== latchedAtEntry) throw appendRejection;
 	}
 
 	#assertSessionAdmissionOpen(): void {
@@ -11078,7 +11109,6 @@ export class AgentSession {
 		if (claims?.size === 0) this.#perToolTtsrClaims.delete(toolCallId);
 	}
 
-
 	/**
 	 * `afterToolCall` hook: fold any per-tool TTSR reminders into the result.
 	 * The claim stays provisional until #settlePerToolTtsrDelivery sees the
@@ -11203,7 +11233,7 @@ export class AgentSession {
 	#reconcileTtsrConsumptionFromMessages(): void {
 		// A committed reminder can outlive its missing ttsr_injection marker and be compacted out
 		// of Agent context. Reconcile consumption without restoring the reminder text (#7838).
-		if (!this.#ttsrManager || !this.#ttsrManager.getSettings().enabled) {
+		if (!this.#ttsrManager?.getSettings().enabled) {
 			return;
 		}
 		// Latest published checkpoint per rule. A legacy entry without one only proves the rule
@@ -15823,7 +15853,8 @@ export class AgentSession {
 		sessionContext: SessionContext,
 		fence?: SessionViewRestoreFence,
 	): Promise<void> {
-		if (fence && !fence.isCurrent()) throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
+		if (fence && !fence.isCurrent())
+			throw Object.assign(new Error("Session view changed."), { code: "resource_gone" });
 		this.#resetExplicitMCPToolSelectionAuthority();
 		if (!this.#mcpDiscoveryEnabled && this.#resolveEffectiveDiscoveryMode() !== "all") {
 			await this.#attachAskToolIfWorkflowActive(fence);
@@ -16289,6 +16320,7 @@ export class AgentSession {
 
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
+		this.#assertTranscriptAcceptsTurn();
 		this.#assertExternalSessionIngress();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
@@ -16357,6 +16389,7 @@ export class AgentSession {
 				continuationSdkRunToken === undefined ? "full" : "publication",
 			);
 		}
+		this.#throwLatchedAppendRejection(undefined);
 	}
 
 	buildDisplaySessionContext(): SessionContext {
@@ -16643,6 +16676,8 @@ export class AgentSession {
 			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		// A skill always starts a turn; refuse before claiming its epoch or running preflight.
+		this.#assertTranscriptAcceptsTurn();
 		const internalOptions = {
 			...options,
 			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
@@ -17938,6 +17973,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const latchedAtEntry = this.sessionManager.getAppendIdentityMismatch();
 		this.#btwPrefixLedger.clear();
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		const observer = options?.onRunAccepted;
@@ -17973,11 +18009,7 @@ export class AgentSession {
 				observer ? { ...options, onRunAccepted: notifyRunAccepted } : options,
 				releaseStartupPromptWaiter,
 			);
-			// Agent-core converts listener failures into an aborted response. Keep a
-			// rejected persistence fence typed at the public prompt boundary instead
-			// of reporting the misleading provider-level "Request was aborted".
-			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
-			if (appendRejection) throw appendRejection;
+			this.#throwLatchedAppendRejection(latchedAtEntry);
 		} finally {
 			if (observedLogicalRunId !== undefined) {
 				const observers = this.#promptRunAcceptedObservers.get(observedLogicalRunId);
@@ -18086,6 +18118,11 @@ export class AgentSession {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+
+		// Extension and custom commands that do not start a turn have returned above, so a
+		// stuck session can still run them (status commands, or commands that open another
+		// session). Everything from here on starts a turn: refuse it before admission.
+		this.#assertTranscriptAcceptsTurn();
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
@@ -18434,6 +18471,7 @@ export class AgentSession {
 		const internalOptions: InternalCustomMessageOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
 			: undefined;
+		this.#assertTranscriptAcceptsTurn();
 		this.#assertExternalSessionIngress();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
@@ -18526,6 +18564,7 @@ export class AgentSession {
 			},
 			options?.preflightSignal,
 		);
+		this.#throwLatchedAppendRejection(undefined);
 	}
 
 	async #promptWithMessage(
@@ -18554,6 +18593,10 @@ export class AgentSession {
 			workflowIntentDiff?: WorkflowIntentDiff;
 		},
 	): Promise<void> {
+		// Every turn ends up here, including the auto-continue prompt, hidden next-turn
+		// deliveries, sendCustomMessage with triggerTurn and cancelAndSubmit. Refuse a
+		// stuck transcript before the system prompt build, recall and before_agent_start.
+		this.#assertTranscriptAcceptsTurn();
 		this.#assertNoHandoffTransition();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
@@ -19073,7 +19116,7 @@ export class AgentSession {
 			this.#extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
 				event: "command",
-				error: err instanceof Error ? err.message : String(err),
+				error: operatorErrorMessage(err, String(err)),
 			});
 			return true;
 		}
@@ -19262,6 +19305,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		this.#assertTranscriptAcceptsTurn();
 		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
@@ -19291,6 +19335,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		this.#assertTranscriptAcceptsTurn();
 		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
@@ -20175,6 +20220,7 @@ export class AgentSession {
 					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
 						skipPostPromptRecoveryWait: true,
 					});
+					this.#throwLatchedAppendRejection(undefined);
 				} finally {
 					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
 					// The direct idle admission bypasses onFollowUpConsumed:
@@ -20229,6 +20275,7 @@ export class AgentSession {
 				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
 					skipPostPromptRecoveryWait: true,
 				});
+				this.#throwLatchedAppendRejection(undefined);
 			} finally {
 				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
 				// The direct idle admission bypasses onFollowUpConsumed:
@@ -22382,7 +22429,7 @@ export class AgentSession {
 			this.#rebindProviderSessionState(new Map());
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
-			if (!options?.drop) await this.sessionManager.flush();
+			if (!options?.drop) await this.sessionManager.flushBeforeLeaving();
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
 			const prepared = await this.sessionManager.prepareNewSession(options);
@@ -22465,7 +22512,7 @@ export class AgentSession {
 			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId))) {
 				throw new Error("Owned async deliveries did not settle before session replacement.");
 			}
-			if (!options?.drop) await this.sessionManager.flush();
+			if (!options?.drop) await this.sessionManager.flushBeforeLeaving();
 
 			if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) {
 				throw new Error("Owned async jobs did not settle before session replacement.");
@@ -22620,6 +22667,9 @@ export class AgentSession {
 		// root through the common admitted control publication before resetting anything
 		// (#7824); a legacy session keeps the legacy refusal. Adoption while the turn is
 		// aborted refuses before the reset rather than switching protocols mid-clear.
+		// A transcript that already refuses writes is refused before the agent reset,
+		// which would otherwise drop the in-memory history and then fail at the flush.
+		this.#assertTranscriptAcceptsTurn();
 		const operation = "clear context";
 		const assertMode = this.#controlPublicationModeFence(operation);
 		const sharedPublication = this.#usesSharedSessionPublication();
@@ -22917,7 +22967,7 @@ export class AgentSession {
 			await this.#settleBtwForSessionTransition();
 
 			// Flush current session to ensure all entries are written
-			await this.sessionManager.flush();
+			await this.sessionManager.flushBeforeLeaving();
 
 			const boundedColdForkEligible =
 				this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined;
@@ -24823,7 +24873,12 @@ export class AgentSession {
 	async #setSharedSessionDefaultModel(
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
+		options: {
+			signal?: AbortSignal;
+			shouldMutate?: () => boolean;
+			onMutationStarted?: () => void;
+			cause?: ModelChangeCause;
+		},
 	): Promise<void> {
 		const operation = "set session model";
 		const assertMode = this.#controlPublicationModeFence(operation);
@@ -27668,6 +27723,9 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		// Compaction runs hooks and a summarization model before its append; a transcript
+		// that already refuses writes would spend both and then fail.
+		this.#assertTranscriptAcceptsTurn();
 		const sharedCompaction = this.#usesSharedSessionPublication();
 		const invocationManager = this.sessionManager;
 		const invocationSessionId = invocationManager.getSessionId();
@@ -28063,6 +28121,9 @@ export class AgentSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		// Handoff generates its document with a model call and then flushes this
+		// transcript; a transcript that already refuses writes would spend the call and fail.
+		this.#assertTranscriptAcceptsTurn();
 		const entries = this.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -32960,7 +33021,8 @@ export class AgentSession {
 			// However, enforce the concurrency Retry-After deadline before allowing
 			// same-selector rotation/retry: if a deadline exists for this selector,
 			// advance instead of retrying before the deadline.
-			const deadlineMs = failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
+			const deadlineMs =
+				failedSelector !== undefined ? this.#concurrencyWaitRetryAfterDeadlines.get(failedSelector) : undefined;
 			if (deadlineMs !== undefined && Date.now() < deadlineMs) {
 				// Deadline not yet reached; advance instead of retrying
 				outcome = controller.advance() ? "advance" : "exhausted";
@@ -35340,7 +35402,7 @@ export class AgentSession {
 
 			await this.#settleBtwForSessionTransition();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
-			await this.sessionManager.flush();
+			await this.sessionManager.flushBeforeLeaving();
 			const previousSessionState = await this.sessionManager.captureRollbackState();
 			const previousSessionAgentModelOverrides = this.getSessionAgentModelOverrideState();
 			let stagedSessionAgentModelRevision: number | undefined;
@@ -36113,7 +36175,7 @@ export class AgentSession {
 			await this.#settleBtwForSessionTransition();
 
 			// Flush pending writes before preparing the successor.
-			await this.sessionManager.flush();
+			await this.sessionManager.flushBeforeLeaving();
 			const prepared = selectedEntry.parentId
 				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId)
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
@@ -36244,8 +36306,7 @@ export class AgentSession {
 		const explicitActiveToolSelectionGeneration = this.#explicitActiveToolSelectionGeneration;
 		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousSelectedDiscoveredToolNames = new Set(this.#selectedDiscoveredToolNames);
-		const previousHasExplicitActiveToolSelectionForContext =
-			this.#committedHasExplicitActiveToolSelectionForContext;
+		const previousHasExplicitActiveToolSelectionForContext = this.#committedHasExplicitActiveToolSelectionForContext;
 		const previousExplicitMCPToolSelectionForContext = this.#committedExplicitMCPToolSelectionForContext
 			? [...this.#committedExplicitMCPToolSelectionForContext]
 			: undefined;
@@ -36366,8 +36427,7 @@ export class AgentSession {
 					if (authorityOurs()) {
 						this.#hasExplicitActiveToolSelectionForContext = previousHasExplicitActiveToolSelectionForContext;
 						this.#explicitMCPToolSelectionForContext = previousExplicitMCPToolSelectionForContext;
-						this.#explicitMCPToolSelectionPersistsForContext =
-							previousExplicitMCPToolSelectionPersistsForContext;
+						this.#explicitMCPToolSelectionPersistsForContext = previousExplicitMCPToolSelectionPersistsForContext;
 						this.#commitExplicitMCPToolSelectionAuthority();
 					}
 					// Prompt before tools: the tool observer may publish prompt state of

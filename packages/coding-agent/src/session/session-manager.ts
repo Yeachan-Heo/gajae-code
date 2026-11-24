@@ -10500,15 +10500,7 @@ export class SessionManager {
 		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
 		if (initializeMissing && transcriptMissing) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
-			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
-			this.#applyFreshSessionMetadata(fresh);
-			this.#commitResidentTextStoreTransition(prepared);
-			this.#retireEphemeralArtifacts();
-			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
-			await this.#rewriteFile();
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
+			await this.#initializeFreshTranscriptAt(resolvedSessionFile);
 			return;
 		}
 		if (strictResume?.reuseEntries !== false) strictManagedFallbackEntries = strictResume?.inspection.entries;
@@ -10530,15 +10522,7 @@ export class SessionManager {
 		revalidateStrictResume();
 		if (entries.length === 0) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
-			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
-			this.#applyFreshSessionMetadata(fresh);
-			this.#commitResidentTextStoreTransition(prepared);
-			this.#retireEphemeralArtifacts();
-			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
-			await this.#rewriteFile();
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
+			await this.#initializeFreshTranscriptAt(resolvedSessionFile);
 			return;
 		}
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -10579,6 +10563,23 @@ export class SessionManager {
 			this.#sessionMemoryMode = "shadow";
 			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 		}
+	}
+
+	/**
+	 * Install a fresh session at `resolvedSessionFile` and persist its header: the
+	 * missing-file and empty-transcript outcomes of `#initSessionFile`. Callers refuse a
+	 * staged rollback candidate before calling.
+	 */
+	async #initializeFreshTranscriptAt(resolvedSessionFile: string): Promise<void> {
+		const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+		const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
+		this.#applyFreshSessionMetadata(fresh);
+		this.#commitResidentTextStoreTransition(prepared);
+		this.#retireEphemeralArtifacts();
+		this.#writeTerminalBreadcrumb(resolvedSessionFile);
+		await this.#rewriteFile();
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
 	}
 
 	#writeTerminalBreadcrumb(sessionFile: string): void {
@@ -13180,6 +13181,17 @@ export class SessionManager {
 			return !(totals && this.#addValidatedUsage(totals));
 		}
 		return false;
+	}
+
+	/**
+	 * The persistence failure that every later append rethrows before writing, if one is
+	 * latched: a {@link ManagedAppendIdentityMismatchError} after another process changed
+	 * the transcript, or an earlier write failure. Near-limit outcomes are not latched.
+	 * @internal
+	 */
+	getLatchedPersistenceFailure(): Error | undefined {
+		if (!this.persist || !this.#sessionFile) return undefined;
+		return this.#persistError;
 	}
 
 	/** Ownership loss remains observable even when an agent event listener aborts the turn. */
@@ -17787,6 +17799,25 @@ export class SessionManager {
 			}
 		});
 		if (this.#persistError) throw this.#persistError;
+	}
+
+	/**
+	 * {@link flush} for a caller that is leaving this transcript: `/resume`, `/new`,
+	 * `/fork` or shutdown.
+	 *
+	 * Once another process changes a managed transcript, the append fence latches
+	 * {@link ManagedAppendIdentityMismatchError} and every later flush rethrows it. The
+	 * fence rejected those appends before writing any byte and managed appends are
+	 * synchronous, so nothing is left to flush; rethrowing would trap the operator in a
+	 * session whose only recovery is to leave it. Every other flush failure still throws.
+	 * @internal
+	 */
+	async flushBeforeLeaving(): Promise<void> {
+		try {
+			await this.flush();
+		} catch (error) {
+			if (error === undefined || error !== this.getAppendIdentityMismatch()) throw error;
+		}
 	}
 
 	#releaseClosedSessionState(): void {
@@ -22836,7 +22867,10 @@ export class SessionManager {
 
 	async #sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist(): Promise<boolean> {
 		const patches = this.#sanitizeLoadedOpenAIResponsesReplayMetadata();
-		if (!this.isManagedDestination()) await this.#persistPatches(patches);
+		if (!this.isManagedDestination()) {
+			if (patches.length > 0) this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
+			await this.#persistPatches(patches);
+		}
 		return patches.length > 0;
 	}
 
@@ -22846,7 +22880,6 @@ export class SessionManager {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitizedMessage === entry.message) continue;
-			this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
 			entry.message = sanitizedMessage;
 			patches.push({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
 		}
@@ -24745,17 +24778,33 @@ export class SessionManager {
 			sessionMemoryMode,
 		);
 		if (opened.kind === "error") {
-			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
-			if (opened.reason === "artifact_capacity_exceeded")
-				throw new SessionArtifactCapacityError(
-					opened.message ?? "Session artifacts exceed the migration capacity.",
-				);
-			if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
-			if (opened.reason === "context_too_large") throw new SessionContextTooLargeError(opened.size ?? 0);
-			if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
-			throw new Error(`Could not open session: ${opened.reason}`);
+			throw SessionManager.#typedStrictOpenError(opened) ?? new Error(`Could not open session: ${opened.reason}`);
 		}
 		return opened.manager;
+	}
+
+	/**
+	 * The typed error for a strict-open failure whose reason the operator can act on, or
+	 * `undefined` for a reason the caller handles itself (a generic open error, or skipping
+	 * a `--continue` candidate).
+	 */
+	static #typedStrictOpenError(failure: StrictSessionOpenFailure): Error | undefined {
+		switch (failure.reason) {
+			case "legacy_migration_disabled":
+				return new SessionMigrationPolicyError();
+			case "artifact_capacity_exceeded":
+				return new SessionArtifactCapacityError(
+					failure.message ?? "Session artifacts exceed the migration capacity.",
+				);
+			case "oversized":
+				return new SessionTranscriptOversizedError(failure.size ?? 0);
+			case "context_too_large":
+				return new SessionContextTooLargeError(failure.size ?? 0);
+			case "migration_busy":
+				return new SessionMigrationBusyError();
+			default:
+				return undefined;
+		}
 	}
 
 	static async openNestedManaged(
@@ -25892,14 +25941,8 @@ export class SessionManager {
 				sessionMemoryMode,
 			);
 			if (opened.kind === "error") {
-				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
-				if (opened.reason === "artifact_capacity_exceeded")
-					throw new SessionArtifactCapacityError(
-						opened.message ?? "Session artifacts exceed the migration capacity.",
-					);
-				if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
-				if (opened.reason === "context_too_large") throw new SessionContextTooLargeError(opened.size ?? 0);
-				if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
+				const typed = SessionManager.#typedStrictOpenError(opened);
+				if (typed) throw typed;
 				return undefined;
 			}
 			return opened.manager;
