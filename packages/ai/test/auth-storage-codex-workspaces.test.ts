@@ -279,12 +279,12 @@ describe("AuthStorage openai-codex workspaces", () => {
 	});
 
 	describe("a row stored before workspaces were tracked", () => {
-		async function seedLegacy(workspaceId: string): Promise<number> {
+		async function seedLegacy(workspaceId: string, expires = Date.now() - 60_000): Promise<number> {
 			const legacy: OAuthCredential = {
 				type: "oauth",
 				access: codexAccessToken(workspaceId, "legacy"),
 				refresh: "refresh-legacy",
-				expires: Date.now() - 60_000,
+				expires,
 				accountId: workspaceId,
 				email: EMAIL,
 			};
@@ -331,6 +331,56 @@ describe("AuthStorage openai-codex workspaces", () => {
 			expect(rows).toHaveLength(1);
 			expect(rows[0]?.id).toBe(legacyId);
 			expect(rows[0]?.credential.organizationId).toBe(TEAM.id);
+			// The pruned login row carried the workspace name; the surviving row keeps it, in memory and on disk.
+			expect(rows[0]?.credential.organizationName).toBe(TEAM.name);
+			// The pruned row stays listed as disabled; the surviving active row is labeled by its workspace.
+			expect(
+				authStorage
+					.listCredentialInventory("openai-codex")
+					.filter(row => !row.disabled)
+					.map(row => [row.id, row.identityLabel]),
+			).toEqual([[legacyId, `${EMAIL} (${TEAM.name})`]]);
+			expect(authStorage.resolveOAuthPinTarget("openai-codex", { kind: "org", value: TEAM.name }).credentialId).toBe(
+				legacyId,
+			);
+			const reopened = await SqliteAuthCredentialStore.open(dbPath);
+			try {
+				const [persisted] = reopened.listAuthCredentials("openai-codex");
+				expect(persisted?.credential.type === "oauth" ? persisted.credential.organizationName : undefined).toBe(
+					TEAM.name,
+				);
+			} finally {
+				reopened.close();
+			}
+		});
+
+		it("serves a request whose own refresh names it against a login of the same workspace", async () => {
+			// Fresh when selection starts, so the pre-request refresh pass skips it; the usage check of the pinned row
+			// then moves the clock past expiry and the request path performs the refresh that prunes the named row.
+			const startMs = Date.now();
+			let clockMs = startMs;
+			vi.spyOn(Date, "now").mockImplementation(() => clockMs);
+			const legacyId = await seedLegacy(TEAM.id, startMs + 120_000);
+			await login(TEAM.id, "team");
+			expect(stored()).toHaveLength(2);
+			backend.suffix = "legacy-refreshed";
+			backend.usedPercentByWorkspace[TEAM.id] = 5;
+			const usageLookup = global.fetch;
+			global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input instanceof Request ? input.url : input);
+				if (url.endsWith("/wham/usage")) clockMs = startMs + 90_000;
+				return usageLookup(input, init);
+			}) as typeof fetch;
+
+			const apiKey = await authStorage.getApiKey("openai-codex", "session", {
+				credentialSelector: { kind: "id", value: String(legacyId) },
+			});
+
+			expect(apiKey).toBe(codexAccessToken(TEAM.id, "legacy-refreshed"));
+			const rows = stored();
+			expect(rows.map(row => [row.id, row.credential.organizationId, row.credential.organizationName])).toEqual([
+				[legacyId, TEAM.id, TEAM.name],
+			]);
 		});
 	});
 });

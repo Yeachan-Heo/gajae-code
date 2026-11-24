@@ -3176,6 +3176,34 @@ export class AuthStorage {
 		return deduped.reverse();
 	}
 
+	/**
+	 * A refresh that establishes a legacy row's organization keeps that row and prunes any other row of the same
+	 * identity (see {@link AuthStorage.#pruneDuplicateStoredCredentials}). The pruned row may be a newer login that
+	 * carries the organization's display name, which refresh responses do not always return (OpenAI Codex looks the
+	 * workspace name up only at login). Carry that name over so the surviving row keeps its label and stays
+	 * selectable by `org:<name>`.
+	 */
+	#withDuplicateOrganizationName<T extends AuthCredential>(
+		provider: string,
+		entries: readonly StoredCredential[],
+		targetId: number,
+		credential: T,
+	): T {
+		if (credential.type !== "oauth" || credential.organizationName?.trim() || !credential.organizationId?.trim()) {
+			return credential;
+		}
+		const identityKey = this.#resolveOAuthDedupeIdentityKey(provider, credential);
+		if (!identityKey) return credential;
+		for (const entry of entries) {
+			if (entry.id === targetId || entry.credential.type !== "oauth") continue;
+			const organizationName = entry.credential.organizationName?.trim();
+			if (!organizationName) continue;
+			if (this.#resolveOAuthDedupeIdentityKey(provider, entry.credential) !== identityKey) continue;
+			return { ...credential, organizationName };
+		}
+		return credential;
+	}
+
 	#pruneDuplicateStoredCredentials(
 		provider: string,
 		entries: StoredCredential[],
@@ -3792,21 +3820,30 @@ export class AuthStorage {
 		}
 	}
 
-	/** Updates a credential at index after OAuth token refresh. */
-	#replaceCredentialAt(
+	/**
+	 * Updates a credential at index after OAuth token refresh. Returns the credential actually stored, which may
+	 * carry an organization name over from a pruned duplicate; callers that compare against or hand out the
+	 * refreshed credential must use the returned value.
+	 */
+	#replaceCredentialAt<T extends AuthCredential>(
 		provider: string,
 		index: number,
-		credential: AuthCredential,
+		credential: T,
 		persist = true,
 		expectedId?: number,
-	): void {
+	): T {
 		const entries = this.#getStoredCredentials(provider);
-		if (index < 0 || index >= entries.length) return;
+		if (index < 0 || index >= entries.length) return credential;
 		const target = entries[index];
 		if (expectedId !== undefined && target.id !== expectedId) {
 			throw new Error("Credential authority changed during refresh");
 		}
-		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
+		const named = this.#withDuplicateOrganizationName(provider, entries, target.id, credential);
+		// A refresh lease already persisted the refreshed tokens, but not a name carried over from a pruned duplicate.
+		const nameCarried = named !== credential;
+		credential = named;
+		if ((persist || nameCarried) && !this.#store.refreshSnapshot)
+			this.#store.updateAuthCredential(target.id, credential);
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
@@ -3828,6 +3865,7 @@ export class AuthStorage {
 				this.getProviderOAuthRefreshGeneration(storageProvider) + 1,
 			);
 		}
+		return credential;
 	}
 
 	/**
@@ -6640,8 +6678,7 @@ export class AuthStorage {
 						type: "oauth",
 					};
 					if (!this.#reconcileOAuthCredentialSelection(provider, candidate.selection)) return;
-					candidate.selection.credential = updated;
-					this.#replaceCredentialAt(
+					candidate.selection.credential = this.#replaceCredentialAt(
 						provider,
 						candidate.selection.index,
 						updated,
@@ -7147,7 +7184,7 @@ export class AuthStorage {
 				result = await getOAuthApiKey(provider as OAuthProvider, oauthCreds);
 			}
 			if (!result) return undefined;
-			const updated: OAuthCredential = {
+			const refreshedCredential: OAuthCredential = {
 				type: "oauth",
 				access: result.newCredentials.access,
 				refresh: result.newCredentials.refresh,
@@ -7161,10 +7198,10 @@ export class AuthStorage {
 				organizationName: result.newCredentials.organizationName ?? selection.credential.organizationName,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
-			this.#replaceCredentialAt(
+			const updated = this.#replaceCredentialAt(
 				provider,
 				selection.index,
-				updated,
+				refreshedCredential,
 				!refreshedAuthority.persistedByLease,
 				selectionCredentialId,
 			);
@@ -7982,13 +8019,13 @@ export class AuthStorage {
 				organizationName: refreshed.organizationName ?? target.credential.organizationName,
 				mcpBinding: refreshed.mcpBinding,
 			};
-			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
+			const stored = this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
 			const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === id);
 			return {
 				id,
 				provider,
-				credential: { ...updated, refresh: REMOTE_REFRESH_SENTINEL },
-				identityKey: resolveCredentialIdentityKey(provider, updated),
+				credential: { ...stored, refresh: REMOTE_REFRESH_SENTINEL },
+				identityKey: resolveCredentialIdentityKey(provider, stored),
 				...(persisted?.revision === undefined ? {} : { revision: persisted.revision }),
 			};
 		}
