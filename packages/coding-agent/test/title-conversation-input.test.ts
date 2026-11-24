@@ -134,6 +134,43 @@ describe("buildConversationTitleInputWithFallback", () => {
 		expect(result).toBe("live user message");
 	});
 
+	it("skips cold-spilled persisted entries and falls through to the compaction summary", () => {
+		const coldSpilled = {
+			type: "message",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "[Compacted history content evicted to durable cold storage]" }],
+				timestamp: 0,
+			} as AgentMessage,
+			evictedContent: {
+				firstKeptEntryId: "kept",
+				payloads: {
+					"message.content.0.text": {
+						kind: "cold_spill",
+						ref: "blob:sha256:00",
+						encoding: "utf8",
+						originalChars: 4096,
+					},
+				},
+				pathEncoding: "v1",
+			},
+		} as unknown as SessionMessageEntry;
+		const liveMessages = [
+			{ role: "compactionSummary", summary: "Refactor the auth module" },
+		] as unknown as AgentMessage[];
+
+		const onlySpilled = { getBranch: () => [coldSpilled] } as unknown as SessionManager;
+		expect(buildConversationTitleInputWithFallback(liveMessages, onlySpilled)).toBe("Refactor the auth module");
+
+		const mixed = {
+			getBranch: () => [
+				coldSpilled,
+				{ type: "message", message: user("short resident prompt") } as SessionMessageEntry,
+			],
+		} as unknown as SessionManager;
+		expect(buildConversationTitleInputWithFallback(liveMessages, mixed)).toBe("short resident prompt");
+	});
+
 	it("prefers persisted entries over summary when both available", () => {
 		const persistedEntries = [
 			{

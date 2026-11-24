@@ -11,7 +11,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { collectEnvSecrets, createSecretObfuscator, loadSecrets } from "../secrets";
-import type { SessionManager, SessionMessageEntry } from "../session/session-manager";
+import type { SessionEntry, SessionManager } from "../session/session-manager";
 import { syncCmuxWorkspaceTitle } from "./cmux-workspace";
 import { syncHerdrPaneTitle } from "./herdr-pane";
 
@@ -59,29 +59,17 @@ function extractUserMessageTexts(messages: readonly AgentMessage[]): string[] {
 }
 
 /**
- * Extract user message text from persisted sessionManager entries.
- * Returns the raw user message strings (not yet formatted).
+ * Extract user message text from persisted active-branch entries.
+ * Entries whose content was cold-spilled after compaction are skipped: their
+ * resident text is a storage notice, not the user's prompt.
  */
-function extractUserMessagesFromSessionEntries(entries: readonly object[]): string[] {
-	const userMessages: string[] = [];
+function extractUserMessagesFromSessionEntries(entries: readonly SessionEntry[]): string[] {
+	const messages: AgentMessage[] = [];
 	for (const entry of entries) {
-		const messageEntry = entry as Partial<SessionMessageEntry>;
-		if (messageEntry.type !== "message" || !messageEntry.message) continue;
-		const message = messageEntry.message as AgentMessage;
-		if (message.role !== "user") continue;
-		const content = message.content;
-		const text =
-			typeof content === "string"
-				? content
-				: content
-						.filter((block: any) => block.type === "text")
-						.map((block: any) => block.text)
-						.join("\n");
-		const trimmed = text.trim();
-		if (!trimmed) continue;
-		userMessages.push(text);
+		if (entry.type !== "message" || entry.evictedContent) continue;
+		messages.push(entry.message);
 	}
-	return userMessages;
+	return extractUserMessageTexts(messages);
 }
 
 /**
@@ -90,11 +78,8 @@ function extractUserMessagesFromSessionEntries(entries: readonly object[]): stri
  */
 function extractSummaryFromMessages(messages: readonly AgentMessage[]): string | undefined {
 	for (const message of messages) {
-		if (message.role === "compactionSummary" || message.role === "branchSummary") {
-			const summaryMsg = message as any;
-			if (typeof summaryMsg.summary === "string" && summaryMsg.summary.trim()) {
-				return summaryMsg.summary;
-			}
+		if ((message.role === "compactionSummary" || message.role === "branchSummary") && message.summary.trim()) {
+			return message.summary;
 		}
 	}
 	return undefined;
