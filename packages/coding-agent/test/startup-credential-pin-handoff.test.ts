@@ -528,6 +528,43 @@ describe("startup credential pin handoff", () => {
 		}
 	});
 
+	test("a stale configured pin is not retargeted to a stored api_key account through apiKeyEnv (#8012)", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-pin-config-env-");
+		const fixture = await createCredentialFixture(tempDir.path());
+		const alternateKey = "fixture-alternate-api-key";
+		fixture.authStorage.upsertCredential(fixture.provider, { type: "api_key", key: alternateKey });
+		fixture.authStorage.setConfigApiKey(fixture.provider, "fixture-env-config-key", {
+			envSourced: true,
+			owner: fixture.modelRegistry.getAuthStorageOwner(),
+		});
+		expect(fixture.authStorage.disableCredentialById(fixture.paidRowId, "oauth refresh failed")).toBe(true);
+		let session: AgentSession | undefined;
+		const requests: string[] = [];
+		using _fetch = hookFetch((_input, init) => {
+			const bearer = new Headers(init?.headers).get("Authorization");
+			if (bearer) requests.push(bearer);
+			return Response.json({ data: [] });
+		});
+		try {
+			// Explicit same-provider model: the request path, not model selection, must hold the block.
+			const result = await createAgentSession({
+				...sessionOptions(fixture),
+				startupAuthConfig: snapshot(fixture.provider, `id:${fixture.paidRowId}`),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			session = result.session;
+
+			expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, "credential-scope")).toBe(true);
+			await expect(fixture.modelRegistry.getApiKeyForProvider(fixture.provider, "credential-scope")).rejects.toThrow(
+				"is unavailable",
+			);
+			expect(requests).not.toContain(`Bearer ${alternateKey}`);
+			expect(requests).not.toContain(`Bearer ${fixture.wrongKey}`);
+		} finally {
+			await disposeFixture(fixture, session);
+		}
+	});
+
 	test("resumes a saved model with a removed pin without selecting the settings default on that provider", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-saved-resume-");
 		const fixture = await createCredentialFixture(tempDir.path());

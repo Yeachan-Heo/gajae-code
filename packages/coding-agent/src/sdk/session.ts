@@ -2303,12 +2303,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// abort startup for a session whose model authenticates elsewhere.
 				try {
 					applyCredentialSelector(credentialSessionId, provider, selector);
-				} catch (error) {
+				} catch {
 					authStorage.clearSessionCredentialSelector(provider, credentialSessionId);
 					authStorage.markSessionCredentialUnavailable(credentialSessionId, provider, selector);
-					logger.warn("Configured credential pin is unavailable; provider blocked until re-login or re-pin", {
+					// The selector may carry an email or account id; log the provider only.
+					logger.warn("Configured credential pin is unavailable; re-pin a credential or select AUTO explicitly", {
 						provider: sanitizeProviderForLog(provider),
-						error: error instanceof Error ? error.message : String(error),
 					});
 				}
 			}
