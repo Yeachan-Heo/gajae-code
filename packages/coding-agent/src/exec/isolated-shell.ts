@@ -177,7 +177,12 @@ export class IsolatedShell {
 	async abort(): Promise<void> {
 		if (this.#closed) return;
 		this.#abortPromise ??= this.#ready.promise
-			.then(() => this.#requestVoid("abort"))
+			.then(() => {
+				if (this.#closed || this.#child.exitCode !== null || this.#child.signalCode !== null) return;
+				// Abort acknowledgement can wait behind the foreground command. The
+				// run promise owns cancellation settlement, so do not wait for it here.
+				this.#dispatchVoid("abort").acknowledgement.catch(() => undefined);
+			})
 			.finally(() => {
 				this.#abortPromise = undefined;
 			});
@@ -201,7 +206,12 @@ export class IsolatedShell {
 	}
 
 	async #requestVoid(type: "abort" | "close"): Promise<void> {
-		if (this.#child.exitCode !== null || this.#child.signalCode !== null) return;
+		await this.#dispatchVoid(type).acknowledgement;
+	}
+
+	#dispatchVoid(type: "abort" | "close"): { acknowledgement: Promise<void> } {
+		if (this.#child.exitCode !== null || this.#child.signalCode !== null)
+			return { acknowledgement: Promise.resolve() };
 		const id = this.#nextId++;
 		const deferred = Promise.withResolvers<void>();
 		this.#pending.set(id, { kind: "void", resolve: deferred.resolve, reject: deferred.reject });
@@ -211,7 +221,7 @@ export class IsolatedShell {
 			this.#pending.delete(id);
 			throw error;
 		}
-		await deferred.promise;
+		return { acknowledgement: deferred.promise };
 	}
 
 	#send(request: BashShellWorkerRequest): void {
