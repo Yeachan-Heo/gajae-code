@@ -321,6 +321,21 @@ describePosix("standalone HTML export through the bounded loader leaves its sour
 		});
 	}
 
+	it("asks to retry when the last line is still being written during the open", async () => {
+		const { sourceDir, sessionFile } = seedSource(coldEligibleTranscript(SMALL_COLD_ENTRIES).slice(0, -1));
+		const before = snapshotTree(sourceDir);
+		const outputPath = path.join(makeTempDir("output"), "export.html");
+		forceBoundedSnapshot();
+
+		const refusal = await rejectionMessage(() => exportFromFile(sessionFile, { outputPath }));
+
+		expect(refusal).toContain(
+			"Session transcript changed while it was being read (bounded_scan_unterminated); retry when the session is idle",
+		);
+		expect(snapshotTree(sourceDir)).toEqual(before);
+		expect(fs.existsSync(outputPath)).toBe(false);
+	});
+
 	const changedAfterOpen: ReadonlyArray<{ name: string; change: (sessionFile: string) => void }> = [
 		{
 			name: "replaced by a rename",
