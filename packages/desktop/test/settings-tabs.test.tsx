@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
 	SETTINGS_TABS,
@@ -9,12 +9,13 @@ import {
 	settingsTabId,
 } from "../src/SettingsTabs";
 import { closeComponentFixture, componentFixture, componentReady, browserPath } from "./component-fixture";
+import { startViteBrowser, VITE_BROWSER_SETUP_TIMEOUT_MS, type ViteBrowser } from "./vite-browser";
 
 const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
-let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
+let vite: ViteBrowser | undefined;
 let browser: Browser;
 
 /** Read one attribute from an opening tag without depending on attribute order. */
@@ -76,33 +77,13 @@ describe("settings tab presentation", () => {
 
 suite("settings tab interactions", () => {
 	beforeAll(async () => {
-		server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
-			cwd: `${import.meta.dir}/..`,
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-		for (let i = 0; i < 100; i++) {
-			try {
-				if ((await fetch(origin)).ok) break;
-			} catch {
-				// server is starting
-			}
-			await Bun.sleep(100);
-		}
 		if (!browserPath) return;
-		browser = await puppeteer.launch({
-			executablePath: browserPath,
-			headless: true,
-		});
-	}, 30000);
+		vite = await startViteBrowser(port);
+		browser = vite.browser;
+	}, VITE_BROWSER_SETUP_TIMEOUT_MS);
 
 	afterAll(async () => {
-		await browser?.close();
-		if (server) {
-			server.kill();
-			await server.exited;
-		}
+		await vite?.close();
 	});
 
 	async function fixture(): Promise<{ context: BrowserContext; page: Page }> {

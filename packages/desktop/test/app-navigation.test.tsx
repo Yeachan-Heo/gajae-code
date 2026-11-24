@@ -1,55 +1,43 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import type { DesktopMethod, DesktopRequest } from "@gajae-code/desktop-host/protocol";
 import { browserPath } from "./component-fixture";
+import { startViteBrowser, VITE_BROWSER_SETUP_TIMEOUT_MS, type ViteBrowser } from "./vite-browser";
 import { installNavigationFixture } from "./fixtures/navigation";
 
 const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
-let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
+let vite: ViteBrowser | undefined;
 let browser: Browser;
 
 beforeAll(async () => {
 	if (!browserPath) return;
-	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
-		cwd: `${import.meta.dir}/..`, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+	// Beyond loading the app entry, warm the first long transcript render: the browser's first one
+	// is far slower than later ones.
+	vite = await startViteBrowser(port, {
+		warmUp: async warming => {
+			const context = await warming.createBrowserContext();
+			try {
+				const page = await context.newPage();
+				await page.setViewport({ width: 1400, height: 900 });
+				await page.evaluateOnNewDocument(installNavigationFixture, false);
+				await page.goto(origin, { waitUntil: "networkidle0", timeout: 60000 });
+				await page.waitForSelector(".session-row", { timeout: 30000 });
+				await seedTranscripts(page);
+				await openTranscript(page, "old");
+				await openTranscript(page, "new");
+			} finally {
+				await context.close();
+			}
+		},
 	});
-	let ready = false;
-	for (let i = 0; i < 300 && !ready; i++) {
-		try { ready = (await fetch(origin)).ok; } catch { /* Server is starting. */ }
-		if (!ready) await Bun.sleep(100);
-	}
-	if (!ready) throw new Error(`The Vite dev server did not answer at ${origin}`);
-	browser = await puppeteer.launch({
-		executablePath: browserPath, headless: true,
-	});
-	// Pay the one-time cold start here, not inside the first test's budget: a fresh checkout has no
-	// Vite dependency cache, so the first page load optimizes dependencies and transforms every
-	// module, and the browser's first long transcript render is far slower than later ones. On a
-	// cold CI runner that alone took the first test past its 30 s limit, and the timeout then
-	// killed the shared browser and failed every later test in the file.
-	// A first load can also be reloaded by Vite once it finishes optimizing dependencies, so the
-	// warm-up waits for the network to go idle and tries a second page if the first was replaced.
-	for (let attempt = 1; ; attempt++) {
-		const context = await browser.createBrowserContext();
-		try {
-			const page = await context.newPage();
-			await page.setViewport({ width: 1400, height: 900 });
-			await page.evaluateOnNewDocument(installNavigationFixture, false);
-			await page.goto(origin, { waitUntil: "networkidle0", timeout: 60000 });
-			await page.waitForSelector(".session-row", { timeout: 30000 });
-			await seedTranscripts(page);
-			await openTranscript(page, "old");
-			await openTranscript(page, "new");
-			break;
-		} catch (error) {
-			if (attempt >= 2) throw error;
-		} finally { await context.close(); }
-	}
-}, 180000);
-afterAll(async () => { await browser?.close(); if (server) { server.kill(); await server.exited; } });
+	browser = vite.browser;
+}, VITE_BROWSER_SETUP_TIMEOUT_MS);
+afterAll(async () => {
+	await vite?.close();
+});
 
 async function fixture(holdBootstrap = false): Promise<{ context: BrowserContext; page: Page }> {
 	const context = await browser.createBrowserContext();

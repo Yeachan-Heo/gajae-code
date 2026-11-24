@@ -1,47 +1,41 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { DesktopMethod, DesktopRequest, DesktopSession } from "@gajae-code/desktop-host/protocol";
 import type { DesktopToolList } from "@gajae-code/desktop-host/tool-protocol";
-import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { editedToolNames, parseToolList } from "../src/ToolCatalogDialog";
 import { browserPath } from "./component-fixture";
+import { startViteBrowser, VITE_BROWSER_SETUP_TIMEOUT_MS, type ViteBrowser } from "./vite-browser";
 import { installNavigationFixture } from "./fixtures/navigation";
 
 const suite = browserPath ? describe : describe.skip;
 
 const port = 16000 + Math.floor(Math.random() * 20000);
 const origin = `http://127.0.0.1:${port}`;
-let server: Bun.Subprocess<"ignore", "ignore", "ignore">;
+let vite: ViteBrowser | undefined;
 let browser: Browser;
 
 beforeAll(async () => {
 	if (!browserPath) return;
-	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
-		cwd: `${import.meta.dir}/..`,
-		stdin: "ignore",
-		stdout: "ignore",
-		stderr: "ignore",
+	// The first test opens a conversation and its Tools dialog; pay that path's cold start once here.
+	vite = await startViteBrowser(port, {
+		warmUp: async warming => {
+			const { context, page } = await fixture(warming);
+			try {
+				await openTools(page);
+			} finally {
+				await context.close();
+			}
+		},
 	});
-	for (let i = 0; i < 100; i++) {
-		try {
-			if ((await fetch(origin)).ok) break;
-		} catch {
-			/* Server is starting. */
-		}
-		await Bun.sleep(100);
-	}
-	browser = await puppeteer.launch({ executablePath: browserPath, headless: true });
-}, 30000);
+	browser = vite.browser;
+}, VITE_BROWSER_SETUP_TIMEOUT_MS);
 afterAll(async () => {
-	await browser?.close();
-	if (server) {
-		server.kill();
-		await server.exited;
-	}
+	await vite?.close();
 });
 
 /** The mounted App on the page-owned navigation transport, with the idle "old" conversation selected. */
-async function fixture(): Promise<{ context: BrowserContext; page: Page }> {
-	const context = await browser.createBrowserContext();
+async function fixture(target: Browser = browser): Promise<{ context: BrowserContext; page: Page }> {
+	const context = await target.createBrowserContext();
 	try {
 		const page = await context.newPage();
 		await page.setViewport({ width: 1400, height: 900 });
