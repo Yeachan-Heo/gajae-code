@@ -7,17 +7,22 @@ import { RESUME_TRANSCRIPT_MAX_BYTES } from "@gajae-code/coding-agent/session/se
 import { getAgentDir, getSessionsDir, getSidecarCacheRootDir, getTerminalSessionsDir } from "@gajae-code/utils";
 
 // A real transcript above the eager-load cap, exported in a child process so its peak RSS is
-// the export's own and not this test's (which hashes the source and parses the HTML).
+// the export's own and not this test's (which hashes the source and scans the HTML).
+// Opt-in, like the session-memory RSS suite: it writes about 330 MB to a temp dir. The bounded
+// path itself is covered at small sizes by html-export-source-readonly.test.ts.
+const enabled = process.env.GJC_EXPORT_LARGE_TRANSCRIPT === "1" && process.platform !== "win32";
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const TARGET_BYTES = RESUME_TRANSCRIPT_MAX_BYTES + 8 * 1024 * 1024;
 const EXPORT_MODULE = path.resolve(import.meta.dir, "../../src/export/html/index.ts");
 const SESSION_MODULE = path.resolve(import.meta.dir, "../../src/session/session-manager.ts");
-// "baseline" loads the same modules and does nothing; "hold" opens the snapshot and waits to be interrupted.
+// "baseline" loads the same modules and does nothing; "hold" opens a bounded snapshot (forced at
+// any size) and waits to be interrupted.
 const CHILD_SCRIPT = `import { exportFromFile } from ${JSON.stringify(EXPORT_MODULE)};
-import { SessionManager } from ${JSON.stringify(SESSION_MODULE)};
+import { SessionManager, SessionManagerTestHooks } from ${JSON.stringify(SESSION_MODULE)};
 const [mode, input, output] = process.argv.slice(2);
 if (mode === "export") await exportFromFile(input, { outputPath: output });
 if (mode === "hold") {
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
 	await SessionManager.openReadOnlySnapshot(input);
 	process.stdout.write("ready\\n");
 	await Bun.sleep(120_000);
@@ -157,15 +162,85 @@ async function writeLargeTranscript(file: string, targetBytes: number): Promise<
 	return { ids, leafId };
 }
 
+/**
+ * Streams the exported HTML's base64 session data and collects every `"id"` (header first, then
+ * entries in order) and the `leafId`, without holding the page or the decoded JSON in memory.
+ */
+function scanExportedIds(htmlFile: string): { ids: string[]; leafId: string | undefined } {
+	const openTag = '<script id="session-data" type="application/json">';
+	const ids: string[] = [];
+	let leafId: string | undefined;
+	const idPattern = /"(id|leafId)":"([^"]*)"/g;
+	const textDecoder = new TextDecoder();
+	let state: "before" | "data" | "done" = "before";
+	let prefix = "";
+	let base64Remainder = "";
+	let decoded = "";
+	const scan = (final: boolean): void => {
+		idPattern.lastIndex = 0;
+		let consumed = 0;
+		for (let match = idPattern.exec(decoded); match; match = idPattern.exec(decoded)) {
+			if (match[1] === "id") ids.push(match[2]);
+			else leafId = match[2];
+			consumed = idPattern.lastIndex;
+		}
+		// Keep enough unscanned text for a match split across chunks (ids here are short).
+		decoded = final ? "" : decoded.slice(Math.max(consumed, decoded.length - 256));
+	};
+	const feedBase64 = (text: string, final: boolean): void => {
+		const all = base64Remainder + text;
+		const usable = final ? all.length : all.length - (all.length % 4);
+		base64Remainder = all.slice(usable);
+		decoded += textDecoder.decode(Buffer.from(all.slice(0, usable), "base64"), { stream: !final });
+		scan(final);
+	};
+	const buffer = Buffer.allocUnsafe(4 * 1024 * 1024);
+	const fd = fs.openSync(htmlFile, "r");
+	try {
+		for (let read = fs.readSync(fd, buffer); read > 0 && state !== "done"; read = fs.readSync(fd, buffer)) {
+			let text = buffer.subarray(0, read).toString("latin1");
+			if (state === "before") {
+				prefix += text;
+				const start = prefix.indexOf(openTag);
+				if (start < 0) {
+					prefix = prefix.slice(-openTag.length);
+					continue;
+				}
+				text = prefix.slice(start + openTag.length);
+				state = "data";
+			}
+			const end = text.indexOf("<");
+			if (end < 0) feedBase64(text, false);
+			else {
+				feedBase64(text.slice(0, end), true);
+				state = "done";
+			}
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	return { ids, leafId };
+}
+
 let workDir: string;
 let sourceDir: string;
 let sessionFile: string;
+let smallSourceDir: string;
+let smallSessionFile: string;
 let generated: { ids: string[]; leafId: string };
 let childScript: string;
 
 beforeAll(async () => {
 	if (process.platform === "win32") return;
 	workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-export-large-")));
+	childScript = path.join(workDir, "export-child.ts");
+	fs.writeFileSync(childScript, CHILD_SCRIPT);
+	smallSourceDir = path.join(workDir, "small-source");
+	fs.mkdirSync(smallSourceDir, { mode: 0o700 });
+	smallSessionFile = path.join(smallSourceDir, "session.jsonl");
+	await writeLargeTranscript(smallSessionFile, 256 * 1024);
+	fs.chmodSync(smallSessionFile, 0o600);
+	if (!enabled) return;
 	sourceDir = path.join(workDir, "source");
 	fs.mkdirSync(sourceDir, { mode: 0o700 });
 	sessionFile = path.join(sourceDir, "session.jsonl");
@@ -177,16 +252,14 @@ beforeAll(async () => {
 	fs.writeFileSync(path.join(artifactRoot, "tool-output.txt"), "artifact payload", { mode: 0o600 });
 	fs.writeFileSync(path.join(artifactRoot, "leftover.tmp"), "decoy temporary file", { mode: 0o600 });
 	fs.writeFileSync(`${sessionFile}.spill.idx`, "decoy legacy sidecar", { mode: 0o600 });
-	childScript = path.join(workDir, "export-child.ts");
-	fs.writeFileSync(childScript, CHILD_SCRIPT);
 }, 120_000);
 
 afterAll(() => {
 	if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
 });
 
-// Windows has no bounded loader: export there still refuses transcripts above the eager cap.
-describe.skipIf(process.platform === "win32")("standalone HTML export of a transcript above the eager-load cap", () => {
+// Windows lacks the owner-only private sidecar cache, so export there still refuses transcripts above the eager cap.
+describe.skipIf(!enabled)("standalone HTML export of a transcript above the eager-load cap", () => {
 	it("exports every entry with bounded memory and leaves the source and caches untouched", async () => {
 		const transcriptBytes = fs.statSync(sessionFile).size;
 		expect(transcriptBytes).toBeGreaterThan(RESUME_TRANSCRIPT_MAX_BYTES);
@@ -211,23 +284,19 @@ describe.skipIf(process.platform === "win32")("standalone HTML export of a trans
 		expect(snapshotTreeIfPresent(getTerminalSessionsDir())).toEqual(breadcrumbsBefore);
 		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
 
-		const html = fs.readFileSync(outputPath, "utf8");
-		const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1] ?? "";
-		const data = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as {
-			header: { id: string };
-			entries: Array<{ id: string }>;
-			leafId: string;
-		};
-		expect(data.header.id).toBe("large-export");
-		expect(data.leafId).toBe(generated.leafId);
-		expect(data.entries.length).toBe(generated.ids.length);
-		expect(data.entries.every((entry, index) => entry.id === generated.ids[index])).toBe(true);
+		const exported = scanExportedIds(outputPath);
+		expect(exported.ids[0]).toBe("large-export");
+		expect(exported.leafId).toBe(generated.leafId);
+		expect(exported.ids.length - 1).toBe(generated.ids.length);
+		expect(exported.ids.slice(1).every((id, index) => id === generated.ids[index])).toBe(true);
 	}, 300_000);
+});
 
+describe.skipIf(process.platform === "win32")("bounded read-only snapshot in a separate process", () => {
 	it("removes its private sidecar cache when interrupted with SIGINT", async () => {
-		const before = snapshotTree(sourceDir);
+		const before = snapshotTree(smallSourceDir);
 		const instancesBefore = sidecarCacheInstances();
-		const child = Bun.spawn([process.execPath, childScript, "hold", sessionFile, ""], {
+		const child = Bun.spawn([process.execPath, childScript, "hold", smallSessionFile, ""], {
 			cwd: workDir,
 			env: process.env,
 			stdout: "pipe",
@@ -257,6 +326,6 @@ describe.skipIf(process.platform === "win32")("standalone HTML export of a trans
 		});
 		expect(output).not.toContain("maxRssKiB");
 		expect(newSidecarCacheInstances(instancesBefore)).toEqual([]);
-		expect(snapshotTree(sourceDir)).toEqual(before);
-	}, 300_000);
+		expect(snapshotTree(smallSourceDir)).toEqual(before);
+	}, 60_000);
 });
