@@ -73,12 +73,14 @@ function makeFakeSession() {
 		extensionRunner: undefined,
 		customCommands: [] as Array<{ command: { name: string } }>,
 		getQueuedMessages: () => ({ steering, followUp }),
-		clearQueue: () => {
-			const s = [...steering];
-			const f = [...followUp];
-			steering.length = 0;
-			followUp.length = 0;
-			return { steering: s, followUp: f };
+		// Stubs of AgentSession.queuedMessageMark / dropUserInputQueuedSince: every entry is user
+		// input, so dropping removes what arrived after the mark and (when given) is still in `until`.
+		queuedMessageMark: () => new Set<string>([...steering, ...followUp]),
+		dropUserInputQueuedSince: (mark: ReadonlySet<string>, until?: ReadonlySet<string>) => {
+			const kept = (queue: string[]) =>
+				queue.filter(entry => mark.has(entry) || (until !== undefined && !until.has(entry)));
+			steering.splice(0, steering.length, ...kept(steering));
+			followUp.splice(0, followUp.length, ...kept(followUp));
 		},
 		prompt,
 		steer,

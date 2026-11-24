@@ -584,6 +584,7 @@ import {
 	ttsrPromptFields,
 	wrapUntrustedContent,
 } from "./messages";
+import { isHiddenUserCompanion, isUserAuthoredQueuedMessage } from "./queued-messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import type { SessionRecapAppendResult, SessionRecapInput } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
@@ -20673,6 +20674,52 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
+	/** The messages queued right now, as an opaque mark for {@link dropUserInputQueuedSince}. */
+	queuedMessageMark(): ReadonlySet<AgentMessage> {
+		return new Set([...this.agent.snapshotSteering(), ...this.agent.snapshotFollowUp()]);
+	}
+
+	/**
+	 * Remove the user input queued after `mark` (from {@link queuedMessageMark}) and, when given,
+	 * still present in `until` (a later mark), together with the hidden companions right before
+	 * it. Everything else stays queued: messages already queued at `mark`, messages queued after
+	 * `until`, and agent or extension work that is not user input (with an agent-attributed
+	 * prompt's companions). A caller takes back a batch whose delivery failed by marking before
+	 * delivery and after it; user input another source queued between the two marks cannot be
+	 * told apart from the batch: it is removed with the batch and is not restored.
+	 */
+	dropUserInputQueuedSince(mark: ReadonlySet<AgentMessage>, until?: ReadonlySet<AgentMessage>): void {
+		const callers = (message: AgentMessage): boolean =>
+			!mark.has(message) && (until === undefined || until.has(message));
+		const dropped = new Set<AgentMessage>();
+		const collect = (queue: readonly AgentMessage[]): void => {
+			let companions: AgentMessage[] = [];
+			for (const message of queue) {
+				if (callers(message) && isHiddenUserCompanion(message)) {
+					companions.push(message);
+					continue;
+				}
+				// Companions go with the message they precede.
+				if (callers(message) && isUserAuthoredQueuedMessage(message)) {
+					for (const companion of companions) dropped.add(companion);
+					dropped.add(message);
+				}
+				companions = [];
+			}
+		};
+		collect(this.agent.snapshotSteering());
+		collect(this.agent.snapshotFollowUp());
+		if (dropped.size === 0) return;
+		this.agent.removeQueuedMessages(candidate => dropped.has(candidate));
+		this.#steeringMessages = this.#steeringMessages.filter(
+			entry => entry.message === undefined || !dropped.has(entry.message),
+		);
+		this.#followUpMessages = this.#followUpMessages.filter(
+			entry => entry.message === undefined || !dropped.has(entry.message),
+		);
+		this.#fireQueuedRemovalHooks([...dropped]);
+	}
+
 	/** Number of pending messages (includes steering, follow-up, and next-turn messages) */
 	get queuedMessageCount(): number {
 		return this.#steeringMessages.length + this.#followUpMessages.length + this.#pendingNextTurnMessages.length;
@@ -30994,7 +31041,8 @@ export class AgentSession {
 	setAutoCompactionEnabled(enabled: boolean): void {
 		this.settings.set("compaction.enabled", enabled);
 		if (enabled && this.settings.get("compaction.strategy") === "off") {
-			this.settings.set("compaction.strategy", "context-full");
+			const defaultStrategy = getDefault("compaction.strategy");
+			this.settings.set("compaction.strategy", defaultStrategy === "off" ? "context-full" : defaultStrategy);
 		}
 	}
 

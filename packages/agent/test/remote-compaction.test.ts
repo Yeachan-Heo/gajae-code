@@ -121,6 +121,96 @@ describe("buildOpenAiNativeHistory custom tool calls", () => {
 	});
 });
 
+const ZERO_USAGE = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+// Codex carries native responses-API items on `providerPayload`. The history
+// builder reads call ids from there (not the message content blocks), so each
+// turn pairs a content `toolCall` (kept by `transformMessages` so the matching
+// result survives) with a `providerPayload` function/custom call of the same id.
+// `dt: true` appends to the running history; `dt: false` is a full snapshot that
+// replaces it.
+const CODEX_MODEL = makeOpenAiModel({ provider: "openai-codex" });
+
+function codexAssistant(calls: Array<{ callId: string; custom?: boolean }>, dt: boolean): AssistantMessage {
+	const content = calls.map(c => ({
+		type: "toolCall" as const,
+		id: `${c.callId}|${c.custom ? "ctc" : "fc"}_${c.callId}`,
+		name: c.custom ? "edit" : "read",
+		arguments: c.custom ? { input: "p" } : {},
+		...(c.custom ? { customWireName: "apply_patch" } : {}),
+	}));
+	const items = calls.map(c =>
+		c.custom
+			? { type: "custom_tool_call", id: `ctc_${c.callId}`, call_id: c.callId, name: "apply_patch", input: "p" }
+			: { type: "function_call", id: `fc_${c.callId}`, call_id: c.callId, name: "read", arguments: "{}" },
+	);
+	return {
+		role: "assistant",
+		content,
+		timestamp: Date.now(),
+		provider: "openai-codex",
+		model: "gpt-5",
+		api: "openai-responses",
+		usage: ZERO_USAGE,
+		stopReason: "toolUse",
+		providerPayload: { type: "openaiResponsesHistory", provider: "openai-codex", ...(dt ? { dt: true } : {}), items },
+	} as unknown as AssistantMessage;
+}
+
+function toolResultFor(callId: string, custom = false): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: `${callId}|${custom ? "ctc" : "fc"}_${callId}`,
+		toolName: custom ? "edit" : "read",
+		content: [{ type: "text", text: "result" }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+}
+
+describe("buildOpenAiNativeHistory call-id tracking", () => {
+	test("registers function_call ids carried in providerPayload so later tool results are emitted", () => {
+		const items = buildOpenAiNativeHistory(
+			[codexAssistant([{ callId: "call_1" }], true), toolResultFor("call_1")],
+			CODEX_MODEL,
+		);
+		const output = items.find(item => item.type === "function_call_output");
+		expect(output?.call_id).toBe("call_1");
+		expect(items.find(item => item.type === "custom_tool_call_output")).toBeUndefined();
+	});
+
+	test("registers custom_tool_call ids from providerPayload so outputs use the custom wire shape", () => {
+		const items = buildOpenAiNativeHistory(
+			[codexAssistant([{ callId: "call_2", custom: true }], true), toolResultFor("call_2", true)],
+			CODEX_MODEL,
+		);
+		expect(items.find(item => item.type === "custom_tool_call_output")?.call_id).toBe("call_2");
+		expect(items.find(item => item.type === "function_call_output")).toBeUndefined();
+	});
+
+	test("a full-snapshot providerPayload resets known call ids so stale outputs are dropped", () => {
+		const items = buildOpenAiNativeHistory(
+			[
+				codexAssistant([{ callId: "call_old" }], true),
+				// dt: false → splices the running history; call_old's function_call is gone.
+				codexAssistant([{ callId: "call_new" }], false),
+				toolResultFor("call_old"),
+				toolResultFor("call_new"),
+			],
+			CODEX_MODEL,
+		);
+		expect(items.some(item => item.type === "function_call_output" && item.call_id === "call_old")).toBe(false);
+		expect(items.some(item => item.type === "function_call_output" && item.call_id === "call_new")).toBe(true);
+	});
+});
+
 describe("remote compaction input trimming", () => {
 	test("trims removable items against reserved input budget when input fits full context window", async () => {
 		let requestInput: Array<Record<string, unknown>> | undefined;

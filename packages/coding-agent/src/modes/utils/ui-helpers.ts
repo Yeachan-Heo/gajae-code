@@ -1300,8 +1300,15 @@ export class UiHelpers {
 		this.ctx.compactionQueuedMessages = [] as CompactionQueuedMessage[];
 		this.ctx.updatePendingMessagesDisplay();
 
+		const queuedBeforeFlush = this.ctx.session.queuedMessageMark();
+		let queuedByFlush: ReadonlySet<AgentMessage> | undefined;
+		let restored = false;
+
 		const restoreQueue = (error: unknown) => {
-			this.ctx.session.clearQueue();
+			// A `rest` delivery and the fire-and-forget first prompt can both fail; restore once.
+			if (restored) return;
+			restored = true;
+			this.ctx.session.dropUserInputQueuedSince(queuedBeforeFlush, queuedByFlush);
 			this.ctx.compactionQueuedMessages = queuedMessages;
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.showError(
@@ -1345,6 +1352,8 @@ export class UiHelpers {
 				await this.#deliverQueuedMessage(message);
 			}
 
+			queuedByFlush = this.ctx.session.queuedMessageMark();
+
 			// Pass streamingBehavior so that if the session is still streaming when
 			// compaction-end fires (race window between isStreaming flipping false and
 			// the event landing here), prompt() routes the message into the steer/
@@ -1376,7 +1385,14 @@ export class UiHelpers {
 
 			for (const message of rest) {
 				await this.#deliverQueuedMessage(message);
+				// The first prompt failed while the rest was still being delivered: the whole batch is
+				// back in the compaction queue, so take back what was delivered since and stop.
+				if (restored) {
+					this.ctx.session.dropUserInputQueuedSince(queuedBeforeFlush);
+					return;
+				}
 			}
+			queuedByFlush = this.ctx.session.queuedMessageMark();
 			this.ctx.updatePendingMessagesDisplay();
 			void promptPromise;
 		} catch (error) {

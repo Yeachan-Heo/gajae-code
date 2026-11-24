@@ -428,6 +428,14 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 	item: Record<string, unknown>,
 	normalizedCallIds: Map<string, string>,
 ): OpenAIResponsesReplayItem | undefined {
+	if (item.type === "function_call") {
+		if (typeof item.arguments !== "string" || item.arguments.trim().length === 0) return undefined;
+		try {
+			JSON.parse(item.arguments);
+		} catch {
+			return undefined;
+		}
+	}
 	if (item.type === "item_reference") return undefined;
 
 	// providerPayload stores raw output items; replay strips fields that are output-only.
