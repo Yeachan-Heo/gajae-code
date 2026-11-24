@@ -65,13 +65,28 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	for (const claim of claims.splice(0)) claim.release();
-	resetSessionOwnershipForTests();
-	delete SessionOwnershipTestHooks.homeOverride;
-	delete SessionOwnershipTestHooks.lockBackend;
-	vi.restoreAllMocks();
-	await fs.chmod(home, 0o700);
-	await fs.rm(home, { recursive: true, force: true });
+	try {
+		for (const claim of claims.splice(0)) claim.release();
+	} finally {
+		delete SessionOwnershipTestHooks.homeOverride;
+		delete SessionOwnershipTestHooks.lockBackend;
+		delete SessionOwnershipTestHooks.beforeRecordPublish;
+		vi.restoreAllMocks();
+		await fs.chmod(home, 0o700).catch(() => {});
+		await fs.rm(home, { recursive: true, force: true });
+		// Last, so a leaked claim fails this test without skipping the cleanup above.
+		resetSessionOwnershipForTests();
+	}
+});
+
+describe("test isolation", () => {
+	it("a leaked claim is dropped and reported, and the registry is clean afterwards", async () => {
+		const leaked = await claimSessionOwner("leak", { surface: "terminal" });
+		expect(leaked.status).toBe("claimed");
+		expect(() => resetSessionOwnershipForTests()).toThrow("1 session claim(s) were never released");
+		expect(await probeSessionOwner("leak")).toEqual({ state: "free" });
+		expect(() => resetSessionOwnershipForTests()).not.toThrow();
+	});
 });
 
 describe("sessionOwnerKey", () => {

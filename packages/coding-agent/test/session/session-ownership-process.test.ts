@@ -43,14 +43,17 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	for (const claim of claims.splice(0)) claim.release();
-	for (const child of children.splice(0)) {
-		child.kill("SIGKILL");
-		await child.exited;
+	try {
+		for (const claim of claims.splice(0)) claim.release();
+	} finally {
+		for (const child of children.splice(0)) {
+			child.kill("SIGKILL");
+			await child.exited;
+		}
+		for (const pid of strayPids.splice(0)) if (alive(pid)) process.kill(pid, "SIGKILL");
+		delete SessionOwnershipTestHooks.homeOverride;
+		await fs.rm(home, { recursive: true, force: true });
 	}
-	for (const pid of strayPids.splice(0)) if (alive(pid)) process.kill(pid, "SIGKILL");
-	delete SessionOwnershipTestHooks.homeOverride;
-	await fs.rm(home, { recursive: true, force: true });
 });
 
 interface Holder {

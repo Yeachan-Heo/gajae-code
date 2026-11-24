@@ -304,11 +304,17 @@ function registry(): SessionOwnerRegistry {
 	return found;
 }
 
-/** Test-only: forget a process-wide `unavailable` latch. Refuses while claims are held. */
+/**
+ * Test-only: forget the `unavailable` latch and drop any claim a test leaked, unlocking it, then
+ * throw if one was leaked. The registry is clean either way, so one leak fails one test only.
+ */
 export function resetSessionOwnershipForTests(): void {
 	const current = registry();
-	if (current.entries.size > 0 || current.pending.size > 0) throw new Error("session claims are still held");
 	current.unavailable = undefined;
+	const leaked = [...current.entries.values()];
+	current.entries.clear();
+	for (const entry of leaked) entry.lock.release();
+	if (leaked.length > 0) throw new Error(`${leaked.length} session claim(s) were never released`);
 }
 
 function markUnavailable(code: string | undefined): string {
