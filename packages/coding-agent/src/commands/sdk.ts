@@ -236,10 +236,12 @@ function isIdentifiedBrokerPublication(observation: unknown): boolean {
  * index, so it can still reach this host. An unreadable or unidentifiable
  * publication is not proof of orphanhood but accrues against the same bound.
  *
- * `readWorkLease` reports whether the host's session-work lease is held. A turn
- * in flight is never cut short by broker absence: the window keeps accruing, but
- * the host only exits once the lease is released. If the bound was crossed
- * during the turn, the host exits on the first poll after the turn ends.
+ * `readWorkLease` reports whether the host's session-work lease is held. It
+ * defaults to the lease the host's SDK runtime publishes (the AgentSession's
+ * `sessionWorkLease`, registered by the notifications bus at host startup). A
+ * turn in flight is never cut short by broker absence: the window keeps
+ * accruing, but the host only exits once the lease is released. If the bound was
+ * crossed during the turn, the host exits on the first poll after the turn ends.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
 	agentDir: string;
@@ -253,7 +255,7 @@ export async function watchSessionHostBrokerLiveness(deps: {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
 	const readDiscovery = deps.readDiscovery ?? readBrokerDiscovery;
-	const readWorkLease = deps.readWorkLease ?? (() => false);
+	const readWorkLease = deps.readWorkLease ?? sessionHostWorkLeaseActive;
 	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
 	let absentSince: number | null = null;
@@ -1659,7 +1661,7 @@ export async function runSessionHost(
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
 	const reapReason = await Promise.race([
-		watchSessionHostBrokerLiveness({ agentDir, readWorkLease: sessionHostWorkLeaseActive }).then(() => undefined),
+		watchSessionHostBrokerLiveness({ agentDir }).then(() => undefined),
 		watchSessionHostClientAttachment({
 			readAttachedClients: sessionHostAttachedClients,
 			readWorkLease: sessionHostWorkLeaseActive,

@@ -4105,6 +4105,7 @@ test("session host orphan watchdog resolves only after no broker is observable f
 			if (observation instanceof Error) throw observation;
 			return observation ?? null;
 		},
+		readWorkLease: () => false,
 		graceMs: 20,
 		pollMs: 10,
 	});
@@ -4144,6 +4145,7 @@ test("session host orphan watchdog lets a replacement broker reset the absence w
 			reads += 1;
 			return observation ?? null;
 		},
+		readWorkLease: () => false,
 		graceMs: 20,
 		pollMs: 10,
 	});

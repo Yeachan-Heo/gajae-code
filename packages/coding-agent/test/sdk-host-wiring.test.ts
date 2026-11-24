@@ -63,6 +63,7 @@ async function firePreflightAccept(options?: {
 	else options?.onPreflightAccepted?.();
 }
 
+import { watchSessionHostBrokerLiveness } from "../src/commands/sdk";
 import { createAcpReverseConnection } from "../src/modes/acp/acp-agent";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
@@ -946,6 +947,59 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 	} finally {
 		await observer.close();
+		await host.stop();
+	}
+}, 60_000);
+
+test("broker-absence watchdog defaults to the production host's AgentSession work lease (#7998)", async () => {
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-broker-absence-lease-"));
+	dirs.push(cwd);
+	// The bus is registered by createAgentSession itself (the same session.ts block a
+	// lifecycle session host goes through), not by an injected fixture extension.
+	const host = await startProductionSdkHost(cwd, {
+		acceptPromptPreflightWithoutExecution: true,
+		sessionWiredNotificationsHost: true,
+	});
+	const HALT = "halt-broker-absence-watch";
+	// No `readWorkLease` is injected: the watcher must read the lease the SDK
+	// runtime published for this AgentSession, exactly as `runSessionHost` calls it.
+	const watchWithoutBroker = async (polls: number): Promise<"exited" | "still-running"> => {
+		let nowMs = 0;
+		let seen = 0;
+		try {
+			await watchSessionHostBrokerLiveness({
+				agentDir: path.join(cwd, ".gjc", "agent"),
+				readDiscovery: async () => null,
+				now: () => nowMs,
+				sleep: async ms => {
+					nowMs += ms;
+					seen += 1;
+					if (seen >= polls) throw new Error(HALT);
+				},
+				graceMs: 20,
+				pollMs: 10,
+			});
+			return "exited";
+		} catch (error) {
+			if (error instanceof Error && error.message === HALT) return "still-running";
+			throw error;
+		}
+	};
+	try {
+		expect(host.session.sessionWorkLease.isHeld()).toBe(false);
+		await host.session.extensionRunner?.emit({ type: "agent_start" });
+		expect(host.session.sessionWorkLease.isHeld()).toBe(true);
+		// 50 polls is 25x the grace with no broker at all: the in-flight turn holds the host.
+		expect(await watchWithoutBroker(50)).toBe("still-running");
+		await host.session.extensionRunner?.emit({
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop" }],
+		} as never);
+		await waitFor(() => !sessionHostWorkLeaseActive(), "turn lease release");
+		// With the turn settled, the same watcher exits at the grace bound.
+		expect(await watchWithoutBroker(50)).toBe("exited");
+	} finally {
 		await host.stop();
 	}
 }, 60_000);
