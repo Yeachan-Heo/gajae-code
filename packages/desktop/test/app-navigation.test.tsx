@@ -16,14 +16,39 @@ beforeAll(async () => {
 	server = Bun.spawn(["bun", "run", "vite", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
 		cwd: `${import.meta.dir}/..`, stdin: "ignore", stdout: "ignore", stderr: "ignore",
 	});
-	for (let i = 0; i < 100; i++) {
-		try { if ((await fetch(origin)).ok) break; } catch { /* Server is starting. */ }
-		await Bun.sleep(100);
+	let ready = false;
+	for (let i = 0; i < 300 && !ready; i++) {
+		try { ready = (await fetch(origin)).ok; } catch { /* Server is starting. */ }
+		if (!ready) await Bun.sleep(100);
 	}
+	if (!ready) throw new Error(`The Vite dev server did not answer at ${origin}`);
 	browser = await puppeteer.launch({
 		executablePath: browserPath, headless: true,
 	});
-}, 30000);
+	// Pay the one-time cold start here, not inside the first test's budget: a fresh checkout has no
+	// Vite dependency cache, so the first page load optimizes dependencies and transforms every
+	// module, and the browser's first long transcript render is far slower than later ones. On a
+	// cold CI runner that alone took the first test past its 30 s limit, and the timeout then
+	// killed the shared browser and failed every later test in the file.
+	// A first load can also be reloaded by Vite once it finishes optimizing dependencies, so the
+	// warm-up waits for the network to go idle and tries a second page if the first was replaced.
+	for (let attempt = 1; ; attempt++) {
+		const context = await browser.createBrowserContext();
+		try {
+			const page = await context.newPage();
+			await page.setViewport({ width: 1400, height: 900 });
+			await page.evaluateOnNewDocument(installNavigationFixture, false);
+			await page.goto(origin, { waitUntil: "networkidle0", timeout: 60000 });
+			await page.waitForSelector(".session-row", { timeout: 30000 });
+			await seedTranscripts(page);
+			await openTranscript(page, "old");
+			await openTranscript(page, "new");
+			break;
+		} catch (error) {
+			if (attempt >= 2) throw error;
+		} finally { await context.close(); }
+	}
+}, 180000);
 afterAll(async () => { await browser?.close(); if (server) { server.kill(); await server.exited; } });
 
 async function fixture(holdBootstrap = false): Promise<{ context: BrowserContext; page: Page }> {
@@ -1229,20 +1254,36 @@ suite("mounted desktop navigation", () => {
 			await page.click('.session-select[title="Oldest conversation · Idle"]');
 			await page.waitForSelector(".composer textarea");
 			await page.evaluate(() => document.documentElement.style.setProperty("--text-size", "20px"));
-			await page.evaluate(() => {
-				const session = window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!;
-				window.navigationFixture.emit({
-					type: "session",
-					session: {
-						...session,
-						// Long enough to take about six lines in the header, as the reviewed case did.
-						title: "터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 창에서도 몇 줄에 걸쳐 줄바꿈되는지 확인하는 제목입니다 ".repeat(3).trim(),
-						controlGeneration: null,
-						connection: { state: "disconnected" },
-					},
+			// The reviewed case was a title that wraps to about six lines in the header. How many
+			// characters that takes depends on the installed fonts (Hangul metrics differ between
+			// macOS and Linux), so grow the title until it wraps that far instead of fixing its length.
+			const titleLines = () =>
+				page.evaluate(() => {
+					const title = document.querySelector(".toolbar-title h1")!;
+					return Math.round(title.getBoundingClientRect().height / Number.parseFloat(getComputedStyle(title).lineHeight));
 				});
-			});
-			await page.waitForSelector(".connection-notice");
+			let lines = 0;
+			for (let repeat = 3; repeat <= 12 && lines < 6; repeat++) {
+				await page.evaluate(repeat => {
+					const session = window.navigationFixture.snapshot().sessions.find(item => item.id === "old")!;
+					window.navigationFixture.emit({
+						type: "session",
+						session: {
+							...session,
+							title: "터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 창에서도 몇 줄에 걸쳐 줄바꿈되는지 확인하는 제목입니다 ".repeat(repeat).trim(),
+							controlGeneration: null,
+							connection: { state: "disconnected" },
+						},
+					});
+				}, repeat);
+				await page.waitForSelector(".connection-notice");
+				await page.waitForFunction(
+					repeat => document.querySelector(".toolbar-title h1")?.textContent?.length === "터미널에서 이어서 작업한 아주 긴 대화 제목이 좁은 창에서도 몇 줄에 걸쳐 줄바꿈되는지 확인하는 제목입니다 ".repeat(repeat).trim().length,
+					{},
+					repeat,
+				);
+				lines = await titleLines();
+			}
 			const placement = await page.evaluate(() => {
 				const button = [...document.querySelectorAll<HTMLButtonElement>(".connection-notice button")].find(
 					node => node.textContent === "Connect",
@@ -1258,7 +1299,7 @@ suite("mounted desktop navigation", () => {
 					),
 				};
 			});
-			expect(placement.titleLines).toBeGreaterThanOrEqual(5);
+			expect(placement.titleLines).toBeGreaterThanOrEqual(6);
 			expect({ inView: placement.inView, unobstructed: placement.unobstructed }).toEqual({ inView: true, unobstructed: true });
 		} finally { await context.close(); }
 	}, 30000);
