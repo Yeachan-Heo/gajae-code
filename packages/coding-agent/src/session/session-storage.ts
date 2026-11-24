@@ -116,6 +116,8 @@ export interface DirectoryIdentity {
 export interface RuntimeLockDirectory {
 	readonly path: string;
 	readonly directories: readonly DirectoryIdentity[];
+	/** The noun error text uses for this namespace's directories, e.g. `append-lock`. */
+	readonly label: string;
 }
 
 /** A prepared append-lock path plus the identities of `.gjc`, `runtime`, and `append-locks`. */
@@ -196,6 +198,7 @@ export function prepareRuntimeLockDirectory(
 	return {
 		path: lockRoot,
 		directories: [gjcRoot, appendLockRuntimeRoot, lockRoot].map(directory => realDirectoryIdentity(directory, label)),
+		label,
 	};
 }
 

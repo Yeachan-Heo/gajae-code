@@ -180,7 +180,7 @@ function inspectOwnersDirectory(): string | undefined {
 
 function assertOwnersDirectoryUnchanged(directory: RuntimeLockDirectory): void {
 	try {
-		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed", "session-owner");
+		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed", directory.label);
 	} catch (error) {
 		throw new SessionOwnershipError("owners_directory_changed", { cause: error });
 	}

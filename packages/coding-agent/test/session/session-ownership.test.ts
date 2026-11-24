@@ -440,7 +440,8 @@ describe.if(supported)("the owners directory fails closed like the append lock",
 			await fs.rm(directory, { recursive: true });
 			await fs.symlink(home, directory);
 		}
-		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(owners.directories, "c", "session-owner"))).toBe(
+		expect([owners.label, appendLocks.label]).toEqual(["session-owner", "append-lock"]);
+		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(owners.directories, "c", owners.label))).toBe(
 			`Error: Unsafe session-owner directory: ${owners.path}`,
 		);
 		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(appendLocks.directories))).toBe(
