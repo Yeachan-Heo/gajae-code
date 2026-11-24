@@ -141,6 +141,12 @@ import {
 	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
+	type GraphSuccessorRefusal,
+	graphSuccessorRefusalMessage,
+	proveOwnCommittedGraph,
+	sanitizeLoadedSessionEntryReplayMetadata,
+} from "./internal/graph-successor-proof";
+import {
 	deleteManagedSessionCandidate,
 	isRecoverableOwnerOnlyModeDrift,
 	type ManagedCandidateWriteAuthority,
@@ -171,6 +177,7 @@ import {
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
 import {
+	ManagedSessionBusyError,
 	type ManagedSessionTransactionScope,
 	withManagedSessionTransaction,
 } from "./internal/managed-session-transaction";
@@ -2659,6 +2666,20 @@ export class SharedSessionMutationUnsupportedError extends Error {
 	constructor(readonly operation: string) {
 		super(`Shared session mutation requires transaction admission: ${operation}`);
 		this.name = "SharedSessionMutationUnsupportedError";
+	}
+}
+
+export type { GraphSuccessorRefusal } from "./internal/graph-successor-proof";
+
+/** A refused graph successor that names the reason; still a shared-mutation refusal. */
+export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsupportedError {
+	constructor(
+		operation: string,
+		readonly reason: GraphSuccessorRefusal,
+	) {
+		super(operation);
+		this.message = graphSuccessorRefusalMessage(reason);
+		this.name = "GraphSuccessorUnavailableError";
 	}
 }
 
@@ -6005,14 +6026,6 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	return cloned;
 }
 
-/** Match eager-resume replay sanitation whenever an entry is loaded from a bounded sidecar path. */
-function sanitizeLoadedSessionEntryReplayMetadata(entry: SessionEntry): SessionEntry {
-	if (entry.type === "message" && entry.message.role === "assistant") {
-		entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
-	}
-	return entry;
-}
-
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
 	if (entry.type === "compaction") {
 		const cache = new Map<string, string>();
@@ -8006,6 +8019,8 @@ export class SessionManager {
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
 	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
 	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
+	/** Successors proven against the committed transcript. */
+	readonly #committedGraphSuccessors = new WeakSet<PreparedNewSessionState>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
 	#sessionFile: string | undefined;
@@ -11188,11 +11203,16 @@ export class SessionManager {
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
-		this.assertLegacyMutationAllowed("prepare fork");
+		this.#requireGraphSuccessorRoute("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
-		this.assertLegacyMutationAllowed("prepare fork");
+		const route = this.#requireGraphSuccessorRoute("prepare fork");
+		if (route === "committed") {
+			// Prove ownership before hydration can load peer entries as resident.
+			const owned = this.#proveOwnCommittedGraph([]);
+			if (typeof owned === "string") throw new GraphSuccessorUnavailableError("prepare fork", owned);
+		}
 		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
@@ -11210,12 +11230,13 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: sourceId,
 		};
-		const entries: FileEntry[] = [
-			header,
-			...materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
-				(entry): entry is SessionEntry => entry.type !== "session",
-			),
-		];
+		const sourceEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
+			(entry): entry is SessionEntry => entry.type !== "session",
+		);
+		// Prove before copying artifacts.
+		const proof = route === "committed" ? this.#proveOwnCommittedGraph(sourceEntries) : undefined;
+		if (typeof proof === "string") throw new GraphSuccessorUnavailableError("prepare fork", proof);
+		const entries: FileEntry[] = [header, ...sourceEntries];
 		const stage: PreparedNewSessionState = {
 			sessionId,
 			sessionFile,
@@ -11232,17 +11253,22 @@ export class SessionManager {
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
+		if (route === "committed") this.#committedGraphSuccessors.add(stage);
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
 			this.#assertPreparedGraphPublicationAllowed(stage);
-			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-			if (this.destination.kind === "managed") {
-				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
-					path.basename(sessionFile),
-					Buffer.from(content, "utf8"),
-				);
+			if (proof) {
+				await this.#publishCommittedGraphSuccessor(stage, sourceFile, proof, [], "prepare fork");
 			} else {
-				this.#storage.writeTextSync(sessionFile, content);
+				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
+				if (this.destination.kind === "managed") {
+					this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+						path.basename(sessionFile),
+						Buffer.from(content, "utf8"),
+					);
+				} else {
+					this.#storage.writeTextSync(sessionFile, content);
+				}
 			}
 		} catch (error) {
 			try {
@@ -11260,15 +11286,16 @@ export class SessionManager {
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
-		this.assertLegacyMutationAllowed("prepare branched session");
+		this.#requireGraphSuccessorRoute("prepare branched session");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
-		this.assertLegacyMutationAllowed("prepare branched session");
+		this.#requireGraphSuccessorRoute("prepare branched session");
 		const sourceId = this.#sessionId;
+		const sourceFile = this.#sessionFile;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
-		this.#assertLogicalSessionMutationAllowed(sourceId, "prepare branched session", true);
+		const route = this.#requireGraphSuccessorRoute("prepare branched session", sourceId);
 		const timestamp = new Date().toISOString();
 		const sessionId = createSessionId();
 		const sessionFile = this.persist
@@ -11281,7 +11308,8 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
-			parentSession: this.persist ? this.#sessionFile : undefined,
+			// The committed route records the source id; the legacy route keeps the path.
+			parentSession: route === "committed" ? sourceId : this.persist ? this.#sessionFile : undefined,
 		};
 		const pathWithoutLabels = branchPath.filter(entry => entry.type !== "label");
 		const pathEntryIds = new Set(pathWithoutLabels.map(entry => entry.id));
@@ -11301,11 +11329,10 @@ export class SessionManager {
 			labelEntries.push(labelEntry);
 			labelParentId = labelEntry.id;
 		}
-		const entries: FileEntry[] = [
-			header,
-			...materializeResidentEntriesForReadSync(pathWithoutLabels, this.#residentBlobStores()),
-			...labelEntries,
-		];
+		const sourceEntries = materializeResidentEntriesForReadSync(pathWithoutLabels, this.#residentBlobStores());
+		const proof = route === "committed" ? this.#proveOwnCommittedGraph(sourceEntries) : undefined;
+		if (typeof proof === "string") throw new GraphSuccessorUnavailableError("prepare branched session", proof);
+		const entries: FileEntry[] = [header, ...sourceEntries, ...labelEntries];
 		const stage: PreparedNewSessionState = {
 			sessionId,
 			sessionFile,
@@ -11322,8 +11349,17 @@ export class SessionManager {
 		this.#preparedNewSessions.add(stage);
 		this.#freezePreparedNewSessionIdentity(stage);
 		this.#preparedGraphSourceIds.set(stage, sourceId);
+		if (route === "committed") this.#committedGraphSuccessors.add(stage);
 		try {
-			if (sessionFile) {
+			if (proof) {
+				await this.#publishCommittedGraphSuccessor(
+					stage,
+					sourceFile,
+					proof,
+					labelEntries,
+					"prepare branched session",
+				);
+			} else if (sessionFile) {
 				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
 				if (this.destination.kind === "managed") {
 					this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
@@ -20781,8 +20817,131 @@ export class SessionManager {
 
 	#assertPreparedGraphPublicationAllowed(stage: PreparedNewSessionState): void {
 		const sourceId = this.#preparedGraphSourceIds.get(stage);
-		if (sourceId !== undefined)
-			this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor", true);
+		if (sourceId === undefined) return;
+		if (this.#committedGraphSuccessors.has(stage)) {
+			// Adoption never writes the source; only an in-flight publication refuses.
+			if ((this.#activeSharedMutationSessionCounts.get(sourceId) ?? 0) > 0)
+				throw new GraphSuccessorUnavailableError("publish prepared graph successor", "publication-in-flight");
+			return;
+		}
+		this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor", true);
+	}
+
+	/** Why a fork or branch cannot be prepared now; non-throwing and write-free, for use before any effect. */
+	graphSuccessorRefusal(target: { leafId?: string; wholeSession?: boolean } = {}): GraphSuccessorRefusal | undefined {
+		let refusal: GraphSuccessorRefusal | undefined;
+		try {
+			if (target.leafId !== undefined && !this.#resolveEntry(target.leafId)) refusal = "unknown-entry";
+			else {
+				const route = this.#graphSuccessorRoute(this.#sessionId);
+				if (route !== "committed") refusal = route === "legacy" ? undefined : route;
+				else {
+					const entries =
+						target.wholeSession === true
+							? this.#fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session")
+							: target.leafId !== undefined
+								? this.#getCanonicalBranchClones(target.leafId).filter(entry => entry.type !== "label")
+								: [];
+					const proof = this.#proveOwnCommittedGraph(
+						materializeResidentEntriesForReadSync(entries, this.#residentBlobStores()),
+					);
+					if (typeof proof === "string") refusal = proof;
+				}
+			}
+		} catch (error) {
+			logger.warn("Graph successor probe failed", { error: toError(error).message });
+			refusal = "unreadable";
+		}
+		if (refusal) logger.debug("Graph successor unavailable", { sessionId: this.#sessionId, reason: refusal });
+		return refusal;
+	}
+
+	/** "legacy" without shared bars (admission unchanged), "committed" when only the bars refuse, else the refusal. */
+	#graphSuccessorRoute(sessionId: string): "legacy" | "committed" | GraphSuccessorRefusal {
+		const barred = this.#sharedAppendBarSessionIds.has(sessionId) || this.#sharedRewriteBarSessionIds.has(sessionId);
+		if (!barred) return "legacy";
+		if (
+			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0 ||
+			(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) > 0
+		)
+			return "publication-in-flight";
+		return this.destination.kind === "managed" && this.persist ? "committed" : "not-admitted";
+	}
+
+	/** The route for `operation` on the current session, throwing the refusal. */
+	#requireGraphSuccessorRoute(operation: string, sourceId = this.#sessionId): "legacy" | "committed" {
+		if (this.#sessionId !== sourceId) throw new GraphSuccessorUnavailableError(operation, "changed");
+		const route = this.#graphSuccessorRoute(sourceId);
+		if (route === "legacy") {
+			this.assertLegacyMutationAllowed(operation);
+			return route;
+		}
+		if (route === "committed") return route;
+		throw new GraphSuccessorUnavailableError(operation, route);
+	}
+
+	/** {@link proveOwnCommittedGraph} over this opener's committed transcript; read-only. */
+	#proveOwnCommittedGraph(
+		sourceEntries: readonly SessionEntry[],
+	): { lines: string[]; digest: string } | GraphSuccessorRefusal {
+		const sessionFile = this.#sessionFile;
+		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
+		if (this.destination.kind !== "managed" || !this.persist || !sessionFile || !readSnapshot) return "not-admitted";
+		// A cold-retired view cannot prove ownership: its resident ids are incomplete.
+		if (this.#coldSidecarActive()) return "large-session";
+		let bytes: Uint8Array;
+		try {
+			bytes = readSnapshot(sessionFile).bytes;
+		} catch {
+			return "unreadable";
+		}
+		// A scratch store: blob refs are content hashes the committed lines already hold.
+		const scratch = new MemoryBlobStore();
+		return proveOwnCommittedGraph({
+			bytes,
+			sessionId: this.#sessionId,
+			ownIds: new Set(this.#residentEntryIds()),
+			sourceEntries,
+			serialize: entry => prepareEntryForPersistenceSync(entry, scratch),
+			onMismatch: entryId => logger.warn("Committed session entry differs from the resident entry", { entryId }),
+		});
+	}
+
+	/** Publish a proven successor; under the source's lease only the proven digest is re-checked. */
+	async #publishCommittedGraphSuccessor(
+		stage: PreparedNewSessionState,
+		sourceFile: string | undefined,
+		proof: { lines: string[]; digest: string },
+		addedEntries: readonly FileEntry[],
+		operation: string,
+	): Promise<void> {
+		const sourceId = this.#preparedGraphSourceIds.get(stage);
+		const sessionFile = stage.sessionFile;
+		this.#refreshManagedTranscriptRelocation();
+		if (!sourceId || !sourceFile || !sessionFile || this.#sessionFile !== sourceFile)
+			throw new GraphSuccessorUnavailableError(operation, "changed");
+		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sourceFile));
+		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+		const lines = [JSON.stringify(stage.header), ...proof.lines];
+		for (const entry of addedEntries)
+			lines.push(JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore)));
+		try {
+			await withManagedSessionTransaction({ locksDirectory, sessionId: sourceId }, async scope => {
+				scope.assertOwned();
+				if (this.#sessionFile !== sourceFile) throw new GraphSuccessorUnavailableError(operation, "changed");
+				this.#requireGraphSuccessorRoute(operation, sourceId);
+				if (this.#committedDigestSync(sourceFile) !== proof.digest)
+					throw new GraphSuccessorUnavailableError(operation, "changed");
+				scope.assertOwned();
+				this.#managedTranscriptStore(sessionFile).publishNoReplaceSync(
+					path.basename(sessionFile),
+					Buffer.from(`${lines.join("\n")}\n`, "utf8"),
+				);
+			});
+		} catch (error) {
+			if (error instanceof ManagedSessionBusyError) throw new GraphSuccessorUnavailableError(operation, "busy");
+			throw error;
+		}
 	}
 
 	#assertDiscardTranscriptAllowed(bytes: Buffer): void {
