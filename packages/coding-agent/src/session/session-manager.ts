@@ -10485,15 +10485,7 @@ export class SessionManager {
 		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
 		if (initializeMissing && transcriptMissing) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
-			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
-			this.#applyFreshSessionMetadata(fresh);
-			this.#commitResidentTextStoreTransition(prepared);
-			this.#retireEphemeralArtifacts();
-			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
-			await this.#rewriteFile();
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
+			await this.#initializeFreshTranscriptAt(resolvedSessionFile);
 			return;
 		}
 		if (strictResume?.reuseEntries !== false) strictManagedFallbackEntries = strictResume?.inspection.entries;
@@ -10515,15 +10507,7 @@ export class SessionManager {
 		revalidateStrictResume();
 		if (entries.length === 0) {
 			if (stagedRollbackCandidate) throw new Error("Could not open session: unstable");
-			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
-			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
-			this.#applyFreshSessionMetadata(fresh);
-			this.#commitResidentTextStoreTransition(prepared);
-			this.#retireEphemeralArtifacts();
-			if (!stagedRollbackCandidate) this.#writeTerminalBreadcrumb(resolvedSessionFile);
-			await this.#rewriteFile();
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
+			await this.#initializeFreshTranscriptAt(resolvedSessionFile);
 			return;
 		}
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -10564,6 +10548,23 @@ export class SessionManager {
 			this.#sessionMemoryMode = "shadow";
 			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 		}
+	}
+
+	/**
+	 * Install a fresh session at `resolvedSessionFile` and persist its header: the
+	 * missing-file and empty-transcript outcomes of `#initSessionFile`. Callers refuse a
+	 * staged rollback candidate before calling.
+	 */
+	async #initializeFreshTranscriptAt(resolvedSessionFile: string): Promise<void> {
+		const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+		const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
+		this.#applyFreshSessionMetadata(fresh);
+		this.#commitResidentTextStoreTransition(prepared);
+		this.#retireEphemeralArtifacts();
+		this.#writeTerminalBreadcrumb(resolvedSessionFile);
+		await this.#rewriteFile();
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
 	}
 
 	#writeTerminalBreadcrumb(sessionFile: string): void {
