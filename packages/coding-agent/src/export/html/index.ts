@@ -2,7 +2,15 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
-import { APP_NAME, isCredentialKey, isEnoent, postmortem, redactCrashSecrets } from "@gajae-code/utils";
+import {
+	APP_NAME,
+	isCredentialKey,
+	isEnoent,
+	isFsError,
+	logger,
+	postmortem,
+	redactCrashSecrets,
+} from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import {
 	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
@@ -333,7 +341,16 @@ async function writeSessionHtmlAtomically(
 ): Promise<void> {
 	const descriptors = await openAtomicHtmlExportDescriptors(sourcePath, outputPath);
 	const tempPath = descriptors.temp.path;
-	const unregisterTempCleanup = postmortem.register("html-export-temp", () => removeHtmlExportTempFile(tempPath));
+	const unregisterTempCleanup = postmortem.register("html-export-temp", () => {
+		try {
+			removeHtmlExportTempFile(tempPath);
+		} catch (error) {
+			// Shutdown cleanup must not throw; the leftover is an owner-only dot file beside the output.
+			logger.warn("Failed to remove an unfinished HTML export temp file", {
+				code: isFsError(error) ? error.code : "unknown",
+			});
+		}
+	});
 	let tempOpen = true;
 	let published = false;
 	const sink = Bun.file(descriptors.temp.fd).writer();
@@ -459,15 +476,6 @@ export async function exportSessionToHtml(
 	return outputPath;
 }
 
-/**
- * Bounded-open refusals caused by a concurrent writer rather than the transcript's shape: the
- * descriptor moved during the scan, or the last line was still being written.
- */
-const BOUNDED_OPEN_CHANGED_REASONS: ReadonlySet<string> = new Set([
-	"bounded_first_open_descriptor_changed",
-	"bounded_scan_unterminated",
-]);
-
 /** Export session file to HTML (standalone). */
 export async function exportFromFile(inputPath: string, options?: ExportOptions | string): Promise<string> {
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
@@ -492,9 +500,15 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 			);
 		}
 		if (err instanceof SessionTranscriptBoundedOpenError) {
-			if (BOUNDED_OPEN_CHANGED_REASONS.has(err.reason))
+			// A concurrent writer, not the transcript's shape. An unterminated last line may also be
+			// a write a crash cut off, which no retry repairs, so the message names both causes.
+			if (err.reason === "bounded_first_open_descriptor_changed")
 				throw new Error(
 					`Session transcript changed while it was being read (${err.reason}); retry when the session is idle: ${inputPath}`,
+				);
+			if (err.reason === "bounded_scan_unterminated")
+				throw new Error(
+					`Session transcript's last line is incomplete (${err.reason}): it is still being written, so retry when the session is idle, or an earlier write was interrupted, which retrying does not fix: ${inputPath}`,
 				);
 			throw new Error(
 				`Session transcript is too large to export in full (${err.size} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes) and cannot be streamed (${err.reason}); only linear, compacted transcripts without patch records can be: ${inputPath}`,
