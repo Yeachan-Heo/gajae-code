@@ -584,6 +584,7 @@ import {
 	ttsrPromptFields,
 	wrapUntrustedContent,
 } from "./messages";
+import { operatorErrorMessage } from "./operator-error-message";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import type { SessionRecapAppendResult, SessionRecapInput } from "./recap";
 import { readSdkRunCapability } from "./sdk-run-capability";
@@ -19114,7 +19115,7 @@ export class AgentSession {
 			this.#extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
 				event: "command",
-				error: err instanceof Error ? err.message : String(err),
+				error: operatorErrorMessage(err, String(err)),
 			});
 			return true;
 		}

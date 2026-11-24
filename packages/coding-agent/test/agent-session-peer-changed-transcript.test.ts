@@ -43,6 +43,7 @@ const COMPACTION_HOOK_SOURCE = [
 	"export default function(pi) {",
 	'\tpi.registerCommand("r5-status", { handler: async () => { globalThis.__r5StatusRuns = (globalThis.__r5StatusRuns ?? 0) + 1; } });',
 	'\tpi.registerCommand("r5-trigger", { handler: async () => { pi.sendMessage({ customType: "r5", content: "triggered turn", display: false }, { triggerTurn: true }); } });',
+	'\tpi.registerCommand("r5-compact", { handler: async (_args, ctx) => { await ctx.compact(); } });',
 	'\tpi.on("before_agent_start", async () => { globalThis.__r5BeforeAgentStart = (globalThis.__r5BeforeAgentStart ?? 0) + 1; });',
 	'\tpi.on("session_before_compact", async event => ({',
 	"\t\tcompaction: {",
@@ -547,6 +548,20 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(harness.counts()).toEqual(before);
 		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);
 		delete hooks.__r5BeforeAgentStart;
+	});
+
+	it("reports an extension command's stuck-session write failure with the operator message", async () => {
+		const harness = await setup({ withHooks: true });
+		const runtimeErrors: string[] = [];
+		await initializeExtensions(harness.session, {
+			reportSendError: () => {},
+			reportRuntimeError: error => runtimeErrors.push(error.error),
+		});
+		const latched = await latch(harness);
+
+		await harness.session.prompt("/r5-compact");
+
+		expect(runtimeErrors).toEqual([latched.operatorMessage]);
 	});
 
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
