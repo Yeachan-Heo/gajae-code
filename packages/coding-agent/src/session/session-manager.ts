@@ -17753,6 +17753,24 @@ export class SessionManager {
 		if (this.#persistError) throw this.#persistError;
 	}
 
+	/**
+	 * {@link flush} for a caller that is leaving this transcript: `/resume`, `/new`,
+	 * `/fork` or shutdown.
+	 *
+	 * Once another process changes a managed transcript, the append fence latches
+	 * {@link ManagedAppendIdentityMismatchError} and every later flush rethrows it. The
+	 * fence rejected those appends before writing any byte and managed appends are
+	 * synchronous, so nothing is left to flush; rethrowing would trap the operator in a
+	 * session whose only recovery is to leave it. Every other flush failure still throws.
+	 */
+	async flushBeforeLeaving(): Promise<void> {
+		try {
+			await this.flush();
+		} catch (error) {
+			if (error === undefined || error !== this.getAppendIdentityMismatch()) throw error;
+		}
+	}
+
 	#releaseClosedSessionState(): void {
 		this.#clearManagedTranscriptRelocationResolver();
 		const runtime = this.#sidecarRuntime;

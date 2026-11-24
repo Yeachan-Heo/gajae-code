@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { z } from "@gajae-code/ai";
@@ -11,7 +11,10 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { operatorErrorMessage } from "@gajae-code/coding-agent/session/operator-error-message";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
-import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
+import {
+	ManagedAppendIdentityMismatchError,
+	ManagedSessionDescendantStore,
+} from "../src/session/internal/managed-session-storage";
 
 type Script = "text" | "tool";
 
@@ -297,5 +300,59 @@ describe("AgentSession on a transcript another process changed", () => {
 			"user:after resume",
 			"assistant:reply 5",
 		]);
+	});
+});
+
+describe("SessionManager.flushBeforeLeaving", () => {
+	let tempDir: TempDir | undefined;
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		tempDir?.removeSync();
+		tempDir = undefined;
+	});
+
+	async function persistedManager(): Promise<{ manager: SessionManager; root: string; file: string }> {
+		tempDir = TempDir.createSync("@gjc-flush-before-leaving-");
+		const root = tempDir.path();
+		const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
+		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted transcript");
+		return { manager, root, file };
+	}
+
+	it("settles a latched identity mismatch that flush keeps rethrowing", async () => {
+		const { manager, root, file } = await persistedManager();
+		const writerB = await SessionManager.open(
+			file,
+			SessionManager.managedDestination(root, path.join(root, "agent")),
+		);
+		writerB.appendMessage({ role: "user", content: "from B", timestamp: 2 });
+		await writerB.flush();
+		await writerB.close();
+		expect(() => manager.appendMessage({ role: "user", content: "refused", timestamp: 3 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+
+		await expect(manager.flush()).rejects.toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		await expect(manager.flushBeforeLeaving()).resolves.toBeUndefined();
+		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+	});
+
+	it("still throws any other latched persistence failure", async () => {
+		const { manager } = await persistedManager();
+		const failure = new Error("uncertain write");
+		const append = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
+			.mockImplementation(() => {
+				throw failure;
+			});
+		expect(() => manager.appendMessage({ role: "user", content: "lost?", timestamp: 2 })).toThrow(failure);
+		append.mockRestore();
+
+		await expect(manager.flushBeforeLeaving()).rejects.toBe(failure);
+		await manager.closeStrict();
 	});
 });
