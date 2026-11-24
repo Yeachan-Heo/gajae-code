@@ -24587,17 +24587,33 @@ export class SessionManager {
 			sessionMemoryMode,
 		);
 		if (opened.kind === "error") {
-			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
-			if (opened.reason === "artifact_capacity_exceeded")
-				throw new SessionArtifactCapacityError(
-					opened.message ?? "Session artifacts exceed the migration capacity.",
-				);
-			if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
-			if (opened.reason === "context_too_large") throw new SessionContextTooLargeError(opened.size ?? 0);
-			if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
-			throw new Error(`Could not open session: ${opened.reason}`);
+			throw SessionManager.#typedStrictOpenError(opened) ?? new Error(`Could not open session: ${opened.reason}`);
 		}
 		return opened.manager;
+	}
+
+	/**
+	 * The typed error for a strict-open failure whose reason the operator can act on, or
+	 * `undefined` for a reason the caller handles itself (a generic open error, or skipping
+	 * a `--continue` candidate).
+	 */
+	static #typedStrictOpenError(failure: StrictSessionOpenFailure): Error | undefined {
+		switch (failure.reason) {
+			case "legacy_migration_disabled":
+				return new SessionMigrationPolicyError();
+			case "artifact_capacity_exceeded":
+				return new SessionArtifactCapacityError(
+					failure.message ?? "Session artifacts exceed the migration capacity.",
+				);
+			case "oversized":
+				return new SessionTranscriptOversizedError(failure.size ?? 0);
+			case "context_too_large":
+				return new SessionContextTooLargeError(failure.size ?? 0);
+			case "migration_busy":
+				return new SessionMigrationBusyError();
+			default:
+				return undefined;
+		}
 	}
 
 	static async openNestedManaged(
@@ -25734,14 +25750,8 @@ export class SessionManager {
 				sessionMemoryMode,
 			);
 			if (opened.kind === "error") {
-				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
-				if (opened.reason === "artifact_capacity_exceeded")
-					throw new SessionArtifactCapacityError(
-						opened.message ?? "Session artifacts exceed the migration capacity.",
-					);
-				if (opened.reason === "oversized") throw new SessionTranscriptOversizedError(opened.size ?? 0);
-				if (opened.reason === "context_too_large") throw new SessionContextTooLargeError(opened.size ?? 0);
-				if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
+				const typed = SessionManager.#typedStrictOpenError(opened);
+				if (typed) throw typed;
 				return undefined;
 			}
 			return opened.manager;
