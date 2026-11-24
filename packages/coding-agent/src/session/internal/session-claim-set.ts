@@ -11,10 +11,26 @@
 import { logger } from "@gajae-code/utils";
 import type { SessionManager } from "../session-manager";
 import { countSessionOwnershipEvent, type SessionOwnerClaim } from "../session-ownership";
-import { type SessionOwnershipMode, sessionOwnershipMode } from "../session-ownership-mode";
+import {
+	type SessionOwnershipMode,
+	sessionOwnershipMode,
+	sessionOwnershipTestHookSlot,
+} from "../session-ownership-mode";
 
 /** How long a deferred owner shutdown may keep its predecessor's claim (design §2.5). */
 export const DEFERRED_RELEASE_CAP_MS = 60_000;
+
+/** Thrown only under the strict test seam, for a write the detector flags. */
+export class SessionWriteWithoutClaimError extends Error {
+	readonly code = "session_write_without_claim";
+	readonly site: string;
+
+	constructor(site: string) {
+		super(`session_write_without_claim: ${site}`);
+		this.name = "SessionWriteWithoutClaimError";
+		this.site = site;
+	}
+}
 
 interface DeferredHold {
 	readonly sessionId: string;
@@ -43,6 +59,8 @@ export class SessionClaimSet {
 	#closed = false;
 	/** Read once per bind, so a settings reload never changes the mode under a bound session. */
 	#mode: SessionOwnershipMode = "off";
+	/** Detector reports already logged, as `<id> <site>`: log once, count every time. */
+	readonly #reported = new Set<string>();
 
 	constructor() {
 		abandonedSets.register(this, this.#claims);
@@ -72,6 +90,23 @@ export class SessionClaimSet {
 		if (this.#mode === "off" || previous === undefined || previous === sessionId || this.#transitions > 0) return;
 		countSessionOwnershipEvent("bind_outside_transition");
 		logger.debug("Session id changed outside a claim-set transition", { mode: this.#mode });
+	}
+
+	/**
+	 * The write-path detector (design §2.5), called before a transcript write. When ownership is on
+	 * and this set holds no claim for `sessionId` (the current id unless a successor is named), it
+	 * logs `session_write_without_claim` with the call site and counts it. It never claims, and it
+	 * throws only under the strict test seam. In `off` it returns at once.
+	 */
+	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
+		if (this.#mode === "off" || sessionId === undefined || this.#claims.has(sessionId)) return;
+		countSessionOwnershipEvent("session_write_without_claim");
+		const report = `${sessionId} ${site}`;
+		if (!this.#reported.has(report)) {
+			this.#reported.add(report);
+			logger.warn("session_write_without_claim", { site, sessionId, mode: this.#mode });
+		}
+		if (sessionOwnershipTestHookSlot().strictWriteDetection) throw new SessionWriteWithoutClaimError(site);
 	}
 
 	/**
