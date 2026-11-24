@@ -156,6 +156,9 @@ import { closeSocket } from "./helpers/close-socket";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 test("SDK capability construction is not exported from the general session module", () => {
 	expect("createSdkRunCapability" in sessionSdkRunCapability).toBe(false);
@@ -663,7 +666,7 @@ test("lifecycle SDK startup capability settles once and sanitizes public failure
 });
 
 test("lifecycle teardown swallows dual owner failures without surfacing an extension error and retains exact retry authority", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-proof-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-proof-"));
 	dirs.push(cwd);
 	const sessionId = `cleanup-proof-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
@@ -753,7 +756,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 	}
 }, 60_000);
 test("lifecycle cleanup fences same-id startup and preserves proven owner release across retry", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-retry-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-retry-"));
 	dirs.push(cwd);
 	const sessionId = `cleanup-retry-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
@@ -809,7 +812,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 }, 60_000);
 
 test("a blocked Telegram ownership race preserves the canonical endpoint and withholds adapters", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");
 	const sessionId = `telegram-sibling-isolation-${Date.now()}`;
@@ -883,7 +886,7 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 }, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-single-host-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-single-host-"));
 	dirs.push(cwd);
 	const serverStart = spyOn(NotificationServer.prototype, "start");
 	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
@@ -904,7 +907,7 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 }, 60_000);
 
 test("observer daemon demand covers hello-before-replay, replay-after, and disconnect-before-replay while live work promotes demand", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-observer-demand-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-observer-demand-"));
 	dirs.push(cwd);
 	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
 	const baseDemand = sessionHostAttachedClients() ?? 0;
@@ -948,7 +951,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 }, 60_000);
 
 test("accepted prompt keeps the host lease held until active lifecycle settles", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-admission-lease-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-admission-lease-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-admission-lease-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -995,7 +998,7 @@ test("accepted prompt keeps the host lease held until active lifecycle settles",
 }, 60_000);
 
 test("accepted steer failure releases its queued host lease", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-lease-failure-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-lease-failure-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-steer-lease-failure-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -1058,7 +1061,7 @@ async function startLeaseHarness(
 	socket: WebSocket;
 	control(id: string, operation: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
 }> {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-${prefix}-`));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-${prefix}-`));
 	dirs.push(cwd);
 	const sessionId = `sdk-${prefix}-${Date.now()}`;
 	const sessionContext = { ...context(cwd, sessionId), ...contextOverrides };
@@ -1193,7 +1196,7 @@ test("an accepted prompt diverted into steering or removed from the queue releas
 }, 60_000);
 
 test("a steer whose durable settlement fails after dispatch keeps its lease while the message stays queued", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-settle-failure-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-settle-failure-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-steer-settle-failure-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -1276,7 +1279,7 @@ test("a submission promoted after its runtime stopped releases its lease instead
 }, 60_000);
 
 test("an accepted prompt that fails closed before its terminal releases its submission lease", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fail-closed-lease-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fail-closed-lease-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-fail-closed-lease-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -1351,7 +1354,7 @@ test("replay capability claims cannot turn a demanding connection into an observ
 		sdkFrame = callback;
 		return sdkFrameImpl.call(this, callback);
 	});
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-replay-capability-demand-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-replay-capability-demand-"));
 	dirs.push(cwd);
 	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
 	const baseDemand = sessionHostAttachedClients() ?? 0;
@@ -1414,7 +1417,7 @@ for (const confirmNative of [false, true]) {
 			sdkFrame = callback;
 			return registerFrame.call(this, callback);
 		});
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-observer-demand-"));
+		const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-observer-demand-"));
 		dirs.push(cwd);
 		try {
 			const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
@@ -1477,7 +1480,7 @@ test("an ACP-shaped turnStream SessionRouter negotiates turn_stream alone and re
 			return callback(error, connectionId, capabilities);
 		});
 	});
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
 	dirs.push(cwd);
 	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
 	try {
@@ -1519,7 +1522,7 @@ test("only a positioned-effects SessionRouter negotiates positioned-only notific
 			return callback(error, connectionId, capabilities);
 		});
 	});
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-router-positioned-effects-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-router-positioned-effects-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
@@ -1580,7 +1583,7 @@ test("late capability and replay callbacks after close cannot erase a live deman
 		sdkFrame = callback;
 		return sdkFrameImpl.call(this, callback);
 	});
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-late-capability-close-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-late-capability-close-"));
 	dirs.push(cwd);
 	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
 	let demanding: SdkClient | undefined;
@@ -1610,7 +1613,7 @@ test("late capability and replay callbacks after close cannot erase a live deman
 }, 60_000);
 
 test("lifecycle session shutdown disposes the exact endpoint once", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-once-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-once-"));
 	dirs.push(cwd);
 	const sessionId = `cleanup-once-${Date.now()}`;
 	const tracker = new SdkStartupRollbackTracker();
@@ -1654,7 +1657,7 @@ test("lifecycle rollback proof only fences the exact started endpoint generation
 });
 
 test("lifecycle startup settles failure when native callback registration throws before host start", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prestart-failure-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prestart-failure-"));
 	dirs.push(cwd);
 	const sessionId = "prestart-failure";
 	const capability = new SdkStartupCapability(undefined, "immediate", "prestart-failure-marker");
@@ -1680,7 +1683,7 @@ test.each([
 	false,
 	true,
 ])("session_start swallows startup plus owner-release failure without surfacing an extension error (peer cleanup=%s)", async peerCleanup => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
 	dirs.push(cwd);
 	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
 	const startupScope = new AsyncLocalStorage<boolean>();
@@ -1788,7 +1791,7 @@ test.each([
 }, 60_000);
 
 test("lifecycle startup reports an actionable error when native capability registration is missing", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-missing-capability-callback-"));
 	dirs.push(cwd);
 	const capability = new SdkStartupCapability(undefined, "immediate", "missing-capability-marker");
 	const prototype = NotificationServer.prototype as unknown as { onNegotiatedCapabilities?: unknown };
@@ -1815,7 +1818,7 @@ test("lifecycle startup reports an actionable error when native capability regis
 });
 
 test("lifecycle startup settles native capability incompatibility before constructing the host", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-incompatible-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-incompatible-"));
 	dirs.push(cwd);
 	const capability = new SdkStartupCapability(undefined, "immediate", "native-incompatible-marker");
 	const original = (NotificationServer.prototype as unknown as { retireIfUnclaimed?: unknown }).retireIfUnclaimed;
@@ -1839,7 +1842,7 @@ test("lifecycle startup settles native capability incompatibility before constru
 });
 
 test("SDK broker registration records an absolute lifecycle scope", async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-locator-"));
+	const root = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-locator-"));
 	const cwd = path.relative(process.cwd(), root);
 	const agentDir = path.join(root, "agent");
 	const sessionId = `locator-${Date.now()}`;
@@ -2077,7 +2080,7 @@ test("interactive SDK controls reject Broker-owned session handoff", async () =>
 });
 
 test("startup records identity before an early lifecycle event and publishes it only after NotificationServer starts", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-identity-startup-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-identity-startup-"));
 	dirs.push(cwd);
 	const sessionId = `identity-startup-${Date.now()}`;
 	const prototype = NotificationServer.prototype as unknown as {
@@ -2145,7 +2148,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 });
 
 test("serializes concurrent /notify on across overlapping replacement startups", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-startup-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-startup-"));
 	dirs.push(cwd);
 	const sessionId = `notify-startup-${Date.now()}`;
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
@@ -2193,7 +2196,7 @@ test("serializes concurrent /notify on across overlapping replacement startups",
 });
 
 test("/notify on refuses a startup result for a rotated runtime identity", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-rotation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-rotation-"));
 	dirs.push(cwd);
 	const initialSessionId = `notify-rotation-a-${Date.now()}`;
 	let currentSessionId = initialSessionId;
@@ -2239,7 +2242,7 @@ test("/notify on refuses a startup result for a rotated runtime identity", async
 });
 
 test("/notify on fences teardown and permits a later same-ID replacement runtime", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-teardown-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-teardown-"));
 	dirs.push(cwd);
 	const sessionId = `notify-teardown-${Date.now()}`;
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
@@ -2290,7 +2293,7 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 });
 
 test("SDK host replays file attachment data as base64 while passing raw bytes to N-API", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-file-replay-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-file-replay-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-file-replay-${Date.now()}`;
 	const bytes = Buffer.from([0, 1, 2, 253, 254, 255]);
@@ -2397,7 +2400,7 @@ test("SDK host replays file attachment data as base64 while passing raw bytes to
 });
 
 test("SDK host replays event frames over direct v3 ingress and routes queries through the v2 control-command seam", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-${Date.now()}`;
 	process.env.GJC_NOTIFICATIONS = "1";
@@ -2557,7 +2560,7 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 });
 
 test("SDK host preserves positioned live order and replay parity for every attached direct subscriber", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-live-events-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-live-events-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-${Date.now()}`;
 	process.env.GJC_NOTIFICATIONS = "1";
@@ -2655,7 +2658,7 @@ test("SDK host preserves positioned live order and replay parity for every attac
 });
 
 test("SDK host preserves ordered prompt image blocks in the host payload", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-images-${Date.now()}`;
 	const sent: CapturedSendCall[] = [];
@@ -2801,7 +2804,7 @@ async function stageOverSdkClient(client: SdkClient, bytes: Buffer, finish = tru
 }
 
 test("SDK host privately stages large images with authenticated connection ownership", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-staged-image-wire-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-staged-image-wire-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-staged-image-${Date.now()}`;
 	const bytes = makeStagedTestPng();
@@ -2961,7 +2964,7 @@ test("SDK host privately stages large images with authenticated connection owner
 });
 
 test("bus retains staged-image capacity until a turn-aborted preflight producer settles", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-preflight-abort-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-preflight-abort-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-image-preflight-abort-${Date.now()}`;
 	const producerStarted = Promise.withResolvers<void>();
@@ -3048,7 +3051,7 @@ test("bus retains staged-image capacity until a turn-aborted preflight producer 
 });
 
 test("bus retains staged-image capacity across aborted late acceptance and shutdown", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-late-acceptance-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-late-acceptance-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-image-late-acceptance-${Date.now()}`;
 	const producerStarted = Promise.withResolvers<void>();
@@ -3155,7 +3158,7 @@ test("bus retains staged-image capacity across aborted late acceptance and shutd
 });
 
 test("bus keeps an accepted staged image charged through producer settlement before run adoption", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-unadopted-shutdown-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-unadopted-shutdown-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-image-unadopted-shutdown-${Date.now()}`;
 	const producerStarted = Promise.withResolvers<void>();
@@ -3256,7 +3259,7 @@ test.each([
 	"failed-before-refusal",
 ] as const)("native image refusal uses real queued Core authority (%s)", async mode => {
 	const pendingProducer = mode !== "returned";
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-native-core-image-refusal-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-native-core-image-refusal-"));
 	dirs.push(cwd);
 	const manager = SessionManager.create(cwd, cwd);
 	const sessionId = manager.getSessionId();
@@ -3481,7 +3484,7 @@ test.each([
 	"post-start",
 	"post-start-unknown",
 ] as const)("bus retains a promoted staged image until agent_start adopts its run (%s)", async mode => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-promotion-adoption-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-promotion-adoption-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-image-promotion-adoption-${Date.now()}`;
 	const ledger = createRunResourceLedger();
@@ -3589,7 +3592,7 @@ test.each([
 });
 
 test("bus btw.ask forwards caller exchanges to the session runner and advertises the input version", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-exchanges-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-exchanges-"));
 	dirs.push(cwd);
 	const sessionId = `btw-exchanges-${Date.now()}`;
 	const sessionContext = {
@@ -3644,7 +3647,7 @@ test("bus btw.ask forwards caller exchanges to the session runner and advertises
 }, 20_000);
 
 test.each(["disconnect", "shutdown"] as const)("broker BTW cancellation reaches runner on %s", async ending => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-abort-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-btw-abort-"));
 	dirs.push(cwd);
 	const sessionId = `btw-abort-${ending}-${Date.now()}`;
 	const sessionContext = {
@@ -3706,7 +3709,7 @@ test.each([
 	"domain",
 	"terminal",
 ] as const)("bus omits private image controls without ownership authority (%s)", async missing => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-authority-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-authority-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-image-authority-${missing}-${Date.now()}`;
 	const ledger = createRunResourceLedger();
@@ -3751,7 +3754,7 @@ test.each([
 	"missing-domain-pending",
 	"missing-domain-quarantined",
 ] as const)("bus staged-image capacity survives disconnect and an unrelated run terminal (%s)", async mode => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-domain-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-domain-"));
 	const sourceBytesBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
 	dirs.push(cwd);
 	const sessionId = `sdk-image-domain-${Date.now()}`;
@@ -3918,7 +3921,7 @@ test.each([
 	"claim-failure",
 	"finalize-failure",
 ] as const)("a diverted text-only prompt keeps exact lifecycle ownership (%s)", async mode => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-text-owner-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-text-owner-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-steered-text-owner-${Date.now()}`;
 	const live = { idle: true, handle: "original-run" };
@@ -4310,7 +4313,7 @@ test.each([
 }, 60_000);
 
 test("SDK host text-only stop/restart isolates late predecessor progress and terminal ownership", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-text-owner-restart-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-text-owner-restart-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-text-owner-restart-${Date.now()}`;
 	const live: { idle?: boolean; handle: string } = { idle: true, handle: "predecessor-run" };
@@ -4671,7 +4674,7 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 });
 
 test("SDK host stopped instance leaves its armed prompt deadline out of the durable store (#7342)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-stopped-deadline-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-stopped-deadline-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-stopped-deadline-${Date.now()}`;
 	const base = context(cwd, sessionId);
@@ -4741,7 +4744,7 @@ test("SDK host stopped instance leaves its armed prompt deadline out of the dura
 });
 
 test("SDK host deadline expiry waiting at a tool boundary does not write after shutdown (#7342)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-boundary-deadline-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-boundary-deadline-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-boundary-deadline-${Date.now()}`;
 	const base = context(cwd, sessionId);
@@ -4817,7 +4820,7 @@ test("SDK host deadline expiry waiting at a tool boundary does not write after s
 }, 20_000);
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-follow-up-correlation-${Date.now()}`;
 	const sent: CapturedSendCall[] = [];
@@ -4893,7 +4896,7 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 });
 
 test("SDK host directly delivers correlated lifecycle frames for an accepted prompt", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-success-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-success-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-success-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -5106,7 +5109,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 });
 
 test("SDK host buffers synchronous pre-ack start and end until after acknowledgement", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-pre-ack-end-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-pre-ack-end-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-pre-ack-end-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -5164,7 +5167,7 @@ test("SDK host buffers synchronous pre-ack start and end until after acknowledge
 });
 
 test("SDK host buffers synchronous pre-ack accepted failure until after acknowledgement", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-pre-ack-failed-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-pre-ack-failed-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-pre-ack-failed-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -5235,7 +5238,7 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 });
 
 test("SDK host replays an accepted prompt terminal after its requester disconnects", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-disconnect-replay-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-disconnect-replay-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-disconnect-replay-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -5332,7 +5335,7 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 });
 
 test("SDK host serializes concurrent prompt admission and replays correlated lifecycle", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-concurrent-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-concurrent-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-concurrent-${Date.now()}`;
 	const submissions: string[] = [];
@@ -5462,7 +5465,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 });
 
 test("SDK host delivers accepted prompt failures after their acknowledgement", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-terminal-${Date.now()}`;
 	const handlers = start(context(cwd, sessionId), undefined, () =>
@@ -5510,7 +5513,7 @@ test("SDK host delivers accepted prompt failures after their acknowledgement", a
 });
 
 test("SDK host terminalizes a cancelled preflight and releases prompt authority", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-cancelled-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-cancelled-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-preflight-cancelled-${Date.now()}`;
 	const preflightStarted = Promise.withResolvers<void>();
@@ -5586,7 +5589,7 @@ test("SDK host terminalizes a cancelled preflight and releases prompt authority"
 });
 
 test("SDK host cancels canonical skill invocation before agent start and fences late acceptance", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-preflight-cancelled-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-preflight-cancelled-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-preflight-cancelled-${Date.now()}`;
 	const preflightStarted = Promise.withResolvers<void>();
@@ -5679,7 +5682,7 @@ test("SDK host cancels canonical skill invocation before agent start and fences 
 });
 
 test("SDK host waits for accepted handleless skill settlement before publishing cancellation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-accepted-handleless-cancel-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-accepted-handleless-cancel-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-accepted-handleless-cancel-${Date.now()}`;
 	const acceptedWithoutHandle = Promise.withResolvers<void>();
@@ -5825,7 +5828,7 @@ function acceptedCorrelation(frame: Record<string, unknown> | undefined): { comm
 }
 
 test("SDK host retains the final assistant text for a skill whose invocation settles before its terminal is finalized", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-result-text-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-result-text-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-result-text-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -5984,7 +5987,7 @@ test("SDK host retains the final assistant text for a skill whose invocation set
 	}
 });
 test("SDK host retains final text for an ownerless durable skill invocation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ownerless-skill-result-text-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ownerless-skill-result-text-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-ownerless-skill-result-text-${Date.now()}`;
 	const ownerlessText = "ownerless durable skill result ✓";
@@ -6085,7 +6088,7 @@ test("SDK host retains final text for an ownerless durable skill invocation", as
 	}
 }, 60_000);
 test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-durable-accept-cancel-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6205,7 +6208,7 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 }, 30_000);
 
 test("SDK host waits for durable skill acceptance before completing concurrent cancellation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-durable-accept-cancel-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-durable-accept-cancel-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-durable-accept-cancel-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6329,7 +6332,7 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 }, 60_000);
 
 test("SDK host rolls back canonical skill ownership when durable acceptance fails", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-acceptance-failed-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6426,7 +6429,7 @@ test("SDK host rolls back canonical skill ownership when durable acceptance fail
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 test("session_shutdown awaits a late reconciliation publication before teardown can remove it", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-late-publication-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-late-publication-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-late-publication-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6525,7 +6528,7 @@ test("session_shutdown awaits a late reconciliation publication before teardown 
 	pausedCommit.restore();
 }, 60_000);
 test("session_shutdown joins a still-executing skill before teardown can race its publication (#4743)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-teardown-join-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-teardown-join-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-skill-teardown-join-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6606,7 +6609,7 @@ test("session_shutdown joins a still-executing skill before teardown can race it
 }, 60_000);
 test("session_shutdown bounds a hung reconciliation publication and reports the drain timeout (#4743)", async () => {
 	process.env.GJC_SDK_RECONCILIATION_DRAIN_TIMEOUT_MS = "250";
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-deadline-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-deadline-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-drain-deadline-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6700,7 +6703,7 @@ test("session_shutdown bounds a hung reconciliation publication and reports the 
 }, 60_000);
 
 test("session_shutdown propagates a rejected reconciliation publication without an unhandled rejection (#4743)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-publish-failure-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-publish-failure-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-drain-publish-failure-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6795,7 +6798,7 @@ test("session_shutdown propagates a rejected reconciliation publication without 
 	}
 }, 60_000);
 test("a recovered reconciliation publication lets a later teardown drain report success (#4743)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-recovery-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-recovery-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-drain-recovery-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -6921,7 +6924,7 @@ test("a recovered reconciliation publication lets a later teardown drain report 
 	}
 }, 60_000);
 test("SDK host terminalizes a never-resolving preflight on abort and fences late acceptance", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-preflight-never-${Date.now()}`;
 	const preflightStarted = Promise.withResolvers<void>();
@@ -6999,7 +7002,7 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 });
 
 test("terminal abort cancels a pending prompt preflight (never accepts)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-preflight-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-preflight-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-terminal-preflight-${Date.now()}`;
 	const live = { idle: true };
@@ -7068,7 +7071,7 @@ test("terminal abort cancels a pending prompt preflight (never accepts)", async 
 });
 
 test("SDK host abort-and-prompt cancels a never-resolving preflight before replacement submission", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-never-preflight-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-never-preflight-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-never-preflight-${Date.now()}`;
 	const live = { idle: true };
@@ -7157,7 +7160,7 @@ test("SDK host abort-and-prompt cancels a never-resolving preflight before repla
 // #7555: the session stays non-idle while a cancelled preflight unwinds, before
 // any run has started. The requester's own replacement must still abort.
 async function startPreflightUnwindHarness(label: string) {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-abort-prompt-${label}-`));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-abort-prompt-${label}-`));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-${label}-${Date.now()}`;
 	const live = { idle: true };
@@ -7319,7 +7322,7 @@ test("SDK host abort-and-prompt runs two same-connection replacements queued beh
 });
 
 test("SDK host abort-and-prompt leaves another connection's pending preflight running", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-preflight-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-preflight-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-foreign-preflight-${Date.now()}`;
 	const live = { idle: true };
@@ -7403,7 +7406,7 @@ test("SDK host abort-and-prompt leaves another connection's pending preflight ru
 });
 
 test("SDK host waits for asynchronous abort unwind before delivering an abort-and-prompt replacement", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-${Date.now()}`;
 	const live = { idle: true };
@@ -7484,7 +7487,7 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 });
 
 test("SDK host abort-and-prompt replaces the requester's accepted prompt before its agent_start", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-prestart-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-prestart-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-prestart-${Date.now()}`;
 	const live = { idle: true };
@@ -7560,7 +7563,7 @@ test("SDK host abort-and-prompt replaces the requester's accepted prompt before 
 });
 
 test("SDK host abort-and-prompt queues a steer instead of stopping a run the connection does not own", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-foreign-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-foreign-${Date.now()}`;
 	const live = { idle: false };
@@ -7635,7 +7638,7 @@ test("SDK host abort-and-prompt queues a steer instead of stopping a run the con
 });
 
 test("SDK host abort-and-prompt keeps a fallback steer bound to the run captured before its durable reservation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-bound-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-bound-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-bound-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -7743,7 +7746,7 @@ test("SDK host abort-and-prompt keeps a fallback steer bound to the run captured
 });
 
 test("SDK host abort-and-prompt replay whose steer record retention evicts before reservation never reaches the current run", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-evicted-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-evicted-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-evicted-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -7873,7 +7876,7 @@ test("SDK host abort-and-prompt replay whose steer record retention evicts befor
 });
 
 test("SDK host abort-and-prompt reports a delivered steer as uncertain when its acceptance write fails", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-steer-uncertain-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-steer-uncertain-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-steer-uncertain-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -7954,7 +7957,7 @@ test("SDK host abort-and-prompt reports a delivered steer as uncertain when its 
 });
 
 test("SDK host turn.abort terminal mode returns no-effect with no active turn", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-terminal-noop-${Date.now()}`;
 	const sessionContext = {
@@ -8009,7 +8012,7 @@ test("terminal abort from a queued requester never cancels another connection's 
 	// wrapper preflight but must NOT invoke the session-wide preflight seam —
 	// it cancels the session's single controller captured by the OTHER
 	// connection's active preflight, failing an unrelated prompt.
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-preflight-scope-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-preflight-scope-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-preflight-scope-${Date.now()}`;
 	let sessionPreflightCancelled = 0;
@@ -8095,7 +8098,7 @@ test("full-bus terminal replay advances a finalized row through the stored repla
 	// only advances a pending row when the written response matches either
 	// stored hash. Without replayPayloadHash the written replay stays durably
 	// pending forever.
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fullbus-replay-hash-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fullbus-replay-hash-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-fullbus-replay-hash-${Date.now()}`;
 	const sessionFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`);
@@ -8188,7 +8191,7 @@ test("terminal abort durable replay after restart never cancels a NEW unrelated 
 	// admission predicate must treat EVERY stored-carrying replay as a
 	// non-admission — cancelling the requester's unrelated in-preflight prompt
 	// there would give an idempotency replay real effects (review thread P1).
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-replay-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-replay-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-terminal-replay-${Date.now()}`;
 	const sessionFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`);
@@ -8323,7 +8326,7 @@ test("terminal abort durable replay after restart never cancels a NEW unrelated 
 }, 20_000);
 
 test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started prompt as cancelled", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-fence-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-fence-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-terminal-fence-${Date.now()}`;
 	const live = { idle: true };
@@ -8429,7 +8432,7 @@ test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started pr
  * run is aborted, so the turn stays active until something stops it.
  */
 async function startTerminalTypedBusTurn(prefix: string, typeTurn = true) {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), prefix));
 	dirs.push(cwd);
 	const notices: Array<{ message: string; type: string | undefined }> = [];
 	const host = await startProductionSdkHost(cwd, {
@@ -8799,7 +8802,7 @@ test("operator turn.abort selects target by active-run ownership; bus fallback n
 }, 60_000);
 
 test("predecessor teardown cannot clear a successor SDK permission provider", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-owner-"));
 	dirs.push(cwd);
 	const sessionA = `permission-owner-a-${Date.now()}`;
 	const sessionB = `permission-owner-b-${Date.now()}`;
@@ -8911,7 +8914,7 @@ test("predecessor teardown cannot clear a successor SDK permission provider", as
 }, 60_000);
 
 test("SDK session switches rotate endpoint authority before publishing the replacement host", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-switch-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-switch-"));
 	dirs.push(cwd);
 	const sessionA = `sdk-switch-a-${Date.now()}`;
 	const sessionB = `sdk-switch-b-${Date.now()}`;
@@ -8980,7 +8983,7 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 
 for (const eventType of ["session_switch", "session_branch"] as const) {
 	test(`SDK ${eventType} rotation fails closed when predecessor release is uncertain`, async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-rotate-fail-${eventType}-`));
+		const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-rotate-fail-${eventType}-`));
 		dirs.push(cwd);
 		const sessionA = `rotate-fail-a-${Date.now()}`;
 		const sessionB = `rotate-fail-b-${Date.now()}`;
@@ -9063,7 +9066,7 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 }
 
 test("SDK host binds session query and control seams and excludes uninstalled resources", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-bindings-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-bindings-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-bindings-${Date.now()}`;
 	start(context(cwd, sessionId));
@@ -9194,7 +9197,7 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 });
 
 test("SDK host routes pure ACP permission prompts through a live reverse provider", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-provider-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-permission-provider-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-permission-provider-${Date.now()}`;
 	let permissionProvider:
@@ -9296,7 +9299,7 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 });
 
 test("ACP permission attachment normalizes decisions through the registered provider path", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-acp-permission-path-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-acp-permission-path-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-acp-permission-path-${Date.now()}`;
 	const acpSessionId = "acp-session-authority";
@@ -9461,7 +9464,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 });
 
 test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-ui-provider-${Date.now()}`;
 	process.env.GJC_NOTIFICATIONS = "1";
@@ -9642,7 +9645,7 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 });
 
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-ui-provider-notify-priority-${Date.now()}`;
 	const sessionContext = {
@@ -9796,7 +9799,7 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 	}
 });
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-provider-validation-${Date.now()}`;
 	process.env.GJC_NOTIFICATIONS = "1";
@@ -9924,7 +9927,7 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 });
 
 test("Q17 returns empty observation without readable assistant text and reads a completed persisted turn after reopen", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-last-assistant-"));
 	dirs.push(cwd);
 	const original = SessionManager.create(cwd, cwd);
 	await original.flush();
@@ -10117,7 +10120,7 @@ test("Q17 returns empty observation without readable assistant text and reads a 
 });
 
 test("terminal shutdown removes session snapshot spills", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-snapshots-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-snapshots-"));
 	dirs.push(cwd);
 	const sessionId = `snapshots-${Date.now()}`;
 	const handlers = start(context(cwd, sessionId));
@@ -10152,7 +10155,7 @@ test("terminal shutdown removes session snapshot spills", async () => {
 });
 
 test("diff queries return typed errors outside a Git working tree", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-no-git-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-no-git-"));
 	dirs.push(cwd);
 	const sessionId = `no-git-${Date.now()}`;
 	const handlers = start(context(cwd, sessionId));
@@ -10195,7 +10198,7 @@ test("diff queries return typed errors outside a Git working tree", async () => 
 });
 
 test("diff queries return a bounded error for oversized diffs", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-large-diff-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-large-diff-"));
 	dirs.push(cwd);
 	for (const args of [
 		["init", "-q"],
@@ -10422,7 +10425,7 @@ test("legacy Q06-Q08 fail closed on 101 small tracked edits instead of publishin
 }, 30_000);
 
 test("SDK host honors disable opt-out and excludes subagent sessions", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-gate-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-gate-"));
 	dirs.push(cwd);
 	process.env.GJC_SDK_DISABLE = "1";
 	start(context(cwd, "disabled"));
@@ -10435,7 +10438,7 @@ test("SDK host honors disable opt-out and excludes subagent sessions", async () 
 });
 
 test("context.get reports live streaming state and typed queue depths without notifications", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-live-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-live-"));
 	dirs.push(cwd);
 	const sessionId = `live-${Date.now()}`;
 	// Notifications intentionally NOT configured: SDK-only hosting.
@@ -10497,7 +10500,7 @@ test("context.get reports live streaming state and typed queue depths without no
 });
 
 test("SDK endpoint applies typed skill, plan, goal, and config controls with observable readback", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-typed-controls-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-typed-controls-"));
 	dirs.push(cwd);
 	const sessionId = `typed-controls-${Date.now()}`;
 	let plan: { enabled: boolean; planFilePath: string } | undefined;
@@ -10699,7 +10702,7 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 });
 
 test("Q12 records the runtime-turn correlation before a workflow gate is exposed", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-q12-runtime-turn-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-q12-runtime-turn-"));
 	dirs.push(cwd);
 	const emitter = new BrokerWorkflowGateEmitter("q12-runtime-turn", new FileGateStore(path.join(cwd, "gates.json")));
 	const detachTerminalController = emitter.registerGateTerminalController!({
@@ -10731,7 +10734,7 @@ test("Q12 records the runtime-turn correlation before a workflow gate is exposed
 	}
 });
 test("workflow gate recommendation projection marks only one exact hint without changing raw options", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-workflow-gate-recommendation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-workflow-gate-recommendation-"));
 	dirs.push(cwd);
 	const sessionId = `workflow-gate-recommendation-${Date.now()}`;
 	let emitGate:
@@ -10820,7 +10823,7 @@ test("workflow gate recommendation projection marks only one exact hint without 
 }, 60_000);
 
 test("SDK host discovers, answers, and advances a durable workflow gate", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-workflow-gate-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-workflow-gate-"));
 	dirs.push(cwd);
 	const sessionId = `workflow-gate-${Date.now()}`;
 	const gateStore = new FileGateStore(path.join(cwd, ".gjc", "state", "workflow-gates.json"));
@@ -11028,7 +11031,7 @@ test("SDK host discovers, answers, and advances a durable workflow gate", async 
 });
 
 test("session teardown drains admitted direct gate resolution before detaching its controller", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-direct-resolution-drain-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-direct-resolution-drain-"));
 	dirs.push(cwd);
 	const sessionId = `direct-resolution-drain-${Date.now()}`;
 	const emitter = new BrokerWorkflowGateEmitter(sessionId, new FileGateStore(path.join(cwd, "gates.json")));
@@ -11210,7 +11213,7 @@ test("PresentationArbiter drops a retired presentation before terminal persisten
 });
 
 test("SDK host omits direct workflow controls for a legacy workflow-gate emitter", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-legacy-workflow-gate-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-legacy-workflow-gate-"));
 	dirs.push(cwd);
 	const sessionId = `legacy-workflow-gate-${Date.now()}`;
 	const legacyEmitter = {
@@ -12303,7 +12306,7 @@ test("PresentationArbiter fences already-terminal direct controls and resets exh
 });
 
 test("AC2/AC8: SDK host completes successful session mutations over its live WebSocket", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-successful-verbs-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-successful-verbs-"));
 	dirs.push(cwd);
 	const sessionId = `successful-verbs-${Date.now()}`;
 	const emitter = new BrokerWorkflowGateEmitter(
@@ -12475,7 +12478,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 });
 
 test("turn.prompt_status settles durable acceptance after disconnect before agent_start", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-reconcile-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-reconcile-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-reconcile-${Date.now()}`;
 	const sessionFile = path.join(cwd, "session.jsonl");
@@ -12617,7 +12620,7 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 });
 
 test("turn.result reports a prompt admitted during preflight, then its cancellation by requester disconnect (#7867)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-admitted-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-admitted-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-admitted-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -12714,7 +12717,7 @@ test("turn.result reports a prompt admitted during preflight, then its cancellat
 });
 
 test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idempotency_conflict", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-ordered-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-ordered-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-ordered-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -12775,7 +12778,7 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 });
 
 test("turn.result validates selectors and its prompt alias rejects invalid clientRef input", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-validation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-validation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-validation-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -12860,7 +12863,7 @@ test("turn.result validates selectors and its prompt alias rejects invalid clien
 });
 
 test("clientRef admission reservation is released when a submission is rejected before acceptance", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-release-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-release-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-release-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -12927,7 +12930,7 @@ test("clientRef admission reservation is released when a submission is rejected 
 });
 
 test("busy rejection releases the clientRef admission so a same-ref retry succeeds after the turn", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-busy-release-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-busy-release-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-busy-release-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -12971,7 +12974,7 @@ test("busy rejection releases the clientRef admission so a same-ref retry succee
 });
 
 test("accepted-then-failed submission retains its reconciliation record and blocks ref reuse", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-accepted-failure-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-accepted-failure-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-accepted-failure-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -13049,7 +13052,7 @@ test("accepted-then-failed submission retains its reconciliation record and bloc
 });
 
 test("long-running prompt settles terminally after the delivery buffer expires", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-longrun-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-longrun-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-longrun-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -13167,8 +13170,8 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 });
 
 test("identical clientRefs in separate session runtimes stay isolated", async () => {
-	const cwdA = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-a-"));
-	const cwdB = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-b-"));
+	const cwdA = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-a-"));
+	const cwdB = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-b-"));
 	dirs.push(cwdA, cwdB);
 	const sessionA = `sdk-session-a-${Date.now()}`;
 	const sessionB = `sdk-session-b-${Date.now()}`;
@@ -13242,7 +13245,7 @@ test("identical clientRefs in separate session runtimes stay isolated", async ()
 	await handlersB.get("session_shutdown")?.({ type: "session_shutdown" }, contextB);
 });
 test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn correlated", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-canonical-subagent-gate-correlation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-canonical-subagent-gate-correlation-"));
 	dirs.push(cwd);
 	const subagentSessionManager = SessionManager.inMemory(cwd);
 	const sessionId = subagentSessionManager.getSessionId();
@@ -13372,7 +13375,7 @@ test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn c
  * terminalized, and every ACP client hung until the 30-minute prompt deadline.
  */
 test("SDK host keeps the prompt correlation across a mid-prompt continuation agent_start", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-continuation-correlation-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-continuation-correlation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-continuation-correlation-${Date.now()}`;
 	const sessionContext = context(cwd, sessionId);
@@ -13445,7 +13448,7 @@ test("notification host rebinds the steering snapshot before terminalizing with 
 	// steering admission token is present — an abort admitted under another
 	// connection's turn whose requester's prompt wins the race would otherwise
 	// have the session reject the still-old token as unknown_run.
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-rebind-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-rebind-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-notif-rebind-${Date.now()}`;
 	const rebinds: number[] = [];
@@ -13520,7 +13523,7 @@ test("notification host rebinds the steering snapshot before terminalizing with 
 
 for (const attached of [false, true]) {
 	test(`session_closed non-delivery logs at ${attached ? "warn with an attached client" : "debug with no client"}`, async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-closed-level-"));
+		const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-closed-level-"));
 		dirs.push(cwd);
 		const sessionId = `session-closed-level-${attached ? "attached" : "empty"}-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
@@ -13569,7 +13572,7 @@ for (const attached of [false, true]) {
 	});
 }
 test("SDK host publishes one replayable bash_folded frame per fold and runtime.jobs.list carries foldReason", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-bash-folded-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-bash-folded-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-bash-folded-${Date.now()}`;
 	const foldListeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
@@ -13657,7 +13660,7 @@ test("SDK host publishes one replayable bash_folded frame per fold and runtime.j
 }, 30_000);
 
 test("SDK host abort-and-prompt replaces the requester's own skill still unwinding from a cancelled preflight", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-skill-unwinding-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-skill-unwinding-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-skill-unwinding-${Date.now()}`;
 	const live = { idle: true };
@@ -13736,7 +13739,7 @@ test("SDK host abort-and-prompt replaces the requester's own skill still unwindi
 });
 
 test("SDK host abort-and-prompt does not let another connection claim a cancelled preflight that is still unwinding", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-unwinding-peer-"));
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-abort-prompt-unwinding-peer-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-abort-prompt-unwinding-peer-${Date.now()}`;
 	const live = { idle: true };

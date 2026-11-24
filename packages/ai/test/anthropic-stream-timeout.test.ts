@@ -1586,9 +1586,9 @@ describe("anthropic SDK request timeout (stalled before headers)", () => {
 		}
 	});
 
-	it("bounds the connect/headers phase at the 600s Anthropic first-event window by default", () => {
+	it("bounds the connect/headers phase at the 900s default first-event window", () => {
 		const options = buildAnthropicClientOptions({ model, apiKey: "sk-ant-test" });
-		expect(options.timeout).toBe(600_000);
+		expect(options.timeout).toBe(900_000);
 	});
 
 	it("floors a short caller first-event override so slow setup is not killed", () => {
@@ -1597,7 +1597,7 @@ describe("anthropic SDK request timeout (stalled before headers)", () => {
 			apiKey: "sk-ant-test",
 			streamFirstEventTimeoutMs: 1,
 		});
-		expect(options.timeout).toBe(600_000);
+		expect(options.timeout).toBe(900_000);
 	});
 
 	it("omits the SDK timeout when the first-event watchdog is explicitly disabled", () => {
@@ -1613,9 +1613,9 @@ describe("anthropic SDK request timeout (stalled before headers)", () => {
 		const options = buildAnthropicClientOptions({
 			model,
 			apiKey: "sk-ant-test",
-			streamIdleTimeoutMs: 500_000,
+			streamIdleTimeoutMs: 1_200_000,
 		});
-		expect(options.timeout).toBe(500_000);
+		expect(options.timeout).toBe(1_200_000);
 	});
 
 	it("uses the configured model idle timeout on Kimi's Anthropic route", async () => {

@@ -1,0 +1,3 @@
+### Fixed
+
+- Session listing, including `/resume`, no longer probes a legacy session's migration receipt once per v2 transcript. Coalescing migrated sessions checked the receipt for every (legacy session, v2 transcript) pair in two passes. Each check hashed the receipt name and attempted a no-follow open, so listing slowed down with legacy sessions × v2 sessions. The listing now looks up each legacy session's receipt once to find the destination it names, and runs the existing receipt verification only for that destination. With 553 legacy and 214 v2 sessions, `/resume` opened in about 11 s and now opens in about 5.4 s. The same sessions are listed with the same migration state.

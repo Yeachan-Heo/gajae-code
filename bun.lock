@@ -44,6 +44,7 @@
       },
       "devDependencies": {
         "@types/bun": "catalog:",
+        "fast-check": "catalog:",
       },
     },
     "packages/coding-agent": {

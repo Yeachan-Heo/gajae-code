@@ -271,4 +271,59 @@ describe("buildCanonicalModelIndex resolution reuse", () => {
 		expect(index.byId.get("custom-model")!.variants.map(entry => entry.model)).toEqual([slashedProvider]);
 		expect(index.byId.get("region/custom-model")!.variants.map(entry => entry.model)).toEqual([slashedId]);
 	});
+
+	test("reuses resolution when a reloaded equivalence config has the same content", () => {
+		// Count `id` reads on fresh model objects: a memoized resolution reads the id
+		// a fixed few times, a full heuristic resolution reads it more. The catalog is
+		// larger than the bounded per-id heuristic cache so that cache cannot hide a miss.
+		const ids = Array.from({ length: 400 }, (_, index) => `reuse-family-${index}.5-preview`);
+		const idReadsForRebuild = (equivalence: { exclude: string[] }): number => {
+			let reads = 0;
+			const models = ids.map(id => {
+				const model = makeModel("reuse-provider", id);
+				return new Proxy(model, {
+					get(target, property, receiver) {
+						if (property === "id") reads += 1;
+						return Reflect.get(target, property, receiver);
+					},
+				});
+			});
+			buildCanonicalModelIndex(models, equivalence);
+			return reads;
+		};
+		const config = { exclude: ["reuse-provider/excluded-model"] };
+		const firstReads = idReadsForRebuild(config);
+		const reloadedReads = idReadsForRebuild(structuredClone(config));
+
+		expect(reloadedReads).toBeLessThan(firstReads);
+	});
+
+	test("does not reuse resolution across equivalence configs with different content", () => {
+		// Each step changes exactly one field so a key that ignored either field would
+		// hand back the previous step's resolutions.
+		const pinned = makeModel("reuse-provider", "pinned-source");
+		const normalized = makeModel("reuse-provider", "claude-sonnet-4-5-20250929");
+		const canonicalOf = (
+			equivalence: { overrides: Record<string, string>; exclude: string[] },
+			model: Model<Api>,
+		): string | undefined =>
+			buildCanonicalModelIndex([pinned, normalized], equivalence).bySelector.get(
+				`${model.provider}/${model.id}`.toLowerCase(),
+			);
+		const exclude = ["reuse-provider/unrelated"];
+
+		expect(canonicalOf({ overrides: { "reuse-provider/pinned-source": "pinned-a" }, exclude }, pinned)).toBe(
+			"pinned-a",
+		);
+		expect(canonicalOf({ overrides: { "reuse-provider/pinned-source": "pinned-b" }, exclude }, pinned)).toBe(
+			"pinned-b",
+		);
+
+		const overrides = { "reuse-provider/pinned-source": "pinned-b" };
+		const heuristic = canonicalOf({ overrides, exclude }, normalized);
+		expect(heuristic).not.toBe(normalized.id);
+		expect(canonicalOf({ overrides, exclude: ["reuse-provider/claude-sonnet-4-5-20250929"] }, normalized)).toBe(
+			normalized.id,
+		);
+	});
 });

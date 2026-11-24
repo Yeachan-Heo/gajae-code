@@ -1166,8 +1166,11 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 
 	// Fault injection: only the reminder publication is refused; the manager stays healthy.
 	// Stale and unknown require session close per #7838; rejected can retry in memory.
-	it("continues a shared TTSR retry in memory after a rejected reminder refusal", async () =>
-		exerciseManagedRetry("discard", "shared-rejected"));
+	it.each([
+		"keep",
+		"discard",
+	] as const)("continues a shared TTSR retry in memory after a rejected reminder refusal (%s)", async contextMode =>
+		exerciseManagedRetry(contextMode, "shared-rejected"));
 
 	it("closes a shared TTSR session after a typed stale reminder refusal without retrying in memory", async () =>
 		exerciseManagedRetry("discard", "shared-stale"));
@@ -2061,6 +2064,20 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			await manager.flush();
 			if (contextMode === "discard") {
 				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(true);
+			} else {
+				// keep: no retry rewrite; the aborted partial output stays in live history.
+				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(false);
+				const live = target.session.agent.state.messages;
+				const abortedIndex = live.findIndex(
+					message => message.role === "assistant" && message.stopReason === "aborted",
+				);
+				const reminderIndexes = live.flatMap((message, index) =>
+					message.role === "custom" && message.customType === "ttsr-injection" ? [index] : [],
+				);
+				expect(abortedIndex).toBeGreaterThanOrEqual(0);
+				// One reminder, appended after the kept partial output.
+				expect(reminderIndexes).toHaveLength(1);
+				expect(reminderIndexes[0]).toBeGreaterThan(abortedIndex);
 			}
 			// The retry ran: a second model call that carries the reminder.
 			expect(target.modelMessages).toHaveLength(calls + (refused ? 2 : 1));

@@ -108,7 +108,8 @@ export function posixQuote(value: string): string {
 
 /** Quote a path for the PowerShell command shown on native Windows. */
 export function windowsPowerShellQuote(value: string): string {
-	return `'${value.replace(/'/g, "''")}'`;
+	// PowerShell also treats U+2018 through U+201B as single quotes inside a single-quoted string.
+	return `'${value.replace(/['\u2018-\u201B]/g, "$&$&")}'`;
 }
 
 function quoteAsidePath(value: string, platform = process.platform): string {

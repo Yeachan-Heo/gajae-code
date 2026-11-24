@@ -156,8 +156,41 @@ export function normalizeAnthropicBaseUrl(baseUrl?: string): string | undefined 
 	if (!trimmed) {
 		return undefined;
 	}
-	const withoutTrailingSlashes = trimmed.replace(/\/+$/, "");
-	return withoutTrailingSlashes.endsWith("/v1") ? withoutTrailingSlashes.slice(0, -3) : withoutTrailingSlashes;
+	// Normalize the path only: a slash or `/v1` inside a signed query is data.
+	const suffixStart = trimmed.search(/[?#]/);
+	const path = suffixStart === -1 ? trimmed : trimmed.slice(0, suffixStart);
+	const suffix = suffixStart === -1 ? "" : trimmed.slice(suffixStart);
+	const withoutTrailingSlashes = path.replace(/\/+$/, "");
+	const origin = withoutTrailingSlashes.endsWith("/v1") ? withoutTrailingSlashes.slice(0, -3) : withoutTrailingSlashes;
+	return `${origin}${suffix}`;
+}
+
+/**
+ * Splits a normalized base URL into the query-free base handed to the SDK and the raw
+ * base query. The SDK concatenates `/v1/messages` onto `baseURL` as a string, so a base
+ * query would swallow the route; the query is re-attached verbatim per request instead.
+ */
+function splitAnthropicBaseUrlQuery(baseUrl: string | undefined): { baseURL: string | undefined; query: string } {
+	if (!baseUrl) {
+		return { baseURL: baseUrl, query: "" };
+	}
+	const suffixStart = baseUrl.search(/[?#]/);
+	if (suffixStart === -1) {
+		return { baseURL: baseUrl, query: "" };
+	}
+	const suffix = baseUrl.slice(suffixStart);
+	const query = suffix.startsWith("?") ? suffix.slice(1).split("#", 1)[0] : "";
+	return { baseURL: baseUrl.slice(0, suffixStart), query };
+}
+
+/**
+ * Composes the Messages URL for a base URL: `/v1/messages` goes on the path exactly once
+ * and the base query is kept verbatim, ahead of `extraQuery`.
+ */
+export function buildAnthropicMessagesUrl(baseUrl: string, extraQuery?: string): string {
+	const { baseURL, query } = splitAnthropicBaseUrlQuery(normalizeAnthropicBaseUrl(baseUrl) ?? baseUrl);
+	const search = [query, extraQuery].filter(Boolean).join("&");
+	return `${baseURL}/v1/messages${search ? `?${search}` : ""}`;
 }
 
 // Build deduplicated beta header string
@@ -1650,6 +1683,42 @@ function wrapAnthropicFetchForProviderDispatch(
 	);
 }
 
+/**
+ * Re-attaches a base URL's raw query to requests the SDK builds under `sdkBaseUrl`,
+ * ahead of any query the SDK added itself, so signed proxy bases keep their exact bytes.
+ */
+function wrapAnthropicFetchForBaseQuery(baseFetch: FetchImpl, sdkBaseUrl: string, baseQuery: string): FetchImpl {
+	const base = URL.parse(sdkBaseUrl);
+	if (!base) {
+		return baseFetch;
+	}
+	const basePath = base.pathname.replace(/\/+$/, "");
+	const withBaseQuery = (rawUrl: string): string => {
+		const url = URL.parse(rawUrl);
+		if (
+			!url ||
+			url.origin !== base.origin ||
+			(url.pathname !== basePath && !url.pathname.startsWith(`${basePath}/`))
+		) {
+			return rawUrl;
+		}
+		const sdkQuery = url.search.slice(1);
+		url.search = "";
+		url.hash = "";
+		return `${url.toString()}?${baseQuery}${sdkQuery ? `&${sdkQuery}` : ""}`;
+	};
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			if (input instanceof Request) {
+				const url = withBaseQuery(input.url);
+				return baseFetch(url === input.url ? input : new Request(url, input), init);
+			}
+			return baseFetch(withBaseQuery(String(input)), init);
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+}
+
 /** Compresses request bodies with gzip for first-party Anthropic endpoints only. */
 export function wrapAnthropicFetchForGzip(baseFetch: FetchImpl): FetchImpl {
 	return Object.assign(
@@ -2453,7 +2522,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					api: output.api,
 					model: model.id,
 					method: "POST",
-					url: `${baseUrl}/v1/messages`,
+					url: buildAnthropicMessagesUrl(baseUrl),
 					body,
 				};
 			};
@@ -3597,6 +3666,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const needsFineGrainedToolStreamingBeta = hasTools && !compat.supportsEagerToolInputStreaming;
 	const oauthToken = isOAuth ?? isAnthropicOAuthToken(apiKey);
 	const baseUrl = resolveAnthropicBaseUrl(model, apiKey, args.endpointConfiguration);
+	const { baseURL: sdkBaseUrl, query: baseQuery } = splitAnthropicBaseUrlQuery(baseUrl);
 	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model, args.endpointConfiguration);
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl, args.endpointConfiguration);
 	const baseFetch = args.fetch ?? fetch;
@@ -3612,6 +3682,10 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const debugFetch = onSseEvent
 		? wrapFetchForSseDebug(providerScopedFetch, event => onSseEvent(event, model))
 		: providerScopedFetch;
+	// Outermost, so every inner wrapper (including the dispatch observer) sees the
+	// final URL with the base query restored.
+	const requestFetch =
+		sdkBaseUrl && baseQuery ? wrapAnthropicFetchForBaseQuery(debugFetch, sdkBaseUrl, baseQuery) : debugFetch;
 	// Bound the connect/headers phase. The first-event watchdog arms only after
 	// response headers arrive, so a request whose connection dies before headers
 	// was previously governed only by the Anthropic SDK's 10-minute default per
@@ -3647,13 +3721,13 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			isOAuthToken: false,
 			apiKey: null,
 			authToken: copilotApiKey,
-			baseURL: baseUrl,
+			baseURL: sdkBaseUrl,
 			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			fetch: debugFetch,
+			fetch: requestFetch,
 			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 		};
 	}
@@ -3685,13 +3759,13 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			isOAuthToken: false,
 			apiKey: null,
 			authToken: null,
-			baseURL: baseUrl,
+			baseURL: sdkBaseUrl,
 			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			fetch: debugFetch,
+			fetch: requestFetch,
 		};
 	}
 
@@ -3704,13 +3778,13 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			isOAuthToken: false,
 			apiKey: null,
 			authToken: null,
-			baseURL: baseUrl,
+			baseURL: sdkBaseUrl,
 			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			fetch: debugFetch,
+			fetch: requestFetch,
 			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 		};
 	}
@@ -3719,13 +3793,13 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isOAuthToken: oauthToken,
 		apiKey: oauthToken ? null : apiKey,
 		authToken: oauthToken ? apiKey : undefined,
-		baseURL: baseUrl,
+		baseURL: sdkBaseUrl,
 		maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
 		...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
 		logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-		fetch: debugFetch,
+		fetch: requestFetch,
 		...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 	};
 }

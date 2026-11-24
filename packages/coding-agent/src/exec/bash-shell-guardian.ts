@@ -68,6 +68,7 @@ export function extendOwnedDarwinAncestry<T extends { uniqueId: bigint; parentUn
 export function authenticateOwnershipRecord(
 	line: string,
 	ledgerToken: string,
+	processBindings?: Pick<typeof NativeProcess, "fromPid" | "observe">,
 ): { processRef?: NativeProcess; darwinUniqueId?: bigint; pending?: true } | undefined {
 	const record = parseOwnershipRecord(line);
 	if (!record) return undefined;
@@ -82,14 +83,22 @@ export function authenticateOwnershipRecord(
 		return undefined;
 	}
 	if (received.byteLength !== expected.byteLength || !timingSafeEqual(received, expected)) return undefined;
-	const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
-	const owned = Process.fromPid(record.pid);
+	const nativeBindings = processBindings || (require("@gajae-code/natives") as NativeProcessBindings).Process;
+	const owned = nativeBindings.fromPid(record.pid);
 	const darwinUniqueId = record.darwinUniqueId ? { darwinUniqueId: BigInt(record.darwinUniqueId) } : {};
 	if (owned?.incarnation === record.incarnation) return { processRef: owned, ...darwinUniqueId };
-	// fromPid() conflates death with an inconclusive lookup. Only a confirmed
-	// absence or a different incarnation settles the record; an unknown result
-	// keeps it pending so the caller retries the line on the next scan.
-	if (!owned && Process.observe(record.pid).status === "unknown") return { pending: true, ...darwinUniqueId };
+	if (!owned) {
+		// fromPid() conflates death with an inconclusive lookup, and a live process can deny the
+		// authority fromPid needs while observe still reads it. Only a confirmed absence or a
+		// different incarnation settles the record; an unknown result, or this same incarnation
+		// we cannot hold a reference to, keeps it pending so the caller retries on the next scan.
+		const observed = nativeBindings.observe(record.pid);
+		if (
+			observed.status === "unknown" ||
+			(observed.status === "present" && observed.incarnation === record.incarnation)
+		)
+			return { pending: true, ...darwinUniqueId };
+	}
 	return darwinUniqueId;
 }
 

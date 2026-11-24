@@ -51,7 +51,9 @@ import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { readBrokerDiscovery } from "../../sdk/broker/discovery";
 import { ensureBroker } from "../../sdk/broker/ensure";
+import { brokerLockRefusalApiMessage, normalizeBrokerLockRefusalError } from "../../sdk/broker/lock-refusal";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
+import { BrokerStartupError } from "../../sdk/broker/startup-failure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
@@ -3525,8 +3527,27 @@ export class AcpAgent implements Agent {
 			}
 			return object(result) ?? {};
 		} catch (error) {
-			const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
-			const message = error instanceof Error ? error.message : String(error);
+			let code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal";
+			let message = error instanceof Error ? error.message : String(error);
+
+			// Redact lock paths from broker startup refusal errors to prevent exposing local paths in ACP responses.
+			// Unwrap AggregateError to handle cleanup failures alongside primary refusal.
+			const normalized = normalizeBrokerLockRefusalError(error);
+			if (normalized.refusalCode !== undefined) {
+				code = "broker_unavailable";
+				message = normalized.cleanupUnverified
+					? `${brokerLockRefusalApiMessage(normalized.refusalCode)} Spawned broker cleanup was not verified.`
+					: brokerLockRefusalApiMessage(normalized.refusalCode);
+			} else if (normalized.primaryError instanceof BrokerStartupError && normalized.primaryError.lockRefused) {
+				code = "broker_unavailable";
+				const refusalMsg = normalized.primaryError.refusalCode
+					? brokerLockRefusalApiMessage(normalized.primaryError.refusalCode)
+					: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+				message = normalized.cleanupUnverified
+					? `${refusalMsg} Spawned broker cleanup was not verified.`
+					: refusalMsg;
+			}
+
 			return { ok: false, error: { code, message } };
 		}
 	}

@@ -16,13 +16,15 @@ import {
 	RequestError,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
-import { TempDir } from "@gajae-code/utils";
 import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import packageJson from "../../package.json" with { type: "json" };
 import { AcpAgent, acpRequestFailure } from "../../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import { SessionIndex } from "../../src/sdk/broker/session-index";
 import { ACP_PROMPT_INFERENCE_TIMEOUT_MS } from "../../src/sdk/prompt-watchdog";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(20_000);
 
@@ -107,7 +109,7 @@ function planUpdates(updates: SessionNotification[]): number {
 }
 
 async function createFixture(): Promise<Fixture> {
-	const tempDir = TempDir.createSync("@acp-abandon-plan-");
+	const tempDir = trackedTemp.tempDirSync("@acp-abandon-plan-");
 	const agentDir = path.join(tempDir.path(), "agent");
 	const cwd = path.join(tempDir.path(), "workspace");
 	const token = "acp-abandon-plan-token";

@@ -286,6 +286,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		const deadlineAt = Date.now() + timeoutMs;
 		const timeoutSignal = AbortSignal.timeout(timeoutMs);
 		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+		let targetTimedOut = false;
 		const throwIfSearchCancelled = (): void => {
 			signal?.throwIfAborted();
 			if (Date.now() >= deadlineAt) throw new Error("Aborted: Timeout");
@@ -396,6 +397,25 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								}))
 							: (multiTargets ?? []);
 						for (const target of targets) {
+							throwIfSearchCancelled();
+							// Calculate remaining timeout for this target and create a fresh signal
+							// to avoid reusing the original combinedSignal across multiple grep calls.
+							// issue #7892: multi-path grep hangs in SDK session host when signals are
+							// reused across multiple native grep calls.
+							const remainingMs = Math.max(0, deadlineAt - Date.now());
+							if (remainingMs <= 0) throw new Error("Aborted: Timeout");
+							// Create a fresh signal for each target to prevent signal reuse issues.
+							// This avoids potential deadlocks when the same signal is shared across
+							// multiple native grep invocations in SDK session host mode.
+							const targetTimeoutSignal = AbortSignal.timeout(remainingMs);
+							targetTimeoutSignal.addEventListener(
+								"abort",
+								() => {
+									targetTimedOut = true;
+								},
+								{ once: true },
+							);
+							const targetSignal = signal ? AbortSignal.any([signal, targetTimeoutSignal]) : targetTimeoutSignal;
 							const targetResult = await grep(
 								{
 									pattern: normalizedPattern,
@@ -411,8 +431,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
-									signal: combinedSignal,
-									timeoutMs,
+									signal: targetSignal,
+									timeoutMs: remainingMs,
 								},
 								undefined,
 							);
@@ -693,7 +713,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			return completedResult;
 		} catch (error) {
 			const nativeTimedOut = error instanceof Error && error.message === "Aborted: Timeout";
-			if ((timeoutSignal.aborted || nativeTimedOut) && !signal?.aborted) {
+			if ((timeoutSignal.aborted || targetTimedOut || nativeTimedOut) && !signal?.aborted) {
 				const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
 				throw new ToolError(`Search timed out after ${seconds}s; increase timeout or narrow paths/pattern`);
 			}

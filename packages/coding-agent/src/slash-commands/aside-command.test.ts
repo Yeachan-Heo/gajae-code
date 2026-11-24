@@ -80,6 +80,10 @@ describe("posixQuote", () => {
 			"'C:\\Users\\demo\\Aside CLI\\aside.exe'",
 		);
 		expect(windowsPowerShellQuote("C:\\Users\\O'Brien\\aside.exe")).toBe("'C:\\Users\\O''Brien\\aside.exe'");
+		// PowerShell treats U+2018 through U+201B as single quotes too.
+		expect(windowsPowerShellQuote("C:\\Users\\O\u2019Brien\\aside.exe")).toBe(
+			"'C:\\Users\\O\u2019\u2019Brien\\aside.exe'",
+		);
 	});
 
 	test("selects PowerShell quoting for native Windows MCP commands", () => {

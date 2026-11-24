@@ -151,6 +151,7 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { isLoopbackHost } from "@gajae-code/ai/utils/loopback-transport";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
@@ -4913,6 +4914,15 @@ export class AgentSession {
 	 */
 	#nestedToolScopes = new Map<string, NestedToolScope>();
 	#ttsrAbortPending = false;
+	/**
+	 * Assistant stream sequence, advanced synchronously when an assistant message_start is
+	 * admitted. Each message_update is stamped with its stream at admission, so a TTSR
+	 * interrupt can suppress exactly the rest of its own stream even when update handlers
+	 * run after the next stream has started.
+	 */
+	#assistantStreamSequence = 0;
+	#assistantStreamByUpdate = new WeakMap<object, number>();
+	#ttsrInterruptedStream: number | undefined = undefined;
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
@@ -5159,6 +5169,8 @@ export class AgentSession {
 			this.#handoffTransitionActive ||
 			this.#cancelAndSubmitInProgress ||
 			this.#sessionWorkLease.isHeld() ||
+			// A detached recap still holds an open provider request until its handle clears.
+			this.#recapController !== undefined ||
 			(manager?.getRunningJobs(ownerFilter).length ?? 0) > 0
 		) {
 			throw Object.assign(new AgentBusyError("Session is not idle."), { code: "busy" });
@@ -7284,6 +7296,14 @@ export class AgentSession {
 			},
 		});
 
+		// Restore goal mode state from the saved session branch during initialization.
+		// Schedule it to run after construction so we can call onThreadResumed.
+		queueMicrotask(() => {
+			if (!this.#isDisposed) {
+				void this.#restoreGoalModeStateFromBranch();
+			}
+		});
+
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
 		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
@@ -8510,6 +8530,8 @@ export class AgentSession {
 		}
 		// A new run means the conversation is moving on: no pending recap may commit.
 		if (event.type === "agent_start") this.#cancelPendingSessionRecap();
+		if (event.type === "message_start" && event.message.role === "assistant") this.#assistantStreamSequence++;
+		else if (event.type === "message_update") this.#assistantStreamByUpdate.set(event, this.#assistantStreamSequence);
 		this.#agentEventAdmission.set(event, {
 			scope: this.#activeAttemptScope,
 			sdkRunToken: this.#activeSdkRunToken,
@@ -9467,7 +9489,16 @@ export class AgentSession {
 		}
 
 		// TTSR: Check for pattern matches on assistant text/thinking and tool argument deltas
-		if (event.type === "message_update" && this.#ttsrManager?.hasRules()) {
+		// A stream interrupt owns the rest of its assistant stream: later deltas (in flight
+		// before the abort lands, or replayed when a managed fallback attempt is accepted)
+		// must not re-trigger rules or schedule another retry. Any other stream, including
+		// a newer prompt's while a stale retry is still pending, is checked normally.
+		const ttsrStream = event.type === "message_update" ? this.#assistantStreamByUpdate.get(event) : undefined;
+		if (
+			event.type === "message_update" &&
+			(ttsrStream === undefined || ttsrStream !== this.#ttsrInterruptedStream) &&
+			this.#ttsrManager?.hasRules()
+		) {
 			const assistantEvent = event.assistantMessageEvent;
 			let matchContext: TtsrMatchContext | undefined;
 
@@ -9483,6 +9514,7 @@ export class AgentSession {
 				const matches = this.#ttsrManager.checkDelta(assistantEvent.delta, matchContext);
 				const timestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
 				if (matches.length > 0 && this.#handleTtsrMatches(matches, matchContext, timestamp, activePromptHandle)) {
+					if (ttsrStream !== undefined) this.#ttsrInterruptedStream = ttsrStream;
 					return;
 				}
 			}
@@ -9909,9 +9941,9 @@ export class AgentSession {
 	#cancelPendingSessionRecap(): void {
 		this.#recapEpoch++;
 		this.#terminalRecapContext = undefined;
-		const controller = this.#recapController;
-		this.#recapController = undefined;
-		controller?.abort();
+		// Keep the handle until the detached chain settles (its finally clears it): an aborted
+		// recap can still be finishing an append, and idle close must count it as busy.
+		this.#recapController?.abort();
 	}
 
 	/** Cancel a pending recap and forget the request of the turn in progress. */
@@ -16450,6 +16482,11 @@ export class AgentSession {
 		});
 	}
 
+	/** MCP control admission fences mutations but does not replace the session's read identity. */
+	get isMcpControlActive(): boolean {
+		return this.#sessionTransitionKind === "mcp-control" && !this.#handoffTransitionActive;
+	}
+
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;
@@ -17700,7 +17737,17 @@ export class AgentSession {
 	 * The legacy form throws inline as before. The shared form publishes in the background:
 	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
 	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
-	 * `onCommitted` fires only when the entry is durable.
+	 *
+	 * On the shared path `onCommitted` fires only after the entry committed, so it means the
+	 * entry is durable. On the legacy path it fires right after `SessionManager.appendMessage`,
+	 * which only admits the entry: `_persist` deliberately returns before writing a transcript
+	 * until the session is ensured on disk or holds its first assistant entry. A legacy
+	 * callback therefore means "recorded in this session's graph", not "durable after a reload".
+	 *
+	 * On the shared path the callback runs after the durable write. A synchronous throw is
+	 * reported through the operator-notice seam and structured log, not treated as a refusal
+	 * or a reason to publish again. The task tracks callback invocation only; callbacks must
+	 * be synchronous and their return values are ignored.
 	 */
 	#publishMessageInBackground(
 		label: string,
@@ -17712,11 +17759,39 @@ export class AgentSession {
 			onCommitted?.();
 			return Promise.resolve({ committed: true });
 		}
-		return this.#publishInBackground(label, () => this.sessionManager.appendMessageSharingSession(message)).then(
-			result => {
-				if (result.committed) onCommitted?.();
+		const publication = this.#publishInBackground(label, () =>
+			this.sessionManager.appendMessageSharingSession(message),
+		);
+		return this.#trackBackgroundPublication(
+			publication.then(result => {
+				if (result.committed) {
+					try {
+						onCommitted?.();
+					} catch (error) {
+						this.#reportBackgroundFollowUpFailure(label, error);
+					}
+				}
 				return result;
-			},
+			}),
+		);
+	}
+
+	/**
+	 * Report a completion callback that threw after its entry was already durable.
+	 *
+	 * The entry is saved and must not be published again, so this is neither a refusal nor
+	 * an uncertainty: the operator only needs to know the follow-up step did not run.
+	 */
+	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
+		logger.warn("A durable shared publication's completion callback failed", {
+			operation,
+			error: safeErrorDescription(error),
+		});
+		if (this.#isDisposed) return;
+		this.emitNotice(
+			"warning",
+			`Saved the ${operation} to this session, but its completion step failed.`,
+			"session-publication",
 		);
 	}
 
@@ -20883,6 +20958,57 @@ export class AgentSession {
 			phase.tasks = phase.tasks.filter(t => t.status !== "completed" && t.status !== "abandoned");
 		}
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
+	}
+
+	/**
+	 * Restore goal mode state from the saved session branch during initialization.
+	 * When a session is resumed from a saved state, the goal mode information is
+	 * stored in the branch's mode_change entries, but it is not automatically
+	 * applied to the agent session. This function restores it.
+	 *
+	 * Mirrors the interactive goal-mode-controller: calls onThreadResumed() to set
+	 * up the accounting baseline, and respects explicit empty tool selection.
+	 */
+	async #restoreGoalModeStateFromBranch(): Promise<void> {
+		const sessionContext = this.buildDisplaySessionContext();
+		const mode = sessionContext.mode;
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		if (!savedGoal) return;
+
+		// When an SDK session explicitly requests zero tools (--no-tools), the goal
+		// tool is excluded to honor that contract. In this case, do not enable the goal
+		// to avoid automatic continuation with no way to interact with it.
+		const goalToolAvailable = this.getActiveToolNames().includes("goal");
+		const isExplicitEmpty = this.isExplicitEmptyToolSelection();
+		if (!goalToolAvailable && isExplicitEmpty) {
+			return;
+		}
+
+		// Set the initial goal state, preserving terminal states for completed/dropped goals
+		if (savedGoal.status === "complete") {
+			// A completed goal must be disabled and in exiting mode
+			this.setGoalModeState({ enabled: false, mode: "exiting", reason: "completed", goal: savedGoal });
+		} else if (savedGoal.status === "dropped") {
+			// A dropped goal should not be restored as active
+			return;
+		} else if (savedGoal.status === "paused") {
+			// A paused goal is disabled but remains in active mode
+			this.setGoalModeState({ enabled: false, mode: "active", goal: savedGoal });
+		} else {
+			// An active goal is enabled in active mode (or mode_change persisted it as "goal")
+			this.setGoalModeState({ enabled: true, mode: "active", goal: savedGoal });
+		}
+
+		// Call onThreadResumed to set up the accounting baseline, just like the
+		// interactive goal-mode-controller does (see goal-mode-controller.ts:298).
+		// This ensures token accounting is properly initialized for active goals.
+		// For terminal goals (complete/dropped), this call is benign and maintains consistency.
+		// onThreadResumed already commits the state; do not reapply a stale paused
+		// state if the goal was resumed via operateGoal() while this restore was pending.
+		await this.#goalRuntime.onThreadResumed();
 	}
 
 	async #compactionStateSnapshot(
@@ -31182,6 +31308,11 @@ export class AgentSession {
 		// Without this the message carries no transport facts and would fall
 		// through to "unknown", which is admitted for bounded retry (#5627).
 		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
+		// Gemini reasoning-summary header runaway is deterministic for the submitted
+		// context: replaying the identical conversation re-triggers the identical
+		// runaway, so an auto-retry loop can never succeed and only re-bills the
+		// full context on every attempt.
+		if (message.errorCode === GEMINI_HEADER_RUNAWAY_ERROR_CODE) return "terminal";
 		// A 2xx body in the wrong protocol replays identically; its embedded body text
 		// (e.g. "HTTP 503") must not be reparsed as a transient failure.
 		if (message.errorCode === PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE) return "terminal";
@@ -33587,8 +33718,13 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortBash() still cancels all Bash executions.
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is persisted: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it. Only a shared-transaction session guarantees
+	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
+	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
+	 *   so it does not by itself prove the entry survives a reload.
+	 *   This is a synchronous notification; return values (including promises) are ignored.
 	 */
 	async executeBash(
 		command: string,
@@ -33757,8 +33893,13 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.signal Cancels only this invocation; abortEval() still cancels all Python executions.
 	 * @param options.excludeFromContext If true, execution won't be sent to LLM ($$ prefix)
-	 * @param options.onPersisted Called once the execution's message is in session state
-	 *   (immediately when idle, at the post-turn flush while streaming)
+	 * @param options.onPersisted Called once the execution's message is persisted: after the
+	 *   append commits when idle, or at the post-turn flush while streaming. A refused or
+	 *   unconfirmed publication never calls it. Only a shared-transaction session guarantees
+	 *   the entry is in the transcript: a legacy session calls it after the in-memory append,
+	 *   whose persist step may still defer the transcript write (`#publishMessageInBackground`),
+	 *   so it does not by itself prove the entry survives a reload.
+	 *   This is a synchronous notification; return values (including promises) are ignored.
 	 */
 	async executePython(
 		code: string,
@@ -33909,7 +34050,12 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			void this.#publishMessageInBackground("python result", pythonMessage);
+			const shared = this.#usesSharedSessionPublication();
+			if (shared) {
+				void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
+			} else {
+				this.sessionManager.appendMessage(pythonMessage);
+			}
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -33917,7 +34063,8 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
-			options?.onPersisted?.();
+			// Reserve queued work before invoking the legacy callback, which may throw inline.
+			if (!shared) options?.onPersisted?.();
 		}
 	}
 

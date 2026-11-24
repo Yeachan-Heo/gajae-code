@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
-import { logger, TempDir } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpPromptPayload } from "../src/modes/acp/acp-agent";
@@ -21,6 +21,9 @@ import {
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
 } from "./helpers/sdk-exact-session-authority";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(60_000);
 
@@ -176,7 +179,7 @@ type FixtureOptions = {
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
-	const tempDir = TempDir.createSync("@acp-prompt-watchdog-");
+	const tempDir = trackedTemp.tempDirSync("@acp-prompt-watchdog-");
 	const agentDir = path.join(tempDir.path(), "agent");
 	const cwd = path.join(tempDir.path(), "workspace");
 	const token = "acp-prompt-watchdog-token";
