@@ -1,0 +1,3 @@
+### Fixed
+
+- On macOS, a bash tool command (including a `monitor` job) that happened to start the shared SDK broker no longer SIGKILLs it when the command finishes or is cancelled. Before, the bash shell guardian tracked the detached broker as one of the command's descendants, so every session host bound to it died, either at once with `SIGHUP` or 10 minutes later through the broker-absence exit. The guardian now leaves alone a process whose pid and kernel incarnation match the published broker discovery, together with its session hosts. A reused pid, or a broker-shaped process that is not the published broker, is still killed. Linux and Windows behavior is unchanged ([#7998](https://github.com/Yeachan-Heo/gajae-code/issues/7998)).

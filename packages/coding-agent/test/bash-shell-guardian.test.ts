@@ -5,8 +5,11 @@ import {
 	authenticateOwnershipRecord,
 	createDarwinAncestryTracker,
 	extendOwnedDarwinAncestry,
+	findSparedSdkBrokerPids,
+	findSparedSdkBrokerPidsBounded,
 	parseOwnershipRecord,
 	retainOwnedProcess,
+	sdkBrokerAgentDirFromArgs,
 } from "../src/exec/bash-shell-guardian";
 
 type ProcessDouble = { pid: number; incarnation: string; children: () => NativeProcess[] };
@@ -350,6 +353,178 @@ describe("bash-shell-guardian", () => {
 			expect(tracker.trackGuardian(processRef, 999n)).toBe(true);
 			expect(owned.get("12345:test-incarnation")).toBe(processRef);
 			tracker.close();
+		});
+	});
+
+	describe("sdkBrokerAgentDirFromArgs", () => {
+		it("reads the agent dir from compiled and source broker launches", () => {
+			expect(sdkBrokerAgentDirFromArgs(["/bin/gjc", "sdk", "broker-internal", "--agent-dir", "/a"])).toBe("/a");
+			expect(
+				sdkBrokerAgentDirFromArgs([
+					"bun",
+					"--no-env-file",
+					"--config=/x/bunfig.toml",
+					"/x/cli.ts",
+					"sdk",
+					"broker-internal",
+					"--agent-dir",
+					"/b",
+				]),
+			).toBe("/b");
+		});
+
+		it("rejects other sdk commands and malformed broker argv", () => {
+			expect(sdkBrokerAgentDirFromArgs(["gjc", "sdk", "broker", "run", "--agent-dir", "/a"])).toBeUndefined();
+			expect(
+				sdkBrokerAgentDirFromArgs(["gjc", "sdk", "session-host-internal", "--agent-dir", "/a"]),
+			).toBeUndefined();
+			expect(sdkBrokerAgentDirFromArgs(["gjc", "broker-internal", "--agent-dir", "/a"])).toBeUndefined();
+			expect(sdkBrokerAgentDirFromArgs(["gjc", "sdk", "broker-internal", "--agent-dir"])).toBeUndefined();
+			expect(sdkBrokerAgentDirFromArgs(["gjc", "sdk", "broker-internal", "--agent-dir", ""])).toBeUndefined();
+			expect(
+				sdkBrokerAgentDirFromArgs(["gjc", "sdk", "broker-internal", "--agent-dir", "/a", "--extra"]),
+			).toBeUndefined();
+		});
+	});
+
+	describe("findSparedSdkBrokerPids", () => {
+		const brokerArgv = (agentDir: string) => ["/bin/gjc", "sdk", "broker-internal", "--agent-dir", agentDir];
+		const owned = (pid: number, incarnation: string, args: string[] | (() => string[])) => ({
+			pid,
+			incarnation,
+			args: typeof args === "function" ? args : () => args,
+		});
+
+		it("spares the published broker and its lineage, and nothing else", async () => {
+			const spared = await findSparedSdkBrokerPids(
+				[owned(10, "b", brokerArgv("/agent")), owned(20, "x", ["python3", "-c", "sleep"])],
+				{
+					readDiscovery: async dir => (dir === "/agent" ? { pid: 10, incarnation: "b" } : null),
+					lineage: pid => (pid === 10 ? new Set([10, 11, 12]) : undefined),
+					incarnationOf: pid => (pid === 10 ? "b" : undefined),
+				},
+			);
+			expect([...spared].sort()).toEqual([10, 11, 12]);
+		});
+
+		it("kills a broker-shaped process whose identity does not match the discovery record", async () => {
+			const deps = {
+				lineage: (pid: number) => new Set([pid]),
+				incarnationOf: () => "b",
+			};
+			// A reused pid: same pid, different incarnation.
+			expect(
+				(
+					await findSparedSdkBrokerPids([owned(10, "stale", brokerArgv("/agent"))], {
+						...deps,
+						readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+					})
+				).size,
+			).toBe(0);
+			// A second broker for the same agent dir that lost the publication race.
+			expect(
+				(
+					await findSparedSdkBrokerPids([owned(30, "b", brokerArgv("/agent"))], {
+						...deps,
+						readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+					})
+				).size,
+			).toBe(0);
+			// Nothing published, or the discovery read fails.
+			for (const readDiscovery of [async () => null, async () => Promise.reject(new Error("unsupported state"))]) {
+				expect(
+					(await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], { ...deps, readDiscovery })).size,
+				).toBe(0);
+			}
+		});
+
+		it("does not spare a broker that changed incarnation during the lineage walk", async () => {
+			const spared = await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], {
+				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				lineage: () => new Set([10, 11]),
+				incarnationOf: () => "replacement",
+			});
+			expect(spared.size).toBe(0);
+		});
+
+		it("still spares the broker itself when its lineage cannot be read", async () => {
+			const spared = await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], {
+				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				lineage: () => undefined,
+				incarnationOf: () => "b",
+			});
+			expect([...spared]).toEqual([10]);
+		});
+
+		it("skips processes whose argv cannot be read", async () => {
+			const spared = await findSparedSdkBrokerPids(
+				[
+					owned(10, "b", () => {
+						throw new Error("EPERM");
+					}),
+				],
+				{
+					readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+					lineage: () => new Set([10]),
+					incarnationOf: () => "b",
+				},
+			);
+			expect(spared.size).toBe(0);
+		});
+	});
+
+	describe("findSparedSdkBrokerPidsBounded", () => {
+		const broker = {
+			pid: 10,
+			incarnation: "b",
+			args: () => ["/bin/gjc", "sdk", "broker-internal", "--agent-dir", "/agent"],
+		};
+		const published = async () => ({ pid: 10, incarnation: "b" });
+
+		it("spares the published broker when the lookup completes in time", async () => {
+			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				readDiscovery: published,
+				lineage: () => new Set([10, 11]),
+				incarnationOf: () => "b",
+			});
+			expect([...spared].sort()).toEqual([10, 11]);
+		});
+
+		it("spares nothing when the lineage walk throws", async () => {
+			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				readDiscovery: published,
+				lineage: () => {
+					throw new Error("proc_listallpids failed");
+				},
+				incarnationOf: () => "b",
+			});
+			expect(spared.size).toBe(0);
+		});
+
+		it("spares nothing when the discovery read throws synchronously", async () => {
+			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				readDiscovery: () => {
+					throw new Error("sync failure");
+				},
+				lineage: () => new Set([10]),
+				incarnationOf: () => "b",
+			});
+			expect(spared.size).toBe(0);
+		});
+
+		it("spares nothing when the discovery read stalls past the timeout", async () => {
+			const started = Date.now();
+			const spared = await findSparedSdkBrokerPidsBounded(
+				[broker],
+				{
+					readDiscovery: () => new Promise(() => {}),
+					lineage: () => new Set([10]),
+					incarnationOf: () => "b",
+				},
+				50,
+			);
+			expect(spared.size).toBe(0);
+			expect(Date.now() - started).toBeLessThan(1_000);
 		});
 	});
 });
