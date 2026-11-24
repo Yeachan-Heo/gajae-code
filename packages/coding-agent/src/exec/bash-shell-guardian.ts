@@ -490,12 +490,15 @@ export type SignalOwnedProcessDeps = {
  * SIGKILL one owned process without touching its descendants, and only while `pid`
  * still names the incarnation that was recorded as owned.
  *
- * The identity-bound native signal is used when the platform provides one (Linux
- * pidfd, Windows handle). Darwin has no atomic "signal iff start time matches"
- * primitive, so `signalRoot` fails closed there and the fallback re-reads the
- * incarnation immediately before a raw `kill(2)`, with nothing in between. The
- * window left between that read and the syscall is the same one the native
- * `killTree` accepts on darwin, which this path replaces when a broker is spared.
+ * The only caller is darwin cleanup when a broker is spared. Darwin has no atomic
+ * "signal iff start time matches" primitive, so `signalRoot` fails closed there
+ * today; it is tried first so this picks up an identity-bound signal if the platform
+ * ever gains one. The fallback re-reads the incarnation right before a raw `kill(2)`.
+ * That is the same check-then-kill race the native `killTree` accepts per node on
+ * darwin (slightly wider here because of the JS and napi hop), and narrower than
+ * `killTree`'s unchecked process-group signal, which this path replaces. The
+ * `signalRoot` rule against raw-pid fallback covers broker retirement, where failing
+ * closed just spares the broker; here failing closed would leak an owned process.
  * Returns whether a signal was delivered.
  */
 export function signalOwnedProcessAlone(

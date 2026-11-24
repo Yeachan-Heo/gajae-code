@@ -588,5 +588,37 @@ describe("bash-shell-guardian", () => {
 			expect(delivered).toBe(false);
 			expect(attempts).toBe(1);
 		});
+
+		it.skipIf(process.platform !== "darwin")(
+			"kills a real owned process and spares one whose recorded incarnation no longer matches",
+			async () => {
+				const { Process } = await import("@gajae-code/natives");
+				const deps = {
+					incarnationOf: (pid: number) => Process.fromPid(pid)?.incarnation,
+					killPid: (pid: number, signal: NodeJS.Signals) => process.kill(pid, signal),
+				};
+				const survivor = Bun.spawn(["sleep", "30"]);
+				const victim = Bun.spawn(["sleep", "30"]);
+				try {
+					const survivorRef = Process.fromPid(survivor.pid);
+					const victimRef = Process.fromPid(victim.pid);
+					if (!survivorRef || !victimRef) throw new Error("process refs unavailable");
+					const stale = {
+						pid: survivorRef.pid,
+						incarnation: "darwin:0:0",
+						signalRoot: (signal: number) => survivorRef.signalRoot(signal),
+					};
+					expect(signalOwnedProcessAlone(stale, deps)).toBe(false);
+					expect(signalOwnedProcessAlone(victimRef, deps)).toBe(true);
+					expect(await victim.exited).not.toBe(0);
+					expect(victim.signalCode).toBe("SIGKILL");
+					expect(survivor.exitCode).toBeNull();
+					expect(survivor.killed).toBe(false);
+				} finally {
+					survivor.kill("SIGKILL");
+					victim.kill("SIGKILL");
+				}
+			},
+		);
 	});
 });
