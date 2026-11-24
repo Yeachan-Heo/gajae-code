@@ -176,18 +176,31 @@ const restoreEnv: (() => void)[] = [];
 delete process.env.GJC_SDK_BROKER_AUTOSTART;
 afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
-	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
+	// Take ownership of this test's directories before stopping their brokers.
+	// A broker stop that throws must fail only the test that owns it: leaving
+	// the directory in `dirs` (and the env unrestored) re-threw the same error
+	// from every later afterEach and failed the rest of the file.
+	const ownedDirs = dirs.splice(0);
+	let brokerStopFailure: unknown;
+	for (const dir of ownedDirs) {
+		try {
+			await brokerOwnerForTest(dir)?.stop();
+		} catch (error) {
+			brokerStopFailure ??= error;
+		}
+	}
 	if (process.platform === "win32") {
 		Bun.gc(true);
 		await Bun.sleep(50);
 	}
-	for (const dir of dirs.splice(0)) await removeTempDir(dir);
+	for (const dir of ownedDirs) await removeTempDir(dir);
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 	for (const restore of restoreEnv.splice(0)) restore();
+	if (brokerStopFailure !== undefined) throw brokerStopFailure;
 });
 
 const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
