@@ -471,23 +471,65 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 /** Lookup options for the GitHub release check. */
 export interface LatestReleaseLookupOptions extends GithubReleaseLookupOptions {
 	channel?: UpdateChannel;
+	/** When true for stable releases, checks that the release has the binary asset for the current platform. */
+	forBinaryUpdate?: boolean;
 }
 
 /**
  * Get the latest release info for a channel from GitHub releases.
  * Stable uses `/releases/latest`. Nightly uses the newest published prerelease.
+ * When checking for binary assets (stable channel with forBinaryUpdate=true),
+ * fetches multiple releases to find one with the binary for the current platform.
  */
 async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
 	const channel = options?.channel ?? "stable";
-	const release = await fetchGithubChannelRelease({ ...options, channel, useAmbientToken: true });
+	const skippedReleases: Array<{ tag: string; version: string }> = [];
+	let requiredBinaryAsset = options?.requiredBinaryAsset;
+
+	const releaseOptions: typeof options & {
+		requiredBinaryAsset?: string;
+		onSkippedRelease?: (tag: string, version: string) => void;
+	} = {
+		...options,
+		channel,
+		useAmbientToken: true,
+	};
+
+	// For stable releases when checking for binary updates, require the binary
+	// asset to be present and try multiple releases until we find one that has it
+	if (channel === "stable" && "forBinaryUpdate" in (options ?? {}) && options?.forBinaryUpdate) {
+		const binaryName = getBinaryName();
+		releaseOptions.requiredBinaryAsset = binaryName;
+		requiredBinaryAsset = binaryName;
+	}
+
+	// When checking for binary assets, set up callback to track skipped releases
+	// If a callback was already provided in options, we still need to track internally
+	if (releaseOptions.requiredBinaryAsset) {
+		const userCallback = releaseOptions.onSkippedRelease;
+		releaseOptions.onSkippedRelease = (tag, version) => {
+			skippedReleases.push({ tag, version });
+			if (userCallback) {
+				userCallback(tag, version);
+			}
+		};
+	}
+
+	const release = await fetchGithubChannelRelease(releaseOptions);
 	if (!isSafeReleaseTag(release.tag)) {
 		throw new Error(`Refusing unsafe GitHub release tag: ${release.tag}`);
 	}
+
+	const warnings = [...(release.warnings || [])];
+	for (const skipped of skippedReleases) {
+		warnings.push(`release ${skipped.tag} has no asset for ${requiredBinaryAsset} yet`);
+	}
+
 	return {
 		tag: release.tag,
 		version: release.version || versionFromTag(release.tag),
 		registry: `https://github.com/${RELEASE_REPO}`,
-		warnings: release.warnings,
+		warnings,
 	};
 }
 
@@ -2166,9 +2208,14 @@ export async function runUpdateCommand(
 		return flushTelemetryBeforeExit();
 	}
 
+	// For binary and migration updates, check that the release has the binary asset
+	// for the current platform. Otherwise, fall back to the latest stable release
+	// without checking for assets (e.g., for npm/bun installations).
+	const forBinaryUpdate = target?.method === "binary" || target?.method === "migrate";
+
 	let release: ReleaseInfo;
 	try {
-		release = await lookupRelease({ channel });
+		release = await lookupRelease({ channel, forBinaryUpdate });
 	} catch (err) {
 		record("update_check_completed", { channel, result: "failed" });
 		console.error(chalk.red(`Failed to check for updates: ${err}`));

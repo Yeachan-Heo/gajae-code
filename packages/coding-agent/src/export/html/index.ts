@@ -4,7 +4,11 @@ import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
 import { APP_NAME, isCredentialKey, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
-import { SessionManager } from "../../session/session-manager";
+import {
+	RESUME_TRANSCRIPT_MAX_BYTES,
+	SessionManager,
+	SessionTranscriptOversizedError,
+} from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
 import { cssColorOrFallback } from "./css-color";
 import { openHtmlExportDestination } from "./html-export-destination";
@@ -354,28 +358,20 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
 	const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
 
-	let sm: SessionManager;
-	const artifactRoot = inputPath.endsWith(".jsonl") ? inputPath.slice(0, -6) : inputPath;
-	const hasExistingSidecars = (
-		await Promise.all(
-			["idx", "tail", "commit"].map(kind =>
-				Bun.file(path.join(artifactRoot, `.session-memory.spill.${kind}`)).exists(),
-			),
-		)
-	).some(Boolean);
 	if (!(await Bun.file(inputPath).exists())) throw new Error(`File not found: ${inputPath}`);
 	await assertExportDoesNotAliasSource(inputPath, outputPath);
 
+	// Another process may be writing this session: export reads a detached snapshot and
+	// never writes to the transcript or its artifact directory.
+	let sm: SessionManager;
 	try {
-		sm = await SessionManager.open(
-			inputPath,
-			undefined,
-			undefined,
-			"copy-retain",
-			hasExistingSidecars ? "off" : "enabled",
-		);
+		sm = await SessionManager.openReadOnlySnapshot(inputPath);
 	} catch (err) {
 		if (isEnoent(err)) throw new Error(`File not found: ${inputPath}`);
+		if (err instanceof SessionTranscriptOversizedError)
+			throw new Error(
+				`Session transcript is too large to export (${err.size} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes): ${inputPath}`,
+			);
 		throw err;
 	}
 

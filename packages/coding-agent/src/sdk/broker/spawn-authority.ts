@@ -133,6 +133,15 @@ export type SpawnAuthorityV1 = {
 	/** Launch locator, so a colliding generation/pid in another workspace cannot pass. */
 	endpointCwd?: string;
 	endpointStateRoot?: string;
+	/**
+	 * Canonical (symlink-resolved) path of `endpointStateRoot`, taken when the
+	 * child host registered. Ownership attribution compares only this value: the
+	 * stored spelling is never re-resolved later, since a retargeted symlink would
+	 * then name another directory. Absent on rows written before it existed, and
+	 * when the root could not be resolved; such a row attributes the child to no
+	 * listed row.
+	 */
+	endpointStateRootIdentity?: string;
 	closeState: SpawnAuthorityCloseState;
 	orphanedAt?: number;
 	orphanRecoveredAt?: number;
@@ -141,6 +150,9 @@ export type SpawnAuthorityV1 = {
 	createdAt: number;
 	updatedAt: number;
 };
+
+/** The spawning master of one child session id and the canonical state roots its host registered in. */
+export type SpawnOwnerRecord = { ownerSessionId: string; stateRoots: ReadonlySet<string> };
 
 export type SpawnClaimTransition = {
 	claimId: string;
@@ -283,6 +295,7 @@ const AUTHORITY_KEYS = new Set([
 	"endpointIncarnation",
 	"endpointCwd",
 	"endpointStateRoot",
+	"endpointStateRootIdentity",
 	"closeState",
 	"orphanedAt",
 	"orphanRecoveredAt",
@@ -410,6 +423,7 @@ export function isSpawnAuthorityV1(value: unknown): value is SpawnAuthorityV1 {
 		(authority.endpointIncarnation === undefined || isOpaque(authority.endpointIncarnation)) &&
 		(authority.endpointCwd === undefined || isOpaque(authority.endpointCwd)) &&
 		(authority.endpointStateRoot === undefined || isOpaque(authority.endpointStateRoot)) &&
+		(authority.endpointStateRootIdentity === undefined || isOpaque(authority.endpointStateRootIdentity)) &&
 		(authority.nativeSessionId === undefined || isOpaque(authority.nativeSessionId)) &&
 		(authority.pid === undefined || isPositiveInteger(authority.pid)) &&
 		(authority.processIncarnation === undefined || isOpaque(authority.processIncarnation)) &&
@@ -724,17 +738,26 @@ export class SpawnAuthorityStore {
 	}
 
 	/**
-	 * Spawning master per child session id. A child that more than one recorded
-	 * authority attributes to different owners is omitted: ownership is reported
-	 * only when the durable evidence names exactly one master.
+	 * Spawning master per child session id, with the canonical state roots the
+	 * child's host registered in. A child that more than one recorded authority
+	 * attributes to different owners is omitted: ownership is reported only when
+	 * the durable evidence names exactly one master. An authority without a
+	 * registration-time canonical root (pre-pin, or written before that field
+	 * existed) contributes no root, so on its own it attributes the child to no row.
 	 */
-	spawnOwnersByChild(): ReadonlyMap<string, string> {
-		const owners = new Map<string, string>();
+	spawnOwnersByChild(): ReadonlyMap<string, SpawnOwnerRecord> {
+		const owners = new Map<string, { ownerSessionId: string; stateRoots: Set<string> }>();
 		const conflicted = new Set<string>();
 		for (const authority of this.#authorities.values()) {
 			const prior = owners.get(authority.childId);
-			if (prior !== undefined && prior !== authority.ownerSessionId) conflicted.add(authority.childId);
-			else owners.set(authority.childId, authority.ownerSessionId);
+			if (prior !== undefined && prior.ownerSessionId !== authority.ownerSessionId) {
+				conflicted.add(authority.childId);
+				continue;
+			}
+			const entry = prior ?? { ownerSessionId: authority.ownerSessionId, stateRoots: new Set<string>() };
+			if (authority.endpointStateRootIdentity !== undefined)
+				entry.stateRoots.add(authority.endpointStateRootIdentity);
+			owners.set(authority.childId, entry);
 		}
 		for (const childId of conflicted) owners.delete(childId);
 		return owners;

@@ -1,7 +1,7 @@
 import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
-import { logger, TempDir } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../../package.json" with { type: "json" };
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
@@ -13,6 +13,9 @@ import {
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(75_000);
 
@@ -104,7 +107,7 @@ export function createFixture(
 	} = {},
 ): Promise<Fixture> {
 	return (async () => {
-		const tempDir = TempDir.createSync("@acp-cancel-settlement-");
+		const tempDir = trackedTemp.tempDirSync("@acp-cancel-settlement-");
 		const agentDir = path.join(tempDir.path(), "agent");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const token = "acp-cancel-settlement-token";

@@ -877,6 +877,14 @@ export function cleanup(): Promise<void> {
 	return runCleanup(Reason.MANUAL);
 }
 
+/**
+ * For testing: run cleanup callbacks with a specific reason without exiting.
+ * Never use in production code.
+ */
+export function cleanupWithReasonForTest(reason: Reason): Promise<void> {
+	return runCleanup(reason);
+}
+
 interface ProcessOutputDrain {
 	promise: Promise<void>;
 	cancel: () => void;

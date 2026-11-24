@@ -18,6 +18,7 @@ import {
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@gajae-code/ai/providers/openai-codex/constants";
+import { moveCodexInstructionsToInput } from "@gajae-code/ai/providers/openai-codex/request-transformer";
 import { parseTextSignature } from "@gajae-code/ai/providers/openai-responses-shared";
 import { transformMessages } from "@gajae-code/ai/providers/transform-messages";
 import type { AssistantMessage, Message, Model } from "@gajae-code/ai/types";
@@ -59,7 +60,8 @@ export interface OpenAiRemoteCompactionPreserveData {
 export interface OpenAiRemoteCompactionRequest {
 	model: string;
 	input: Array<Record<string, unknown>>;
-	instructions: string;
+	instructions?: string;
+	prompt_cache_key?: string;
 }
 
 export interface OpenAiRemoteCompactionResponse extends OpenAiRemoteCompactionPreserveData {}
@@ -526,6 +528,13 @@ export async function requestOpenAiRemoteCompaction(
 		Authorization: `Bearer ${apiKey}`,
 		...(model.headers ?? {}),
 	};
+
+	// codex-rs routes `/responses/compact` through `build_responses_request`, so on the
+	// ChatGPT Codex backend the instructions ride as a tagged leading input item. The
+	// public OpenAI API keeps the documented top-level `instructions` field.
+	if (model.provider === "openai-codex") {
+		moveCodexInstructionsToInput(request);
+	}
 
 	// OpenAI code backend endpoints require additional auth headers
 	if (model.provider === "openai-codex") {

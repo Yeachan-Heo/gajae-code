@@ -349,3 +349,40 @@ describe("remote compaction invalid_prompt termination (issue #2282)", () => {
 		expect(sentBody).toContain("<\u200b|channel|>");
 	});
 });
+
+describe("remote compaction base instructions placement", () => {
+	async function captureCompactionBody(provider: "openai" | "openai-codex"): Promise<Record<string, unknown>> {
+		let body: Record<string, unknown> | undefined;
+		using _hook = hookFetch(async (_input, init) => {
+			body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return Response.json({ output: [{ type: "compaction_summary", summary: "compact" }] });
+		});
+		await requestOpenAiRemoteCompaction(
+			makeOpenAiModel({ provider }),
+			"test-key",
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+			"Base instructions.",
+		);
+		if (!body) throw new Error("compaction request was not sent");
+		return body;
+	}
+
+	test("openai-codex sends instructions as a leading model.base_instructions developer message", async () => {
+		const body = await captureCompactionBody("openai-codex");
+		expect(body.instructions).toBeUndefined();
+		const [first] = body.input as Array<Record<string, unknown>>;
+		expect(first).toMatchObject({
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: "Base instructions." }],
+			internal_chat_message_metadata_passthrough: { content_item_kinds: ["model.base_instructions"] },
+		});
+	});
+
+	test("public openai keeps the top-level instructions field", async () => {
+		const body = await captureCompactionBody("openai");
+		expect(body.instructions).toBe("Base instructions.");
+		const input = body.input as Array<Record<string, unknown>>;
+		expect(input.some(item => item.role === "developer")).toBe(false);
+	});
+});

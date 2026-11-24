@@ -56,11 +56,19 @@ export function standardizeMacOSPath(p: string): string {
 }
 
 export function resolveEquivalentPath(inputPath: string): string {
-	const resolvedPath = path.resolve(inputPath);
+	return resolveExistingEquivalentPath(inputPath) ?? path.resolve(inputPath);
+}
+
+/**
+ * Canonical (symlink-resolved) path of an existing filesystem object, or
+ * undefined when it cannot be resolved. `resolveEquivalentPath` is this plus a
+ * lexical fallback, so values from the two always agree for existing paths.
+ */
+export function resolveExistingEquivalentPath(inputPath: string): string | undefined {
 	try {
-		return fs.realpathSync(resolvedPath);
+		return fs.realpathSync(path.resolve(inputPath));
 	} catch {
-		return resolvedPath;
+		return undefined;
 	}
 }
 

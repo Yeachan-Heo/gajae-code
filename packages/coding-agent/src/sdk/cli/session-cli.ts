@@ -14,6 +14,7 @@ import {
 import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
+import { normalizeBrokerLockRefusalError } from "../broker/lock-refusal";
 import { resolveSessionLocator } from "../broker/session-index";
 import {
 	MASTER_OWNER_SESSION_ENV,
@@ -25,6 +26,7 @@ import {
 	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { BrokerStartupError } from "../broker/startup-failure";
 import { bounded, readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
@@ -229,6 +231,25 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	});
 }
 
+/**
+ * `broker_unavailable` with the fixed `lock_refused` diagnostic when a detached
+ * broker refused an existing `broker.lock`; `undefined` for any other error.
+ * Neither the lock path nor the broker's message is exposed.
+ * Unwraps AggregateError to handle cleanup failures alongside primary refusal.
+ */
+export function brokerLockRefusalFailure(error: unknown, details?: unknown): PublicCommandFailure | undefined {
+	const normalized = normalizeBrokerLockRefusalError(error);
+	if (normalized.refusalCode === undefined) {
+		// Also check BrokerStartupError with lockRefused (when refusal code info was lost)
+		if (!(normalized.primaryError instanceof BrokerStartupError) || !normalized.primaryError.lockRefused)
+			return undefined;
+	}
+	return new PublicCommandFailure({
+		...sdkPublicFailure("broker_unavailable", details, "pre-send").input,
+		diagnostics: normalized.cleanupUnverified ? ["lock_refused", "broker_cleanup_unverified"] : ["lock_refused"],
+	});
+}
+
 function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): PublicCommandFailure {
 	if (error instanceof PublicCommandFailure)
 		return new PublicCommandFailure({
@@ -243,6 +264,8 @@ function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): Publi
 			],
 		});
 	const context = { sessionId: args.sessionId, operationRef: args.opRef, idempotencyKey: args.idempotencyKey };
+	const lockFailure = brokerLockRefusalFailure(error, context);
+	if (lockFailure) return lockFailure;
 	if (error instanceof SdkSessionCliError)
 		return sdkPublicFailure(
 			error.exitCode === 2 && error.code !== "invalid_json" ? "usage" : error.code,
@@ -2330,7 +2353,8 @@ async function resolveCloseAuthority(
 		typeof row.endpointIncarnation !== "string" ||
 		!/^[a-f0-9]{64}$/u.test(row.endpointIncarnation)
 	)
-		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} has no live endpoint authority.`, 1);
+		// Refused while resolving authority: no close request was sent and no key was bound.
+		throw sdkPublicFailure("session_unavailable", { sessionId }, "pre-send");
 	return { endpointGeneration: row.endpointGeneration, endpointIncarnation: row.endpointIncarnation };
 }
 
@@ -2418,10 +2442,15 @@ async function runRawGlobal(
 			throw failure;
 		}
 	} catch (error) {
-		throw normalizeSessionFailure(error, {
+		const failure = normalizeSessionFailure(error, {
 			...args,
 			sessionId: typeof input.sessionId === "string" ? input.sessionId : args.sessionId,
 		});
+		// The raw global command path does not name the operation; carry it so a busy or stale
+		// close gets close guidance (wait and retry the same key) instead of steering advice.
+		throw operation === "session.close"
+			? new PublicCommandFailure({ ...failure.input, sessionClose: true })
+			: failure;
 	}
 	return response;
 }
@@ -2525,6 +2554,8 @@ export async function runSdkSessionCli(
 			const input = await inputFromArgs(args);
 			if (input.sessionId !== undefined && input.sessionId !== sessionId)
 				throw new SdkSessionCliError("invalid_input", "Close sessionId does not match the selected session.", 2);
+			if (args.ifIdle && Object.hasOwn(input, "ifIdle") && input.ifIdle !== true)
+				throw new SdkSessionCliError("invalid_input", "--if-idle conflicts with the JSON input ifIdle value.", 2);
 			const secretError = validateAdapterSecretFields("session.close", input);
 			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 			const lifecycle = deps.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -512,14 +513,14 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		await withFileLock(
 			lockedFile,
 			async () => {
-				const realOpen = fs.open;
-				vi.spyOn(fs, "open").mockImplementation((async (target, flags, mode) => {
+				const realOpenSync = fsSync.openSync;
+				vi.spyOn(fsSync, "openSync").mockImplementation(((target, flags, mode) => {
 					if (!deniedInfoRead && String(target) === lockInfoPath) {
 						deniedInfoRead = true;
 						throw Object.assign(new Error("metadata temporarily locked"), { code: "EPERM" });
 					}
-					return await realOpen(target, flags, mode);
-				}) as typeof fs.open);
+					return realOpenSync(target, flags, mode);
+				}) as typeof fsSync.openSync);
 				contender = withFileLock(
 					lockedFile,
 					async () => {
@@ -2486,7 +2487,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		const attempt = withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
 		await expect(attempt).rejects.toMatchObject({
 			code: "acquire_timeout",
-			removalFailure: { outcome: "error", code: "EACCES" },
+			removalFailure: { outcome: "error", code: "sharing_violation" },
 		});
 		await expect(attempt).rejects.toThrow(/Failed to remove file lock tree: sharing_violation/);
 	});

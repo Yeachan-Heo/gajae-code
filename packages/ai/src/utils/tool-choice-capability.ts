@@ -386,7 +386,7 @@ export interface ResolveToolChoiceResult {
 	targetToolName?: string;
 }
 
-function requestedToolChoiceLevel(requested: ToolChoice | undefined): {
+export function requestedToolChoiceLevel(requested: ToolChoice | undefined): {
 	requestedLevel: ToolChoiceSupport;
 	targetToolName?: string;
 } {

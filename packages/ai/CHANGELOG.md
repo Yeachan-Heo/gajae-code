@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-19
+
+### Added
+
+- `classifyFallbackTrigger` marks a `rate_limit` trigger with `concurrencyLimited: true` when its typed code says the account is running its maximum number of parallel requests (`session_limit_reached`, `concurrency_limit_exceeded`, `concurrent_request_limit_exceeded`, `too_many_concurrent_requests`), so callers can wait for a free slot instead of failing over.
+
+- Added Rapid-MLX local provider support with OpenAI-compatible model discovery, `RAPID_MLX_BASE_URL`, and optional `RAPID_MLX_API_KEY` authentication. For built-in OpenAI-compatible inference, provider identity selects the transport: `rapid-mlx` uses the direct-transport fetch and every other provider keeps the ambient proxy-aware `fetch`. The endpoint check then decides whether a direct socket is used, so only an HTTP(S) loopback endpoint is dialed directly and a non-loopback endpoint falls back to the ambient `fetch`. A caller-supplied `fetch` wins for inference and owns its transport and redirect policy. Registry discovery is a separate rule: a loopback `/models` probe is direct for the `rapid-mlx` provider and for any custom provider with `discovery.type: rapid-mlx`, so a custom provider can bypass the proxy for `/models` while its inference still uses the ambient `fetch`; an inference `fetch` override does not control discovery. Transport selection follows provider identity for inference, so another loopback provider keeps its documented proxy configuration.
+
+- Bundled GPT-6.2 Astra (`gpt-6.2-astra`) and GPT-6.2 Sol (`gpt-6.2-sol`), released 2026-11-17, on `openai`, `openai-codex`, `opencode-zen`, `openrouter` (including `-pro` and `:batch` variants), `kilo` (including `-pro` and `-fast`), `vercel-ai-gateway` (including `-fast`), and `venice` (`openai-gpt-62-astra`, `openai-gpt-62-sol`, and their `-pro` variants). Both have a 1.05M context window, 128K max output, text and image input, and `low` through `max` reasoning effort.
+- GPT-6.2 Astra pricing: $8 input / $40 output / $0.40 cached input / $10 cache write per 1M tokens; above 272K input tokens, $16 / $60 / $0.80 / $20.
+- GPT-6.2 Sol pricing: $2 input / $10 output / $0.10 cached input / $2.50 cache write per 1M tokens; above 272K input tokens, $4 / $15 / $0.20 / $5.
+- GPT-6.2 Astra and Sol accept the ultrafast service tier on `openai`, `openai-codex`, and `opencode-zen`.
+
+### Changed
+
+- GPT-6.2 Astra replaces GPT-6 Astra as the first OpenAI Codex model in the model selector. GPT-6 Astra stays in the catalog and can still be selected.
+
+### Fixed
+
+- MCP OAuth token refresh requires HTTPS unless the token endpoint host is loopback, including IPv4-mapped loopback literals.
+- A stored non-loopback HTTP MCP binding no longer fails the whole auth-broker snapshot; it fails transport admission at use instead, and new bindings cannot be uploaded over cleartext.
+
+- Configured `org:` credential preferences match the organization id only and are skipped when no active OAuth row or several active OAuth rows hold it, so an ambiguous or removed organization never fails credential selection or moves to another organization by display name.
+- The auth-broker client's credential inventory now includes the email, account id, project id, and organization of active OAuth rows (no token material), matching the local store.
+
+## [0.21.1] - 2026-11-17
+
+### Fixed
+
+- Schema normalization for Cloud Code Assist (CCA) now correctly filters type-specific keys when collapsing mixed-type `anyOf` variants. Previously, when collapsing `anyOf: [{ type: "string", ... }, { type: "array", items: {...} }]` to a single type (string variant first), the collapsed schema would retain `items` from the array variant, resulting in invalid schemas with type-mismatched keys. The fix ensures only keys valid for the chosen type are carried forward (issue #7808).
+
 ## [0.21.0] - 2026-11-16
 
 ### Added

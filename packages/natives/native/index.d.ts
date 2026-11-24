@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -414,7 +415,8 @@ export declare class Process {
    * Unlike [`Self::from_pid`] returning `null` (which conflates a confirmed-
    * dead pid with one that simply could not be queried), this keeps positive
    * OS-reported absence separate from every inconclusive outcome. It never
-   * signals, kills, reaps, waits on, or spawns any process.
+   * signals, kills, reaps, blocks waiting for, or spawns any process. Windows
+   * checks exit state with a zero-timeout wait on its own handle.
    */
   static observe(pid: number): NativeProcessObservation
   /** Operating-system process identifier for this process reference. */
@@ -686,7 +688,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_21_0(): void
+export declare function __piNativesV0_22_0(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -2453,7 +2455,8 @@ export interface NativePermissionRepairResult {
  * - `"present"` — `incarnation` is the exact kernel-reported identity
  *   evidence.
  * - `"absent"` — the OS positively confirmed no process currently has this
- *   pid.
+ *   pid, or (Windows) that the process has exited while a handle still keeps
+ *   its object queryable.
  * - `"unknown"` — `reasonCode` explains why liveness could not be determined
  *   (e.g. an invalid pid, a permission denial, or a platform limitation); this
  *   is never proof of death.

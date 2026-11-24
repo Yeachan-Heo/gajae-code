@@ -320,7 +320,8 @@ function parseCodexAuth(raw: string, source: string): ImportableCredential | Ski
 			access,
 			refresh,
 			expires: expiresAt ?? Date.now(),
-			...(accountId ? { accountId } : {}),
+			// The ChatGPT workspace id is also the credential's organization: one login holds a row per workspace.
+			...(accountId ? { accountId, organizationId: accountId } : {}),
 			...(email ? { email } : {}),
 		};
 		const identity =

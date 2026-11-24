@@ -739,6 +739,18 @@ export interface CredentialDisabledEvent {
 }
 
 /**
+ * Event payload describing an OAuth authorization warning.
+ *
+ * This is used to surface OAuth-related warnings (e.g., account suspension risk)
+ * via a persistent event subscription rather than optional callbacks, ensuring
+ * SDK consumers always receive important warnings even without callback handlers.
+ */
+export interface OAuthWarningEvent {
+	provider: string;
+	message: string;
+}
+
+/**
  * How {@link AuthStorage} orders multiple healthy OAuth credentials of the same
  * provider:type pool when selecting one for a (new) session.
  *
@@ -1099,7 +1111,8 @@ const USAGE_CACHE_PREFIX = "usage_cache:";
  * Argon / Claude-GPT quota pools; schema 1 rows carry window `default` with
  * per-model labels and pool nothing.
  */
-const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2 };
+// openai-codex 2: reports carry the ChatGPT workspace id as `orgId`, so cached reports without it are not reused.
+const USAGE_REPORT_SCHEMA_VERSIONS: Readonly<Record<string, number>> = { "google-antigravity": 2, "openai-codex": 2 };
 
 function usageReportSchemaTag(provider: string): string {
 	const version = USAGE_REPORT_SCHEMA_VERSIONS[provider];
@@ -1170,6 +1183,12 @@ const OAUTH_REFRESH_SKEW_MS = 60_000;
  * pathological detach-without-reattach loops can't grow memory unboundedly.
  */
 const MAX_PENDING_DISABLED_EVENTS = 32;
+/**
+ * Cap on the buffered OAuth warning backlog held while no handler is attached.
+ * OAuth warnings (e.g., account suspension risk) are critical for SDK consumers,
+ * so this is bounded to prevent unbounded memory growth in edge cases.
+ */
+const MAX_PENDING_OAUTH_WARNING_EVENTS = 16;
 /**
  * Cap on how many times an OAuth resolution may reload the credential store and
  * re-resolve after a failed refresh. Each retry exists to recover from a peer
@@ -1736,6 +1755,14 @@ export class AuthStorage {
 	 * but a process that runs without subscribers for a long time shouldn't grow this unboundedly).
 	 */
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
+	#oauthWarningListeners: Set<(event: OAuthWarningEvent) => void | Promise<void>> = new Set();
+	/**
+	 * Buffer for OAuth warning events fired while no listener is subscribed.
+	 * Drained (in insertion order) to the first listener that triggers the empty→non-empty
+	 * transition via {@link AuthStorage.onOAuthWarning}. Bounded at
+	 * {@link MAX_PENDING_OAUTH_WARNING_EVENTS}; oldest entries are dropped to keep memory predictable.
+	 */
+	#pendingOAuthWarningEvents: OAuthWarningEvent[] = [];
 	#generation = 1;
 	#providerGenerations = new Map<string, number>();
 	#providerConfigurationGenerations = new Map<string, number>();
@@ -2118,6 +2145,39 @@ export class AuthStorage {
 		}
 		return () => {
 			this.#credentialDisabledListeners.delete(listener);
+		};
+	}
+
+	/**
+	 * Subscribe to {@link OAuthWarningEvent}s. Multiple subscribers are supported and
+	 * each fires for every warning event; subscribers are invoked in registration order with
+	 * exceptions and async rejections isolated per-listener so a misbehaving subscriber
+	 * cannot break the warning path or starve the rest of the chain.
+	 *
+	 * If `oauth_warning` events were emitted while no listener was subscribed, they are
+	 * replayed (in insertion order) to the listener that triggers the empty→non-empty
+	 * transition. The drain is one-shot — listeners that subscribe after that no longer see
+	 * past events.
+	 *
+	 * Returns an unsubscribe function. The function is idempotent: calling it more than once
+	 * is a no-op. After every subscriber has unsubscribed, subsequent warning events buffer
+	 * again until the next subscribe.
+	 *
+	 * @param listener Callback invoked with each warning event. May be sync or async.
+	 * @returns A function that removes this listener from the subscriber set.
+	 */
+	onOAuthWarning(listener: (event: OAuthWarningEvent) => void | Promise<void>): () => void {
+		const wasEmpty = this.#oauthWarningListeners.size === 0;
+		this.#oauthWarningListeners.add(listener);
+		if (wasEmpty && this.#pendingOAuthWarningEvents.length > 0) {
+			const drained = this.#pendingOAuthWarningEvents;
+			this.#pendingOAuthWarningEvents = [];
+			for (const event of drained) {
+				this.#invokeOAuthWarningListener(listener, event);
+			}
+		}
+		return () => {
+			this.#oauthWarningListeners.delete(listener);
 		};
 	}
 
@@ -3916,6 +3976,42 @@ export class AuthStorage {
 		}
 	}
 
+	#emitOAuthWarning(event: OAuthWarningEvent): void {
+		if (this.#oauthWarningListeners.size === 0) {
+			// No subscribers — buffer for later replay. Cap the backlog so a process that runs
+			// without subscribers for a long time can't grow memory unboundedly; drop oldest
+			// under pressure.
+			if (this.#pendingOAuthWarningEvents.length >= MAX_PENDING_OAUTH_WARNING_EVENTS) {
+				this.#pendingOAuthWarningEvents.shift();
+			}
+			this.#pendingOAuthWarningEvents.push(event);
+			return;
+		}
+		// Snapshot before iteration so a listener that subscribes/unsubscribes during fan-out
+		// can't observe a partially-mutated set or receive an event it just registered for.
+		const listeners = [...this.#oauthWarningListeners];
+		for (const listener of listeners) {
+			this.#invokeOAuthWarningListener(listener, event);
+		}
+	}
+
+	#invokeOAuthWarningListener(
+		listener: (event: OAuthWarningEvent) => void | Promise<void>,
+		event: OAuthWarningEvent,
+	): void {
+		const logListenerError = (error: unknown): void => {
+			logger.warn("onOAuthWarning listener threw", { provider: event.provider, error: String(error) });
+		};
+		try {
+			const result = listener(event);
+			if (result && typeof (result as PromiseLike<void>).then === "function") {
+				(result as Promise<void>).catch(logListenerError);
+			}
+		} catch (error) {
+			logListenerError(error);
+		}
+	}
+
 	/**
 	 * Get credential for a provider (first entry if multiple).
 	 */
@@ -4331,6 +4427,30 @@ export class AuthStorage {
 				break;
 			}
 			case "google-gemini-cli": {
+				const warningMessage =
+					"⚠️  WARNING: Google may suspend accounts using Gemini subscription OAuth through third-party clients like this one. Consider using the Google provider (google) or Vertex AI (google-vertex) for direct API key authentication instead to avoid account suspension risk.";
+				// Emit warning via both event system (for SDK consumers without callbacks) and onProgress callback (for CLI/UI).
+				// IMPORTANT: Emit BEFORE calling login function to surface warning before OAuth URL is generated.
+				this.#emitOAuthWarning({ provider, message: warningMessage });
+				ctrl.onProgress?.(warningMessage);
+				// Require explicit confirmation before proceeding with OAuth.
+				if (ctrl.onConfirmWarning) {
+					// SDK path: use the dedicated confirmation callback
+					const confirmed = await ctrl.onConfirmWarning({ provider, message: warningMessage });
+					if (!confirmed) {
+						throw new Error("OAuth authorization was declined by user");
+					}
+				} else if (ctrl.onPrompt) {
+					// CLI/TUI path: use onPrompt to get explicit confirmation
+					const answer = await ctrl.onPrompt({
+						message: `${warningMessage}\n\nContinue with Gemini CLI OAuth authorization? (yes/no)`,
+						allowEmpty: false,
+					});
+					const confirmed = /^(yes|y)$/i.test(answer);
+					if (!confirmed) {
+						throw new Error("OAuth authorization was declined by user");
+					}
+				}
 				const { loginGeminiCli } = await import("./utils/oauth/google-gemini-cli");
 				credentials = await loginGeminiCli({
 					...ctrl,
@@ -5247,8 +5367,8 @@ export class AuthStorage {
 		const email = this.#getUsageReportMetadataValue(report, "email");
 		if (email) identifiers.push(`email:${email.toLowerCase()}`);
 		if (report.provider === "openai-codex" || report.provider === "anthropic") {
-			// One Anthropic account can sign in to several organizations; each has its own limits.
-			const orgId = report.provider === "anthropic" ? this.#getUsageReportMetadataValue(report, "orgId") : undefined;
+			// One account can sign in to several Anthropic organizations or ChatGPT workspaces; each has its own limits.
+			const orgId = this.#getUsageReportMetadataValue(report, "orgId");
 			if (orgId) return identifiers.map(identifier => `${report.provider}:${identifier}|org:${orgId}`.toLowerCase());
 			return identifiers.map(identifier => `${report.provider}:${identifier.toLowerCase()}`);
 		}

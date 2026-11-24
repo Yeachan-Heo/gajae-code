@@ -1,0 +1,336 @@
+import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	AuthStorage,
+	type ConfiguredCredentialPreference,
+	type OAuthCredential,
+	SqliteAuthCredentialStore,
+} from "../src/auth-storage";
+import { openaiCodexUsageProvider } from "../src/usage/openai-codex";
+
+const EMAIL = "user@example.com";
+const TEAM = { id: "ws-team", name: "Acme Team" };
+const PERSONAL = { id: "ws-personal", name: "Personal" };
+
+const originalFetch = global.fetch;
+
+function codexAccessToken(workspaceId: string, suffix: string): string {
+	const payload = {
+		"https://api.openai.com/auth": { chatgpt_account_id: workspaceId },
+		"https://api.openai.com/profile": { email: EMAIL },
+		suffix,
+	};
+	return `header.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.signature`;
+}
+
+function workspaceOf(accessToken: string): string | undefined {
+	const payload = JSON.parse(Buffer.from(accessToken.split(".")[1] ?? "", "base64url").toString("utf8")) as {
+		"https://api.openai.com/auth"?: { chatgpt_account_id?: string };
+	};
+	return payload["https://api.openai.com/auth"]?.chatgpt_account_id;
+}
+
+function json(body: unknown, status = 200): Response {
+	return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+
+/** The ChatGPT workspace list as `wham/accounts/check` returns it: the personal workspace has no name. */
+function workspaceList(): Response {
+	return json({
+		accounts: [
+			{ id: TEAM.id, structure: "workspace", plan_type: "team", name: TEAM.name },
+			{ id: PERSONAL.id, structure: "personal", plan_type: "pro", name: null },
+		],
+	});
+}
+
+interface CodexBackend {
+	/** Workspace the next token exchange or refresh is bound to. */
+	workspaceId: string;
+	suffix: string;
+	workspaceLookup: () => Response;
+	usedPercentByWorkspace: Record<string, number>;
+}
+
+function installCodexBackend(backend: CodexBackend): void {
+	global.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input instanceof Request ? input.url : input);
+		if (url.endsWith("/deviceauth/usercode"))
+			return json({ device_auth_id: "device", user_code: "CODE", interval: 0 });
+		if (url.endsWith("/deviceauth/token")) return json({ authorization_code: "code", code_verifier: "verifier" });
+		if (url === "https://auth.openai.com/oauth/token") {
+			return json({
+				access_token: codexAccessToken(backend.workspaceId, backend.suffix),
+				refresh_token: `refresh-${backend.suffix}`,
+				expires_in: 3600,
+			});
+		}
+		if (url.endsWith("/wham/accounts/check")) return backend.workspaceLookup();
+		if (url.endsWith("/wham/usage")) {
+			const authorization = new Headers(init?.headers).get("authorization") ?? "";
+			const workspaceId = workspaceOf(authorization.replace(/^Bearer /, ""));
+			const usedPercent = workspaceId ? backend.usedPercentByWorkspace[workspaceId] : undefined;
+			if (usedPercent === undefined) return new Response("unauthorized", { status: 401 });
+			return json({
+				plan_type: "team",
+				rate_limit: {
+					allowed: usedPercent < 100,
+					limit_reached: usedPercent >= 100,
+					primary_window: { used_percent: usedPercent, limit_window_seconds: 18_000, reset_after_seconds: 600 },
+					secondary_window: { used_percent: 1, limit_window_seconds: 604_800, reset_after_seconds: 6000 },
+				},
+			});
+		}
+		return new Response("not found", { status: 404 });
+	}) as unknown as typeof fetch;
+}
+
+function readRows(dbPath: string): Array<{ id: number; identity_key: string | null }> {
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		return db
+			.prepare("SELECT id, identity_key FROM auth_credentials WHERE provider = 'openai-codex' ORDER BY id")
+			.all() as Array<{ id: number; identity_key: string | null }>;
+	} finally {
+		db.close();
+	}
+}
+
+describe("AuthStorage openai-codex workspaces", () => {
+	let tempDir = "";
+	let dbPath = "";
+	let store: SqliteAuthCredentialStore;
+	let authStorage: AuthStorage;
+	let backend: CodexBackend;
+
+	function createStorage(preferences?: readonly ConfiguredCredentialPreference[]): AuthStorage {
+		return new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "openai-codex" ? openaiCodexUsageProvider : undefined),
+			// Resolve per call: each test swaps `global.fetch` after construction.
+			usageFetch: ((input: string | URL | Request, init?: RequestInit) => global.fetch(input, init)) as typeof fetch,
+			...(preferences ? { credentialPreferences: { "openai-codex": preferences } } : {}),
+		});
+	}
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-codex-workspaces-"));
+		dbPath = path.join(tempDir, "agent.db");
+		store = await SqliteAuthCredentialStore.open(dbPath);
+		authStorage = createStorage();
+		backend = { workspaceId: TEAM.id, suffix: "initial", workspaceLookup: workspaceList, usedPercentByWorkspace: {} };
+		installCodexBackend(backend);
+		// The device flow waits between polls; the mocked backend answers immediately.
+		vi.spyOn(Bun, "sleep").mockResolvedValue(undefined);
+	});
+
+	afterEach(async () => {
+		global.fetch = originalFetch;
+		vi.restoreAllMocks();
+		store.close();
+		await fs.rm(tempDir, { recursive: true, force: true });
+	});
+
+	async function login(workspaceId: string, suffix: string, storage = authStorage): Promise<void> {
+		backend.workspaceId = workspaceId;
+		backend.suffix = suffix;
+		await storage.login("openai-codex-device", { onAuth: () => {}, onPrompt: async () => "" });
+	}
+
+	function stored(): Array<{ id: number; credential: OAuthCredential }> {
+		return store
+			.listAuthCredentials("openai-codex")
+			.flatMap(entry => (entry.credential.type === "oauth" ? [{ id: entry.id, credential: entry.credential }] : []));
+	}
+
+	it("keeps one credential per workspace of the same login, labeled by workspace", async () => {
+		await login(TEAM.id, "team");
+		await login(PERSONAL.id, "personal");
+
+		expect(stored().map(({ credential }) => [credential.organizationId, credential.organizationName])).toEqual([
+			[TEAM.id, TEAM.name],
+			[PERSONAL.id, PERSONAL.name],
+		]);
+		expect(readRows(dbPath).map(row => row.identity_key)).toEqual([
+			`email:${EMAIL}|org:${TEAM.id}`,
+			`email:${EMAIL}|org:${PERSONAL.id}`,
+		]);
+		expect(authStorage.listCredentialInventory("openai-codex").map(row => row.identityLabel)).toEqual([
+			`${EMAIL} (${TEAM.name})`,
+			`${EMAIL} (${PERSONAL.name})`,
+		]);
+	});
+
+	it("replaces only the matching workspace when it logs in again", async () => {
+		await login(TEAM.id, "team-1");
+		await login(PERSONAL.id, "personal");
+		await login(TEAM.id, "team-2");
+
+		const rows = stored();
+		expect(rows).toHaveLength(2);
+		expect(rows.find(row => row.credential.organizationId === TEAM.id)?.credential.refresh).toBe("refresh-team-2");
+		expect(rows.find(row => row.credential.organizationId === PERSONAL.id)?.credential.refresh).toBe(
+			"refresh-personal",
+		);
+	});
+
+	it("stores the workspace id when the workspace name lookup fails", async () => {
+		backend.workspaceLookup = () => new Response("unavailable", { status: 503 });
+		await login(TEAM.id, "team");
+		backend.workspaceLookup = () => {
+			throw new Error("network down");
+		};
+		await login(PERSONAL.id, "personal");
+
+		expect(stored().map(({ credential }) => [credential.organizationId, credential.organizationName])).toEqual([
+			[TEAM.id, undefined],
+			[PERSONAL.id, undefined],
+		]);
+	});
+
+	it("refreshes without the workspace lookup and keeps the stored workspace name", async () => {
+		await login(TEAM.id, "team");
+		const [team] = stored();
+		if (!team) throw new Error("team row missing");
+		const generationBefore = authStorage.getProviderConfigurationGeneration("openai-codex");
+		// A lookup that never answers must not hold up a refresh that has already rotated the refresh token.
+		let lookups = 0;
+		backend.workspaceLookup = () => {
+			lookups += 1;
+			return new Promise<Response>(() => {}) as unknown as Response;
+		};
+		backend.suffix = "team-refreshed";
+
+		await authStorage.forceRefreshOAuthCredential("openai-codex", team.credential);
+
+		expect(lookups).toBe(0);
+		const [refreshed] = stored();
+		expect(refreshed?.credential.refresh).toBe("refresh-team-refreshed");
+		expect([refreshed?.credential.organizationId, refreshed?.credential.organizationName]).toEqual([
+			TEAM.id,
+			TEAM.name,
+		]);
+		expect(readRows(dbPath).map(row => row.identity_key)).toEqual([`email:${EMAIL}|org:${TEAM.id}`]);
+		// Token rotation for a known workspace is not a configuration change.
+		expect(authStorage.getProviderConfigurationGeneration("openai-codex")).toBe(generationBefore);
+	});
+
+	it("pins and switches by workspace name while the shared email is ambiguous", async () => {
+		await login(TEAM.id, "team");
+		await login(PERSONAL.id, "personal");
+		const [teamRow, personalRow] = stored();
+
+		expect(authStorage.resolveOAuthPinTarget("openai-codex", { kind: "org", value: "personal" }).credentialId).toBe(
+			personalRow?.id,
+		);
+		expect(() => authStorage.resolveOAuthPinTarget("openai-codex", { kind: "email", value: EMAIL })).toThrow(
+			/matches multiple OAuth credentials/,
+		);
+		authStorage.switchSessionCredential("openai-codex", "session-1", { kind: "org", value: TEAM.name });
+		expect(authStorage.getSessionCredentialRowId("openai-codex", "session-1")).toBe(teamRow?.id);
+	});
+
+	it("reports usage per workspace instead of merging the shared email", async () => {
+		await login(TEAM.id, "team");
+		await login(PERSONAL.id, "personal");
+		backend.usedPercentByWorkspace = { [TEAM.id]: 80, [PERSONAL.id]: 5 };
+
+		const reports =
+			(await authStorage.fetchUsageReports())?.filter(report => report.provider === "openai-codex") ?? [];
+		const byWorkspace = Object.fromEntries(
+			reports.map(report => [
+				report.metadata?.orgId,
+				report.limits.find(limit => limit.id === "openai-codex:primary")?.amount.usedFraction,
+			]),
+		);
+		expect(byWorkspace).toEqual({ [TEAM.id]: 0.8, [PERSONAL.id]: 0.05 });
+	});
+
+	async function preferTeamThenPersonal(): Promise<AuthStorage> {
+		await login(TEAM.id, "team");
+		await login(PERSONAL.id, "personal");
+		const preferred = createStorage([
+			{ selector: { kind: "org", value: TEAM.id } },
+			{ selector: { kind: "org", value: PERSONAL.id } },
+		]);
+		await preferred.reload();
+		return preferred;
+	}
+
+	it("uses the preferred workspace ahead of a less-used one, then the next one after a quota failure", async () => {
+		const preferred = await preferTeamThenPersonal();
+		// Balanced ranking alone would pick the less-used personal workspace.
+		backend.usedPercentByWorkspace = { [TEAM.id]: 40, [PERSONAL.id]: 5 };
+
+		expect(workspaceOf((await preferred.getApiKey("openai-codex", "session")) ?? "")).toBe(TEAM.id);
+		expect(await preferred.markUsageLimitReached("openai-codex", "session", { retryAfterMs: 60_000 })).toMatchObject({
+			state: "marked",
+		});
+		expect(workspaceOf((await preferred.getApiKey("openai-codex", "session")) ?? "")).toBe(PERSONAL.id);
+	});
+
+	it("skips a preferred workspace whose usage is exhausted", async () => {
+		const preferred = await preferTeamThenPersonal();
+		backend.usedPercentByWorkspace = { [TEAM.id]: 100, [PERSONAL.id]: 5 };
+
+		expect(workspaceOf((await preferred.getApiKey("openai-codex", "exhausted")) ?? "")).toBe(PERSONAL.id);
+	});
+
+	describe("a row stored before workspaces were tracked", () => {
+		async function seedLegacy(workspaceId: string): Promise<number> {
+			const legacy: OAuthCredential = {
+				type: "oauth",
+				access: codexAccessToken(workspaceId, "legacy"),
+				refresh: "refresh-legacy",
+				expires: Date.now() - 60_000,
+				accountId: workspaceId,
+				email: EMAIL,
+			};
+			const [row] = store.upsertAuthCredentialForProvider("openai-codex", legacy);
+			await authStorage.reload();
+			return row?.id ?? -1;
+		}
+
+		async function refreshLegacy(legacyId: number, workspaceId: string): Promise<void> {
+			const legacy = stored().find(row => row.id === legacyId)?.credential;
+			if (!legacy) throw new Error("legacy row missing");
+			backend.workspaceId = workspaceId;
+			backend.suffix = "legacy-refreshed";
+			await authStorage.forceRefreshOAuthCredential("openai-codex", legacy);
+		}
+
+		it("is not replaced by a login to another workspace and learns its workspace on refresh", async () => {
+			const legacyId = await seedLegacy(PERSONAL.id);
+			await login(TEAM.id, "team");
+			expect(readRows(dbPath).map(row => row.identity_key)).toEqual([
+				`email:${EMAIL}`,
+				`email:${EMAIL}|org:${TEAM.id}`,
+			]);
+
+			await refreshLegacy(legacyId, PERSONAL.id);
+
+			const legacy = stored().find(row => row.id === legacyId)?.credential;
+			// Refresh records the workspace id from the token; the name is only looked up at login.
+			expect([legacy?.organizationId, legacy?.organizationName]).toEqual([PERSONAL.id, undefined]);
+			expect(stored()).toHaveLength(2);
+			expect(readRows(dbPath).find(row => row.id === legacyId)?.identity_key).toBe(
+				`email:${EMAIL}|org:${PERSONAL.id}`,
+			);
+		});
+
+		it("is deduplicated against a login of the same workspace once refresh names it", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			expect(stored()).toHaveLength(2);
+
+			await refreshLegacy(legacyId, TEAM.id);
+
+			const rows = stored();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.id).toBe(legacyId);
+			expect(rows[0]?.credential.organizationId).toBe(TEAM.id);
+		});
+	});
+});

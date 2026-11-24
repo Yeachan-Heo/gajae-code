@@ -1,6 +1,8 @@
 import { getAgentDir, VERSION } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { brokerLockRefusalApiMessage, normalizeBrokerLockRefusalError } from "../broker/lock-refusal";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { BrokerStartupError } from "../broker/startup-failure";
 import { bounded, SdkClientError } from "../client/client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
@@ -125,11 +127,44 @@ function asString(args: Arguments, name: string): string | null {
 }
 
 function resultError(error: unknown): { ok: false; error: { code: string; message: string; path?: string } } {
-	if (error instanceof SessionRouterError) return { ok: false, error: { code: error.phase, message: error.message } };
-	if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
+	// Map lock refusal errors to safe code/message without paths or stderr excerpts.
+	// Unwrap AggregateError to handle cleanup failures alongside primary refusal.
+	const normalized = normalizeBrokerLockRefusalError(error);
+	if (normalized.refusalCode !== undefined) {
+		return {
+			ok: false,
+			error: {
+				code: "broker_unavailable",
+				message: normalized.cleanupUnverified
+					? brokerLockRefusalApiMessage(normalized.refusalCode) + " Spawned broker cleanup was not verified."
+					: brokerLockRefusalApiMessage(normalized.refusalCode),
+			},
+		};
+	}
+	if (normalized.primaryError instanceof BrokerStartupError && normalized.primaryError.lockRefused) {
+		const refusalMsg = normalized.primaryError.refusalCode
+			? brokerLockRefusalApiMessage(normalized.primaryError.refusalCode)
+			: "SDK broker startup refused existing lock (held by an owner whose liveness cannot be verified).";
+		return {
+			ok: false,
+			error: {
+				code: "broker_unavailable",
+				message: normalized.cleanupUnverified
+					? `${refusalMsg} Spawned broker cleanup was not verified.`
+					: refusalMsg,
+			},
+		};
+	}
+	if (normalized.primaryError instanceof SessionRouterError)
+		return { ok: false, error: { code: normalized.primaryError.phase, message: normalized.primaryError.message } };
+	if (normalized.primaryError instanceof SdkClientError)
+		return { ok: false, error: { code: normalized.primaryError.code, message: normalized.primaryError.message } };
 	return {
 		ok: false,
-		error: { code: "unavailable", message: error instanceof Error ? error.message : "SDK request failed" },
+		error: {
+			code: "unavailable",
+			message: normalized.primaryError instanceof Error ? normalized.primaryError.message : "SDK request failed",
+		},
 	};
 }
 

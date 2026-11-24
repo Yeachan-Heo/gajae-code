@@ -3964,6 +3964,7 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the reasoning-content replay
 	// breaker below (DeepSeek "reasoning_content ... must be passed back").
 	let reasoningContentRepairAttempted = false;
+	let retriedMalformedVeniceCall = false;
 	// Consecutive resamples spent on the current turn because its tool arguments
 	// arrived `\uXXXX`-escaped. Reset once a turn gets past the check, so every
 	// turn is judged on its own wire bytes.
@@ -4146,9 +4147,14 @@ async function runLoopBody(
 			const wasEscapedNonAsciiRecoveryAttempt = recoveryAttempt?.kind === "escaped-nonascii";
 			try {
 				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
-					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
-					escapedNonAsciiToolChoice = config.getToolChoice?.();
-					escapedNonAsciiToolChoiceCaptured = true;
+					if (!escapedNonAsciiToolChoiceCaptured) {
+						escapedNonAsciiToolChoice = config.getToolChoice?.();
+						escapedNonAsciiToolChoiceCaptured = true;
+					}
+					const effectiveChoice = escapedNonAsciiToolChoice ?? config.toolChoice;
+					if (retriedMalformedVeniceCall && (!effectiveChoice || effectiveChoice === "auto")) {
+						return "required";
+					}
 					return escapedNonAsciiToolChoice;
 				};
 				const attemptConfig = attemptTransaction
@@ -4290,6 +4296,28 @@ async function runLoopBody(
 					continue;
 				}
 			}
+			// Retry only the rejected completion, never a turn that offered a call
+			// for dispatch. Remove the rejected assistant tail before sending again.
+			if (
+				!retriedMalformedVeniceCall &&
+				!config.fallbackManaged &&
+				escapedToolTransaction &&
+				!escapedToolTransaction.committed &&
+				!escapedToolTransaction.rejected &&
+				(escapedNonAsciiToolChoice ?? config.toolChoice) !== "none" &&
+				!loopSignal.aborted &&
+				message.provider === "venice" &&
+				message.stopReason === "error" &&
+				message.errorCode === "venice_deepseek_malformed_tool_call" &&
+				!message.content.some(block => block.type === "toolCall") &&
+				currentContext.messages.at(-1) === message
+			) {
+				retriedMalformedVeniceCall = true;
+				escapedToolTransaction.discard();
+				currentContext.messages.pop();
+				continue;
+			}
+			retriedMalformedVeniceCall = false;
 			// Session-level invalid_prompt circuit breaker (bounded, neutralize-only).
 			// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is
 			// a deterministic content fault: re-sending the same history re-triggers it,
@@ -5327,7 +5355,11 @@ async function streamAssistantResponse(
 								// tool arguments. Publication does not accept or execute tools:
 								// terminal validation and the consumer drain still precede dispatch.
 								// A published escaped call is rejected rather than silently resampled.
-								provisionalToolTransaction?.commitCallbacksAndUpdates();
+								// Venice DeepSeek can reject a text-bearing attempt at EOF. Keep it
+								// staged until that decision; the transaction's size cap still applies.
+								if (!(config.model.provider === "venice" && /deepseek/i.test(config.model.id))) {
+									provisionalToolTransaction?.commitCallbacksAndUpdates();
+								}
 							}
 							break;
 
@@ -5542,9 +5574,24 @@ async function executeToolCalls(
 		steeringCheck = (async () => {
 			const steering = await getSteeringMessages();
 			if (steering.length > 0) {
-				steeringMessages = steering;
-				interruptState.triggered = true;
-				steeringAbortController.abort();
+				// Check if all steering messages are IRC-sourced.
+				// If so, defer them to the next tool boundary instead of interrupting immediately.
+				const allIrcSourced = steering.every(msg => {
+					const ircPeer = extractIrcSourceIfPresent(msg);
+					return ircPeer !== undefined;
+				});
+
+				if (allIrcSourced && config.requeueSteeringMessages) {
+					// IRC-sourced steering: defer to next tool boundary
+					// Requeue the messages so they're processed after current tools complete
+					config.requeueSteeringMessages(steering);
+					// Don't interrupt: let tools continue and finish naturally
+				} else {
+					// Real user steering or mixed: interrupt immediately
+					steeringMessages = steering;
+					interruptState.triggered = true;
+					steeringAbortController.abort();
+				}
 			}
 		})().finally(() => {
 			steeringCheck = null;
@@ -5939,7 +5986,8 @@ async function executeToolCalls(
 		const interrupted = interruptState.triggered;
 		if (interrupted) {
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(), true);
+			const steeringSource = steeringMessages ? determineSteeringSource(steeringMessages) : "user";
+			emitToolResult(record, createSkippedToolResult(steeringSource), true);
 		} else {
 			emitToolResult(record, result, isError);
 		}
@@ -6024,7 +6072,9 @@ async function executeToolCalls(
 						toolName: record.toolCall.name,
 						status: "skipped",
 					});
-					emitToolResult(record, createSkippedToolResult(), true);
+					const skipSource =
+						interruptState.triggered && steeringMessages ? determineSteeringSource(steeringMessages) : undefined;
+					emitToolResult(record, createSkippedToolResult(skipSource), true);
 				}
 			});
 		if (reservation?.ok) {
@@ -6077,7 +6127,9 @@ async function executeToolCalls(
 				toolName: record.toolCall.name,
 				status: "skipped",
 			});
-			emitToolResult(record, createSkippedToolResult(), true);
+			const skipSource =
+				interruptState.triggered && steeringMessages ? determineSteeringSource(steeringMessages) : undefined;
+			emitToolResult(record, createSkippedToolResult(skipSource), true);
 		}
 	}
 
@@ -6147,9 +6199,43 @@ function createAbortedToolResult(
 	return toolResultMessage;
 }
 
-function createSkippedToolResult(): AgentToolResult<any> {
+/**
+ * Detect if a message is an IRC-sourced custom message and extract the peer name.
+ * Returns the peer name if IRC-sourced, or undefined for user messages.
+ */
+function extractIrcSourceIfPresent(message: AgentMessage): string | undefined {
+	if (message.role !== "custom") return undefined;
+	const customMsg = message as any; // CustomMessage
+	const customType = customMsg.customType;
+	// IRC custom messages have customType starting with "irc:"
+	if (typeof customType === "string" && (customType === "irc:incoming" || customType === "irc:autoreply")) {
+		const details = customMsg.details as any;
+		if (details && typeof details.from === "string") {
+			return details.from;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Determine the source of steering messages (IRC peer name or "user").
+ * If any message in the batch is IRC-sourced, returns the peer name.
+ * Otherwise returns "user" indicating genuine user steering.
+ */
+function determineSteeringSource(messages: AgentMessage[]): string {
+	for (const msg of messages) {
+		const ircPeer = extractIrcSourceIfPresent(msg);
+		if (ircPeer) {
+			return ircPeer;
+		}
+	}
+	return "user";
+}
+
+function createSkippedToolResult(source?: string): AgentToolResult<any> {
+	const sourceLabel = source === "user" ? "user message" : `incoming IRC message from ${source}`;
 	return {
-		content: [{ type: "text", text: "Skipped due to queued user message." }],
+		content: [{ type: "text", text: `Skipped due to queued ${sourceLabel}.` }],
 		details: {},
 	};
 }

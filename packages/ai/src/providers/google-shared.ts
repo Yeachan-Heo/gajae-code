@@ -2,7 +2,7 @@
  * Shared utilities for Google Generative AI and Google Cloud Code Assist providers.
  */
 
-import { extractHttpStatusFromError, readJsonl, readSseJson } from "@gajae-code/utils";
+import { extractHttpStatusFromError, logger, readJsonl, readSseJson } from "@gajae-code/utils";
 import type { ProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
 import {
 	isProviderSafetyStopAdapterInvocation,
@@ -29,6 +29,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
+import { GeminiHeaderRunawayError, GeminiHeaderRunDetector, isGeminiModel } from "../utils/thinking-loop";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
@@ -456,6 +457,7 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case "OTHER":
 		case "LANGUAGE":
 		case "MALFORMED_FUNCTION_CALL":
+		case "MALFORMED_RESPONSE":
 		case "UNEXPECTED_TOOL_CALL":
 		case "NO_IMAGE":
 			return "error";
@@ -597,6 +599,10 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	let firstTokenSeen = false;
 	let providerSafetyStop = false;
+	// Gate detector to Gemini models only (Google API is Gemini, but gate for consistency).
+	const isGemini = isGeminiModel(model.id);
+	const geminiHeaderRunDetector = isGemini ? new GeminiHeaderRunDetector() : null;
+	let geminiHeaderRunawayError: Error | null = null;
 
 	const flushCurrent = () => {
 		if (!currentBlock) return;
@@ -633,7 +639,21 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 							delta: part.text,
 							partial: output,
 						});
+						// Feed thinking to Gemini header runaway detector (Gemini models only).
+						if (geminiHeaderRunDetector?.push(part.text)) {
+							logger.debug(
+								`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupting stream.`,
+							);
+							// Defer error until after tool calls in this frame are processed.
+							// Error will be caught by caller and classified by error code in retry policy.
+							geminiHeaderRunawayError = new GeminiHeaderRunawayError(
+								`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupted to prevent budget exhaustion.`,
+								geminiHeaderRunDetector.count,
+							);
+						}
 					} else {
+						// Reset Gemini header runaway detector when transitioning to visible text.
+						geminiHeaderRunDetector?.reset();
 						currentBlock.text += part.text;
 						if (retainTextSignature) {
 							currentBlock.textSignature = retainThoughtSignature(
@@ -651,6 +671,8 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 				}
 
 				if (part.functionCall) {
+					// Reset Gemini header runaway detector when transitioning to tool calls.
+					geminiHeaderRunDetector?.reset();
 					if (currentBlock) {
 						flushCurrent();
 						currentBlock = null;
@@ -671,9 +693,14 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 
 					output.content.push(toolCall);
 					pushToolCallEvents(toolCall, blockIndex(), output, stream);
+					// Throw deferred Gemini runaway error after tool call is processed.
+					if (geminiHeaderRunawayError) throw geminiHeaderRunawayError;
 				}
 			}
 		}
+
+		// Throw deferred Gemini runaway error if no tool calls followed in this chunk.
+		if (geminiHeaderRunawayError) throw geminiHeaderRunawayError;
 
 		if (candidate?.finishReason) {
 			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
@@ -1038,6 +1065,10 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			// Detect Gemini header runaway error and set error code for terminal classification.
+			if (error instanceof GeminiHeaderRunawayError) {
+				output.errorCode = error.errorCode;
+			}
 			output.errorStatus = extractHttpStatusFromError(error);
 			output.transportFailure = transportFailureFacts(error) ?? output.transportFailure;
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
