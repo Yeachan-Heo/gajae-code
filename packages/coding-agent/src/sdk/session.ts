@@ -2297,7 +2297,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 					continue;
 				}
-				applyCredentialSelector(credentialSessionId, provider, selector);
+				// A configured pin outlives the account it names: the row may since have
+				// been removed or disabled (for example after a failed OAuth refresh).
+				// Like durable replay above, that must block only this provider, never
+				// abort startup for a session whose model authenticates elsewhere.
+				try {
+					applyCredentialSelector(credentialSessionId, provider, selector);
+				} catch (error) {
+					authStorage.clearSessionCredentialSelector(provider, credentialSessionId);
+					authStorage.markSessionCredentialUnavailable(credentialSessionId, provider, selector);
+					logger.warn("Configured credential pin is unavailable; provider blocked until re-login or re-pin", {
+						provider: sanitizeProviderForLog(provider),
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 			}
 		}
 		if (options.credentialSelector?.provider) {
