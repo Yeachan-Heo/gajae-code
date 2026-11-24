@@ -1,4 +1,5 @@
 import type { AppKeybinding } from "../config/keybindings";
+import { operatorErrorMessage } from "../session/operator-error-message";
 
 export type FocusDomain = "composer" | "selector" | "overlay" | "global";
 
@@ -109,7 +110,9 @@ export class ActionRegistry<Context> {
 	}
 
 	#reportError(id: AppKeybinding, phase: "availability" | "execution", error: unknown): void {
-		const cause = error instanceof Error ? error.message : String(error);
+		// Session refusals (for example a transcript another process changed) render
+		// their operator message instead of a machine code.
+		const cause = operatorErrorMessage(error, String(error));
 		try {
 			this.options.showError(`Action ${id} ${phase} failed: ${cause}`);
 		} catch {

@@ -6,3 +6,4 @@
 - Quitting the TUI from a session whose transcript another process changed no longer crashes with an unhandled `managed_append_identity_mismatch` rejection.
 - After any other transcript write failure, those turns are also refused up front with the original error, so a hidden custom-message turn no longer resolves with unsaved entries.
 - `/compact` and `/handoff` on a session already known to be stuck are refused before any compaction hook or model call, and their failure text in the TUI and in headless/ACP slash commands shows the operator message.
+- Keybinding actions that fail with a session refusal, such as the queue/follow-up shortcut on a stuck session, show the operator message instead of the raw code.
