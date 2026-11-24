@@ -412,9 +412,26 @@ describe("dormant", () => {
 		const users: string[] = [];
 		for await (const file of new Bun.Glob("**/*.ts").scan({ cwd: src })) {
 			if (file === path.join("session", "session-ownership.ts")) continue;
-			if (/["'][^"']*session-ownership(?:\.ts)?["']/.test(await Bun.file(path.join(src, file)).text()))
-				users.push(file);
+			if (/session-ownership(?:\.[jt]s)?["']/.test(await Bun.file(path.join(src, file)).text())) users.push(file);
 		}
 		expect(users).toEqual([]);
+	});
+
+	it("the package does not export it", async () => {
+		const manifest = (await Bun.file(path.join(import.meta.dir, "../../package.json")).json()) as {
+			exports: Record<string, unknown>;
+		};
+		expect(manifest.exports["./session/session-ownership"]).toBeNull();
+		expect(manifest.exports["./session/session-ownership.js"]).toBeNull();
+		for (const specifier of [
+			"@gajae-code/coding-agent/session/session-ownership",
+			"@gajae-code/coding-agent/session/session-ownership.js",
+		]) {
+			expect(() => Bun.resolveSync(specifier, import.meta.dir)).toThrow();
+		}
+		// The wildcard still exports its neighbours, so the refusal above is specific to this module.
+		expect(Bun.resolveSync("@gajae-code/coding-agent/session/session-storage", import.meta.dir)).toEndWith(
+			path.join("src", "session", "session-storage.ts"),
+		);
 	});
 });
