@@ -1,6 +1,7 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isFileLockAcquireTimeout } from "../../config/file-lock";
+import { findOperatorMessage } from "../../session/operator-error-message";
 import {
 	SecureLocalGrantReplayFence,
 	secureLocalFrameOperation,
@@ -232,7 +233,9 @@ function errorFrame(connectionId: string, frame: SdkFrame, error: unknown): SdkF
 			: typeof candidate?.code === "string"
 				? candidate.code
 				: "internal";
-	const message = typeof candidate?.message === "string" ? candidate.message : "SDK host operation failed.";
+	const message =
+		findOperatorMessage(error) ??
+		(typeof candidate?.message === "string" ? candidate.message : "SDK host operation failed.");
 	if (frame.type === "control_request") {
 		return {
 			type: "control_response",

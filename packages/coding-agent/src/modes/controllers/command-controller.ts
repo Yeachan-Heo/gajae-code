@@ -32,6 +32,7 @@ import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -1563,7 +1564,7 @@ export class CommandController {
 			const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
 			await this.ctx.session.prompt(message);
 		} catch (err) {
-			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Failed to load skill: ${operatorErrorMessage(err, String(err))}`);
 		}
 	}
 

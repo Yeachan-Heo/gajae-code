@@ -73,6 +73,7 @@ import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } f
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
@@ -1666,7 +1667,9 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
-	const message = error instanceof Error ? error.message : code;
+	// The discriminator stays in `data.code`; the human text is the operator message when
+	// the error carries one (for example a transcript another process changed).
+	const message = error instanceof Error ? operatorErrorMessage(error) : code;
 	// ACP clients render `data.details` after the JSON-RPC message. The MCP launch
 	// diagnostic is already the complete additional message, so repeating it in
 	// `details` produces `Internal error: X.: X.` on the wire.
