@@ -589,7 +589,9 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface))
 		return "another gjc process";
 	if (holder.host !== undefined)
-		return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host} (pid ${holder.pid})` : "another gjc process";
+		return SAFE_HOST.test(holder.host)
+			? `a gjc process on ${holder.host} (pid ${holder.pid})`
+			: "another gjc process";
 	const subagent = holder.surface.endsWith(" (subagent)");
 	const base = (subagent ? holder.surface.slice(0, -" (subagent)".length) : holder.surface) as SessionOwnerBaseSurface;
 	const noun = SURFACE_NOUNS[base];
