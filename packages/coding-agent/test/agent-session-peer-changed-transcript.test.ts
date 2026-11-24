@@ -564,6 +564,29 @@ describe("AgentSession on a transcript another process changed", () => {
 		expect(runtimeErrors).toEqual([latched.operatorMessage]);
 	});
 
+	it.each([
+		["an idle trigger", undefined],
+		["a next-turn trigger", "nextTurn"],
+	] as const)("reports a mid-turn peer write from %s instead of resolving", async (_label, deliverAs) => {
+		const harness = await setup();
+		harness.setScript("tool");
+		harness.onToolRun(async () => {
+			harness.onToolRun(undefined);
+			await harness.appendFromB("from B mid-turn");
+		});
+
+		const refusal = await settle(
+			harness.session.sendCustomMessage(
+				{ customType: "probe", content: "triggered turn", display: false },
+				{ triggerTurn: true, ...(deliverAs ? { deliverAs } : {}) },
+			),
+		);
+
+		expect(refusal).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		expect(harness.counts().toolRuns).toBe(1);
+		expect(memoryMessages(harness.session.messages)).toContain("toolResult:tool ok");
+	});
+
 	it("leaves a single writer's prompts, tool turns, /new and /resume unchanged", async () => {
 		const harness = await setup();
 		await harness.session.prompt("second");
