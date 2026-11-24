@@ -84,7 +84,7 @@ import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
-import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
+import { mapWithConcurrencyLimit } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary, type TaskResultReceipt } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
@@ -181,6 +181,7 @@ function captureTaskExecutionScope(session: ToolSession): {
 		"getAsyncJobManager",
 		"getCredentialSessionId",
 		"getAgentId",
+		"getTaskPool",
 		"getSessionAgentDir",
 		"getActiveModelString",
 		"getModelString",
@@ -1239,7 +1240,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 
-		const maxConcurrency = session.settings.get("task.maxConcurrency");
 		const ownerId = session.getAgentId?.() ?? undefined;
 		const parentSession = session.getSessionFile();
 		const admitDuplicateLaunch = (
@@ -1421,7 +1421,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 			manager.setResumeRunner(resumeRunner);
 		}
-		const semaphore = new Semaphore(maxConcurrency);
+		const taskPool = session.getTaskPool?.();
+		const taskDepth = session.taskDepth ?? 0;
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
 			if (!requestsForkContext(task)) return undefined;
 			if (!session.buildForkContextSeed) {
@@ -1511,9 +1512,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					async ({ signal: runSignal, reportProgress }) => {
 						const startedAt = Date.now();
 						const progress = progressByTaskId.get(taskItem.id);
-						await semaphore.acquire();
+						const slotInfo = taskPool ? await taskPool.acquire(taskDepth) : { acquiredSlot: false };
 						if (runSignal.aborted) {
-							semaphore.release();
+							if (taskPool) taskPool.release(slotInfo);
 							if (progress) {
 								progress.status = "aborted";
 							}
@@ -1623,7 +1624,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							}
 							throw error;
 						} finally {
-							semaphore.release();
+							if (taskPool) taskPool.release(slotInfo);
 						}
 					},
 					{

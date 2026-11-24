@@ -24,6 +24,7 @@ import type { SessionArtifactPublication } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import type { SkillActiveEntry } from "../skill-state/active-state";
 import type { AgentOutputManager } from "../task/output-manager";
+import type { SessionTaskPool } from "../task/task-pool";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
 import type { EventBus } from "../utils/event-bus";
 import type { WorkspaceTree } from "../workspace-tree";
@@ -298,6 +299,8 @@ export interface ToolSession {
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */
 	getAgentId?: () => string | null;
+	/** Get the session-global task concurrency pool for enforcing task.maxConcurrency limits. */
+	getTaskPool?: () => SessionTaskPool | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/**
