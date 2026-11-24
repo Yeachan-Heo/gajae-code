@@ -109,14 +109,32 @@ function backend(): SessionOwnerLockBackend {
 	return SessionOwnershipTestHooks.lockBackend ?? nativeBackend;
 }
 
-/** A failure that refuses the session, as the append lock refuses it (design §2.7). */
+/**
+ * A failure that refuses the session, as the append lock refuses it (design §2.7). `code` is the
+ * machine code: `owners_directory_unsafe` (a safety check refused the directory),
+ * `owners_directory_io` (the filesystem refused, e.g. EROFS or ENOSPC; see `errno`),
+ * `owners_directory_changed`, or the lock's own failure code.
+ */
 export class SessionOwnershipError extends Error {
 	readonly code: string;
-	constructor(code: string, options?: { cause?: unknown }) {
+	readonly errno: string | undefined;
+	readonly operatorMessage =
+		"gjc could not check safely whether another process has this session open, so it was not opened for writing. Check that ~/.gjc/runtime belongs to you and is writable.";
+
+	constructor(code: string, options?: { cause?: unknown; errno?: string }) {
 		super(`session_ownership_failed: ${code}`, options);
 		this.name = "SessionOwnershipError";
 		this.code = code;
+		this.errno = options?.errno;
 	}
+}
+
+/** Classify a directory setup failure: a filesystem errno, or a refused safety check. */
+function directoryFailure(error: unknown): SessionOwnershipError {
+	const errno = (error as { code?: unknown } | undefined)?.code;
+	if (typeof errno === "string" && /^E[A-Z0-9]+$/.test(errno))
+		return new SessionOwnershipError("owners_directory_io", { cause: error, errno });
+	return new SessionOwnershipError("owners_directory_unsafe", { cause: error });
 }
 
 // =============================================================================
@@ -397,7 +415,7 @@ export async function claimSessionOwner(
 	try {
 		directory = prepareRuntimeLockDirectory("session-owners", trustedHome());
 	} catch (error) {
-		throw new SessionOwnershipError("owners_directory_unsafe", { cause: error });
+		throw directoryFailure(error);
 	}
 	const owners = directory.path;
 	const sidecar = path.join(owners, `${key}${SIDECAR_SUFFIX}`);

@@ -364,8 +364,21 @@ describe.if(supported)("the owners directory fails closed like the append lock",
 
 	it("refuses a home other users can write", async () => {
 		await fs.chmod(home, 0o777);
-		await expect(claimSessionOwner("s6", { surface: "terminal" })).rejects.toBeInstanceOf(SessionOwnershipError);
+		const refused = await claimSessionOwner("s6", { surface: "terminal" }).catch((error: unknown) => error);
+		expect(refused).toBeInstanceOf(SessionOwnershipError);
+		expect(refused).toMatchObject({ code: "owners_directory_unsafe", errno: undefined });
 		expect((await probeSessionOwner("s6")).state).toBe("unknown");
+	});
+
+	it.if(process.getuid?.() !== 0)("reports a filesystem refusal as I/O, with a fixed operator message", async () => {
+		// Owner-only but not writable: creating `.gjc` fails with EACCES, not a safety check.
+		await fs.chmod(home, 0o500);
+		const refused = await claimSessionOwner("s13", { surface: "terminal" }).catch((error: unknown) => error);
+		expect(refused).toBeInstanceOf(SessionOwnershipError);
+		expect(refused).toMatchObject({ code: "owners_directory_io", errno: "EACCES" });
+		const message = (refused as InstanceType<typeof SessionOwnershipError>).operatorMessage;
+		expect(message).toStartWith("gjc could not check safely whether another process has this session open");
+		expect(message).not.toContain(home);
 	});
 });
 
@@ -455,7 +468,7 @@ describe("narrow fail-open", () => {
 		expect(warnings).toEqual(["Session ownership claim timed out; this claim is skipped"]);
 	});
 
-	it("any other lock failure refuses, EACCES included", async () => {
+	it("any other lock failure refuses, open/permission EACCES included", async () => {
 		for (const code of ["EACCES", "foreign_owner", "ELOOP"]) {
 			backend(() => ({ status: FileLockAcquireStatus.Failed, code }));
 			const refused = await claimSessionOwner(`f5-${code}`, { surface: "terminal" }).catch(
