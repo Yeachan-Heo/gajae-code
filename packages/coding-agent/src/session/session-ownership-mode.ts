@@ -5,7 +5,7 @@
  * - `observe`: claims and the write-path detector run, and nothing is refused.
  * - `enforce`: refusals as each later step enables them.
  *
- * The mode comes from the user setting `session.ownership`, which is global-only, so a project
+ * The mode comes from the user setting `session.ownership.mode`, which is global-only, so a project
  * cannot set it. The environment override `GJC_SESSION_OWNERSHIP` is read only when the operator
  * set it (not a project `.env`) and can only lower the mode.
  *
@@ -98,7 +98,7 @@ function readTrustedOverride(): string | undefined {
 let cachedOverride: { readonly value: string | undefined } | undefined;
 let settingSource: (() => unknown) | undefined;
 
-/** Settings supplies the global-only `session.ownership` value. Without a source the default applies. */
+/** Settings supplies the global-only `session.ownership.mode` value. Without a source the default applies. */
 export function setSessionOwnershipSettingSource(source: (() => unknown) | undefined): void {
 	settingSource = source;
 }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,8 +24,17 @@ async function tempRoot(): Promise<string> {
 	return root;
 }
 
+// An operator override in the runner's environment would lower the modes these tests expect.
+const operatorOverride = process.env.GJC_SESSION_OWNERSHIP;
+
+beforeEach(() => {
+	delete process.env.GJC_SESSION_OWNERSHIP;
+});
+
 afterEach(async () => {
 	resetSettingsForTest();
+	if (operatorOverride === undefined) delete process.env.GJC_SESSION_OWNERSHIP;
+	else process.env.GJC_SESSION_OWNERSHIP = operatorOverride;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -76,39 +85,72 @@ describe("GJC_SESSION_OWNERSHIP provenance", () => {
 	});
 });
 
-describe("the session.ownership setting", () => {
-	async function initSettings(global: unknown, project: unknown, overrides?: Record<string, unknown>) {
+describe("the session.ownership.mode setting", () => {
+	type Surface = "settings.json" | "config.yml";
+	async function initSettings(
+		global: unknown,
+		project: unknown,
+		overrides?: Record<string, unknown>,
+		surface: Surface = "settings.json",
+	) {
 		const root = await tempRoot();
 		const cwd = path.join(root, "project");
 		const agentDir = path.join(root, "agent");
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		await fs.mkdir(agentDir, { recursive: true });
 		await Bun.write(path.join(agentDir, "config.yml"), YAML.stringify(global));
-		await Bun.write(path.join(cwd, ".gjc", "settings.json"), JSON.stringify(project));
+		const projectFile = path.join(cwd, ".gjc", surface);
+		await Bun.write(projectFile, surface === "settings.json" ? JSON.stringify(project) : YAML.stringify(project));
 		return Settings.init({ cwd, agentDir, overrides });
 	}
+	const userEnforce = { session: { ownership: { mode: "enforce" } } };
 
 	it("defaults to off, with or without process settings", async () => {
 		expect(sessionOwnershipTestHookSlot().mode).toBeUndefined();
 		expect(sessionOwnershipMode()).toBe("off");
 		const settings = await initSettings({}, {});
-		expect(settings.get("session.ownership")).toBe("off");
+		expect(settings.get("session.ownership.mode")).toBe("off");
 		expect(sessionOwnershipMode()).toBe("off");
 	});
 
 	it("is global-only: project files and runtime overrides cannot set it", async () => {
 		const settings = await initSettings(
-			{ session: { ownership: "observe" } },
-			{ session: { ownership: "enforce" } },
-			{ "session.ownership": "off" },
+			{ session: { ownership: { mode: "observe" } } },
+			{ session: { ownership: { mode: "enforce" } } },
+			{ "session.ownership.mode": "off" },
 		);
-		expect(settings.get("session.ownership")).toBe("observe");
+		expect(settings.get("session.ownership.mode")).toBe("observe");
 		expect(sessionOwnershipMode()).toBe("observe");
 	});
 
+	it("a null or scalar session parent in a project file or a runtime override does not lower it", async () => {
+		const parents: unknown[] = [null, "x", [], 1, { ownership: null }, { ownership: "off" }];
+		for (const parent of parents) {
+			for (const surface of ["settings.json", "config.yml"] as const) {
+				await initSettings(userEnforce, { session: parent }, undefined, surface);
+				expect([surface, parent, sessionOwnershipMode()]).toEqual([surface, parent, "enforce"]);
+				resetSettingsForTest();
+			}
+			await initSettings(userEnforce, {}, { session: parent });
+			expect(["overrides", parent, sessionOwnershipMode()]).toEqual(["overrides", parent, "enforce"]);
+			resetSettingsForTest();
+			const settings = await initSettings(userEnforce, {});
+			settings.override("session" as never, parent as never);
+			expect(["override()", parent, sessionOwnershipMode()]).toEqual(["override()", parent, "enforce"]);
+			resetSettingsForTest();
+		}
+	});
+
+	it("covers the whole session.ownership namespace as global-only", async () => {
+		const settings = await initSettings(userEnforce, { session: { ownership: { mode: "off", laterFlag: true } } });
+		const resolution = settings.getResolutionSnapshot()["session.ownership.mode"];
+		expect(resolution.allowedLayers).toEqual(["global"]);
+		expect(sessionOwnershipMode()).toBe("enforce");
+	});
+
 	it("the schema lists exactly the modes the resolver knows, with the same default", () => {
-		expect(SETTINGS_SCHEMA["session.ownership"].values).toEqual([...SESSION_OWNERSHIP_MODES]);
-		expect<string>(SETTINGS_SCHEMA["session.ownership"].default).toBe(DEFAULT_SESSION_OWNERSHIP_MODE);
+		expect(SETTINGS_SCHEMA["session.ownership.mode"].values).toEqual([...SESSION_OWNERSHIP_MODES]);
+		expect<string>(SETTINGS_SCHEMA["session.ownership.mode"].default).toBe(DEFAULT_SESSION_OWNERSHIP_MODE);
 	});
 
 	it("is not a public import path, so an embedder cannot replace the setting source", async () => {
@@ -125,7 +167,7 @@ describe("the session.ownership setting", () => {
 	});
 
 	it("cannot be raised from a project file when the user left it at off", async () => {
-		await initSettings({}, { session: { ownership: "enforce" } });
+		await initSettings({}, { session: { ownership: { mode: "enforce" } } });
 		expect(sessionOwnershipMode()).toBe("off");
 	});
 });
