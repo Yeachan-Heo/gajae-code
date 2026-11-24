@@ -27,16 +27,17 @@ export class SessionTaskPool {
 
 	/**
 	 * Get current concurrency limit from live settings.
-	 * 0 or undefined = unlimited, otherwise use the configured value.
+	 * 0 or undefined = unlimited, negative = clamped to 1 (not unlimited).
 	 */
 	private getLimit(): number | null {
 		const configured = this.#settings.get("task.maxConcurrency");
-		// 0 or undefined = unlimited, negative/non-numeric = default to 1
+		// 0 or undefined = unlimited, negative/non-numeric = clamp to 1
 		if (configured === 0 || configured === null || configured === undefined) {
 			return null; // unlimited
 		}
 		const parsed = typeof configured === "number" ? configured : 1;
-		return parsed <= 0 ? null : parsed;
+		// Only 0 and null are unlimited; clamp negative values to 1
+		return parsed < 0 ? 1 : parsed;
 	}
 
 	/**
