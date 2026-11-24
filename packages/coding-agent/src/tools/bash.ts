@@ -1722,6 +1722,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			onRawLine?: (line: string, jobId: string) => void;
 			shouldAcceptRawLine?: (jobId: string) => boolean;
 			lifecycle?: import("../async").AsyncJobLifecycleCleanup;
+			/**
+			 * Asked once when the command exits successfully. Returning true
+			 * acknowledges the job's own completion delivery before the manager
+			 * settles it, so no async-result is enqueued: the caller's stdout
+			 * notifications already reported the run (#7993).
+			 */
+			shouldAcknowledgeCompletion?: () => boolean;
 		} = {},
 	): Promise<{ jobId: string; label: string; commandCwd: string }> {
 		const manager = this.#resolveOwnedJobManager();
@@ -1817,6 +1824,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					flushTrailingLine();
 					const resultText = appendArtifactDetails(result.output || "(no output)", result);
 					this.#buildResultText(result, prepared.timeoutSec, resultText);
+					if (opts.shouldAcknowledgeCompletion?.()) manager.acknowledgeDeliveries([id]);
 					return resultText;
 				} catch (error) {
 					flushTrailingLine();

@@ -1,10 +1,10 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
+import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled } from "../async";
 import monitorDescription from "../prompts/tools/monitor.md" with { type: "text" };
 import { truncateTail } from "../session/streaming-output";
-import { lookupOwnedRegistration } from "../session/terminal-abort";
+import { lookupOwnedRegistration, unregisterOwnedRegistration } from "../session/terminal-abort";
 import { escapeXmlAttribute } from "../utils/xml-escape";
 import { BashTool } from "./bash";
 import type { ToolSession } from "./index";
@@ -148,6 +148,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		const persistent = params.persistent ?? false;
 		const label = buildMonitorLabel(params);
 		const ownerId = this.session.getAgentId?.() ?? undefined;
+		// Endpoint scope for owned-registration lookups: concurrent sessions reuse
+		// manager-local job ids (review thread P2).
+		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local";
 		const bash = new BashTool(this.session);
 		let deliveredFirstLine = false;
 		const controller = { closed: false };
@@ -157,6 +160,14 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		let latestLine: string | undefined;
 		let coalescedCount = 0;
 		let flushScheduled = false;
+		let completionAcknowledged = false;
+		// Notification sends whose sendCustomMessage has not settled: still waiting
+		// for queue admission, or (idle path) running the turn they started.
+		let unsettledSends = 0;
+		// Set when the exit-time settlement may have been deferred to an unsettled
+		// send: a send that settles later without delivering (e.g. rejected during
+		// a handoff) leaves nothing else to settle the registration.
+		let deferredSettlementJob: AsyncJob | undefined;
 		// Count of notification *sends* (not live queue depth): once it exceeds the
 		// cap, each new send first purges older queued notifications for this task,
 		// keeping the queue bounded and latest-biased.
@@ -165,7 +176,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			message.customType === "task-notification" &&
 			(message.details as { taskId?: string } | undefined)?.taskId === currentJobId;
 		const flushLatest = () => {
-			if (!persistent || latestLine === undefined) return;
+			if (!persistent || latestLine === undefined) return false;
 			if (flushTimer) {
 				clearTimeout(flushTimer);
 				flushTimer = undefined;
@@ -176,20 +187,50 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			coalescedCount = 0;
 			flushScheduled = false;
 			sendNotification(line, currentJobId, count);
+			return true;
 		};
-		const closeMonitor = (mode: "purge" | "flush") => {
+		const closeMonitor = (mode: "purge" | "evict" | "flush", job?: AsyncJob) => {
 			// "flush" (natural process exit): deliver the newest pending line so the
 			// final state is never lost, then stop. "purge" (explicit cancel / registry
 			// eviction): drop the queued backlog. Non-persistent monitors keep their one
-			// notification, so they never purge.
+			// notification, so they never purge. "evict" (automatic retention expiry)
+			// purges like "purge", except after an acknowledged completion: the
+			// flushed line is then the only report of the exit, and dropping it from a
+			// turn still running past the retention window would lose that exit. An
+			// explicit late cancel ("purge" via onTombstonePurge) still drops it.
 			if (mode === "flush") {
-				flushLatest();
+				const flushed = flushLatest();
 				controller.closed = true;
+				if (completionAcknowledged && !flushed && job) {
+					deferredSettlementJob = job;
+					settleRegistrationAfterExit(job);
+				}
 				return;
 			}
 			controller.closed = true;
-			if (!persistent) return;
+			if (!persistent || (mode === "evict" && completionAcknowledged)) return;
 			return this.session.purgeQueuedCustomMessages?.(isMonitorMessage);
+		};
+		// A flushed final notification is sent after the job is terminal, so
+		// AgentSession settles its owned envelope on delivery. With nothing pending
+		// at exit, every notification went out while the job was running, and the
+		// acknowledged async-result will never carry the envelope. A notification
+		// that is still in flight or queued is delivered after the exit and settles
+		// the registration itself; retiring it now would make a scope:"turn" abort
+		// deny that notification, the only remaining report of the exit. Only when
+		// every notification was already consumed does nothing else settle it, so
+		// it is retired here, as a `job` poll that consumes a terminal job does.
+		const settleRegistrationAfterExit = (job: AsyncJob) => {
+			if (unsettledSends > 0) return;
+			let queued = false;
+			// Non-destructive scan: the predicate records a match and keeps it queued.
+			this.session.purgeQueuedCustomMessages?.(message => {
+				if (isMonitorMessage(message)) queued = true;
+				return false;
+			});
+			if (queued) return;
+			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
+			if (registration) unregisterOwnedRegistration(registration);
 		};
 		const sendNotification = (line: string, jobId: string, count: number) => {
 			if (controller.closed) return;
@@ -223,13 +264,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			// sessions have monitors with the same manager-local job id, and an
 			// endpoint-less fallback scan could attach a foreign session's
 			// registration (review thread P2).
-			const registration = generation
-				? lookupOwnedRegistration(
-						jobId,
-						generation,
-						this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
-					)
-				: undefined;
+			const registration = generation ? lookupOwnedRegistration(jobId, generation, endpointId) : undefined;
 			const ownedCompletion = registration
 				? {
 						lineageIdHash: registration.lineageIdHash,
@@ -266,6 +301,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				});
 				return;
 			}
+			unsettledSends += 1;
 			void this.session
 				.sendCustomMessage(
 					{ customType: "task-notification", content, display: false, attribution: "agent", details },
@@ -275,6 +311,12 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 					logger.warn("Monitor task-notification delivery failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});
+				})
+				.finally(() => {
+					unsettledSends -= 1;
+					// Safe to repeat: a queued message keeps the registration, and an
+					// already settled one makes the lookup return undefined.
+					if (deferredSettlementJob) settleRegistrationAfterExit(deferredSettlementJob);
 				});
 		};
 		const schedulePersistentNotification = (line: string) => {
@@ -295,9 +337,24 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				shouldAcceptRawLine: () => !controller.closed,
 				lifecycle: {
 					onCancel: () => closeMonitor("purge"),
-					onTerminal: () => closeMonitor("flush"),
-					onEvict: () => closeMonitor("purge"),
+					onTerminal: job => closeMonitor("flush", job),
+					onEvict: () => closeMonitor("evict"),
 					onTombstonePurge: () => closeMonitor("purge"),
+				},
+				// A clean exit after stdout notifications is already reported by them
+				// (onTerminal flushes any pending line), so the job's own async-result
+				// would wake the agent a second time for the same exit (#7993). Every
+				// other exit keeps the async-result because it is then the only exit
+				// report: failures, timeouts, no stdout line, no custom-message router,
+				// and clients that defer agent-initiated turns (a task-notification
+				// there does not wake the agent).
+				shouldAcknowledgeCompletion: () => {
+					completionAcknowledged =
+						deliveredFirstLine &&
+						!controller.closed &&
+						this.session.sendCustomMessage !== undefined &&
+						this.session.getClientBridge?.()?.deferAgentInitiatedTurns !== true;
+					return completionAcknowledged;
 				},
 				onRawLine: (line, jobId) => {
 					if (controller.closed) return;
