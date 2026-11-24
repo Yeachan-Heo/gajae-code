@@ -450,6 +450,8 @@ export interface ExecutorOptions {
 	 * always-on MCP tools without the removed process-global singleton.
 	 */
 	parentMcpManager?: import("../runtime-mcp/manager").MCPManager;
+	/** Parent session's task pool for nested sessions; shared to enforce session-tree-wide concurrency limits. */
+	parentTaskPool?: import("../task/task-pool").SessionTaskPool;
 }
 
 export class ManagedTaskPersistence {
@@ -2244,6 +2246,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					telemetry: subagentTelemetry,
 					forkContextSeed,
 					agentRegistry,
+					parentTaskPool: options.parentTaskPool,
 					shouldPause: () => pauseRequested,
 				}),
 			);

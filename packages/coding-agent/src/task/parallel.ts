@@ -86,6 +86,8 @@ export async function mapWithConcurrencyLimit<T, R>(
 interface QueuedWaiter {
 	resolve: () => void;
 	preAllocated?: boolean;
+	/** Token to safely remove from queue if cancelled */
+	token?: object;
 }
 
 /**
@@ -105,24 +107,60 @@ export class Semaphore {
 		}
 	}
 
-	async acquire(): Promise<void> {
+	async acquire(signal?: AbortSignal): Promise<void> {
 		// Unlimited: always acquire immediately
 		if (this.#max === null) {
+			if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
 			this.#current++; // Track active count even in unlimited mode
 			return;
 		}
 
 		if (this.#current < this.#max) {
+			if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
 			this.#current++;
 			return;
 		}
-		const { promise, resolve } = Promise.withResolvers<void>();
-		const waiter: QueuedWaiter = { resolve };
+
+		// Need to queue and wait
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const token = {};
+		const waiter: QueuedWaiter = { resolve, token };
 		this.#queue.push(waiter);
-		await promise;
-		// If pre-allocated by release/setMax, don't increment. Otherwise increment now.
-		if (!waiter.preAllocated) {
-			this.#current++;
+
+		// Handle abort signal if provided
+		let abortListener: (() => void) | undefined;
+		if (signal) {
+			if (signal.aborted) {
+				// Already aborted, remove from queue immediately
+				const idx = this.#queue.indexOf(waiter);
+				if (idx !== -1) {
+					this.#queue.splice(idx, 1);
+				}
+				reject(signal.reason ?? new Error("Aborted"));
+				return;
+			}
+			// Listen for abort while waiting
+			abortListener = () => {
+				// Remove from queue if still waiting
+				const idx = this.#queue.findIndex(w => w.token === token);
+				if (idx !== -1) {
+					this.#queue.splice(idx, 1);
+				}
+				reject(signal.reason ?? new Error("Aborted"));
+			};
+			signal.addEventListener("abort", abortListener);
+		}
+
+		try {
+			await promise;
+			// If pre-allocated by release/setMax, don't increment. Otherwise increment now.
+			if (!waiter.preAllocated) {
+				this.#current++;
+			}
+		} finally {
+			if (abortListener && signal) {
+				signal.removeEventListener("abort", abortListener);
+			}
 		}
 	}
 

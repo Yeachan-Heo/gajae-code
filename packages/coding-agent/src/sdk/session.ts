@@ -681,6 +681,8 @@ export interface CreateAgentSessionOptions {
 	 * changes but never connects or disposes this manager.
 	 */
 	inheritedMcpManager?: import("../runtime-mcp/manager").MCPManager;
+	/** Parent task pool for nested sessions; shared to enforce session-tree-wide concurrency limits. */
+	parentTaskPool?: import("../task/task-pool").SessionTaskPool;
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
@@ -3144,8 +3146,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		};
 
-		// Create the session-global task concurrency pool
-		const taskPool = new SessionTaskPool(settings, settings.get("task.maxConcurrency") ?? 1);
+		// Create or inherit the session-global task concurrency pool
+		const taskPool =
+			options.parentTaskPool ?? new SessionTaskPool(settings, settings.get("task.maxConcurrency") ?? 1);
 
 		const toolSession: ToolSession = {
 			get cwd() {

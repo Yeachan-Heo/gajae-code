@@ -1344,7 +1344,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
 						// Acquire pool slot for resumed task execution (at depth 0 - top-level resume)
-						const slotInfo = taskPool ? await taskPool.acquire(0) : { acquiredSlot: false };
+						const slotInfo = taskPool ? await taskPool.acquire(0, runSignal) : { acquiredSlot: false };
 						if (runSignal.aborted) {
 							if (taskPool) taskPool.release(slotInfo);
 							throw new Error("Aborted before execution");
@@ -1524,9 +1524,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					async ({ signal: runSignal, reportProgress }) => {
 						const startedAt = Date.now();
 						const progress = progressByTaskId.get(taskItem.id);
-						const slotInfo = taskPool ? await taskPool.acquire(taskDepth) : { acquiredSlot: false };
+						const slotInfo = taskPool ? await taskPool.acquire(taskDepth, runSignal) : { acquiredSlot: false };
 						if (runSignal.aborted) {
-							if (taskPool) taskPool.release(slotInfo);
+							if (taskPool && slotInfo.acquiredSlot) taskPool.release(slotInfo);
 							if (progress) {
 								progress.status = "aborted";
 							}
@@ -2593,6 +2593,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentHindsightSessionState: session.getHindsightSessionState?.(),
 						parentTelemetry: session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
+						parentTaskPool: session.getTaskPool?.(),
 						forkContextSeed,
 					});
 					return {
@@ -2685,6 +2686,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentHindsightSessionState: session.getHindsightSessionState?.(),
 						parentTelemetry: session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
+						parentTaskPool: session.getTaskPool?.(),
 						forkContextSeed,
 					});
 					let capturedResult = {

@@ -61,11 +61,12 @@ export class SessionTaskPool {
 	 * is no longer waiting (it's executing); children acquire after the parent
 	 * is in progress, not before the parent has acquired.
 	 * @param _taskDepth The nesting depth of this task (0 = top-level, 1+ = nested) [unused, kept for API compatibility]
+	 * @param signal Optional abort signal to cancel acquisition
 	 * @returns Information about whether a slot was acquired
 	 */
-	async acquire(_taskDepth: number): Promise<{ acquiredSlot: boolean }> {
+	async acquire(_taskDepth: number, signal?: AbortSignal): Promise<{ acquiredSlot: boolean }> {
 		this.resizeIfNeeded();
-		await this.#semaphore.acquire();
+		await this.#semaphore.acquire(signal);
 		return { acquiredSlot: true };
 	}
 
@@ -76,6 +77,8 @@ export class SessionTaskPool {
 	 */
 	release(info: { acquiredSlot: boolean }): void {
 		if (info.acquiredSlot) {
+			// Check for limit changes before releasing so we wake waiters under the current limit
+			this.resizeIfNeeded();
 			this.#semaphore.release();
 		}
 	}

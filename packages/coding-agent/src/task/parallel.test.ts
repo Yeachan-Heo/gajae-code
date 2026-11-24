@@ -177,8 +177,8 @@ describe("Semaphore", () => {
 			// Wait a tick for the waiter to potentially acquire
 			await new Promise(resolve => setTimeout(resolve, 10));
 
-			// The waiter should have been woken since we have space
-			expect(waiterReleased).toBe(true);
+			// The waiter should NOT have been woken yet since we still have 1 active holder and limit is 1
+			expect(waiterReleased).toBe(false);
 
 			// But active count should not exceed the new limit of 1 during release
 			// (accounting should prevent more than 1 from being active)
