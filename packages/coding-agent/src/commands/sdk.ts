@@ -141,8 +141,11 @@ export async function lifecycleArgs(
  * same agent directory reaches a host its predecessor launched. The window
  * therefore only runs while no live broker is published at all. It still has to
  * outlast a restart-shaped gap, because a broker that is merely slow to
- * republish must never cost a live host, but it must stay finite, or every
- * broker that is gone for good leaks a detached multi-hundred-megabyte host.
+ * republish must never cost a live host, but it must stay finite for an idle
+ * host, or every broker that is gone for good leaks a detached
+ * multi-hundred-megabyte host. A host holding its session-work lease is the one
+ * exception: it never exits on broker absence, so a turn that never settles keeps
+ * the host alive until it is closed or signalled.
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
@@ -206,26 +209,22 @@ async function waitForBrokerStartupTestGate(gateFile: string): Promise<void> {
 }
 
 /**
- * Identity of the broker incarnation an observation describes, or `null` when
- * it carries no usable identity.
- *
- * Two observations with different identities are two different brokers, never
- * the same broker seen twice: `incarnation` is start-time derived, so it
- * separates a genuine survivor from a successor that merely reused the pid.
+ * Whether a discovery observation identifies a broker at all (owner id, pid or
+ * incarnation). Which broker it is does not matter to a session host: any live
+ * broker for the agent directory can route to it.
  */
-function brokerPublicationIdentity(observation: unknown): string | null {
-	if (!observation || typeof observation !== "object") return null;
+function isIdentifiedBrokerPublication(observation: unknown): boolean {
+	if (!observation || typeof observation !== "object") return false;
 	const { ownerId, pid, incarnation } = observation as {
 		ownerId?: unknown;
 		pid?: unknown;
 		incarnation?: unknown;
 	};
-	const parts = [
-		typeof ownerId === "string" ? ownerId : "",
-		Number.isSafeInteger(pid) ? String(pid) : "",
-		typeof incarnation === "string" ? incarnation : "",
-	];
-	return parts.some(part => part !== "") ? parts.join(":") : null;
+	return (
+		(typeof ownerId === "string" && ownerId !== "") ||
+		Number.isSafeInteger(pid) ||
+		(typeof incarnation === "string" && incarnation !== "")
+	);
 }
 
 /**
@@ -239,8 +238,8 @@ function brokerPublicationIdentity(observation: unknown): string | null {
  *
  * `readWorkLease` reports whether the host's session-work lease is held. A turn
  * in flight is never cut short by broker absence: the window keeps accruing, but
- * the host only exits once the lease is released. Its result does not depend on
- * a broker, and the bound still applies the moment the work ends.
+ * the host only exits once the lease is released. If the bound was crossed
+ * during the turn, the host exits on the first poll after the turn ends.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
 	agentDir: string;
@@ -265,7 +264,7 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} catch {
 			// Transient read failures are ambiguity, not proof of orphanhood.
 		}
-		if (brokerPublicationIdentity(live) !== null) {
+		if (isIdentifiedBrokerPublication(live)) {
 			absentSince = null;
 		} else {
 			absentSince ??= now();

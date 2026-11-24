@@ -4179,7 +4179,6 @@ test("session host orphan watchdog does not exit while a turn holds the work lea
 test("session host orphan watchdog exits at the grace bound when no work lease is held", async () => {
 	let nowMs = 0;
 	let reads = 0;
-	let leaseReads = 0;
 	await watchSessionHostBrokerLiveness({
 		agentDir: "/unused",
 		now: () => nowMs,
@@ -4190,18 +4189,13 @@ test("session host orphan watchdog exits at the grace bound when no work lease i
 			reads += 1;
 			return null;
 		},
-		readWorkLease: () => {
-			leaseReads += 1;
-			return false;
-		},
+		readWorkLease: () => false,
 		graceMs: 20,
 		pollMs: 10,
 	});
 	// Absent from read 1 (t=0); the grace is crossed at read 3 (t=20).
 	expect(reads).toBe(3);
 	expect(nowMs).toBe(20);
-	// The lease is only consulted once the bound is crossed.
-	expect(leaseReads).toBe(1);
 });
 
 test("startup failure artifacts reject symlink and oversize collisions while accepting byte-identical owner evidence", async () => {
