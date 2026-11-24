@@ -145,6 +145,25 @@ describe.if(supported)("claim, probe and release", () => {
 		expect(seen).toEqual(["acquired, record false", "unlock, record false"]);
 	});
 
+	it("a failed record write leaves no temp file and no stale record", async () => {
+		await claimed("s12");
+		const recordFile = ownersPath("s12", ".owner.json");
+		const stale = await readJson(recordFile);
+		claims.pop()?.release();
+		await Bun.write(recordFile, JSON.stringify({ ...stale, claimNonce: "dead-holder" }));
+		SessionOwnershipTestHooks.beforeRecordPublish = () => {
+			throw new Error("ENOSPC");
+		};
+		try {
+			const claim = await claimed("s12");
+			expect(claim.shared).toBe(false);
+		} finally {
+			delete SessionOwnershipTestHooks.beforeRecordPublish;
+		}
+		expect(await fs.readdir(sessionOwnersDirectory())).toEqual([`${sessionOwnerKey("s12")}.session-owner`]);
+		expect(warnings).toEqual(["Session owner record write failed"]);
+	});
+
 	it("shares a session this process already holds, and only the last release unlocks", async () => {
 		const [a, b] = await Promise.all([
 			claimSessionOwner("s2", { surface: "app" }),

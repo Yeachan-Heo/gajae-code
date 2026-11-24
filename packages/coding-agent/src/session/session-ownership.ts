@@ -96,6 +96,8 @@ export const SessionOwnershipTestHooks: {
 	/** Trusted home for this process's claims and probes. */
 	homeOverride?: string;
 	lockBackend?: SessionOwnerLockBackend;
+	/** Runs after a record's temp file is written and before it is renamed into place. */
+	beforeRecordPublish?: () => void;
 } = {};
 
 const nativeBackend: SessionOwnerLockBackend = {
@@ -237,17 +239,20 @@ function readRecord(recordPath: string): OwnerRecord | undefined {
 function writeRecord(recordPath: string, record: OwnerRecord): void {
 	const temp = `${recordPath}.${record.claimNonce}.tmp`;
 	const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
-	const fd = fs.openSync(temp, flags, 0o600);
+	let published = false;
 	try {
-		fs.writeSync(fd, JSON.stringify(record));
-	} finally {
-		fs.closeSync(fd);
-	}
-	try {
+		const fd = fs.openSync(temp, flags, 0o600);
+		try {
+			fs.writeSync(fd, JSON.stringify(record));
+		} finally {
+			fs.closeSync(fd);
+		}
+		SessionOwnershipTestHooks.beforeRecordPublish?.();
 		fs.renameSync(temp, recordPath);
-	} catch (error) {
-		fs.rmSync(temp, { force: true });
-		throw error;
+		published = true;
+	} finally {
+		// The temp name carries this claim's nonce, so it is never another writer's file.
+		if (!published) fs.rmSync(temp, { force: true });
 	}
 }
 
@@ -439,7 +444,15 @@ export async function claimSessionOwner(
 					});
 				} catch (error) {
 					// The lock is the truth; without a record the holder reads as "another gjc process".
+					// A record left by an earlier holder must not name that holder instead: this claim
+					// holds the lock, so no live process owns it.
 					logger.warn("Session owner record write failed", { error: String(error) });
+					try {
+						fs.unlinkSync(entry.recordPath);
+					} catch (unlinkError) {
+						if (!isEnoent(unlinkError))
+							logger.warn("Stale session owner record removal failed", { error: String(unlinkError) });
+					}
 				}
 				current.entries.set(sidecar, entry);
 				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
