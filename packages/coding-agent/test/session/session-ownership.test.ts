@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +12,7 @@ import {
 	probeFileLock,
 	tryAcquireFileLock,
 } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import * as ownership from "../../src/session/session-ownership";
 // @ts-expect-error -- Bun loads a query-suffixed specifier as a second instance of the module.
 import * as ownershipCopy from "../../src/session/session-ownership.ts?copy=2";
@@ -32,6 +34,7 @@ const supported = process.platform === "linux" || process.platform === "darwin";
 
 let home: string;
 let claims: ownership.SessionOwnerClaim[];
+let warnings: string[];
 
 async function claimed(sessionId: string, surface: ownership.SessionOwnerSurface = "terminal") {
 	const result = await claimSessionOwner(sessionId, { surface });
@@ -52,6 +55,11 @@ beforeEach(async () => {
 	home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-ownership-")));
 	SessionOwnershipTestHooks.homeOverride = home;
 	claims = [];
+	// Warnings stay in memory: the logger's file sink lives under the real home.
+	warnings = [];
+	vi.spyOn(logger, "warn").mockImplementation(message => {
+		warnings.push(message);
+	});
 	// Every claim below must land in this temp home, never in the real one.
 	if (!sessionOwnersDirectory().startsWith(`${home}${path.sep}`)) throw new Error("owners directory escaped");
 });
@@ -61,6 +69,7 @@ afterEach(async () => {
 	resetSessionOwnershipForTests();
 	delete SessionOwnershipTestHooks.homeOverride;
 	delete SessionOwnershipTestHooks.lockBackend;
+	vi.restoreAllMocks();
 	await fs.chmod(home, 0o700);
 	await fs.rm(home, { recursive: true, force: true });
 });
@@ -108,6 +117,34 @@ describe.if(supported)("claim, probe and release", () => {
 		expect(await probeSessionOwner("s1")).toEqual({ state: "free" });
 	});
 
+	it("the record appears only after the lock is held and is gone before the unlock", async () => {
+		const recordFile = ownersPath("s7", ".owner.json");
+		const seen: string[] = [];
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				const result = await tryAcquireFileLock(sidecar, timeoutMs);
+				seen.push(`acquired, record ${fsSync.existsSync(recordFile)}`);
+				const lock = result.lock;
+				if (!lock) return result;
+				const observed = {
+					get held() {
+						return lock.held;
+					},
+					release() {
+						seen.push(`unlock, record ${fsSync.existsSync(recordFile)}`);
+						lock.release();
+					},
+				};
+				return { ...result, lock: observed };
+			},
+			probe: probeFileLock,
+		};
+		const claim = await claimed("s7");
+		expect(fsSync.existsSync(recordFile)).toBe(true);
+		claim.release();
+		expect(seen).toEqual(["acquired, record false", "unlock, record false"]);
+	});
+
 	it("shares a session this process already holds, and only the last release unlocks", async () => {
 		const [a, b] = await Promise.all([
 			claimSessionOwner("s2", { surface: "app" }),
@@ -151,6 +188,7 @@ describe.if(supported)("claim, probe and release", () => {
 			expect(await copy.probeSessionOwner("s4")).toMatchObject({ state: "held", self: true });
 			const second = await copy.claimSessionOwner("s4", { surface: "sdk" });
 			if (second.status !== "claimed") throw new Error("expected a shared claim");
+			claims.push(second.claim);
 			expect(second.claim.shared).toBe(true);
 			first.release();
 			second.claim.release();
@@ -231,6 +269,7 @@ describe("narrow fail-open", () => {
 		});
 		expect(await probeSessionOwner("f2")).toEqual({ state: "unknown", reason: "unavailable", code: "ENOLCK" });
 		expect(calls).toEqual({ acquire: 1, probe: 0 });
+		expect(warnings).toEqual(["Session ownership is unavailable; claims are off for this process"]);
 	});
 
 	it("an unavailable probe also turns claims off", async () => {
@@ -263,6 +302,7 @@ describe("narrow fail-open", () => {
 		const claim = await claimed("f4");
 		expect(claim.shared).toBe(false);
 		expect(calls.acquire).toBe(2);
+		expect(warnings).toEqual(["Session ownership claim timed out; this claim is skipped"]);
 	});
 
 	it("any other lock failure refuses, EACCES included", async () => {
