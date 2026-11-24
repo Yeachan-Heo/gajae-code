@@ -2668,6 +2668,8 @@ export class SharedSessionMutationUnsupportedError extends Error {
 	}
 }
 
+export type { GraphSuccessorRefusal } from "./internal/graph-successor-proof";
+
 /** A refused graph successor that names the reason; still a shared-mutation refusal. */
 export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsupportedError {
 	constructor(
