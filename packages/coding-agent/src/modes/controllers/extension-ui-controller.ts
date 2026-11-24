@@ -57,6 +57,7 @@ import { getSdkClientControlOperations, getSessionClientControls } from "../../s
 import { isSideConversationOperation } from "../../sdk/side-conversation";
 
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
@@ -614,9 +615,7 @@ export class ExtensionUiController {
 					})
 					.catch((err: unknown) => {
 						if (this.#isStopped()) return;
-						this.ctx.showError(
-							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
+						this.ctx.showError(`Extension sendMessage failed: ${operatorErrorMessage(err, String(err))}`);
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
@@ -852,7 +851,7 @@ export class ExtensionUiController {
 					.sendCustomMessage(message, { ...options, origin: "external" })
 					.then(() => this.#applyCustomMessageDisplay(wasStreaming, message.display))
 					.catch((err: unknown) => {
-						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
+						const errorText = `Extension sendMessage failed: ${operatorErrorMessage(err, String(err))}`;
 						if (this.ctx.isBackgrounded) {
 							logger.error(errorText);
 							return;
@@ -1639,7 +1638,7 @@ export class ExtensionUiController {
 		applyInjectedUserSubmission(this.ctx, { content, queued });
 		void send.catch((err: unknown) => {
 			if (this.#isStopped()) return;
-			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Extension sendUserMessage failed: ${operatorErrorMessage(err, String(err))}`);
 		});
 		return send;
 	};

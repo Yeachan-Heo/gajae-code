@@ -12,3 +12,4 @@
 - Turns started without a typed prompt on a stuck session are refused before the system prompt build, recall or `before_agent_start` hooks: the auto-continue prompt, hidden next-turn deliveries, `cancelAndSubmit`, and extension `sendMessage(…, { triggerTurn: true })`. The extension send now reports the failure instead of resolving as a success.
 - Extension command failures on a stuck session show the operator message. An error that wraps a session refusal but reports its own failure (for example a failed rollback) keeps that failure in front of the operator message instead of hiding it.
 - SDK and ACP error text only ever carries the fixed operator message. A wrapper's own failure message, which can include local paths, stays on local surfaces (TUI, print mode, CLI stderr).
+- Extension `sendMessage` and `sendUserMessage` failures in the TUI show the operator message on a stuck session.
