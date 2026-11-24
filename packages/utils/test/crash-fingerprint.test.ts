@@ -143,6 +143,16 @@ describe("computeCrashFingerprint", () => {
 		);
 	});
 
+	it("keeps the v1 fingerprint stable when a malformed preamble precedes a closed container", () => {
+		// 40 collapsed `<path>` prefixes stay under the 512-byte message cap, so the closed
+		// container below them is still fingerprinted. The hash is base 9bfbc54f90's value.
+		const message = "/secret={unclosed\n".repeat(40) + "secret={\nbody: HISTORICAL_BODY\n}\n";
+		const historical = computeCrashFingerprintV1({ name: "Error", message, stack: "" }, OPTIONS);
+
+		expect(historical.version).toBe(1);
+		expect(historical.fingerprint).toBe("ec9d834e32c4de311d44ed855f610ab4");
+	});
+
 	it("never hashes raw path or secret text (only its normalized form)", () => {
 		const withSecret = computeCrashFingerprint(
 			{ name: "Error", message: "credential sk-abcdefgh12345678 at /home/alice/x", stack: "" },

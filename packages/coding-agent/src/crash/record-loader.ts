@@ -81,8 +81,11 @@ function computeCrashFingerprintForVersion(
 	handled: boolean,
 ): CrashFingerprint | undefined {
 	if (version === 1) return handled ? computeHandledErrorFingerprintV1(input) : computeCrashFingerprintV1(input);
+	// Record text is persisted already masked, so the v2 identity consumes it as-is.
 	if (version === CRASH_FINGERPRINT_VERSION)
-		return handled ? computeHandledErrorFingerprint(input) : computeCrashFingerprint(input);
+		return handled
+			? computeHandledErrorFingerprint(input, { alreadyMasked: true })
+			: computeCrashFingerprint(input, { alreadyMasked: true });
 	return undefined;
 }
 
