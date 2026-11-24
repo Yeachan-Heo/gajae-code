@@ -231,47 +231,76 @@ export async function fetchGithubChannelRelease(options: GithubReleaseLookupOpti
 	// to find one with the required asset. If not checking for assets, use the
 	// traditional /releases/latest endpoint.
 	if (options.requiredBinaryAsset) {
-		const listUrl = `${apiOrigin}/repos/${RELEASE_REPO}/releases?per_page=50`;
 		try {
-			const payload = await readGithubJson(listUrl, options);
-			if (!Array.isArray(payload)) {
-				throw new Error(`${listUrl} did not return a release list`);
-			}
-			for (const entry of payload) {
-				if (typeof entry !== "object" || entry === null) continue;
-				const record = entry as GithubReleaseJson;
-				if (record.draft === true || record.prerelease === true) continue;
-				const tag = typeof record.tag_name === "string" ? record.tag_name : "";
-				if (!isSafeReleaseTag(tag)) continue;
-				const version = versionFromTag(tag);
-				if (!STABLE_VERSION_RE.test(version)) continue;
+			const fetchImpl = options.fetchImpl ?? fetch;
+			const timeoutMs = options.timeoutMs ?? 20_000;
+			const token = options.useAmbientToken ? readToken(options.lookupEnv) : undefined;
+			let page = 1;
+			let hasNextPage = true;
 
-				// Check if this release has the required asset
-				if (!releaseHasBinaryAsset(record, options.requiredBinaryAsset)) {
-					if (options.onSkippedRelease) {
-						options.onSkippedRelease(tag, version);
-					}
-					continue;
+			while (hasNextPage) {
+				const listUrl = `${apiOrigin}/repos/${RELEASE_REPO}/releases?per_page=50&page=${page}`;
+				const response = await fetchImpl(listUrl, {
+					headers: githubReleaseHeaders(token),
+					signal: AbortSignal.timeout(timeoutMs),
+					redirect: "follow",
+				});
+
+				if (!response.ok) {
+					throw new GithubApiStatusError(listUrl, response.status);
 				}
 
-				return {
-					tag,
-					version,
-					channel,
-					htmlUrl: typeof record.html_url === "string" ? record.html_url : undefined,
-					warnings: [],
-				};
+				const payload = await response.json();
+				if (!Array.isArray(payload)) {
+					throw new Error(`${listUrl} did not return a release list`);
+				}
+
+				// Check if there's a next page by looking at the Link header
+				const linkHeader = response.headers.get("link");
+				hasNextPage = linkHeader?.includes('rel="next"') ?? false;
+
+				for (const entry of payload) {
+					if (typeof entry !== "object" || entry === null) continue;
+					const record = entry as GithubReleaseJson;
+					if (record.draft === true || record.prerelease === true) continue;
+					const tag = typeof record.tag_name === "string" ? record.tag_name : "";
+					if (!isSafeReleaseTag(tag)) continue;
+					const version = versionFromTag(tag);
+					if (!STABLE_VERSION_RE.test(version)) continue;
+
+					// Check if this release has the required asset
+					if (!releaseHasBinaryAsset(record, options.requiredBinaryAsset)) {
+						if (options.onSkippedRelease) {
+							options.onSkippedRelease(tag, version);
+						}
+						continue;
+					}
+
+					return {
+						tag,
+						version,
+						channel,
+						htmlUrl: typeof record.html_url === "string" ? record.html_url : undefined,
+						warnings: [],
+					};
+				}
+
+				page++;
 			}
-			// If we get here, no release with the asset was found in the fetched list
+
+			// If we get here, no release with the asset was found after paginating through all releases
 			throw new Error(
 				`The stable channel has no published release with the ${options.requiredBinaryAsset} asset yet`,
 			);
 		} catch (error) {
 			if (error instanceof GithubApiStatusError && error.isRateLimited) {
-				// Fall through to try the web fallback, but we can't check assets that way
-			} else {
-				throw error;
+				// When checking for assets, rate-limit is a hard error because we cannot fall back
+				// to web lookups without losing the asset predicate.
+				throw new Error(
+					`${error.message} during binary asset verification. ${TOKEN_HINT}. Install updates using the npm registry (bun install -g gajae-code@latest) or wait for rate-limit reset.`,
+				);
 			}
+			throw error;
 		}
 	}
 
