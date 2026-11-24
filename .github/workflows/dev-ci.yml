@@ -4,9 +4,8 @@ on:
   push:
     branches: [dev]
   pull_request:
-    # Trigger on stacked PRs (base branch != main) and native PRs (base branch = dev).
-    # Upper-stack PRs target lower PR branches; lower PR branches are excluded from main CI (ci.yml)
-    # so each stacked layer relies on dev-ci to validate against the cumulative integration base.
+    # Any base except main (ci.yml): upper layers of a native stack target the
+    # lower layer's branch and are validated against dev (resolve-effective-base).
     branches-ignore: [main]
     types: [opened, edited, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -124,54 +123,52 @@ jobs:
   # downstream jobs to override event-provided values for stacked PR scenarios.
   resolve-effective-base:
     name: Resolve effective base for stacked PRs
-    if: ${{ github.event_name == 'pull_request' }}
+    # Runs for every event: downstream jobs `need` it, and a skipped need would
+    # skip the whole DAG on push. It shares affected-plan's dispatch/metadata-edit
+    # filter. Non-PR events emit no outputs and keep their existing base selection.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
       contents: read
     outputs:
-      effective_base_ref: ${{ steps.resolve.outputs.effective_base_ref }}
       effective_base_sha: ${{ steps.resolve.outputs.effective_base_sha }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Resolve effective base for stacked PR
+      - name: Resolve effective base
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          base_ref='${{ github.event.pull_request.base.ref }}'
-          base_sha='${{ github.event.pull_request.base.sha }}'
-          head_sha='${{ github.event.pull_request.head.sha }}'
-          
-          if [ "$base_ref" = "dev" ]; then
-            # Native PR targeting dev: use event base as-is
-            echo "effective_base_ref=$base_ref" >> "$GITHUB_OUTPUT"
-            echo "effective_base_sha=$base_sha" >> "$GITHUB_OUTPUT"
-          else
-            # Stacked PR targeting a lower PR branch: validate against current dev
-            if ! git fetch --no-tags origin dev:refs/remotes/origin/dev-integration; then
-              echo "::error::Could not fetch current dev integration base from origin."
-              exit 1
-            fi
-            dev_sha="$(git rev-parse refs/remotes/origin/dev-integration)"
-            
-            # Verify this PR head contains the current dev (cumulative stack validation)
-            if ! git merge-base --is-ancestor "$dev_sha" "$head_sha"; then
-              status=$?
-              if [ "$status" -eq 1 ]; then
-                echo "::error::Stacked PR head does not contain current dev integration base ($dev_sha). Rebase the stack onto dev."
-              else
-                echo "::error::Could not verify stacked PR head contains dev (merge-base exit $status)."
-              fi
-              exit 1
-            fi
-            
-            echo "effective_base_ref=dev" >> "$GITHUB_OUTPUT"
-            echo "effective_base_sha=$dev_sha" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            exit 0
           fi
+          if [ "$PR_BASE_REF" = "dev" ]; then
+            echo "effective_base_sha=$PR_BASE_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Native stacked PR: a stack merges every layer into dev, so validate this
+          # layer's cumulative diff against the current dev tip, which its head must contain.
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -c protocol.version=2 fetch -q --no-tags --filter=blob:none origin "refs/heads/dev:refs/remotes/origin/dev" "${PR_HEAD_SHA}"
+          dev_sha="$(git rev-parse --verify refs/remotes/origin/dev^{commit})"
+          if git merge-base --is-ancestor "$dev_sha" "$PR_HEAD_SHA"; then
+            :
+          else
+            status=$?
+            if [ "$status" -eq 1 ]; then
+              echo "::error::Stacked PR head ${PR_HEAD_SHA} does not contain current dev ${dev_sha}; rebase the stack onto dev."
+            else
+              echo "::error::Could not compare stacked PR head ${PR_HEAD_SHA} with dev ${dev_sha} (merge-base exit ${status})."
+            fi
+            exit 1
+          fi
+          echo "effective_base_sha=$dev_sha" >> "$GITHUB_OUTPUT"
 
   # Planner: resolve changed-path relevance and the affected task plan once, then
   # fan the plan out into per-task shards. Emits the matrix, has_tasks/has_native
@@ -202,7 +199,6 @@ jobs:
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
       GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
-      GITHUB_BASE_REF: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_ref) || (github.event_name == 'workflow_dispatch' && inputs.base_ref) || github.ref_name }}
       CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -333,7 +329,7 @@ jobs:
     env:
       GITHUB_BASE_SHA: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}
       GITHUB_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      BASE_REF: ${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_ref) || (github.event_name == 'workflow_dispatch' && inputs.base_ref) || github.ref_name }}
+      BASE_REF: ${{ github.event_name == 'pull_request' && 'dev' || github.event_name == 'workflow_dispatch' && inputs.base_ref || github.ref_name }}
       HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
       BASE_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.event_name == 'workflow_dispatch' && inputs.base_repository || github.repository }}
       HEAD_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}

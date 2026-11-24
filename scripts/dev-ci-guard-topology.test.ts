@@ -82,6 +82,23 @@ function requiredEnvValue(value: WorkflowJob | WorkflowStep, key: string): strin
 
 
 describe("dev-ci Telegram daemon generation guard topology", () => {
+	test("native stacked PRs run Dev CI and are validated against the dev integration base", async () => {
+		const d = await workflow();
+		const on = d.on as unknown as { pull_request: { branches?: string[]; "branches-ignore"?: string[] } };
+		expect(on.pull_request.branches).toBeUndefined();
+		expect(on.pull_request["branches-ignore"]).toEqual(["main"]);
+		const resolve = requiredJob(d, "resolve-effective-base");
+		// Must not be PR-only: downstream jobs need it, and a skipped need skips the push DAG.
+		expect(resolve.if).toBe(requiredJob(d, "affected-plan").if);
+		const run = namedStep(resolve, "Resolve effective base").run;
+		expect(run).toContain('if [ "$PR_BASE_REF" = "dev" ]; then\n  echo "effective_base_sha=$PR_BASE_SHA"');
+		expect(run).toContain('refs/heads/dev:refs/remotes/origin/dev');
+		expect(run).toContain('git merge-base --is-ancestor "$dev_sha" "$PR_HEAD_SHA"');
+		expect(run).not.toContain("${{");
+		for (const name of ["affected-plan", "telegram-daemon-generation", "affected-shards", "gjc-state-gates-relevance", "gjc-state-gates-matrix"])
+			expect(requiredJob(d, name).needs).toContain("resolve-effective-base");
+	});
+
 	test("metadata event matrix isolates concurrency and skips the entire code DAG, not the contract", async () => {
 		const document = await workflow();
 		if (!document.concurrency) throw new Error("Missing workflow concurrency");
@@ -290,7 +307,7 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(requiredEnvValue(guard, "GITHUB_HEAD_SHA")).toContain("github.event.pull_request.head.sha");
 		expect(requiredEnvValue(guard, "GITHUB_HEAD_SHA")).toContain("github.sha");
 
-		const baseExpression = "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}";
+		const baseExpression = "${{ (github.event_name == 'pull_request' && needs.resolve-effective-base.outputs.effective_base_sha) || (github.event_name == 'workflow_dispatch' && inputs.base_sha) || github.event.before }}";
 		// All consumers of the affected plan use the identical event-specific base
 		// expression. In particular, dispatch cannot plan/shard one range while the
 		// daemon guard validates another.
@@ -417,7 +434,7 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const upload = namedStep(native, "Upload state-gate native addon(s)");
 		expect(upload.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
 		expect(native.needs).toEqual(["gjc-state-gates-relevance"]);
-		expect(matrix.needs).toEqual(["gjc-state-gates-relevance", "gjc-state-gates-native"]);
+		expect(matrix.needs).toEqual(["gjc-state-gates-relevance", "gjc-state-gates-native", "resolve-effective-base"]);
 		const download = namedStep(matrix, "Download state-gate native addon(s)");
 		expect(download.with?.name).toBe("dev-state-gates-native-${{ github.run_id }}");
 		expect(download.with?.path).toBe("packages/natives/native");
