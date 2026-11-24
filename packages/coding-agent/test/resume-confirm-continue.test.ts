@@ -323,7 +323,9 @@ describe("bare resume startup gating", () => {
 
 describe("explicit resume destination authority", () => {
 	it("binds both direct resume path forms to the supplied explicit session directory", async () => {
-		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
+		const open = vi
+			.spyOn(SessionManager, "open")
+			.mockResolvedValue({ isFilesystemConfined: () => false } as unknown as SessionManager);
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "enabled" : "copy-retain"),
 			getGlobal: (key: SettingPath) => (key === "session.ownership.mode" ? "off" : undefined),
@@ -344,6 +346,7 @@ describe("explicit resume destination authority", () => {
 			"copy-retain",
 			"enabled",
 			{ surface: "sdk", mode: "off" },
+			"none",
 		);
 		expect(open).toHaveBeenNthCalledWith(
 			2,
@@ -353,11 +356,14 @@ describe("explicit resume destination authority", () => {
 			"copy-retain",
 			"enabled",
 			{ surface: "sdk", mode: "off" },
+			"none",
 		);
 	});
 
 	it("binds a direct resume path without --session-dir to its parent directory", async () => {
-		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
+		const open = vi
+			.spyOn(SessionManager, "open")
+			.mockResolvedValue({ isFilesystemConfined: () => false } as unknown as SessionManager);
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "off" : "copy-retain"),
 			getGlobal: (key: SettingPath) => (key === "session.ownership.mode" ? "off" : undefined),
@@ -373,6 +379,7 @@ describe("explicit resume destination authority", () => {
 			"copy-retain",
 			"off",
 			{ surface: "sdk", mode: "off" },
+			"none",
 		);
 	});
 

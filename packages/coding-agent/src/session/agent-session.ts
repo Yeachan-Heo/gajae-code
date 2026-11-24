@@ -22621,6 +22621,8 @@ export class AgentSession {
 					undefined,
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
+					undefined,
+					{ confined: previousManager.isFilesystemConfined() },
 				);
 				let exactRetirement: PreparedExactMcpRetirement | undefined;
 				let adopted = false;
@@ -33623,6 +33625,19 @@ export class AgentSession {
 
 				if (result?.cancel) {
 					return false;
+				}
+			}
+			// Tool wrappers were built for the current scope, so a switch must not
+			// cross between confined and ordinary transcripts. Checked before any
+			// session state changes, so a rejected switch needs no rollback.
+			if (fs.existsSync(sessionPath)) {
+				const currentConfined = this.sessionManager.isFilesystemConfined();
+				const target = SessionManager.inspectTranscriptScope(sessionPath);
+				if (!target) throw new Error(`Could not read the filesystem scope of session ${sessionPath}`);
+				if (target.confined !== currentConfined) {
+					throw new Error(
+						`Cannot switch between confined and unconfined sessions: current is ${currentConfined ? "confined" : "unconfined"}, target is ${target.confined ? "confined" : "unconfined"}`,
+					);
 				}
 			}
 			options?.onTransitionMutationStarted?.();
