@@ -140,6 +140,12 @@ import {
 	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
+	type GraphSuccessorRefusal,
+	graphSuccessorRefusalMessage,
+	proveOwnCommittedGraph,
+	sanitizeLoadedSessionEntryReplayMetadata,
+} from "./internal/graph-successor-proof";
+import {
 	deleteManagedSessionCandidate,
 	isRecoverableOwnerOnlyModeDrift,
 	type ManagedCandidateWriteAuthority,
@@ -2662,34 +2668,6 @@ export class SharedSessionMutationUnsupportedError extends Error {
 	}
 }
 
-/** Why a fork or branch of a shared session cannot be built from its committed transcript. */
-export type GraphSuccessorRefusal =
-	| "publication-in-flight"
-	| "not-admitted"
-	| "unknown-entry"
-	| "large-session"
-	| "old-format"
-	| "unreadable"
-	| "foreign-entry"
-	| "uncommitted"
-	| "content-mismatch"
-	| "changed"
-	| "busy";
-
-const GRAPH_SUCCESSOR_REFUSAL_TEXT: Record<GraphSuccessorRefusal, string> = {
-	"publication-in-flight": "a save to this session is still in progress",
-	"not-admitted": "this session does not allow it right now",
-	"unknown-entry": "the selected message is not in this session",
-	"large-session": "this session is too large to fork safely",
-	"old-format": "this session file uses an older format",
-	unreadable: "the session file could not be read",
-	"foreign-entry": "another gjc process has written to this session",
-	uncommitted: "part of this branch has not been saved to the session file",
-	"content-mismatch": "the saved session file does not match the loaded session",
-	changed: "the session file changed while the fork was prepared",
-	busy: "another gjc process is writing to this session",
-};
-
 /** A refused graph successor that names the reason; still a shared-mutation refusal. */
 export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsupportedError {
 	constructor(
@@ -2697,22 +2675,9 @@ export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsuppo
 		readonly reason: GraphSuccessorRefusal,
 	) {
 		super(operation);
-		this.message = `Cannot fork this session: ${GRAPH_SUCCESSOR_REFUSAL_TEXT[reason]}.`;
+		this.message = graphSuccessorRefusalMessage(reason);
 		this.name = "GraphSuccessorUnavailableError";
 	}
-}
-
-/**
- * Whether a committed transcript entry and the legacy serialisation of a resident entry
- * are the same entry for a successor: JSON-equal as they stand, or equal once both have
- * had the load-time projection applied. Resume strips OpenAI Responses replay metadata
- * in memory without rewriting a managed transcript; a live session keeps it on both sides.
- */
-function committedEntryMatchesResident(committed: FileEntry, serializedResident: FileEntry): boolean {
-	if (Bun.deepEquals(committed, serializedResident)) return true;
-	if (committed.type === "session" || serializedResident.type === "session") return false;
-	const project = (entry: SessionEntry) => sanitizeLoadedSessionEntryReplayMetadata(structuredClone(entry));
-	return Bun.deepEquals(project(committed), project(serializedResident));
 }
 
 /**
@@ -6033,14 +5998,6 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	return cloned;
 }
 
-/** Match eager-resume replay sanitation whenever an entry is loaded from a bounded sidecar path. */
-function sanitizeLoadedSessionEntryReplayMetadata(entry: SessionEntry): SessionEntry {
-	if (entry.type === "message" && entry.message.role === "assistant") {
-		entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
-	}
-	return entry;
-}
-
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
 	if (entry.type === "compaction") {
 		const cache = new Map<string, string>();
@@ -8034,7 +7991,7 @@ export class SessionManager {
 	#preparedNewSessions = new Set<PreparedNewSessionState>();
 	/** Provenance is manager-owned; fresh successors do not inherit shared restrictions. */
 	readonly #preparedGraphSourceIds = new WeakMap<PreparedNewSessionState, string>();
-	/** Graph successors proven against the committed transcript while only shared bars refused legacy ones. */
+	/** Successors proven against the committed transcript. */
 	readonly #committedGraphSuccessors = new WeakSet<PreparedNewSessionState>();
 	#sessionName: string | undefined;
 	#titleSource: "auto" | "user" | undefined;
@@ -11250,7 +11207,7 @@ export class SessionManager {
 		const sourceEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
 			(entry): entry is SessionEntry => entry.type !== "session",
 		);
-		// Prove before copying artifacts; the publish re-checks the proven bytes under the lease.
+		// Prove before copying artifacts.
 		const proof = route === "committed" ? this.#proveOwnCommittedGraph(sourceEntries) : undefined;
 		if (typeof proof === "string") throw new GraphSuccessorUnavailableError("prepare fork", proof);
 		const entries: FileEntry[] = [header, ...sourceEntries];
@@ -11325,7 +11282,7 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
-			// A committed-transcript successor records the source by id; the legacy path keeps its file path.
+			// The committed route records the source id; the legacy route keeps the path.
 			parentSession: route === "committed" ? sourceId : this.persist ? this.#sessionFile : undefined,
 		};
 		const pathWithoutLabels = branchPath.filter(entry => entry.type !== "label");
@@ -20760,8 +20717,7 @@ export class SessionManager {
 		const sourceId = this.#preparedGraphSourceIds.get(stage);
 		if (sourceId === undefined) return;
 		if (this.#committedGraphSuccessors.has(stage)) {
-			// Proven against the committed transcript; adoption never writes the source,
-			// so only a publication still in flight on the source refuses it.
+			// Adoption never writes the source; only an in-flight publication refuses.
 			if ((this.#activeSharedMutationSessionCounts.get(sourceId) ?? 0) > 0)
 				throw new GraphSuccessorUnavailableError("publish prepared graph successor", "publication-in-flight");
 			return;
@@ -20769,12 +20725,7 @@ export class SessionManager {
 		this.#assertLogicalSessionMutationAllowed(sourceId, "publish prepared graph successor", true);
 	}
 
-	/**
-	 * Why a fork or branch of the current session cannot be prepared now, or undefined
-	 * when it can. Non-throwing and write-free, so callers check it before any agent,
-	 * hook, UI or settings effect. `leafId` requires that branch path to be proven;
-	 * `wholeSession` requires every resident entry; neither checks ownership only.
-	 */
+	/** Why a fork or branch cannot be prepared now; non-throwing and write-free, for use before any effect. */
 	graphSuccessorRefusal(target: { leafId?: string; wholeSession?: boolean } = {}): GraphSuccessorRefusal | undefined {
 		let refusal: GraphSuccessorRefusal | undefined;
 		try {
@@ -20803,17 +20754,9 @@ export class SessionManager {
 		return refusal;
 	}
 
-	/**
-	 * How a graph successor of session `sessionId` is built: "legacy" when this manager
-	 * has no shared bar (legacy admission then decides, as before), "committed" when
-	 * only the shared bars refuse it, otherwise the refusal. Root TUIs publish through shared append, which latches the bars for the
-	 * manager's lifetime even with no peer; a successor is a new transcript and never
-	 * writes the source, so it can be built from this opener's own committed graph.
-	 */
+	/** "legacy" without shared bars (admission unchanged), "committed" when only the bars refuse, else the refusal. */
 	#graphSuccessorRoute(sessionId: string): "legacy" | "committed" | GraphSuccessorRefusal {
 		const barred = this.#sharedAppendBarSessionIds.has(sessionId) || this.#sharedRewriteBarSessionIds.has(sessionId);
-		// Unbarred managers keep dev's legacy admission exactly; in-flight publications
-		// elsewhere in the process matter only once the shared route is in play.
 		if (!barred) return "legacy";
 		if (
 			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0 ||
@@ -20835,64 +20778,34 @@ export class SessionManager {
 		throw new GraphSuccessorUnavailableError(operation, route);
 	}
 
-	/**
-	 * Prove that the committed transcript is this opener's own graph and that each source
-	 * entry is committed as this opener holds it, and return the successor's source lines
-	 * with the digest of the bytes the proof read. The proof requires: this session at
-	 * the current version; no entry id this opener does not hold (a peer's sibling is
-	 * foreign; id-less patch lines are applied, not counted); every source entry
-	 * committed and matching ({@link committedEntryMatchesResident}). The lines are the
-	 * legacy serialisation of the resident entries, so the successor matches a legacy
-	 * fork; it serialises into a scratch in-memory blob store (refs are content hashes the
-	 * committed lines already reference). Read-only; a cold-retired view cannot prove
-	 * ownership because its resident ids are incomplete.
-	 */
+	/** {@link proveOwnCommittedGraph} over this opener's committed transcript; read-only. */
 	#proveOwnCommittedGraph(
 		sourceEntries: readonly SessionEntry[],
 	): { lines: string[]; digest: string } | GraphSuccessorRefusal {
 		const sessionFile = this.#sessionFile;
 		const readSnapshot = this.#storage.readSnapshotSync?.bind(this.#storage);
 		if (this.destination.kind !== "managed" || !this.persist || !sessionFile || !readSnapshot) return "not-admitted";
+		// A cold-retired view cannot prove ownership: its resident ids are incomplete.
 		if (this.#coldSidecarActive()) return "large-session";
 		let bytes: Uint8Array;
-		let committed: FileEntry[];
 		try {
 			bytes = readSnapshot(sessionFile).bytes;
-			committed = parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
 		} catch {
 			return "unreadable";
 		}
-		const header = committed[0];
-		if (header?.type !== "session" || header.id !== this.#sessionId) return "unreadable";
-		if (header.version !== CURRENT_SESSION_VERSION) return "old-format";
-		const own = new Set(this.#residentEntryIds());
-		const byId = new Map<string, SessionEntry>();
-		for (const entry of committed) {
-			if (entry.type === "session" || typeof entry.id !== "string") continue;
-			if (!own.has(entry.id)) return "foreign-entry";
-			byId.set(entry.id, entry);
-		}
+		// A scratch store: blob refs are content hashes the committed lines already hold.
 		const scratch = new MemoryBlobStore();
-		const lines: string[] = [];
-		for (const entry of sourceEntries) {
-			const line = byId.get(entry.id);
-			if (!line) return "uncommitted";
-			const serialized = JSON.parse(JSON.stringify(prepareEntryForPersistenceSync(entry, scratch))) as FileEntry;
-			if (!committedEntryMatchesResident(line, serialized)) {
-				logger.warn("Committed session entry differs from the resident entry", { entryId: entry.id });
-				return "content-mismatch";
-			}
-			lines.push(JSON.stringify(serialized));
-		}
-		return { lines, digest: crypto.createHash("sha256").update(bytes).digest("hex") };
+		return proveOwnCommittedGraph({
+			bytes,
+			sessionId: this.#sessionId,
+			ownIds: new Set(this.#residentEntryIds()),
+			sourceEntries,
+			serialize: entry => prepareEntryForPersistenceSync(entry, scratch),
+			onMismatch: entryId => logger.warn("Committed session entry differs from the resident entry", { entryId }),
+		});
 	}
 
-	/**
-	 * Publish a graph successor proven against the committed transcript. The proof (parse,
-	 * serialise, compare) runs before the source's session transaction; under it, only
-	 * the digest of the committed bytes is re-checked, so peers wait for one read and one
-	 * hash. The source is only read; the successor is a new file.
-	 */
+	/** Publish a proven successor; under the source's lease only the proven digest is re-checked. */
 	async #publishCommittedGraphSuccessor(
 		stage: PreparedNewSessionState,
 		sourceFile: string | undefined,
