@@ -449,15 +449,17 @@ export async function claimSessionOwner(
 	}
 }
 
-async function probeOne(owners: string | undefined, sessionId: string): Promise<SessionOwnerProbe> {
+type OwnersDirectoryState = "present" | "missing" | "unsafe";
+
+async function probeOne(owners: string, state: OwnersDirectoryState, sessionId: string): Promise<SessionOwnerProbe> {
 	const current = registry();
-	const sidecar =
-		owners === undefined ? undefined : path.join(owners, `${sessionOwnerKey(sessionId)}${SIDECAR_SUFFIX}`);
-	if (sidecar === undefined) return { state: "free" };
-	const pending = current.pending.get(sidecar);
-	if (pending) await pending;
+	const sidecar = path.join(owners, `${sessionOwnerKey(sessionId)}${SIDECAR_SUFFIX}`);
+	// This process's own claims come first: the registry knows them whatever the directory says.
+	for (let pending = current.pending.get(sidecar); pending; pending = current.pending.get(sidecar)) await pending;
 	const own = current.entries.get(sidecar);
 	if (own) return { state: "held", self: true, holder: selfHolder(own) };
+	if (state === "missing") return { state: "free" };
+	if (state === "unsafe") return { state: "unknown", reason: "failed", code: "owners_directory_unsafe" };
 	if (current.unavailable !== undefined) return { state: "unknown", reason: "unavailable", code: current.unavailable };
 	const result = await backend().probe(sidecar, NATIVE_BUDGET_MS);
 	switch (result.state) {
@@ -483,17 +485,17 @@ export async function probeSessionOwners(sessionIds: readonly string[]): Promise
 	const ids = [...new Set(sessionIds)];
 	for (const id of ids) sessionOwnerKey(id);
 	const results = new Map<string, SessionOwnerProbe>();
-	let owners: string | undefined;
+	const owners = sessionOwnersDirectory();
+	let state: OwnersDirectoryState;
 	try {
-		owners = inspectOwnersDirectory();
+		state = inspectOwnersDirectory() === undefined ? "missing" : "present";
 	} catch (error) {
 		logger.warn("Session owners directory failed its checks", { error: String(error) });
-		for (const id of ids) results.set(id, { state: "unknown", reason: "failed", code: "owners_directory_unsafe" });
-		return results;
+		state = "unsafe";
 	}
 	for (let start = 0; start < ids.length; start += PROBE_CONCURRENCY) {
 		const batch = ids.slice(start, start + PROBE_CONCURRENCY);
-		const probes = await Promise.all(batch.map(id => probeOne(owners, id)));
+		const probes = await Promise.all(batch.map(id => probeOne(owners, state, id)));
 		for (const [index, id] of batch.entries()) results.set(id, probes[index]);
 	}
 	return results;

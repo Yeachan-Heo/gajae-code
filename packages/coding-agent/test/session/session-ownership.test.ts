@@ -179,6 +179,39 @@ describe.if(supported)("claim, probe and release", () => {
 		expect(await probeSessionOwner("s3")).toEqual({ state: "free" });
 	});
 
+	it("a probe reports this process's own claim even when the owners directory is gone", async () => {
+		await claimed("s8");
+		const moved = path.join(home, "moved-owners");
+		await fs.rename(sessionOwnersDirectory(), moved);
+		try {
+			expect(await probeSessionOwner("s8")).toMatchObject({ state: "held", self: true });
+			expect(await probeSessionOwner("s9")).toEqual({ state: "free" });
+		} finally {
+			await fs.rename(moved, sessionOwnersDirectory());
+		}
+	});
+
+	it("a probe waits for a claim in flight in this process", async () => {
+		const started = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				started.resolve();
+				await gate.promise;
+				return tryAcquireFileLock(sidecar, timeoutMs);
+			},
+			// Without the wait, the probe would ask the lock and hear "free".
+			probe: async () => ({ state: FileLockProbeState.Free }),
+		};
+		const claiming = claimSessionOwner("s10", { surface: "terminal" });
+		await started.promise;
+		const probing = probeSessionOwner("s10");
+		gate.resolve();
+		const result = await claiming;
+		if (result.status === "claimed") claims.push(result.claim);
+		expect(await probing).toMatchObject({ state: "held", self: true });
+	});
+
 	it("two copies of the module share one registry", async () => {
 		const copy: typeof ownership = ownershipCopy;
 		expect(copy.claimSessionOwner).not.toBe(claimSessionOwner);
