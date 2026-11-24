@@ -66,12 +66,20 @@ describe("operator text on SDK and ACP surfaces", () => {
 		expect(response.error).toEqual({ code: "internal", message: "Control operation failed." });
 	});
 
-	it("maps an ACP prompt refusal to the operator text with the machine code in data", () => {
+	it("publishes an ACP refusal's operator text in data.operatorMessage and keeps details", () => {
 		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
-		const failure = acpRequestFailure(mismatch) as Error & { data?: { code?: unknown; details?: unknown } };
-		expect(failure.message).toContain(mismatch.operatorMessage);
-		expect(failure.message).not.toContain("managed_append_identity_mismatch");
+		const failure = acpRequestFailure(mismatch) as Error & {
+			data?: { code?: unknown; details?: unknown; operatorMessage?: unknown };
+		};
 		expect(failure.data?.code).toBe("managed_append_identity_mismatch");
-		expect(failure.data?.details).toBe(mismatch.operatorMessage);
+		expect(failure.data?.details).toBe("managed_append_identity_mismatch");
+		expect(failure.data?.operatorMessage).toBe(mismatch.operatorMessage);
+	});
+
+	it("adds no operatorMessage key to ACP errors without operator text", () => {
+		const failure = acpRequestFailure(Object.assign(new Error("busy now"), { code: "busy" })) as Error & {
+			data?: Record<string, unknown>;
+		};
+		expect(failure.data).toEqual({ code: "busy", details: "busy now" });
 	});
 });

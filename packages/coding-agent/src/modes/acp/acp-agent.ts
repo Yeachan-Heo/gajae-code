@@ -73,7 +73,7 @@ import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } f
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
-import { operatorErrorMessage } from "../../session/operator-error-message";
+import { findOperatorMessage } from "../../session/operator-error-message";
 import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
@@ -1667,9 +1667,7 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
-	// The discriminator stays in `data.code`; the human text is the operator message when
-	// the error carries one (for example a transcript another process changed).
-	const message = error instanceof Error ? operatorErrorMessage(error) : code;
+	const message = error instanceof Error ? error.message : code;
 	// ACP clients render `data.details` after the JSON-RPC message. The MCP launch
 	// diagnostic is already the complete additional message, so repeating it in
 	// `details` produces `Internal error: X.: X.` on the wire.
@@ -1688,6 +1686,11 @@ export function acpRequestFailure(error: unknown): unknown {
 	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
 	// that observed no plan adds no keys, so its payload stays byte-identical to before.
 	if (error instanceof AcpPromptAbandonedError) Object.assign(data, promptAbandonWireData(error.plan));
+	// A session refusal that carries operator text (for example a transcript another
+	// process changed) publishes it under the same `data.operatorMessage` key prompt
+	// terminals use (#5615). `code`/`details` and the JSON-RPC message are untouched.
+	const operatorMessage = findOperatorMessage(error);
+	if (operatorMessage !== undefined) Object.assign(data, { operatorMessage });
 	switch (code) {
 		case "authentication_failed":
 			return RequestError.authRequired(data, message);
