@@ -293,18 +293,29 @@ describe("SessionTaskPool resizing with active permits and waiters", () => {
 		// Resize: increase limit to 3
 		settings.set("task.maxConcurrency", 3);
 
-		// Trigger resize by acquiring
-		// (resizeIfNeeded is called in acquire)
-		const slot3 = await pool.acquire(0);
-		// The waiter should have been woken by the resize
+		// Try to acquire - this will trigger resizeIfNeeded and wake the waiter
+		let slot3Acquired = false;
+		const slot3Promise = pool.acquire(0).then(() => {
+			slot3Acquired = true;
+			return true;
+		});
+
+		// The waiter should be woken by the resize
 		await waiter3Promise;
 		expect(waiter3Acquired).toBe(true);
-		expect(slot3.acquiredSlot).toBe(true);
+
+		// slot3 should still be blocked (at capacity: 2 original + waiter3 = 3)
+		await new Promise(resolve => setTimeout(resolve, 50));
+		expect(slot3Acquired).toBe(false);
+
+		// Release slot1 to make room for slot3
+		pool.release(slot1);
+		await slot3Promise;
+		expect(slot3Acquired).toBe(true);
 
 		// Cleanup
-		pool.release(slot1);
 		pool.release(slot2);
-		pool.release(slot3);
+		pool.release({ acquiredSlot: true });
 	});
 
 	it("should correctly shrink limit while preserving existing holders", async () => {

@@ -20,8 +20,9 @@ export class SessionTaskPool {
 
 	constructor(settings: Settings, initialLimit: number) {
 		this.#settings = settings;
-		// Convert 0 or negative to null (unlimited)
-		this.#lastKnownLimit = initialLimit <= 0 ? null : initialLimit;
+		// Apply the same normalization as getLimit():
+		// 0 = unlimited, negative = clamp to 1
+		this.#lastKnownLimit = initialLimit === 0 ? null : initialLimit < 0 ? 1 : initialLimit;
 		this.#semaphore = new Semaphore(this.#lastKnownLimit);
 	}
 

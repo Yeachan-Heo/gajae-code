@@ -83,6 +83,11 @@ export async function mapWithConcurrencyLimit<T, R>(
 	return { results, aborted: signal?.aborted ?? false };
 }
 
+interface QueuedWaiter {
+	resolve: () => void;
+	preAllocated?: boolean;
+}
+
 /**
  * Simple counting semaphore for limiting concurrency across independently-scheduled async work.
  * Supports in-place resizing while preserving active permits and queued waiters.
@@ -90,7 +95,7 @@ export async function mapWithConcurrencyLimit<T, R>(
 export class Semaphore {
 	#max: number | null; // null = unlimited
 	#current = 0;
-	#queue: Array<() => void> = [];
+	#queue: QueuedWaiter[] = [];
 
 	constructor(max: number | null) {
 		if (max === null || max === 0) {
@@ -112,8 +117,13 @@ export class Semaphore {
 			return;
 		}
 		const { promise, resolve } = Promise.withResolvers<void>();
-		this.#queue.push(resolve);
-		return promise;
+		const waiter: QueuedWaiter = { resolve };
+		this.#queue.push(waiter);
+		await promise;
+		// If pre-allocated by release/setMax, don't increment. Otherwise increment now.
+		if (!waiter.preAllocated) {
+			this.#current++;
+		}
 	}
 
 	release(): void {
@@ -123,27 +133,39 @@ export class Semaphore {
 			return;
 		}
 
-		const next = this.#queue.shift();
-		if (next) {
-			next(); // This will trigger acquire() in the waiter, incrementing #current
-		} else {
-			this.#current--;
+		// First, decrement since we're releasing
+		this.#current--;
+
+		// If we still have waiters and capacity is available, wake a waiter
+		if (this.#current < this.#max && this.#queue.length > 0) {
+			const waiter = this.#queue.shift();
+			if (waiter) {
+				// Mark as pre-allocated and increment #current for this waiter
+				waiter.preAllocated = true;
+				this.#current++;
+				// Resolve the waiter; it will NOT re-increment in its acquire() return
+				waiter.resolve();
+			}
 		}
 	}
 
 	/**
-	 * Resize the semaphore limit while preserving existing permits and waiters.
+	 * Resize the semaphore limit while preserving existing permits and queued waiters.
 	 * When shrinking: existing holders drain naturally, new acquires blocked if over limit.
-	 * When growing: queued waiters are woken to fill new slots.
+	 * When growing: queued waiters are woken to fill new slots, with permits reserved.
 	 */
 	setMax(newMax: number | null): void {
 		if (newMax === null || newMax === 0) {
 			this.#max = null; // Switch to unlimited
 			// Wake all queued waiters since we're now unlimited
-			// Don't clear #current; we're just changing the limit mode
+			// Reserve permits for each waiter being woken
 			while (this.#queue.length > 0) {
-				const resolve = this.#queue.shift();
-				if (resolve) resolve();
+				const waiter = this.#queue.shift();
+				if (waiter) {
+					waiter.preAllocated = true;
+					this.#current++;
+					waiter.resolve();
+				}
 			}
 			return;
 		}
@@ -162,17 +184,21 @@ export class Semaphore {
 		this.#max = normalized;
 
 		// If growing, wake waiters to fill new slots.
-		// Count the actual available slots: (new max) - (current holders)
-		// This ensures the acquiring waiter will increment #current when resume,
-		// but only if there's actual capacity.
+		// Only wake if the new limit provides additional capacity
 		if (normalized > oldMax) {
 			const availableSlots = normalized - this.#current;
 			for (let i = 0; i < availableSlots && this.#queue.length > 0; i++) {
-				const resolve = this.#queue.shift();
-				if (resolve) resolve();
+				const waiter = this.#queue.shift();
+				if (waiter) {
+					// Mark as pre-allocated and reserve the permit
+					waiter.preAllocated = true;
+					this.#current++;
+					// Resolve the waiter; it will NOT re-increment in its acquire() return
+					waiter.resolve();
+				}
 			}
 		}
 		// If shrinking: nothing to do. Existing holders drain naturally.
-		// New acquires will be blocked if current >= normalized.
+		// When they release(), we'll check if we're over the new limit.
 	}
 }

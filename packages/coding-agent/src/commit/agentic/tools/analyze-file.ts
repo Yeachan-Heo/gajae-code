@@ -13,13 +13,8 @@ import type { TaskParams } from "../../../task/types";
 import type { ToolSession } from "../../../tools";
 import { getFilePriority } from "./git-file-diff";
 
-// Context holder for the session's task pool during tool execution.
-// Set by the agent when the session is initialized and used by analyze-files.
-let sessionTaskPoolContext: SessionTaskPool | undefined;
-
-export function setAnalyzeFilesTaskPoolContext(pool: SessionTaskPool | undefined): void {
-	sessionTaskPoolContext = pool;
-}
+// Pool context is now passed through the getTaskPool getter in options,
+// which is per-invocation and prevents concurrent calls from overwriting shared state.
 
 const analyzeFileSchema = z.object({
 	files: z.array(z.string().describe("file path")).min(1),
@@ -72,9 +67,8 @@ export function createAnalyzeFileTool(options: {
 		description: "Spawn quick_task agents to analyze files.",
 		parameters: analyzeFileSchema,
 		async execute(toolCallId, params, onUpdate, ctx, signal) {
-			// Use the context-provided pool or fall back to options if provided
-			const getTaskPool = options.getTaskPool || (() => sessionTaskPoolContext);
-			const toolSession = buildToolSession(ctx, options, getTaskPool);
+			// Use the per-invocation pool getter from options
+			const toolSession = buildToolSession(ctx, options, options.getTaskPool);
 			const taskTool = await TaskTool.create(toolSession);
 			const numstat = options.state.overview?.numstat ?? [];
 			const tasks = params.files.map((file, index) => {
