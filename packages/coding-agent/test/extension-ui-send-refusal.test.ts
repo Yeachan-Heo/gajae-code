@@ -55,7 +55,7 @@ describe("extension sends on a stuck session", () => {
 		const { actions, showError } = captureActions(mismatch);
 
 		// A queued delivery keeps the optimistic chat rendering out of this fake context.
-		await actions.sendUserMessage("go", { deliverAs: "followUp" }).catch(() => {});
+		await Promise.resolve(actions.sendUserMessage("go", { deliverAs: "followUp" })).catch(() => {});
 		for (let attempt = 0; attempt < 50 && showError.mock.calls.length === 0; attempt++) await Bun.sleep(1);
 
 		expect(showError).toHaveBeenCalledWith(`Extension sendUserMessage failed: ${mismatch.operatorMessage}`);
