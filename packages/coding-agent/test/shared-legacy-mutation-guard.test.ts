@@ -116,7 +116,7 @@ const NOT_LEGACY_WRITERS: Record<string, string> = {
 	prepareManagedCandidateForStrictAdoption: "storage candidate preparation",
 	promoteRecoveryHydrationAfterOwnershipReadyFence: "recovery hydration promotion",
 	deleteSessionVerified: "verified delete of a session file",
-	sanitizeLoadedOpenAIResponsesReplayMetadata: "load-time only; refuses when it would mutate",
+	sanitizeLoadedOpenAIResponsesReplayMetadata: "load-time, resident-only; never persists patches",
 	branch: "local cursor movement, no transcript write",
 	resetLeaf: "local cursor movement, no transcript write",
 	ensureOnDisk: "materializes an already-owned transcript",

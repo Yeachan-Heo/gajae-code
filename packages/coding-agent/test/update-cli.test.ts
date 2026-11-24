@@ -504,6 +504,152 @@ describe("update-cli release lookup", () => {
 			}),
 		).rejects.toThrow("GITHUB_TOKEN");
 	});
+
+	it("skips stable releases without the binary asset for the current platform", async () => {
+		const requested: string[] = [];
+		const skipped: Array<{ tag: string; version: string }> = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: "stable",
+			requiredBinaryAsset: "gjc-linux-x64",
+			onSkippedRelease: (tag, version) => skipped.push({ tag, version }),
+			fetchImpl: async url => {
+				requested.push(String(url));
+				// Return multiple releases: v9.9.9 without the asset, v9.9.8 with it
+				return new Response(
+					JSON.stringify([
+						{
+							tag_name: "v9.9.9",
+							draft: false,
+							prerelease: false,
+							assets: [{ name: "gjc-darwin-arm64" }, { name: "gjc-windows-x64.exe" }],
+						},
+						{
+							tag_name: "v9.9.8",
+							draft: false,
+							prerelease: false,
+							assets: [{ name: "gjc-linux-x64" }, { name: "gjc-darwin-arm64" }],
+						},
+					]),
+					{ status: 200, headers: new Headers() },
+				);
+			},
+		});
+
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50&page=1");
+		expect(skipped).toEqual([{ tag: "v9.9.9", version: "9.9.9" }]);
+		expect(release.tag).toBe("v9.9.8");
+		expect(release.version).toBe("9.9.8");
+		expect(release.warnings).toEqual(["release v9.9.9 has no asset for gjc-linux-x64 yet"]);
+	});
+
+	it("throws when no stable releases have the required binary asset", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				channel: "stable",
+				requiredBinaryAsset: "gjc-linux-x64",
+				fetchImpl: async () =>
+					new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.9",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-darwin-arm64" }],
+							},
+							{
+								tag_name: "v9.9.8",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-windows-x64.exe" }],
+							},
+						]),
+						{ status: 200 },
+					),
+			}),
+		).rejects.toThrow("no published release with the gjc-linux-x64 asset yet");
+	});
+
+	it("paginates through releases to find stable release with required asset", async () => {
+		const requested: string[] = [];
+		const skipped: Array<{ tag: string; version: string }> = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: "stable",
+			requiredBinaryAsset: "gjc-linux-x64",
+			onSkippedRelease: (tag, version) => skipped.push({ tag, version }),
+			fetchImpl: async url => {
+				requested.push(String(url));
+				const urlStr = String(url);
+				// First page: only nightly releases
+				if (urlStr.includes("page=1")) {
+					return new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.10-nightly.1.0.g123abc",
+								draft: false,
+								prerelease: true,
+								assets: [],
+							},
+							{
+								tag_name: "v9.9.9-nightly.2.0.g456def",
+								draft: false,
+								prerelease: true,
+								assets: [],
+							},
+						]),
+						{
+							status: 200,
+							headers: new Headers({
+								link: '<https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?page=2&per_page=50>; rel="next"',
+							}),
+						},
+					);
+				}
+				// Second page: stable releases, v9.9.8 without asset, v9.9.7 with it
+				if (urlStr.includes("page=2")) {
+					return new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.8",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-darwin-arm64" }],
+							},
+							{
+								tag_name: "v9.9.7",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-linux-x64" }, { name: "gjc-darwin-arm64" }],
+							},
+						]),
+						{ status: 200, headers: new Headers() },
+					);
+				}
+				return new Response("Unexpected URL", { status: 404 });
+			},
+		});
+
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50&page=1");
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50&page=2");
+		expect(skipped).toEqual([{ tag: "v9.9.8", version: "9.9.8" }]);
+		expect(release.tag).toBe("v9.9.7");
+		expect(release.version).toBe("9.9.7");
+	});
+
+	it("throws explicit error when rate limited during asset-aware release lookup", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				channel: "stable",
+				requiredBinaryAsset: "gjc-linux-x64",
+				fetchImpl: async () => new Response("Rate limited", { status: 429 }),
+			}),
+		).rejects.toThrow(/responded 429.*binary asset verification.*GITHUB_TOKEN.*bun install -g gajae-code@latest/);
+	});
 });
 
 describe("update-cli install target detection", () => {

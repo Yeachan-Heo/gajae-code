@@ -178,6 +178,12 @@ export type DarwinAncestryTracker = {
 	track(processRef: NativeProcess, uniqueId?: bigint): boolean;
 	trackGuardian(processRef: NativeProcess, uniqueId?: bigint): boolean;
 	poll(): boolean;
+	/**
+	 * Pids currently descended from `rootPid` by unique-id ancestry, including
+	 * `rootPid` itself. Reparenting does not break the chain. Returns undefined
+	 * when the root or the process table cannot be read.
+	 */
+	lineage(rootPid: number): Set<number> | undefined;
 	close(): void;
 };
 
@@ -314,6 +320,20 @@ export function createDarwinAncestryTracker(
 			retainOwnedProcess(owned, processRef);
 			return true;
 		};
+		const listIdentities = (): Map<number, DarwinIdentity> | undefined => {
+			const capacity = proc.symbols.proc_listallpids(null, 0);
+			if (capacity <= 0) return undefined;
+			const pids = new Int32Array(capacity + 64);
+			const count = proc.symbols.proc_listallpids(ptr(pids), pids.byteLength);
+			if (count <= 0) return undefined;
+			const identities = new Map<number, DarwinIdentity>();
+			for (let index = 0; index < count; index++) {
+				const pid = pids[index]!;
+				const identity = uniqueIdentity(pid);
+				if (identity) identities.set(pid, identity);
+			}
+			return identities;
+		};
 		return {
 			seed(uniqueId) {
 				knownUniqueIds.add(uniqueId);
@@ -332,18 +352,9 @@ export function createDarwinAncestryTracker(
 						anchorKeys.delete(`${anchor.pid}:${anchor.incarnation}`);
 					}
 				}
-				const capacity = proc.symbols.proc_listallpids(null, 0);
-				if (capacity <= 0) return false;
-				const pids = new Int32Array(capacity + 64);
-				const count = proc.symbols.proc_listallpids(ptr(pids), pids.byteLength);
-				if (count <= 0) return false;
 				// First pass: collect identities for all pids, avoiding Process.fromPid calls.
-				const identities = new Map<number, { uniqueId: bigint; parentUniqueId: bigint }>();
-				for (let index = 0; index < count; index++) {
-					const pid = pids[index]!;
-					const identity = uniqueIdentity(pid);
-					if (identity) identities.set(pid, identity);
-				}
+				const identities = listIdentities();
+				if (!identities) return false;
 				// Extend ancestry evidence, then validate every listed pid that is known but
 				// not yet retained: new descendants plus earlier ones whose Process.fromPid
 				// check failed (it can return null for a live pid it could not query). A pid
@@ -362,6 +373,13 @@ export function createDarwinAncestryTracker(
 				}
 				return true;
 			},
+			lineage(rootPid) {
+				const root = uniqueIdentity(rootPid);
+				if (!root) return undefined;
+				const identities = listIdentities();
+				if (!identities) return undefined;
+				return new Set([rootPid, ...extendOwnedDarwinAncestry(new Set([root.uniqueId]), identities)]);
+			},
 			close() {
 				proc.close();
 			},
@@ -375,6 +393,137 @@ function supervisorArgv(): string[] {
 	return isCompiledBinary()
 		? [process.execPath, BASH_SHELL_SUPERVISOR_ARG]
 		: [process.execPath, path.join(import.meta.dir, "bash-shell-supervisor-entry.ts")];
+}
+
+/**
+ * Agent dir of a shared SDK broker launch argv (`... sdk broker-internal --agent-dir <dir>`),
+ * the only shape `ensure.ts` spawns. The argv only says where to look; the published
+ * discovery record decides whether the process is that broker.
+ */
+export function sdkBrokerAgentDirFromArgs(args: readonly string[]): string | undefined {
+	const index = args.lastIndexOf("broker-internal");
+	if (index < 1 || args[index - 1] !== "sdk" || args[index + 1] !== "--agent-dir") return undefined;
+	if (args.length !== index + 3) return undefined;
+	return args[index + 2] || undefined;
+}
+
+export type SparedSdkBrokerDeps = {
+	/** Published broker identity for an agent dir, read fresh; null when none is published. */
+	readDiscovery: (agentDir: string) => Promise<{ pid: number; incarnation: string } | null>;
+	/** Pids descended from a pid by unique-id ancestry, including the pid itself. */
+	lineage: (pid: number) => Set<number> | undefined;
+	/** Current kernel incarnation of a pid, or undefined when it is gone or unreadable. */
+	incarnationOf: (pid: number) => string | undefined;
+};
+
+/**
+ * Pids cleanup must not kill: every owned process that is the published shared SDK
+ * broker for its agent dir (same pid and incarnation as the discovery record), plus
+ * the broker's descendants (its session hosts). The broker is a machine-wide daemon
+ * that a guarded command may only have happened to start. A reused pid has a
+ * different incarnation, so it does not match and is still killed.
+ */
+export async function findSparedSdkBrokerPids(
+	owned: Iterable<Pick<NativeProcess, "pid" | "incarnation" | "args">>,
+	deps: SparedSdkBrokerDeps,
+): Promise<Set<number>> {
+	const spared = new Set<number>();
+	for (const processRef of owned) {
+		let args: string[];
+		try {
+			args = processRef.args();
+		} catch {
+			continue;
+		}
+		const agentDir = sdkBrokerAgentDirFromArgs(args);
+		if (!agentDir) continue;
+		const discovery = await Promise.resolve()
+			.then(() => deps.readDiscovery(agentDir))
+			.catch(() => null);
+		if (discovery?.pid !== processRef.pid || discovery.incarnation !== processRef.incarnation) continue;
+		// The lineage walk reads the root by bare pid, so only trust it if the broker
+		// still holds the same incarnation afterwards.
+		const lineage = deps.lineage(processRef.pid) ?? new Set([processRef.pid]);
+		if (deps.incarnationOf(processRef.pid) !== processRef.incarnation) continue;
+		for (const pid of lineage) spared.add(pid);
+	}
+	return spared;
+}
+
+/** Upper bound on the broker lookup so a stalled discovery read cannot stall cleanup. */
+export const SPARED_SDK_BROKER_LOOKUP_TIMEOUT_MS = 1_000;
+
+/**
+ * {@link findSparedSdkBrokerPids} that cannot weaken cleanup: any throw, or a lookup
+ * that outlives `timeoutMs`, spares nothing, so every owned process is killed as before.
+ */
+export async function findSparedSdkBrokerPidsBounded(
+	owned: Iterable<Pick<NativeProcess, "pid" | "incarnation" | "args">>,
+	deps: SparedSdkBrokerDeps,
+	timeoutMs = SPARED_SDK_BROKER_LOOKUP_TIMEOUT_MS,
+): Promise<Set<number>> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<Set<number>>(resolve => {
+		timer = setTimeout(() => resolve(new Set()), timeoutMs);
+	});
+	try {
+		return await Promise.race([
+			Promise.resolve()
+				.then(() => findSparedSdkBrokerPids(owned, deps))
+				.catch(() => new Set<number>()),
+			timeout,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** Process operations {@link signalOwnedProcessAlone} needs, injectable for tests. */
+export type SignalOwnedProcessDeps = {
+	/** Current kernel incarnation of a pid, or undefined when it is gone or unreadable. */
+	incarnationOf: (pid: number) => string | undefined;
+	/** Raw signal by pid; throws when delivery fails. */
+	killPid: (pid: number, signal: NodeJS.Signals) => void;
+};
+
+/**
+ * SIGKILL one owned process without touching its descendants, and only while `pid`
+ * still names the incarnation that was recorded as owned.
+ *
+ * The only caller is darwin cleanup when a broker is spared. Darwin has no atomic
+ * "signal iff start time matches" primitive, so `signalRoot` fails closed there
+ * today; it is tried first so this picks up an identity-bound signal if the platform
+ * ever gains one. The fallback re-reads the incarnation right before a raw `kill(2)`.
+ * That is the same check-then-kill race the native `killTree` accepts per node on
+ * darwin (slightly wider here because of the JS and napi hop), and narrower than
+ * `killTree`'s unchecked process-group signal, which this path replaces. The
+ * `signalRoot` rule against raw-pid fallback covers broker retirement, where failing
+ * closed just spares the broker; here failing closed would leak an owned process.
+ * Returns whether a signal was delivered.
+ */
+export function signalOwnedProcessAlone(
+	owned: Pick<NativeProcess, "pid" | "incarnation" | "signalRoot">,
+	deps: SignalOwnedProcessDeps,
+): boolean {
+	try {
+		if (owned.signalRoot(9)) return true;
+	} catch {}
+	if (deps.incarnationOf(owned.pid) !== owned.incarnation) return false;
+	try {
+		deps.killPid(owned.pid, "SIGKILL");
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function readPublishedSdkBroker(agentDir: string): Promise<{ pid: number; incarnation: string } | null> {
+	// Loaded lazily so guardian startup does not pull in the SDK discovery modules; it
+	// only runs at cleanup when an owned process has the broker launch argv.
+	const { readBrokerDiscovery } = await import("../sdk/broker/discovery");
+	// A stale heartbeat does not make the published broker any less shared; liveness
+	// and incarnation are still checked against the kernel.
+	return readBrokerDiscovery(agentDir, Number.POSITIVE_INFINITY);
 }
 
 export async function runBashShellGuardian(): Promise<void> {
@@ -540,7 +689,27 @@ export async function runBashShellGuardian(): Promise<void> {
 					pending.push(...processRef.children());
 				}
 				trackingOk = (await scanOwnership()) && trackingOk;
-				for (const owned of ownedProcesses.values()) owned.killTree(9);
+				const spared = darwinTracker
+					? await findSparedSdkBrokerPidsBounded(ownedProcesses.values(), {
+							readDiscovery: readPublishedSdkBroker,
+							lineage: pid => darwinTracker.lineage(pid),
+							incarnationOf: pid => Process.fromPid(pid)?.incarnation,
+						})
+					: undefined;
+				for (const owned of ownedProcesses.values()) {
+					if (spared?.has(owned.pid)) continue;
+					if (!spared?.size) {
+						owned.killTree(9);
+						continue;
+					}
+					// killTree walks ppid descendants, so on a non-spared ancestor (for example
+					// the darwin launch trampoline) it would still reach the spared broker.
+					// Darwin ownership already lists every descendant, so signal each one alone.
+					signalOwnedProcessAlone(owned, {
+						incarnationOf: pid => Process.fromPid(pid)?.incarnation,
+						killPid: (pid, signal) => process.kill(pid, signal),
+					});
+				}
 			}
 			darwinTracker?.close();
 			await ledger.close();

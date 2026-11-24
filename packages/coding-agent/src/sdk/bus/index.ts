@@ -4685,6 +4685,9 @@ export function createNotificationsExtension(
 	// Failed terminal teardown remains fenced from normal runtime lookup while the
 	// exact runtime object retains authority for an explicit idempotent retry.
 	const cleanupRetries = new Map<string, SessionRuntime>();
+	// The one terminal release in flight for an exact runtime. Concurrent stops
+	// join it instead of running a second release beside it.
+	const terminalReleases = new WeakMap<SessionRuntime, Promise<boolean>>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
 	const forceIsolatedChatSessions = new Set<string>();
 	const branchStartupTasks = new Set<Promise<void>>();
@@ -4979,6 +4982,25 @@ export function createNotificationsExtension(
 			rt.pendingInteractive.clear();
 			return true;
 		}
+		// A shutdown that lands while startup is still pending reaches this release
+		// up to three times for the same runtime: from the shutdown itself, from the
+		// startup that observes its own removal, and from the re-stop deferred behind
+		// the pending start above. Run concurrently, each one published its own
+		// `session_closed` frame and raced the owner releases. Join the release in
+		// flight instead. A settled release clears its entry, so an explicit retry
+		// after a retained owner-release failure still runs a fresh release.
+		const inFlight = terminalReleases.get(rt);
+		if (inFlight) return await inFlight;
+		const release = releaseSessionRuntime(id, rt);
+		terminalReleases.set(rt, release);
+		try {
+			return await release;
+		} finally {
+			if (terminalReleases.get(rt) === release) terminalReleases.delete(rt);
+		}
+	}
+
+	async function releaseSessionRuntime(id: string, rt: SessionRuntime): Promise<boolean> {
 		rt.abortBtwQuestions();
 		// Keep this exact object authoritative for the full terminal release, including
 		// the interval before a failed owner can be recorded for a later retry.

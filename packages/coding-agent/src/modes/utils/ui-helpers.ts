@@ -35,6 +35,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import {
 	associateSessionMessageViewportAnchorId,
 	getSessionMessageEntryId,
@@ -1305,9 +1306,10 @@ export class UiHelpers {
 			this.ctx.compactionQueuedMessages = queuedMessages;
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.showError(
-				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
+				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${operatorErrorMessage(
+					error,
+					String(error),
+				)}`,
 			);
 		};
 
