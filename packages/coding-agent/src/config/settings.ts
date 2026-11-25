@@ -2434,6 +2434,12 @@ export class Settings implements NotificationSettingsReader {
 				bypassCache,
 			});
 			let merged: RawSettings = {};
+
+			// Log any warnings from settings discovery (parse failures, unreadable files, etc.)
+			for (const warning of result.warnings) {
+				logger.warn(`Settings: ${warning}`, { cwd: this.#cwd });
+			}
+
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;
 				// Retained project settings.json remains discoverable for non-workflow
@@ -6371,8 +6377,15 @@ export class Settings implements NotificationSettingsReader {
 		}
 
 		// Ensure taskObj (now potentially modified) is updated back to raw
-		if (taskObj && isolationObj) {
-			taskObj.isolation = isolationObj;
+		if (taskObj) {
+			if (isolationObj) {
+				taskObj.isolation = isolationObj;
+			}
+			// Drop malformed (non-object) task.isolation before merging so it doesn't
+			// mask the global value (issue #8034)
+			if (taskObj.isolation && (typeof taskObj.isolation !== "object" || Array.isArray(taskObj.isolation))) {
+				delete taskObj.isolation;
+			}
 			raw.task = taskObj;
 		}
 
