@@ -18,6 +18,7 @@ import { logger } from "@gajae-code/utils";
 import { SessionWriteWithoutClaimError, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import type {
 	MemoryGuardParticipantDescriptorV1,
+	MemoryGuardRestoreResult,
 	MemoryGuardSessionManagerCheckpointV1,
 } from "../../src/session/memory-guard-checkpoint-participant";
 import { type DefaultModelSelectionStage, SessionManager } from "../../src/session/session-manager";
@@ -28,6 +29,12 @@ import {
 	SessionOwnershipTestHooks,
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
+import {
+	expectStrictDetections,
+	outsideStrictSeam,
+	undeclaredStrictDetections,
+	useStrictWriteDetection,
+} from "./strict-write-detection";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
@@ -54,6 +61,11 @@ afterEach(async () => {
 		resetSessionOwnershipForTests();
 	}
 });
+
+/** Close every manager the test opened, so writes left for close are made (and counted) now. */
+async function closeManagers(): Promise<void> {
+	for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
+}
 
 function user(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
@@ -555,14 +567,20 @@ describe.if(supported)("recovery promotion", () => {
 		} as RecoveryFsRoot;
 	}
 
-	/** A staged memory-guard recovery of an explicit-destination session holding `messages`. */
-	async function stagedRecovery(messages: readonly Parameters<SessionManager["appendMessage"]>[0][]) {
+	/** A staged memory-guard recovery of a session holding `messages`, restored to a `kind` destination. */
+	async function stagedRecovery(
+		messages: readonly Parameters<SessionManager["appendMessage"]>[0][],
+		kind: Kind = "explicit",
+	) {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-recovery-")));
 		roots.push(root);
 		const source = await SessionManager.open(path.join(root, "source", "checkpoint.jsonl"));
 		managers.push(source);
 		for (const message of messages) source.appendMessage(message);
 		await source.flush();
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(path.join(root, "agent"), { recursive: true, mode: 0o700 });
 		const checkpointRoot = path.join(root, "checkpoint");
 		const ingressLease = source.acquireMemoryGuardParticipantIngressLease();
 		let checkpoint: MemoryGuardSessionManagerCheckpointV1;
@@ -576,7 +594,10 @@ describe.if(supported)("recovery promotion", () => {
 			incidentAuthority: authority(checkpointRoot),
 			participant: participant(checkpoint),
 			checkpoint,
-			destination: path.join(root, "restore"),
+			destination:
+				kind === "managed"
+					? SessionManager.managedDestination(cwd, path.join(root, "agent"))
+					: path.join(root, "restore"),
 		});
 		if (restored.kind !== "staged") throw new Error(`expected a staged recovery, got ${restored.reason}`);
 		managers.push(restored.manager);
@@ -596,29 +617,30 @@ describe.if(supported)("recovery promotion", () => {
 		});
 	});
 
-	it("the replay-metadata sanitize the promotion persists first is checked before it writes (strict seam)", async () => {
-		// An assistant reply carrying OpenAI Responses replay state the promotion sanitizes and persists.
-		const stale = {
-			role: "assistant",
-			content: [
-				{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
-				{ type: "text", text: "answer" },
-			],
-			api: "openai-responses",
-			provider: "openai",
-			model: "gpt-fixture",
-			usage: {
-				input: 1,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 2,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-			providerPayload: { type: "openaiResponsesHistory", items: [] },
-		} as unknown as Parameters<SessionManager["appendMessage"]>[0];
+	// An assistant reply carrying OpenAI Responses replay state the promotion sanitizes and persists.
+	const stale = {
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
+			{ type: "text", text: "answer" },
+		],
+		api: "openai-responses",
+		provider: "openai",
+		model: "gpt-fixture",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+		providerPayload: { type: "openaiResponsesHistory", items: [] },
+	} as unknown as Parameters<SessionManager["appendMessage"]>[0];
+
+	it("the replay-metadata sanitize the promotion persists first is reported before the promotion", async () => {
 		// In observe the sanitize persists its patch, through the persist writer it opens, and is reported.
 		const observed = await stagedRecovery([user("question"), stale]);
 		detectorLogs = [];
@@ -629,23 +651,48 @@ describe.if(supported)("recovery promotion", () => {
 		const sites = (detectorLogs as { site: string }[]).map(log => log.site);
 		expect(sites.indexOf("persist writer open")).toBeGreaterThanOrEqual(0);
 		expect(sites.indexOf("persist writer open")).toBeLessThan(sites.indexOf("recovery promotion"));
+	});
 
-		const restored = await stagedRecovery([user("question"), stale]);
-		const staged = restored.manager.getSessionFile()!;
-		const assistant = restored.manager
-			.getEntries()
-			.find(entry => entry.type === "message" && entry.message.role === "assistant");
-		// The sanitize has something to persist at promotion time.
-		expect((assistant as { message: { providerPayload?: unknown } }).message.providerPayload).toBeDefined();
-		const before = await fs.readFile(staged, "utf8");
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		await expect(
+	describe("under the strict seam", () => {
+		useStrictWriteDetection(closeManagers);
+		const promote = (restored: Extract<MemoryGuardRestoreResult, { kind: "staged" }>) =>
 			restored.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(restored.hydrationContext, {
 				ownershipReady: true,
-			}),
-		).rejects.toMatchObject({ name: "SessionWriteWithoutClaimError", site: "persist writer open" });
-		// Nothing reached the staged transcript before the detector stopped it.
-		expect(await fs.readFile(staged, "utf8")).toBe(before);
+			});
+
+		it("the replay-metadata sanitize the promotion persists first is checked before it writes", async () => {
+			const restored = await outsideStrictSeam(() => stagedRecovery([user("question"), stale]));
+			const staged = restored.manager.getSessionFile()!;
+			const assistant = restored.manager
+				.getEntries()
+				.find(entry => entry.type === "message" && entry.message.role === "assistant");
+			// The sanitize has something to persist at promotion time.
+			expect((assistant as { message: { providerPayload?: unknown } }).message.providerPayload).toBeDefined();
+			const before = await fs.readFile(staged, "utf8");
+			await expect(promote(restored)).rejects.toMatchObject({
+				name: "SessionWriteWithoutClaimError",
+				site: "persist writer open",
+			});
+			expectStrictDetections(1);
+			// Nothing reached the staged transcript before the detector stopped it.
+			expect(await fs.readFile(staged, "utf8")).toBe(before);
+		});
+
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`the promotion (${kind}) is refused before it publishes anything`, async () => {
+				// Nothing to sanitize, so the promotion's own check is the first one reached.
+				const restored = await outsideStrictSeam(() => stagedRecovery([user("recovered")], kind));
+				const directory = path.dirname(restored.manager.getSessionFile()!);
+				const before = await transcripts(directory);
+				await expect(promote(restored)).rejects.toMatchObject({
+					name: "SessionWriteWithoutClaimError",
+					site: "recovery promotion",
+				});
+				expectStrictDetections(1);
+				// No promoted transcript appeared, and the staged one is still there, unchanged.
+				expect(await transcripts(directory)).toEqual(before);
+			});
+		}
 	});
 });
 
@@ -666,38 +713,55 @@ describe.if(supported)("the detector", () => {
 		expect(new Set(sites).size).toBe(sites.length);
 	});
 
-	it("the strict seam throws before the write, and is silent for a claimed session", async () => {
+	describe("under the strict seam", () => {
+		useStrictWriteDetection(closeManagers);
 		const update = (m: SessionManager, first: string) =>
 			m.applyEntryMessageUpdates([{ ...m.getEntry(first), message: user("rewritten") } as never]);
-		const unclaimed = await bound("explicit");
-		const before = await transcripts(unclaimed.root);
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		update(unclaimed.manager, unclaimed.context.first);
-		await expect(unclaimed.manager.rewriteEntries()).rejects.toThrow(SessionWriteWithoutClaimError);
-		expect(changed(before, await transcripts(unclaimed.root))).toBe(false);
 
-		delete SessionOwnershipTestHooks.strictWriteDetection;
-		const claimed = await bound("explicit");
-		const result = await claimSessionOwner(claimed.manager.getSessionId(), { surface: "terminal" });
-		if (result.status !== "claimed") throw new Error("expected a claim");
-		sessionClaimSetOf(claimed.manager).add(result.claim);
-		const claimedBefore = await transcripts(claimed.root);
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		update(claimed.manager, claimed.context.first);
-		await claimed.manager.rewriteEntries();
-		expect(changed(claimedBefore, await transcripts(claimed.root))).toBe(true);
-	});
+		it("throws before the write", async () => {
+			const unclaimed = await outsideStrictSeam(() => bound("explicit"));
+			const before = await transcripts(unclaimed.root);
+			update(unclaimed.manager, unclaimed.context.first);
+			await expect(unclaimed.manager.rewriteEntries()).rejects.toThrow(SessionWriteWithoutClaimError);
+			expect(changed(before, await transcripts(unclaimed.root))).toBe(false);
+			expectStrictDetections(1);
+		});
 
-	it("does nothing in off, even under the strict seam", async () => {
-		SessionOwnershipTestHooks.mode = "off";
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		const { manager, root } = await bound("managed");
-		const before = await transcripts(root);
-		manager.appendMessage(user("off"));
-		manager.rewriteEntries();
-		await manager.flush();
-		expect(changed(before, await transcripts(root))).toBe(true);
-		expect(sessionOwnershipCounters().session_write_without_claim).toBe(0);
-		expect(detectorLogs).toEqual([]);
+		it("is silent for a claimed session", async () => {
+			const claimed = await outsideStrictSeam(async () => {
+				const fixture = await bound("explicit");
+				const result = await claimSessionOwner(fixture.manager.getSessionId(), { surface: "terminal" });
+				if (result.status !== "claimed") throw new Error("expected a claim");
+				sessionClaimSetOf(fixture.manager).add(result.claim);
+				return fixture;
+			});
+			const before = await transcripts(claimed.root);
+			update(claimed.manager, claimed.context.first);
+			await claimed.manager.rewriteEntries();
+			expect(changed(before, await transcripts(claimed.root))).toBe(true);
+		});
+
+		it("a strict throw a caller swallows is still counted against the test", async () => {
+			const { manager } = await outsideStrictSeam(() => bound("managed"));
+			try {
+				manager.appendMessage(user("swallowed"));
+			} catch {
+				// A caller that turns the refusal into an outcome.
+			}
+			// Without this declaration the afterEach check fails the test.
+			expect(undeclaredStrictDetections()).toBe(1);
+			expectStrictDetections(1);
+		});
+
+		it("does nothing in off", async () => {
+			SessionOwnershipTestHooks.mode = "off";
+			const { manager, root } = await bound("managed");
+			const before = await transcripts(root);
+			manager.appendMessage(user("off"));
+			manager.rewriteEntries();
+			await manager.flush();
+			expect(changed(before, await transcripts(root))).toBe(true);
+			expect(detectorLogs).toEqual([]);
+		});
 	});
 });
