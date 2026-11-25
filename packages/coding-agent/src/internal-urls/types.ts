@@ -4,6 +4,7 @@
  * Internal URLs (agent://, artifact://, memory://, rule://, gjc://, local://) are resolved by tools like read,
  * providing access to agent outputs and server resources without exposing filesystem paths.
  */
+import type { Rule } from "../capability/rule";
 
 /**
  * Raw resource payload returned by protocol handlers. The `immutable` flag is
@@ -69,6 +70,13 @@ export interface ResolveContext {
 	signal?: AbortSignal;
 	/** Scope-held MCP facade used for mcp:// resolution; never inferred from process-global state. */
 	mcpManager?: import("../runtime-mcp/manager").MCPManager;
+	/**
+	 * Rules the calling session loaded. When supplied (even as an empty list),
+	 * `rule://` resolves only against them, so concurrent sessions cannot see or
+	 * borrow each other's rules. Callers that omit the property keep the
+	 * process-global snapshot used by the reader route.
+	 */
+	rules?: readonly Rule[];
 }
 
 /**

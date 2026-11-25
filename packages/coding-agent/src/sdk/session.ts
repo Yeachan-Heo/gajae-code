@@ -2698,6 +2698,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			return { ttsrManager, rulebookRules, alwaysApplyRules };
 		});
+		// One snapshot per session. The reader route keeps reading the process-global
+		// copy below, while bash expands `rule://` against this session's own list so
+		// a concurrent session cannot resolve another project's rule by name.
+		const sessionRules = [...rulebookRules, ...alwaysApplyRules];
 
 		// Resolve contextFiles up-front (it's needed before tool creation). The
 		// workspace tree scan is slow on large repos and we MUST NOT block startup on
@@ -3170,6 +3174,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			get skills() {
 				return skills;
 			},
+			get rules() {
+				return sessionRules;
+			},
 			eventBus,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
@@ -3609,7 +3616,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
-			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
+			setActiveRules(sessionRules);
 			// Claim process-cwd authority for the FIRST top-level session launched at
 			// the process cwd. A later sibling launched at the same root does not get
 			// the claim, so its rescope leaves process-global state (chdir,
