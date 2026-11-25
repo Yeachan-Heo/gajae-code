@@ -30,13 +30,15 @@ export function undeclaredStrictDetections(): number {
 
 /** Build a fixture outside the strict seam; the detections it causes are not counted. */
 export async function outsideStrictSeam<T>(setup: () => Promise<T>): Promise<T> {
+	const strict = SessionOwnershipTestHooks.strictWriteDetection;
 	delete SessionOwnershipTestHooks.strictWriteDetection;
 	const before = sessionOwnershipCounters().session_write_without_claim;
 	try {
 		return await setup();
 	} finally {
 		baseline += sessionOwnershipCounters().session_write_without_claim - before;
-		SessionOwnershipTestHooks.strictWriteDetection = true;
+		if (strict === undefined) delete SessionOwnershipTestHooks.strictWriteDetection;
+		else SessionOwnershipTestHooks.strictWriteDetection = strict;
 	}
 }
 
