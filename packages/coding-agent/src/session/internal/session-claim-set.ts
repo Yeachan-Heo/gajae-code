@@ -120,6 +120,15 @@ export class SessionClaimSet {
 			return;
 		}
 		this.#claims.set(claim.sessionId, claim);
+		// A target staged outside the transition that rotates to it is exposed to any unrelated
+		// transition's settle. Visible in observe; off stays inert.
+		if (
+			this.#mode !== "off" &&
+			this.#current !== undefined &&
+			claim.sessionId !== this.#current &&
+			this.#transitions === 0
+		)
+			countSessionOwnershipEvent("target_staged_outside_transition");
 	}
 
 	/**

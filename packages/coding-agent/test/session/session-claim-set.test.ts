@@ -430,6 +430,32 @@ describe("missed-release signals", () => {
 		}
 	});
 
+	it.if(supported)("counts a target staged outside any transition, only when ownership is on", async () => {
+		const count = () => sessionOwnershipCounters().target_staged_outside_transition;
+		const off = new SessionClaimSet();
+		off.bind("staged-current");
+		off.add(await claim("staged-off"));
+		expect(count()).toBe(0);
+		off.releaseAll();
+		SessionOwnershipTestHooks.mode = "observe";
+		const set = new SessionClaimSet();
+		try {
+			set.add(await claim("unbound"));
+			set.bind("staged-current");
+			set.add(await claim("staged-current"));
+			{
+				using _transition = set.transition();
+				set.add(await claim("staged-inside"));
+			}
+			expect(count()).toBe(0);
+			set.add(await claim("staged-outside"));
+			expect(count()).toBe(1);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			set.releaseAll();
+		}
+	});
+
 	it.if(supported)("counts only the unreleased claims left on a claim set that was garbage-collected", async () => {
 		let kept: SessionOwnerClaim | undefined;
 		await (async () => {
@@ -547,6 +573,7 @@ describe("with ownership off (the default)", () => {
 				session_write_without_claim: 0,
 				claims_abandoned: 0,
 				bind_outside_transition: 0,
+				target_staged_outside_transition: 0,
 			});
 		} finally {
 			SessionOwnershipTestHooks.homeOverride = preloadHome;
