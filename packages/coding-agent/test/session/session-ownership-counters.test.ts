@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import { getStatsDbPath } from "@gajae-code/utils";
 import { runStatsCommand } from "../../src/cli/stats-cli";
 import {
 	claimSessionOwner,
+	countSessionOwnershipEvent,
 	persistSessionOwnershipCounters,
 	resetSessionOwnershipForTests,
 	SessionOwnershipTestHooks,
@@ -24,8 +25,31 @@ let root: string;
 let preloadHome: string | undefined;
 let dbPath: string;
 
+/** The stats database this process would use with no test override: it must never change. */
+const operatorStatsDb = getStatsDbPath();
+async function operatorStatsSnapshot(): Promise<string[]> {
+	return Promise.all(
+		["", "-wal", "-shm"].map(suffix =>
+			fs.stat(`${operatorStatsDb}${suffix}`).then(
+				stat => `${suffix}:${stat.ino}:${stat.size}:${stat.mtimeMs}`,
+				() => `${suffix}:absent`,
+			),
+		),
+	);
+}
+let operatorBefore: string[];
+beforeAll(async () => {
+	operatorBefore = await operatorStatsSnapshot();
+});
+
+/** A relative `PI_CONFIG_DIR` (it must be under the home) naming `directory`. */
+function configDirUnder(directory: string): string {
+	return path.relative(os.homedir(), directory);
+}
+
 beforeEach(async () => {
-	root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ownership-counters-")));
+	// Under the home, not the temp root: a `PI_CONFIG_DIR` must be home-relative without `..`.
+	root = await fs.realpath(await fs.mkdtemp(path.join(os.homedir(), "gjc-ownership-counters-")));
 	preloadHome = SessionOwnershipTestHooks.homeOverride;
 	SessionOwnershipTestHooks.homeOverride = root;
 	dbPath = path.join(root, "stats.db");
@@ -97,9 +121,18 @@ describe("session ownership counters", () => {
 		expect(await fs.readdir(root)).toEqual([]);
 	});
 
-	it("never write the operator's stats database from a test process", async () => {
+	it("arm one exit write per process, however many events", () => {
+		const before = process.listenerCount("exit");
+		for (let index = 0; index < 3; index++) countSessionOwnershipEvent("claims_abandoned");
+		expect(process.listenerCount("exit") - before).toBeLessThanOrEqual(1);
+	});
+
+	it("never write the stats database from a test process that names none", async () => {
 		delete SessionOwnershipTestHooks.statsDbPath;
+		const originalConfigDir = process.env.PI_CONFIG_DIR;
+		process.env.PI_CONFIG_DIR = configDirUnder(path.join(root, "config"));
 		const statsDb = getStatsDbPath();
+		expect(statsDb.startsWith(root)).toBe(true);
 		// The directory exists, so only the guard can keep the write out.
 		await fs.mkdir(path.dirname(statsDb), { recursive: true });
 		const before = await fs.stat(statsDb).then(
@@ -113,7 +146,12 @@ describe("session ownership counters", () => {
 			},
 		};
 		await claimSessionOwner("x", { surface: "terminal" });
-		persistSessionOwnershipCounters({ atExit: true });
+		try {
+			persistSessionOwnershipCounters({ atExit: true });
+		} finally {
+			if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalConfigDir;
+		}
 		expect(
 			await fs.stat(statsDb).then(
 				stat => stat.mtimeMs,
@@ -157,7 +195,7 @@ describe("gjc stats", () => {
 	const originalConfigDir = process.env.PI_CONFIG_DIR;
 
 	beforeEach(() => {
-		process.env.PI_CONFIG_DIR = path.relative(os.homedir(), path.join(root, "config"));
+		process.env.PI_CONFIG_DIR = configDirUnder(path.join(root, "config"));
 	});
 
 	afterEach(() => {
@@ -231,5 +269,11 @@ describe("gjc stats", () => {
 		} finally {
 			db.close();
 		}
+	});
+});
+
+describe("the operator's stats database", () => {
+	it("was not touched by any test in this file", async () => {
+		expect(await operatorStatsSnapshot()).toEqual(operatorBefore);
 	});
 });

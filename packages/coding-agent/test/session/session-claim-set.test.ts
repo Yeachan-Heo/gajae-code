@@ -536,6 +536,7 @@ describe("with ownership off (the default)", () => {
 		roots.push(home);
 		const preloadHome = SessionOwnershipTestHooks.homeOverride;
 		const lockCalls: string[] = [];
+		const exitListeners = process.listenerCount("exit");
 		SessionOwnershipTestHooks.homeOverride = home;
 		SessionOwnershipTestHooks.lockBackend = {
 			tryAcquire: async sidecar => {
@@ -570,6 +571,8 @@ describe("with ownership off (the default)", () => {
 			expect(await Bun.file(sessionOwnersDirectory()).exists()).toBe(false);
 			expect(await fs.readdir(home)).toEqual([]);
 			expect(Object.values(sessionOwnershipCounters())).toEqual(SESSION_OWNERSHIP_COUNTERS.map(() => 0));
+			// Nothing counted, so no exit write was armed.
+			expect(process.listenerCount("exit")).toBe(exitListeners);
 		} finally {
 			SessionOwnershipTestHooks.homeOverride = preloadHome;
 			delete SessionOwnershipTestHooks.lockBackend;
