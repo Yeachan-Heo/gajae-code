@@ -104,35 +104,41 @@ interface ReportRow {
 
 /**
  * All-time totals (or since `cutoff`), per counter and per gjc version, with how many process
- * reports they come from (distinct report ids; distinct write times for legacy rows), so "zero" reads apart from "nothing reported".
- * `undefined` when nothing valid was recorded or the table has another shape. Never creates it.
+ * reports they come from (distinct report ids; distinct write times for legacy rows), so "zero"
+ * reads apart from "nothing reported". `undefined` when nothing valid was recorded or the table has
+ * another shape. Never creates or alters it. One read transaction, so the column check, the totals
+ * and the report counts see the same rows while processes exit and write.
  */
 export function readSessionOwnershipStats(db: Database, cutoff = 0): SessionOwnershipStats | undefined {
 	try {
-		if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(TABLE)) return undefined;
-		const columns = tableColumns(db);
-		if (!COLUMNS.every(column => columns.has(column))) return undefined;
-		const report = reportKey(columns.has("report_id"));
-		const where = `${VALID_ROW} AND ${report.valid}`;
-		const totals = db
-			.prepare(
-				`SELECT gjc_version AS version, name, SUM(count) AS total FROM ${TABLE}
-				WHERE ${where} GROUP BY gjc_version, name ORDER BY gjc_version, name`,
-			)
-			.all(cutoff) as TotalRow[];
-		if (totals.length === 0) return undefined;
-		const reports = db
-			.prepare(
-				`SELECT gjc_version AS version, COUNT(DISTINCT ${report.key}) AS reports, MIN(timestamp) AS first,
-				MAX(timestamp) AS last FROM ${TABLE} WHERE ${where} GROUP BY gjc_version
-				UNION ALL SELECT NULL, COUNT(DISTINCT ${report.key}), MIN(timestamp), MAX(timestamp)
-				FROM ${TABLE} WHERE ${where}`,
-			)
-			.all(cutoff) as ReportRow[];
-		return summarize(totals, reports);
+		return db.transaction(() => readInSnapshot(db, cutoff))();
 	} catch {
 		return undefined;
 	}
+}
+
+function readInSnapshot(db: Database, cutoff: number): SessionOwnershipStats | undefined {
+	if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(TABLE)) return undefined;
+	const columns = tableColumns(db);
+	if (!COLUMNS.every(column => columns.has(column))) return undefined;
+	const report = reportKey(columns.has("report_id"));
+	const where = `${VALID_ROW} AND ${report.valid}`;
+	const totals = db
+		.prepare(
+			`SELECT gjc_version AS version, name, SUM(count) AS total FROM ${TABLE}
+				WHERE ${where} GROUP BY gjc_version, name ORDER BY gjc_version, name`,
+		)
+		.all(cutoff) as TotalRow[];
+	if (totals.length === 0) return undefined;
+	const reports = db
+		.prepare(
+			`SELECT gjc_version AS version, COUNT(DISTINCT ${report.key}) AS reports, MIN(timestamp) AS first,
+				MAX(timestamp) AS last FROM ${TABLE} WHERE ${where} GROUP BY gjc_version
+				UNION ALL SELECT NULL, COUNT(DISTINCT ${report.key}), MIN(timestamp), MAX(timestamp)
+				FROM ${TABLE} WHERE ${where}`,
+		)
+		.all(cutoff) as ReportRow[];
+	return summarize(totals, reports);
 }
 
 function summarize(totals: readonly TotalRow[], reports: readonly ReportRow[]): SessionOwnershipStats | undefined {
