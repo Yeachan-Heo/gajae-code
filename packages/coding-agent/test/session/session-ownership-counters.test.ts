@@ -44,18 +44,26 @@ beforeAll(async () => {
 
 /**
  * A stats database for `getStatsDbPath()`: a temp config dir under the home, named by a
- * home-relative `GJC_CONFIG_DIR`. The canonical name is required: the test runner sets
- * `GJC_CONFIG_DIR=.gjc`, which outranks the legacy `PI_CONFIG_DIR` alias. There is no absolute override, and
+ * home-relative `GJC_CONFIG_DIR` and `PI_CONFIG_DIR`. The canonical name is required because the
+ * test runner sets `GJC_CONFIG_DIR=.gjc`, which outranks the legacy alias; the alias covers a
+ * project dotenv that makes the resolver ignore the canonical name. There is no absolute override, and
  * `os.homedir()` does not follow a runtime `HOME` change. It is removed with `removeSync`, which the
  * test preload allows wherever the home is. Returns the restore.
  */
 function useStatsConfigDir(): () => void {
-	const original = process.env.GJC_CONFIG_DIR;
+	// Set both names: the resolver ignores GJC_CONFIG_DIR when a project dotenv declares it,
+	// and then falls back to PI_CONFIG_DIR, which must point at the same temp dir.
+	const names = ["GJC_CONFIG_DIR", "PI_CONFIG_DIR"] as const;
+	const originals = names.map(name => process.env[name]);
 	const config = TempDir.createSync(path.join(os.homedir(), "gjc-ownership-counters-stats-"));
-	process.env.GJC_CONFIG_DIR = path.relative(os.homedir(), config.join("config"));
+	const relative = path.relative(os.homedir(), config.join("config"));
+	for (const name of names) process.env[name] = relative;
 	return () => {
-		if (original === undefined) delete process.env.GJC_CONFIG_DIR;
-		else process.env.GJC_CONFIG_DIR = original;
+		names.forEach((name, index) => {
+			const original = originals[index];
+			if (original === undefined) delete process.env[name];
+			else process.env[name] = original;
+		});
 		config.removeSync();
 	};
 }
