@@ -82,7 +82,7 @@ import {
 	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
-import { type SessionInfo, SessionManager } from "../../session/session-manager";
+import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
@@ -2136,6 +2136,19 @@ export class SelectorController {
 		const userMessages = this.ctx.session.getUserMessagesForBranching();
 		if (userMessages.length === 0) {
 			this.ctx.showStatus("No messages to branch from");
+			return;
+		}
+		// Refuse before goal continuation and the side chat are touched, unless some
+		// prompt starts a fresh session (no parent) and needs no graph successor.
+		// This picker-time probe checks ownership only; branch() proves the selected path.
+		const refusal = this.ctx.sessionManager.graphSuccessorRefusal();
+		if (
+			refusal &&
+			userMessages.every(message => this.ctx.sessionManager.getEntryForFidelity(message.entryId)?.parentId)
+		) {
+			this.ctx.showError(
+				`Fork failed: ${new GraphSuccessorUnavailableError("prepare branched session", refusal).message}`,
+			);
 			return;
 		}
 

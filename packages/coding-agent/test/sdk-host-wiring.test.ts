@@ -176,18 +176,31 @@ const restoreEnv: (() => void)[] = [];
 delete process.env.GJC_SDK_BROKER_AUTOSTART;
 afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
-	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
+	// Take ownership of this test's directories before stopping their brokers.
+	// A broker stop that throws must fail only the test that owns it: leaving
+	// the directory in `dirs` (and the env unrestored) re-threw the same error
+	// from every later afterEach and failed the rest of the file.
+	const ownedDirs = dirs.splice(0);
+	let brokerStopFailure: unknown;
+	for (const dir of ownedDirs) {
+		try {
+			await brokerOwnerForTest(dir)?.stop();
+		} catch (error) {
+			brokerStopFailure ??= error;
+		}
+	}
 	if (process.platform === "win32") {
 		Bun.gc(true);
 		await Bun.sleep(50);
 	}
-	for (const dir of dirs.splice(0)) await removeTempDir(dir);
+	for (const dir of ownedDirs) await removeTempDir(dir);
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
 	for (const restore of restoreEnv.splice(0)) restore();
+	if (brokerStopFailure !== undefined) throw brokerStopFailure;
 });
 
 const waitFor = (predicate: () => boolean, label: string): Promise<void> =>
@@ -9644,6 +9657,9 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 	disposePriorAnswerSource();
 });
 
+// session_start spawns a real SDK broker for the isolated agent dir; that cold
+// start alone is about 2 s on a lightly loaded machine, so the default 5 s
+// test budget leaves no headroom under parallel load.
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
 	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
@@ -9797,7 +9813,7 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = previousNotifications;
 	}
-});
+}, 20_000);
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
 	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);
@@ -13571,6 +13587,60 @@ for (const attached of [false, true]) {
 		}
 	});
 }
+test("a shutdown that races a pending startup publishes session_closed once", async () => {
+	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-closed-startup-race-"));
+	dirs.push(cwd);
+	const sessionId = `session-closed-startup-race-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	// Hold startup after the endpoint is bound and published, so shutdown
+	// arrives while the startup that will later observe its own removal is
+	// still pending.
+	const transportBound = Promise.withResolvers<void>();
+	const releaseStartup = Promise.withResolvers<void>();
+	let heldStart = false;
+	const serverStartImpl = NotificationServer.prototype.start;
+	const serverStart = spyOn(NotificationServer.prototype, "start").mockImplementation(async function (
+		this: NotificationServer,
+		...args: Parameters<NotificationServer["start"]>
+	) {
+		const endpoint = await serverStartImpl.apply(this, args);
+		if (!heldStart) {
+			heldStart = true;
+			transportBound.resolve();
+			await releaseStartup.promise;
+		}
+		return endpoint;
+	});
+	// Hold the shutdown's terminal frame so its owner release is still in
+	// flight when the abandoned startup and the deferred re-stop run.
+	const closedFrames: string[] = [];
+	const releaseClosedFrame = Promise.withResolvers<boolean>();
+	const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockImplementation(
+		async (frame: string) => {
+			const parsed = JSON.parse(frame) as { type?: unknown; sessionId?: unknown };
+			if (parsed.type !== "session_closed" || parsed.sessionId !== sessionId) return false;
+			closedFrames.push(frame);
+			return closedFrames.length === 1 ? await releaseClosedFrame.promise : false;
+		},
+	);
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const handlers = start(sessionContext, undefined, async () => {}, false, new Map(), undefined, false);
+		const startup = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, sessionContext));
+		await transportBound.promise;
+		const shutdown = Promise.resolve(handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext));
+		await waitFor(() => closedFrames.length === 1, "shutdown session_closed");
+		releaseStartup.resolve();
+		releaseClosedFrame.resolve(false);
+		await Promise.all([startup, shutdown]);
+		expect(closedFrames).toHaveLength(1);
+	} finally {
+		releaseStartup.resolve();
+		releaseClosedFrame.resolve(false);
+		serverStart.mockRestore();
+		pushFrameAndWait.mockRestore();
+	}
+});
 test("SDK host publishes one replayable bash_folded frame per fold and runtime.jobs.list carries foldReason", async () => {
 	const cwd = trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-bash-folded-"));
 	dirs.push(cwd);

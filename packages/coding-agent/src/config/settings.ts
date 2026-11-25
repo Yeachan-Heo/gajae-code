@@ -41,6 +41,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "../sdk/bus/config";
 import { AgentStorage } from "../session/agent-storage";
+import { setSessionOwnershipSettingSource } from "../session/session-ownership-mode";
 import { type EditMode, type EditVariantMatch, normalizeEditMode } from "../utils/edit-mode";
 import {
 	type AtomicYamlConfigTransaction,
@@ -527,6 +528,15 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	// Operator consent for the plan-mode write guard. A project file or runtime override must not flip it.
 	"plan.enabled",
 ]);
+
+/**
+ * Session ownership settings (`session.ownership.*`) are global-only as a namespace, so a sub-flag
+ * added later is covered without a new entry here. A project or runtime layer must not lower
+ * another process's protection.
+ */
+function isSessionOwnershipSettingsPath(path: string): boolean {
+	return path === "session.ownership" || path.startsWith("session.ownership.");
+}
 /**
  * Project-layer values ignored at merge.
  * User config and runtime overrides still apply.
@@ -942,7 +952,10 @@ export class Settings implements NotificationSettingsReader {
 				previous = effective;
 			}
 			const allowedLayers: SettingsLayer[] = ["global"];
-			const globalOnly = GLOBAL_ONLY_SETTINGS.has(settingPath) || isNotificationSettingsPath(settingPath);
+			const globalOnly =
+				GLOBAL_ONLY_SETTINGS.has(settingPath) ||
+				isNotificationSettingsPath(settingPath) ||
+				isSessionOwnershipSettingsPath(settingPath);
 			if (!globalOnly) {
 				if (
 					!PROJECT_LAYER_DENIED_SETTINGS.has(settingPath) &&
@@ -6960,6 +6973,7 @@ export class Settings implements NotificationSettingsReader {
 			deleteByPath(project, segments);
 			deleteByPath(overrides, segments);
 		}
+		for (const layer of [project, overrides]) deleteByPath(layer, ["session", "ownership"]);
 		for (const settingPath of PROJECT_LAYER_DENIED_SETTINGS) {
 			deleteByPath(project, settingPath.split("."));
 		}
@@ -7116,6 +7130,12 @@ export function onAppendOnlyModeChanged(cb: (value: string) => void): () => void
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
+
+// Session ownership reads its global-only mode from the process settings. Injected, because the
+// session modules sit below config in the import graph.
+// The global layer only: a project or runtime value, including a null or scalar `session` parent
+// that would replace the user's whole `session` object in the merge, never reaches the mode.
+setSessionOwnershipSettingSource(() => globalInstance?.getGlobal("session.ownership.mode"));
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;

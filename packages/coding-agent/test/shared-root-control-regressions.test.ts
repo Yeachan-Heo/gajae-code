@@ -940,3 +940,109 @@ describe("#7823/#7824 interactive TUI command path after a canonical shared mess
 		expect(f.session.getActiveModelProfile()).toBe(profileName);
 	});
 });
+
+describe("/fork after canonical shared messages in a root TUI", () => {
+	it("branches from the selected prompt into a new session and leaves the source untouched", async () => {
+		const f = await fixture();
+		await canonicalMessage(f, "first shared prompt");
+		await canonicalMessage(f, "second shared prompt");
+		const sourceId = f.manager.getSessionId();
+		const bytes = await Bun.file(f.file).bytes();
+		const selected = f.session.getUserMessagesForBranching().find(message => message.text === "second shared prompt");
+		if (!selected) throw new Error("missing selectable prompt");
+		const result = await f.session.branch(selected.entryId);
+		expect(result).toEqual({ selectedText: "second shared prompt", cancelled: false });
+		expect(f.manager.getSessionId()).not.toBe(sourceId);
+		expect(f.manager.getHeader()?.parentSession).toBe(sourceId);
+		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
+		expect(f.manager.getEntries().some(entry => JSON.stringify(entry).includes('"second shared prompt"'))).toBe(
+			false,
+		);
+		const source = f.file;
+		f.file = f.manager.getSessionFile()!;
+		expect(f.file).not.toBe(source);
+		await canonicalMessage(f, "next prompt in the fork");
+		expect(await Bun.file(source).bytes()).toEqual(bytes);
+	});
+
+	it("forks the whole session with its artifacts through AgentSession.fork", async () => {
+		const f = await fixture();
+		await canonicalMessage(f, "first shared prompt");
+		await canonicalMessage(f, "second shared prompt");
+		const sourceId = f.manager.getSessionId();
+		const artifacts = f.file.slice(0, -6);
+		// Owner-only, as the managed artifact store creates them; Linux managed storage
+		// refuses to snapshot a group- or world-readable tree.
+		await fs.mkdir(artifacts, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifacts, "sentinel.log"), "artifact", { mode: 0o600 });
+		const bytes = await Bun.file(f.file).bytes();
+		expect(await f.session.fork()).toBe(true);
+		const forkFile = f.manager.getSessionFile()!;
+		expect(f.manager.getSessionId()).not.toBe(sourceId);
+		expect(f.manager.getHeader()?.parentSession).toBe(sourceId);
+		expect(await Bun.file(path.join(forkFile.slice(0, -6), "sentinel.log")).text()).toBe("artifact");
+		expect(await fs.readdir(artifacts)).toEqual(["sentinel.log"]);
+		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
+		const source = f.file;
+		f.file = forkFile;
+		await canonicalMessage(f, "next prompt in the whole-session fork");
+		expect(await Bun.file(source).bytes()).toEqual(bytes);
+	});
+
+	it("refuses beside a peer sibling before any branch effect", async () => {
+		const f = await fixture();
+		await canonicalMessage(f, "first shared prompt");
+		const peer = await SessionManager.open(f.file, SessionManager.managedDestination(f.cwd, f.agentDir));
+		managers.push(peer);
+		expect((await peer.appendMessageSharingSession(user("peer sibling"))).kind).toBe("committed");
+		await canonicalMessage(f, "second shared prompt");
+		const sourceId = f.manager.getSessionId();
+		const bytes = await Bun.file(f.file).bytes();
+		const selected = f.session.getUserMessagesForBranching().find(message => message.text === "second shared prompt");
+		if (!selected) throw new Error("missing selectable prompt");
+		const flush = vi.spyOn(f.manager, "flush");
+		const prepare = vi.spyOn(f.manager, "prepareBranchedSession");
+		await expect(f.session.branch(selected.entryId)).rejects.toThrow(
+			"Cannot fork this session: another gjc process has written to this session.",
+		);
+		// branch() flushes only after the hook, the agent disconnect and the /btw settle.
+		expect(flush).not.toHaveBeenCalled();
+		expect(prepare).not.toHaveBeenCalled();
+		expect(f.manager.getSessionId()).toBe(sourceId);
+		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
+		// A refused prepare (which closes the persist writer) leaves the source publishing.
+		await expect(f.manager.prepareBranchedSession(selected.entryId)).rejects.toThrow(
+			"Cannot fork this session: another gjc process has written to this session.",
+		);
+		await canonicalMessage(f, "still usable after the refusal");
+	});
+
+	it("refuses Move Session before the cwd transition and flush, and star before any write", async () => {
+		const f = await fixture();
+		await canonicalMessage(f);
+		const bytes = await Bun.file(f.file).bytes();
+		const target = path.join(path.dirname(f.cwd), "move-target");
+		await fs.mkdir(target);
+		const showError = vi.fn();
+		const ctx = {
+			session: f.session,
+			sessionManager: f.manager,
+			showError,
+		} as unknown as InteractiveModeContext;
+		const transition = vi.spyOn(f.manager, "runExclusiveCwdMoveTransition");
+		const flush = vi.spyOn(f.manager, "flush");
+		await new CommandController(ctx).handleMoveCommand(target);
+		expect(showError).toHaveBeenCalledWith(
+			"Move failed: Shared session mutation requires transaction admission: move session",
+		);
+		expect(transition).not.toHaveBeenCalled();
+		expect(flush).not.toHaveBeenCalled();
+		expect(f.manager.getCwd()).toBe(f.cwd);
+		await expect(f.manager.setSessionStarred(true)).rejects.toThrow(
+			"Shared session mutation requires transaction admission: set session starred",
+		);
+		expect(f.manager.isSessionStarred()).toBe(false);
+		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
+		expect(await fs.readdir(target)).toEqual([]);
+	});
+});
