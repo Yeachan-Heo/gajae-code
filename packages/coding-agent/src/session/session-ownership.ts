@@ -25,6 +25,7 @@ import {
 import { getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
+import { type SessionOwnershipTestHookSlot, sessionOwnershipTestHookSlot } from "./session-ownership-mode";
 import {
 	assertAppendLockHomeNotSharedWritable,
 	assertNoReparsePath,
@@ -91,14 +92,15 @@ export interface SessionOwnerLockBackend {
 	probe(sidecar: string, timeoutMs: number): Promise<FileLockProbeResult>;
 }
 
-/** Test-only seams. Code, not environment, so a project `.env` cannot reach them. */
-export const SessionOwnershipTestHooks: {
-	/** Trusted home for this process's claims and probes. */
-	homeOverride?: string;
+/**
+ * Test-only seams. Code, not environment, so a project `.env` cannot reach them. One object per
+ * process (see {@link sessionOwnershipTestHookSlot}), shared by every copy of this module.
+ */
+export const SessionOwnershipTestHooks: SessionOwnershipTestHookSlot & {
 	lockBackend?: SessionOwnerLockBackend;
 	/** Runs after a record's temp file is written and before it is renamed into place. */
 	beforeRecordPublish?: () => void;
-} = {};
+} = sessionOwnershipTestHookSlot();
 
 const nativeBackend: SessionOwnerLockBackend = {
 	tryAcquire: (sidecar, timeoutMs) => tryAcquireFileLock(sidecar, timeoutMs),
@@ -119,7 +121,7 @@ export class SessionOwnershipError extends Error {
 	readonly code: string;
 	readonly errno: string | undefined;
 	readonly operatorMessage =
-		"gjc could not check safely whether another process has this session open, so it was not opened for writing. Check that ~/.gjc/runtime belongs to you and is writable.";
+		"gjc could not check safely whether another process has this session open, so it was not opened for writing. Check that .gjc/runtime in your home directory belongs to you and is writable.";
 
 	constructor(code: string, options?: { cause?: unknown; errno?: string }) {
 		super(`session_ownership_failed: ${code}`, options);
@@ -178,7 +180,7 @@ function inspectOwnersDirectory(): string | undefined {
 
 function assertOwnersDirectoryUnchanged(directory: RuntimeLockDirectory): void {
 	try {
-		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed");
+		assertRuntimeLockDirectoryUnchanged(directory.directories, "owners_directory_changed", directory.label);
 	} catch (error) {
 		throw new SessionOwnershipError("owners_directory_changed", { cause: error });
 	}
@@ -378,8 +380,11 @@ class Claim implements SessionOwnerClaim {
 		const entry = this.#entry;
 		entry.holders -= 1;
 		if (entry.holders > 0) return;
+		const entries = registry().entries;
+		// A test reset dropped and unlocked this entry; the sidecar may now name a newer claim.
+		if (entries.get(this.#sidecar) !== entry) return;
 		// Synchronous from here to the unlock, so no claim in this process can meet its own lock.
-		registry().entries.delete(this.#sidecar);
+		entries.delete(this.#sidecar);
 		// Remove the record before the lock, so a successor's record is never removed; leave a
 		// record whose nonce is not ours.
 		if (readRecord(entry.recordPath)?.claimNonce === entry.nonce) {
@@ -507,7 +512,8 @@ export async function claimSessionOwner(
 	}
 }
 
-type OwnersDirectoryState = "present" | "missing" | "unsafe";
+/** `present`, `missing`, or the code of the failure that refused the directory. */
+type OwnersDirectoryState = "present" | "missing" | { readonly failed: string };
 
 async function probeOne(owners: string, state: OwnersDirectoryState, sessionId: string): Promise<SessionOwnerProbe> {
 	const current = registry();
@@ -517,7 +523,7 @@ async function probeOne(owners: string, state: OwnersDirectoryState, sessionId: 
 	const own = current.entries.get(sidecar);
 	if (own) return { state: "held", self: true, holder: selfHolder(own) };
 	if (state === "missing") return { state: "free" };
-	if (state === "unsafe") return { state: "unknown", reason: "failed", code: "owners_directory_unsafe" };
+	if (typeof state === "object") return { state: "unknown", reason: "failed", code: state.failed };
 	if (current.unavailable !== undefined) return { state: "unknown", reason: "unavailable", code: current.unavailable };
 	const result = await backend().probe(sidecar, NATIVE_BUDGET_MS);
 	switch (result.state) {
@@ -552,7 +558,7 @@ export async function probeSessionOwners(sessionIds: readonly string[]): Promise
 		state = inspectOwnersDirectory() === undefined ? "missing" : "present";
 	} catch (error) {
 		logger.warn("Session owners directory failed its checks", { error: String(error) });
-		state = "unsafe";
+		state = { failed: directoryFailure(error).code };
 	}
 	for (let start = 0; start < ids.length; start += PROBE_CONCURRENCY) {
 		const batch = ids.slice(start, start + PROBE_CONCURRENCY);
