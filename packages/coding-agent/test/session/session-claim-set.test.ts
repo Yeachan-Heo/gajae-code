@@ -7,7 +7,11 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionClaimSet, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import {
+	SessionClaimSet,
+	SessionWriteWithoutClaimError,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import { type SessionDestination, SessionManager } from "../../src/session/session-manager";
 import {
 	claimSessionOwner,
@@ -476,6 +480,34 @@ describe("missed-release signals", () => {
 		expect(sessionOwnershipCounters().claims_abandoned).toBe(1);
 		// The lock stays until the process exits; release it here for the next test.
 		kept?.release();
+	});
+});
+
+describe("the detector before the first bind", () => {
+	it("checks a named id against the mode read now, and stays silent with no id to check", () => {
+		const count = () => sessionOwnershipCounters().session_write_without_claim;
+		const set = new SessionClaimSet();
+		// Ownership off (the default): nothing is counted, bound or not.
+		set.checkWrite("pre-bind", "fork-id");
+		expect(count()).toBe(0);
+		SessionOwnershipTestHooks.mode = "observe";
+		try {
+			set.checkWrite("no id");
+			expect(count()).toBe(0);
+			set.checkWrite("pre-bind", "fork-id");
+			expect(count()).toBe(1);
+			SessionOwnershipTestHooks.strictWriteDetection = true;
+			expect(() => set.checkWrite("pre-bind", "fork-id")).toThrow(SessionWriteWithoutClaimError);
+			delete SessionOwnershipTestHooks.strictWriteDetection;
+			// Once bound, the mode the bind read applies, as before.
+			set.bind("fork-id");
+			SessionOwnershipTestHooks.mode = "off";
+			set.checkWrite("bound");
+			expect(count()).toBe(3);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.strictWriteDetection;
+		}
 	});
 });
 
