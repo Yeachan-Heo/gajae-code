@@ -353,6 +353,31 @@ describe("session ownership writer inventory", () => {
 	});
 });
 
+describe.if(supported)("static successor writes", () => {
+	it("forkFromCaptured: the fork's publish is reported", async () => {
+		const { manager, root, context } = await bound("managed");
+		await manager.close();
+		const capture = SessionManager.captureTranscriptStrict(context.file);
+		if (capture.kind !== "captured") throw new Error(`capture failed: ${capture.reason}`);
+		try {
+			const destination = SessionManager.managedDestination(context.cwd, path.join(root, "agent"));
+			detectorLogs = [];
+			const before = sessionOwnershipCounters().session_write_without_claim;
+			const forked = await SessionManager.forkFromCaptured(capture.snapshot, context.cwd, destination);
+			if (forked.kind !== "forked") throw new Error(`fork failed: ${forked.reason}`);
+			managers.push(forked.manager);
+			expect(sessionOwnershipCounters().session_write_without_claim - before).toBeGreaterThan(0);
+			expect(detectorLogs).toContainEqual({
+				site: "fork successor",
+				sessionId: forked.manager.getSessionId(),
+				mode: "observe",
+			});
+		} finally {
+			capture.snapshot.close();
+		}
+	});
+});
+
 describe.if(supported)("the detector", () => {
 	it("in production it logs and counts, and never claims or throws", async () => {
 		const { manager } = await bound("managed");
