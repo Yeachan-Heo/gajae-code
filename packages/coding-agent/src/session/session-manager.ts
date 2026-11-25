@@ -81,6 +81,7 @@ import {
 	type HeaderPatchRecord,
 	isEntryPatchRecord,
 	isHeaderPatchRecord,
+	isSessionTranscriptFileName,
 	isSupportedSessionVersion,
 	type MutableSessionHeaderFields,
 	parseStoredSessionEntries,
@@ -7135,8 +7136,7 @@ export function listProjectSessionTranscriptFiles(cwd: string): string[] {
 			}
 			if (
 				entry.isFile() &&
-				!entry.name.startsWith(".") &&
-				entry.name.endsWith(".jsonl") &&
+				isSessionTranscriptFileName(entry.name) &&
 				isProjectSessionTranscriptPath(projectGjcDir, entryPath)
 			) {
 				files.push(entryPath);
