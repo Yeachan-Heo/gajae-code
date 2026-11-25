@@ -182,6 +182,7 @@ import {
 	withManagedSessionTransaction,
 } from "./internal/managed-session-transaction";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
+import { SessionClaimSet, sessionClaimSetCapability } from "./internal/session-claim-set";
 import {
 	applyReducerDelta,
 	type BaseAnchor,
@@ -8010,6 +8011,8 @@ export class SessionManager {
 		  }>
 		| undefined;
 	#sessionId: string = "";
+	/** The session claims this manager holds (design §2.5); empty unless a factory or transition hands one in. */
+	readonly #ownershipClaims = new SessionClaimSet();
 	#committedIdentityGeneration = 0;
 	#committedIdentity: { id: string; file: string | undefined } | undefined;
 	#titleMutationRevision = 0;
@@ -9070,6 +9073,7 @@ export class SessionManager {
 
 	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
 	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
+		using _rotation = this.#ownershipClaims.transition();
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		const issued = this.#authenticateStateSnapshot(snapshot);
 		if (!issued.coldRestoreFile) {
@@ -9156,7 +9160,7 @@ export class SessionManager {
 			} catch (error) {
 				logger.warn("Failed to release predecessor rollback sidecar authority", { error: toError(error).message });
 			}
-			this.#sessionId = issued.sessionId;
+			this.#bindSessionId(issued.sessionId);
 			this.#sessionName = issued.sessionName;
 			this.#titleSource = issued.titleSource;
 			this.#sessionFile = issued.coldRestoreFile;
@@ -9249,6 +9253,7 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		using _rotation = this.#ownershipClaims.transition();
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.#assertArtifactOpen();
 		const issued = this.#resolveAdoptedStateSnapshot(snapshot);
@@ -9289,7 +9294,7 @@ export class SessionManager {
 				}
 			}
 			managedTransition?.adopt();
-			this.#sessionId = issued.sessionId;
+			this.#bindSessionId(issued.sessionId);
 			this.#sessionName = issued.sessionName;
 			this.#titleSource = issued.titleSource;
 			this.#sessionFile = issued.sessionFile;
@@ -9345,7 +9350,7 @@ export class SessionManager {
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
-		this.#sessionId = state.sessionId;
+		this.#bindSessionId(state.sessionId);
 		this.#sessionName = state.header.title;
 		this.#titleSource = state.header.titleSource;
 		this.#sessionFile = state.sessionFile;
@@ -9564,7 +9569,7 @@ export class SessionManager {
 				prepared.dispose();
 				return false;
 			}
-			this.#sessionId = header.id;
+			this.#bindSessionId(header.id);
 			this.#sessionName = header.title;
 			this.#titleSource = header.titleSource;
 			this.#needsFullRewriteOnNextPersist = false;
@@ -9776,7 +9781,7 @@ export class SessionManager {
 			}
 			this.#managedPersistExpectedIdentity =
 				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
-			this.#sessionId = discovery.header.id;
+			this.#bindSessionId(discovery.header.id);
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
 			this.#needsFullRewriteOnNextPersist = false;
@@ -10570,7 +10575,7 @@ export class SessionManager {
 			"memory-fallback",
 		);
 		this.#sessionFile = resolvedSessionFile;
-		this.#sessionId = sessionId;
+		this.#bindSessionId(sessionId);
 		this.#sessionName = header?.title;
 		this.#titleSource = header?.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
@@ -10636,7 +10641,7 @@ export class SessionManager {
 			policy,
 		);
 		this.#sessionFile = resolvedSessionFile;
-		this.#sessionId = header.id;
+		this.#bindSessionId(header.id);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
@@ -10656,6 +10661,7 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching). */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
+		using _rotation = this.#ownershipClaims.transition();
 		this.#assertArtifactOpen();
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
@@ -10864,7 +10870,7 @@ export class SessionManager {
 				managedTransition?.adopt();
 				this.#clearManagedTranscriptRelocationResolver();
 				this.#sessionFile = resolvedSessionFile;
-				this.#sessionId = sessionId;
+				this.#bindSessionId(sessionId);
 				this.#sessionName = header?.title;
 				this.#titleSource = header?.titleSource;
 				this.#needsFullRewriteOnNextPersist = migrationApplied;
@@ -10937,7 +10943,7 @@ export class SessionManager {
 				this.#persistError = previous.persistError;
 				this.#closeRetryOriginError = previous.closeRetryOriginError;
 				this.#persistErrorReported = previous.persistErrorReported;
-				this.#sessionId = previous.sessionId;
+				this.#bindSessionId(previous.sessionId);
 				this.#sessionName = previous.sessionName;
 				this.#titleSource = previous.titleSource;
 				this.#sessionFile = previous.sessionFile;
@@ -11386,6 +11392,7 @@ export class SessionManager {
 
 	/** Publish a prepared successor synchronously after all readiness awaits succeed. @internal */
 	commitPreparedNewSession(prepared: PreparedNewSession): void {
+		using _rotation = this.#ownershipClaims.transition();
 		this.#assertRecoveryHydrationWritable();
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded) {
@@ -11443,7 +11450,7 @@ export class SessionManager {
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
 		this.#persistErrorReported = false;
-		this.#sessionId = stage.sessionId;
+		this.#bindSessionId(stage.sessionId);
 		this.#sessionName = stage.sessionName;
 		this.#titleSource = stage.titleSource;
 		this.#sessionFile = stage.sessionFile;
@@ -11659,6 +11666,7 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+		using _rotation = this.#ownershipClaims.transition();
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
@@ -11814,7 +11822,7 @@ export class SessionManager {
 			}
 			throw failure;
 		}
-		this.#sessionId = newSessionId;
+		this.#bindSessionId(newSessionId);
 		this.#sessionFile = newSessionFile;
 		this.#sessionName = newHeader.title;
 		this.#titleSource = newHeader.titleSource;
@@ -16534,7 +16542,7 @@ export class SessionManager {
 		);
 		transition.preserveSelectedLeaf(leafId);
 		this.#commitResidentTextStoreTransition(transition, false);
-		this.#sessionId = header.id;
+		this.#bindSessionId(header.id);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		if (migrationApplied) this.#needsFullRewriteOnNextPersist = true;
@@ -17874,6 +17882,9 @@ export class SessionManager {
 	}
 
 	#releaseClosedSessionState(): void {
+		// The terminal step of every close (close, a terminal closeStrict, a rejected open), so the
+		// claims go with the state they protect.
+		this.#ownershipClaims.releaseAll();
 		this.#clearManagedTranscriptRelocationResolver();
 		const runtime = this.#sidecarRuntime;
 		if (runtime) {
@@ -18056,7 +18067,11 @@ export class SessionManager {
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
 		try {
-			return await this.#closeStrictSession();
+			const outcome = await this.#closeStrictSession();
+			// `close_unknown` is terminal for its callers too; only a retryable close keeps its claims,
+			// because the retry still writes under them.
+			if (outcome.kind !== "close_failed_retryable") this.#ownershipClaims.releaseAll();
+			return outcome;
 		} finally {
 			this.#disposeSnapshotSidecarsBestEffort();
 		}
@@ -23094,6 +23109,19 @@ export class SessionManager {
 
 		return roots;
 	}
+	[sessionClaimSetCapability](): SessionClaimSet {
+		return this.#ownershipClaims;
+	}
+
+	/**
+	 * Every change of this manager's session id goes through here, so the claim set always knows the
+	 * current id. Bookkeeping only: it never claims, and releases happen when a transition settles.
+	 */
+	#bindSessionId(sessionId: string): void {
+		this.#sessionId = sessionId;
+		this.#ownershipClaims.bind(sessionId);
+	}
+
 	[sessionManagerReadCapability](): SessionManagerReadAccess {
 		return this.#internalReadAccess;
 	}
@@ -23164,6 +23192,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		using _rotation = this.#ownershipClaims.transition();
 		this.assertLegacyMutationAllowed("create branched session");
 		this.#assertRecoveryHydrationWritable();
 		this.#ensureFullHotView();
@@ -23253,7 +23282,7 @@ export class SessionManager {
 				transition.dispose();
 				throw error;
 			}
-			this.#sessionId = newSessionId;
+			this.#bindSessionId(newSessionId);
 			this.#sessionFile = newSessionFile;
 			this.#clearManagedTranscriptRelocationResolver();
 			this.#flushed = true;
@@ -23290,7 +23319,7 @@ export class SessionManager {
 			},
 			"retain-and-throw",
 		);
-		this.#sessionId = newSessionId;
+		this.#bindSessionId(newSessionId);
 		this.#clearManagedTranscriptRelocationResolver();
 		this.#commitResidentTextStoreTransition(transition);
 		this.#noteCommittedIdentityChange(previousSessionId, previousSessionFile);
