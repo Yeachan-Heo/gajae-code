@@ -128,6 +128,7 @@ import {
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
 	isImageOnlyModel,
+	isSqliteError,
 	isUsageLimitError,
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
@@ -4492,6 +4493,8 @@ export class AgentSession {
 	#managedFallbackCapturedCredential = new Map<string, { credentialKind: string; rowId: number; access?: string }>();
 	/** Access token that was actually used for a failed OAuth request, captured to detect peer rotation during recovery. */
 	#rejectedOAuthAccessTokenSnapshot: string | undefined;
+	/** Row ID of the OAuth credential actually used for the failed request, captured to detect peer rotation. */
+	#rejectedOAuthCredentialRowId: number | undefined;
 	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
 	#managedFallbackNextCredentialOverride:
 		| { modelKey: string; storageProvider: string; rowId: number; credentialKind: string }
@@ -6820,18 +6823,21 @@ export class AgentSession {
 					});
 					if (isAuthenticated(apiKey)) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+						this.#captureRejectedOAuthCredentialSnapshot(model);
 						return apiKey;
 					}
 					// The preselected credential is no longer available; try to resolve another one of the same kind.
 					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(model, override.credentialKind);
 					if (fallbackApiKey !== undefined) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+						this.#captureRejectedOAuthCredentialSnapshot(model);
 						return fallbackApiKey;
 					}
 					throw new Error("Selected managed fallback credential is no longer available");
 				}
 				const apiKey = await invokeOriginalGetApiKey(provider);
 				if (shouldCapture && model && isAuthenticated(apiKey)) this.#captureManagedFallbackActiveCredential(model);
+				this.#captureRejectedOAuthCredentialSnapshot(model);
 				return apiKey;
 			};
 			this.agent.getApiKey = managedGetApiKey;
@@ -31221,14 +31227,22 @@ export class AgentSession {
 		const credentialSnapshot = authStorage.getOAuthCredentialByRowId(model.provider, rowId);
 		if (!credentialSnapshot) return false;
 
-		// Check if the credential has been rotated by another session between the failed request
-		// and recovery. If the access token snapshot we captured at error-time differs from the
-		// current row's access token, another session has rotated the row, so we should not
-		// refresh a token that was not the one that was rejected.
-		if (
-			this.#rejectedOAuthAccessTokenSnapshot !== undefined &&
-			this.#rejectedOAuthAccessTokenSnapshot !== credentialSnapshot.access
-		) {
+		// Fail closed if the credential identity could not be established at dispatch time.
+		// Without knowing which credential was actually used for the failed request, we cannot
+		// safely detect if another session has rotated the credential.
+		if (this.#rejectedOAuthAccessTokenSnapshot === undefined || this.#rejectedOAuthCredentialRowId === undefined) {
+			return false;
+		}
+
+		// Check if the row ID has changed, indicating the credential was rotated to a different row.
+		if (this.#rejectedOAuthCredentialRowId !== rowId) {
+			return false;
+		}
+
+		// Check if the access token within the same row has been rotated by another session.
+		// If the snapshot differs from the current row's access token, another session has rotated
+		// the row, so we should not refresh a token that was not the one that was rejected.
+		if (this.#rejectedOAuthAccessTokenSnapshot !== credentialSnapshot.access) {
 			// The credential was rotated by another session; do not refresh the replacement.
 			return false;
 		}
@@ -31236,7 +31250,8 @@ export class AgentSession {
 		let rejectedApiKey: string | undefined;
 		try {
 			rejectedApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
-		} catch {
+		} catch (error) {
+			if (isSqliteError(error)) throw error;
 			return false;
 		}
 		if (!isAuthenticated(rejectedApiKey)) return false;
@@ -31253,13 +31268,15 @@ export class AgentSession {
 			let freshApiKey: string | undefined;
 			try {
 				freshApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
-			} catch {
+			} catch (error) {
+				if (isSqliteError(error)) throw error;
 				return false;
 			}
 			return isAuthenticated(freshApiKey) && freshApiKey !== rejectedApiKey;
 		} finally {
-			// Clear the snapshot so it doesn't affect subsequent refresh attempts
+			// Clear the snapshots so they don't affect subsequent refresh attempts
 			this.#rejectedOAuthAccessTokenSnapshot = undefined;
+			this.#rejectedOAuthCredentialRowId = undefined;
 		}
 	}
 
@@ -32674,6 +32691,22 @@ export class AgentSession {
 		}
 	}
 
+	#captureRejectedOAuthCredentialSnapshot(model: Model | undefined): void {
+		if (!model) return;
+		const authStorage = this.#modelRegistry.authStorage;
+		const rowId = authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId);
+		const credentialKind = authStorage.getSessionCredentialType(model.provider, this.credentialSessionId);
+		// Only capture for OAuth credentials. For bare defaults, only capture if not already captured
+		// by managed fallback (which is indicated by the absence of a dispatched credential snapshot).
+		if (rowId !== undefined && credentialKind === "oauth" && this.#rejectedOAuthAccessTokenSnapshot === undefined) {
+			const access = authStorage.getOAuthCredentialByRowId(model.provider, rowId)?.access;
+			if (access !== undefined) {
+				this.#rejectedOAuthAccessTokenSnapshot = access;
+				this.#rejectedOAuthCredentialRowId = rowId;
+			}
+		}
+	}
+
 	#hasManagedFallbackCredentialPin(provider: string): boolean {
 		const authStorage = this.#modelRegistry.authStorage;
 		return (
@@ -33058,20 +33091,13 @@ export class AgentSession {
 				const modelKey = this.#managedFallbackCanonicalModelKey(this.model);
 				const managedCapture = this.#managedFallbackCapturedCredential.get(modelKey);
 				if (managedCapture?.access !== undefined) {
-					// Use the token that was captured when the request was made
+					// Use the credential identity that was captured when the request was made
 					this.#rejectedOAuthAccessTokenSnapshot = managedCapture.access;
-				} else {
-					// Fallback: capture the current token, though this might have been rotated already
-					try {
-						this.#rejectedOAuthAccessTokenSnapshot = await this.#modelRegistry.getApiKey(
-							this.model,
-							this.credentialSessionId,
-						);
-					} catch {
-						// If we can't get the current key, we can't store the snapshot.
-						// Proceed anyway - the refresh attempt will handle it.
-					}
+					this.#rejectedOAuthCredentialRowId = managedCapture.rowId;
 				}
+				// For ordinary (non-managed-fallback) requests, the credential identity cannot be
+				// reliably established after the 401. The recovery path will fail closed if credentials
+				// are undefined, preventing refresh of a potentially rotated credential.
 			}
 			credentialRotated = await this.#refreshRejectedOAuthCredential();
 			if (!credentialRotated && !managedFallback) {
