@@ -432,15 +432,6 @@ describe.if(supported)("session ownership static writer inventory", () => {
 		expect(listed.length).toBe(new Set(listed).size);
 	});
 
-	/** Scenarios whose transcript publish no detector call covers yet; each is pinned as unreported. */
-	const KNOWN_UNCHECKED = new Set([
-		"open (missing, managed)",
-		"open (missing, session memory enabled, managed)",
-		"forkFrom (compacted, session memory enabled, managed)",
-		"forkFrom (compacted, session memory enabled, explicit)",
-		"forkFromCaptured (compacted, session memory enabled, managed)",
-		"forkFromCaptured (compacted, session memory enabled, explicit)",
-	]);
 	const wrote = new Set<string>();
 	for (const [name, scenarios] of Object.entries(CHECKED_WRITERS)) {
 		for (const [scenario, run] of Object.entries(scenarios)) {
@@ -448,11 +439,6 @@ describe.if(supported)("session ownership static writer inventory", () => {
 				it(`${name} (${scenario}, ${kind}): every transcript write without a claim is detected`, async () => {
 					const result = await attribute(kind, run);
 					expect(result.error).toBeUndefined();
-					if (KNOWN_UNCHECKED.has(`${name} (${scenario}, ${kind})`)) {
-						wrote.add(name);
-						expect([result.touched.length, result.unreported]).toEqual([1, result.touched]);
-						return;
-					}
 					expect(result.unreported).toEqual([]);
 					expect(result.unbound).toEqual([]);
 					if (result.touched.length > 0) {
