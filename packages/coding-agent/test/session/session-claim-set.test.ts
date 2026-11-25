@@ -349,6 +349,29 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 		expect(await held("not-yet-held")).toBe(false);
 	});
 
+	it("a hold that ends inside a transition keeps its id for that transition to decide", async () => {
+		const set = new SessionClaimSet();
+		set.bind("held-a");
+		set.add(await claim("held-a"));
+		const finalization = Promise.withResolvers<void>();
+		set.holdUntil("held-a", finalization.promise);
+		{
+			using _transition = set.transition();
+			set.add(await claim("target-b"));
+			set.bind("target-b");
+			finalization.resolve();
+			await finalization.promise;
+			// The transition is still open, so its outcome is not known yet.
+			expect(await held("held-a")).toBe(true);
+			// It rotates back to the held id, which must still be claimed when it settles.
+			set.bind("held-a");
+		}
+		expect(await held("held-a")).toBe(true);
+		expect(await held("target-b")).toBe(false);
+		set.releaseAll();
+		expect(await held("held-a")).toBe(false);
+	});
+
 	it("refuses a released claim, and releases a claim handed to a closed manager", async () => {
 		const { manager, claims } = await persisted();
 		const released = await claim("released-first");
@@ -407,13 +430,17 @@ describe("missed-release signals", () => {
 		}
 	});
 
-	it.if(supported)("counts claims left on a claim set that was garbage-collected", async () => {
+	it.if(supported)("counts only the unreleased claims left on a claim set that was garbage-collected", async () => {
 		let kept: SessionOwnerClaim | undefined;
 		await (async () => {
 			const set = new SessionClaimSet();
 			set.bind("abandoned");
 			kept = await claim("abandoned");
 			set.add(kept);
+			// Released directly, so the set still lists it: it is not a missed release.
+			const done = await claim("abandoned-but-released");
+			set.add(done);
+			done.release();
 		})();
 		for (let attempt = 0; attempt < 100 && sessionOwnershipCounters().claims_abandoned === 0; attempt++) {
 			Bun.gc(true);
