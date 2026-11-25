@@ -22,9 +22,9 @@
  * - A commit that lands before its header exists (an open whose bytes follow through the handle)
  *   moves the checks pending then into a reservation, and is decided once its header can be read:
  *   at the next check, at the next commit that lands, or when the ledger is read. It is covered
- *   only by a reserved check for its own session. While its header is still missing, a read of the
- *   ledger reports it as `(no session header)` without settling it, so when the ledger is read
- *   never changes what is decided.
+ *   only by a reserved check for its own session. Reading the ledger settles a deferred commit
+ *   whose header is already readable; one whose header is still missing is reported as
+ *   `(no session header)` without being settled.
  * A check's session is the id it names, or the manager's bound id.
  *
  * Spied: SessionStorage writes, renames, exact replaces and writer opens; staged-writer publishes;
@@ -161,9 +161,8 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 	const ledger = {
 		events: [] as string[],
 		/**
-		 * Read through getters, which decide the deferred commits whose header can now be read and
-		 * report each one still waiting as uncovered, without settling it: reading never changes
-		 * what a later commit or check decides.
+		 * Read through getters, which settle each deferred commit whose header is already readable,
+		 * and report each one still waiting as uncovered without settling it.
 		 */
 		get uncovered(): string[] {
 			return reported().map(entry => entry.label);
