@@ -416,9 +416,8 @@ async function checkpointOf(source: string) {
 /**
  * Writers that write only a staged transcript: one below `.staging`, or at a dot-prefixed name.
  * The step that publishes it is checked or deferred as named. Each runs, and every transcript it
- * changes (measured before close, which may discard it) must be such a staged one. A managed
- * restore's dot-prefixed transcript still shows in the managed listing and `continueRecent` until
- * PR #8049 (hide staged memory-guard restore transcripts from managed listing) lands.
+ * changes (measured before close, which may discard it) must be such a staged one, which the
+ * managed listing and `continueRecent` do not pick up.
  */
 const STAGED_WRITERS: Record<string, { readonly reason: string; readonly run: Run }> = {
 	openStaged: {
@@ -504,6 +503,15 @@ describe.if(supported)("session ownership static writer inventory", () => {
 				expect([kind, changed.filter(name => !staged(name))]).toEqual([kind, []]);
 				// A write the ledger could not attribute is a staged one: these publish later, checked.
 				expect([kind, writes.uncovered.filter(entry => !staged(entry.split(" ")[1]!))]).toEqual([kind, []]);
+				// Nothing resumes or lists the staged transcript.
+				const surfaced = (file: string) => changed.some(name => path.join(f.root, name) === file);
+				const listed =
+					kind === "managed"
+						? await SessionManager.listManagedForResumePickerReadOnly(f.cwd, f.agentDir)
+						: await SessionManager.listForResumePickerReadOnly(f.cwd, path.dirname(f.existing));
+				expect([kind, listed.map(info => info.path).filter(surfaced)]).toEqual([kind, []]);
+				const continued = keep(await SessionManager.continueRecent(f.cwd, f.destination())) as SessionManager;
+				expect([kind, surfaced(continued.getSessionFile()!)]).toEqual([kind, false]);
 			}
 		});
 	}
