@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { SessionClaimSet } from "../../src/session/internal/session-claim-set";
 import type { MemoryGuardSessionManagerCheckpointV1 } from "../../src/session/memory-guard-checkpoint-participant";
 import { type SessionDestination, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
@@ -26,6 +27,7 @@ import {
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
 import { isStagedSessionPath } from "../../src/session/session-staging-paths";
+import { FileSessionStorage } from "../../src/session/session-storage";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
@@ -489,6 +491,85 @@ describe.if(supported)("session ownership static writer inventory", () => {
 			}
 		});
 	}
+
+	describe("under the strict seam, each factory publish is refused before it writes", () => {
+		/**
+		 * Record every publish of a transcript, as it happens: the end state alone cannot tell a
+		 * refusal before the publish from a publish its failure cleanup later deleted.
+		 */
+		function spyOnPublishes(): string[] {
+			const published: string[] = [];
+			const record = (primitive: string, target: unknown) => {
+				if (typeof target === "string" && target.endsWith(".jsonl"))
+					published.push(`${primitive} ${path.basename(target)}`);
+			};
+			const storage = FileSessionStorage.prototype;
+			const openStagedWriter = storage.openStagedWriter;
+			vi.spyOn(storage, "openStagedWriter").mockImplementation(function (this: FileSessionStorage, ...args) {
+				const writer = openStagedWriter.apply(this, args);
+				const publish = writer.publishNoReplace.bind(writer);
+				writer.publishNoReplace = () => {
+					record("stagedPublish", args[0]);
+					publish();
+				};
+				return writer;
+			});
+			for (const name of ["renameSync", "rename", "writeTextSync", "writeText"] as const) {
+				const original = storage[name] as (...args: never[]) => unknown;
+				const at = name.startsWith("rename") ? 1 : 0;
+				vi.spyOn(storage, name).mockImplementation(function (this: FileSessionStorage, ...args: never[]) {
+					record(name, args[at]);
+					return original.apply(this, args);
+				} as never);
+			}
+			const store = ManagedSessionDescendantStore.prototype;
+			for (const name of [
+				"publishNoReplace",
+				"publishNoReplaceSync",
+				"replaceSync",
+				"replaceExpectedIdentitySync",
+			] as const) {
+				const original = store[name] as (...args: never[]) => unknown;
+				vi.spyOn(store, name).mockImplementation(function (this: ManagedSessionDescendantStore, ...args: never[]) {
+					record(`store.${name}`, args[0]);
+					return original.apply(this, args);
+				} as never);
+			}
+			return published;
+		}
+
+		const publishes: Record<string, { readonly run: Run; readonly site: Record<Kind, string> }> = {
+			"open of a missing transcript": {
+				run: f => SessionManager.open(f.missing, f.destination()),
+				// An explicit missing open writes its header through the rewrite funnel.
+				site: { managed: "open create", explicit: "rewrite" },
+			},
+			"bounded forkFrom": {
+				run: f => SessionManager.forkFrom(f.compacted, f.cwd, f.destination(), undefined, undefined, "enabled"),
+				site: { managed: "fork successor", explicit: "fork successor" },
+			},
+			"bounded forkFromCaptured": {
+				run: f => forkCaptured(f.compacted, f, "enabled"),
+				site: { managed: "fork successor", explicit: "fork successor" },
+			},
+		};
+		for (const [name, { run, site }] of Object.entries(publishes)) {
+			for (const kind of ["managed", "explicit"] as const) {
+				it(`${name} (${kind})`, async () => {
+					const f = await fixture(kind);
+					const before = await transcripts(f.root);
+					const published = spyOnPublishes();
+					SessionOwnershipTestHooks.strictWriteDetection = true;
+					await expect(run(f).then(keep)).rejects.toMatchObject({
+						name: "SessionWriteWithoutClaimError",
+						site: site[kind],
+					});
+					expect(published).toEqual([]);
+					expect(await transcripts(f.root)).toEqual(before);
+				});
+			}
+		}
+	});
 
 	it("each checked writer wrote in at least one scenario", () => {
 		expect(Object.keys(CHECKED_WRITERS).filter(name => !wrote.has(name))).toEqual([]);
