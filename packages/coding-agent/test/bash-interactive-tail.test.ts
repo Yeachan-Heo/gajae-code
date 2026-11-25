@@ -84,7 +84,7 @@ describe("interactive Bash PTY tail retention", () => {
 		await Settings.init({
 			inMemory: true,
 			cwd: tempDir,
-			overrides: { "tools.artifactTailBytes": 1, "tools.artifactHeadBytes": 1 },
+			overrides: { "tools.bashOutputTailBytes": 1, "tools.bashOutputHeadBytes": 1 },
 		});
 		const result = await runInteractiveBashPty(createTestUi(), {
 			command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'",

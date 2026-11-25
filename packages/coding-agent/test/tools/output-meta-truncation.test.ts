@@ -3,7 +3,6 @@ import { z } from "@gajae-code/ai";
 import { Settings } from "../../src/config/settings";
 import { truncateHead, truncateMiddleWindows } from "../../src/session/streaming-output";
 import {
-	BASH_DEFAULT_OUTPUT_TAIL_BYTES,
 	formatOutputNotice,
 	formatTruncationMetaNotice,
 	outputMeta,
@@ -14,12 +13,16 @@ import {
 import { ToolError } from "../../src/tools/tool-errors";
 
 describe("output truncation metadata plumbing", () => {
-	test("defaults Bash capture to a 1 KiB tail while preserving explicit retention budgets", () => {
-		expect(BASH_DEFAULT_OUTPUT_TAIL_BYTES).toBe(1024);
+	test("resolves Bash retention from its own keys: 1 KiB tail and no head by default", () => {
 		expect(resolveBashOutputSinkTailBytes(Settings.isolated())).toBe(1024);
-		expect(resolveBashOutputSinkTailBytes(Settings.isolated({ "tools.artifactTailBytes": 7 }))).toBe(7 * 1024);
+		expect(resolveBashOutputSinkTailBytes(Settings.isolated({ "tools.bashOutputTailBytes": 7 }))).toBe(7 * 1024);
 		expect(resolveBashOutputSinkHeadBytes(Settings.isolated())).toBe(0);
-		expect(resolveBashOutputSinkHeadBytes(Settings.isolated({ "tools.artifactHeadBytes": 7 }))).toBe(7 * 1024);
+		expect(resolveBashOutputSinkHeadBytes(Settings.isolated({ "tools.bashOutputHeadBytes": 7 }))).toBe(7 * 1024);
+	});
+	test("shared artifact budgets no longer leak into Bash retention", () => {
+		const shared = Settings.isolated({ "tools.artifactTailBytes": 20, "tools.artifactHeadBytes": 20 });
+		expect(resolveBashOutputSinkTailBytes(shared)).toBe(1024);
+		expect(resolveBashOutputSinkHeadBytes(shared)).toBe(0);
 	});
 	test("forwards noticeOwner on ordinary truncation builders", () => {
 		const result = truncateHead("one\ntwo\nthree", { maxLines: 2, maxBytes: 100 });

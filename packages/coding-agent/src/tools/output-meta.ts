@@ -952,31 +952,20 @@ export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
 	return getSpillConfig(s).headBytes;
 }
 
-export const BASH_DEFAULT_OUTPUT_TAIL_BYTES = 1024;
-
 /**
- * Bash uses a deliberately small tail window to nudge callers toward focused
- * commands and dedicated search tools. An explicitly configured shared tail
- * budget still wins.
+ * Bash has its own retention budgets (`tools.bashOutputTailBytes`,
+ * `tools.bashOutputHeadBytes`) instead of the shared artifact spill keys: its
+ * default tail is deliberately small (1 KiB, no head) to nudge callers toward
+ * focused commands and dedicated search tools, while other tools keep the
+ * larger shared defaults. Keeping the keys separate means the value a user
+ * sees in settings is the value Bash applies.
  */
 export function resolveBashOutputSinkTailBytes(s: Settings): number {
-	const configuredTailBytes = s.get("tools.artifactTailBytes");
-	const hasExplicitTailBytes =
-		typeof s.has === "function" ? s.has("tools.artifactTailBytes") : configuredTailBytes !== undefined;
-	return hasExplicitTailBytes && configuredTailBytes !== undefined
-		? configuredTailBytes * 1024
-		: BASH_DEFAULT_OUTPUT_TAIL_BYTES;
+	return (s.get("tools.bashOutputTailBytes") ?? getDefault("tools.bashOutputTailBytes")) * 1024;
 }
-/**
- * Bash keeps only the tail unless the user explicitly opts into the shared
- * head-retention setting. Schema defaults still apply to other streaming
- * tools without silently turning Bash back into middle-elision mode.
- */
+
 export function resolveBashOutputSinkHeadBytes(s: Settings): number {
-	const configuredHeadBytes = s.get("tools.artifactHeadBytes");
-	const hasExplicitHeadBytes =
-		typeof s.has === "function" ? s.has("tools.artifactHeadBytes") : configuredHeadBytes !== undefined;
-	return hasExplicitHeadBytes && configuredHeadBytes !== undefined ? configuredHeadBytes * 1024 : 0;
+	return (s.get("tools.bashOutputHeadBytes") ?? getDefault("tools.bashOutputHeadBytes")) * 1024;
 }
 
 /**

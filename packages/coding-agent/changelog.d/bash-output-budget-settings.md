@@ -1,0 +1,3 @@
+### Changed
+
+- The Bash tool now reads its inline output retention from dedicated settings, `tools.bashOutputTailBytes` (default 1 KB) and `tools.bashOutputHeadBytes` (default 0, tail only), instead of overloading the shared `tools.artifactTailBytes` / `tools.artifactHeadBytes` keys. The shared keys previously showed a 20 KB default in `/settings` and `gjc config get` while Bash silently used 1 KB unless the key was physically present in `config.yml`, so re-selecting the displayed default changed Bash behavior. Users who set the shared keys to widen Bash output should move those values to the new keys; the shared keys keep governing other tool spills.
