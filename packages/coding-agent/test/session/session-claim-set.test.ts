@@ -337,6 +337,52 @@ describe.if(supported)("the claim set on every close path", () => {
 	});
 });
 
+describe.if(supported)("claim-set guards and the rotating methods' settle", () => {
+	it("a hold for an id the set does not hold protects nothing added later", async () => {
+		const { manager, claims } = await persisted();
+		claims.add(await claim(manager.getSessionId()));
+		claims.holdUntil("not-yet-held", new Promise<void>(() => {}));
+		{
+			using _transition = claims.transition();
+			claims.add(await claim("not-yet-held"));
+		}
+		expect(await held("not-yet-held")).toBe(false);
+	});
+
+	it("refuses a released claim, and releases a claim handed to a closed manager", async () => {
+		const { manager, claims } = await persisted();
+		const released = await claim("released-first");
+		released.release();
+		expect(() => claims.add(released)).toThrow("session_claim_released");
+		await manager.close();
+		const late = await claim("after-close");
+		claims.add(late);
+		expect(late.released).toBe(true);
+		expect(await held("after-close")).toBe(false);
+		expect(claims.sessionIds).toEqual([]);
+	});
+
+	it("setSessionFile settles on its own: the predecessor is released once the switch returns", async () => {
+		const other = await persisted();
+		const otherFile = other.manager.getSessionFile()!;
+		await other.manager.close();
+		const { manager, claims } = await persisted("managed", other);
+		const predecessor = manager.getSessionId();
+		claims.add(await claim(predecessor));
+		await manager.setSessionFile(otherFile);
+		expect(await held(predecessor)).toBe(false);
+	});
+
+	it("fork settles on its own: the predecessor is released once the fork returns", async () => {
+		const { manager, claims } = await persisted();
+		const predecessor = manager.getSessionId();
+		claims.add(await claim(predecessor));
+		await manager.fork();
+		expect(manager.getSessionId()).not.toBe(predecessor);
+		expect(await held(predecessor)).toBe(false);
+	});
+});
+
 describe("the identity helper", () => {
 	it("every session-id change reaches the claim set", async () => {
 		const checks: string[] = [];
