@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { FileLockAcquireStatus } from "@gajae-code/natives";
 import { closeDb } from "@gajae-code/stats";
 import { readSessionOwnershipStats, recordSessionOwnershipCounts } from "@gajae-code/stats/session-ownership";
-import { getStatsDbPath } from "@gajae-code/utils";
+import { getStatsDbPath, TempDir } from "@gajae-code/utils";
 import { runStatsCommand } from "../../src/cli/stats-cli";
 import {
 	claimSessionOwner,
@@ -42,14 +42,25 @@ beforeAll(async () => {
 	operatorBefore = await operatorStatsSnapshot();
 });
 
-/** A relative `PI_CONFIG_DIR` (it must be under the home) naming `directory`. */
-function configDirUnder(directory: string): string {
-	return path.relative(os.homedir(), directory);
+/**
+ * A stats database for `getStatsDbPath()`: a temp config dir under the home, named by a
+ * home-relative `PI_CONFIG_DIR`, as `stats-cli*.test.ts` do. There is no absolute override, and
+ * `os.homedir()` does not follow a runtime `HOME` change. It is removed with `removeSync`, which the
+ * test preload allows wherever the home is. Returns the restore.
+ */
+function useStatsConfigDir(): () => void {
+	const original = process.env.PI_CONFIG_DIR;
+	const config = TempDir.createSync(path.join(os.homedir(), "gjc-ownership-counters-stats-"));
+	process.env.PI_CONFIG_DIR = path.relative(os.homedir(), config.join("config"));
+	return () => {
+		if (original === undefined) delete process.env.PI_CONFIG_DIR;
+		else process.env.PI_CONFIG_DIR = original;
+		config.removeSync();
+	};
 }
 
 beforeEach(async () => {
-	// Under the home, not the temp root: a `PI_CONFIG_DIR` must be home-relative without `..`.
-	root = await fs.realpath(await fs.mkdtemp(path.join(os.homedir(), "gjc-ownership-counters-")));
+	root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ownership-counters-")));
 	preloadHome = SessionOwnershipTestHooks.homeOverride;
 	SessionOwnershipTestHooks.homeOverride = root;
 	dbPath = path.join(root, "stats.db");
@@ -129,35 +140,33 @@ describe("session ownership counters", () => {
 
 	it("never write the stats database from a test process that names none", async () => {
 		delete SessionOwnershipTestHooks.statsDbPath;
-		const originalConfigDir = process.env.PI_CONFIG_DIR;
-		process.env.PI_CONFIG_DIR = configDirUnder(path.join(root, "config"));
-		const statsDb = getStatsDbPath();
-		expect(statsDb.startsWith(root)).toBe(true);
-		// The directory exists, so only the guard can keep the write out.
-		await fs.mkdir(path.dirname(statsDb), { recursive: true });
-		const before = await fs.stat(statsDb).then(
-			stat => stat.mtimeMs,
-			() => undefined,
-		);
-		SessionOwnershipTestHooks.lockBackend = {
-			tryAcquire: async () => ({ status: FileLockAcquireStatus.Held }),
-			probe: async () => {
-				throw new Error("no probe");
-			},
-		};
-		await claimSessionOwner("x", { surface: "terminal" });
+		const restoreConfig = useStatsConfigDir();
 		try {
-			persistSessionOwnershipCounters({ atExit: true });
-		} finally {
-			if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
-			else process.env.PI_CONFIG_DIR = originalConfigDir;
-		}
-		expect(
-			await fs.stat(statsDb).then(
+			const statsDb = getStatsDbPath();
+			expect(statsDb).not.toBe(operatorStatsDb);
+			// The directory exists, so only the guard can keep the write out.
+			await fs.mkdir(path.dirname(statsDb), { recursive: true });
+			const before = await fs.stat(statsDb).then(
 				stat => stat.mtimeMs,
 				() => undefined,
-			),
-		).toBe(before);
+			);
+			SessionOwnershipTestHooks.lockBackend = {
+				tryAcquire: async () => ({ status: FileLockAcquireStatus.Held }),
+				probe: async () => {
+					throw new Error("no probe");
+				},
+			};
+			await claimSessionOwner("x", { surface: "terminal" });
+			persistSessionOwnershipCounters({ atExit: true });
+			expect(
+				await fs.stat(statsDb).then(
+					stat => stat.mtimeMs,
+					() => undefined,
+				),
+			).toBe(before);
+		} finally {
+			restoreConfig();
+		}
 	});
 });
 
@@ -192,16 +201,15 @@ describe.if(supported)("a real process", () => {
 });
 
 describe("gjc stats", () => {
-	const originalConfigDir = process.env.PI_CONFIG_DIR;
+	let restoreConfig: () => void;
 
 	beforeEach(() => {
-		process.env.PI_CONFIG_DIR = configDirUnder(path.join(root, "config"));
+		restoreConfig = useStatsConfigDir();
 	});
 
 	afterEach(() => {
 		closeDb();
-		if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
-		else process.env.PI_CONFIG_DIR = originalConfigDir;
+		restoreConfig();
 	});
 
 	async function stats(json: boolean): Promise<string> {
