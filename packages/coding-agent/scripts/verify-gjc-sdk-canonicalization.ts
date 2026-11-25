@@ -1782,6 +1782,8 @@ function scanPackageExports(contents: string, sourceFiles: readonly string[]): s
 
 function forbiddenMachineModule(file: string): string | undefined {
 	if (file === "packages/coding-agent/src/modes/acp/acp-event-mapper.ts") return undefined;
+	// Import-free error-text helper: it formats operator messages and cannot reach session state.
+	if (file === "packages/coding-agent/src/session/operator-error-message.ts") return undefined;
 	if (file === "packages/coding-agent/src/main.ts" || file === "packages/coding-agent/src/modes/interactive-mode.ts")
 		return "process bootstrap/main session host";
 	if (file === "packages/coding-agent/src/sdk/session.ts") return "direct session mutation module";
