@@ -1004,6 +1004,21 @@ describe.if(supported)("the detector", () => {
 			});
 		}
 
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`a ${kind} session never written to disk moves without a report`, async () => {
+				// Nothing to republish, so nothing to check.
+				const { manager, root, context } = await outsideStrictSeam(async () => {
+					const fixture = await bound(kind, true);
+					await fs.mkdir(path.join(fixture.context.cwd, "moved"));
+					return fixture;
+				});
+				const before = await transcripts(root);
+				await manager.moveTo(path.join(context.cwd, "moved"));
+				expect(manager.getSessionFile()).not.toBe(context.file);
+				expect(await transcripts(root)).toEqual(before);
+			});
+		}
+
 		it("does nothing in off", async () => {
 			SessionOwnershipTestHooks.mode = "off";
 			const { manager, root, context } = await bound("managed");
