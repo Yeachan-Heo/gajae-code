@@ -753,13 +753,32 @@ describe.if(supported)("the detector", () => {
 			expectStrictDetections(1);
 		});
 
+		it("a managed move is refused before it moves the transcript", async () => {
+			const { manager, root, context } = await outsideStrictSeam(async () => {
+				const fixture = await bound("managed");
+				await fs.mkdir(path.join(fixture.context.cwd, "moved"));
+				return fixture;
+			});
+			const before = await transcripts(root);
+			await expect(manager.moveTo(path.join(context.cwd, "moved"))).rejects.toMatchObject({
+				name: "SessionWriteWithoutClaimError",
+				site: "session move",
+			});
+			expectStrictDetections(1);
+			expect(await transcripts(root)).toEqual(before);
+			expect(manager.getSessionFile()).toBe(context.file);
+		});
+
 		it("does nothing in off", async () => {
 			SessionOwnershipTestHooks.mode = "off";
-			const { manager, root } = await bound("managed");
+			const { manager, root, context } = await bound("managed");
 			const before = await transcripts(root);
 			manager.appendMessage(user("off"));
 			manager.rewriteEntries();
 			await manager.flush();
+			await fs.mkdir(path.join(context.cwd, "moved"));
+			await manager.moveTo(path.join(context.cwd, "moved"));
+			expect(manager.getSessionFile()).not.toBe(context.file);
 			expect(changed(before, await transcripts(root))).toBe(true);
 			expect(detectorLogs).toEqual([]);
 		});
