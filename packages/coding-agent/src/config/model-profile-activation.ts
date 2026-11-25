@@ -1559,8 +1559,11 @@ async function resolveAndClampSelectorValue(
 					options.modelRegistry.lookupAliasExists?.(bareSelector.toLowerCase()) ?? providers.length > 0;
 				if (selectors.length === 1) {
 					if (!aliasKnown) {
-						throw new Error(
-							`Model profile "${profileLabel}" ${role} selector "${bareSelector}" does not match any catalog model`,
+						throw Object.assign(
+							new Error(
+								`Model profile "${profileLabel}" ${role} selector "${bareSelector}" does not match any catalog model`,
+							),
+							{ code: "invalid_input" },
 						);
 					}
 					throw new ModelProfileCredentialError(
@@ -1960,11 +1963,24 @@ export async function prepareModelProfileActivation(
 		const defaultResolutionSkips = defaultResolution.skips;
 		if (bindings.defaultSelector && !defaultModel) {
 			const configuredDefaults = normalizeModelSelectorValue(bindings.defaultSelector);
+			// Distinguish authentication failures from genuine catalog misses:
+			// - If all skips are auth-related (credential_unavailable, unauthenticated), it's authentication_failed
+			// - Otherwise, selectors don't exist in the catalog, so it's invalid_input
+			const authRelatedSkipReasons = new Set(["credential_unavailable", "unauthenticated"]);
+			const hasUnknownModelSkip = defaultResolutionSkips.some(skip => !authRelatedSkipReasons.has(skip.reason));
+			const errorCode = hasUnknownModelSkip ? "invalid_input" : "authentication_failed";
 			if (configuredDefaults.length === 1) {
+				if (errorCode === "authentication_failed") {
+					// Preserve credential errors through proper class rather than a typed plain Error
+					throw new ModelProfileCredentialError(profileLabel, configuredDefaults, "default");
+				}
 				throw Object.assign(
 					new Error(`Model profile "${profileLabel}" default selector did not resolve: ${configuredDefaults[0]}`),
 					{ code: "invalid_input" },
 				);
+			}
+			if (errorCode === "authentication_failed") {
+				throw new ModelProfileCredentialError(profileLabel, configuredDefaults, "default");
 			}
 			throw Object.assign(
 				new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`),

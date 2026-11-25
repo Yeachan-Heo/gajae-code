@@ -3513,9 +3513,10 @@ describe("model profile activation", () => {
 		expect((error as Error).message).toBe(
 			'Model profile "unknown-bare-only" default selector "typo-model" does not match any catalog model',
 		);
+		expect((error as any).code).toBe("invalid_input");
 	});
 
-	test("rejects a fully unresolved qualified executor chain", async () => {
+	test("rejects a fully unresolved qualified executor chain with invalid_input error code", async () => {
 		const executorChain = ["provider-a/unknown-executor", "provider-b/unknown-executor"];
 		const profile: ModelProfileDefinition = {
 			name: "unresolved-executor",
@@ -3525,15 +3526,61 @@ describe("model profile activation", () => {
 		};
 		const settings = Settings.isolated();
 
-		await expect(
-			activateModelProfile({
+		let error: unknown;
+		try {
+			await activateModelProfile({
 				session: fakeSession(),
 				modelRegistry: fakeRegistry({ profiles: [profile] }),
 				settings,
 				profileName: profile.name,
-			}),
-		).rejects.toThrow(/executor selectors do not match any catalog model/);
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toMatch(/executor selectors do not match any catalog model/);
+		expect((error as any).code).toBe("invalid_input");
 		expect(settings.get("task.agentModelOverrides")).toEqual({});
+	});
+
+	test("preserves authentication failures when default selector requires credentials", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "needs-auth",
+			requiredProviders: ["provider-b"],
+			modelMapping: { default: "provider-b/model" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile], missingProviders: ["provider-b"] });
+		// Simulate: model exists in catalog but no credentials available
+		const registry = {
+			...baseRegistry,
+			getAvailable: () => [], // No authenticated models
+			getAll: () => [
+				model("provider-b", "model"),
+				...baseRegistry
+					.getAll()
+					.filter(
+						(m: any) =>
+							m.provider === "provider-a" || m.provider === "provider-c" || m.provider === "openai-codex",
+					),
+			],
+		};
+
+		let error: unknown;
+		try {
+			await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(ModelProfileCredentialError);
+		expect((error as any).code).toBe("authentication_failed");
 	});
 
 	test("persists profile ownership when a partial profile has no default mapping", async () => {
