@@ -39,17 +39,26 @@ async function freshDb(): Promise<string> {
  * Another process that holds the database's write lock for `holdMs`. Resolves once the lock is
  * taken (a marker file, not stdout, which a child may flush only at exit) to the child's exit.
  */
-async function holdWriteLock(dbPath: string, holdMs: number): Promise<{ readonly exited: Promise<number> }> {
+async function holdWriteLock(
+	dbPath: string,
+	holdMs: number,
+	options: { readonly commitWrite?: boolean } = {},
+): Promise<{ readonly exited: Promise<number> }> {
 	const marker = `${dbPath}.locked`;
 	const script = `const { Database } = require("bun:sqlite");
 const fs = require("node:fs");
 const db = new Database(process.argv[1]);
 db.exec("BEGIN IMMEDIATE");
+if (process.argv[4] === "write") {
+	db.exec("CREATE TABLE IF NOT EXISTS lock_holder_writes (x)");
+	db.exec("INSERT INTO lock_holder_writes VALUES (1)");
+}
 fs.writeFileSync(process.argv[3], "");
 Bun.sleepSync(Number(process.argv[2]));
 db.exec("COMMIT");
 db.close();`;
-	const child = Bun.spawn([process.execPath, "-e", script, dbPath, String(holdMs), marker], {
+	const args = [dbPath, String(holdMs), marker, options.commitWrite ? "write" : "hold"];
+	const child = Bun.spawn([process.execPath, "-e", script, ...args], {
 		env: { PATH: process.env.PATH, HOME: tempDir?.path() ?? os.tmpdir() },
 		stdout: "ignore",
 		stderr: "pipe",
@@ -126,6 +135,75 @@ describe("session ownership counters in the stats database", () => {
 		});
 	});
 
+	it("an exit write to an existing table waits out another process that writes and commits", async () => {
+		const dbPath = await freshDb();
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(1_000));
+		// The holder commits a change while the exit write waits: a deferred transaction that has
+		// already read could not upgrade after that commit, and would fail without waiting.
+		const holder = await holdWriteLock(dbPath, 300, { commitWrite: true });
+		expect(writeLocked(dbPath)).toBe(true);
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(1_000));
+		expect(await holder.exited).toBe(0);
+		expect(read(dbPath)).toMatchObject({ counters: { claim_taken: 2 }, reports: 2 });
+	});
+
+	it("counts two processes that exit in the same millisecond as two reports", async () => {
+		const dbPath = await freshDb();
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(5_000, "0.22.1"));
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1, held_at_exit: 1 }, meta(5_000, "0.22.1"));
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(5_000, "0.23.0"));
+		expect(read(dbPath)).toMatchObject({
+			counters: { claim_taken: 3, held_at_exit: 1 },
+			reports: 3,
+			byVersion: { "0.22.1": { reports: 2 }, "0.23.0": { reports: 1 } },
+		});
+	});
+
+	it("reads a table from before report ids, and the next write migrates it", async () => {
+		const dbPath = await freshDb();
+		const legacy = new Database(dbPath);
+		legacy.exec(`CREATE TABLE session_ownership_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			count INTEGER NOT NULL,
+			gjc_version TEXT NOT NULL
+		)`);
+		const insert = legacy.prepare(
+			"INSERT INTO session_ownership_events (timestamp, name, count, gjc_version) VALUES (?, ?, ?, ?)",
+		);
+		// Two legacy reports: one of two rows, one of one row.
+		insert.run(1_000, "claim_taken", 1, "0.22.1");
+		insert.run(1_000, "claim_released", 1, "0.22.1");
+		insert.run(2_000, "claim_taken", 1, "0.22.1");
+		legacy.close();
+		const columns = () => {
+			const db = new Database(dbPath, { readonly: true });
+			try {
+				return (db.prepare("PRAGMA table_info(session_ownership_events)").all() as { name: string }[]).map(
+					column => column.name,
+				);
+			} finally {
+				db.close();
+			}
+		};
+
+		expect(read(dbPath)).toMatchObject({ counters: { claim_released: 1, claim_taken: 2 }, reports: 2 });
+		expect((await getDashboardStats()).sessionOwnership).toMatchObject({ reports: 2 });
+		closeDb();
+		// Reading never alters the table.
+		expect(columns()).not.toContain("report_id");
+
+		// A write at a legacy row's time is still its own report.
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(2_000));
+		expect(columns()).toContain("report_id");
+		expect(read(dbPath)).toMatchObject({
+			counters: { claim_released: 1, claim_taken: 3 },
+			reports: 3,
+			lastAt: 2_000,
+		});
+	});
+
 	it("skips invalid rows, and a table of another shape, instead of failing", async () => {
 		const dbPath = await freshDb();
 		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(1_000));
@@ -139,6 +217,9 @@ describe("session ownership counters in the stats database", () => {
 		insert.run(2_000, "claim_taken", "five", "0.22.1");
 		insert.run(2_000, "claim_taken", -5, "0.22.1");
 		insert.run(2_000, "claim_taken", 9e15, "0.22.1");
+		db.prepare(
+			"INSERT INTO session_ownership_events (timestamp, name, count, gjc_version, report_id) VALUES (?, ?, ?, ?, ?)",
+		).run(2_000, "claim_taken", 5, "0.22.1", "x".repeat(65));
 		db.close();
 		expect(read(dbPath)).toMatchObject({ counters: { claim_taken: 1 }, reports: 1, lastAt: 1_000 });
 
