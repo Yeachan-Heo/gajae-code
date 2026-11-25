@@ -10,6 +10,7 @@ import {
 	parseOwnershipRecord,
 	retainOwnedProcess,
 	sdkBrokerAgentDirFromArgs,
+	signalOwnedProcessAlone,
 } from "../src/exec/bash-shell-guardian";
 
 type ProcessDouble = { pid: number; incarnation: string; children: () => NativeProcess[] };
@@ -526,5 +527,98 @@ describe("bash-shell-guardian", () => {
 			expect(spared.size).toBe(0);
 			expect(Date.now() - started).toBeLessThan(1_000);
 		});
+	});
+
+	describe("signalOwnedProcessAlone", () => {
+		const ownedRef = (signalRoot: () => boolean) => ({ pid: 10, incarnation: "b", signalRoot });
+
+		it("uses the identity-bound native signal when the platform delivers it", () => {
+			const kills: number[] = [];
+			const delivered = signalOwnedProcessAlone(
+				ownedRef(() => true),
+				{
+					incarnationOf: () => {
+						throw new Error("must not re-read identity");
+					},
+					killPid: pid => kills.push(pid),
+				},
+			);
+			expect(delivered).toBe(true);
+			expect(kills).toEqual([]);
+		});
+
+		it("falls back to a raw kill only while the recorded incarnation still holds", () => {
+			const kills: Array<[number, string]> = [];
+			const deps = { killPid: (pid: number, signal: string) => kills.push([pid, signal]) };
+			expect(
+				signalOwnedProcessAlone(
+					ownedRef(() => false),
+					{ ...deps, incarnationOf: () => "b" },
+				),
+			).toBe(true);
+			expect(kills).toEqual([[10, "SIGKILL"]]);
+
+			expect(
+				signalOwnedProcessAlone(
+					ownedRef(() => false),
+					{ ...deps, incarnationOf: () => "reused" },
+				),
+			).toBe(false);
+			expect(
+				signalOwnedProcessAlone(
+					ownedRef(() => false),
+					{ ...deps, incarnationOf: () => undefined },
+				),
+			).toBe(false);
+			expect(kills).toHaveLength(1);
+		});
+
+		it("treats a throwing native signal as unsupported and a failed raw kill as undelivered", () => {
+			const throwing = ownedRef(() => {
+				throw new Error("unsupported");
+			});
+			let attempts = 0;
+			const delivered = signalOwnedProcessAlone(throwing, {
+				incarnationOf: () => "b",
+				killPid: () => {
+					attempts += 1;
+					throw new Error("ESRCH");
+				},
+			});
+			expect(delivered).toBe(false);
+			expect(attempts).toBe(1);
+		});
+
+		it.skipIf(process.platform !== "darwin")(
+			"kills a real owned process and spares one whose recorded incarnation no longer matches",
+			async () => {
+				const { Process } = await import("@gajae-code/natives");
+				const deps = {
+					incarnationOf: (pid: number) => Process.fromPid(pid)?.incarnation,
+					killPid: (pid: number, signal: NodeJS.Signals) => process.kill(pid, signal),
+				};
+				const survivor = Bun.spawn(["sleep", "30"]);
+				const victim = Bun.spawn(["sleep", "30"]);
+				try {
+					const survivorRef = Process.fromPid(survivor.pid);
+					const victimRef = Process.fromPid(victim.pid);
+					if (!survivorRef || !victimRef) throw new Error("process refs unavailable");
+					const stale = {
+						pid: survivorRef.pid,
+						incarnation: "darwin:0:0",
+						signalRoot: (signal: number) => survivorRef.signalRoot(signal),
+					};
+					expect(signalOwnedProcessAlone(stale, deps)).toBe(false);
+					expect(signalOwnedProcessAlone(victimRef, deps)).toBe(true);
+					expect(await victim.exited).not.toBe(0);
+					expect(victim.signalCode).toBe("SIGKILL");
+					expect(survivor.exitCode).toBeNull();
+					expect(survivor.killed).toBe(false);
+				} finally {
+					survivor.kill("SIGKILL");
+					victim.kill("SIGKILL");
+				}
+			},
+		);
 	});
 });

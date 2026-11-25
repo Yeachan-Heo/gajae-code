@@ -6,5 +6,4 @@
 
 ### Changed
 
-- `gjc --export` now refuses every transcript larger than 128 MiB with a "too large to export" error. Before, such a transcript, including a default-store session, could be exported once while it had no session-memory sidecars yet, by building sidecars in its artifact directory (in the managed store for default-store sessions); a later export of the same file was already refused.
 - `gjc --export` no longer repoints this terminal's `gjc --continue` at the exported session.

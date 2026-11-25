@@ -30,7 +30,7 @@
 	},
 	"scripts": {
 		"build": "bun run verify:markit-vendor && bun scripts/build-binary.ts",
-		"check": "bun run verify:markit-vendor && biome check . && bun run check:types",
+		"check": "bun run verify:markit-vendor && bun ../../scripts/check-biome-max-size.ts && biome check . && bun run check:types",
 		"check:runtime": "bun run generate-hotkeys-docs --check && bun run verify:sdk-canonicalization",
 		"check:types": "bun run generate-docs-index && tsc -p tsconfig.json --noEmit",
 		"check:autorouting-map": "bun scripts/check-autorouting-tier-map.ts",
@@ -139,6 +139,10 @@
 		"./session/session-manager-internal.js": null,
 		"./session/sdk-run-capability": null,
 		"./session/sdk-run-capability.js": null,
+		"./session/session-ownership": null,
+		"./session/session-ownership.js": null,
+		"./session/session-ownership-mode": null,
+		"./session/session-ownership-mode.js": null,
 		"./extensibility/extensions/function-hooks-internal": null,
 		"./extensibility/extensions/function-hooks-internal.js": null,
 		"./sdk": {
