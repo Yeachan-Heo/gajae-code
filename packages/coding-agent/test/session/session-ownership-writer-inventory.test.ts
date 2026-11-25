@@ -401,16 +401,16 @@ async function transcripts(directory: string): Promise<Map<string, string>> {
 	return found;
 }
 
-/** Basenames of the transcripts whose bytes differ. */
-function changedNames(before: Map<string, string>, after: Map<string, string>): Set<string> {
-	const names = new Set<string>();
+/** Full paths, under `root`, of the transcripts whose bytes differ (a removed one included). */
+function changedPaths(root: string, before: Map<string, string>, after: Map<string, string>): Set<string> {
+	const paths = new Set<string>();
 	for (const name of new Set([...before.keys(), ...after.keys()]))
-		if (before.get(name) !== after.get(name)) names.add(path.basename(name));
-	return names;
+		if (before.get(name) !== after.get(name)) paths.add(path.join(root, name));
+	return paths;
 }
 
 function changed(before: Map<string, string>, after: Map<string, string>): boolean {
-	return changedNames(before, after).size > 0;
+	return changedPaths("", before, after).size > 0;
 }
 
 async function bound(kind: Kind, fresh = false) {
@@ -461,18 +461,20 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 		// A refusal is fine; only bytes that reached the disk need attribution.
 	}
 	// Close discards unpublished successors, so look before it too.
-	const touched = changedNames(before, await transcripts(root));
+	const touched = changedPaths(root, before, await transcripts(root));
 	// In-memory rewrites (message updates, eviction) reach the disk as rewrite debt at close.
 	await manager.close().catch(() => undefined);
-	for (const name of changedNames(before, await transcripts(root))) touched.add(name);
+	for (const file of changedPaths(root, before, await transcripts(root))) touched.add(file);
 	return {
 		wrote: touched.size > 0,
 		detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore,
 		/** Commits no detector call covered, and changed transcripts no spied primitive wrote. */
 		unattributed: [
 			...writes.uncovered,
-			...[...touched].filter(name => !writes.written.has(name)).map(n => `unspied ${n}`),
+			...[...touched].filter(file => !writes.written.has(file)).map(file => `unspied ${path.basename(file)}`),
 		],
+		/** Detector calls that went silent for want of a bound id. */
+		unbound: [...writes.unbound],
 		events: [...writes.events],
 		file: context.file,
 	};
@@ -536,8 +538,8 @@ describe("session ownership writer inventory", () => {
 		for (const kind of ["managed", "explicit"] as const) {
 			it(`${name} (${kind}): every transcript write without a claim is detected`, async () => {
 				const result = await attribute(kind, writer);
-				// Each commit to a transcript follows its own detector call.
-				expect(result.unattributed).toEqual([]);
+				// Each commit to a transcript follows its own detector call, and none of them went silent.
+				expect([result.unattributed, result.unbound]).toEqual([[], []]);
 				if (result.wrote) {
 					wroteSomewhere.add(name);
 					expect(result.detected).toBeGreaterThan(0);
@@ -553,6 +555,31 @@ describe("session ownership writer inventory", () => {
 				const result = await attribute(kind, writer, true);
 				expect([kind, result.detected, result.unattributed]).toEqual([kind, 0, []]);
 			}
+		});
+	}
+
+	for (const kind of ["managed", "explicit"] as const) {
+		it(`moveTo (${kind}): a failed move's rollback puts the transcript back, attributed as a restore`, async () => {
+			const { manager, context } = await bound(kind);
+			const target = path.join(context.cwd, "moved");
+			await fs.mkdir(target);
+			const bytes = await fs.readFile(context.file, "utf8");
+			// Fail the target-directory check that follows the transcript's move, once it has moved.
+			const lstat = fsSync.promises.lstat;
+			let injected = false;
+			vi.spyOn(fsSync.promises, "lstat").mockImplementation(((file: fsSync.PathLike, options?: never) => {
+				if (!injected && file === target && !fsSync.existsSync(context.file)) {
+					injected = true;
+					return Promise.reject(Object.assign(new Error("injected"), { code: "EIO" }));
+				}
+				return lstat(file, options);
+			}) as never);
+			writes.reset();
+			await expect(manager.moveTo(target)).rejects.toThrow();
+			expect(injected).toBe(true);
+			expect(await fs.readFile(context.file, "utf8")).toBe(bytes);
+			expect(writes.events.filter(event => event.startsWith("restore "))).toHaveLength(1);
+			expect(writes.uncovered).toEqual([]);
 		});
 	}
 
@@ -830,21 +857,23 @@ describe.if(supported)("the detector", () => {
 			expectStrictDetections(1);
 		});
 
-		it("a managed move is refused before it moves the transcript", async () => {
-			const { manager, root, context } = await outsideStrictSeam(async () => {
-				const fixture = await bound("managed");
-				await fs.mkdir(path.join(fixture.context.cwd, "moved"));
-				return fixture;
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`a move from a ${kind} destination is refused before it moves the transcript`, async () => {
+				const { manager, root, context } = await outsideStrictSeam(async () => {
+					const fixture = await bound(kind);
+					await fs.mkdir(path.join(fixture.context.cwd, "moved"));
+					return fixture;
+				});
+				const before = await transcripts(root);
+				await expect(manager.moveTo(path.join(context.cwd, "moved"))).rejects.toMatchObject({
+					name: "SessionWriteWithoutClaimError",
+					site: "session move",
+				});
+				expectStrictDetections(1);
+				expect(await transcripts(root)).toEqual(before);
+				expect(manager.getSessionFile()).toBe(context.file);
 			});
-			const before = await transcripts(root);
-			await expect(manager.moveTo(path.join(context.cwd, "moved"))).rejects.toMatchObject({
-				name: "SessionWriteWithoutClaimError",
-				site: "session move",
-			});
-			expectStrictDetections(1);
-			expect(await transcripts(root)).toEqual(before);
-			expect(manager.getSessionFile()).toBe(context.file);
-		});
+		}
 
 		it("does nothing in off", async () => {
 			SessionOwnershipTestHooks.mode = "off";
