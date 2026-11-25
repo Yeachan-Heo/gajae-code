@@ -612,17 +612,9 @@ describe("SessionHeldError", () => {
 	});
 });
 
+// Dormancy is proven by behaviour now that the claim set imports this module: a full session
+// lifecycle in `off` makes no lock call (session-claim-set.test.ts).
 describe("dormant", () => {
-	it("nothing in src uses the ownership module yet", async () => {
-		const src = path.join(import.meta.dir, "../../src");
-		const users: string[] = [];
-		for await (const file of new Bun.Glob("**/*.ts").scan({ cwd: src })) {
-			if (file === path.join("session", "session-ownership.ts")) continue;
-			if (/session-ownership(?:\.[jt]s)?["']/.test(await Bun.file(path.join(src, file)).text())) users.push(file);
-		}
-		expect(users).toEqual([]);
-	});
-
 	it("the package does not export it", async () => {
 		const manifest = (await Bun.file(path.join(import.meta.dir, "../../package.json")).json()) as {
 			exports: Record<string, unknown>;
