@@ -16,6 +16,7 @@ import { logger } from "@gajae-code/utils";
 import * as ownership from "../../src/session/session-ownership";
 // @ts-expect-error -- Bun loads a query-suffixed specifier as a second instance of the module.
 import * as ownershipCopy from "../../src/session/session-ownership.ts?copy=2";
+import { assertRuntimeLockDirectoryUnchanged, prepareRuntimeLockDirectory } from "../../src/session/session-storage";
 
 const {
 	claimSessionOwner,
@@ -51,8 +52,12 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 	return JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
 }
 
+/** The test preload's isolated home, restored after each test. */
+let preloadHome: string | undefined;
+
 beforeEach(async () => {
 	home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-ownership-")));
+	preloadHome = SessionOwnershipTestHooks.homeOverride;
 	SessionOwnershipTestHooks.homeOverride = home;
 	claims = [];
 	// Warnings stay in memory: the logger's file sink lives under the real home.
@@ -68,7 +73,7 @@ afterEach(async () => {
 	try {
 		for (const claim of claims.splice(0)) claim.release();
 	} finally {
-		delete SessionOwnershipTestHooks.homeOverride;
+		SessionOwnershipTestHooks.homeOverride = preloadHome;
 		delete SessionOwnershipTestHooks.lockBackend;
 		delete SessionOwnershipTestHooks.beforeRecordPublish;
 		vi.restoreAllMocks();
@@ -80,12 +85,30 @@ afterEach(async () => {
 });
 
 describe("test isolation", () => {
+	it("the test preload points every claim at its own temp home", () => {
+		expect(preloadHome).toBeString();
+		expect(path.dirname(preloadHome!)).toBe(path.resolve(os.tmpdir()));
+		expect(path.basename(preloadHome!)).toStartWith("gjc-test-owners-");
+	});
+
 	it("a leaked claim is dropped and reported, and the registry is clean afterwards", async () => {
 		const leaked = await claimSessionOwner("leak", { surface: "terminal" });
 		expect(leaked.status).toBe("claimed");
 		expect(() => resetSessionOwnershipForTests()).toThrow("1 session claim(s) were never released");
 		expect(await probeSessionOwner("leak")).toEqual({ state: "free" });
 		expect(() => resetSessionOwnershipForTests()).not.toThrow();
+	});
+
+	it.if(supported)("releasing a claim the reset dropped leaves a newer claim of that session alone", async () => {
+		const leaked = await claimSessionOwner("leak2", { surface: "terminal" });
+		if (leaked.status !== "claimed") throw new Error("expected a claim");
+		expect(() => resetSessionOwnershipForTests()).toThrow("1 session claim(s) were never released");
+		const newer = await claimed("leak2", "sdk");
+		expect(newer.shared).toBe(false);
+		leaked.claim.release();
+		expect(await probeSessionOwner("leak2")).toMatchObject({ state: "held", self: true, holder: { surface: "sdk" } });
+		expect(await probeFileLock(ownersPath("leak2", ".session-owner"))).toEqual({ state: FileLockProbeState.Held });
+		expect(await readJson(ownersPath("leak2", ".owner.json"))).toMatchObject({ surface: "sdk" });
 	});
 });
 
@@ -289,20 +312,17 @@ describe.if(supported)("claim, probe and release", () => {
 	it("two copies of the module share one registry", async () => {
 		const copy: typeof ownership = ownershipCopy;
 		expect(copy.claimSessionOwner).not.toBe(claimSessionOwner);
-		copy.SessionOwnershipTestHooks.homeOverride = home;
-		try {
-			const first = await claimed("s4");
-			expect(await copy.probeSessionOwner("s4")).toMatchObject({ state: "held", self: true });
-			const second = await copy.claimSessionOwner("s4", { surface: "sdk" });
-			if (second.status !== "claimed") throw new Error("expected a shared claim");
-			claims.push(second.claim);
-			expect(second.claim.shared).toBe(true);
-			first.release();
-			second.claim.release();
-			expect(await copy.probeSessionOwner("s4")).toEqual({ state: "free" });
-		} finally {
-			delete copy.SessionOwnershipTestHooks.homeOverride;
-		}
+		// One test-hook slot per process too, so the preload's isolation reaches every copy.
+		expect(copy.SessionOwnershipTestHooks).toBe(SessionOwnershipTestHooks);
+		const first = await claimed("s4");
+		expect(await copy.probeSessionOwner("s4")).toMatchObject({ state: "held", self: true });
+		const second = await copy.claimSessionOwner("s4", { surface: "sdk" });
+		if (second.status !== "claimed") throw new Error("expected a shared claim");
+		claims.push(second.claim);
+		expect(second.claim.shared).toBe(true);
+		first.release();
+		second.claim.release();
+		expect(await copy.probeSessionOwner("s4")).toEqual({ state: "free" });
 	});
 
 	it("batch-probes many ids in one call", async () => {
@@ -379,6 +399,54 @@ describe.if(supported)("the owners directory fails closed like the append lock",
 		const message = (refused as InstanceType<typeof SessionOwnershipError>).operatorMessage;
 		expect(message).toStartWith("gjc could not check safely whether another process has this session open");
 		expect(message).not.toContain(home);
+		// The trusted home need not be `~`, so the message never names it that way.
+		expect(message).not.toContain("~");
+		expect(message).toContain(".gjc/runtime in your home directory");
+	});
+
+	it.if(process.getuid?.() !== 0)("a probe reports a filesystem refusal as I/O, as a claim does", async () => {
+		(await claimed("s14")).release();
+		const runtime = path.join(home, ".gjc", "runtime");
+		await fs.chmod(runtime, 0o000);
+		try {
+			expect(await probeSessionOwner("s14")).toEqual({
+				state: "unknown",
+				reason: "failed",
+				code: "owners_directory_io",
+			});
+		} finally {
+			await fs.chmod(runtime, 0o700);
+		}
+	});
+
+	it("accepts only a single lower-case segment as a lock namespace name", () => {
+		for (const name of ["", "..", "../owners", "a/b", "Owners", ".hidden", "x".repeat(65)])
+			expect(() => prepareRuntimeLockDirectory(name, home)).toThrow(TypeError);
+		expect(prepareRuntimeLockDirectory("session-owners", home).path).toBe(sessionOwnersDirectory());
+	});
+
+	it("names each namespace in its directory errors, keeping the append-lock text", async () => {
+		const owners = prepareRuntimeLockDirectory("session-owners", home);
+		const appendLocks = prepareRuntimeLockDirectory("append-locks", home);
+		const causeOf = (run: () => void): string => {
+			try {
+				run();
+			} catch (error) {
+				return String((error as Error).cause);
+			}
+			throw new Error("expected a refusal");
+		};
+		for (const directory of [owners.path, appendLocks.path]) {
+			await fs.rm(directory, { recursive: true });
+			await fs.symlink(home, directory);
+		}
+		expect([owners.label, appendLocks.label]).toEqual(["session-owner", "append-lock"]);
+		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(owners.directories, "c", owners.label))).toBe(
+			`Error: Unsafe session-owner directory: ${owners.path}`,
+		);
+		expect(causeOf(() => assertRuntimeLockDirectoryUnchanged(appendLocks.directories))).toBe(
+			`Error: Unsafe append-lock directory: ${appendLocks.path}`,
+		);
 	});
 });
 

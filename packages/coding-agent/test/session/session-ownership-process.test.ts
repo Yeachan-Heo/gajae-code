@@ -36,8 +36,12 @@ function recordPath(sessionId: string): string {
 	return path.join(sessionOwnersDirectory(), `${sessionOwnerKey(sessionId)}.owner.json`);
 }
 
+/** The test preload's isolated home, restored after each test. */
+let preloadHome: string | undefined;
+
 beforeEach(async () => {
 	home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-ownership-proc-")));
+	preloadHome = SessionOwnershipTestHooks.homeOverride;
 	SessionOwnershipTestHooks.homeOverride = home;
 	if (!sessionOwnersDirectory().startsWith(`${home}${path.sep}`)) throw new Error("owners directory escaped");
 });
@@ -51,7 +55,7 @@ afterEach(async () => {
 			await child.exited;
 		}
 		for (const pid of strayPids.splice(0)) if (alive(pid)) process.kill(pid, "SIGKILL");
-		delete SessionOwnershipTestHooks.homeOverride;
+		SessionOwnershipTestHooks.homeOverride = preloadHome;
 		await fs.rm(home, { recursive: true, force: true });
 	}
 });
