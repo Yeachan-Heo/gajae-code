@@ -2471,6 +2471,11 @@ export class Settings implements NotificationSettingsReader {
 			) {
 				throw error;
 			}
+			// Log the error when project settings loading fails (issue #8034)
+			logger.warn(
+				`Settings: project settings discovery failed but layer is tolerated; some project settings may be unavailable`,
+				{ error: error instanceof Error ? error.message : String(error), cwd: this.#cwd },
+			);
 			return {};
 		}
 	}
@@ -6339,8 +6344,8 @@ export class Settings implements NotificationSettingsReader {
 		}
 
 		// task.isolation.enabled (boolean) -> task.isolation.mode (enum)
-		const taskObj = raw.task as Record<string, unknown> | undefined;
-		const isolationObj = taskObj?.isolation as Record<string, unknown> | undefined;
+		const taskObj = rawSettingsRecord(raw.task);
+		const isolationObj = taskObj ? rawSettingsRecord(taskObj.isolation) : undefined;
 		if (isolationObj && "enabled" in isolationObj) {
 			if (typeof isolationObj.enabled === "boolean") {
 				isolationObj.mode = isolationObj.enabled ? "auto" : "none";
@@ -6365,27 +6370,34 @@ export class Settings implements NotificationSettingsReader {
 			}
 		}
 
+		// Ensure taskObj (now potentially modified) is updated back to raw
+		if (taskObj && isolationObj) {
+			taskObj.isolation = isolationObj;
+			raw.task = taskObj;
+		}
+
 		// edit.mode: removed "atom" variant is now "hashline"
-		const editObj = raw.edit as Record<string, unknown> | undefined;
+		const editObj = rawSettingsRecord(raw.edit);
 		if (editObj) {
 			if (editObj.mode === "atom") {
 				editObj.mode = "hashline";
 			}
-			const modelVariants = editObj.modelVariants as Record<string, unknown> | undefined;
-			if (modelVariants && typeof modelVariants === "object" && !Array.isArray(modelVariants)) {
+			const modelVariants = rawSettingsRecord(editObj.modelVariants);
+			if (modelVariants) {
 				for (const [pattern, variant] of Object.entries(modelVariants)) {
 					if (variant === "atom") {
 						modelVariants[pattern] = "hashline";
 					}
 				}
 			}
+			raw.edit = editObj;
 		}
 		if (raw["edit.mode"] === "atom") {
 			raw["edit.mode"] = "hashline";
 		}
 
 		// statusLine: rename "plan_mode" segment to "mode"
-		const statusLineObj = raw.statusLine as Record<string, unknown> | undefined;
+		const statusLineObj = rawSettingsRecord(raw.statusLine);
 		if (statusLineObj) {
 			for (const key of ["leftSegments", "rightSegments"] as const) {
 				const segments = statusLineObj[key];
@@ -6393,22 +6405,23 @@ export class Settings implements NotificationSettingsReader {
 					statusLineObj[key] = segments.map(seg => (seg === "plan_mode" ? "mode" : seg));
 				}
 			}
-			const segmentOptions = statusLineObj.segmentOptions as Record<string, unknown> | undefined;
+			const segmentOptions = rawSettingsRecord(statusLineObj.segmentOptions);
 			if (segmentOptions && "plan_mode" in segmentOptions && !("mode" in segmentOptions)) {
 				segmentOptions.mode = segmentOptions.plan_mode;
 				delete segmentOptions.plan_mode;
 			}
+			raw.statusLine = statusLineObj;
 		}
 
 		// Map legacy `memories.enabled` boolean to the explicit `memory.backend`
 		// enum if the latter hasn't been set yet. Idempotent: subsequent
 		// migrations are no-ops once memory.backend is materialised.
-		const memoryBackendObj = raw.memory as Record<string, unknown> | undefined;
+		const memoryBackendObj = rawSettingsRecord(raw.memory);
 		const memoryBackendSet = memoryBackendObj && typeof memoryBackendObj.backend === "string";
-		const memoriesObj = raw.memories as Record<string, unknown> | undefined;
+		const memoriesObj = rawSettingsRecord(raw.memories);
 		if (!memoryBackendSet && memoriesObj && typeof memoriesObj.enabled === "boolean") {
 			const next = memoriesObj.enabled ? "local" : "off";
-			const memoryRoot = (memoryBackendObj ?? {}) as Record<string, unknown>;
+			const memoryRoot = memoryBackendObj ?? {};
 			memoryRoot.backend = next;
 			raw.memory = memoryRoot;
 		}
@@ -6420,7 +6433,7 @@ export class Settings implements NotificationSettingsReader {
 		// - hindsight.agentName was only used as the agent slot in the legacy
 		//   dynamic tuple; if the user customised it we surface it as the new
 		//   bankId base when no explicit bankId is set.
-		const hindsightObj = raw.hindsight as Record<string, unknown> | undefined;
+		const hindsightObj = rawSettingsRecord(raw.hindsight);
 		if (hindsightObj) {
 			if ("dynamicBankId" in hindsightObj) {
 				if (!("scoping" in hindsightObj) && hindsightObj.dynamicBankId === true) {
@@ -6440,6 +6453,7 @@ export class Settings implements NotificationSettingsReader {
 				}
 				delete hindsightObj.agentName;
 			}
+			raw.hindsight = hindsightObj;
 		}
 
 		// Migrate legacy providers.image* settings into modelRoles.image.
