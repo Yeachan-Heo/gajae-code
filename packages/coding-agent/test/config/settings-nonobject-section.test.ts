@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -189,6 +189,53 @@ theme:
 		expect(isolationMode).toBe("auto");
 	});
 
+	test("falsy project task.isolation values (null, false, 0, empty string) do not mask global task.isolation", async () => {
+		const root = await tempDir();
+		const agentDir = path.join(root, ".gjc");
+		await fs.mkdir(agentDir, { recursive: true });
+
+		// Write global config.yml with a non-default task.isolation.mode
+		const globalConfigPath = path.join(agentDir, "config.yml");
+		await fs.writeFile(
+			globalConfigPath,
+			`task:
+  isolation:
+    mode: auto
+theme:
+  dark: ocean-purple
+`,
+		);
+
+		// Create project .gjc with falsy task.isolation value (null)
+		const projectRoot = path.join(root, "project");
+		const projectGjcDir = path.join(projectRoot, ".gjc");
+		await fs.mkdir(projectGjcDir, { recursive: true });
+
+		const projectConfigPath = path.join(projectGjcDir, "config.yml");
+		await fs.writeFile(
+			projectConfigPath,
+			`task:
+  isolation: null
+theme:
+  dark: red-claw
+`,
+		);
+
+		// Load settings from project directory
+		const settings = await Settings.loadForScope({
+			cwd: projectRoot,
+			agentDir: agentDir,
+		});
+
+		// The valid project theme should be loaded
+		expect(settings.get("theme.dark")).toBe("red-claw");
+
+		// Global task.isolation.mode should NOT be masked by falsy project value
+		// Should preserve the global "auto" value, not fall back to default "none"
+		const isolationMode = settings.get("task.isolation.mode");
+		expect(isolationMode).toBe("auto");
+	});
+
 	test("settings-loader warnings from malformed YAML are surfaced to the user", async () => {
 		const root = await tempDir();
 		const agentDir = path.join(root, ".gjc");
@@ -210,17 +257,7 @@ key: [value
 		);
 
 		// Spy on logger to check if warnings are logged
-		const warnSpy = (globalThis as any).vi?.spyOn(logger, "warn");
-
-		if (!warnSpy) {
-			// Skip warning verification if vi is not available in this test environment
-			const settings = await Settings.loadForScope({
-				cwd: projectRoot,
-				agentDir: agentDir,
-			});
-			expect(settings).toBeDefined();
-			return;
-		}
+		const warnSpy = spyOn(logger, "warn");
 
 		try {
 			// Load settings from project directory

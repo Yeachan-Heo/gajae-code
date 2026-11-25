@@ -6383,7 +6383,7 @@ export class Settings implements NotificationSettingsReader {
 			}
 			// Drop malformed (non-object) task.isolation before merging so it doesn't
 			// mask the global value (issue #8034)
-			if (taskObj.isolation && (typeof taskObj.isolation !== "object" || Array.isArray(taskObj.isolation))) {
+			if ("isolation" in taskObj && !rawSettingsRecord(taskObj.isolation)) {
 				delete taskObj.isolation;
 			}
 			raw.task = taskObj;
@@ -6998,6 +6998,7 @@ export class Settings implements NotificationSettingsReader {
 		// A non-object hindsight value would replace the global hindsight object and drop
 		// the global-only hindsight.apiUrl. A non-object compaction value would similarly
 		// replace the compaction object and drop the global-only compaction.remoteEndpoint.
+		// A non-object task.isolation value would mask the global task.isolation object.
 		// Drop malformed parents; nested objects still lose only the global-only child paths.
 		for (const layer of [project, overrides]) {
 			for (const section of ["hindsight", "compaction"] as const) {
@@ -7005,6 +7006,11 @@ export class Settings implements NotificationSettingsReader {
 				if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value))) {
 					delete layer[section];
 				}
+			}
+			// Drop malformed task.isolation (issue #8034)
+			const taskObj = rawSettingsRecord(layer.task);
+			if (taskObj && "isolation" in taskObj && !rawSettingsRecord(taskObj.isolation)) {
+				delete taskObj.isolation;
 			}
 		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
