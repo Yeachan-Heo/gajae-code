@@ -549,6 +549,11 @@ describe.if(supported)("session ownership static writer inventory", () => {
 				run: f => forkCaptured(f.compacted, f, "enabled"),
 				site: { managed: "fork successor", explicit: "fork successor" },
 			},
+			// The eager captured fork streams its transcript through the staged writer.
+			"forkFromCaptured (streaming publish)": {
+				run: f => forkCaptured(f.existing, f),
+				site: { managed: "fork successor", explicit: "fork successor" },
+			},
 		};
 		for (const [name, { run, site }] of Object.entries(publishes)) {
 			for (const kind of ["managed", "explicit"] as const) {
