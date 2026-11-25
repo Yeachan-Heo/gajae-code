@@ -1,31 +1,44 @@
 /**
  * Per-write attribution for the ownership write-path detector (single-owner design §12, before G1).
  *
- * Spies on the primitives that commit bytes to a transcript (`*.jsonl`) and on the detector itself,
- * in order. Each commit must follow a detector call made since the previous commit, so a writer
- * that makes one checked write and one that goes around the detector is caught even though the
- * operation as a whole was seen. Explicit destinations are checked when the persist writer opens,
- * so the open is the commit and the lines written through that handle are not counted again.
+ * Spies on the detector itself and, in order, on the write primitives listed below when they
+ * target a transcript (`*.jsonl`). Each commit must follow a detector call made since the previous
+ * commit, so a writer that makes one checked write and one that goes around the detector is caught
+ * even though the operation as a whole was seen. Explicit destinations are checked when the persist
+ * writer opens, so the open is the commit and the lines written through that handle are not
+ * counted again.
+ *
+ * Spied: SessionStorage writes, renames, exact replaces and writer opens; staged-writer publishes;
+ * the managed store's publish, replace, append and move; the natives' no-replace rename and link;
+ * `node:fs` sync, callback and promise writes, renames, links, copies, truncates, write opens and
+ * write streams; `Bun.write` and `Bun.file().writer()`.
+ *
+ * Not spied, so a write through them is caught only by the inventory's per-transcript byte check
+ * ("unspied"), which sees that a transcript changed but not which write changed it: other native
+ * writes, writes from child processes or workers, and writes through a descriptor opened before the
+ * ledger was installed. No production code writes a transcript through these today.
  *
  * Transcripts are keyed by full path. A rename or move commits to its target and vacates its
- * source; a later commit that puts the vacated transcript back (a rename back, or a republish of
- * the bytes a managed removal took) is a restore, such as a failed move's rollback, and needs no
- * check of its own. Removals are recorded, so the byte backstop sees them, but are not commits:
- * deletes are outside G1 (design §12, "Before G1" item 4).
+ * source; a later commit that puts the vacated transcript back (the same file renamed back from
+ * where it went, or the exact bytes a managed removal took, republished) is a restore, such as a
+ * failed move's rollback, and needs no check of its own. Removals are recorded, so the byte check
+ * sees them, but are not commits: deletes are outside G1 (design §12, "Before G1" item 4).
  *
- * Not seen, so outside G1 too: directory-level renames that carry a transcript inside them (a
- * fork's private staging directory, an explicit staged child's commit). Their target is a
- * directory, not a `*.jsonl` path.
+ * Also outside G1: directory-level renames that carry a transcript inside them (a fork's private
+ * staging directory, an explicit staged child's commit). Their target is a directory, not a
+ * `*.jsonl` path.
  *
- * Storage methods call `node:fs` and the natives underneath; a nested call that targets the
- * transcript an outer primitive is already committing is merged into it. Spies are restored by
+ * Primitives call each other and `node:fs` underneath; a nested call that targets the transcript an
+ * outer primitive is already committing is merged into it. Spies are restored by
  * `vi.restoreAllMocks()`.
  */
+
 import { vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
+import type { BunFile } from "bun";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { SessionClaimSet } from "../../src/session/internal/session-claim-set";
 import {
@@ -249,14 +262,41 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 	wrap(natives, "renameNoReplacePath", renameAt("natives.renameNoReplacePath"));
 	wrap(natives, "linkNoReplacePath", at(1)("natives.linkNoReplacePath"));
 
-	for (const name of ["writeFileSync", "appendFileSync"]) wrap(fs, name, at(0)(`fs.${name}`));
-	wrap(fs, "renameSync", renameAt("fs.renameSync"));
-	for (const name of ["linkSync", "copyFileSync"]) wrap(fs, name, at(1)(`fs.${name}`));
-	wrap(fs, "unlinkSync", (call, args) => remove("fs.unlinkSync", args[0], call));
+	// Sync and callback forms. A write stream commits when it is created, like a writer open.
+	for (const name of [
+		"writeFileSync",
+		"appendFileSync",
+		"truncateSync",
+		"writeFile",
+		"appendFile",
+		"truncate",
+		"createWriteStream",
+	])
+		wrap(fs, name, at(0)(`fs.${name}`));
+	for (const name of ["renameSync", "rename"]) wrap(fs, name, renameAt(`fs.${name}`));
+	for (const name of ["linkSync", "copyFileSync", "link", "copyFile"]) wrap(fs, name, at(1)(`fs.${name}`));
+	for (const name of ["unlinkSync", "unlink", "rmSync"])
+		wrap(fs, name, (call, args) => remove(`fs.${name}`, args[0], call));
 	wrap(fs, "openSync", (call, args) => (writeFlags(args[1]) ? commit("fs.openSync", args[0], call) : call()));
+	wrap(fs, "open", (call, args) => (writeFlags(args[1]) ? commit("fs.open", args[0], call) : call()));
+
+	// Bun's own writers: Bun.write, and a file's writer, which commits when it is created.
+	const named = (target: unknown) =>
+		typeof target === "string" ? target : (target as { name?: unknown } | null)?.name;
+	wrap(Bun, "write", (call, args) => commit("Bun.write", named(args[0]), call));
+	wrap(Bun, "file", call => {
+		const file = call() as BunFile;
+		if (transcriptPath(file.name) === undefined) return file;
+		const writer = file.writer.bind(file);
+		Object.defineProperty(file, "writer", {
+			value: (...args: Parameters<typeof file.writer>) =>
+				commit("Bun.file().writer", file.name, () => writer(...args)),
+		});
+		return file;
+	});
 	// `node:fs/promises` is its own module object, apart from `fs.promises`.
 	for (const promises of new Set<object>([fs.promises, fsPromises])) {
-		for (const name of ["writeFile", "appendFile"]) wrap(promises, name, at(0)(`fs.promises.${name}`));
+		for (const name of ["writeFile", "appendFile", "truncate"]) wrap(promises, name, at(0)(`fs.promises.${name}`));
 		wrap(promises, "rename", renameAt("fs.promises.rename"));
 		for (const name of ["link", "copyFile"]) wrap(promises, name, at(1)(`fs.promises.${name}`));
 		for (const name of ["unlink", "rm"])

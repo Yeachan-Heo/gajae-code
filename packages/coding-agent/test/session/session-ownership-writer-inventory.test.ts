@@ -500,17 +500,42 @@ describe("session ownership writer inventory", () => {
 		expect(result.unattributed).toEqual([`fs.promises.appendFile ${path.basename(result.file)}`]);
 	});
 
-	it("per-write attribution rejects one checked write followed by one around the detector", async () => {
-		// The operation as a whole is seen; only its second write is not.
-		const mixed: Invoke = async (m, { file }) => {
-			m.appendMessage(user("checked"));
-			await fs.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`);
-		};
-		const result = await attribute("managed", mixed);
-		expect(result).toMatchObject({ wrote: true });
-		expect(result.detected).toBeGreaterThan(0);
-		expect(result.unattributed).toEqual([`fs.promises.appendFile ${path.basename(result.file)}`]);
-	});
+	/** Write primitives a writer could reach the disk with after a checked write. */
+	const BYPASSES: Record<string, (file: string) => Promise<unknown>> = {
+		"fs.promises.appendFile": file => fs.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`),
+		"fs.appendFile": file => {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			fsSync.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`, error =>
+				error ? reject(error) : resolve(),
+			);
+			return promise;
+		},
+		"fs.truncateSync": async file => fsSync.truncateSync(file, 1),
+		"fs.createWriteStream": file => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			fsSync.createWriteStream(file, { flags: "a" }).end(`${JSON.stringify({ type: "custom" })}\n`, resolve);
+			return promise;
+		},
+		"Bun.write": file => Bun.write(file, `${JSON.stringify({ type: "custom" })}\n`),
+		"Bun.file().writer": async file => {
+			const sink = Bun.file(file).writer();
+			sink.write(`${JSON.stringify({ type: "custom" })}\n`);
+			await sink.end();
+		},
+	};
+	for (const [primitive, bypass] of Object.entries(BYPASSES)) {
+		it(`per-write attribution rejects one checked write followed by one through ${primitive}`, async () => {
+			// The operation as a whole is seen; only its second write is not.
+			const mixed: Invoke = async (m, { file }) => {
+				m.appendMessage(user("checked"));
+				await bypass(file);
+			};
+			const result = await attribute("managed", mixed);
+			expect(result).toMatchObject({ wrote: true });
+			expect(result.detected).toBeGreaterThan(0);
+			expect(result.unattributed).toEqual([`${primitive} ${path.basename(result.file)}`]);
+		});
+	}
 
 	const writers = { ...CURRENT_WRITERS, ...SUCCESSOR_WRITERS };
 	for (const [name, { funnel: funnels, writer }] of Object.entries(INDIRECT_WRITERS)) {
@@ -539,7 +564,12 @@ describe("session ownership writer inventory", () => {
 			it(`${name} (${kind}): every transcript write without a claim is detected`, async () => {
 				const result = await attribute(kind, writer);
 				// Each commit to a transcript follows its own detector call, and none of them went silent.
-				expect([result.unattributed, result.unbound]).toEqual([[], []]);
+				// The ordered events are in the failure message.
+				expect({ unattributed: result.unattributed, unbound: result.unbound }).toEqual({
+					unattributed: [],
+					unbound: [],
+					...(result.unattributed.length + result.unbound.length > 0 ? { events: result.events } : {}),
+				});
 				if (result.wrote) {
 					wroteSomewhere.add(name);
 					expect(result.detected).toBeGreaterThan(0);
