@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+### Added
+
+- `tryAcquireFileLock(path, timeoutMs?)`, `probeFileLock(path, timeoutMs?)` and the `FileLock` handle: a non-blocking, kernel-backed exclusive lock on a sidecar file, using an open-file-description lock on Linux and `flock` on macOS. The kernel releases the lock when its holder exits or is killed, and the descriptor is close-on-exec, so spawned children never keep it. The probe reports `free`, `held` or `unknown` with a read-lock query and never takes the lock. Acquire and probe run off the JS thread, and a time budget (default 2 s, clamped to 1-60000 ms) bounds how long the caller waits; past it they answer `timed_out`, while a call stuck in a stalled filesystem keeps its thread until the filesystem answers. `release()` and garbage collection close the descriptor synchronously, with no budget. Only `ENOLCK`, `ENOTSUP`/`EOPNOTSUPP` and an unsupported platform report `unavailable`. A symlinked, non-regular, foreign-owned, group- or other-accessible or multiply-linked sidecar, and every other error, reports `failed`. Every target other than Linux and macOS, Windows included, reports `unavailable` for now. Nothing uses the lock yet.
+
 ## [0.22.1] - 2026-11-24
 
 ### Fixed

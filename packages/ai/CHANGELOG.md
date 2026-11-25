@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+### Fixed
+
+- OpenAI Codex logins now keep one credential per ChatGPT workspace. One ChatGPT login can belong to several workspaces (a personal plan and Team or Business workspaces), each with its own usage limits. The workspace id (`chatgpt_account_id`) is recorded as the credential's organization, and the workspace name is looked up once at login as its display name, so logging in to a second workspace no longer replaces the first, and usage is reported per workspace instead of being merged under the shared email. Token refresh does not repeat the name lookup. Rows stored before this change keep working and are deduplicated once their next refresh records the workspace.
+
 ## [0.22.1] - 2026-11-24
 
 ### Added
