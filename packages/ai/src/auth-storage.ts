@@ -7910,6 +7910,7 @@ export class AuthStorage {
 			});
 		} catch (error) {
 			if (options.signal?.aborted) throw error;
+			if (isSqliteError(error)) throw error;
 			// Log transient refresh failures at warn level to surface issues above debug.
 			// Definitive failures (invalid_grant, revoked) are surfaced through the
 			// existing disable event.

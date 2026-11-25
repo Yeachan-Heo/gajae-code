@@ -4489,7 +4489,9 @@ export class AgentSession {
 	/** Credential rows tried by managed fallback for each canonical model and credential kind. */
 	#managedFallbackActiveCredentialRows = new Map<string, Map<string, Set<number>>>();
 	/** Currently captured credential after a managed request resolves its API key for tracking same-turn rows. */
-	#managedFallbackCapturedCredential = new Map<string, { credentialKind: string; rowId: number }>();
+	#managedFallbackCapturedCredential = new Map<string, { credentialKind: string; rowId: number; access?: string }>();
+	/** Access token that was actually used for a failed OAuth request, captured to detect peer rotation during recovery. */
+	#rejectedOAuthAccessTokenSnapshot: string | undefined;
 	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
 	#managedFallbackNextCredentialOverride:
 		| { modelKey: string; storageProvider: string; rowId: number; credentialKind: string }
@@ -31219,6 +31221,18 @@ export class AgentSession {
 		const credentialSnapshot = authStorage.getOAuthCredentialByRowId(model.provider, rowId);
 		if (!credentialSnapshot) return false;
 
+		// Check if the credential has been rotated by another session between the failed request
+		// and recovery. If the access token snapshot we captured at error-time differs from the
+		// current row's access token, another session has rotated the row, so we should not
+		// refresh a token that was not the one that was rejected.
+		if (
+			this.#rejectedOAuthAccessTokenSnapshot !== undefined &&
+			this.#rejectedOAuthAccessTokenSnapshot !== credentialSnapshot.access
+		) {
+			// The credential was rotated by another session; do not refresh the replacement.
+			return false;
+		}
+
 		let rejectedApiKey: string | undefined;
 		try {
 			rejectedApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
@@ -31227,21 +31241,26 @@ export class AgentSession {
 		}
 		if (!isAuthenticated(rejectedApiKey)) return false;
 
-		const refreshed = await authStorage.refreshRejectedOAuthCredential(model.provider, rejectedApiKey, {
-			sessionId: credentialSessionId,
-			baseUrl: model.baseUrl,
-			modelId: model.id,
-			owner: this.#modelRegistry.getAuthStorageOwner(),
-			rejectedCredentialId: { id: rowId, access: credentialSnapshot.access },
-		});
-		if (!refreshed) return false;
-		let freshApiKey: string | undefined;
 		try {
-			freshApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
-		} catch {
-			return false;
+			const refreshed = await authStorage.refreshRejectedOAuthCredential(model.provider, rejectedApiKey, {
+				sessionId: credentialSessionId,
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				rejectedCredentialId: { id: rowId, access: credentialSnapshot.access },
+			});
+			if (!refreshed) return false;
+			let freshApiKey: string | undefined;
+			try {
+				freshApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
+			} catch {
+				return false;
+			}
+			return isAuthenticated(freshApiKey) && freshApiKey !== rejectedApiKey;
+		} finally {
+			// Clear the snapshot so it doesn't affect subsequent refresh attempts
+			this.#rejectedOAuthAccessTokenSnapshot = undefined;
 		}
-		return isAuthenticated(freshApiKey) && freshApiKey !== rejectedApiKey;
 	}
 
 	#canRotateCodexCredential(message: AssistantMessage): boolean {
@@ -32643,7 +32662,13 @@ export class AgentSession {
 		const rowId = authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId);
 		const credentialKind = authStorage.getSessionCredentialType(model.provider, this.credentialSessionId);
 		if (rowId !== undefined && credentialKind !== undefined) {
-			this.#managedFallbackCapturedCredential.set(modelKey, { credentialKind, rowId });
+			// Also capture the OAuth access token at the time of the request to detect
+			// if another session has rotated the credential by the time rejection recovery runs.
+			const access =
+				credentialKind === "oauth"
+					? authStorage.getOAuthCredentialByRowId(model.provider, rowId)?.access
+					: undefined;
+			this.#managedFallbackCapturedCredential.set(modelKey, { credentialKind, rowId, access });
 			const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
 			triedRows.add(rowId);
 		}
@@ -33025,6 +33050,29 @@ export class AgentSession {
 		// fresh. Refresh that row once and replay on the new token; when the
 		// refresh fails, fall through to the existing auth-failure handling.
 		if (canRefreshRejectedOAuthCredential && trigger.class === "auth" && !providerRetryCeilingReached) {
+			// Capture the access token that was actually used for the failed request from the
+			// managed fallback capture if available, as it was recorded when the request was made.
+			// This allows us to detect if another session has rotated the credential between the
+			// failed request and the refresh attempt.
+			if (this.model) {
+				const modelKey = this.#managedFallbackCanonicalModelKey(this.model);
+				const managedCapture = this.#managedFallbackCapturedCredential.get(modelKey);
+				if (managedCapture?.access !== undefined) {
+					// Use the token that was captured when the request was made
+					this.#rejectedOAuthAccessTokenSnapshot = managedCapture.access;
+				} else {
+					// Fallback: capture the current token, though this might have been rotated already
+					try {
+						this.#rejectedOAuthAccessTokenSnapshot = await this.#modelRegistry.getApiKey(
+							this.model,
+							this.credentialSessionId,
+						);
+					} catch {
+						// If we can't get the current key, we can't store the snapshot.
+						// Proceed anyway - the refresh attempt will handle it.
+					}
+				}
+			}
 			credentialRotated = await this.#refreshRejectedOAuthCredential();
 			if (!credentialRotated && !managedFallback) {
 				return managedOutcome
