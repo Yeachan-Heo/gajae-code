@@ -207,11 +207,13 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 		[...ledger.exempt.keys()].some(directory => file.startsWith(`${directory}${path.sep}`));
 
 	/**
-	 * Run `call` as the outermost primitive on `file`; nested primitives on the same file merge into
-	 * it. `record` runs before the call and returns what to do once it has completed, with whether
-	 * the write landed. For a callback form (`callbackArgs`, the arguments `call` passes on), it
-	 * completes when its callback fires, before the caller's callback runs; an error there means the
-	 * write did not land.
+	 * Run `call` as the outermost primitive on `file`. A primitive called on the same file while the
+	 * outer one is still running synchronously (a storage method calling `node:fs` underneath) merges
+	 * into it; once the outer call has returned, any other call is its own commit, even while the
+	 * outer one's promise or callback is still pending. `record` runs before the call and returns
+	 * what to do once it has completed, with whether the write landed. For a callback form
+	 * (`callbackArgs`, the arguments `call` passes on), it completes when its callback fires, before
+	 * the caller's callback runs; an error there means the write did not land.
 	 */
 	const outermost = (
 		file: string,
@@ -220,38 +222,35 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 		callbackArgs?: unknown[],
 	): unknown => {
 		const finish = inFlight.has(file) ? undefined : record();
-		inFlight.set(file, (inFlight.get(file) ?? 0) + 1);
 		let ended = false;
 		const done = (didLand: boolean) => {
 			if (ended) return;
 			ended = true;
-			const left = (inFlight.get(file) ?? 1) - 1;
-			if (left === 0) inFlight.delete(file);
-			else inFlight.set(file, left);
 			finish?.(didLand);
 		};
 		const last = callbackArgs === undefined ? -1 : callbackArgs.length - 1;
 		const callback = callbackArgs?.[last];
-		if (callbackArgs !== undefined && typeof callback === "function") {
+		const viaCallback = callbackArgs !== undefined && typeof callback === "function";
+		if (viaCallback) {
 			const caller = callback as (error: unknown, ...rest: unknown[]) => unknown;
 			callbackArgs[last] = (error: unknown, ...rest: unknown[]) => {
 				done(!error);
 				return caller(error, ...rest);
 			};
-			try {
-				return call();
-			} catch (error) {
-				done(false);
-				throw error;
-			}
 		}
+		inFlight.set(file, (inFlight.get(file) ?? 0) + 1);
 		let result: unknown;
 		try {
 			result = call();
 		} catch (error) {
 			done(false);
 			throw error;
+		} finally {
+			const left = (inFlight.get(file) ?? 1) - 1;
+			if (left === 0) inFlight.delete(file);
+			else inFlight.set(file, left);
 		}
+		if (viaCallback) return result;
 		if (result instanceof Promise)
 			return result.then(
 				value => {

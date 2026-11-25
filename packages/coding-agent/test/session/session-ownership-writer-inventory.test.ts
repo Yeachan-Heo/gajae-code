@@ -800,6 +800,21 @@ describe("session ownership writer inventory", () => {
 			expect(writes.uncovered).toEqual([]);
 		});
 
+		it("a write made while another write to the transcript is still pending is its own commit", async () => {
+			const at = await files("a.jsonl");
+			const line = `${JSON.stringify({ type: "custom" })}\n`;
+			check();
+			const { promise, resolve } = Promise.withResolvers<unknown>();
+			fsSync.appendFile(at("a.jsonl"), line, resolve);
+			fsSync.appendFileSync(at("a.jsonl"), line);
+			// The same while a promise form is pending.
+			check();
+			const pending = fs.appendFile(at("a.jsonl"), line);
+			fsSync.appendFileSync(at("a.jsonl"), line);
+			await Promise.all([promise, pending]);
+			expect(writes.uncovered).toHaveLength(2);
+		});
+
 		it("a check with no write of its own covers no later write to another session", async () => {
 			const at = await files();
 			check("session-x");
