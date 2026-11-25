@@ -489,6 +489,8 @@ describe.if(supported)("session ownership static writer inventory", () => {
 			for (const kind of ["managed", "explicit"] as const) {
 				const f = await fixture(kind);
 				const before = await transcripts(f.root);
+				// Checks the fixture left pending must not cover the writer's writes.
+				writes.reset();
 				keep(await run(f));
 				const after = await transcripts(f.root);
 				const changed = [...after.keys()].filter(name => before.get(name) !== after.get(name));
@@ -498,11 +500,10 @@ describe.if(supported)("session ownership static writer inventory", () => {
 					changed.length > 0,
 					[...before.keys()].every(name => after.get(name) === before.get(name)),
 				]).toEqual([kind, true, true]);
-				const staged = (name: string) =>
-					isStagedSessionPath(path.join(f.root, name)) || path.basename(name).startsWith(".");
-				expect([kind, changed.filter(name => !staged(name))]).toEqual([kind, []]);
+				const staged = (file: string) => isStagedSessionPath(file) || path.basename(file).startsWith(".");
+				expect([kind, changed.filter(name => !staged(path.join(f.root, name)))]).toEqual([kind, []]);
 				// A write the ledger could not attribute is a staged one: these publish later, checked.
-				expect([kind, writes.uncovered.filter(entry => !staged(entry.split(" ")[1]!))]).toEqual([kind, []]);
+				expect([kind, writes.uncoveredFiles.filter(file => !staged(file))]).toEqual([kind, []]);
 				// Nothing resumes or lists the staged transcript.
 				const surfaced = (file: string) => changed.some(name => path.join(f.root, name) === file);
 				const listed =
