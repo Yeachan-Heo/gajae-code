@@ -26,10 +26,18 @@ const ALLOWED: Record<string, { readonly mentions: number | "any"; readonly reas
 
 const LOADERS = { ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx", ".js": "js" } as const;
 
-/** Mentions of the seam's name outside comments, not counting the target of a `delete`. */
-function seamMentions(file: string, text: string): number {
+/**
+ * Mentions of the seam's name outside comments, not counting the target of a `delete`, or why the
+ * file could not be read as code.
+ */
+function seamMentions(file: string, text: string): number | string {
 	const loader = LOADERS[path.extname(file) as keyof typeof LOADERS] ?? "ts";
-	const code = new Bun.Transpiler({ loader, deadCodeElimination: false }).transformSync(text);
+	let code: string;
+	try {
+		code = new Bun.Transpiler({ loader, deadCodeElimination: false }).transformSync(text);
+	} catch (error) {
+		return `could not be parsed as ${loader}: ${error instanceof Error ? error.message : String(error)}`;
+	}
 	const all = code.split(SEAM).length - 1;
 	const deletions =
 		code.match(/\bdelete\s+[\w$.]+(?:\.strictWriteDetection\b|\[\s*["'`]strictWriteDetection["'`]\s*\])/g)?.length ??
@@ -43,7 +51,7 @@ it("only the strict-seam helper turns the strict seam on", async () => {
 		{ cwd: path.join(root, "test"), prefix: "test", pattern: "**/*.{ts,tsx,js,mts,cts}" },
 		{ cwd: path.join(root, "src"), prefix: "src", pattern: "**/*.test.{ts,tsx}" },
 	];
-	const found: Record<string, number> = {};
+	const found: Record<string, number | string> = {};
 	for (const { cwd, prefix, pattern } of scans) {
 		for await (const relative of new Bun.Glob(pattern).scan({ cwd })) {
 			const file = `${prefix}/${relative}`;
