@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import { type GeneratedProvider, getBundledModel, type Usage } from "@gajae-code/ai";
 import { getConfigRootDir, getStatsDbPath, redactCrashSecrets } from "@gajae-code/utils";
+import { readSessionOwnershipStats } from "./session-ownership";
 import type {
 	AgentRole,
 	AgentStats,
@@ -20,6 +21,7 @@ import type {
 	ModelTimeSeriesPoint,
 	ParsedMessageStats,
 	PromptPrefixChange,
+	SessionOwnershipStats,
 	TimeSeriesPoint,
 	UserMessageLink,
 	UserMessageStats,
@@ -890,6 +892,11 @@ export function getMessageCount(): number {
 	const stmt = db.prepare("SELECT COUNT(*) as count FROM messages");
 	const row = stmt.get() as { count: number };
 	return row.count;
+}
+
+/** Session ownership counter totals since `cutoff`; `undefined` when none were recorded. */
+export function getSessionOwnershipStats(cutoff?: number): SessionOwnershipStats | undefined {
+	return db ? readSessionOwnershipStats(db, cutoff) : undefined;
 }
 
 /**

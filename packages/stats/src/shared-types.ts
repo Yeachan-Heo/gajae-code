@@ -203,6 +203,17 @@ export interface DashboardStats {
 	modelPerformanceSeries: ModelPerformancePoint[];
 	costSeries: CostTimeSeriesPoint[];
 	cacheMissAttribution: CacheMissAttribution;
+	/** Local session ownership counters, all-time (not the selected range); absent until one is recorded. */
+	sessionOwnership?: SessionOwnershipStats;
+}
+
+/** Session ownership counter totals (single-owner design §2.9). Local only. */
+export interface SessionOwnershipStats {
+	/** Totals per counter name, in name order. */
+	readonly counters: Readonly<Record<string, number>>;
+	/** First and last time a process recorded counts, in ms since the epoch. */
+	readonly firstAt: number;
+	readonly lastAt: number;
 }
 
 /**

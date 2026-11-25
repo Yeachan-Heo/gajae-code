@@ -1,0 +1,2 @@
+### Added
+- With session ownership turned on (`session.ownership.mode` set to `observe` or `enforce`), each gjc process adds its ownership counts to the local stats database when it exits: claims taken, released and refused, fail-open claims, locks still held at exit, writes without a claim, and the claim-set signals. `gjc stats --summary` and `gjc stats --json` show the all-time totals and the dates they span. The counts stay on this machine. With the default `off`, nothing is counted or written, and `gjc stats` output is unchanged.

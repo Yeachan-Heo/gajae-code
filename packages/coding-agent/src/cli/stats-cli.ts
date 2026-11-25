@@ -136,7 +136,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 async function printStatsSummary(): Promise<void> {
 	const { getDashboardStats } = await import("@gajae-code/stats");
 	const stats = await getDashboardStats();
-	const { overall, failures, byModel, byFolder, byAgent, cacheMissAttribution } = stats;
+	const { overall, failures, byModel, byFolder, byAgent, cacheMissAttribution, sessionOwnership } = stats;
 
 	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
 
@@ -208,6 +208,15 @@ async function printStatsSummary(): Promise<void> {
 			);
 			console.log(`    ${label}: ${formatNumber(cause.misses)}`);
 		}
+	}
+
+	// Recorded only by processes with session ownership on; absent otherwise.
+	if (sessionOwnership) {
+		const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+		console.log(chalk.bold("\nSession Ownership (local counters):"));
+		console.log(`  Recorded: ${day(sessionOwnership.firstAt)} to ${day(sessionOwnership.lastAt)}`);
+		for (const [name, count] of Object.entries(sessionOwnership.counters))
+			console.log(`  ${sanitizeDisplayLine(name)}: ${count}`);
 	}
 
 	console.log("");
