@@ -174,13 +174,18 @@ it("idle close refuses a real foreground bash command", async () => {
 	const pending = session.executeBash("printf started; sleep 30", chunk => {
 		if (chunk.includes("started")) entered.resolve();
 	});
-	await entered.promise;
+	await Promise.race([entered.promise, pending]);
 	try {
 		expect(session.isBashRunning).toBe(true);
 		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
 	} finally {
 		session.abortBash();
-		await pending;
+		await Promise.race([
+			pending,
+			Bun.sleep(1_000).then(() => {
+				throw new Error("foreground bash did not settle after abort");
+			}),
+		]);
 	}
 });
 
@@ -203,6 +208,37 @@ it("settles a foreground bash command when its worker exits before output", asyn
 	await expect(session.executeBash("printf never-seen")).rejects.toThrow(
 		"Isolated shell worker exited with exit code 1",
 	);
+});
+
+it("does not wait for an isolated shell abort acknowledgement", async () => {
+	if (process.platform === "win32") return;
+	const worker = [
+		"let token = '';",
+		"let input = '';",
+		"process.stdin.on('data', chunk => {",
+		"input += chunk;",
+		"for (const line of input.split('\\n').slice(0, -1)) {",
+		"const request = JSON.parse(line);",
+		"if (request.type === 'init') { token = request.token; process.stdout.write(JSON.stringify({ type: 'ready', token }) + '\\n'); }",
+		"if (request.type === 'close') process.stdout.write(JSON.stringify({ type: 'void', id: request.id, token }) + '\\n', () => process.exit(0));",
+		"}",
+		"input = input.slice(input.lastIndexOf('\\n') + 1);",
+		"});",
+	].join(" ");
+	const shell = new IsolatedShell(undefined, { workerArgv: [process.execPath, "-e", worker] });
+	try {
+		await shell.ready();
+		await expect(
+			Promise.race([
+				shell.abort(),
+				Bun.sleep(100).then(() => {
+					throw new Error("abort acknowledgement blocked settlement");
+				}),
+			]),
+		).resolves.toBeUndefined();
+	} finally {
+		await shell.close();
+	}
 });
 
 afterEach(async () => {

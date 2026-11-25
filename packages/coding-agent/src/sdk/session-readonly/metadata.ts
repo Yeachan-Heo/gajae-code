@@ -112,25 +112,21 @@ export async function readSessionListTrailingPatches(
 			const start = Math.max(0, position - chunkSize);
 			const length = position - start;
 			const { bytesRead } = await handle.read(buffer, 0, length, start);
-			const combined = Buffer.concat([buffer.subarray(0, bytesRead), trailingFragment]);
-			let complete = combined;
-			if (start > 0) {
-				const firstNewline = combined.indexOf(0x0a);
-				if (firstNewline === -1) {
-					trailingFragment = combined;
-					position = start;
-					continue;
-				}
-				trailingFragment = combined.subarray(0, firstNewline);
-				complete = combined.subarray(firstNewline + 1);
+			const chunk = buffer.subarray(0, bytesRead);
+			// The carried fragment directly follows `chunk` in the file and never holds a
+			// newline, so the first newline of chunk + fragment is always the chunk's own.
+			const firstNewline = start > 0 ? chunk.indexOf(0x0a) : -1;
+			if (start > 0 && firstNewline === -1) {
+				trailingFragment = Buffer.concat([chunk, trailingFragment]);
+				position = start;
+				continue;
 			}
-			// Marker may straddle the discarded partial first line; still parse when
-			// the raw chunk or carried fragment could hold a header_patch record.
-			const mayContainPatch =
-				complete.includes(headerPatchMarker) ||
-				buffer.subarray(0, bytesRead).includes(headerPatchMarker) ||
-				trailingFragment.includes(headerPatchMarker);
-			if (mayContainPatch) {
+			// Test chunk + fragment for the marker without joining them: most chunks hold
+			// none, and joining every chunk made the walk copy each transcript once more.
+			// The seam check catches a marker split between the chunk and the fragment.
+			// As before, a marker in the discarded partial first line also opens the gate.
+			if (adjacentBytesInclude(chunk, trailingFragment, headerPatchMarker)) {
+				const complete = Buffer.concat([chunk.subarray(firstNewline + 1), trailingFragment]);
 				const lines = complete.toString("utf8").split("\n");
 				for (let index = lines.length - 1; index >= 0; index--) {
 					const line = lines[index];
@@ -148,12 +144,22 @@ export async function readSessionListTrailingPatches(
 					}
 				}
 			}
+			// Copy the partial first line out: `buffer` is overwritten by the next read.
+			if (start > 0) trailingFragment = Buffer.from(chunk.subarray(0, firstNewline));
 			position = start;
 		}
 		return latest.cwd === undefined && latest.title === undefined && latest.starred === undefined ? [] : [latest];
 	} finally {
 		await handle.close();
 	}
+}
+
+/** Whether `needle` occurs in `head` followed directly by `tail`, without concatenating them. */
+function adjacentBytesInclude(head: Buffer, tail: Buffer, needle: Buffer): boolean {
+	if (head.includes(needle) || tail.includes(needle)) return true;
+	const overlap = needle.length - 1;
+	const seam = Buffer.concat([head.subarray(Math.max(0, head.length - overlap)), tail.subarray(0, overlap)]);
+	return seam.includes(needle);
 }
 
 export function applySessionListHeaderPatch(header: SessionListHeader, patch: HeaderPatchRecord["patch"]): void {

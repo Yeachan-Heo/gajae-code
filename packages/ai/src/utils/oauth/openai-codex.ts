@@ -2,7 +2,7 @@
  * OpenAI code provider (ChatGPT OAuth) flow — browser and device-code flows.
  */
 
-import { OPENAI_HEADER_VALUES } from "../../providers/openai-codex/constants";
+import { CODEX_BASE_URL, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "../../providers/openai-codex/constants";
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "./callback-server";
 import { generatePKCE } from "./pkce";
 import type { OAuthController, OAuthCredentials } from "./types";
@@ -16,6 +16,8 @@ const SCOPE = "openid profile email offline_access";
 const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const JWT_PROFILE_CLAIM = "https://api.openai.com/profile";
 const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
+const WORKSPACE_LOOKUP_URL = `${CODEX_BASE_URL}/wham/accounts/check`;
+const WORKSPACE_LOOKUP_TIMEOUT_MS = 5_000;
 const DEVICE_USERCODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_URL = "https://auth.openai.com/api/accounts/deviceauth/token";
 const DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback";
@@ -61,6 +63,50 @@ function getTokenProfile(accessToken: string): { accountId?: string; email?: str
 interface PKCE {
 	verifier: string;
 	challenge: string;
+}
+
+/**
+ * Display name of the ChatGPT workspace a token is bound to, for account labels and `org:` selectors.
+ * One ChatGPT login can belong to several workspaces (a personal plan and Team/Business workspaces),
+ * and the token only carries the workspace id. The personal workspace has no name and is labeled
+ * "Personal". The lookup is best-effort: any failure leaves the name unset and never fails the login.
+ * It runs only at login, never on refresh: a refresh has already rotated the refresh token upstream and
+ * must not spend its timeout budget on a lookup. Refresh merges keep the stored name.
+ */
+async function fetchWorkspaceName(accessToken: string, workspaceId: string): Promise<string | undefined> {
+	try {
+		const response = await fetch(WORKSPACE_LOOKUP_URL, {
+			headers: {
+				Authorization: `Bearer ${accessToken}`,
+				"ChatGPT-Account-Id": workspaceId,
+				[OPENAI_HEADERS.ORIGINATOR]: OPENAI_HEADER_VALUES.ORIGINATOR_CODEX,
+			},
+			signal: AbortSignal.timeout(WORKSPACE_LOOKUP_TIMEOUT_MS),
+		});
+		if (!response.ok) return undefined;
+		const body = (await response.json()) as { accounts?: unknown };
+		if (!Array.isArray(body.accounts)) return undefined;
+		const workspace = body.accounts.find(
+			(account): account is { name?: unknown; structure?: unknown } =>
+				typeof account === "object" && account !== null && (account as { id?: unknown }).id === workspaceId,
+		);
+		if (!workspace) return undefined;
+		const name = typeof workspace.name === "string" ? workspace.name.trim() : "";
+		if (name) return name;
+		return workspace.structure === "personal" ? "Personal" : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Identity fields of a Codex token. The ChatGPT workspace id (`chatgpt_account_id`) is also the
+ * credential's organization, so each workspace of one login is stored, ranked, and preferred as its
+ * own credential instead of replacing the other workspaces of the same email.
+ */
+function getTokenIdentity(accessToken: string): Pick<OAuthCredentials, "accountId" | "email" | "organizationId"> {
+	const { accountId, email } = getTokenProfile(accessToken);
+	return accountId ? { accountId, email, organizationId: accountId } : { email };
 }
 
 /**
@@ -172,17 +218,18 @@ async function exchangeCodeForToken(code: string, verifier: string, redirectUri:
 		throw new Error("Token response missing required fields");
 	}
 
-	const { accountId, email } = getTokenProfile(tokenData.access_token);
-	if (!accountId) {
+	const identity = getTokenIdentity(tokenData.access_token);
+	if (!identity.accountId) {
 		throw new Error("Failed to extract accountId from token");
 	}
+	const organizationName = await fetchWorkspaceName(tokenData.access_token, identity.accountId);
 
 	return {
 		access: tokenData.access_token,
 		refresh: tokenData.refresh_token,
 		expires: Date.now() + tokenData.expires_in * 1000,
-		accountId,
-		email,
+		...identity,
+		...(organizationName ? { organizationName } : {}),
 	};
 }
 
@@ -324,13 +371,10 @@ export async function refreshOpenAICodexToken(refreshToken: string): Promise<OAu
 		throw new Error("Token response missing required fields");
 	}
 
-	const { accountId, email } = getTokenProfile(tokenData.access_token);
-
 	return {
 		access: tokenData.access_token,
 		refresh: tokenData.refresh_token || refreshToken,
 		expires: Date.now() + tokenData.expires_in * 1000,
-		accountId: accountId ?? undefined,
-		email,
+		...getTokenIdentity(tokenData.access_token),
 	};
 }

@@ -179,7 +179,7 @@ export async function runOrdinaryCli(argv: string[]): Promise<void> {
 		return;
 	}
 	if (argv[0] === "--internal-doctor-probe") {
-		if (argv.length !== 2 || (argv[1] !== "native" && argv[1] !== "projection")) {
+		if (argv.length !== 2 || (argv[1] !== "native" && argv[1] !== "projection" && argv[1] !== "session-owners")) {
 			process.stderr.write("gjc doctor: invalid internal probe invocation\n");
 			process.exitCode = 2;
 			return;

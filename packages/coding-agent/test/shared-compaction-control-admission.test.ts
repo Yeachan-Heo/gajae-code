@@ -5,6 +5,7 @@ import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { CompactionCancelledError } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel, modelSupportsMaintenanceCalls } from "@gajae-code/ai/models";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { loadExtensions } from "../src/extensibility/extensions/loader";
@@ -22,7 +23,7 @@ const registries: ModelRegistry[] = [];
 
 const user = (content: string, timestamp = 1) => ({ role: "user" as const, content, timestamp });
 
-async function fixture() {
+async function sessionFixture(rootInteractiveSharedAppend: boolean) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-compaction-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -96,12 +97,17 @@ async function fixture() {
 		}),
 		modelRegistry: registry,
 		extensionRunner: runner,
-		rootInteractiveSharedAppend: true,
+		rootInteractiveSharedAppend,
 	});
 	sessions.push(session);
-	const shared = await manager.appendMessageSharingSession(user("root shared canonical turn", 100));
+	return { manager, session, file, destination, runner };
+}
+
+async function fixture() {
+	const base = await sessionFixture(true);
+	const shared = await base.manager.appendMessageSharingSession(user("root shared canonical turn", 100));
 	if (shared.kind !== "committed") throw new Error(`Could not admit root shared append: ${shared.kind}`);
-	return { manager, session, file, destination, shared, runner };
+	return { ...base, shared };
 }
 
 async function withinBarrier<T>(pending: Promise<T>, phase: string): Promise<T> {
@@ -528,6 +534,74 @@ describe("opted-in managed shared compaction control", () => {
 			const peerEntry = peer.getBranch().find(entry => entry.id === peerSecond.id);
 			expect(peerEntry?.parentId).toBe(peerFirst.id);
 			expect((await Bun.file(file).text()).startsWith(persisted)).toBe(true);
+		});
+	}
+});
+
+describe("transcript-size emergency floor", () => {
+	const answer = () => {
+		const stream = new AssistantMessageEventStream();
+		queueMicrotask(() => {
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "ok" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: "stop",
+				usage: {
+					input: 100,
+					output: 10,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 110,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "done", reason: "stop", message });
+		});
+		return stream;
+	};
+
+	const cases = [
+		{ name: "is skipped in a shared session above the floor", shared: true, providerBytes: 0, compacts: false },
+		{ name: "still compacts a legacy session above the floor", shared: false, providerBytes: 0, compacts: true },
+		{
+			name: "keeps the other floors in a shared session above it",
+			shared: true,
+			providerBytes: 25 * 1024 * 1024,
+			compacts: true,
+		},
+	];
+	for (const { name, shared, providerBytes, compacts } of cases) {
+		it(name, async () => {
+			const { manager, session } = shared ? await fixture() : await sessionFixture(false);
+			session.agent.streamFn = answer;
+			// Above the 48 MiB transcript floor; only the provider-context floor can also fire.
+			session.setResourceSampler(() => ({
+				heapUsedBytes: 0,
+				providerBytes,
+				messageCount: 0,
+				imageBytes: 0,
+				transcriptFileBytes: 64 * 1024 * 1024,
+			}));
+			const events: AgentSessionEvent[] = [];
+			session.subscribe(event => events.push(event));
+
+			await session.prompt("next turn");
+
+			const starts = events.filter(event => event.type === "auto_compaction_start");
+			expect(starts).toEqual(compacts ? [expect.objectContaining({ reason: "overflow" })] : []);
+			expect(manager.getBranch().filter(entry => entry.type === "compaction")).toHaveLength(compacts ? 1 : 0);
+			expect(
+				session.agent.state.messages.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(block => block.type === "text" && block.text === "ok"),
+				),
+			).toBe(true);
 		});
 	}
 });

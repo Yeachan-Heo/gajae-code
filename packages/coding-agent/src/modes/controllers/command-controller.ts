@@ -32,6 +32,7 @@ import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -1338,6 +1339,13 @@ export class CommandController {
 			this.ctx.showError("Usage: /move <path>");
 			return;
 		}
+		// Refuse before the cwd transition and flush, not from inside them.
+		try {
+			this.ctx.sessionManager.assertLegacyMutationAllowed("move session");
+		} catch (err) {
+			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
 
 		const cwd = this.ctx.sessionManager.getCwd();
 		const resolvedPath = resolveToCwd(unquoted, cwd);
@@ -1373,7 +1381,7 @@ export class CommandController {
 			);
 			this.ctx.ui.requestRender();
 		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Move failed: ${operatorErrorMessage(err, String(err))}`);
 		}
 	}
 
@@ -1563,7 +1571,7 @@ export class CommandController {
 			const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
 			await this.ctx.session.prompt(message);
 		} catch (err) {
-			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Failed to load skill: ${operatorErrorMessage(err, String(err))}`);
 		}
 	}
 
@@ -1610,8 +1618,7 @@ export class CommandController {
 			if (outcome === "cancelled") {
 				this.ctx.showError("Compaction cancelled");
 			} else {
-				const message = error instanceof Error ? error.message : String(error);
-				this.ctx.showError(`Compaction failed: ${message}`);
+				this.ctx.showError(`Compaction failed: ${operatorErrorMessage(error, String(error))}`);
 			}
 		} finally {
 			compactingLoader.stop();
@@ -1688,7 +1695,7 @@ export class CommandController {
 			if (message === "Handoff cancelled" || (error instanceof Error && error.name === "AbortError")) {
 				this.ctx.showError("Handoff cancelled");
 			} else {
-				this.ctx.showError(`Handoff failed: ${message}`);
+				this.ctx.showError(`Handoff failed: ${operatorErrorMessage(error, message)}`);
 			}
 			// The failure is non-destructive: the current session is unchanged. If the
 			// document was already generated, preserve it on the clipboard for retry.
