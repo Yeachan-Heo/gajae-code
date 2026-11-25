@@ -100,6 +100,7 @@ const CURRENT_WRITERS: Record<string, Writer> = {
 			m.applyCustomMessageEntryUpdates([{ ...m.getEntry(id as string), content: "after" } as never]),
 	},
 	rewriteEntries: m => m.rewriteEntries(),
+	_persist: { setup: (m, { first }) => m.getEntry(first), run: (m, _context, entry) => m._persist(entry as never) },
 	appendCustomMessageEntry: m => m.appendCustomMessageEntry("inventory", "content", true),
 	appendMCPToolSelection: m => m.appendMCPToolSelection([]),
 	appendDiscoveredBuiltinToolSelection: m => m.appendDiscoveredBuiltinToolSelection([]),
@@ -177,54 +178,120 @@ const SUCCESSOR_WRITERS: Record<string, Writer> = {
 	},
 };
 
-/** Mutation-shaped methods that write no transcript bytes of a session this manager binds. */
-const NOT_TRANSCRIPT_WRITERS: Record<string, string> = {
-	appendSessionRecap: "plans a recap, then writes it through appendCustomEntry",
-	appendSessionRecapSharingSession: "plans a recap, then writes it through appendCustomEntrySharingSession",
-	appendThinkingLevelChangeSharingSession:
-		"needs AgentSession's thinking-control owner; writes through the shared append funnel like its siblings",
-	restoreRollbackState: "rebinds the id; claim-set behaviour in session-claim-set.test.ts",
-	restoreState: "rebinds the id; claim-set behaviour in session-claim-set.test.ts",
-	setSessionFile: "rebinds the id; claim-set behaviour in session-claim-set.test.ts",
-	prepareNewSession: "stages an unpublished successor in memory",
-	appendPreparedModelChange: "stages into an unpublished successor; ensurePreparedNewSessionOnDisk writes it",
-	appendPreparedThinkingLevelChange: "stages into an unpublished successor; ensurePreparedNewSessionOnDisk writes it",
-	appendPreparedServiceTierChange: "stages into an unpublished successor; ensurePreparedNewSessionOnDisk writes it",
-	appendPreparedCustomMessageEntry: "stages into an unpublished successor; ensurePreparedNewSessionOnDisk writes it",
-	appendPreparedModelProfileOwnershipMarker:
-		"stages into an unpublished successor; ensurePreparedNewSessionOnDisk writes it",
-	discardPreparedNewSession: "removes an unpublished successor",
-	discardUncommittedSession: "removes a never-committed session",
-	discardDefaultModelSelectionStage: "removes a staged temp file",
+/**
+ * Writers that act only through the funnels above, or only in a state this scenario does not
+ * reach (no queued writes, no latched failure, no completed turn). Each runs through the same
+ * attribution check, without the requirement to write.
+ */
+const INDIRECT_WRITERS: Record<string, Writer> = {
+	appendSessionRecap: m => m.appendSessionRecap({ recap: "r" } as never),
+	appendSessionRecapSharingSession: m => m.appendSessionRecapSharingSession({ recap: "r" } as never),
+	appendThinkingLevelChangeSharingSession: m => m.appendThinkingLevelChangeSharingSession("high", true, always),
+	newSession: m => m.newSession(),
+	flush: m => m.flush(),
+	flushBeforeLeaving: m => m.flushBeforeLeaving(),
+	close: m => m.close(),
+	closeStrict: m => m.closeStrict(),
+	flushAndCloseStrict: m => m.flushAndCloseStrict(),
+	recoverPersistenceFailure: m => m.recoverPersistenceFailure(),
+};
+
+/** Methods that write no transcript bytes. Each runs, and must leave every transcript unchanged. */
+const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
+	restoreRollbackState: m => m.restoreRollbackState(m.captureState()),
+	restoreState: m => m.restoreState(m.captureState()),
+	setSessionFile: (m, { file }) => m.setSessionFile(file),
+	prepareNewSession: m => m.prepareNewSession(),
+	appendPreparedModelChange: async m => m.appendPreparedModelChange(await m.prepareNewSession(), "fixture/model"),
+	appendPreparedThinkingLevelChange: async m =>
+		m.appendPreparedThinkingLevelChange(await m.prepareNewSession(), "high"),
+	appendPreparedServiceTierChange: async m =>
+		m.appendPreparedServiceTierChange(await m.prepareNewSession(), "priority"),
+	appendPreparedCustomMessageEntry: async m =>
+		m.appendPreparedCustomMessageEntry(await m.prepareNewSession(), "inventory", "staged", true),
+	appendPreparedModelProfileOwnershipMarker: async m =>
+		m.appendPreparedModelProfileOwnershipMarker(await m.prepareNewSession(), { kind: "cleared" }),
+	discardPreparedNewSession: async m => m.discardPreparedNewSession(await m.prepareNewSession()),
+	discardDefaultModelSelectionStage: async m =>
+		m.discardDefaultModelSelectionStage(
+			await m.stageDefaultModelSelection("anthropic/claude-sonnet-4-5", "high", { appendThinkingLevel: true }),
+		),
+	setSessionMemoryMode: m => m.setSessionMemoryMode("shadow"),
+	stageAdoptedArtifactManagerForTransition: m => m.stageAdoptedArtifactManagerForTransition(),
+	ensureArtifactManager: m => m.ensureArtifactManager(),
+	sanitizeLoadedOpenAIResponsesReplayMetadata: m => m.sanitizeLoadedOpenAIResponsesReplayMetadata(),
+	branch: (m, { first }) => m.branch(first),
+	resetLeaf: m => m.resetLeaf(),
+	saveDraft: m => m.saveDraft("draft text"),
+	consumeDraft: m => m.consumeDraft(),
+	saveArtifact: m => m.saveArtifact("artifact text", "bash"),
+	putBlob: m => m.putBlob(Buffer.from("blob")),
+	setSidecarHotSuffixBudgetForTests: m => m.setSidecarHotSuffixBudgetForTests(1 << 20),
+	setParentArtifactBudgetForTests: m => m.setParentArtifactBudgetForTests(1 << 20),
+};
+
+/** Writers this step does not cover; the step named in each reason does. Not run here. */
+const DEFERRED_WRITERS: Record<string, string> = {
+	discardUncommittedSession: "deletes a never-committed session; delete ownership is the scoped-claim step",
 	dropSession: "deletes a session; delete ownership is the scoped-claim step",
+	deleteSessionVerified: "verified delete; delete ownership is the scoped-claim step",
 	setSessionStarredForPicker: "picker write of any session; scoped claims cover picker writes",
-	setSessionMemoryMode: "in-memory mode",
-	createMemoryGuardCheckpoint: "in-memory checkpoint",
-	stageAdoptedArtifactManagerForTransition: "artifact storage only",
-	ensureArtifactManager: "artifact storage only",
+	createMemoryGuardCheckpoint: "needs a memory-guard ingress lease; captures the transcript, does not write it",
 	remapStagedArtifactReferences: "staged child artifact references; staged sessions claim at commit",
-	sanitizeLoadedOpenAIResponsesReplayMetadata: "load-time only; factories claim before it",
-	branch: "local cursor movement",
-	resetLeaf: "local cursor movement",
 	prepareManagedCandidateForWrite: "open-time candidate preparation; factories claim before it",
 	prepareManagedCandidateForStrictAdoption: "open-time candidate preparation; factories claim before it",
+	finalizeWritableOpen: "open-time finalization; factories claim before it",
+	finalizePendingWritableOpen: "open-time finalization; factories claim before it",
 	commitStaged: "staged child publication; staged sessions claim at commit",
 	rollbackCommittedStaged: "staged child rollback",
 	discardStaged: "unpublished staged child cleanup",
 	commitStagedNestedManaged: "staged child publication; staged sessions claim at commit",
 	discardStagedNestedManaged: "unpublished staged child cleanup",
+	finalizeStagedCommit: "staged child publication; staged sessions claim at commit",
 	promoteRecoveryHydrationAfterOwnershipReadyFence: "recovery hydration of an opening manager",
-	deleteSessionVerified: "verified delete; delete ownership is the scoped-claim step",
-	setSidecarHotSuffixBudgetForTests: "test hook",
-	setParentArtifactBudgetForTests: "test hook",
 };
+
+/**
+ * Names outside the mutation-shaped prefixes that are classified too. The remaining prototype
+ * methods are getters and queries; classifying all of them (and the static methods) is left to the
+ * factory-claims step.
+ */
+const ALSO_CLASSIFIED = [
+	"_persist",
+	"newSession",
+	"flush",
+	"flushBeforeLeaving",
+	"close",
+	"closeStrict",
+	"flushAndCloseStrict",
+	"recoverPersistenceFailure",
+	"saveDraft",
+	"consumeDraft",
+	"saveArtifact",
+	"putBlob",
+	"finalizeWritableOpen",
+	"finalizePendingWritableOpen",
+	"finalizeStagedCommit",
+] as const;
 
 const MUTATION_SHAPED =
 	/^(append|set|clear|branch|rewrite|apply|stage|promote|discard|drop|move|fork|prepare|commit|evict|remap|rollback|reset|delete|sanitize|create|ensure|restore)/;
 
+const CLASSIFICATIONS = [
+	CURRENT_WRITERS,
+	SUCCESSOR_WRITERS,
+	INDIRECT_WRITERS,
+	NOT_TRANSCRIPT_WRITERS,
+	DEFERRED_WRITERS,
+];
+
 function unclassified(methods: readonly string[]): string[] {
-	return methods.filter(
-		name => !(name in CURRENT_WRITERS) && !(name in SUCCESSOR_WRITERS) && !(name in NOT_TRANSCRIPT_WRITERS),
+	return methods.filter(name => !CLASSIFICATIONS.some(classification => name in classification));
+}
+
+function classifiedMethods(): string[] {
+	return Object.getOwnPropertyNames(SessionManager.prototype).filter(
+		name => MUTATION_SHAPED.test(name) || (ALSO_CLASSIFIED as readonly string[]).includes(name),
 	);
 }
 
@@ -299,14 +366,13 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 
 describe("session ownership writer inventory", () => {
 	it("classifies every mutation-shaped SessionManager method", () => {
-		const methods = Object.getOwnPropertyNames(SessionManager.prototype).filter(name => MUTATION_SHAPED.test(name));
+		const methods = classifiedMethods();
+		for (const name of ALSO_CLASSIFIED) expect(methods).toContain(name);
 		expect(unclassified(methods)).toEqual([]);
-		const listed = [
-			...Object.keys(CURRENT_WRITERS),
-			...Object.keys(SUCCESSOR_WRITERS),
-			...Object.keys(NOT_TRANSCRIPT_WRITERS),
-		];
+		const listed = CLASSIFICATIONS.flatMap(classification => Object.keys(classification));
 		expect(listed.filter(name => !methods.includes(name))).toEqual([]);
+		// Each method is in exactly one classification.
+		expect(listed.length).toBe(new Set(listed).size);
 		// A writer added later is caught until it is listed.
 		expect(unclassified([...methods, "appendBypassingWriter"])).toEqual(["appendBypassingWriter"]);
 	});
@@ -318,6 +384,20 @@ describe("session ownership writer inventory", () => {
 	});
 
 	const writers = { ...CURRENT_WRITERS, ...SUCCESSOR_WRITERS };
+	for (const [name, writer] of Object.entries(INDIRECT_WRITERS)) {
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`${name} (${kind}): any transcript write it makes is detected`, async () => {
+				const result = await attribute(kind, writer);
+				if (result.wrote) expect(result.detected).toBeGreaterThan(0);
+			});
+		}
+	}
+	for (const [name, writer] of Object.entries(NOT_TRANSCRIPT_WRITERS)) {
+		it(`${name}: writes no transcript bytes`, async () => {
+			for (const kind of ["managed", "explicit"] as const)
+				expect([kind, (await attribute(kind, writer)).wrote]).toEqual([kind, false]);
+		});
+	}
 	const wroteSomewhere = new Set<string>();
 	for (const [name, writer] of Object.entries(writers)) {
 		for (const kind of ["managed", "explicit"] as const) {
@@ -353,7 +433,39 @@ describe("session ownership writer inventory", () => {
 	});
 });
 
-describe.if(supported)("static successor writes", () => {
+describe.if(supported)("successor writes are checked against the successor's id", () => {
+	const successors: Record<string, (m: SessionManager, first: string) => Promise<string>> = {
+		fork: async m => {
+			await m.fork();
+			return m.getSessionId();
+		},
+		prepareFork: async m => (await m.prepareFork())!.sessionId,
+		prepareBranchedSession: async (m, first) => (await m.prepareBranchedSession(first)).sessionId,
+		createBranchedSession: async (m, first) => {
+			m.createBranchedSession(first);
+			return m.getSessionId();
+		},
+	};
+	for (const [name, run] of Object.entries(successors)) {
+		it(`${name}: with the current session claimed, the unclaimed successor is still reported`, async () => {
+			for (const kind of ["managed", "explicit"] as const) {
+				const { manager, context } = await bound(kind);
+				const current = manager.getSessionId();
+				const result = await claimSessionOwner(current, { surface: "terminal" });
+				if (result.status !== "claimed") throw new Error("expected a claim");
+				sessionClaimSetOf(manager).add(result.claim);
+				detectorLogs = [];
+				const successor = await run(manager, context.first);
+				expect(successor).not.toBe(current);
+				const reported = detectorLogs as { site: string; sessionId: string }[];
+				expect([kind, reported.some(log => log.site.endsWith("successor") && log.sessionId === successor)]).toEqual(
+					[kind, true],
+				);
+				expect(reported.some(log => log.sessionId === current)).toBe(false);
+			}
+		});
+	}
+
 	it("forkFromCaptured: the fork's publish is reported", async () => {
 		const { manager, root, context } = await bound("managed");
 		await manager.close();
