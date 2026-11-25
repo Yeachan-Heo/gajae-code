@@ -1,4 +1,5 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { collectSessionOwnersReport, renderSessionOwnersText } from "../cli/session-owners-cli";
 import {
 	attachGjcTmuxSession,
 	createGjcTmuxSession,
@@ -45,12 +46,13 @@ function sessionJson(session: SessionJsonDto): SessionJsonDto {
 }
 
 export default class Session extends Command {
-	static description = "List, inspect, attach, and remove tagged GJC-managed tmux sessions";
+	static description =
+		"List, inspect, attach, and remove tagged GJC-managed tmux sessions, or list session owners (`owners`)";
 	static strict = false;
 
 	static args = {
 		action: Args.string({
-			description: "list (default), status, create, attach, or remove",
+			description: "list (default), status, create, attach, remove, or owners",
 			required: false,
 		}),
 		session: Args.string({
@@ -76,6 +78,7 @@ export default class Session extends Command {
 		"gjc session attach <session>",
 		"gjc session remove <session>",
 		"gjc session force-close <session> --session-id <id>",
+		"gjc session owners --json",
 	];
 
 	async run(): Promise<void> {
@@ -112,6 +115,13 @@ export default class Session extends Command {
 					return;
 				}
 				writeText([`created: ${session.name}`]);
+				return;
+			}
+
+			if (action === "owners") {
+				const report = await collectSessionOwnersReport();
+				if (json) writeJson({ ok: true, ...report });
+				else writeText(renderSessionOwnersText(report));
 				return;
 			}
 
