@@ -326,6 +326,7 @@ describe("/provider preset CLI surface", () => {
 			"requesty",
 			"runcrate",
 			"standardcompute",
+			"teamorouter",
 			"uberllm",
 		]);
 	});

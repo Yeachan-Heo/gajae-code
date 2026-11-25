@@ -451,6 +451,37 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("cheaperinference")?.id).toBe("cheaper-inference");
 	});
 
+	it("adds TeamoRouter with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "teamorouter", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.teamorouter;
+
+		expect(result.providerId).toBe("teamorouter");
+		expect(result.presetName).toBe("TeamoRouter");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.teamorouter.com/v1",
+			api: "openai-completions",
+			apiKeyEnv: "TEAMOROUTER_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("teamo-router")?.id).toBe("teamorouter");
+	});
+
 	it("adds Standard Compute with automatic discovery", async () => {
 		const modelsPath = await tempModelsPath();
 		const result = await addApiCompatibleProvider({ preset: "standardcompute", modelsPath });
