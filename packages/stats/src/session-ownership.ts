@@ -7,6 +7,7 @@
  * exactly as before. Nothing here leaves the machine.
  */
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import type { SessionOwnershipStats } from "./shared-types";
 
 const TABLE = "session_ownership_events";
@@ -15,9 +16,12 @@ const COUNTER_NAME = /^[a-z_]{1,64}$/;
 export const SESSION_OWNERSHIP_WRITE_BUSY_TIMEOUT_MS = 1_000;
 
 /**
- * Append one process's counts. Zero and malformed entries are skipped, and with nothing left the
- * database is not opened at all. Never creates a directory: a missing parent fails, like any other
- * failure, with an error the caller drops.
+ * Append one process's counts, as one report: every row of a write carries the same fresh
+ * `report_id`, so two processes that exit in the same millisecond still count as two reports.
+ * Zero and malformed entries are skipped, and with nothing left the database is not opened at all.
+ * Never creates a directory: a missing parent fails, like any other failure, with an error the
+ * caller drops. A table from before `report_id` gains the column here, inside the write's
+ * transaction; the reader never alters it.
  */
 export function recordSessionOwnershipCounts(
 	dbPath: string,
@@ -31,17 +35,22 @@ export function recordSessionOwnershipCounts(
 	const db = new Database(dbPath, { create: true });
 	try {
 		db.exec(`PRAGMA busy_timeout = ${SESSION_OWNERSHIP_WRITE_BUSY_TIMEOUT_MS}`);
-		db.exec(`CREATE TABLE IF NOT EXISTS ${TABLE} (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp INTEGER NOT NULL,
-			name TEXT NOT NULL,
-			count INTEGER NOT NULL,
-			gjc_version TEXT NOT NULL
-		)`);
-		const insert = db.prepare(`INSERT INTO ${TABLE} (timestamp, name, count, gjc_version) VALUES (?, ?, ?, ?)`);
+		const reportId = randomUUID();
 		db.transaction(() => {
-			for (const [name, count] of rows) insert.run(meta.timestamp, name, count, meta.gjcVersion);
-		})();
+			db.exec(`CREATE TABLE IF NOT EXISTS ${TABLE} (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				timestamp INTEGER NOT NULL,
+				name TEXT NOT NULL,
+				count INTEGER NOT NULL,
+				gjc_version TEXT NOT NULL,
+				report_id TEXT
+			)`);
+			if (!tableColumns(db).has("report_id")) db.exec(`ALTER TABLE ${TABLE} ADD COLUMN report_id TEXT`);
+			const insert = db.prepare(
+				`INSERT INTO ${TABLE} (timestamp, name, count, gjc_version, report_id) VALUES (?, ?, ?, ?, ?)`,
+			);
+			for (const [name, count] of rows) insert.run(meta.timestamp, name, count, meta.gjcVersion, reportId);
+		}).immediate();
 	} finally {
 		db.close();
 	}
@@ -59,6 +68,23 @@ const VALID_ROW = `typeof(timestamp) = 'integer' AND timestamp BETWEEN ?1 AND 86
 	AND gjc_version NOT GLOB '*[^0-9A-Za-z.+-]*'`;
 const COLUMNS = ["timestamp", "name", "count", "gjc_version"];
 
+function tableColumns(db: Database): Set<string> {
+	return new Set((db.prepare(`PRAGMA table_info(${TABLE})`).all() as { name: string }[]).map(column => column.name));
+}
+
+/**
+ * What identifies one process report: its `report_id`, or, for a row written before that column
+ * (null, or a table the writer has not migrated yet), its write time, as the reader counted before.
+ */
+function reportKey(hasReportId: boolean): { readonly key: string; readonly valid: string } {
+	const legacy = `'t:' || timestamp`;
+	if (!hasReportId) return { key: legacy, valid: "1" };
+	return {
+		key: `COALESCE(report_id, ${legacy})`,
+		valid: "(report_id IS NULL OR (typeof(report_id) = 'text' AND length(report_id) BETWEEN 1 AND 64))",
+	};
+}
+
 interface TotalRow {
 	version: string;
 	name: string;
@@ -74,29 +100,29 @@ interface ReportRow {
 
 /**
  * All-time totals (or since `cutoff`), per counter and per gjc version, with how many process
- * reports (distinct write times) they come from, so "zero" reads apart from "nothing reported".
+ * reports they come from (distinct report ids; distinct write times for legacy rows), so "zero" reads apart from "nothing reported".
  * `undefined` when nothing valid was recorded or the table has another shape. Never creates it.
  */
 export function readSessionOwnershipStats(db: Database, cutoff = 0): SessionOwnershipStats | undefined {
 	try {
 		if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(TABLE)) return undefined;
-		const columns = new Set(
-			(db.prepare(`PRAGMA table_info(${TABLE})`).all() as { name: string }[]).map(column => column.name),
-		);
+		const columns = tableColumns(db);
 		if (!COLUMNS.every(column => columns.has(column))) return undefined;
+		const report = reportKey(columns.has("report_id"));
+		const where = `${VALID_ROW} AND ${report.valid}`;
 		const totals = db
 			.prepare(
 				`SELECT gjc_version AS version, name, SUM(count) AS total FROM ${TABLE}
-				WHERE ${VALID_ROW} GROUP BY gjc_version, name ORDER BY gjc_version, name`,
+				WHERE ${where} GROUP BY gjc_version, name ORDER BY gjc_version, name`,
 			)
 			.all(cutoff) as TotalRow[];
 		if (totals.length === 0) return undefined;
 		const reports = db
 			.prepare(
-				`SELECT gjc_version AS version, COUNT(DISTINCT timestamp) AS reports, MIN(timestamp) AS first,
-				MAX(timestamp) AS last FROM ${TABLE} WHERE ${VALID_ROW} GROUP BY gjc_version
-				UNION ALL SELECT NULL, COUNT(DISTINCT timestamp), MIN(timestamp), MAX(timestamp)
-				FROM ${TABLE} WHERE ${VALID_ROW}`,
+				`SELECT gjc_version AS version, COUNT(DISTINCT ${report.key}) AS reports, MIN(timestamp) AS first,
+				MAX(timestamp) AS last FROM ${TABLE} WHERE ${where} GROUP BY gjc_version
+				UNION ALL SELECT NULL, COUNT(DISTINCT ${report.key}), MIN(timestamp), MAX(timestamp)
+				FROM ${TABLE} WHERE ${where}`,
 			)
 			.all(cutoff) as ReportRow[];
 		return summarize(totals, reports);
