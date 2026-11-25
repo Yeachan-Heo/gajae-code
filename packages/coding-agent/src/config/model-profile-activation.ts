@@ -1969,14 +1969,17 @@ export async function prepareModelProfileActivation(
 			//   it means the model is filtered out due to missing credentials, so it's authentication_failed
 			// - Otherwise, selectors don't exist in the catalog, so it's invalid_input
 			const authRelatedSkipReasons = new Set(["credential_unavailable", "unauthenticated"]);
+			const transientSkipReasons = new Set(["circuit_open"]);
 			const fullCatalog = options.modelRegistry.getAll(credentialSessionId);
 			const fullCatalogIndex = createRegistrySelectorIndex(fullCatalog);
 			const hasGenuinelyUnknownSelector = defaultResolutionSkips.some(skip => {
 				if (authRelatedSkipReasons.has(skip.reason)) return false;
+				if (transientSkipReasons.has(skip.reason)) return false;
 				// Check if this unknown_model selector actually exists in the full catalog
 				if (skip.reason === "unknown_model") {
-					// If the selector exists in the full catalog, it's auth-filtered, not genuinely unknown
-					return !fullCatalogIndex.exact.has(skip.selector.trim().toLowerCase());
+					// If the selector exists in the full catalog, it's auth-filtered, not genuinely unknown.
+					// Use the selector-aware predicate that handles thinking suffixes (e.g. provider-b/model:high).
+					return !registrySelectorResolvesToModel(skip.selector, fullCatalogIndex);
 				}
 				return true;
 			});

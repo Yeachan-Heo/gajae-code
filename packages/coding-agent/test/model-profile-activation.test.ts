@@ -3618,6 +3618,74 @@ describe("model profile activation", () => {
 		// This validates that auth-filtered selectors don't trigger invalid_input
 	});
 
+	test("treats thinking-suffixed auth-filtered selectors as authentication_failed", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "thinking-suffixed-auth-filtered",
+			requiredProviders: [],
+			modelMapping: { default: "provider-b/filtered-model:high" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile], missingProviders: ["provider-b"] });
+		// Simulate: selector exists in catalog but no credentials available
+		const registry = {
+			...baseRegistry,
+			getAvailable: () => [
+				model("provider-a", "initial"),
+				...baseRegistry.getAll().filter((m: any) => m.provider === "provider-c" || m.provider === "openai-codex"),
+			], // provider-b not authenticated
+			getAll: () => [
+				model("provider-a", "initial"),
+				model("provider-b", "filtered-model"),
+				...baseRegistry.getAll().filter((m: any) => m.provider === "provider-c" || m.provider === "openai-codex"),
+			], // Full catalog includes provider-b/filtered-model (without suffix)
+		};
+
+		const session = fakeSession();
+		// Should throw authentication_failed, not invalid_input, because the base selector exists in the catalog
+		await expect(
+			activateModelProfile({
+				session,
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow();
+		// The error should be a ModelProfileCredentialError, not a generic invalid_input error
+		const error: any = await activateModelProfile({
+			session,
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		}).catch(e => e);
+		expect(error).toBeInstanceOf(ModelProfileCredentialError);
+	});
+
+	test("treats all-circuits-open chain as authentication_failed not invalid_input", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "all-circuits-open",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-b/model-1", "provider-b/model-2"] },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const circuitOpenSelectors = new Set(["provider-b/model-1", "provider-b/model-2"]);
+		// Mock registry with all selectors having open circuits
+		const registry = {
+			...baseRegistry,
+			isSelectorCircuitOpen: (selector: string) => circuitOpenSelectors.has(selector),
+		};
+
+		const session = fakeSession();
+		// Should throw authentication_failed, not invalid_input, because circuit_open is transient
+		const error: any = await activateModelProfile({
+			session,
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		}).catch(e => e);
+		expect(error).toBeInstanceOf(ModelProfileCredentialError);
+	});
+
 	test("persists profile ownership when a partial profile has no default mapping", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "executor-only-profile",
