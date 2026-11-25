@@ -30,7 +30,7 @@
 	"types": "./native/index.d.ts",
 	"scripts": {
 		"build": "bun scripts/build-native.ts",
-		"check": "biome check . && bun run check:types",
+		"check": "bun ../../scripts/check-biome-max-size.ts && biome check . && bun run check:types",
 		"check:types": "bun ../coding-agent/scripts/generate-docs-index.ts && tsc -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",

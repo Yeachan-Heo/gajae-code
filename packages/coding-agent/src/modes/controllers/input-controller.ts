@@ -21,6 +21,7 @@ import {
 } from "../../modes/types";
 import type { AgentSession, AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import {
@@ -1047,7 +1048,7 @@ export class InputController {
 	}
 
 	#reportSubmissionError(error: unknown): void {
-		this.ctx.showError(error instanceof Error ? error.message : String(error));
+		this.ctx.showError(operatorErrorMessage(error, String(error)));
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
@@ -1800,7 +1801,7 @@ export class InputController {
 				this.ctx.ui.requestRender();
 			}
 		} catch (err) {
-			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Failed to load skill: ${operatorErrorMessage(err, String(err))}`);
 		}
 		return true;
 	}

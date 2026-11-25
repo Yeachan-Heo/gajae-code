@@ -96,7 +96,7 @@ function resident(manager: SessionManager) {
 
 describe("early direct shared mutation admission", () => {
 	it("refuses each direct mutation before resident, cursor, header, blob, or disk effects", async () => {
-		const { a, destination, file, root, custom, kept, compaction, sibling, own } = await shared();
+		const { a, destination, file, root, custom, assistant, kept, compaction, sibling, own } = await shared();
 		const message = a.getEntries().find(entry => entry.id === root);
 		const customMessage = a.getEntries().find(entry => entry.id === custom);
 		if (message?.type !== "message" || customMessage?.type !== "custom_message") throw new Error("missing seeds");
@@ -118,7 +118,6 @@ describe("early direct shared mutation admission", () => {
 			() => a.applyEntryMessageUpdates([{ ...message, message: user("new payload ".repeat(100_000)) }]),
 			() => a.applyCustomMessageEntryUpdates([{ ...customMessage, content: "changed", details: { value: 2 } }]),
 			() => a.evictCompactedContent(kept, compaction),
-			() => a.sanitizeLoadedOpenAIResponsesReplayMetadata(),
 			() => a.branchWithSummary(root, "forbidden summary"),
 		];
 		for (const mutate of mutations) {
@@ -129,6 +128,15 @@ describe("early direct shared mutation admission", () => {
 			expect(prepare).not.toHaveBeenCalled();
 			expect(applied).not.toHaveBeenCalled();
 		}
+		// In-memory sanitization of replay metadata should work on shared sessions without requiring admission
+		// (it doesn't persist changes). The sanitization succeeds and updates memory, but file bytes remain unchanged
+		const sanitized = a.sanitizeLoadedOpenAIResponsesReplayMetadata();
+		expect(sanitized).toBe(true);
+		const afterSanitize = a.getEntries().find(e => e.id === assistant);
+		if (afterSanitize?.type !== "message" || afterSanitize.message.role !== "assistant")
+			throw new Error("missing assistant");
+		expect(afterSanitize.message.providerPayload).toBeUndefined();
+		expect(await fs.readFile(file)).toEqual(bytes);
 		put.mockRestore();
 		SessionManagerTestHooks.beforeEntryResidentPreparation = undefined;
 		// Navigation is local, not a transcript mutation.

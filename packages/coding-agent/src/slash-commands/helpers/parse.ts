@@ -1,3 +1,4 @@
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 
@@ -56,8 +57,9 @@ export function parseSubcommand(input: string): ParsedSubcommand {
 	return { verb: trimmed.slice(0, spaceIdx).toLowerCase(), rest: trimmed.slice(spaceIdx + 1).trim() };
 }
 
+/** Human text for a failed slash command; session refusals render their operator message. */
 export function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	return operatorErrorMessage(error, String(error));
 }
 
 /**
