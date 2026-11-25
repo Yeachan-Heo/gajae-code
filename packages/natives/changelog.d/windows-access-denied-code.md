@@ -1,4 +1,0 @@
-### Fixed
-
-- Report Windows `STATUS_ACCESS_DENIED` (`0xC0000022`) as `access_denied` instead of `owner_mismatch` from tree snapshots, exact tree removal and detach, exact unlink and restore, and the exact-replace rename. NTFS refuses to rename a directory while another process holds a handle on one of its children, so a lock directory whose `info` file is being read returned a permanent-looking owner failure for what is transient contention. Callers of `exactReplacePath` and `exactRestore` that matched `owner_mismatch` for a denied open or rename now receive `access_denied`. The owner-only security APIs still report a denied open as `owner_mismatch`, so managed-session repair routing and the skip for foreign-owner tmux state keep their behavior.
-- A tree snapshot whose child open fails reports that first failure (for example `sharing_violation` or `access_denied`) instead of the directory reopen's `io_error`.
