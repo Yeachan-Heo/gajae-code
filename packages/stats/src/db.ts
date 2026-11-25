@@ -59,6 +59,8 @@ interface AgentStatsRow {
 }
 
 let db: Database | null = null;
+/** How long `gjc stats` waits for another process's write before giving up. */
+export const STATS_DB_BUSY_TIMEOUT_MS = 5_000;
 
 const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
@@ -80,6 +82,9 @@ export async function initDb(): Promise<Database> {
 	await fs.mkdir(getConfigRootDir(), { recursive: true });
 
 	db = new Database(getStatsDbPath());
+	// Other gjc processes write here when they exit (session ownership counters); wait for them
+	// rather than fail with "database is locked".
+	db.exec(`PRAGMA busy_timeout = ${STATS_DB_BUSY_TIMEOUT_MS}`);
 	db.exec("PRAGMA journal_mode = WAL");
 
 	// Create tables

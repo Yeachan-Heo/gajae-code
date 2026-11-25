@@ -214,6 +214,12 @@ export interface SessionOwnershipStats {
 	/** First and last time a process recorded counts, in ms since the epoch. */
 	readonly firstAt: number;
 	readonly lastAt: number;
+	/** Process reports the totals come from (distinct write times): zero counts with reports are a real zero. */
+	readonly reports: number;
+	/** The same per gjc version, so one release's counts can be read apart from another's. */
+	readonly byVersion: Readonly<
+		Record<string, { readonly reports: number; readonly counters: Readonly<Record<string, number>> }>
+	>;
 }
 
 /**

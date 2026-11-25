@@ -211,12 +211,21 @@ async function printStatsSummary(): Promise<void> {
 	}
 
 	// Recorded only by processes with session ownership on; absent otherwise.
+	// Names and versions are checked by the reader (plain identifiers), so they print as they are.
 	if (sessionOwnership) {
 		const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-		console.log(chalk.bold("\nSession Ownership (local counters):"));
-		console.log(`  Recorded: ${day(sessionOwnership.firstAt)} to ${day(sessionOwnership.lastAt)}`);
-		for (const [name, count] of Object.entries(sessionOwnership.counters))
-			console.log(`  ${sanitizeDisplayLine(name)}: ${count}`);
+		const list = (counters: Readonly<Record<string, number>>) =>
+			Object.entries(counters)
+				.map(([name, count]) => `${name}=${count}`)
+				.join(", ");
+		console.log(chalk.bold("\nSession Ownership (local counters, all time):"));
+		console.log(
+			`  Recorded: ${day(sessionOwnership.firstAt)} to ${day(sessionOwnership.lastAt)}, ${sessionOwnership.reports} process reports`,
+		);
+		for (const [name, count] of Object.entries(sessionOwnership.counters)) console.log(`  ${name}: ${count}`);
+		console.log("  By version:");
+		for (const [version, entry] of Object.entries(sessionOwnership.byVersion))
+			console.log(`    ${version} (${entry.reports} reports): ${list(entry.counters)}`);
 	}
 
 	console.log("");

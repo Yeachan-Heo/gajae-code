@@ -202,9 +202,19 @@ describe("gjc stats", () => {
 				counters: { claim_released: 5, claim_taken: 5, held_at_exit: 1 },
 				firstAt: Date.parse("2026-11-02T10:00:00Z"),
 				lastAt: Date.parse("2026-11-21T10:00:00Z"),
+				reports: 2,
+				byVersion: { "0.22.1": { reports: 2, counters: { claim_released: 5, claim_taken: 5, held_at_exit: 1 } } },
 			});
 			expect(await stats(false)).toContain(
-				"Session Ownership (local counters):\n  Recorded: 2026-11-02 to 2026-11-21\n  claim_released: 5\n  claim_taken: 5\n  held_at_exit: 1",
+				[
+					"Session Ownership (local counters, all time):",
+					"  Recorded: 2026-11-02 to 2026-11-21, 2 process reports",
+					"  claim_released: 5",
+					"  claim_taken: 5",
+					"  held_at_exit: 1",
+					"  By version:",
+					"    0.22.1 (2 reports): claim_released=5, claim_taken=5, held_at_exit=1",
+				].join("\n"),
 			);
 		} finally {
 			setSystemTime();
