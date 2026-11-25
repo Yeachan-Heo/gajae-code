@@ -350,7 +350,9 @@ export type SessionOwnershipCounter =
 	/** Claims still in the claim set of a manager that was garbage-collected: a missed release. */
 	| "claims_abandoned"
 	/** A manager's session id changed outside any transition, so no settle followed it. */
-	| "bind_outside_transition";
+	| "bind_outside_transition"
+	/** A claim for a non-current id was added outside any transition: an unrelated settle could drop it. */
+	| "target_staged_outside_transition";
 
 export function countSessionOwnershipEvent(name: SessionOwnershipCounter): void {
 	const current = registry();
@@ -365,6 +367,7 @@ export function sessionOwnershipCounters(): Readonly<Record<SessionOwnershipCoun
 		release_after_deferred_timeout: counters?.get("release_after_deferred_timeout") ?? 0,
 		claims_abandoned: counters?.get("claims_abandoned") ?? 0,
 		bind_outside_transition: counters?.get("bind_outside_transition") ?? 0,
+		target_staged_outside_transition: counters?.get("target_staged_outside_transition") ?? 0,
 		session_write_without_claim: counters?.get("session_write_without_claim") ?? 0,
 	};
 }

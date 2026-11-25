@@ -11105,6 +11105,7 @@ export class SessionManager {
 		const stage = this.#getPreparedNewSessionStage(prepared);
 		this.#assertPreparedGraphPublicationAllowed(stage);
 		if (!this.persist || !stage.sessionFile || stage.flushed) return;
+		this.#ownershipClaims.checkWrite("new session successor", stage.sessionId);
 		const entries = await Promise.all(
 			stage.fileEntries.map(entry => prepareEntryForPersistence(entry, this.#blobStore)),
 		);
@@ -11263,6 +11264,7 @@ export class SessionManager {
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
 			this.#assertPreparedGraphPublicationAllowed(stage);
+			this.#ownershipClaims.checkWrite("fork successor", stage.sessionId);
 			if (proof) {
 				await this.#publishCommittedGraphSuccessor(stage, sourceFile, proof, [], "prepare fork");
 			} else {
@@ -11357,6 +11359,7 @@ export class SessionManager {
 		this.#preparedGraphSourceIds.set(stage, sourceId);
 		if (route === "committed") this.#committedGraphSuccessors.add(stage);
 		try {
+			if (sessionFile) this.#ownershipClaims.checkWrite("branch successor", stage.sessionId);
 			if (proof) {
 				await this.#publishCommittedGraphSuccessor(
 					stage,
@@ -11714,6 +11717,7 @@ export class SessionManager {
 			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
 			forkArtifactPublication = await this.copyArtifactsForFork(oldSessionFile, newSessionFile);
 			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
+			this.#ownershipClaims.checkWrite("fork successor", newSessionId);
 			// Publish each already-materialized entry through the staged writer without
 			// joining the transcript into another whole-file string/Buffer. Retired cold
 			// history was rehydrated above and is therefore not omitted.
@@ -13330,6 +13334,7 @@ export class SessionManager {
 			return undefined;
 		}
 		// Note: caller must await _closePersistWriter() before calling this if switching files
+		this.#ownershipClaims.checkWrite("persist writer open");
 		this.#persistWriter = new NdjsonFileWriter(this.#storage, this.#sessionFile, {
 			...(this.#storage.acquireExclusiveLockSync
 				? { appendLock: (lockPath: string) => this.#storage.acquireExclusiveLockSync!(lockPath) }
@@ -17261,6 +17266,7 @@ export class SessionManager {
 		this.#ensureFullHotView();
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return;
+		this.#ownershipClaims.checkWrite("rewrite");
 		this.#withSessionPersistenceFenceSync(() => {
 			if (this.destination.kind === "managed") {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
@@ -17702,6 +17708,7 @@ export class SessionManager {
 			}
 			if (this.destination.kind === "managed") {
 				try {
+					this.#ownershipClaims.checkWrite("default model promotion");
 					if (stage.boundedCold) {
 						if (!stage.managedAppendExpectation) throw new Error("Managed bounded append expectation is missing");
 						const bytes = Buffer.concat(
@@ -17734,6 +17741,7 @@ export class SessionManager {
 					return { kind: "unknown", error: new Error("Missing staged session replacement") };
 				}
 				try {
+					this.#ownershipClaims.checkWrite("default model promotion");
 					this.#closePersistWriterInternalSync();
 					if (stage.boundedCold) {
 						if (!this.#storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
@@ -19762,6 +19770,7 @@ export class SessionManager {
 						return { kind: "skipped", reason: "named" };
 					if (!current()) return { kind: "skipped", reason: "stale" };
 					try {
+						this.#ownershipClaims.checkWrite("shared title", sessionId);
 						const record: HeaderPatchRecord = { type: "header_patch", patch };
 						if (snapshot) {
 							attempted = true;
@@ -19888,6 +19897,7 @@ export class SessionManager {
 		if (this.#sharedAppendOnly) SessionManagerTestHooks.beforeSharedAppendPublish?.();
 		this.#refreshManagedTranscriptRelocation();
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
+		this.#ownershipClaims.checkWrite("managed append");
 		this.#withSessionPersistenceFenceSync(() => {
 			const sessionFile = this.#sessionFile!;
 			const store = this.#managedTranscriptStore(sessionFile);
@@ -21328,6 +21338,7 @@ export class SessionManager {
 								this.#residentBlobStores(),
 							).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
 							const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+							this.#ownershipClaims.checkWrite("shared bootstrap");
 							scope.assertOwned();
 							store.assertBound();
 							store.publishNoReplaceSync(name, bytes);
@@ -23270,6 +23281,7 @@ export class SessionManager {
 				"retain-and-throw",
 			);
 			try {
+				this.#ownershipClaims.checkWrite("branch successor", newSessionId);
 				if (this.destination.kind === "managed") {
 					this.#managedTranscriptStore(newSessionFile).publishNoReplaceSync(
 						path.basename(newSessionFile),
@@ -25383,6 +25395,7 @@ export class SessionManager {
 			const sessionFile = manager.#sessionFile;
 			if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
 			const activeManager = manager;
+			manager.#ownershipClaims.checkWrite("fork successor");
 			// Publish each already-parsed entry through the staged writer without joining
 			// another whole-file string/Buffer. The parse/resident graph is still the
 			// compatibility path; retired cold history is never omitted.
@@ -25975,6 +25988,7 @@ export class SessionManager {
 			"retain-and-throw",
 		);
 		try {
+			this.#ownershipClaims.checkWrite("recovery promotion");
 			if (this.destination.kind === "managed") {
 				const store = this.#managedTranscriptStore();
 				const sourceName = path.basename(context.identity.canonicalPath);
