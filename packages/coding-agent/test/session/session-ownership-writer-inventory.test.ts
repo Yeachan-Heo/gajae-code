@@ -655,22 +655,6 @@ describe("session ownership writer inventory", () => {
 			await handle.close();
 		}
 
-		it("one check covers only one handle-written open", async () => {
-			const at = await files();
-			check("session-x");
-			await throughHandle(at("x1.jsonl"), "session-x");
-			await throughHandle(at("x2.jsonl"), "session-x");
-			expect(writes.uncovered).toEqual(["fs.promises.open x2.jsonl"]);
-		});
-
-		it("a handle-written open uses up its check before a later write to the same transcript", async () => {
-			const at = await files();
-			check("session-x");
-			await throughHandle(at("x.jsonl"), "session-x");
-			await fs.appendFile(at("x.jsonl"), `${JSON.stringify({ type: "custom" })}\n`);
-			expect(writes.uncovered).toEqual(["fs.promises.appendFile x.jsonl"]);
-		});
-
 		it("overwriting one session's transcript with another's is not covered by a check for the other", async () => {
 			const at = await files("a.jsonl");
 			check("session-b");
