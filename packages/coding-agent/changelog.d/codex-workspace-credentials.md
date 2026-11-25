@@ -1,2 +1,0 @@
-### Added
-- Each ChatGPT workspace of one OpenAI Codex login is stored as its own account, labeled `email (workspace name)`, and can be chosen with `org:<workspace id or name>` in `--credential`, `/credential`, `gjc accounts pin`, and `gjc accounts prefer openai-codex`, so the workspaces can be ordered with quota fallback (for example `gjc accounts prefer openai-codex 'org:Acme Team' org:Personal`). A row whose name lookup failed is chosen by `org:<workspace-id>`. Importing a Codex CLI `auth.json` is also scoped to its workspace.
