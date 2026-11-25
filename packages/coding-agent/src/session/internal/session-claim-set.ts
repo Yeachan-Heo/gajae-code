@@ -8,7 +8,10 @@
  * predecessor releases the target instead. With no claim in the set, every operation is a no-op,
  * which is what `off` gives: nothing ever adds a claim.
  */
+import { logger } from "@gajae-code/utils";
+import type { SessionManager } from "../session-manager";
 import { countSessionOwnershipEvent, type SessionOwnerClaim } from "../session-ownership";
+import { type SessionOwnershipMode, sessionOwnershipMode } from "../session-ownership-mode";
 
 /** How long a deferred owner shutdown may keep its predecessor's claim (design §2.5). */
 export const DEFERRED_RELEASE_CAP_MS = 60_000;
@@ -20,12 +23,30 @@ interface DeferredHold {
 	timer: NodeJS.Timeout | undefined;
 }
 
+/**
+ * A manager dropped with claims still in its set never released them; the locks stay until the
+ * process exits. Count and log it, so the observe phase shows the missed release. The held value is
+ * the claims map, which does not reference its set.
+ */
+const abandonedSets = new FinalizationRegistry<Map<string, SessionOwnerClaim>>(claims => {
+	const left = [...claims.values()].filter(claim => !claim.released).length;
+	if (left === 0) return;
+	for (let index = 0; index < left; index++) countSessionOwnershipEvent("claims_abandoned");
+	logger.warn("Session claims left on an abandoned session manager", { claims: left });
+});
+
 export class SessionClaimSet {
 	readonly #claims = new Map<string, SessionOwnerClaim>();
 	readonly #holds = new Map<string, DeferredHold>();
 	#current: string | undefined;
 	#transitions = 0;
 	#closed = false;
+	/** Read once per bind, so a settings reload never changes the mode under a bound session. */
+	#mode: SessionOwnershipMode = "off";
+
+	constructor() {
+		abandonedSets.register(this, this.#claims);
+	}
 
 	/** The session id the manager's identity helper last bound. */
 	get currentSessionId(): string | undefined {
@@ -40,9 +61,17 @@ export class SessionClaimSet {
 		return this.#claims.has(sessionId);
 	}
 
-	/** The identity helper's record of the manager's id. It never claims and never releases. */
+	/**
+	 * The identity helper's record of the manager's id. It never claims and never releases. A change
+	 * of id outside any transition is counted (when ownership is on): nothing settles after it.
+	 */
 	bind(sessionId: string): void {
+		const previous = this.#current;
 		this.#current = sessionId;
+		this.#mode = sessionOwnershipMode();
+		if (this.#mode === "off" || previous === undefined || previous === sessionId || this.#transitions > 0) return;
+		countSessionOwnershipEvent("bind_outside_transition");
+		logger.debug("Session id changed outside a claim-set transition", { mode: this.#mode });
 	}
 
 	/**
@@ -164,6 +193,6 @@ interface ClaimSetOwner {
 }
 
 /** The claim set of a SessionManager, for factories, transitions and tests in this package. */
-export function sessionClaimSetOf(manager: object): SessionClaimSet {
-	return (manager as ClaimSetOwner)[sessionClaimSetCapability]();
+export function sessionClaimSetOf(manager: SessionManager): SessionClaimSet {
+	return (manager as unknown as ClaimSetOwner)[sessionClaimSetCapability]();
 }

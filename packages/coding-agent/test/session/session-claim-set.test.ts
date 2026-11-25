@@ -7,7 +7,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import { SessionClaimSet, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { type SessionDestination, SessionManager } from "../../src/session/session-manager";
 import {
 	claimSessionOwner,
@@ -383,6 +383,48 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 	});
 });
 
+describe("missed-release signals", () => {
+	it("counts an id change outside any transition, only when ownership is on", () => {
+		const count = () => sessionOwnershipCounters().bind_outside_transition;
+		const off = new SessionClaimSet();
+		off.bind("a");
+		off.bind("b");
+		expect(count()).toBe(0);
+		SessionOwnershipTestHooks.mode = "observe";
+		try {
+			const set = new SessionClaimSet();
+			set.bind("a");
+			set.bind("a");
+			{
+				using _transition = set.transition();
+				set.bind("b");
+			}
+			expect(count()).toBe(0);
+			set.bind("c");
+			expect(count()).toBe(1);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+		}
+	});
+
+	it.if(supported)("counts claims left on a claim set that was garbage-collected", async () => {
+		let kept: SessionOwnerClaim | undefined;
+		await (async () => {
+			const set = new SessionClaimSet();
+			set.bind("abandoned");
+			kept = await claim("abandoned");
+			set.add(kept);
+		})();
+		for (let attempt = 0; attempt < 100 && sessionOwnershipCounters().claims_abandoned === 0; attempt++) {
+			Bun.gc(true);
+			await Bun.sleep(10);
+		}
+		expect(sessionOwnershipCounters().claims_abandoned).toBe(1);
+		// The lock stays until the process exits; release it here for the next test.
+		kept?.release();
+	});
+});
+
 describe("the identity helper", () => {
 	it("every session-id change reaches the claim set", async () => {
 		const checks: string[] = [];
@@ -476,6 +518,8 @@ describe("with ownership off (the default)", () => {
 			expect(sessionOwnershipCounters()).toEqual({
 				release_after_deferred_timeout: 0,
 				session_write_without_claim: 0,
+				claims_abandoned: 0,
+				bind_outside_transition: 0,
 			});
 		} finally {
 			SessionOwnershipTestHooks.homeOverride = preloadHome;

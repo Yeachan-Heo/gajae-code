@@ -344,7 +344,13 @@ export function resetSessionOwnershipForTests(): void {
 }
 
 /** Events counted for the observe phase (design §2.9). In-process only until the stats step lands. */
-export type SessionOwnershipCounter = "release_after_deferred_timeout" | "session_write_without_claim";
+export type SessionOwnershipCounter =
+	| "release_after_deferred_timeout"
+	| "session_write_without_claim"
+	/** Claims still in the claim set of a manager that was garbage-collected: a missed release. */
+	| "claims_abandoned"
+	/** A manager's session id changed outside any transition, so no settle followed it. */
+	| "bind_outside_transition";
 
 export function countSessionOwnershipEvent(name: SessionOwnershipCounter): void {
 	const current = registry();
@@ -357,6 +363,8 @@ export function sessionOwnershipCounters(): Readonly<Record<SessionOwnershipCoun
 	const counters = registry().counters;
 	return {
 		release_after_deferred_timeout: counters?.get("release_after_deferred_timeout") ?? 0,
+		claims_abandoned: counters?.get("claims_abandoned") ?? 0,
+		bind_outside_transition: counters?.get("bind_outside_transition") ?? 0,
 		session_write_without_claim: counters?.get("session_write_without_claim") ?? 0,
 	};
 }
