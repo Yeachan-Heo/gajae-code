@@ -74,6 +74,9 @@ async function startHolder(sessionId: string, surface: string, grandchildPidFile
 		OWNER_SESSION_ID: sessionId,
 		OWNER_SURFACE: surface,
 	};
+	// The child resolves its directories from HOME alone, never from the runner's XDG or gjc overrides.
+	for (const key of Object.keys(env))
+		if (key.startsWith("XDG_") || /^(GJC|PI)_(CONFIG|CODING_AGENT)_DIR$/.test(key)) delete env[key];
 	if (grandchildPidFile) env.OWNER_GRANDCHILD_PID_FILE = grandchildPidFile;
 	const child = Bun.spawn([process.execPath, holderScript], {
 		cwd: import.meta.dir,

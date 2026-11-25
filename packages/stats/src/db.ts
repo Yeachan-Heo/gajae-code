@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import { type GeneratedProvider, getBundledModel, type Usage } from "@gajae-code/ai";
 import { getConfigRootDir, getStatsDbPath, redactCrashSecrets } from "@gajae-code/utils";
+import { readSessionOwnershipStats } from "./session-ownership";
 import type {
 	AgentRole,
 	AgentStats,
@@ -20,6 +21,7 @@ import type {
 	ModelTimeSeriesPoint,
 	ParsedMessageStats,
 	PromptPrefixChange,
+	SessionOwnershipStats,
 	TimeSeriesPoint,
 	UserMessageLink,
 	UserMessageStats,
@@ -57,6 +59,8 @@ interface AgentStatsRow {
 }
 
 let db: Database | null = null;
+/** How long `gjc stats` waits for another process's write before giving up. */
+export const STATS_DB_BUSY_TIMEOUT_MS = 5_000;
 
 const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
@@ -78,6 +82,9 @@ export async function initDb(): Promise<Database> {
 	await fs.mkdir(getConfigRootDir(), { recursive: true });
 
 	db = new Database(getStatsDbPath());
+	// Other gjc processes write here when they exit (session ownership counters); wait for them
+	// rather than fail with "database is locked".
+	db.exec(`PRAGMA busy_timeout = ${STATS_DB_BUSY_TIMEOUT_MS}`);
 	db.exec("PRAGMA journal_mode = WAL");
 
 	// Create tables
@@ -890,6 +897,11 @@ export function getMessageCount(): number {
 	const stmt = db.prepare("SELECT COUNT(*) as count FROM messages");
 	const row = stmt.get() as { count: number };
 	return row.count;
+}
+
+/** Session ownership counter totals since `cutoff`; `undefined` when none were recorded. */
+export function getSessionOwnershipStats(cutoff?: number): SessionOwnershipStats | undefined {
+	return db ? readSessionOwnershipStats(db, cutoff) : undefined;
 }
 
 /**

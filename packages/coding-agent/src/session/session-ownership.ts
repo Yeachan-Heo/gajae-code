@@ -22,7 +22,8 @@ import {
 	probeFileLock,
 	tryAcquireFileLock,
 } from "@gajae-code/natives";
-import { getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
+import { recordSessionOwnershipCounts } from "@gajae-code/stats/session-ownership";
+import { getStatsDbPath, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
 import {
@@ -329,6 +330,8 @@ interface SessionOwnerRegistry {
 	unavailable: string | undefined;
 	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
 	counters?: Map<SessionOwnershipCounter, number>;
+	/** Counts already written to the stats database, and whether the exit write is armed. */
+	persisted?: { readonly counts: Map<SessionOwnershipCounter, number>; armed: boolean };
 }
 
 /** Versioned, so two copies of this module in one realm share one registry (design §2.5). */
@@ -352,39 +355,93 @@ export function resetSessionOwnershipForTests(): void {
 	const current = registry();
 	current.unavailable = undefined;
 	current.counters?.clear();
+	current.persisted?.counts.clear();
 	const leaked = [...current.entries.values()];
 	current.entries.clear();
 	for (const entry of leaked) entry.lock.release();
 	if (leaked.length > 0) throw new Error(`${leaked.length} session claim(s) were never released`);
 }
 
-/** Events counted for the observe phase (design §2.9). In-process only until the stats step lands. */
-export type SessionOwnershipCounter =
-	| "release_after_deferred_timeout"
-	| "session_write_without_claim"
+/**
+ * Events counted for the observe phase (design §2.9). Lock-level: `claim_taken` and
+ * `claim_released` count locks, not shared references, so a clean process ends with
+ * taken - released - held_at_exit = 0.
+ */
+export const SESSION_OWNERSHIP_COUNTERS = [
+	"claim_taken",
+	"claim_released",
+	/** A claim refused because another process holds the session. */
+	"claim_conflict",
+	/** A claim skipped by the narrow fail-open policy (design §2.7). */
+	"fail_open",
+	/** Locks this process still held when it exited: a missed release. */
+	"held_at_exit",
+	"release_after_deferred_timeout",
+	"session_write_without_claim",
 	/** Claims still in the claim set of a manager that was garbage-collected: a missed release. */
-	| "claims_abandoned"
+	"claims_abandoned",
 	/** A manager's session id changed outside any transition, so no settle followed it. */
-	| "bind_outside_transition"
+	"bind_outside_transition",
 	/** A claim for a non-current id was added outside any transition: an unrelated settle could drop it. */
-	| "target_staged_outside_transition";
+	"target_staged_outside_transition",
+] as const;
+export type SessionOwnershipCounter = (typeof SESSION_OWNERSHIP_COUNTERS)[number];
 
-export function countSessionOwnershipEvent(name: SessionOwnershipCounter): void {
+/**
+ * Count an event. The first count of a process arms one write of its counts to the local stats
+ * database at exit, so a process that never counts (mode `off`) writes nothing.
+ */
+export function countSessionOwnershipEvent(name: SessionOwnershipCounter, by = 1): void {
 	const current = registry();
 	current.counters ??= new Map();
-	current.counters.set(name, (current.counters.get(name) ?? 0) + 1);
+	current.counters.set(name, (current.counters.get(name) ?? 0) + by);
+	current.persisted ??= { counts: new Map(), armed: false };
+	if (current.persisted.armed) return;
+	current.persisted.armed = true;
+	process.once("exit", () => persistSessionOwnershipCounters({ atExit: true }));
 }
 
 /** A snapshot of this process's counts; a name never counted reads 0. */
 export function sessionOwnershipCounters(): Readonly<Record<SessionOwnershipCounter, number>> {
 	const counters = registry().counters;
-	return {
-		release_after_deferred_timeout: counters?.get("release_after_deferred_timeout") ?? 0,
-		claims_abandoned: counters?.get("claims_abandoned") ?? 0,
-		bind_outside_transition: counters?.get("bind_outside_transition") ?? 0,
-		target_staged_outside_transition: counters?.get("target_staged_outside_transition") ?? 0,
-		session_write_without_claim: counters?.get("session_write_without_claim") ?? 0,
-	};
+	const snapshot = {} as Record<SessionOwnershipCounter, number>;
+	for (const name of SESSION_OWNERSHIP_COUNTERS) snapshot[name] = counters?.get(name) ?? 0;
+	return snapshot;
+}
+
+/** Where counts go: the stats database, or under a test home only the path a test names. */
+function countersDbPath(): string | undefined {
+	if (SessionOwnershipTestHooks.homeOverride !== undefined) return SessionOwnershipTestHooks.statsDbPath;
+	return getStatsDbPath();
+}
+
+/**
+ * Write the counts not yet written to the local stats database (design §2.9). Synchronous, as it
+ * runs from the `exit` handler, which also counts the locks still held as `held_at_exit`; it runs
+ * after the shutdown cleanup that releases them. Any failure drops the counts: they are local
+ * diagnostics, and never leave the machine.
+ */
+export function persistSessionOwnershipCounters(options: { readonly atExit?: boolean } = {}): void {
+	const current = registry();
+	if (options.atExit && current.entries.size > 0) countSessionOwnershipEvent("held_at_exit", current.entries.size);
+	const counters = current.counters;
+	if (!counters) return;
+	current.persisted ??= { counts: new Map(), armed: false };
+	const persisted = current.persisted.counts;
+	const delta: Partial<Record<SessionOwnershipCounter, number>> = {};
+	for (const [name, count] of counters) {
+		const unwritten = count - (persisted.get(name) ?? 0);
+		if (unwritten > 0) delta[name] = unwritten;
+	}
+	if (Object.keys(delta).length === 0) return;
+	try {
+		const dbPath = countersDbPath();
+		if (dbPath === undefined) return;
+		recordSessionOwnershipCounts(dbPath, delta, { timestamp: Date.now(), gjcVersion: VERSION });
+		for (const [name, count] of counters) persisted.set(name, count);
+	} catch (error) {
+		logger.debug("Session ownership counters were not recorded", { error: String(error) });
+	}
 }
 
 function markUnavailable(code: string | undefined): string {
@@ -432,6 +489,7 @@ class Claim implements SessionOwnerClaim {
 		if (entries.get(this.#sidecar) !== entry) return;
 		// Synchronous from here to the unlock, so no claim in this process can meet its own lock.
 		entries.delete(this.#sidecar);
+		countSessionOwnershipEvent("claim_released");
 		// Remove the record before the lock, so a successor's record is never removed; leave a
 		// record whose nonce is not ours.
 		if (readRecord(entry.recordPath)?.claimNonce === entry.nonce) {
@@ -453,6 +511,11 @@ function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
 // Claim and probe
 // =============================================================================
 
+function failOpen(reason: "unavailable" | "timed_out", code: string | undefined): SessionOwnerClaimResult {
+	countSessionOwnershipEvent("fail_open");
+	return { status: "skipped", reason, code };
+}
+
 /**
  * Claim `sessionId` for this process. A session this process already holds is shared (design D10).
  * Throws `SessionOwnershipError` when the owners directory or the lock fails in a way that must
@@ -464,8 +527,7 @@ export async function claimSessionOwner(
 ): Promise<SessionOwnerClaimResult> {
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
-	if (current.unavailable !== undefined)
-		return { status: "skipped", reason: "unavailable", code: current.unavailable };
+	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
 	let directory: RuntimeLockDirectory;
 	try {
 		directory = prepareRuntimeLockDirectory("session-owners", trustedHome());
@@ -485,8 +547,7 @@ export async function claimSessionOwner(
 		await pending;
 	}
 	// The acquire waited on may have found the platform unavailable.
-	if (current.unavailable !== undefined)
-		return { status: "skipped", reason: "unavailable", code: current.unavailable };
+	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
 	try {
@@ -537,19 +598,21 @@ export async function claimSessionOwner(
 					}
 				}
 				current.entries.set(sidecar, entry);
+				countSessionOwnershipEvent("claim_taken");
 				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
 			}
 			case FileLockAcquireStatus.Held:
+				countSessionOwnershipEvent("claim_conflict");
 				return {
 					status: "held",
 					holder: verifiedHolder(readRecord(path.join(owners, `${key}${RECORD_SUFFIX}`)), sessionId),
 				};
 			case FileLockAcquireStatus.Unavailable:
-				return { status: "skipped", reason: "unavailable", code: markUnavailable(result.code) };
+				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
 				// A stall is not a platform property: skip this claim only, and try again next time.
 				logger.warn("Session ownership claim timed out; this claim is skipped", { code: result.code });
-				return { status: "skipped", reason: "timed_out", code: result.code };
+				return failOpen("timed_out", result.code);
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}
