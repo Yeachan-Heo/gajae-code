@@ -8,7 +8,7 @@
  * calls `expectStrictDetections`). Register it inside the suite's `describe`, so its `afterEach`
  * reads the counter before a file-level `afterEach` resets ownership state.
  */
-import { afterEach, beforeEach, expect } from "bun:test";
+import { afterEach, beforeEach, expect, vi } from "bun:test";
 import { SessionOwnershipTestHooks, sessionOwnershipCounters } from "../../src/session/session-ownership";
 
 let baseline = 0;
@@ -53,11 +53,19 @@ export function useStrictWriteDetection(settle?: () => Promise<void>): void {
 		declared = 0;
 	});
 	afterEach(async () => {
+		let failure: unknown;
 		try {
 			await settle?.();
+		} catch (error) {
+			failure = error;
 		} finally {
 			delete SessionOwnershipTestHooks.strictWriteDetection;
 		}
-		expect(detections()).toBe(declared);
+		const delta = detections();
+		// Once an afterEach throws, Bun skips the file's later afterEach hooks, which restore spies;
+		// restore them here, so they cannot stack into the next test.
+		if (failure !== undefined || delta !== declared) vi.restoreAllMocks();
+		if (failure !== undefined) throw failure;
+		expect(delta).toBe(declared);
 	});
 }
