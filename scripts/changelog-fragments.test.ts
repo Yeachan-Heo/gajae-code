@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	compareUnreleasedEdit,
 	consumeFragments,
+	findOrphanFragments,
 	foldFragmentsIntoChangelog,
 	fragmentDirectoryFor,
 	listFragmentFilesInDirectory,
@@ -265,5 +266,19 @@ describe("CLI entrypoints", () => {
 		const backmerged = await run(["bun", historyGuardPath, "--base", base], root);
 		expect(backmerged.stderr).toBe("");
 		expect(backmerged.exitCode).toBe(0);
+	});
+
+	test("check rejects orphan fragments outside packages/*/changelog.d", async () => {
+		const root = await tempDir();
+		await init(root);
+		// Create an orphan fragment in crates/pi-natives/changelog.d
+		const orphanPath = "crates/pi-natives/changelog.d/orphan.md";
+		await put(root, orphanPath, "### Fixed\n\n- Orphan fix.\n");
+		await commit(root, "orphan fragment");
+
+		const orphans = await findOrphanFragments(root);
+		expect(orphans.length).toBeGreaterThan(0);
+		expect(orphans[0].file).toContain("crates/pi-natives/changelog.d/orphan.md");
+		expect(orphans[0].message).toContain("orphan fragment outside packages/*/changelog.d");
 	});
 });

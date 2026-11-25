@@ -407,8 +407,58 @@ function report(errors: readonly ChangelogError[]): void {
 	for (const error of errors) console.error(`::error file=${error.file}::${error.message}`);
 }
 
+/**
+ * Scan the repository for orphan changelog fragments outside packages/PKG/changelog.d.
+ * Fragments must live in packages/PKG/changelog.d to be discovered and folded by the release script.
+ */
+export async function findOrphanFragments(root = "."): Promise<ChangelogError[]> {
+	const errors: ChangelogError[] = [];
+	const cratesRoot = path.join(root, "crates");
+
+	let cratesEntries: Dirent[] = [];
+	try {
+		cratesEntries = await fs.readdir(cratesRoot, { withFileTypes: true });
+	} catch (error) {
+		// crates directory may not exist
+		if (!isMissingPath(error)) throw error;
+	}
+
+	for (const entry of cratesEntries) {
+		if (!entry.isDirectory()) continue;
+		const directory = path.join(cratesRoot, entry.name, FRAGMENT_DIRECTORY);
+		let files: string[];
+		try {
+			files = await listFragmentFilesInDirectory(directory);
+		} catch (error) {
+			// Ignore if the directory doesn't exist or other issues
+			if (isMissingPath(error)) continue;
+			// But report structure errors (e.g., fragments must be files, not directories)
+			errors.push(asChangelogError(error, toRepoPath(directory)));
+			continue;
+		}
+
+		if (files.length === 0) continue;
+
+		// Found orphan fragments in crates/*/changelog.d
+		for (const file of files) {
+			errors.push({
+				file: toRepoPath(file),
+				message:
+					`orphan fragment outside packages/*/changelog.d/; ` +
+					`move it to packages/PKG/changelog.d/ where its changelog lives. ` +
+					`Fragments are folded only from packages/*/changelog.d/ during release.`,
+			});
+		}
+	}
+
+	return errors;
+}
+
 export async function runCheck(): Promise<number> {
 	const { packages, errors } = await collectPackageFragments();
+	const orphanErrors = await findOrphanFragments();
+	errors.push(...orphanErrors);
+
 	if (errors.length === 0) {
 		for (const entry of packages) {
 			try {
