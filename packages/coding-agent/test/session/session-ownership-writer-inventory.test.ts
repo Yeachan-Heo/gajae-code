@@ -35,14 +35,17 @@ import {
 	undeclaredStrictDetections,
 	useStrictWriteDetection,
 } from "./strict-write-detection";
+import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
 const managers: SessionManager[] = [];
 let detectorLogs: unknown[] = [];
+let writes: TranscriptWriteLedger;
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
+	writes = spyOnTranscriptWrites();
 	// The detector's log line stays in memory: the logger's file sink lives under the real home.
 	detectorLogs = [];
 	vi.spyOn(logger, "warn").mockImplementation((message, context) => {
@@ -273,6 +276,7 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
 		// The checkpoint copies the transcript, so its root sits outside the measured tree.
 		const checkpointRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-checkpoint-")));
 		roots.push(checkpointRoot);
+		writes.exempt.set(checkpointRoot, "a memory-guard checkpoint copy, not a session transcript");
 		const ingressLease = m.acquireMemoryGuardParticipantIngressLease();
 		try {
 			return await m.createMemoryGuardCheckpoint({ ingressLease, checkpointRoot });
@@ -362,10 +366,16 @@ async function transcripts(directory: string): Promise<Map<string, string>> {
 	return found;
 }
 
+/** Basenames of the transcripts whose bytes differ. */
+function changedNames(before: Map<string, string>, after: Map<string, string>): Set<string> {
+	const names = new Set<string>();
+	for (const name of new Set([...before.keys(), ...after.keys()]))
+		if (before.get(name) !== after.get(name)) names.add(path.basename(name));
+	return names;
+}
+
 function changed(before: Map<string, string>, after: Map<string, string>): boolean {
-	if (before.size !== after.size) return true;
-	for (const [name, text] of after) if (before.get(name) !== text) return true;
-	return false;
+	return changedNames(before, after).size > 0;
 }
 
 async function bound(kind: Kind, fresh = false) {
@@ -408,6 +418,7 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 	}
 	const before = await transcripts(root);
 	const detectedBefore = sessionOwnershipCounters().session_write_without_claim;
+	writes.reset();
 	try {
 		await staged.run(manager, context, prepared);
 		await manager.flush();
@@ -415,11 +426,21 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 		// A refusal is fine; only bytes that reached the disk need attribution.
 	}
 	// Close discards unpublished successors, so look before it too.
-	let wrote = changed(before, await transcripts(root));
+	const touched = changedNames(before, await transcripts(root));
 	// In-memory rewrites (message updates, eviction) reach the disk as rewrite debt at close.
 	await manager.close().catch(() => undefined);
-	wrote ||= changed(before, await transcripts(root));
-	return { wrote, detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore };
+	for (const name of changedNames(before, await transcripts(root))) touched.add(name);
+	return {
+		wrote: touched.size > 0,
+		detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore,
+		/** Commits no detector call covered, and changed transcripts no spied primitive wrote. */
+		unattributed: [
+			...writes.uncovered,
+			...[...touched].filter(name => !writes.written.has(name)).map(n => `unspied ${n}`),
+		],
+		events: [...writes.events],
+		file: context.file,
+	};
 }
 
 describe("session ownership writer inventory", () => {
@@ -438,7 +459,20 @@ describe("session ownership writer inventory", () => {
 	it("the attribution check rejects a writer that reaches the disk around the detector", async () => {
 		const bypass: Invoke = (_m, { file }) => fs.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`);
 		const result = await attribute("explicit", bypass);
-		expect(result).toEqual({ wrote: true, detected: 0 });
+		expect(result).toMatchObject({ wrote: true, detected: 0 });
+		expect(result.unattributed).toEqual([`fs.promises.appendFile ${path.basename(result.file)}`]);
+	});
+
+	it("per-write attribution rejects one checked write followed by one around the detector", async () => {
+		// The operation as a whole is seen; only its second write is not.
+		const mixed: Invoke = async (m, { file }) => {
+			m.appendMessage(user("checked"));
+			await fs.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`);
+		};
+		const result = await attribute("managed", mixed);
+		expect(result).toMatchObject({ wrote: true });
+		expect(result.detected).toBeGreaterThan(0);
+		expect(result.unattributed).toEqual([`fs.promises.appendFile ${path.basename(result.file)}`]);
 	});
 
 	const writers = { ...CURRENT_WRITERS, ...SUCCESSOR_WRITERS };
@@ -448,14 +482,17 @@ describe("session ownership writer inventory", () => {
 				detectorLogs = [];
 				const result = await attribute(kind, writer);
 				expect(result.wrote).toBe(writes);
+				expect(result.unattributed).toEqual([]);
 				if (writes) expect((detectorLogs as { site: string }[]).some(log => log.site === funnel)).toBe(true);
 			});
 		}
 	}
 	for (const [name, writer] of Object.entries(NOT_TRANSCRIPT_WRITERS)) {
 		it(`${name}: writes no transcript bytes`, async () => {
-			for (const kind of ["managed", "explicit"] as const)
-				expect([kind, (await attribute(kind, writer)).wrote]).toEqual([kind, false]);
+			for (const kind of ["managed", "explicit"] as const) {
+				const result = await attribute(kind, writer);
+				expect([kind, result.wrote, result.unattributed]).toEqual([kind, false, []]);
+			}
 		});
 	}
 	const wroteSomewhere = new Set<string>();
@@ -463,6 +500,8 @@ describe("session ownership writer inventory", () => {
 		for (const kind of ["managed", "explicit"] as const) {
 			it(`${name} (${kind}): every transcript write without a claim is detected`, async () => {
 				const result = await attribute(kind, writer);
+				// Each commit to a transcript follows its own detector call.
+				expect(result.unattributed).toEqual([]);
 				if (result.wrote) {
 					wroteSomewhere.add(name);
 					expect(result.detected).toBeGreaterThan(0);
@@ -474,8 +513,10 @@ describe("session ownership writer inventory", () => {
 	for (const [name, writer] of Object.entries(CURRENT_WRITERS)) {
 		// Claims need the native lock, which this platform may not have.
 		it.if(supported)(`${name}: no detection while the current session is claimed`, async () => {
-			for (const kind of ["managed", "explicit"] as const)
-				expect((await attribute(kind, writer, true)).detected).toBe(0);
+			for (const kind of ["managed", "explicit"] as const) {
+				const result = await attribute(kind, writer, true);
+				expect([kind, result.detected, result.unattributed]).toEqual([kind, 0, []]);
+			}
 		});
 	}
 
