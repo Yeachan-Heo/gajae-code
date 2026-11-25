@@ -93,6 +93,6 @@ Metadata-only PR edits must not manufacture successful required checks by skippi
 
 ## Re-requesting reviews
 
-If you want reviewers to re-examine your PR after addressing feedback, comment with `/re-review`. The workflow will request reviews from all human reviewers whose latest review is `CHANGES_REQUESTED` or `COMMENTED` but are not currently requested. Authorized users are the PR author or anyone with `admin`, `maintain`, or `write` permission to the repository.
+If you want reviewers to re-examine your PR after addressing feedback, comment with `/re-review`. Put `/re-review` alone on the first line of the comment; notes for the reviewers may follow on later lines. A comment where `/re-review` is not the whole first line does not trigger the workflow. The workflow will request reviews from all human reviewers whose latest review is `CHANGES_REQUESTED` or `COMMENTED` but are not currently requested. Authorized users are the PR author or anyone with `admin`, `maintain`, or `write` permission to the repository.
 
 **Note:** `issue_comment` workflows only activate once the triggering file (`.github/workflows/re-review.yml`) is present on the repository's default branch, `main`. Merging this PR to `dev` alone does not activate `/re-review`; the workflow will not trigger on comments until the file reaches `main`.
