@@ -189,24 +189,48 @@ const SUCCESSOR_WRITERS: Record<string, Writer> = {
  * reach (no queued writes, no latched failure, no completed turn). Each runs through the same
  * attribution check, without the requirement to write.
  */
-const INDIRECT_WRITERS: Record<string, Writer> = {
-	appendSessionRecap: m => m.appendSessionRecap({ recap: "r" } as never),
-	appendSessionRecapSharingSession: m => m.appendSessionRecapSharingSession({ recap: "r" } as never),
-	appendThinkingLevelChangeSharingSession: m => m.appendThinkingLevelChangeSharingSession("high", true, always),
-	newSession: m => m.newSession(),
-	flush: m => m.flush(),
-	flushBeforeLeaving: m => m.flushBeforeLeaving(),
-	close: m => m.close(),
-	closeStrict: m => m.closeStrict(),
-	flushAndCloseStrict: m => m.flushAndCloseStrict(),
-	recoverPersistenceFailure: m => m.recoverPersistenceFailure(),
+interface IndirectWriter {
+	/** The checked funnel its writes go through. */
+	readonly funnel: string;
+	/** Whether it writes in this scenario. If it does, the write must be reported at `funnel`. */
+	readonly writes: boolean;
+	readonly writer: Writer;
+}
+const INDIRECT_WRITERS: Record<string, IndirectWriter> = {
+	appendSessionRecap: {
+		funnel: "managed append",
+		writes: false,
+		writer: m => m.appendSessionRecap({ recap: "r" } as never),
+	},
+	appendSessionRecapSharingSession: {
+		funnel: "managed append",
+		writes: false,
+		writer: m => m.appendSessionRecapSharingSession({ recap: "r" } as never),
+	},
+	appendThinkingLevelChangeSharingSession: {
+		funnel: "managed append",
+		writes: false,
+		writer: m => m.appendThinkingLevelChangeSharingSession("high", true, always),
+	},
+	newSession: { funnel: "new session successor", writes: false, writer: m => m.newSession() },
+	flush: { funnel: "managed append", writes: false, writer: m => m.flush() },
+	flushBeforeLeaving: { funnel: "managed append", writes: false, writer: m => m.flushBeforeLeaving() },
+	close: { funnel: "rewrite", writes: false, writer: m => m.close() },
+	closeStrict: { funnel: "rewrite", writes: false, writer: m => m.closeStrict() },
+	flushAndCloseStrict: { funnel: "rewrite", writes: false, writer: m => m.flushAndCloseStrict() },
+	recoverPersistenceFailure: { funnel: "rewrite", writes: false, writer: m => m.recoverPersistenceFailure() },
+	// A missing or empty target file is created through the rewrite funnel.
+	setSessionFile: {
+		funnel: "rewrite",
+		writes: true,
+		writer: (m, { file }) => m.setSessionFile(path.join(path.dirname(file), "missing-target.jsonl")),
+	},
 };
 
 /** Methods that write no transcript bytes. Each runs, and must leave every transcript unchanged. */
 const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
 	restoreRollbackState: m => m.restoreRollbackState(m.captureState()),
 	restoreState: m => m.restoreState(m.captureState()),
-	setSessionFile: (m, { file }) => m.setSessionFile(file),
 	prepareNewSession: m => m.prepareNewSession(),
 	appendPreparedModelChange: async m => m.appendPreparedModelChange(await m.prepareNewSession(), "fixture/model"),
 	appendPreparedThinkingLevelChange: async m =>
@@ -233,6 +257,17 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
 	saveArtifact: m => m.saveArtifact("artifact text", "bash"),
 	putBlob: m => m.putBlob(Buffer.from("blob")),
 	setSidecarHotSuffixBudgetForTests: m => m.setSidecarHotSuffixBudgetForTests(1 << 20),
+	createMemoryGuardCheckpoint: async m => {
+		// The checkpoint copies the transcript, so its root sits outside the measured tree.
+		const checkpointRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-checkpoint-")));
+		roots.push(checkpointRoot);
+		const ingressLease = m.acquireMemoryGuardParticipantIngressLease();
+		try {
+			return await m.createMemoryGuardCheckpoint({ ingressLease, checkpointRoot });
+		} finally {
+			ingressLease.release();
+		}
+	},
 	setParentArtifactBudgetForTests: m => m.setParentArtifactBudgetForTests(1 << 20),
 };
 
@@ -242,17 +277,17 @@ const DEFERRED_WRITERS: Record<string, string> = {
 	dropSession: "deletes a session; delete ownership is the scoped-claim step",
 	deleteSessionVerified: "verified delete; delete ownership is the scoped-claim step",
 	setSessionStarredForPicker: "picker write of any session; scoped claims cover picker writes",
-	createMemoryGuardCheckpoint: "needs a memory-guard ingress lease; captures the transcript, does not write it",
 	remapStagedArtifactReferences: "staged child artifact references; staged sessions claim at commit",
-	prepareManagedCandidateForWrite: "open-time candidate preparation; factories claim before it",
+	prepareManagedCandidateForWrite:
+		"4b (H1): the TUI picker calls it on the live manager before any factory, so no claim precedes it yet",
 	prepareManagedCandidateForStrictAdoption: "open-time candidate preparation; factories claim before it",
 	finalizeWritableOpen: "open-time finalization; factories claim before it",
 	finalizePendingWritableOpen: "open-time finalization; factories claim before it",
 	commitStaged: "staged child publication; staged sessions claim at commit",
-	rollbackCommittedStaged: "staged child rollback",
-	discardStaged: "unpublished staged child cleanup",
+	rollbackCommittedStaged: "staged child rollback; staged sessions claim at commit (4b)",
+	discardStaged: "unpublished staged child cleanup; staged sessions claim at commit (4b)",
 	commitStagedNestedManaged: "staged child publication; staged sessions claim at commit",
-	discardStagedNestedManaged: "unpublished staged child cleanup",
+	discardStagedNestedManaged: "unpublished staged child cleanup; staged sessions claim at commit (4b)",
 	finalizeStagedCommit: "staged child publication; staged sessions claim at commit",
 };
 
@@ -395,11 +430,13 @@ describe("session ownership writer inventory", () => {
 	});
 
 	const writers = { ...CURRENT_WRITERS, ...SUCCESSOR_WRITERS };
-	for (const [name, writer] of Object.entries(INDIRECT_WRITERS)) {
+	for (const [name, { funnel, writes, writer }] of Object.entries(INDIRECT_WRITERS)) {
 		for (const kind of ["managed", "explicit"] as const) {
-			it(`${name} (${kind}): any transcript write it makes is detected`, async () => {
+			it(`${name} (${kind}): ${writes ? `writes through ${funnel}, reported` : "writes nothing here"}`, async () => {
+				detectorLogs = [];
 				const result = await attribute(kind, writer);
-				if (result.wrote) expect(result.detected).toBeGreaterThan(0);
+				expect(result.wrote).toBe(writes);
+				if (writes) expect((detectorLogs as { site: string }[]).some(log => log.site === funnel)).toBe(true);
 			});
 		}
 	}
