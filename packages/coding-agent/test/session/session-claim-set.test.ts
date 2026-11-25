@@ -3,6 +3,7 @@
  * real SessionManager rotations and real claims in the test preload's isolated home.
  */
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +18,12 @@ import {
 	sessionOwnersDirectory,
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
+import {
+	FileSessionStorage,
+	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+	SessionStorageWriterRetryableCloseError,
+} from "../../src/session/session-storage";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
@@ -216,6 +223,74 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		expect(await held(id)).toBe(true);
 		finalization.resolve();
 		await finalization.promise;
+		expect(await held(id)).toBe(false);
+	});
+});
+
+type CloseFault = "none" | "retryable_once" | "unknown";
+
+/** Real file storage whose persist-writer close fails in a chosen, certified way. */
+class CloseFaultStorage extends FileSessionStorage {
+	fault: CloseFault = "none";
+
+	override openWriter(file: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+		return super.openWriter(file, {
+			...options,
+			closeAdapter: {
+				close: fd => {
+					if (this.fault === "retryable_once") {
+						this.fault = "none";
+						throw new SessionStorageWriterRetryableCloseError();
+					}
+					fsSync.closeSync(fd);
+					if (this.fault === "unknown") throw new Error("close outcome unknown");
+				},
+			},
+		});
+	}
+}
+
+async function explicitWithFault(fault: CloseFault) {
+	const { root, cwd } = await workspace("explicit");
+	const storage = new CloseFaultStorage();
+	const manager = SessionManager.create(cwd, SessionManager.explicitDestination(path.join(root, "sessions")), storage);
+	managers.push(manager);
+	manager.appendMessage(user("first"));
+	await manager.ensureOnDisk();
+	// An append opens the persist writer whose close the fault targets.
+	manager.appendMessage(user("second"));
+	await manager.flush();
+	const id = manager.getSessionId();
+	sessionClaimSetOf(manager).add(await claim(id));
+	storage.fault = fault;
+	return { manager, id };
+}
+
+describe.if(supported)("the claim set on every close path", () => {
+	for (const method of ["closeStrict", "flushAndCloseStrict"] as const) {
+		it(`${method}: closed and close_unknown release the claims`, async () => {
+			const closed = await explicitWithFault("none");
+			expect((await closed.manager[method]()).kind).toBe("closed");
+			expect(await held(closed.id)).toBe(false);
+			const unknown = await explicitWithFault("unknown");
+			expect((await unknown.manager[method]()).kind).toBe("close_unknown");
+			expect(await held(unknown.id)).toBe(false);
+		});
+
+		it(`${method}: close_failed_retryable keeps the claims until the retry closes`, async () => {
+			const { manager, id } = await explicitWithFault("retryable_once");
+			expect((await manager[method]()).kind).toBe("close_failed_retryable");
+			expect(await held(id)).toBe(true);
+			expect((await manager[method]()).kind).toBe("closed");
+			expect(await held(id)).toBe(false);
+		});
+	}
+
+	it("close(): a failed close keeps the claims, and the retry that completes releases them", async () => {
+		const { manager, id } = await explicitWithFault("retryable_once");
+		await expect(manager.close()).rejects.toThrow();
+		expect(await held(id)).toBe(true);
+		await manager.close();
 		expect(await held(id)).toBe(false);
 	});
 });

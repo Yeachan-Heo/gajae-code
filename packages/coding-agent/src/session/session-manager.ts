@@ -17882,6 +17882,9 @@ export class SessionManager {
 	}
 
 	#releaseClosedSessionState(): void {
+		// The terminal step of every close (close, a terminal closeStrict, a rejected open), so the
+		// claims go with the state they protect.
+		this.#ownershipClaims.releaseAll();
 		this.#clearManagedTranscriptRelocationResolver();
 		const runtime = this.#sidecarRuntime;
 		if (runtime) {
@@ -17975,8 +17978,6 @@ export class SessionManager {
 	async close(): Promise<void> {
 		try {
 			await this.#closeSession();
-			// After a completed close only: a failed close may be retried, and must still write under its claims.
-			this.#ownershipClaims.releaseAll();
 		} finally {
 			this.#disposeSnapshotSidecarsBestEffort();
 		}
@@ -18066,7 +18067,11 @@ export class SessionManager {
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
 		try {
-			return await this.#closeStrictSession();
+			const outcome = await this.#closeStrictSession();
+			// `close_unknown` is terminal for its callers too; only a retryable close keeps its claims,
+			// because the retry still writes under them.
+			if (outcome.kind !== "close_failed_retryable") this.#ownershipClaims.releaseAll();
+			return outcome;
 		} finally {
 			this.#disposeSnapshotSidecarsBestEffort();
 		}
