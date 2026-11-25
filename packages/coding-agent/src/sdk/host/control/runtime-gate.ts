@@ -24,6 +24,28 @@ export function hasBrokerRuntimeReviseCapability(input: unknown): boolean {
 		record(input)?.[BROKER_RUNTIME_REVISE_CAPABILITY_FIELD] === expected
 	);
 }
+/**
+ * Session lifecycle operations that only the Broker lifecycle service may run. A
+ * session's own control surfaces (extension runtime and the interactive extension
+ * UI) refuse them with {@link prohibitBrokerLifecycleOperation}.
+ */
+export const BROKER_LIFECYCLE_OPERATIONS: ReadonlySet<string> = new Set([
+	"session.new",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.switch",
+	"session.branch",
+	"session.handoff",
+	"session.delete",
+]);
+
+export function prohibitBrokerLifecycleOperation(operation: string): never {
+	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
+		code: "operation_prohibited",
+	});
+}
+
 export const BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD = "__gjcBrokerCloseCapability";
 /** Private field carried only on the Broker-authorized terminal-abort request. */
 export const BROKER_RUNTIME_ABORT_CAPABILITY_FIELD = "__gjcBrokerAbortCapability";

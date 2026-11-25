@@ -86,7 +86,14 @@ ${model("fake-model")}${model("fake-model-b")}`,
 	);
 }
 
-type Tui = { pty: PtySession; done: Promise<PtyRunResult>; screen: () => string; mark: () => number };
+type Tui = {
+	pty: PtySession;
+	done: Promise<PtyRunResult>;
+	screen: () => string;
+	mark: () => number;
+	/** Raw bytes received so far; grows on every render. */
+	received: () => number;
+};
 
 function startTui(options: { cli: string; cwd: string; root: string; agent: string; extra?: string[] }): Tui {
 	const env: Record<string, string> = {
@@ -127,16 +134,21 @@ function startTui(options: { cli: string; cwd: string; root: string; agent: stri
 		},
 	);
 	live.push({ pty, done });
-	return { pty, done, screen: () => strip(raw), mark: () => strip(raw).length };
+	return { pty, done, screen: () => strip(raw), mark: () => strip(raw).length, received: () => raw.length };
 }
 
-async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs: number, label: string) {
+async function waitFor(
+	check: () => boolean | Promise<boolean>,
+	timeoutMs: number,
+	label: string,
+	evidence?: () => string | Promise<string>,
+) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (await check()) return;
 		await Bun.sleep(100);
 	}
-	throw new Error(`timed out waiting for ${label}`);
+	throw new Error(`timed out waiting for ${label}${evidence ? `\n${await evidence()}` : ""}`);
 }
 
 type Entry = { type?: string; id?: string; parentId?: string | null; customType?: string; message?: unknown };
@@ -189,13 +201,66 @@ const REFUSAL = /requires transaction admission|Fork failed|Error:/;
 
 /** Screen output produced after `mark`, so earlier text cannot satisfy a check. */
 const since = (tui: Tui, mark: number) => tui.screen().slice(mark);
+const screenSince = (tui: Tui, mark: number) => `--- screen since the input ---\n${since(tui, mark).slice(-3_000)}`;
 
-async function sendCommand(tui: Tui, command: string, expected: RegExp) {
+/**
+ * Best effort: return once the TUI has written nothing for `quietMs`, so a render or
+ * status from the previous step is not still pending when the next input arrives.
+ */
+async function quiet(tui: Tui, quietMs = 400, maxMs = 5_000) {
+	const deadline = Date.now() + maxMs;
+	let seen = tui.received();
+	let stillSince = Date.now();
+	while (Date.now() < deadline) {
+		await Bun.sleep(50);
+		const now = tui.received();
+		if (now !== seen) {
+			seen = now;
+			stillSince = Date.now();
+		} else if (Date.now() - stillSince >= quietMs) return;
+	}
+}
+
+type Added = Entry & Record<string, unknown>;
+
+/** Entries appended to `file` after its first `count` entries. */
+async function addedSince(file: string, count: number): Promise<Added[]> {
+	return (await readTranscript(file)).entries.slice(count) as Added[];
+}
+
+/**
+ * Submit one slash command and wait until its effect is in the transcript.
+ *
+ * Status lines are no completion signal: `showStatus` rewrites the previous status in
+ * place, and on Linux the config hot-reload watcher reports "Configuration reloaded"
+ * after `/model` writes the config. That can replace a later command's status before
+ * any frame shows it.
+ */
+async function sendCommand(tui: Tui, file: string, command: string, applied: (added: Added[]) => boolean) {
+	await quiet(tui);
+	const count = (await readTranscript(file)).entries.length;
 	const mark = tui.mark();
 	tui.pty.write(`${command}\r`);
-	await waitFor(() => expected.test(since(tui, mark)), 30_000, `${command} output`);
+	await waitFor(
+		async () => applied(await addedSince(file, count)),
+		30_000,
+		`${command} in the transcript`,
+		async () =>
+			`${screenSince(tui, mark)}\n--- transcript entries added ---\n${(await addedSince(file, count))
+				.map(entry => JSON.stringify(entry).slice(0, 240))
+				.join("\n")}`,
+	);
+	await quiet(tui);
 	expect(since(tui, mark)).not.toMatch(REFUSAL);
+	return addedSince(file, count);
 }
+
+const modelChange = (model: string) => (added: Added[]) =>
+	added.some(entry => entry.type === "model_change" && entry.model === model);
+const tierChange = (serviceTier: string | null) => (added: Added[]) =>
+	added.some(entry => entry.type === "service_tier_change" && entry.serviceTier === serviceTier);
+const operatorEffort = (added: Added[]) =>
+	added.some(entry => entry.type === "thinking_level_change" && entry.operatorIntent === true);
 
 /**
  * Drive `/fork`, pick the user message `upPresses` above the newest one, and return the
@@ -208,11 +273,24 @@ async function forkFrom(tui: Tui, sessions: string, source: string, upPresses: n
 	const before = new Set(await transcriptFiles(sessions));
 	const mark = tui.mark();
 	tui.pty.write("/fork\r");
-	await waitFor(() => since(tui, mark).includes(selected), 30_000, "fork selector");
+	// The picker's cursor row, not the prompt text that the chat history also shows.
+	await waitFor(
+		() => /›\s*fork-/.test(since(tui, mark)),
+		30_000,
+		"fork selector",
+		() => screenSince(tui, mark),
+	);
 	for (let index = 0; index < upPresses; index++) {
 		tui.pty.write(UP);
 		await Bun.sleep(150);
 	}
+	const cursorOn = new RegExp(`›\\s*${selected}\\b`);
+	await waitFor(
+		() => cursorOn.test(since(tui, mark)),
+		30_000,
+		`fork selector on ${selected}`,
+		() => screenSince(tui, mark),
+	);
 	tui.pty.write("\r");
 	let successor: string | undefined;
 	await waitFor(
@@ -269,15 +347,20 @@ async function runControls(
 	tag: string,
 ) {
 	const before = (await readTranscript(file)).entries.length;
-	await sendCommand(tui, "/model fake/fake-model", /fake-model/);
-	await sendCommand(tui, "/model fake/fake-model-b", /fake-model-b/);
-	await sendCommand(tui, "/fast off", /Fast mode/i);
-	await sendCommand(tui, "/fast on", /Fast mode/i);
-	await sendCommand(tui, "/effort low", /effort/i);
-	const effortMark = tui.mark();
-	await sendCommand(tui, "/effort high", /Effective effort: \w+/);
-	const effort = /Effective effort: \w+/.exec(since(tui, effortMark))![0];
-	await sendCommand(tui, `/rename renamed-${tag}`, new RegExp(`renamed-${tag}`));
+	await sendCommand(tui, file, "/model fake/fake-model", modelChange("fake/fake-model"));
+	await sendCommand(tui, file, "/model fake/fake-model-b", modelChange("fake/fake-model-b"));
+	// On, then off: whatever tier the session starts with, both are changes.
+	await sendCommand(tui, file, "/fast on", tierChange("priority"));
+	await sendCommand(tui, file, "/fast off", tierChange(null));
+	await sendCommand(tui, file, "/effort low", operatorEffort);
+	const high = await sendCommand(tui, file, "/effort high", operatorEffort);
+	// The effective level the control recorded after clamping to the model.
+	const effortEntry = high.findLast(entry => entry.type === "thinking_level_change" && entry.operatorIntent === true);
+	expect(effortEntry).toBeDefined();
+	const effort = effortEntry!.thinkingLevel;
+	await sendCommand(tui, file, `/rename renamed-${tag}`, added =>
+		added.some(entry => JSON.stringify(entry).includes(`"title":"renamed-${tag}"`)),
+	);
 	const prompt = `fork-${tag}-after`;
 	tui.pty.write(`${prompt}\r`);
 	await replied(file, prompt);
@@ -359,95 +442,76 @@ async function only(sessions: string): Promise<string> {
 	return file!;
 }
 
-/**
- * Known failing until the /fork fix lands: the test passes under it.failing only when the
- * run stops on exactly the reported refusal, so a harness break or timeout is not
- * mistaken for the reproduction. Flip to a plain it() with the fix.
- */
-function reproducesRefusal(refusal: RegExp, run: () => Promise<void>): () => Promise<void> {
-	return async () => {
-		try {
-			await run();
-		} catch (error) {
-			if (refusal.test(error instanceof Error ? error.message : String(error))) throw error;
-		}
-	};
-}
-
 describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI", () => {
-	it.failing(
-		"forks from the newest and the first prompt after shared-append messages",
-		reproducesRefusal(/requires transaction admission: prepare branched session/, async () => {
-			const { root, cwd, agent, sessions, cli, model } = await fixture();
-			try {
-				const tui = startTui({ cli, cwd, root, agent });
-				await ready(tui);
-				tui.pty.write("fork-p1\r");
-				const source = await only(sessions);
-				await replied(source, "fork-p1");
-				tui.pty.write("fork-p2\r");
-				await replied(source, "fork-p2");
-				const sourceId = (await readTranscript(source)).header.id;
+	it("forks from the newest and the first prompt after shared-append messages", async () => {
+		const { root, cwd, agent, sessions, cli, model } = await fixture();
+		try {
+			const tui = startTui({ cli, cwd, root, agent });
+			await ready(tui);
+			tui.pty.write("fork-p1\r");
+			const source = await only(sessions);
+			await replied(source, "fork-p1");
+			tui.pty.write("fork-p2\r");
+			await replied(source, "fork-p2");
+			const sourceId = (await readTranscript(source)).header.id;
 
-				// Fork 1: the newest prompt. Model selection survives the fork.
-				await sendCommand(tui, "/model fake/fake-model-b", /fake-model-b/);
-				// The fork never writes the source's workflow state directory.
-				const sourceWorkflow = sessionRoot(cwd, sourceId);
-				const sourceWorkflowBefore = await settledSnapshot(sourceWorkflow);
-				const first = await forkFrom(tui, sessions, source, 0, "fork-p2");
-				expect(first.header.parentSession).toBe(sourceId);
-				expect(messagesWith(first.entries, "fork-p1")).toHaveLength(1);
-				expect(messagesWith(first.entries, "fork-p1-reply")).toHaveLength(1);
-				expect(first.entries.some(entry => entry.type === "model_change")).toBe(true);
-				// Submitting the restored prompt lands it in the fork, on the selected model.
-				await submitRestored(tui, first.file, "fork-p2");
-				await replied(first.file, "fork-p2");
-				expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-p2" });
-				expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
-				const fork1Controls = await runControls(tui, first.file, model, "fork1");
+			// Fork 1: the newest prompt. Model selection survives the fork.
+			await sendCommand(tui, source, "/model fake/fake-model-b", modelChange("fake/fake-model-b"));
+			// The fork never writes the source's workflow state directory.
+			const sourceWorkflow = sessionRoot(cwd, sourceId);
+			const sourceWorkflowBefore = await settledSnapshot(sourceWorkflow);
+			const first = await forkFrom(tui, sessions, source, 0, "fork-p2");
+			expect(first.header.parentSession).toBe(sourceId);
+			expect(messagesWith(first.entries, "fork-p1")).toHaveLength(1);
+			expect(messagesWith(first.entries, "fork-p1-reply")).toHaveLength(1);
+			expect(first.entries.some(entry => entry.type === "model_change")).toBe(true);
+			// Submitting the restored prompt lands it in the fork, on the selected model.
+			await submitRestored(tui, first.file, "fork-p2");
+			await replied(first.file, "fork-p2");
+			expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-p2" });
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
+			const fork1Controls = await runControls(tui, first.file, model, "fork1");
 
-				// Fork 2: the first prompt, from the fork the TUI is now on.
-				const second = await forkFrom(tui, sessions, first.file, 2, "fork-p1");
-				expect(messagesWith(second.entries, "fork-p1")).toHaveLength(0);
-				expect(messagesWith(second.entries, "fork-p2")).toHaveLength(0);
-				await submitRestored(tui, second.file, "fork-p1");
-				await replied(second.file, "fork-p1");
-				expect(Buffer.from(await Bun.file(first.file).arrayBuffer())).toEqual(second.sourceBytes);
-				expect(await runControls(tui, second.file, model, "fork2")).toEqual(fork1Controls);
-				expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
-				expect(await treeSnapshot(sourceWorkflow)).toEqual(sourceWorkflowBefore);
+			// Fork 2: the first prompt, from the fork the TUI is now on.
+			const second = await forkFrom(tui, sessions, first.file, 2, "fork-p1");
+			expect(messagesWith(second.entries, "fork-p1")).toHaveLength(0);
+			expect(messagesWith(second.entries, "fork-p2")).toHaveLength(0);
+			await submitRestored(tui, second.file, "fork-p1");
+			await replied(second.file, "fork-p1");
+			expect(Buffer.from(await Bun.file(first.file).arrayBuffer())).toEqual(second.sourceBytes);
+			expect(await runControls(tui, second.file, model, "fork2")).toEqual(fork1Controls);
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(first.sourceBytes);
+			expect(await treeSnapshot(sourceWorkflow)).toEqual(sourceWorkflowBefore);
 
-				// The source stays fully usable after being forked, and forks again once resumed.
-				tui.pty.kill();
-				await tui.done.catch(() => undefined);
-				const resumed = startTui({ cli, cwd, root, agent, extra: ["--resume", sourceId] });
-				await ready(resumed);
-				expect(await runControls(resumed, source, model, "source")).toEqual(fork1Controls);
-				expect(await transcriptById(sessions, sourceId)).toBe(source);
-				// A real /compact, then a fork whose branch path carries the compaction.
-				resumed.pty.write("/compact\r");
-				await waitFor(
-					async () => (await readTranscript(source)).entries.some(entry => entry.type === "compaction"),
-					60_000,
-					"compaction entry",
-				);
-				resumed.pty.write("fork-after-compact\r");
-				await replied(source, "fork-after-compact");
-				const resumedWorkflow = await settledSnapshot(sourceWorkflow);
-				const third = await forkFrom(resumed, sessions, source, 0, "fork-after-compact");
-				expect(third.entries.some(entry => entry.type === "compaction")).toBe(true);
-				expect(messagesWith(third.entries, "fork-source-after")).toHaveLength(1);
-				await submitRestored(resumed, third.file, "fork-after-compact");
-				await replied(third.file, "fork-after-compact");
-				expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-after-compact" });
-				expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(third.sourceBytes);
-				expect(await treeSnapshot(sourceWorkflow)).toEqual(resumedWorkflow);
-			} finally {
-				await model.server.stop(true);
-			}
-		}),
-		240_000,
-	);
+			// The source stays fully usable after being forked, and forks again once resumed.
+			tui.pty.kill();
+			await tui.done.catch(() => undefined);
+			const resumed = startTui({ cli, cwd, root, agent, extra: ["--resume", sourceId] });
+			await ready(resumed);
+			expect(await runControls(resumed, source, model, "source")).toEqual(fork1Controls);
+			expect(await transcriptById(sessions, sourceId)).toBe(source);
+			// A real /compact, then a fork whose branch path carries the compaction.
+			resumed.pty.write("/compact\r");
+			await waitFor(
+				async () => (await readTranscript(source)).entries.some(entry => entry.type === "compaction"),
+				60_000,
+				"compaction entry",
+			);
+			resumed.pty.write("fork-after-compact\r");
+			await replied(source, "fork-after-compact");
+			const resumedWorkflow = await settledSnapshot(sourceWorkflow);
+			const third = await forkFrom(resumed, sessions, source, 0, "fork-after-compact");
+			expect(third.entries.some(entry => entry.type === "compaction")).toBe(true);
+			expect(messagesWith(third.entries, "fork-source-after")).toHaveLength(1);
+			await submitRestored(resumed, third.file, "fork-after-compact");
+			await replied(third.file, "fork-after-compact");
+			expect(model.turns.at(-1)).toEqual({ model: "fake-model-b", prompt: "fork-after-compact" });
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(third.sourceBytes);
+			expect(await treeSnapshot(sourceWorkflow)).toEqual(resumedWorkflow);
+		} finally {
+			await model.server.stop(true);
+		}
+	}, 240_000);
 
 	it("never writes the shared transcript when /fork runs beside a peer TUI", async () => {
 		const { root, cwd, agent, sessions, cli, model } = await fixture();
@@ -474,7 +538,9 @@ describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI
 				await waitFor(() => /Fork failed|›\s*fork-[ab]\d/.test(since(tui, mark)), 30_000, "fork refusal or picker");
 				if (!/Fork failed/.test(since(tui, mark))) tui.pty.write("\r");
 				await waitFor(() => /Fork failed/.test(since(tui, mark)), 30_000, "fork refusal");
-				expect(since(tui, mark)).toMatch(/requires transaction admission: prepare branched session/);
+				expect(since(tui, mark)).toMatch(
+					/Cannot fork this session: another gjc process has written to this session/,
+				);
 				expect(await transcriptFiles(sessions)).toEqual([shared]);
 				expect(Buffer.from(await Bun.file(shared).arrayBuffer())).toEqual(bytes);
 			}

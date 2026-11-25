@@ -19,9 +19,11 @@ import { isSdkComposerObservationOperation } from "../sdk/composer-observation";
 
 import { isSdkDiffObservationOperation } from "../sdk/diff-observation";
 import {
+	BROKER_LIFECYCLE_OPERATIONS,
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
 	hasBrokerRuntimeReviseCapability,
+	prohibitBrokerLifecycleOperation,
 } from "../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
@@ -39,23 +41,6 @@ import type { AgentSession } from "../session/agent-session";
 import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
-
-const BROKER_LIFECYCLE_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.close",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.delete",
-]);
-
-function prohibitBrokerLifecycleOperation(operation: string): never {
-	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
-		code: "operation_prohibited",
-	});
-}
 
 /** Action name for an extension-originated send failure. */
 export type ExtensionSendAction = "extension_send" | "extension_send_user";
