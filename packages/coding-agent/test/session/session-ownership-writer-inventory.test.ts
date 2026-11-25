@@ -555,12 +555,13 @@ describe.if(supported)("recovery promotion", () => {
 		} as RecoveryFsRoot;
 	}
 
-	it("promoteRecoveryHydrationAfterOwnershipReadyFence: the promoted transcript's publish is reported", async () => {
+	/** A staged memory-guard recovery of an explicit-destination session holding `messages`. */
+	async function stagedRecovery(messages: readonly Parameters<SessionManager["appendMessage"]>[0][]) {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-recovery-")));
 		roots.push(root);
 		const source = await SessionManager.open(path.join(root, "source", "checkpoint.jsonl"));
 		managers.push(source);
-		source.appendMessage(user("recovered"));
+		for (const message of messages) source.appendMessage(message);
 		await source.flush();
 		const checkpointRoot = path.join(root, "checkpoint");
 		const ingressLease = source.acquireMemoryGuardParticipantIngressLease();
@@ -579,6 +580,11 @@ describe.if(supported)("recovery promotion", () => {
 		});
 		if (restored.kind !== "staged") throw new Error(`expected a staged recovery, got ${restored.reason}`);
 		managers.push(restored.manager);
+		return restored;
+	}
+
+	it("promoteRecoveryHydrationAfterOwnershipReadyFence: the promoted transcript's publish is reported", async () => {
+		const restored = await stagedRecovery([user("recovered")]);
 		detectorLogs = [];
 		await restored.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(restored.hydrationContext, {
 			ownershipReady: true,
@@ -588,6 +594,58 @@ describe.if(supported)("recovery promotion", () => {
 			sessionId: restored.manager.getSessionId(),
 			mode: "observe",
 		});
+	});
+
+	it("the replay-metadata sanitize the promotion persists first is checked before it writes (strict seam)", async () => {
+		// An assistant reply carrying OpenAI Responses replay state the promotion sanitizes and persists.
+		const stale = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
+				{ type: "text", text: "answer" },
+			],
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-fixture",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+			providerPayload: { type: "openaiResponsesHistory", items: [] },
+		} as unknown as Parameters<SessionManager["appendMessage"]>[0];
+		// In observe the sanitize persists its patch, through the persist writer it opens, and is reported.
+		const observed = await stagedRecovery([user("question"), stale]);
+		detectorLogs = [];
+		await observed.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(observed.hydrationContext, {
+			ownershipReady: true,
+		});
+		expect(await fs.readFile(observed.manager.getSessionFile()!, "utf8")).toContain('"type":"entry_patch"');
+		const sites = (detectorLogs as { site: string }[]).map(log => log.site);
+		expect(sites.indexOf("persist writer open")).toBeGreaterThanOrEqual(0);
+		expect(sites.indexOf("persist writer open")).toBeLessThan(sites.indexOf("recovery promotion"));
+
+		const restored = await stagedRecovery([user("question"), stale]);
+		const staged = restored.manager.getSessionFile()!;
+		const assistant = restored.manager
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		// The sanitize has something to persist at promotion time.
+		expect((assistant as { message: { providerPayload?: unknown } }).message.providerPayload).toBeDefined();
+		const before = await fs.readFile(staged, "utf8");
+		SessionOwnershipTestHooks.strictWriteDetection = true;
+		await expect(
+			restored.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(restored.hydrationContext, {
+				ownershipReady: true,
+			}),
+		).rejects.toMatchObject({ name: "SessionWriteWithoutClaimError", site: "persist writer open" });
+		// Nothing reached the staged transcript before the detector stopped it.
+		expect(await fs.readFile(staged, "utf8")).toBe(before);
 	});
 });
 
