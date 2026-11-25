@@ -14,8 +14,17 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
+import * as natives from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
-import { SessionWriteWithoutClaimError, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import {
+	SessionClaimSet,
+	SessionWriteWithoutClaimError,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import type {
 	MemoryGuardParticipantDescriptorV1,
 	MemoryGuardRestoreResult,
@@ -517,12 +526,96 @@ describe("session ownership writer inventory", () => {
 			return promise;
 		},
 		"Bun.write": file => Bun.write(file, `${JSON.stringify({ type: "custom" })}\n`),
+		"Bun.file().write": file => Bun.file(file).write(`${JSON.stringify({ type: "custom" })}\n`),
 		"Bun.file().writer": async file => {
 			const sink = Bun.file(file).writer();
 			sink.write(`${JSON.stringify({ type: "custom" })}\n`);
 			await sink.end();
 		},
 	};
+	describe("the write ledger's restores", () => {
+		/** A detector call with an id to check, so the next commit is covered. */
+		const check = () => new SessionClaimSet().checkWrite("ledger self-test", "self-test-session");
+		const bytes = (text: string) => Buffer.from(`${JSON.stringify({ type: "custom", text })}\n`);
+		async function stores() {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ledger-store-")));
+			roots.push(root);
+			const authority = managedDirectoryRoot(root);
+			const open = async (name: string) => {
+				await fs.mkdir(path.join(root, name), { mode: 0o700 });
+				return new ManagedSessionDescendantStore(authority, path.join(root, name));
+			};
+			return { root, a: await open("a"), b: await open("b") };
+		}
+		/** Publish `s.jsonl` (checked), then remove it as a managed removal does. */
+		function publishThenRemove(store: ManagedSessionDescendantStore) {
+			check();
+			store.publishNoReplaceSync("s.jsonl", bytes("original"));
+			store.removeExpected("s.jsonl", store.readExpected("s.jsonl")!);
+		}
+
+		it("republishing the exact bytes a removal took is a restore", async () => {
+			const { a, b } = await stores();
+			writes.reset();
+			publishThenRemove(a);
+			a.publishNoReplaceSync("s.jsonl", bytes("original"));
+			expect(writes.uncovered).toEqual([]);
+			a.close();
+			b.close();
+		});
+
+		it("different bytes at the vacated path are a new write", async () => {
+			const { a, b } = await stores();
+			writes.reset();
+			publishThenRemove(a);
+			a.publishNoReplaceSync("s.jsonl", bytes("different"));
+			expect(writes.uncovered).toEqual(["store.publishNoReplaceSync s.jsonl"]);
+			a.close();
+			b.close();
+		});
+
+		it("the same bytes published into another store are a new write", async () => {
+			const { a, b } = await stores();
+			writes.reset();
+			publishThenRemove(a);
+			b.publishNoReplaceSync("s.jsonl", bytes("original"));
+			expect(writes.uncovered).toEqual(["store.publishNoReplaceSync s.jsonl"]);
+			a.close();
+			b.close();
+		});
+
+		async function files(...names: string[]) {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ledger-files-")));
+			roots.push(root);
+			for (const name of names) await fs.writeFile(path.join(root, name), bytes(name));
+			writes.reset();
+			return (name: string) => path.join(root, name);
+		}
+
+		it("renaming the moved file back is a restore; renaming a different file into its place is not", async () => {
+			const at = await files("a.jsonl", "c.jsonl");
+			check();
+			await fs.rename(at("a.jsonl"), at("b.jsonl"));
+			await fs.rename(at("c.jsonl"), at("a.jsonl"));
+			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl"]);
+
+			const back = await files("a.jsonl");
+			check();
+			await fs.rename(back("a.jsonl"), back("b.jsonl"));
+			await fs.rename(back("b.jsonl"), back("a.jsonl"));
+			expect(writes.uncovered).toEqual([]);
+		});
+
+		it("a rename that did not happen vacates nothing", async () => {
+			const at = await files("a.jsonl", "b.jsonl");
+			check();
+			// The no-replace rename onto an existing file fails without moving anything.
+			expect(natives.renameNoReplacePath(at("a.jsonl"), at("b.jsonl")).mutationState).toBe("not_committed");
+			await fs.rename(at("b.jsonl"), at("a.jsonl"));
+			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl"]);
+		});
+	});
+
 	for (const [primitive, bypass] of Object.entries(BYPASSES)) {
 		it(`per-write attribution rejects one checked write followed by one through ${primitive}`, async () => {
 			// The operation as a whole is seen; only its second write is not.

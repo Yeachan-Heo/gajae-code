@@ -11,7 +11,7 @@
  * Spied: SessionStorage writes, renames, exact replaces and writer opens; staged-writer publishes;
  * the managed store's publish, replace, append and move; the natives' no-replace rename and link;
  * `node:fs` sync, callback and promise writes, renames, links, copies, truncates, write opens and
- * write streams; `Bun.write` and `Bun.file().writer()`.
+ * write streams; `Bun.write`, `Bun.file().write()` and `Bun.file().writer()`.
  *
  * Not spied, so a write through them is caught only by the inventory's per-transcript byte check
  * ("unspied"), which sees that a transcript changed but not which write changed it: other native
@@ -173,13 +173,27 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 					if (pending) pending = false;
 					else ledger.uncovered.push(`${primitive} ${name}`);
 				}
-				if (source !== undefined) {
-					ledger.written.add(source);
-					vacated.set(source, { kind: "renamed", to: file });
-				}
+				if (source !== undefined) ledger.written.add(source);
 			},
-			call,
+			// Only a rename that moved the file vacates its source.
+			source === undefined
+				? call
+				: () => afterSuccess(call, () => vacated.set(source, { kind: "renamed", to: file })),
 		);
+	};
+
+	/**
+	 * Run `call`, then `onSuccess` once it has completed: not when it throws or rejects, and not when
+	 * it returns a native no-replace result whose mutation did not commit.
+	 */
+	const afterSuccess = (call: () => unknown, onSuccess: () => void): unknown => {
+		const settle = (result: unknown) => {
+			const state = (result as { mutationState?: unknown } | null)?.mutationState;
+			if (state === undefined || state === "committed") onSuccess();
+			return result;
+		};
+		const result = call();
+		return result instanceof Promise ? result.then(settle) : settle(result);
 	};
 
 	/** A removal changes the transcript's bytes but is not a commit; a managed one keeps what it took. */
@@ -191,9 +205,10 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 			() => {
 				ledger.events.push(`${primitive} ${path.basename(file)}`);
 				ledger.written.add(file);
-				if (bytes instanceof Uint8Array) vacated.set(file, { kind: "removed", bytes: Buffer.from(bytes) });
 			},
-			call,
+			bytes instanceof Uint8Array
+				? () => afterSuccess(call, () => vacated.set(file, { kind: "removed", bytes: Buffer.from(bytes) }))
+				: call,
 		);
 	};
 
@@ -291,6 +306,10 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 		Object.defineProperty(file, "writer", {
 			value: (...args: Parameters<typeof file.writer>) =>
 				commit("Bun.file().writer", file.name, () => writer(...args)),
+		});
+		const write = file.write.bind(file);
+		Object.defineProperty(file, "write", {
+			value: (...args: Parameters<typeof file.write>) => commit("Bun.file().write", file.name, () => write(...args)),
 		});
 		return file;
 	});
