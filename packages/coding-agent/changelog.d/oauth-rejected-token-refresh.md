@@ -1,0 +1,3 @@
+### Fixed
+
+- When a provider rejects an OAuth access token with HTTP 401 (`token_expired`, `invalid_token`, or an Anthropic `authentication_error`) before the token's recorded expiry, the session now refreshes that login once and retries the request on the new token in the same turn. Previously gjc kept resending the rejected token, and every request failed until the token's local expiry passed. If the refresh token is also dead (`invalid_grant`), the login is disabled so gjc reports the missing credentials instead. API-key credentials, pinned credentials, and `403 forbidden` responses keep their existing behavior.

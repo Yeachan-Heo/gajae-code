@@ -1362,6 +1362,14 @@ export interface InvalidateCredentialMatchingOptions {
 	owner?: object;
 }
 
+export type RefreshRejectedOAuthCredentialOptions = AuthApiKeyOptions & {
+	sessionId?: string;
+	/** Optional row identity and snapshot of the rejected token to avoid apiKey mismatch.
+	 * When provided, refresh is attempted only if the stored row still holds the same access token.
+	 */
+	rejectedCredentialId?: { id: number; access: string };
+};
+
 function isAbortSignalOption(
 	value: InvalidateCredentialMatchingOptions | AbortSignal | undefined,
 ): value is AbortSignal {
@@ -1778,6 +1786,12 @@ export class AuthStorage {
 	 * See {@link OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS}.
 	 */
 	#recentOAuthRefreshFailures = new Map<string, { expiresAt: number; error: unknown }>();
+	/**
+	 * Access tokens a provider rejected before their local expiry, keyed by row id.
+	 * Set only for the duration of {@link AuthStorage.refreshRejectedOAuthCredential};
+	 * a selection whose row still holds that exact token treats it as expired.
+	 */
+	#rejectedOAuthAccessTokens = new Map<number, string>();
 	#oauthRefreshLeaseOwner = crypto.randomUUID();
 
 	#closed = false;
@@ -2663,6 +2677,23 @@ export class AuthStorage {
 		const selected = this.#findCredentialBySelector(provider, preferredSelector);
 		if (selected?.credential.type !== "oauth" || !this.isCredentialAvailable(provider, selected.id)) return undefined;
 		return selected.id;
+	}
+
+	/**
+	 * Get the stored OAuth credential by row ID, returning the access token and refresh token.
+	 * Returns `undefined` if the row does not exist, is not an OAuth credential, or is unavailable.
+	 */
+	getOAuthCredentialByRowId(provider: string, rowId: number): { access: string; refresh: string } | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const credentials = this.#getStoredCredentials(storageProvider);
+		const entry = credentials.find(e => e.id === rowId);
+		if (entry?.credential.type === "oauth") {
+			return {
+				access: entry.credential.access,
+				refresh: entry.credential.refresh,
+			};
+		}
+		return undefined;
 	}
 
 	/** Return the stored API-key row pinned by a credential selector without resolving values. */
@@ -7115,11 +7146,23 @@ export class AuthStorage {
 			// credential's binding; `updated` must persist it or the next refresh
 			// of an MCP-bound row would dial the plain provider endpoint.
 			let refreshedAuthority: RefreshedOAuthCredentials;
+			// A provider rejected this exact access token before its local expiry:
+			// invalidate only this request's snapshot so the refresh below dials
+			// upstream. Lease adoption and the replay guard stay in effect, so a
+			// peer that already rotated the row is adopted instead of re-refreshed.
+			const rejectedAccess =
+				selectionCredentialId === undefined
+					? undefined
+					: this.#rejectedOAuthAccessTokens.get(selectionCredentialId);
+			const refreshInput =
+				rejectedAccess !== undefined && rejectedAccess === selection.credential.access
+					? { ...selection.credential, expires: 0 }
+					: selection.credential;
 			const customProvider = getOAuthProvider(provider);
 			if (customProvider) {
 				const refreshedCredentials = await this.#refreshOAuthCredential(
 					provider,
-					selection.credential,
+					refreshInput,
 					selectionCredentialId,
 					options?.signal,
 				);
@@ -7136,7 +7179,7 @@ export class AuthStorage {
 				// auth failure and soft-disable a still-valid credential.
 				const refreshedCredentials = await this.#refreshOAuthCredential(
 					provider,
-					selection.credential,
+					refreshInput,
 					selectionCredentialId,
 					options?.signal,
 				);
@@ -7807,6 +7850,81 @@ export class AuthStorage {
 			latestRows.map(row => ({ id: row.id, credential: row.credential, revision: row.revision })),
 		);
 		return true;
+	}
+
+	/**
+	 * Refresh the stored OAuth row whose access token a provider just rejected as
+	 * expired or invalid (HTTP 401) even though its recorded expiry is still in the
+	 * future. Expiry-driven refresh never fires for such a token, so without this
+	 * the same rejected token is resent until its local expiry passes.
+	 *
+	 * The refresh runs through the normal selection path for this session: the row
+	 * lease, peer-rotation adoption, and the replay guard all apply, and a
+	 * definitive refresh failure (`invalid_grant`, revoked grant) disables the row
+	 * exactly as an expiry-driven refresh failure would. Transient failures only
+	 * temp-block it.
+	 *
+	 * When `options.rejectedCredentialId` is provided, uses that row identity directly,
+	 * bypassing apiKey matching. This avoids mismatches with provider-adapted OAuth
+	 * request keys that do not reverse-match their stored raw access token. The refresh
+	 * proceeds only if the stored row still holds the same access token snapshot.
+	 *
+	 * Returns `true` when the matched row now holds a different access token.
+	 * API-key rows and keys that match no stored OAuth row return `false` without
+	 * touching any state.
+	 */
+	async refreshRejectedOAuthCredential(
+		provider: string,
+		apiKey: string,
+		options: RefreshRejectedOAuthCredentialOptions = {},
+	): Promise<boolean> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		let rejected: { id: number; access: string } | undefined;
+
+		// Use the provided credential identity and snapshot if available, avoiding
+		// apiKey matching for custom OAuth credentials with provider-adapted keys.
+		if (options.rejectedCredentialId) {
+			const { id, access } = options.rejectedCredentialId;
+			const stored = this.#getStoredCredentials(storageProvider).find(entry => entry.id === id);
+			if (stored?.credential.type === "oauth" && stored.credential.access === access) {
+				rejected = { id, access };
+			}
+		} else {
+			// Fall back to apiKey matching for callers that don't provide credential identity.
+			for (const entry of this.#getStoredCredentials(storageProvider)) {
+				if (entry.credential.type !== "oauth") continue;
+				if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) {
+					rejected = { id: entry.id, access: entry.credential.access };
+					break;
+				}
+			}
+		}
+		if (!rejected) return false;
+
+		const { sessionId, ...apiKeyOptions } = options;
+		this.#rejectedOAuthAccessTokens.set(rejected.id, rejected.access);
+		try {
+			await this.#resolveOAuthSelection(storageProvider, sessionId, {
+				...apiKeyOptions,
+				credentialSelector: { kind: "id", value: String(rejected.id) },
+			});
+		} catch (error) {
+			if (options.signal?.aborted) throw error;
+			// Log transient refresh failures at warn level to surface issues above debug.
+			// Definitive failures (invalid_grant, revoked) are surfaced through the
+			// existing disable event.
+			logger.warn("Refresh of a rejected OAuth access token failed", {
+				provider: storageProvider,
+				credentialId: rejected.id,
+				error: scrubHealthReason(error, [rejected.access]),
+			});
+		} finally {
+			if (this.#rejectedOAuthAccessTokens.get(rejected.id) === rejected.access) {
+				this.#rejectedOAuthAccessTokens.delete(rejected.id);
+			}
+		}
+		const current = this.#getStoredCredentials(storageProvider).find(entry => entry.id === rejected.id);
+		return current?.credential.type === "oauth" && current.credential.access !== rejected.access;
 	}
 
 	// ─── Auth Broker integration ────────────────────────────────────────────
