@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Subprocess } from "bun";
+import { collectSessionOwnersProbe } from "../../src/cli/doctor/session-owners-probe";
 import { collectSessionOwnersReport, renderSessionOwnersText } from "../../src/cli/session-owners-cli";
 import {
 	claimSessionOwner,
@@ -236,4 +237,79 @@ describe.if(supported)("gjc session owners", () => {
 		},
 		TIMEOUT_MS,
 	);
+});
+
+describe.if(supported)("gjc doctor session owners check", () => {
+	it(
+		"flags a held claim whose holder pid is gone, without touching the owners directory",
+		async () => {
+			await startHolder("stale-session", "terminal");
+			await startHolder("live-session", "terminal");
+			const gone = await deadPid();
+			await rewriteRecord("stale-session", { pid: gone, processIncarnation: null });
+			const before = await snapshot(sessionOwnersDirectory());
+
+			const result = await runCli(["doctor", "--json", "--check", "session"]);
+			const report = JSON.parse(result.stdout);
+			const byId = new Map(report.checks.map((check: { id: string }) => [check.id, check]));
+			expect(byId.get("session.owners.holders")).toMatchObject({
+				execution: "completed",
+				health: "warning",
+				reasonCode: "session_owner_holder_gone",
+				evidence: { count: 2, counts: { holderGone: 1 } },
+			});
+			expect(byId.get("session.owners.sidecars")).toMatchObject({
+				health: "ok",
+				reasonCode: "session_owner_sidecars_within_limit",
+				evidence: { count: 2 },
+			});
+			expect(result.stdout).not.toContain(String(gone));
+			expect(await snapshot(sessionOwnersDirectory())).toEqual(before);
+		},
+		TIMEOUT_MS,
+	);
+
+	it(
+		"does not flag a record that a live holder replaces before the second look",
+		async () => {
+			const holder = await startHolder("handoff-session", "terminal");
+			const live = JSON.parse(await fs.readFile(recordPath("handoff-session"), "utf8"));
+			await rewriteRecord("handoff-session", { pid: await deadPid(), processIncarnation: null });
+			const probe = collectSessionOwnersProbe(500);
+			await Bun.sleep(100);
+			await Bun.write(recordPath("handoff-session"), JSON.stringify(live));
+			const receipt = await probe;
+			expect(receipt.checks[0]).toMatchObject({ health: "ok", reasonCode: "session_owner_holders_consistent" });
+			expect(live.pid).toBe(holder);
+		},
+		TIMEOUT_MS,
+	);
+
+	it("warns when sidecars exceed the limit", async () => {
+		const owners = sessionOwnersDirectory();
+		await fs.mkdir(owners, { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(owners), 0o700);
+		await fs.chmod(path.dirname(path.dirname(owners)), 0o700);
+		// Free, owner-only sidecars, as claims leave them.
+		for (const key of ["a", "b", "c"])
+			await fs.writeFile(path.join(owners, `${key}.session-owner`), "", { mode: 0o600 });
+		const receipt = await collectSessionOwnersProbe(0, 2);
+		expect(receipt.checks[1]).toMatchObject({
+			id: "session.owners.sidecars",
+			health: "warning",
+			reasonCode: "session_owner_sidecars_over_limit",
+			evidence: { count: 3 },
+		});
+		expect(receipt.checks[0]).toMatchObject({ health: "ok", evidence: { count: 0 } });
+	});
+
+	it("is not applicable on a home that never claimed, and creates nothing", async () => {
+		const result = await runCli(["doctor", "--json", "--check", "session"]);
+		const report = JSON.parse(result.stdout);
+		expect(report.checks.map((check: { id: string; reasonCode: string }) => [check.id, check.reasonCode])).toEqual([
+			["session.owners.holders", "session_owners_absent"],
+			["session.owners.sidecars", "session_owners_absent"],
+		]);
+		await expect(fs.lstat(path.join(home, ".gjc", "runtime"))).rejects.toThrow();
+	});
 });

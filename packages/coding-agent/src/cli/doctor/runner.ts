@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { getTrustedHomeDir } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/dirs";
 import type { DoctorOptions } from "./args";
 import { BASIC_DOCTOR_COLLECTORS, type DoctorCollector, doctorCheck } from "./checks";
 import { createDoctorContext, type DoctorContext } from "./context";
+import { canonicalDigest } from "./ids";
 import { collectPluginTargets } from "./plugin-targets";
 import { collectDoctorProbe } from "./probe-client";
 import { executeSelectedDoctorRepair, planSelectedDoctorRepair, refuseUnsettledDoctorRepair } from "./repairs";
@@ -50,6 +54,52 @@ const PROJECTION_COLLECTOR: DoctorCollector = {
 	},
 };
 
+/**
+ * Session ownership (design §2.9). A home with no owners directory has nothing to check, so no
+ * probe runs; otherwise a probe child does the lock work, as native code may fail to load.
+ */
+const SESSION_COLLECTOR: DoctorCollector = {
+	id: "session",
+	dependsOn: [],
+	timeoutMs: 5_000,
+	async collect(context) {
+		let owners: string;
+		try {
+			owners = path.join(getTrustedHomeDir(), ".gjc", "runtime", "session-owners");
+		} catch {
+			owners = "";
+		}
+		const targetId = `t1:session-owners:r${canonicalDigest(["session-owners", owners])}`;
+		const absent =
+			owners !== "" &&
+			(await fs.lstat(owners).then(
+				() => false,
+				(error: NodeJS.ErrnoException) => error.code === "ENOENT",
+			));
+		if (absent)
+			return ["session.owners.holders", "session.owners.sidecars"].map(id =>
+				doctorCheck(id, targetId, {
+					execution: "completed",
+					health: "not_applicable",
+					evidenceLevel: "observed",
+					reasonCode: "session_owners_absent",
+				}),
+			);
+		const result = await collectDoctorProbe(context, "session-owners");
+		if (result.status === "completed" && result.receipt)
+			return result.receipt.checks.map(check => ({ ...check, targetId }));
+		return [
+			doctorCheck("session.owners.holders", targetId, {
+				execution:
+					result.status === "timeout" ? "timeout" : result.status === "cancelled" ? "cancelled" : "blocked",
+				health: "unknown",
+				evidenceLevel: "observed",
+				reasonCode: result.reasonCode,
+			}),
+		];
+	},
+};
+
 const SERVICE_COLLECTOR: DoctorCollector = {
 	id: "service",
 	dependsOn: [],
@@ -68,6 +118,7 @@ const COLLECTORS: readonly DoctorCollector[] = [
 	PLUGIN_COLLECTOR,
 	NATIVE_COLLECTOR,
 	PROJECTION_COLLECTOR,
+	SESSION_COLLECTOR,
 ];
 
 function coverage(checks: readonly DoctorCheck[], requested: number): DoctorCoverage {
@@ -162,7 +213,10 @@ function selectedCollectors(options: DoctorOptions): { collectors: DoctorCollect
 	};
 	if (options.checks.length === 0) {
 		for (const collector of COLLECTORS)
-			if (options.mode !== "dry-run" || (collector.id !== "native" && collector.id !== "projection"))
+			if (
+				options.mode !== "dry-run" ||
+				(collector.id !== "native" && collector.id !== "projection" && collector.id !== "session")
+			)
 				add(collector.id);
 	} else {
 		for (const selector of options.checks) {
