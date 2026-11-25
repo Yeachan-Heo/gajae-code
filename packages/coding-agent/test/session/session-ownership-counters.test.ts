@@ -44,17 +44,18 @@ beforeAll(async () => {
 
 /**
  * A stats database for `getStatsDbPath()`: a temp config dir under the home, named by a
- * home-relative `PI_CONFIG_DIR`, as `stats-cli*.test.ts` do. There is no absolute override, and
+ * home-relative `GJC_CONFIG_DIR`. The canonical name is required: the test runner sets
+ * `GJC_CONFIG_DIR=.gjc`, which outranks the legacy `PI_CONFIG_DIR` alias. There is no absolute override, and
  * `os.homedir()` does not follow a runtime `HOME` change. It is removed with `removeSync`, which the
  * test preload allows wherever the home is. Returns the restore.
  */
 function useStatsConfigDir(): () => void {
-	const original = process.env.PI_CONFIG_DIR;
+	const original = process.env.GJC_CONFIG_DIR;
 	const config = TempDir.createSync(path.join(os.homedir(), "gjc-ownership-counters-stats-"));
-	process.env.PI_CONFIG_DIR = path.relative(os.homedir(), config.join("config"));
+	process.env.GJC_CONFIG_DIR = path.relative(os.homedir(), config.join("config"));
 	return () => {
-		if (original === undefined) delete process.env.PI_CONFIG_DIR;
-		else process.env.PI_CONFIG_DIR = original;
+		if (original === undefined) delete process.env.GJC_CONFIG_DIR;
+		else process.env.GJC_CONFIG_DIR = original;
 		config.removeSync();
 	};
 }
