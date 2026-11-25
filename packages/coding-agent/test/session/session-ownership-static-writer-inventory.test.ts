@@ -311,6 +311,13 @@ const CHECKED_WRITERS: Record<string, Record<string, Run>> = {
 
 /** Methods that write no transcript bytes. Each runs, and must leave every transcript unchanged. */
 const NOT_TRANSCRIPT_WRITERS: Record<string, Run> = {
+	nestedManagedDestination: async f => {
+		const parent = SessionManager.managedDestination(f.cwd, f.agentDir);
+		if (parent.kind !== "managed") throw new Error("expected a managed destination");
+		const child = path.join(parent.directory, "child");
+		await fs.mkdir(child, { mode: 0o700 });
+		return SessionManager.nestedManagedDestination(parent.securityContext.rootAuthority, child);
+	},
 	openNoFollowDirectory: async f => (await SessionManager.openNoFollowDirectory(f.cwd)).close(),
 	claimProcessCwdOwnership: async f => {
 		const manager = keep(SessionManager.create(f.cwd, f.destination())) as SessionManager;
@@ -364,7 +371,6 @@ const DEFERRED_WRITERS: Record<string, string> = {
 	prepareManagedCandidateForWrite:
 		"open-time migration of a candidate from a legacy directory, before any manager exists. Open and continueRecent claim the candidate first (4b); forkFrom's migration of its source is pending a design decision (a scoped claim of the source when free, reading it in place when held)",
 	openNestedManaged: "a child session under its parent's store; children claim their own ids (4b class rules)",
-	nestedManagedDestination: "builds a child's destination and writes nothing itself; covered with the children (4b)",
 	stagedNestedManaged: "a staged child; staged sessions claim at commit (4b)",
 	openStagedNestedManaged: "a staged child; staged sessions claim at commit (4b)",
 };
@@ -466,7 +472,7 @@ describe.if(supported)("session ownership static writer inventory", () => {
 		it(`${name}: writes no transcript bytes`, async () => {
 			for (const kind of ["managed", "explicit"] as const) {
 				const result = await attribute(kind, run);
-				expect([kind, result.touched]).toEqual([kind, []]);
+				expect([kind, result.touched, result.error]).toEqual([kind, [], undefined]);
 			}
 		});
 	}
