@@ -9,6 +9,7 @@ import * as readline from "node:readline";
 import type { Process as NativeProcess } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
+import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
 import { BASH_SHELL_SUPERVISOR_ARG, type BashShellWorkerRequest } from "./bash-shell-worker-protocol";
 
 type NativeProcessBindings = { Process: typeof NativeProcess };
@@ -395,11 +396,7 @@ function supervisorArgv(): string[] {
 		: [process.execPath, path.join(import.meta.dir, "bash-shell-supervisor-entry.ts")];
 }
 
-/**
- * Agent dir of a shared SDK broker launch argv (`... sdk broker-internal --agent-dir <dir>`),
- * the only shape `ensure.ts` spawns. The argv only says where to look; the published
- * discovery record decides whether the process is that broker.
- */
+/** Extract the agent dir as a pre-filter only; a broker-shaped tail is not proof of authority. */
 export function sdkBrokerAgentDirFromArgs(args: readonly string[]): string | undefined {
 	const index = args.lastIndexOf("broker-internal");
 	if (index < 1 || args[index - 1] !== "sdk" || args[index + 1] !== "--agent-dir") return undefined;
@@ -410,6 +407,10 @@ export function sdkBrokerAgentDirFromArgs(args: readonly string[]): string | und
 export type SparedSdkBrokerDeps = {
 	/** Published broker identity for an agent dir, read fresh; null when none is published. */
 	readDiscovery: (agentDir: string) => Promise<{ pid: number; incarnation: string } | null>;
+	/** Exact executable and arguments that this runtime uses to launch the broker. */
+	expectedBrokerArgv: (agentDir: string) => readonly string[] | undefined;
+	/** Whether the kernel reports this pid and incarnation executing the expected command. */
+	executableMatches: (pid: number, incarnation: string, command: string) => boolean;
 	/** Pids descended from a pid by unique-id ancestry, including the pid itself. */
 	lineage: (pid: number) => Set<number> | undefined;
 	/** Current kernel incarnation of a pid, or undefined when it is gone or unreadable. */
@@ -417,11 +418,10 @@ export type SparedSdkBrokerDeps = {
 };
 
 /**
- * Pids cleanup must not kill: every owned process that is the published shared SDK
- * broker for its agent dir (same pid and incarnation as the discovery record), plus
- * the broker's descendants (its session hosts). The broker is a machine-wide daemon
- * that a guarded command may only have happened to start. A reused pid has a
- * different incarnation, so it does not match and is still killed.
+ * Spare an owned broker and its descendants only when its full launch argv matches this
+ * runtime's broker spawn command, the kernel identifies the expected executable at
+ * that pid and incarnation, and discovery publishes the same pid and incarnation.
+ * Discovery and argv alone are writable/spoofable and are not executable authority.
  */
 export async function findSparedSdkBrokerPids(
 	owned: Iterable<Pick<NativeProcess, "pid" | "incarnation" | "args">>,
@@ -437,6 +437,10 @@ export async function findSparedSdkBrokerPids(
 		}
 		const agentDir = sdkBrokerAgentDirFromArgs(args);
 		if (!agentDir) continue;
+		const expected = deps.expectedBrokerArgv(agentDir);
+		if (!expected?.length || args.length !== expected.length || args.some((arg, index) => arg !== expected[index]))
+			continue;
+		if (!deps.executableMatches(processRef.pid, processRef.incarnation, expected[0]!)) continue;
 		const discovery = await Promise.resolve()
 			.then(() => deps.readDiscovery(agentDir))
 			.catch(() => null);
@@ -518,8 +522,7 @@ export function signalOwnedProcessAlone(
 }
 
 async function readPublishedSdkBroker(agentDir: string): Promise<{ pid: number; incarnation: string } | null> {
-	// Loaded lazily so guardian startup does not pull in the SDK discovery modules; it
-	// only runs at cleanup when an owned process has the broker launch argv.
+	// Loaded lazily at cleanup, after the broker's exact launch argv and executable match.
 	const { readBrokerDiscovery } = await import("../sdk/broker/discovery");
 	// A stale heartbeat does not make the published broker any less shared; liveness
 	// and incarnation are still checked against the kernel.
@@ -692,6 +695,14 @@ export async function runBashShellGuardian(): Promise<void> {
 				const spared = darwinTracker
 					? await findSparedSdkBrokerPidsBounded(ownedProcesses.values(), {
 							readDiscovery: readPublishedSdkBroker,
+							expectedBrokerArgv: agentDir => {
+								const command = resolveSdkInternalSpawnCommand("broker-internal");
+								return [command.file, ...command.args, "--agent-dir", agentDir];
+							},
+							executableMatches: (pid, incarnation, command) =>
+								Process.fromPath(command).some(
+									candidate => candidate.pid === pid && candidate.incarnation === incarnation,
+								),
 							lineage: pid => darwinTracker.lineage(pid),
 							incarnationOf: pid => Process.fromPid(pid)?.incarnation,
 						})
