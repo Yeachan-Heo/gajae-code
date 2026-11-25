@@ -858,13 +858,17 @@ describe.if(supported)("the detector", () => {
 		});
 
 		for (const kind of ["managed", "explicit"] as const) {
-			it(`a move from a ${kind} destination is refused before it moves the transcript`, async () => {
+			it(`a ${kind} session's move is refused before it moves the transcript`, async () => {
 				const { manager, root, context } = await outsideStrictSeam(async () => {
 					const fixture = await bound(kind);
 					await fs.mkdir(path.join(fixture.context.cwd, "moved"));
 					return fixture;
 				});
 				const before = await transcripts(root);
+				const published: string[] = [];
+				manager.registerMovePublicationListener(move => {
+					published.push(move.newCwd);
+				});
 				await expect(manager.moveTo(path.join(context.cwd, "moved"))).rejects.toMatchObject({
 					name: "SessionWriteWithoutClaimError",
 					site: "session move",
@@ -872,6 +876,8 @@ describe.if(supported)("the detector", () => {
 				expectStrictDetections(1);
 				expect(await transcripts(root)).toEqual(before);
 				expect(manager.getSessionFile()).toBe(context.file);
+				// Refused before the move's publication effects: no listener heard of it.
+				expect(published).toEqual([]);
 			});
 		}
 
@@ -883,8 +889,13 @@ describe.if(supported)("the detector", () => {
 			manager.rewriteEntries();
 			await manager.flush();
 			await fs.mkdir(path.join(context.cwd, "moved"));
+			const published: string[] = [];
+			manager.registerMovePublicationListener(move => {
+				published.push(move.newCwd);
+			});
 			await manager.moveTo(path.join(context.cwd, "moved"));
 			expect(manager.getSessionFile()).not.toBe(context.file);
+			expect(published).toEqual([path.join(context.cwd, "moved")]);
 			expect(changed(before, await transcripts(root))).toBe(true);
 			expect(detectorLogs).toEqual([]);
 		});
