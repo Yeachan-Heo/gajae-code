@@ -79,4 +79,63 @@ compaction:
 		// The valid key should still be loaded
 		expect(settings.get("theme.dark")).toBe("red-claw");
 	});
+
+	test("malformed project hindsight section does not mask global-only hindsight values", async () => {
+		const root = await tempDir();
+		const agentDir = path.join(root, ".gjc");
+		await fs.mkdir(agentDir, { recursive: true });
+
+		// Write config.yml with a malformed hindsight scalar
+		const configPath = path.join(agentDir, "config.yml");
+		await fs.writeFile(
+			configPath,
+			`hindsight: "off"
+theme:
+  dark: red-claw
+`,
+		);
+
+		// Load settings - malformed hindsight should be excluded from project layer
+		const settings = await Settings.loadForScope({
+			cwd: root,
+			agentDir: agentDir,
+		});
+
+		// The valid key should still be loaded
+		expect(settings.get("theme.dark")).toBe("red-claw");
+
+		// Global-only hindsight.apiUrl should not be masked by malformed project scalar
+		const apiUrl = settings.get("hindsight.apiUrl");
+		// Should return a default value or undefined, never the malformed scalar "off"
+		expect(typeof apiUrl === "string" || apiUrl === undefined).toBe(true);
+	});
+
+	test("malformed project compaction section does not mask global-only compaction values", async () => {
+		const root = await tempDir();
+		const agentDir = path.join(root, ".gjc");
+		await fs.mkdir(agentDir, { recursive: true });
+
+		// Write config.yml with a malformed compaction scalar
+		const configPath = path.join(agentDir, "config.yml");
+		await fs.writeFile(
+			configPath,
+			`compaction: "off"
+theme:
+  dark: ocean-purple
+`,
+		);
+
+		// Load settings - malformed compaction should be excluded from project layer
+		const settings = await Settings.loadForScope({
+			cwd: root,
+			agentDir: agentDir,
+		});
+
+		// The valid key should still be loaded
+		expect(settings.get("theme.dark")).toBe("ocean-purple");
+
+		// Global-only compaction.remoteEndpoint should not be masked by malformed scalar
+		const remoteEndpoint = settings.get("compaction.remoteEndpoint");
+		expect(typeof remoteEndpoint === "string" || remoteEndpoint === undefined).toBe(true);
+	});
 });

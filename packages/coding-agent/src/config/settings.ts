@@ -6982,6 +6982,18 @@ export class Settings implements NotificationSettingsReader {
 				delete layer.searxng;
 			}
 		}
+		// A non-object hindsight value would replace the global hindsight object and drop
+		// the global-only hindsight.apiUrl. A non-object compaction value would similarly
+		// replace the compaction object and drop the global-only compaction.remoteEndpoint.
+		// Drop malformed parents; nested objects still lose only the global-only child paths.
+		for (const layer of [project, overrides]) {
+			for (const section of ["hindsight", "compaction"] as const) {
+				const value = layer[section];
+				if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value))) {
+					delete layer[section];
+				}
+			}
+		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
 			deleteByPath(project, segments);
