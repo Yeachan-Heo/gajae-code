@@ -26,7 +26,7 @@ Both eventually use `executeBash()` in `src/exec/bash-executor.ts` for non-PTY e
 - extracts a leading `cd <path> && ...` into `cwd` when `cwd` was not supplied,
 - rejects `async: true` when `async.enabled` is false,
 - optionally removes harmless trailing `| head ...` / `| tail ...` limiters through `applyBashFixups()` when `bash.stripTrailingHeadTail` is enabled,
-- leaves output-window selection to `OutputSink`: the `tools.bashOutputTailBytes` tail budget (1 KiB by default), plus head+tail middle elision when `tools.bashOutputHeadBytes` is non-zero (0 by default). The shared `tools.artifactTailBytes` / `tools.artifactHeadBytes` keys do not apply to the Bash tool.
+- leaves output-window selection to `OutputSink`: the `tools.bashOutputTailBytes` tail budget (1 KiB by default), plus head+tail middle elision when `tools.bashOutputHeadBytes` is non-zero (0 by default). The shared `tools.artifactTailBytes` / `tools.artifactHeadBytes` keys do not apply to the Bash tool: the post-processing wrapper (`wrapToolWithMetaNotice` threshold spill and the `tools.maxInlineResultBytes` inline backstop) also shapes a Bash excerpt from the Bash keys. Only the size cap itself (`tools.maxInlineResultBytes`, 12 KB by default) and `tools.artifactTailLines` remain shared.
 
 ## 2) Optional interception (blocked-command path)
 

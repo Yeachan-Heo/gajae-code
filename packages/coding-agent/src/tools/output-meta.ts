@@ -960,12 +960,29 @@ export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
  * larger shared defaults. Keeping the keys separate means the value a user
  * sees in settings is the value Bash applies.
  */
-export function resolveBashOutputSinkTailBytes(s: Settings): number {
-	return (s.get("tools.bashOutputTailBytes") ?? getDefault("tools.bashOutputTailBytes")) * 1024;
+export function resolveBashOutputSinkTailBytes(s: Settings | undefined): number {
+	return (s?.get("tools.bashOutputTailBytes") ?? getDefault("tools.bashOutputTailBytes")) * 1024;
 }
 
-export function resolveBashOutputSinkHeadBytes(s: Settings): number {
-	return (s.get("tools.bashOutputHeadBytes") ?? getDefault("tools.bashOutputHeadBytes")) * 1024;
+export function resolveBashOutputSinkHeadBytes(s: Settings | undefined): number {
+	return (s?.get("tools.bashOutputHeadBytes") ?? getDefault("tools.bashOutputHeadBytes")) * 1024;
+}
+
+/**
+ * Head/tail byte budgets for the inline excerpt the post-processing wrapper
+ * builds (threshold spill and absolute backstop). Bash results keep following
+ * the Bash keys here so the shared `tools.artifact*Bytes` keys never reshape a
+ * Bash excerpt; every other tool uses the shared spill budgets.
+ */
+function resolveInlineExcerptBudgets(
+	toolName: string,
+	s: Settings | undefined,
+): { headBytes: number; tailBytes: number } {
+	if (toolName === "bash") {
+		return { headBytes: resolveBashOutputSinkHeadBytes(s), tailBytes: resolveBashOutputSinkTailBytes(s) };
+	}
+	const { headBytes, tailBytes } = getSpillConfig(s);
+	return { headBytes, tailBytes };
 }
 
 /**
@@ -999,7 +1016,8 @@ async function spillLargeResultToArtifact(
 
 	const artifactCapability = artifactCapabilityForContext(context);
 	if (!artifactCapability) return result;
-	const { threshold, readThreshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	const { threshold, readThreshold, tailLines } = getSpillConfig(context?.settings);
+	const { headBytes, tailBytes } = resolveInlineExcerptBudgets(toolName, context?.settings);
 	// `read` manages its own per-range truncation, but the combined multi-range
 	// output has no cap — enforce a read-specific (higher) combined threshold
 	// instead of exempting read entirely. 0 disables read spill (backstop only).
@@ -1130,7 +1148,9 @@ function stripBodyOwnedTruncationFooter(text: string, details: unknown): string 
  * (reusing an existing artifactId to avoid double-artifacting) and truncated to a
  * head+tail view that fits the cap. Defaults to 12 KB, chosen by the live
  * tool-result A/B in #5945; a 0 cap, or a context that cannot store an
- * artifact, returns the result untouched.
+ * artifact, returns the result untouched. The cap itself is shared by every
+ * tool; whether the capped excerpt keeps a head follows the tool's own budget
+ * (`tools.bashOutputHeadBytes` for Bash, `tools.artifactHeadBytes` otherwise).
  */
 async function enforceInlineResultBackstop(
 	result: AgentToolResult,
@@ -1139,13 +1159,7 @@ async function enforceInlineResultBackstop(
 ): Promise<AgentToolResult> {
 	const { maxInlineBytes, tailLines } = getSpillConfig(context?.settings);
 	if (maxInlineBytes <= 0) return result;
-
-	// Bash uses its own retention budgets, not the shared artifact spill keys.
-	// Respect those settings to avoid reapplying the shared policy.
-	const headBytes =
-		toolName === "bash" && context?.settings
-			? resolveBashOutputSinkHeadBytes(context.settings)
-			: getSpillConfig(context?.settings).headBytes;
+	const { headBytes } = resolveInlineExcerptBudgets(toolName, context?.settings);
 
 	const textParts: string[] = [];
 	for (const block of result.content) {

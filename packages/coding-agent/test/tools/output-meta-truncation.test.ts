@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import type { AgentTool, AgentToolContext, AgentToolResult } from "@gajae-code/agent-core";
 import { z } from "@gajae-code/ai";
 import { Settings } from "../../src/config/settings";
+import { createReadonlySessionManager, SessionManager } from "../../src/session/session-manager";
 import { truncateHead, truncateMiddleWindows } from "../../src/session/streaming-output";
 import {
 	formatOutputNotice,
@@ -125,19 +127,57 @@ describe("output truncation metadata plumbing", () => {
 			expect(notice).toContain("artifact://art-full");
 		}
 	});
+});
 
-	test("Bash settings don't leak into shared artifact budgets", () => {
-		// Verify that setting shared keys to 20 KB doesn't affect Bash's 1 KB default
-		const bashSettings = Settings.isolated({
-			"tools.bashOutputTailBytes": 1,
-			"tools.bashOutputHeadBytes": 0,
-			"tools.artifactTailBytes": 20,
-			"tools.artifactHeadBytes": 20,
-		});
-		expect(resolveBashOutputSinkTailBytes(bashSettings)).toBe(1024);
-		expect(resolveBashOutputSinkHeadBytes(bashSettings)).toBe(0);
-		// But shared settings stay at 20 KB
-		const shared = bashSettings.get("tools.artifactHeadBytes");
-		expect(shared).toBe(20);
+describe("inline backstop excerpt shape follows the tool's own head budget", () => {
+	const HEAD = "HEADMARK";
+	const TAIL = "TAILMARK";
+	// ~4 KiB body: well above the 1 KiB cap used below, well below the 50 KiB
+	// threshold spill, so only enforceInlineResultBackstop reshapes it.
+	const body = `${HEAD}\n${Array.from({ length: 200 }, (_, i) => `line-${String(i).padStart(3, "0")} ${"x".repeat(12)}`).join("\n")}\n${TAIL}`;
+
+	function tool(name: string): AgentTool {
+		const result: AgentToolResult = { content: [{ type: "text", text: body }] };
+		return { name, description: "", parameters: {}, execute: async () => result } as unknown as AgentTool;
+	}
+
+	async function excerpt(name: string, overrides: Record<string, number>): Promise<string> {
+		const manager = SessionManager.inMemory();
+		const save = vi.spyOn(manager, "saveArtifact").mockImplementation(async () => "art-backstop");
+		try {
+			const context = {
+				settings: Settings.isolated({ "tools.maxInlineResultBytes": 1, ...overrides }),
+				sessionManager: createReadonlySessionManager(manager),
+			} as AgentToolContext;
+			const result = await wrapToolWithMetaNotice(tool(name)).execute("c", {}, undefined, undefined, context);
+			expect(save).toHaveBeenCalledTimes(1);
+			return result.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+		} finally {
+			save.mockRestore();
+		}
+	}
+
+	test("bash keeps a head when tools.bashOutputHeadBytes is set even if the shared head is 0", async () => {
+		const text = await excerpt("bash", { "tools.bashOutputHeadBytes": 1, "tools.artifactHeadBytes": 0 });
+		expect(text).toContain(HEAD);
+		expect(text).toContain(TAIL);
+	});
+
+	test("bash stays tail-only by default even if the shared head is 20 KB", async () => {
+		const text = await excerpt("bash", { "tools.artifactHeadBytes": 20 });
+		expect(text).not.toContain(HEAD);
+		expect(text).toContain(TAIL);
+	});
+
+	test("non-bash tools still follow the shared head budget", async () => {
+		const tailOnly = await excerpt("search", { "tools.artifactHeadBytes": 0, "tools.bashOutputHeadBytes": 1 });
+		expect(tailOnly).not.toContain(HEAD);
+		expect(tailOnly).toContain(TAIL);
+		const middle = await excerpt("search", { "tools.artifactHeadBytes": 1, "tools.bashOutputHeadBytes": 0 });
+		expect(middle).toContain(HEAD);
+		expect(middle).toContain(TAIL);
 	});
 });
