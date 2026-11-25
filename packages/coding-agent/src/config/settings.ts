@@ -534,8 +534,9 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
  * added later is covered without a new entry here. A project or runtime layer must not lower
  * another process's protection.
  */
+const SESSION_OWNERSHIP_SETTINGS_NAMESPACE = "session.ownership";
 function isSessionOwnershipSettingsPath(path: string): boolean {
-	return path === "session.ownership" || path.startsWith("session.ownership.");
+	return path === SESSION_OWNERSHIP_SETTINGS_NAMESPACE || path.startsWith(`${SESSION_OWNERSHIP_SETTINGS_NAMESPACE}.`);
 }
 /**
  * Project-layer values ignored at merge.
@@ -549,6 +550,47 @@ const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>([
 	// Operator extension disable list. A project file must not clear or replace it.
 	"disabledExtensions",
 ]);
+/** Global values the project layer must not erase: global-only, project-denied and credential-selection paths. */
+const PROJECT_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [
+	...GLOBAL_ONLY_SETTINGS,
+	SESSION_OWNERSHIP_SETTINGS_NAMESPACE,
+	...PROJECT_LAYER_DENIED_SETTINGS,
+	...[...GLOBAL_ONLY_AUTH_SETTING_KEYS].map(key => `auth.${key}`),
+].map(settingPath => settingPath.split("."));
+/** Global values the runtime layer must not erase. */
+const RUNTIME_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [
+	...GLOBAL_ONLY_SETTINGS,
+	SESSION_OWNERSHIP_SETTINGS_NAMESPACE,
+].map(settingPath => settingPath.split("."));
+
+/**
+ * Put back protected global values that a merged layer erased by replacing an ancestor with a
+ * non-object (null, a scalar or an array). Deleting the protected leaf before the merge covers object
+ * ancestors only. Every other key under that ancestor keeps the layer's replacement, as before.
+ */
+function restoreProtectedGlobalValues(
+	merged: RawSettings,
+	global: RawSettings,
+	protectedPaths: readonly string[][],
+): void {
+	for (const segments of protectedPaths) {
+		const globalValue = getByPath(global, segments);
+		if (globalValue === undefined || getByPath(merged, segments) !== undefined) continue;
+		let current = merged;
+		for (const segment of segments.slice(0, -1)) {
+			// Copy on write: merged objects can share nested objects with the global layer.
+			const next: RawSettings = { ...rawSettingsRecord(current[segment]) };
+			Object.defineProperty(current, segment, { configurable: true, enumerable: true, value: next, writable: true });
+			current = next;
+		}
+		Object.defineProperty(current, segments[segments.length - 1]!, {
+			configurable: true,
+			enumerable: true,
+			value: structuredClone(globalValue),
+			writable: true,
+		});
+	}
+}
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
@@ -6952,6 +6994,8 @@ export class Settings implements NotificationSettingsReader {
 		const overrides = structuredClone(overrideLayer);
 		// A non-object project clipboard value would replace the user clipboard
 		// object. Drop that parent; nested objects still lose only the denied leaves.
+		// The restore after each merge stage protects every leaf below. The searxng guard stays because
+		// dropping its parent also keeps non-global searxng keys; the clipboard guard is now redundant.
 		const projectClipboard = project.clipboard;
 		if (
 			projectClipboard !== undefined &&
@@ -6973,12 +7017,15 @@ export class Settings implements NotificationSettingsReader {
 			deleteByPath(project, segments);
 			deleteByPath(overrides, segments);
 		}
-		for (const layer of [project, overrides]) deleteByPath(layer, ["session", "ownership"]);
+		for (const layer of [project, overrides]) deleteByPath(layer, SESSION_OWNERSHIP_SETTINGS_NAMESPACE.split("."));
 		for (const settingPath of PROJECT_LAYER_DENIED_SETTINGS) {
 			deleteByPath(project, settingPath.split("."));
 		}
 		const merged = this.#deepMerge(this.#deepMerge({}, global), project);
-		return this.#deepMerge(merged, overrides);
+		restoreProtectedGlobalValues(merged, global, PROJECT_PROTECTED_SETTING_SEGMENTS);
+		const result = this.#deepMerge(merged, overrides);
+		restoreProtectedGlobalValues(result, global, RUNTIME_PROTECTED_SETTING_SEGMENTS);
+		return result;
 	}
 
 	#fireAllHooks(): void {
