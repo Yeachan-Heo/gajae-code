@@ -58,10 +58,18 @@ import {
 } from "../../src/session/session-storage";
 
 export interface TranscriptWriteLedger {
-	/** Ordered `check <site>` and `<primitive> <basename>` events, for failure messages. */
+	/**
+	 * Ordered events, for failure messages: `check <site> <id>` (`(no id)` when the check had none),
+	 * `<primitive> <basename>` for a commit or removal, `restore <primitive> <basename>` for a restore.
+	 */
 	readonly events: string[];
-	/** Commits no detector call covered, as `<primitive> <basename>`. */
+	/**
+	 * Commits no check for their own session covered, as `<primitive> <basename>`, ending in
+	 * ` (no session header)` when the session could not be read.
+	 */
 	readonly uncovered: string[];
+	/** The full paths of the `uncovered` commits, in the same order. */
+	readonly uncoveredFiles: string[];
 	/** Full paths of transcripts a spied primitive committed to, vacated or removed. */
 	readonly written: Set<string>;
 	/** Detector calls that had no session id to check, so they returned without looking. */
@@ -136,20 +144,24 @@ function landed(result: unknown): boolean {
 }
 
 export function spyOnTranscriptWrites(): TranscriptWriteLedger {
-	const uncovered: string[] = [];
+	const uncoveredEntries: { readonly label: string; readonly file: string }[] = [];
 	const ledger = {
 		events: [] as string[],
-		/** Read through a getter, so commits still waiting for their header are decided first. */
+		/** Read through getters, so commits still waiting for their header are decided first. */
 		get uncovered(): string[] {
-			resolveDeferred();
-			return uncovered;
+			resolveDeferred(true);
+			return uncoveredEntries.map(entry => entry.label);
+		},
+		get uncoveredFiles(): string[] {
+			resolveDeferred(true);
+			return uncoveredEntries.map(entry => entry.file);
 		},
 		written: new Set<string>(),
 		unbound: [] as string[],
 		exempt: new Map<string, string>(),
 		reset() {
 			ledger.events.length = 0;
-			uncovered.length = 0;
+			uncoveredEntries.length = 0;
 			deferred.length = 0;
 			ledger.written.clear();
 			ledger.unbound.length = 0;
@@ -169,6 +181,7 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 		sessionId?: string,
 	) {
 		const id = sessionId ?? this.currentSessionId;
+		resolveDeferred(false);
 		if (id === undefined) ledger.unbound.push(site);
 		else pending.add(id);
 		ledger.events.push(`check ${site} ${id ?? "(no id)"}`);
@@ -214,23 +227,31 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 		return result;
 	};
 
+	const flag = (label: string, file: string) => uncoveredEntries.push({ label, file });
+
 	/** A commit to the transcript of `id` is covered by a pending check for that id, which it uses up. */
-	const attribute = (label: string, id: string | undefined) => {
+	const attribute = (label: string, file: string, id: string | undefined) => {
 		if (id !== undefined && pending.delete(id)) return;
-		uncovered.push(id === undefined ? `${label} (no session header)` : label);
+		flag(id === undefined ? `${label} (no session header)` : label, file);
 	};
 
 	/**
 	 * Commits whose transcript had no header yet when they landed: an open whose bytes follow
-	 * through the handle. Each keeps the ids that were pending then, and is decided when the ledger
-	 * is next read, by the header the file has by then.
+	 * through the handle. Each takes the checks pending when it landed out of `pending`, reserving
+	 * them, and is decided once its header can be read: at the next check, at the next commit that
+	 * lands, or when the ledger is read. It is covered only by a reserved check for its own session,
+	 * which it uses up; the reserved checks it did not use go back to `pending`.
 	 */
-	const deferred: { readonly label: string; readonly file: string; readonly ids: Set<string> }[] = [];
-	const resolveDeferred = () => {
-		for (const { label, file, ids } of deferred.splice(0)) {
-			const id = readHeaderId(file);
-			if (id !== undefined && ids.has(id)) pending.delete(id);
-			else uncovered.push(id === undefined ? `${label} (no session header)` : label);
+	const deferred: { readonly label: string; readonly file: string; readonly reserved: Set<string> }[] = [];
+	/** Decide the deferred commits whose header can now be read; with `final`, every one left too. */
+	const resolveDeferred = (final: boolean) => {
+		for (const entry of [...deferred]) {
+			const id = readHeaderId(entry.file);
+			if (id === undefined && !final) continue;
+			deferred.splice(deferred.indexOf(entry), 1);
+			if (id === undefined || !entry.reserved.delete(id))
+				flag(id === undefined ? `${entry.label} (no session header)` : entry.label, entry.file);
+			for (const unused of entry.reserved) pending.add(unused);
 		}
 	};
 
@@ -259,11 +280,15 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 				ledger.events.push(`${restoring ? "restore " : ""}${primitive} ${name}`);
 				return didLand => {
 					if (!didLand) return;
+					resolveDeferred(false);
+					const label = `${primitive} ${name}`;
 					const id = readHeaderId(file);
 					// A restore puts back the same session's transcript; anything else is a new write.
 					if (restoring && gone.id === id) vacated.delete(file);
-					else if (id === undefined) deferred.push({ label: `${primitive} ${name}`, file, ids: new Set(pending) });
-					else attribute(`${primitive} ${name}`, id);
+					else if (id === undefined) {
+						deferred.push({ label, file, reserved: new Set(pending) });
+						pending.clear();
+					} else attribute(label, file, id);
 					// Only a rename that moved the file vacates its source.
 					if (source !== undefined) vacated.set(source, { kind: "renamed", to: file, id });
 				};

@@ -646,6 +646,29 @@ describe("session ownership writer inventory", () => {
 			expect(writes.uncovered).toEqual(["fs.promises.open y.jsonl"]);
 		});
 
+		/** Open `file` exclusively and write a transcript of session `id` through the handle. */
+		async function throughHandle(file: string, id: string) {
+			const handle = await fs.open(file, "wx");
+			await handle.writeFile(bytes(path.basename(file), id));
+			await handle.close();
+		}
+
+		it("one check covers only one handle-written open", async () => {
+			const at = await files();
+			check("session-x");
+			await throughHandle(at("x1.jsonl"), "session-x");
+			await throughHandle(at("x2.jsonl"), "session-x");
+			expect(writes.uncovered).toEqual(["fs.promises.open x2.jsonl"]);
+		});
+
+		it("a handle-written open uses up its check before a later write to the same transcript", async () => {
+			const at = await files();
+			check("session-x");
+			await throughHandle(at("x.jsonl"), "session-x");
+			await fs.appendFile(at("x.jsonl"), `${JSON.stringify({ type: "custom" })}\n`);
+			expect(writes.uncovered).toEqual(["fs.promises.appendFile x.jsonl"]);
+		});
+
 		it("a check with no write of its own covers no later write to another session", async () => {
 			const at = await files();
 			check("session-x");
