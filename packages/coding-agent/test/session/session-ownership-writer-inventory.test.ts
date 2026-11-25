@@ -14,10 +14,20 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
+import * as natives from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
-import { SessionWriteWithoutClaimError, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import {
+	SessionClaimSet,
+	SessionWriteWithoutClaimError,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import type {
 	MemoryGuardParticipantDescriptorV1,
+	MemoryGuardRestoreResult,
 	MemoryGuardSessionManagerCheckpointV1,
 } from "../../src/session/memory-guard-checkpoint-participant";
 import { type DefaultModelSelectionStage, SessionManager } from "../../src/session/session-manager";
@@ -28,14 +38,23 @@ import {
 	SessionOwnershipTestHooks,
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
+import {
+	expectStrictDetections,
+	outsideStrictSeam,
+	undeclaredStrictDetections,
+	useStrictWriteDetection,
+} from "./strict-write-detection";
+import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
 const managers: SessionManager[] = [];
 let detectorLogs: unknown[] = [];
+let writes: TranscriptWriteLedger;
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
+	writes = spyOnTranscriptWrites();
 	// The detector's log line stays in memory: the logger's file sink lives under the real home.
 	detectorLogs = [];
 	vi.spyOn(logger, "warn").mockImplementation((message, context) => {
@@ -55,6 +74,11 @@ afterEach(async () => {
 	}
 });
 
+/** Close every manager the test opened, so writes left for close are made (and counted) now. */
+async function closeManagers(): Promise<void> {
+	for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
+}
+
 function user(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
 }
@@ -72,6 +96,8 @@ interface Staged {
 	readonly run: (manager: SessionManager, context: Context, prepared: unknown) => unknown;
 	/** Start from a manager whose transcript is not on disk yet. */
 	readonly fresh?: boolean;
+	/** Skip the flush after `setup`, so `run` is the first flush of its writes. */
+	readonly unflushed?: boolean;
 }
 type Writer = Invoke | Staged;
 const always = () => true;
@@ -190,39 +216,72 @@ const SUCCESSOR_WRITERS: Record<string, Writer> = {
  * attribution check, without the requirement to write.
  */
 interface IndirectWriter {
-	/** The checked funnel its writes go through. */
-	readonly funnel: string;
-	/** Whether it writes in this scenario. If it does, the write must be reported at `funnel`. */
-	readonly writes: boolean;
+	/**
+	 * The checked funnel its writes go through, per destination, where it writes in this scenario;
+	 * such a write must be reported at that funnel. Without an entry it must write nothing. An
+	 * explicit destination's lines go through the persist writer, checked when it opened.
+	 */
+	readonly funnel: Partial<Record<Kind, string>>;
 	readonly writer: Writer;
 }
+/** A completed turn, so a recap of it is accepted. */
+function completedTurn(m: SessionManager) {
+	const requestEntryId = m.appendMessage(user("request"));
+	const sourceEntryId = m.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "answer" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	} as never);
+	return {
+		text: "recap",
+		sourceEntryId,
+		requestEntryId,
+		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+		generatedAt: "2026-11-02T07:12:00.000Z",
+	};
+}
+const APPEND_FUNNELS = { managed: "managed append", explicit: "persist writer open" } as const;
 const INDIRECT_WRITERS: Record<string, IndirectWriter> = {
 	appendSessionRecap: {
-		funnel: "managed append",
-		writes: false,
-		writer: m => m.appendSessionRecap({ recap: "r" } as never),
+		funnel: APPEND_FUNNELS,
+		writer: { setup: completedTurn, run: (m, _context, recap) => m.appendSessionRecap(recap as never) },
 	},
+	// Shared publications are managed-only; an explicit destination rejects them unwritten.
 	appendSessionRecapSharingSession: {
-		funnel: "managed append",
-		writes: false,
-		writer: m => m.appendSessionRecapSharingSession({ recap: "r" } as never),
+		funnel: { managed: "managed append" },
+		writer: { setup: completedTurn, run: (m, _context, recap) => m.appendSessionRecapSharingSession(recap as never) },
 	},
 	appendThinkingLevelChangeSharingSession: {
-		funnel: "managed append",
-		writes: false,
+		funnel: {},
 		writer: m => m.appendThinkingLevelChangeSharingSession("high", true, always),
 	},
-	newSession: { funnel: "new session successor", writes: false, writer: m => m.newSession() },
-	flush: { funnel: "managed append", writes: false, writer: m => m.flush() },
-	flushBeforeLeaving: { funnel: "managed append", writes: false, writer: m => m.flushBeforeLeaving() },
-	close: { funnel: "rewrite", writes: false, writer: m => m.close() },
-	closeStrict: { funnel: "rewrite", writes: false, writer: m => m.closeStrict() },
-	flushAndCloseStrict: { funnel: "rewrite", writes: false, writer: m => m.flushAndCloseStrict() },
-	recoverPersistenceFailure: { funnel: "rewrite", writes: false, writer: m => m.recoverPersistenceFailure() },
+	newSession: { funnel: {}, writer: m => m.newSession() },
+	// Managed appends and persist-writer lines land synchronously, so a flush only drains queued
+	// rewrites and patch publications, each checked at its own funnel when it runs.
+	flush: { funnel: {}, writer: { unflushed: true, setup: m => m.appendMessage(user("queued")), run: m => m.flush() } },
+	flushBeforeLeaving: {
+		funnel: {},
+		writer: { unflushed: true, setup: m => m.appendMessage(user("queued")), run: m => m.flushBeforeLeaving() },
+	},
+	close: { funnel: {}, writer: m => m.close() },
+	closeStrict: { funnel: {}, writer: m => m.closeStrict() },
+	flushAndCloseStrict: { funnel: {}, writer: m => m.flushAndCloseStrict() },
+	recoverPersistenceFailure: { funnel: {}, writer: m => m.recoverPersistenceFailure() },
 	// A missing or empty target file is created through the rewrite funnel.
 	setSessionFile: {
-		funnel: "rewrite",
-		writes: true,
+		funnel: { managed: "rewrite", explicit: "rewrite" },
 		writer: (m, { file }) => m.setSessionFile(path.join(path.dirname(file), "missing-target.jsonl")),
 	},
 };
@@ -261,6 +320,7 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
 		// The checkpoint copies the transcript, so its root sits outside the measured tree.
 		const checkpointRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-checkpoint-")));
 		roots.push(checkpointRoot);
+		writes.exempt.set(checkpointRoot, "a memory-guard checkpoint copy, not a session transcript");
 		const ingressLease = m.acquireMemoryGuardParticipantIngressLease();
 		try {
 			return await m.createMemoryGuardCheckpoint({ ingressLease, checkpointRoot });
@@ -350,10 +410,16 @@ async function transcripts(directory: string): Promise<Map<string, string>> {
 	return found;
 }
 
+/** Full paths, under `root`, of the transcripts whose bytes differ (a removed one included). */
+function changedPaths(root: string, before: Map<string, string>, after: Map<string, string>): Set<string> {
+	const paths = new Set<string>();
+	for (const name of new Set([...before.keys(), ...after.keys()]))
+		if (before.get(name) !== after.get(name)) paths.add(path.join(root, name));
+	return paths;
+}
+
 function changed(before: Map<string, string>, after: Map<string, string>): boolean {
-	if (before.size !== after.size) return true;
-	for (const [name, text] of after) if (before.get(name) !== text) return true;
-	return false;
+	return changedPaths("", before, after).size > 0;
 }
 
 async function bound(kind: Kind, fresh = false) {
@@ -390,12 +456,13 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 	let prepared: unknown;
 	try {
 		prepared = await staged.setup?.(manager, context);
-		await manager.flush();
+		if (!staged.unflushed) await manager.flush();
 	} catch (error) {
 		throw new Error(`setup failed: ${String(error)}`);
 	}
 	const before = await transcripts(root);
 	const detectedBefore = sessionOwnershipCounters().session_write_without_claim;
+	writes.reset();
 	try {
 		await staged.run(manager, context, prepared);
 		await manager.flush();
@@ -403,11 +470,23 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 		// A refusal is fine; only bytes that reached the disk need attribution.
 	}
 	// Close discards unpublished successors, so look before it too.
-	let wrote = changed(before, await transcripts(root));
+	const touched = changedPaths(root, before, await transcripts(root));
 	// In-memory rewrites (message updates, eviction) reach the disk as rewrite debt at close.
 	await manager.close().catch(() => undefined);
-	wrote ||= changed(before, await transcripts(root));
-	return { wrote, detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore };
+	for (const file of changedPaths(root, before, await transcripts(root))) touched.add(file);
+	return {
+		wrote: touched.size > 0,
+		detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore,
+		/** Commits no detector call covered, and changed transcripts no spied primitive wrote. */
+		unattributed: [
+			...writes.uncovered,
+			...[...touched].filter(file => !writes.written.has(file)).map(file => `unspied ${path.basename(file)}`),
+		],
+		/** Detector calls that went silent for want of a bound id. */
+		unbound: [...writes.unbound],
+		events: [...writes.events],
+		file: context.file,
+	};
 }
 
 describe("session ownership writer inventory", () => {
@@ -426,24 +505,150 @@ describe("session ownership writer inventory", () => {
 	it("the attribution check rejects a writer that reaches the disk around the detector", async () => {
 		const bypass: Invoke = (_m, { file }) => fs.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`);
 		const result = await attribute("explicit", bypass);
-		expect(result).toEqual({ wrote: true, detected: 0 });
+		expect(result).toMatchObject({ wrote: true, detected: 0 });
+		expect(result.unattributed).toEqual([`fs.promises.appendFile ${path.basename(result.file)}`]);
 	});
 
+	/** Write primitives a writer could reach the disk with after a checked write. */
+	const BYPASSES: Record<string, (file: string) => Promise<unknown>> = {
+		"fs.promises.appendFile": file => fs.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`),
+		"fs.appendFile": file => {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			fsSync.appendFile(file, `${JSON.stringify({ type: "custom" })}\n`, error =>
+				error ? reject(error) : resolve(),
+			);
+			return promise;
+		},
+		"fs.truncateSync": async file => fsSync.truncateSync(file, 1),
+		"fs.createWriteStream": file => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			fsSync.createWriteStream(file, { flags: "a" }).end(`${JSON.stringify({ type: "custom" })}\n`, resolve);
+			return promise;
+		},
+		"Bun.write": file => Bun.write(file, `${JSON.stringify({ type: "custom" })}\n`),
+		"Bun.file().write": file => Bun.file(file).write(`${JSON.stringify({ type: "custom" })}\n`),
+		"Bun.file().writer": async file => {
+			const sink = Bun.file(file).writer();
+			sink.write(`${JSON.stringify({ type: "custom" })}\n`);
+			await sink.end();
+		},
+	};
+	describe("the write ledger's restores", () => {
+		/** A detector call with an id to check, so the next commit is covered. */
+		const check = () => new SessionClaimSet().checkWrite("ledger self-test", "self-test-session");
+		const bytes = (text: string) => Buffer.from(`${JSON.stringify({ type: "custom", text })}\n`);
+		async function stores() {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ledger-store-")));
+			roots.push(root);
+			const authority = managedDirectoryRoot(root);
+			const open = async (name: string) => {
+				await fs.mkdir(path.join(root, name), { mode: 0o700 });
+				return new ManagedSessionDescendantStore(authority, path.join(root, name));
+			};
+			return { root, a: await open("a"), b: await open("b") };
+		}
+		/** Publish `s.jsonl` (checked), then remove it as a managed removal does. */
+		function publishThenRemove(store: ManagedSessionDescendantStore) {
+			check();
+			store.publishNoReplaceSync("s.jsonl", bytes("original"));
+			store.removeExpected("s.jsonl", store.readExpected("s.jsonl")!);
+		}
+
+		it("republishing the exact bytes a removal took is a restore", async () => {
+			const { a, b } = await stores();
+			writes.reset();
+			publishThenRemove(a);
+			a.publishNoReplaceSync("s.jsonl", bytes("original"));
+			expect(writes.uncovered).toEqual([]);
+			a.close();
+			b.close();
+		});
+
+		it("different bytes at the vacated path are a new write", async () => {
+			const { a, b } = await stores();
+			writes.reset();
+			publishThenRemove(a);
+			a.publishNoReplaceSync("s.jsonl", bytes("different"));
+			expect(writes.uncovered).toEqual(["store.publishNoReplaceSync s.jsonl"]);
+			a.close();
+			b.close();
+		});
+
+		it("the same bytes published into another store are a new write", async () => {
+			const { a, b } = await stores();
+			writes.reset();
+			publishThenRemove(a);
+			b.publishNoReplaceSync("s.jsonl", bytes("original"));
+			expect(writes.uncovered).toEqual(["store.publishNoReplaceSync s.jsonl"]);
+			a.close();
+			b.close();
+		});
+
+		async function files(...names: string[]) {
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ledger-files-")));
+			roots.push(root);
+			for (const name of names) await fs.writeFile(path.join(root, name), bytes(name));
+			writes.reset();
+			return (name: string) => path.join(root, name);
+		}
+
+		it("renaming the moved file back is a restore; renaming a different file into its place is not", async () => {
+			const at = await files("a.jsonl", "c.jsonl");
+			check();
+			await fs.rename(at("a.jsonl"), at("b.jsonl"));
+			await fs.rename(at("c.jsonl"), at("a.jsonl"));
+			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl"]);
+
+			const back = await files("a.jsonl");
+			check();
+			await fs.rename(back("a.jsonl"), back("b.jsonl"));
+			await fs.rename(back("b.jsonl"), back("a.jsonl"));
+			expect(writes.uncovered).toEqual([]);
+		});
+
+		it("a rename that did not happen vacates nothing", async () => {
+			const at = await files("a.jsonl", "b.jsonl");
+			check();
+			// The no-replace rename onto an existing file fails without moving anything.
+			expect(natives.renameNoReplacePath(at("a.jsonl"), at("b.jsonl")).mutationState).toBe("not_committed");
+			await fs.rename(at("b.jsonl"), at("a.jsonl"));
+			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl"]);
+		});
+	});
+
+	for (const [primitive, bypass] of Object.entries(BYPASSES)) {
+		it(`per-write attribution rejects one checked write followed by one through ${primitive}`, async () => {
+			// The operation as a whole is seen; only its second write is not.
+			const mixed: Invoke = async (m, { file }) => {
+				m.appendMessage(user("checked"));
+				await bypass(file);
+			};
+			const result = await attribute("managed", mixed);
+			expect(result).toMatchObject({ wrote: true });
+			expect(result.detected).toBeGreaterThan(0);
+			expect(result.unattributed).toEqual([`${primitive} ${path.basename(result.file)}`]);
+		});
+	}
+
 	const writers = { ...CURRENT_WRITERS, ...SUCCESSOR_WRITERS };
-	for (const [name, { funnel, writes, writer }] of Object.entries(INDIRECT_WRITERS)) {
+	for (const [name, { funnel: funnels, writer }] of Object.entries(INDIRECT_WRITERS)) {
 		for (const kind of ["managed", "explicit"] as const) {
-			it(`${name} (${kind}): ${writes ? `writes through ${funnel}, reported` : "writes nothing here"}`, async () => {
+			const funnel = funnels[kind];
+			it(`${name} (${kind}): ${funnel ? `writes through ${funnel}, reported` : "writes nothing here"}`, async () => {
 				detectorLogs = [];
 				const result = await attribute(kind, writer);
-				expect(result.wrote).toBe(writes);
-				if (writes) expect((detectorLogs as { site: string }[]).some(log => log.site === funnel)).toBe(true);
+				expect(result.wrote).toBe(funnel !== undefined);
+				expect(result.unattributed).toEqual([]);
+				if (funnel) expect((detectorLogs as { site: string }[]).map(log => log.site)).toContain(funnel);
 			});
 		}
 	}
 	for (const [name, writer] of Object.entries(NOT_TRANSCRIPT_WRITERS)) {
 		it(`${name}: writes no transcript bytes`, async () => {
-			for (const kind of ["managed", "explicit"] as const)
-				expect([kind, (await attribute(kind, writer)).wrote]).toEqual([kind, false]);
+			for (const kind of ["managed", "explicit"] as const) {
+				const result = await attribute(kind, writer);
+				expect([kind, result.wrote, result.unattributed]).toEqual([kind, false, []]);
+			}
 		});
 	}
 	const wroteSomewhere = new Set<string>();
@@ -451,6 +656,13 @@ describe("session ownership writer inventory", () => {
 		for (const kind of ["managed", "explicit"] as const) {
 			it(`${name} (${kind}): every transcript write without a claim is detected`, async () => {
 				const result = await attribute(kind, writer);
+				// Each commit to a transcript follows its own detector call, and none of them went silent.
+				// The ordered events are in the failure message.
+				expect({ unattributed: result.unattributed, unbound: result.unbound }).toEqual({
+					unattributed: [],
+					unbound: [],
+					...(result.unattributed.length + result.unbound.length > 0 ? { events: result.events } : {}),
+				});
 				if (result.wrote) {
 					wroteSomewhere.add(name);
 					expect(result.detected).toBeGreaterThan(0);
@@ -462,8 +674,35 @@ describe("session ownership writer inventory", () => {
 	for (const [name, writer] of Object.entries(CURRENT_WRITERS)) {
 		// Claims need the native lock, which this platform may not have.
 		it.if(supported)(`${name}: no detection while the current session is claimed`, async () => {
-			for (const kind of ["managed", "explicit"] as const)
-				expect((await attribute(kind, writer, true)).detected).toBe(0);
+			for (const kind of ["managed", "explicit"] as const) {
+				const result = await attribute(kind, writer, true);
+				expect([kind, result.detected, result.unattributed]).toEqual([kind, 0, []]);
+			}
+		});
+	}
+
+	for (const kind of ["managed", "explicit"] as const) {
+		it(`moveTo (${kind}): a failed move's rollback puts the transcript back, attributed as a restore`, async () => {
+			const { manager, context } = await bound(kind);
+			const target = path.join(context.cwd, "moved");
+			await fs.mkdir(target);
+			const bytes = await fs.readFile(context.file, "utf8");
+			// Fail the target-directory check that follows the transcript's move, once it has moved.
+			const lstat = fsSync.promises.lstat;
+			let injected = false;
+			vi.spyOn(fsSync.promises, "lstat").mockImplementation(((file: fsSync.PathLike, options?: never) => {
+				if (!injected && file === target && !fsSync.existsSync(context.file)) {
+					injected = true;
+					return Promise.reject(Object.assign(new Error("injected"), { code: "EIO" }));
+				}
+				return lstat(file, options);
+			}) as never);
+			writes.reset();
+			await expect(manager.moveTo(target)).rejects.toThrow();
+			expect(injected).toBe(true);
+			expect(await fs.readFile(context.file, "utf8")).toBe(bytes);
+			expect(writes.events.filter(event => event.startsWith("restore "))).toHaveLength(1);
+			expect(writes.uncovered).toEqual([]);
 		});
 	}
 
@@ -555,14 +794,20 @@ describe.if(supported)("recovery promotion", () => {
 		} as RecoveryFsRoot;
 	}
 
-	/** A staged memory-guard recovery of an explicit-destination session holding `messages`. */
-	async function stagedRecovery(messages: readonly Parameters<SessionManager["appendMessage"]>[0][]) {
+	/** A staged memory-guard recovery of a session holding `messages`, restored to a `kind` destination. */
+	async function stagedRecovery(
+		messages: readonly Parameters<SessionManager["appendMessage"]>[0][],
+		kind: Kind = "explicit",
+	) {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-recovery-")));
 		roots.push(root);
 		const source = await SessionManager.open(path.join(root, "source", "checkpoint.jsonl"));
 		managers.push(source);
 		for (const message of messages) source.appendMessage(message);
 		await source.flush();
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(path.join(root, "agent"), { recursive: true, mode: 0o700 });
 		const checkpointRoot = path.join(root, "checkpoint");
 		const ingressLease = source.acquireMemoryGuardParticipantIngressLease();
 		let checkpoint: MemoryGuardSessionManagerCheckpointV1;
@@ -576,7 +821,10 @@ describe.if(supported)("recovery promotion", () => {
 			incidentAuthority: authority(checkpointRoot),
 			participant: participant(checkpoint),
 			checkpoint,
-			destination: path.join(root, "restore"),
+			destination:
+				kind === "managed"
+					? SessionManager.managedDestination(cwd, path.join(root, "agent"))
+					: path.join(root, "restore"),
 		});
 		if (restored.kind !== "staged") throw new Error(`expected a staged recovery, got ${restored.reason}`);
 		managers.push(restored.manager);
@@ -596,29 +844,30 @@ describe.if(supported)("recovery promotion", () => {
 		});
 	});
 
-	it("the replay-metadata sanitize the promotion persists first is checked before it writes (strict seam)", async () => {
-		// An assistant reply carrying OpenAI Responses replay state the promotion sanitizes and persists.
-		const stale = {
-			role: "assistant",
-			content: [
-				{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
-				{ type: "text", text: "answer" },
-			],
-			api: "openai-responses",
-			provider: "openai",
-			model: "gpt-fixture",
-			usage: {
-				input: 1,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 2,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-			providerPayload: { type: "openaiResponsesHistory", items: [] },
-		} as unknown as Parameters<SessionManager["appendMessage"]>[0];
+	// An assistant reply carrying OpenAI Responses replay state the promotion sanitizes and persists.
+	const stale = {
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
+			{ type: "text", text: "answer" },
+		],
+		api: "openai-responses",
+		provider: "openai",
+		model: "gpt-fixture",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+		providerPayload: { type: "openaiResponsesHistory", items: [] },
+	} as unknown as Parameters<SessionManager["appendMessage"]>[0];
+
+	it("the replay-metadata sanitize the promotion persists first is reported before the promotion", async () => {
 		// In observe the sanitize persists its patch, through the persist writer it opens, and is reported.
 		const observed = await stagedRecovery([user("question"), stale]);
 		detectorLogs = [];
@@ -629,23 +878,48 @@ describe.if(supported)("recovery promotion", () => {
 		const sites = (detectorLogs as { site: string }[]).map(log => log.site);
 		expect(sites.indexOf("persist writer open")).toBeGreaterThanOrEqual(0);
 		expect(sites.indexOf("persist writer open")).toBeLessThan(sites.indexOf("recovery promotion"));
+	});
 
-		const restored = await stagedRecovery([user("question"), stale]);
-		const staged = restored.manager.getSessionFile()!;
-		const assistant = restored.manager
-			.getEntries()
-			.find(entry => entry.type === "message" && entry.message.role === "assistant");
-		// The sanitize has something to persist at promotion time.
-		expect((assistant as { message: { providerPayload?: unknown } }).message.providerPayload).toBeDefined();
-		const before = await fs.readFile(staged, "utf8");
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		await expect(
+	describe("under the strict seam", () => {
+		useStrictWriteDetection(closeManagers);
+		const promote = (restored: Extract<MemoryGuardRestoreResult, { kind: "staged" }>) =>
 			restored.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(restored.hydrationContext, {
 				ownershipReady: true,
-			}),
-		).rejects.toMatchObject({ name: "SessionWriteWithoutClaimError", site: "persist writer open" });
-		// Nothing reached the staged transcript before the detector stopped it.
-		expect(await fs.readFile(staged, "utf8")).toBe(before);
+			});
+
+		it("the replay-metadata sanitize the promotion persists first is checked before it writes", async () => {
+			const restored = await outsideStrictSeam(() => stagedRecovery([user("question"), stale]));
+			const staged = restored.manager.getSessionFile()!;
+			const assistant = restored.manager
+				.getEntries()
+				.find(entry => entry.type === "message" && entry.message.role === "assistant");
+			// The sanitize has something to persist at promotion time.
+			expect((assistant as { message: { providerPayload?: unknown } }).message.providerPayload).toBeDefined();
+			const before = await fs.readFile(staged, "utf8");
+			await expect(promote(restored)).rejects.toMatchObject({
+				name: "SessionWriteWithoutClaimError",
+				site: "persist writer open",
+			});
+			expectStrictDetections(1);
+			// Nothing reached the staged transcript before the detector stopped it.
+			expect(await fs.readFile(staged, "utf8")).toBe(before);
+		});
+
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`the promotion (${kind}) is refused before it publishes anything`, async () => {
+				// Nothing to sanitize, so the promotion's own check is the first one reached.
+				const restored = await outsideStrictSeam(() => stagedRecovery([user("recovered")], kind));
+				const directory = path.dirname(restored.manager.getSessionFile()!);
+				const before = await transcripts(directory);
+				await expect(promote(restored)).rejects.toMatchObject({
+					name: "SessionWriteWithoutClaimError",
+					site: "recovery promotion",
+				});
+				expectStrictDetections(1);
+				// No promoted transcript appeared, and the staged one is still there, unchanged.
+				expect(await transcripts(directory)).toEqual(before);
+			});
+		}
 	});
 });
 
@@ -666,38 +940,102 @@ describe.if(supported)("the detector", () => {
 		expect(new Set(sites).size).toBe(sites.length);
 	});
 
-	it("the strict seam throws before the write, and is silent for a claimed session", async () => {
+	describe("under the strict seam", () => {
+		useStrictWriteDetection(closeManagers);
 		const update = (m: SessionManager, first: string) =>
 			m.applyEntryMessageUpdates([{ ...m.getEntry(first), message: user("rewritten") } as never]);
-		const unclaimed = await bound("explicit");
-		const before = await transcripts(unclaimed.root);
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		update(unclaimed.manager, unclaimed.context.first);
-		await expect(unclaimed.manager.rewriteEntries()).rejects.toThrow(SessionWriteWithoutClaimError);
-		expect(changed(before, await transcripts(unclaimed.root))).toBe(false);
 
-		delete SessionOwnershipTestHooks.strictWriteDetection;
-		const claimed = await bound("explicit");
-		const result = await claimSessionOwner(claimed.manager.getSessionId(), { surface: "terminal" });
-		if (result.status !== "claimed") throw new Error("expected a claim");
-		sessionClaimSetOf(claimed.manager).add(result.claim);
-		const claimedBefore = await transcripts(claimed.root);
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		update(claimed.manager, claimed.context.first);
-		await claimed.manager.rewriteEntries();
-		expect(changed(claimedBefore, await transcripts(claimed.root))).toBe(true);
-	});
+		it("throws before the write", async () => {
+			const unclaimed = await outsideStrictSeam(() => bound("explicit"));
+			const before = await transcripts(unclaimed.root);
+			update(unclaimed.manager, unclaimed.context.first);
+			await expect(unclaimed.manager.rewriteEntries()).rejects.toThrow(SessionWriteWithoutClaimError);
+			expect(changed(before, await transcripts(unclaimed.root))).toBe(false);
+			expectStrictDetections(1);
+		});
 
-	it("does nothing in off, even under the strict seam", async () => {
-		SessionOwnershipTestHooks.mode = "off";
-		SessionOwnershipTestHooks.strictWriteDetection = true;
-		const { manager, root } = await bound("managed");
-		const before = await transcripts(root);
-		manager.appendMessage(user("off"));
-		manager.rewriteEntries();
-		await manager.flush();
-		expect(changed(before, await transcripts(root))).toBe(true);
-		expect(sessionOwnershipCounters().session_write_without_claim).toBe(0);
-		expect(detectorLogs).toEqual([]);
+		it("is silent for a claimed session", async () => {
+			const claimed = await outsideStrictSeam(async () => {
+				const fixture = await bound("explicit");
+				const result = await claimSessionOwner(fixture.manager.getSessionId(), { surface: "terminal" });
+				if (result.status !== "claimed") throw new Error("expected a claim");
+				sessionClaimSetOf(fixture.manager).add(result.claim);
+				return fixture;
+			});
+			const before = await transcripts(claimed.root);
+			update(claimed.manager, claimed.context.first);
+			await claimed.manager.rewriteEntries();
+			expect(changed(before, await transcripts(claimed.root))).toBe(true);
+		});
+
+		it("a strict throw a caller swallows is still counted against the test", async () => {
+			const { manager } = await outsideStrictSeam(() => bound("managed"));
+			try {
+				manager.appendMessage(user("swallowed"));
+			} catch {
+				// A caller that turns the refusal into an outcome.
+			}
+			// Without this declaration the afterEach check fails the test.
+			expect(undeclaredStrictDetections()).toBe(1);
+			expectStrictDetections(1);
+		});
+
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`a ${kind} session's move is refused before it moves the transcript`, async () => {
+				const { manager, root, context } = await outsideStrictSeam(async () => {
+					const fixture = await bound(kind);
+					await fs.mkdir(path.join(fixture.context.cwd, "moved"));
+					return fixture;
+				});
+				const before = await transcripts(root);
+				const published: string[] = [];
+				manager.registerMovePublicationListener(move => {
+					published.push(move.newCwd);
+				});
+				await expect(manager.moveTo(path.join(context.cwd, "moved"))).rejects.toMatchObject({
+					name: "SessionWriteWithoutClaimError",
+					site: "session move",
+				});
+				expectStrictDetections(1);
+				expect(await transcripts(root)).toEqual(before);
+				expect(manager.getSessionFile()).toBe(context.file);
+				// Refused before the move's publication effects: no listener heard of it.
+				expect(published).toEqual([]);
+			});
+		}
+
+		for (const kind of ["managed", "explicit"] as const) {
+			it(`a ${kind} session never written to disk moves without a report`, async () => {
+				// Nothing to republish, so nothing to check.
+				const { manager, root, context } = await outsideStrictSeam(async () => {
+					const fixture = await bound(kind, true);
+					await fs.mkdir(path.join(fixture.context.cwd, "moved"));
+					return fixture;
+				});
+				const before = await transcripts(root);
+				await manager.moveTo(path.join(context.cwd, "moved"));
+				expect(manager.getSessionFile()).not.toBe(context.file);
+				expect(await transcripts(root)).toEqual(before);
+			});
+		}
+
+		it("does nothing in off", async () => {
+			SessionOwnershipTestHooks.mode = "off";
+			const { manager, root, context } = await bound("managed");
+			const before = await transcripts(root);
+			manager.appendMessage(user("off"));
+			manager.rewriteEntries();
+			await manager.flush();
+			await fs.mkdir(path.join(context.cwd, "moved"));
+			const published: string[] = [];
+			manager.registerMovePublicationListener(move => {
+				published.push(move.newCwd);
+			});
+			await manager.moveTo(path.join(context.cwd, "moved"));
+			expect(manager.getSessionFile()).not.toBe(context.file);
+			expect(published).toEqual([path.join(context.cwd, "moved")]);
+			expect(changed(before, await transcripts(root))).toBe(true);
+			expect(detectorLogs).toEqual([]);
+		});
 	});
 });

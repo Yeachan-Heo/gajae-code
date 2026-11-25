@@ -12792,6 +12792,10 @@ export class SessionManager {
 				destination.fsyncTree();
 			};
 			try {
+				// The move republishes this session's transcript at its new path, if it has one on disk.
+				// Checked before any publication effect, so the strict seam refuses with nothing moved.
+				if (oldSessionFile !== newSessionFile && this.#storage.existsSync(oldSessionFile))
+					this.#ownershipClaims.checkWrite("session move");
 				await this.#runMovePublicationListeners(moveDetails);
 				publicationStarted = true;
 			} catch (error) {
