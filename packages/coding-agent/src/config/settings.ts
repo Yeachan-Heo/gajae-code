@@ -534,8 +534,9 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
  * added later is covered without a new entry here. A project or runtime layer must not lower
  * another process's protection.
  */
+const SESSION_OWNERSHIP_SETTINGS_NAMESPACE = "session.ownership";
 function isSessionOwnershipSettingsPath(path: string): boolean {
-	return path === "session.ownership" || path.startsWith("session.ownership.");
+	return path === SESSION_OWNERSHIP_SETTINGS_NAMESPACE || path.startsWith(`${SESSION_OWNERSHIP_SETTINGS_NAMESPACE}.`);
 }
 /**
  * Project-layer values ignored at merge.
@@ -552,13 +553,15 @@ const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>([
 /** Global values the project layer must not erase: global-only, project-denied and credential-selection paths. */
 const PROJECT_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [
 	...GLOBAL_ONLY_SETTINGS,
+	SESSION_OWNERSHIP_SETTINGS_NAMESPACE,
 	...PROJECT_LAYER_DENIED_SETTINGS,
 	...[...GLOBAL_ONLY_AUTH_SETTING_KEYS].map(key => `auth.${key}`),
 ].map(settingPath => settingPath.split("."));
 /** Global values the runtime layer must not erase. */
-const RUNTIME_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [...GLOBAL_ONLY_SETTINGS].map(settingPath =>
-	settingPath.split("."),
-);
+const RUNTIME_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [
+	...GLOBAL_ONLY_SETTINGS,
+	SESSION_OWNERSHIP_SETTINGS_NAMESPACE,
+].map(settingPath => settingPath.split("."));
 
 /**
  * Put back protected global values that a merged layer erased by replacing an ancestor with a
@@ -6991,6 +6994,8 @@ export class Settings implements NotificationSettingsReader {
 		const overrides = structuredClone(overrideLayer);
 		// A non-object project clipboard value would replace the user clipboard
 		// object. Drop that parent; nested objects still lose only the denied leaves.
+		// The restore after each merge stage protects every leaf below. The searxng guard stays because
+		// dropping its parent also keeps non-global searxng keys; the clipboard guard is now redundant.
 		const projectClipboard = project.clipboard;
 		if (
 			projectClipboard !== undefined &&
@@ -7012,7 +7017,7 @@ export class Settings implements NotificationSettingsReader {
 			deleteByPath(project, segments);
 			deleteByPath(overrides, segments);
 		}
-		for (const layer of [project, overrides]) deleteByPath(layer, ["session", "ownership"]);
+		for (const layer of [project, overrides]) deleteByPath(layer, SESSION_OWNERSHIP_SETTINGS_NAMESPACE.split("."));
 		for (const settingPath of PROJECT_LAYER_DENIED_SETTINGS) {
 			deleteByPath(project, settingPath.split("."));
 		}
