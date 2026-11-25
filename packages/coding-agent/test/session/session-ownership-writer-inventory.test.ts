@@ -9,11 +9,17 @@
  * around the detector fails the attribution check.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { RecoveryFsRoot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { SessionWriteWithoutClaimError, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import type {
+	MemoryGuardParticipantDescriptorV1,
+	MemoryGuardSessionManagerCheckpointV1,
+} from "../../src/session/memory-guard-checkpoint-participant";
 import { type DefaultModelSelectionStage, SessionManager } from "../../src/session/session-manager";
 import {
 	claimSessionOwner,
@@ -248,7 +254,11 @@ const DEFERRED_WRITERS: Record<string, string> = {
 	commitStagedNestedManaged: "staged child publication; staged sessions claim at commit",
 	discardStagedNestedManaged: "unpublished staged child cleanup",
 	finalizeStagedCommit: "staged child publication; staged sessions claim at commit",
-	promoteRecoveryHydrationAfterOwnershipReadyFence: "recovery hydration of an opening manager",
+};
+
+/** Writers checked by their own case below, because they need more setup than a bound manager. */
+const SEPARATELY_CHECKED_WRITERS: Record<string, string> = {
+	promoteRecoveryHydrationAfterOwnershipReadyFence: "the recovery promotion case",
 };
 
 /**
@@ -283,6 +293,7 @@ const CLASSIFICATIONS = [
 	INDIRECT_WRITERS,
 	NOT_TRANSCRIPT_WRITERS,
 	DEFERRED_WRITERS,
+	SEPARATELY_CHECKED_WRITERS,
 ];
 
 function unclassified(methods: readonly string[]): string[] {
@@ -487,6 +498,59 @@ describe.if(supported)("successor writes are checked against the successor's id"
 		} finally {
 			capture.snapshot.close();
 		}
+	});
+});
+
+describe.if(supported)("recovery promotion", () => {
+	function participant(checkpoint: MemoryGuardSessionManagerCheckpointV1): MemoryGuardParticipantDescriptorV1 {
+		const { blob_authority, revisions, session_id, session_name, transcript } = checkpoint;
+		return { ordinal: 0, checkpoint: blob_authority, revisions, session_id, session_name, transcript };
+	}
+	function authority(checkpointRoot: string): RecoveryFsRoot {
+		return {
+			readManaged(relativePath: string) {
+				try {
+					return { ok: true, data: new Uint8Array(fsSync.readFileSync(path.join(checkpointRoot, relativePath))) };
+				} catch {
+					return { ok: false };
+				}
+			},
+		} as RecoveryFsRoot;
+	}
+
+	it("promoteRecoveryHydrationAfterOwnershipReadyFence: the promoted transcript's publish is reported", async () => {
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-inventory-recovery-")));
+		roots.push(root);
+		const source = await SessionManager.open(path.join(root, "source", "checkpoint.jsonl"));
+		managers.push(source);
+		source.appendMessage(user("recovered"));
+		await source.flush();
+		const checkpointRoot = path.join(root, "checkpoint");
+		const ingressLease = source.acquireMemoryGuardParticipantIngressLease();
+		let checkpoint: MemoryGuardSessionManagerCheckpointV1;
+		try {
+			checkpoint = await source.createMemoryGuardCheckpoint({ ingressLease, checkpointRoot });
+		} finally {
+			ingressLease.release();
+		}
+		await source.close();
+		const restored = await SessionManager.restoreMemoryGuardCheckpoint({
+			incidentAuthority: authority(checkpointRoot),
+			participant: participant(checkpoint),
+			checkpoint,
+			destination: path.join(root, "restore"),
+		});
+		if (restored.kind !== "staged") throw new Error(`expected a staged recovery, got ${restored.reason}`);
+		managers.push(restored.manager);
+		detectorLogs = [];
+		await restored.manager.promoteRecoveryHydrationAfterOwnershipReadyFence(restored.hydrationContext, {
+			ownershipReady: true,
+		});
+		expect(detectorLogs).toContainEqual({
+			site: "recovery promotion",
+			sessionId: restored.manager.getSessionId(),
+			mode: "observe",
+		});
 	});
 });
 

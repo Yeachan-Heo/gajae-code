@@ -25988,6 +25988,7 @@ export class SessionManager {
 			"retain-and-throw",
 		);
 		try {
+			this.#ownershipClaims.checkWrite("recovery promotion");
 			if (this.destination.kind === "managed") {
 				const store = this.#managedTranscriptStore();
 				const sourceName = path.basename(context.identity.canonicalPath);
