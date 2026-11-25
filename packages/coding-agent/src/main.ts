@@ -88,8 +88,12 @@ import {
 } from "./sdk/broker/session-index";
 import type { ResumeSessionIdentity } from "./sdk/session-readonly/storage";
 import type { AgentSession } from "./session/agent-session";
-import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
+import {
+	ManagedAppendIdentityMismatchError,
+	RESUME_REJECTED_OPERATOR_MESSAGE,
+} from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
+import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
 	resolveResumableSession,
@@ -417,11 +421,11 @@ export async function submitInteractiveInput(
 				agentEnd.promise.then(() => ({ type: "agent_end" as const })),
 			]);
 			if (result.type === "error") {
-				const errorMessage = result.error instanceof Error ? result.error.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(result.error);
 				mode.showError(errorMessage);
 			} else if (result.type === "agent_end") {
 				void prompt.catch((error: unknown) => {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					const errorMessage = operatorErrorMessage(error);
 					mode.showError(errorMessage);
 				});
 			}
@@ -429,7 +433,7 @@ export async function submitInteractiveInput(
 			agentEnd.dispose();
 		}
 	} catch (error: unknown) {
-		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+		const errorMessage = operatorErrorMessage(error);
 		mode.showError(errorMessage);
 	} finally {
 		mode.finishPendingSubmission(input);
@@ -773,11 +777,13 @@ export async function applyStartupModelProfiles(args: StartupModelProfileArgs): 
 
 async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
 	const message = error instanceof Error ? error.message : String(error);
-	process.stderr.write(
+	// Startup model profiles are applied before anything ran in the resumed session, so
+	// a fence rejection here means this resume itself did not happen.
+	const operatorMessage =
 		error instanceof ManagedAppendIdentityMismatchError
-			? `${error.operatorMessage}\n`
-			: `${chalk.red(`Error: ${message}`)}\n`,
-	);
+			? RESUME_REJECTED_OPERATOR_MESSAGE
+			: composeOperatorMessage(error);
+	process.stderr.write(operatorMessage ? `${operatorMessage}\n` : `${chalk.red(`Error: ${message}`)}\n`);
 	await args.session.dispose();
 	process.exit(1);
 }
@@ -1163,7 +1169,7 @@ export async function runInteractiveMode(
 			try {
 				await session.continuePersistedHistory();
 			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(error);
 				mode.showError(errorMessage);
 			}
 		}
@@ -1181,7 +1187,7 @@ export async function runInteractiveMode(
 					maybeGenerateStartupTitle(initialMessage, initialImages);
 					await session.prompt(initialMessage, { images: initialImages });
 				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					const errorMessage = operatorErrorMessage(error);
 					mode.showError(errorMessage);
 				}
 			}
@@ -1218,7 +1224,7 @@ export async function runInteractiveMode(
 					await session.prompt(text);
 				}
 			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(error);
 				mode.showError(errorMessage);
 			}
 		}
@@ -1254,7 +1260,7 @@ export async function runInteractiveMode(
 					maybeGenerateStartupTitle(messageToSend, imagesToSend);
 					await session.prompt(messageToSend, { images: imagesToSend });
 				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					const errorMessage = operatorErrorMessage(error);
 					mode.showError(errorMessage);
 				}
 			}
@@ -1273,7 +1279,7 @@ export async function runInteractiveMode(
 					maybeGenerateStartupTitle(text);
 					await session.prompt(text);
 				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					const errorMessage = operatorErrorMessage(error);
 					mode.showError(errorMessage);
 				}
 			}
@@ -1308,7 +1314,7 @@ export async function runInteractiveMode(
 				maybeGenerateStartupTitle(text);
 				await session.prompt(text);
 			} catch (promptError: unknown) {
-				const errorMessage = promptError instanceof Error ? promptError.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(promptError);
 				mode.showError(errorMessage);
 			}
 		}

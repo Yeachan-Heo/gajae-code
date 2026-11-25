@@ -95,6 +95,22 @@
 					],
 					"default": "copy-retain"
 				},
+				"ownership": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"off",
+								"observe",
+								"enforce"
+							],
+							"description": "Not yet active; reserved for single-owner session claims.",
+							"default": "off"
+						}
+					},
+					"additionalProperties": false
+				},
 				"resumeModelBehavior": {
 					"type": "string",
 					"enum": [

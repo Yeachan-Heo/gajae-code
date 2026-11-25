@@ -39,9 +39,11 @@ import { isSdkComposerObservationOperation } from "../../sdk/composer-observatio
 
 import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
 import {
+	BROKER_LIFECYCLE_OPERATIONS,
 	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
 	hasBrokerRuntimeCloseCapability,
 	hasBrokerRuntimeReviseCapability,
+	prohibitBrokerLifecycleOperation,
 } from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
@@ -57,6 +59,7 @@ import { getSdkClientControlOperations, getSessionClientControls } from "../../s
 import { isSideConversationOperation } from "../../sdk/side-conversation";
 
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
@@ -127,23 +130,6 @@ const EXTENSION_COMMAND_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"compact",
 	"switchSession",
 ]);
-
-const BROKER_LIFECYCLE_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.close",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.delete",
-]);
-
-function prohibitBrokerLifecycleOperation(operation: string): never {
-	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
-		code: "operation_prohibited",
-	});
-}
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
@@ -614,9 +600,7 @@ export class ExtensionUiController {
 					})
 					.catch((err: unknown) => {
 						if (this.#isStopped()) return;
-						this.ctx.showError(
-							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
+						this.ctx.showError(`Extension sendMessage failed: ${operatorErrorMessage(err, String(err))}`);
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
@@ -852,7 +836,7 @@ export class ExtensionUiController {
 					.sendCustomMessage(message, { ...options, origin: "external" })
 					.then(() => this.#applyCustomMessageDisplay(wasStreaming, message.display))
 					.catch((err: unknown) => {
-						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
+						const errorText = `Extension sendMessage failed: ${operatorErrorMessage(err, String(err))}`;
 						if (this.ctx.isBackgrounded) {
 							logger.error(errorText);
 							return;
@@ -1639,7 +1623,7 @@ export class ExtensionUiController {
 		applyInjectedUserSubmission(this.ctx, { content, queued });
 		void send.catch((err: unknown) => {
 			if (this.#isStopped()) return;
-			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Extension sendUserMessage failed: ${operatorErrorMessage(err, String(err))}`);
 		});
 		return send;
 	};
