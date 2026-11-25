@@ -10,12 +10,16 @@
  * not counted again.
  *
  * A commit's session is the id in the session header (the first line, `type: "session"`) of the
- * transcript at its target path, read once the commit has landed. Every transcript starts with
- * that header and keeps it, so this one rule covers an append, a rewrite, a rename or publish of a
- * new file, and a fork's new transcript. A commit that lands before its header exists (an open
- * whose bytes follow through the handle) is decided when the ledger's `uncovered` is next read,
- * against the checks that were pending when it landed. A check's session is the id it names, or
- * the manager's bound id.
+ * transcript at its target path, read once the commit has landed. One rule covers an append, a
+ * rewrite, a rename or publish of a new file, and a fork's new transcript. It is enforced, not
+ * assumed:
+ * - When a transcript was already at the target, the commit must leave the same session's header
+ *   there; otherwise it is uncovered as `(header changed)` (a restore excepted).
+ * - A commit whose session cannot be determined is uncovered as `(no session header)`.
+ * - A commit that lands before its header exists (an open whose bytes follow through the handle)
+ *   reserves the checks pending then, and is decided once its header can be read: at the next
+ *   check, at the next commit that lands, or when the ledger is read.
+ * A check's session is the id it names, or the manager's bound id.
  *
  * Spied: SessionStorage writes, renames, exact replaces and writer opens; staged-writer publishes;
  * the managed store's publish, replace, append and move; the natives' no-replace rename and link;
@@ -65,7 +69,8 @@ export interface TranscriptWriteLedger {
 	readonly events: string[];
 	/**
 	 * Commits no check for their own session covered, as `<primitive> <basename>`, ending in
-	 * ` (no session header)` when the session could not be read.
+	 * ` (no session header)` when the session could not be read, or ` (header changed)` when the
+	 * commit replaced another session's transcript at that path.
 	 */
 	readonly uncovered: string[];
 	/** The full paths of the `uncovered` commits, in the same order. */
@@ -277,6 +282,8 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 				if (source !== undefined) ledger.written.add(source);
 				const gone = vacated.get(file);
 				const restoring = gone !== undefined && options.restores?.(gone, source) === true;
+				// The session whose transcript is there now, if any; the write must not change it.
+				const before = readHeaderId(file);
 				ledger.events.push(`${restoring ? "restore " : ""}${primitive} ${name}`);
 				return didLand => {
 					if (!didLand) return;
@@ -285,6 +292,7 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 					const id = readHeaderId(file);
 					// A restore puts back the same session's transcript; anything else is a new write.
 					if (restoring && gone.id === id) vacated.delete(file);
+					else if (before !== undefined && id !== before) flag(`${label} (header changed)`, file);
 					else if (id === undefined) {
 						deferred.push({ label, file, reserved: new Set(pending) });
 						pending.clear();

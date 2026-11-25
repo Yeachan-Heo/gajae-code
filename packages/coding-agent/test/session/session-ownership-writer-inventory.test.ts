@@ -615,6 +615,8 @@ describe("session ownership writer inventory", () => {
 			const at = await files("a.jsonl");
 			check();
 			await fs.rename(at("a.jsonl"), at("b.jsonl"));
+			// b.jsonl is replaced by another session's transcript, then renamed back to a.jsonl.
+			await fs.rm(at("b.jsonl"));
 			check("other-session");
 			await fs.writeFile(at("b.jsonl"), bytes("replaced", "other-session"));
 			await fs.rename(at("b.jsonl"), at("a.jsonl"));
@@ -669,6 +671,13 @@ describe("session ownership writer inventory", () => {
 			expect(writes.uncovered).toEqual(["fs.promises.appendFile x.jsonl"]);
 		});
 
+		it("overwriting one session's transcript with another's is not covered by a check for the other", async () => {
+			const at = await files("a.jsonl");
+			check("session-b");
+			await fs.writeFile(at("a.jsonl"), bytes("x", "session-b"));
+			expect(writes.uncovered).toEqual(["fs.promises.writeFile a.jsonl (header changed)"]);
+		});
+
 		it("a check with no write of its own covers no later write to another session", async () => {
 			const at = await files();
 			check("session-x");
@@ -687,7 +696,7 @@ describe("session ownership writer inventory", () => {
 			// check pending; the replacing rename of another session's file into a.jsonl is not a restore.
 			expect(natives.renameNoReplacePath(at("a.jsonl"), at("b.jsonl")).mutationState).toBe("not_committed");
 			await fs.rename(at("b.jsonl"), at("a.jsonl"));
-			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl"]);
+			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl (header changed)"]);
 		});
 	});
 
