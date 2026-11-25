@@ -413,36 +413,60 @@ function report(errors: readonly ChangelogError[]): void {
  */
 export async function findOrphanFragments(root = "."): Promise<ChangelogError[]> {
 	const errors: ChangelogError[] = [];
-	const cratesRoot = path.join(root, "crates");
 
-	let cratesEntries: Dirent[] = [];
-	try {
-		cratesEntries = await fs.readdir(cratesRoot, { withFileTypes: true });
-	} catch (error) {
-		// crates directory may not exist
-		if (!isMissingPath(error)) throw error;
-	}
-
-	for (const entry of cratesEntries) {
-		if (!entry.isDirectory()) continue;
-		const directory = path.join(cratesRoot, entry.name, FRAGMENT_DIRECTORY);
-		let files: string[];
+	// Use git to find all changelog.d files in the repository
+	const result = await $`git -C ${root} ls-files`.quiet().nothrow();
+	if (result.exitCode !== 0) {
+		// If git command fails (e.g., not a git repo), fall back to filesystem scan
+		const cratesRoot = path.join(root, "crates");
+		let cratesEntries: Dirent[] = [];
 		try {
-			files = await listFragmentFilesInDirectory(directory);
+			cratesEntries = await fs.readdir(cratesRoot, { withFileTypes: true });
 		} catch (error) {
-			// Ignore if the directory doesn't exist or other issues
-			if (isMissingPath(error)) continue;
-			// But report structure errors (e.g., fragments must be files, not directories)
-			errors.push(asChangelogError(error, toRepoPath(directory)));
-			continue;
+			// crates directory may not exist
+			if (!isMissingPath(error)) throw error;
 		}
 
-		if (files.length === 0) continue;
+		for (const entry of cratesEntries) {
+			if (!entry.isDirectory()) continue;
+			const directory = path.join(cratesRoot, entry.name, FRAGMENT_DIRECTORY);
+			let files: string[];
+			try {
+				files = await listFragmentFilesInDirectory(directory);
+			} catch (error) {
+				// Ignore if the directory doesn't exist or other issues
+				if (isMissingPath(error)) continue;
+				// But report structure errors (e.g., fragments must be files, not directories)
+				errors.push(asChangelogError(error, toRepoPath(directory)));
+				continue;
+			}
 
-		// Found orphan fragments in crates/*/changelog.d
-		for (const file of files) {
+			if (files.length === 0) continue;
+
+			// Found orphan fragments in crates/*/changelog.d
+			for (const file of files) {
+				errors.push({
+					file: toRepoPath(file),
+					message:
+						`orphan fragment outside packages/*/changelog.d/; ` +
+						`move it to packages/PKG/changelog.d/ where its changelog lives. ` +
+						`Fragments are folded only from packages/*/changelog.d/ during release.`,
+				});
+			}
+		}
+		return errors;
+	}
+
+	// Parse the git output to get all changelog.d files
+	const allFiles = result.text().trim().split("\n").filter(f => f.length > 0);
+	const files = allFiles.filter(f => f.includes("changelog.d/"));
+
+	// Reject any fragment not under packages/*/changelog.d/
+	const validFragmentPattern = /^packages\/[^\/]+\/changelog\.d\//;
+	for (const file of files) {
+		if (!validFragmentPattern.test(file)) {
 			errors.push({
-				file: toRepoPath(file),
+				file,
 				message:
 					`orphan fragment outside packages/*/changelog.d/; ` +
 					`move it to packages/PKG/changelog.d/ where its changelog lives. ` +

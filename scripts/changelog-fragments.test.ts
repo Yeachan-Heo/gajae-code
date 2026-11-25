@@ -281,4 +281,25 @@ describe("CLI entrypoints", () => {
 		expect(orphans[0].file).toContain("crates/pi-natives/changelog.d/orphan.md");
 		expect(orphans[0].message).toContain("orphan fragment outside packages/*/changelog.d");
 	});
+
+	test("check rejects orphan fragments in any directory outside packages/*/changelog.d", async () => {
+		const root = await tempDir();
+		await init(root);
+		// Create orphan fragments in multiple non-package directories
+		const orphanPaths = [
+			"changelog.d/root-orphan.md",
+			"plugins/something/changelog.d/plugin-orphan.md",
+			"nested/path/changelog.d/nested-orphan.md",
+		];
+		for (const orphanPath of orphanPaths) {
+			await put(root, orphanPath, "### Fixed\n\n- Orphan fix.\n");
+		}
+		await commit(root, "multiple orphan fragments");
+
+		const orphans = await findOrphanFragments(root);
+		expect(orphans.length).toBe(3);
+		for (const orphan of orphans) {
+			expect(orphan.message).toContain("orphan fragment outside packages/*/changelog.d");
+		}
+	});
 });
