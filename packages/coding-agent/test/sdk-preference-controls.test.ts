@@ -10,6 +10,7 @@ import { readDurableModelProfileOwnership } from "../src/config/model-profile-ow
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { validateSettingPatch } from "../src/config/settings-schema";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { createSdkSurfaceFactory } from "../src/sdk/host/session-runtime";
 import {
@@ -490,6 +491,29 @@ describe("SDK preference controls", () => {
 		});
 		expect(mutate).not.toHaveBeenCalled();
 		expect(f.session.hasSessionAgentModelOverride("executor")).toBe(false);
+	});
+
+	it("refuses session ownership settings at every scope and writes nothing", async () => {
+		const f = await fixture(true);
+		const before = await globalConfig(f);
+		for (const patch of [
+			{ "session.ownership.mode": "off" },
+			{ "session.ownership.mode": "enforce" },
+			{ "session.ownership.refuseNonInteractive": false },
+			{ "session.ownership": { mode: "off" } },
+		]) {
+			expect(validateSettingPatch(patch)).toEqual([
+				{
+					path: Object.keys(patch)[0]!,
+					detail:
+						"Session ownership settings need operator consent: use gjc config set or the config file, not config.patch.",
+				},
+			]);
+			for (const scope of ["global", "project", "session"] as const)
+				await expect(f.controls.patchConfig({ scope, patch })).rejects.toBeInstanceOf(SdkPreferenceError);
+		}
+		expect(await globalConfig(f)).toEqual(before);
+		expect(f.settings.getGlobal("session.ownership.mode")).toBeUndefined();
 	});
 
 	it("requires writable durable storage only for explicit durable selections/writes", async () => {
