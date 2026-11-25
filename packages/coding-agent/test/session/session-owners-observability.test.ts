@@ -2,9 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLockProbeState } from "@gajae-code/natives";
 import type { Subprocess } from "bun";
+import { SESSION_OWNER_SIDECAR_LIMIT, sessionOwnersChecks } from "../../src/cli/doctor/session-owners";
 import { collectSessionOwnersProbe } from "../../src/cli/doctor/session-owners-probe";
 import { collectSessionOwnersReport, renderSessionOwnersText } from "../../src/cli/session-owners-cli";
+import { countSessionOwnerEntries } from "../../src/session/session-owners-layout";
 import {
 	claimSessionOwner,
 	heldSessionClaims,
@@ -40,6 +43,9 @@ afterEach(async () => {
 			child.kill("SIGKILL");
 			await child.exited;
 		}
+		delete SessionOwnershipTestHooks.lockBackend;
+		await fs.chmod(home, 0o700).catch(() => {});
+		await fs.chmod(sessionOwnersDirectory(), 0o700).catch(() => {});
 		SessionOwnershipTestHooks.homeOverride = preloadHome;
 		await fs.rm(home, { recursive: true, force: true });
 	}
@@ -49,11 +55,56 @@ function recordPath(sessionId: string): string {
 	return path.join(sessionOwnersDirectory(), `${sessionOwnerKey(sessionId)}.owner.json`);
 }
 
+/** This environment with `HOME` at the temp home, and no inherited XDG or gjc directory overrides. */
+function isolatedEnv(): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = { ...process.env, HOME: home };
+	for (const key of Object.keys(env))
+		if (key.startsWith("XDG_") || /^(GJC|PI)_(CONFIG|CODING_AGENT)_DIR$/.test(key)) delete env[key];
+	return env;
+}
+
+/** The owners directory, owner-only, as a claim prepares it. */
+async function makeOwnersDirectory(): Promise<string> {
+	const owners = sessionOwnersDirectory();
+	await fs.mkdir(owners, { recursive: true, mode: 0o700 });
+	await fs.chmod(path.dirname(owners), 0o700);
+	await fs.chmod(path.dirname(path.dirname(owners)), 0o700);
+	return owners;
+}
+
+/** A held-looking sidecar whose record names `pid`, written as a claim would write it. */
+async function writeSidecar(sessionId: string, pid: number): Promise<void> {
+	const owners = await makeOwnersDirectory();
+	await fs.writeFile(path.join(owners, `${sessionId}.session-owner`), "", { mode: 0o600 });
+	const record = {
+		v: 1,
+		sessionId,
+		claimNonce: "nonce",
+		pid,
+		processIncarnation: null,
+		surface: "terminal",
+		host: os.hostname(),
+		gjcVersion: "0.0.0",
+		claimedAt: new Date().toISOString(),
+	};
+	await fs.writeFile(recordPath(sessionId), JSON.stringify(record), { mode: 0o600 });
+}
+
+/** Lock probes answer from `answers` in turn (the last one repeats), without native calls. */
+function scriptProbes(answers: FileLockProbeState[]): void {
+	SessionOwnershipTestHooks.lockBackend = {
+		tryAcquire: async () => {
+			throw new Error("no claims here");
+		},
+		probe: async () => ({ state: answers.length > 1 ? (answers.shift() as FileLockProbeState) : answers[0] }),
+	};
+}
+
 /** A process with `HOME` at the temp home that claims `sessionId` and keeps it until killed. */
 async function startHolder(sessionId: string, surface: string): Promise<number> {
 	const child = Bun.spawn([process.execPath, holderScript], {
 		cwd: import.meta.dir,
-		env: { ...process.env, HOME: home, OWNER_SESSION_ID: sessionId, OWNER_SURFACE: surface },
+		env: { ...isolatedEnv(), OWNER_SESSION_ID: sessionId, OWNER_SURFACE: surface },
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -93,7 +144,7 @@ async function snapshot(directory: string): Promise<Record<string, string>> {
 	return result;
 }
 
-async function runCli(args: string[]): Promise<{ stdout: string; exitCode: number }> {
+async function runCli(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
 	const profile = path.join(home, "profile");
 	const child = Bun.spawn([process.execPath, "--no-env-file", `--config=${bunConfig}`, cli, ...args], {
 		cwd: home,
@@ -113,8 +164,12 @@ async function runCli(args: string[]): Promise<{ stdout: string; exitCode: numbe
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-	return { stdout, exitCode };
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	return { stdout, stderr, exitCode };
 }
 
 describe("gjc session owners without an owners directory", () => {
@@ -207,6 +262,9 @@ describe.if(supported)("gjc session owners", () => {
 			await startHolder("foreign-session", "terminal");
 			await rewriteRecord("foreign-session", { host: `bad host${ESC}[5m`, pid: await deadPid() });
 			await Bun.write(path.join(sessionOwnersDirectory(), `evil${ESC}[31m.session-owner`), "");
+			// A live holder's record naming another session's id does not label this sidecar.
+			await startHolder("mismatched-session", "app");
+			await rewriteRecord("mismatched-session", { sessionId: "other-session" });
 
 			const report = await collectSessionOwnersReport();
 			expect(report.unrecognized).toBe(1);
@@ -221,6 +279,9 @@ describe.if(supported)("gjc session owners", () => {
 				claimedAt: undefined,
 			});
 			expect(clean?.ageMs).toBeUndefined();
+			const mismatched = report.owners.find(owner => owner.key === "mismatched-session");
+			expect(mismatched?.record).toBe("invalid");
+			expect(mismatched?.holder).toBeUndefined();
 			const foreign = report.owners.find(owner => owner.key === "foreign-session");
 			expect(foreign?.record).toBe("unverified");
 			expect(foreign?.holder).toBeUndefined();
@@ -285,22 +346,68 @@ describe.if(supported)("gjc doctor session owners check", () => {
 		TIMEOUT_MS,
 	);
 
-	it("warns when sidecars exceed the limit", async () => {
-		const owners = sessionOwnersDirectory();
-		await fs.mkdir(owners, { recursive: true, mode: 0o700 });
-		await fs.chmod(path.dirname(owners), 0o700);
-		await fs.chmod(path.dirname(path.dirname(owners)), 0o700);
-		// Free, owner-only sidecars, as claims leave them.
-		for (const key of ["a", "b", "c"])
-			await fs.writeFile(path.join(owners, `${key}.session-owner`), "", { mode: 0o600 });
-		const receipt = await collectSessionOwnersProbe(0, 2);
-		expect(receipt.checks[1]).toMatchObject({
-			id: "session.owners.sidecars",
+	it("counts only regular sidecar files, and keeps the count when the lock probe times out", async () => {
+		const owners = await makeOwnersDirectory();
+		for (const key of ["a", "b"]) await fs.writeFile(path.join(owners, `${key}.session-owner`), "", { mode: 0o600 });
+		await fs.mkdir(path.join(owners, "c.session-owner"));
+		await fs.symlink(path.join(owners, "a.session-owner"), path.join(owners, "d.session-owner"));
+		expect(countSessionOwnerEntries(owners)).toEqual({ sidecars: 2, records: 0, unrecognized: 2 });
+
+		const checks = sessionOwnersChecks(
+			"t1:session-owners:test",
+			{ sidecars: SESSION_OWNER_SIDECAR_LIMIT + 1, records: 0, unrecognized: 0 },
+			{ status: "timeout", reasonCode: "probe_timeout" },
+		);
+		expect(checks.map(check => [check.id, check.execution, check.health, check.reasonCode])).toEqual([
+			["session.owners.holders", "timeout", "unknown", "probe_timeout"],
+			["session.owners.sidecars", "completed", "warning", "session_owner_sidecars_over_limit"],
+		]);
+	});
+
+	it("does not flag a suspect whose lock state is unknown on the second look", async () => {
+		await writeSidecar("unknown-session", await deadPid());
+		scriptProbes([FileLockProbeState.Held, FileLockProbeState.Unknown]);
+		const receipt = await collectSessionOwnersProbe(0);
+		expect(receipt.checks).toEqual([
+			expect.objectContaining({ health: "ok", evidence: { count: 1, counts: { holderGone: 0 } } }),
+		]);
+	});
+
+	it("does not flag a suspect whose record names another dead pid on the second look", async () => {
+		await writeSidecar("moved-session", await deadPid());
+		scriptProbes([FileLockProbeState.Held]);
+		const probe = collectSessionOwnersProbe(300);
+		await Bun.sleep(100);
+		await writeSidecar("moved-session", await deadPid());
+		expect((await probe).checks[0]).toMatchObject({ health: "ok", reasonCode: "session_owner_holders_consistent" });
+
+		// The same dead pid on both looks is flagged, and only held locks are counted.
+		scriptProbes([FileLockProbeState.Held]);
+		await writeSidecar("live-pid-session", 1);
+		expect((await collectSessionOwnersProbe(0)).checks[0]).toMatchObject({
 			health: "warning",
-			reasonCode: "session_owner_sidecars_over_limit",
-			evidence: { count: 3 },
+			reasonCode: "session_owner_holder_gone",
+			evidence: { count: 2, counts: { holderGone: 1 } },
 		});
-		expect(receipt.checks[0]).toMatchObject({ health: "ok", evidence: { count: 0 } });
+	});
+
+	it.if(process.getuid?.() !== 0)("reports an unreadable directory as an inspection failure", async () => {
+		const owners = await makeOwnersDirectory();
+		await fs.chmod(owners, 0o000);
+		expect((await collectSessionOwnersProbe(0)).checks[0]).toMatchObject({
+			execution: "blocked",
+			health: "unknown",
+			reasonCode: "session_owners_inspection_failed",
+			evidence: { errno: "EACCES" },
+		});
+	});
+
+	it("is left out of --dry-run, which runs no probes", async () => {
+		await makeOwnersDirectory();
+		const result = await runCli(["doctor", "--json", "--dry-run"]);
+		const report = JSON.parse(result.stdout);
+		expect(report.checks.length).toBeGreaterThan(0);
+		expect(report.checks.filter((check: { id: string }) => check.id.startsWith("session."))).toEqual([]);
 	});
 
 	it("is not applicable on a home that never claimed, and creates nothing", async () => {

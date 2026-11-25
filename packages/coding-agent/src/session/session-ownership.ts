@@ -25,6 +25,12 @@ import {
 import { getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
+import {
+	classifySessionOwnerEntry,
+	SESSION_OWNER_RECORD_SUFFIX,
+	SESSION_OWNER_SIDECAR_SUFFIX,
+	SESSION_OWNERS_RELATIVE_DIR,
+} from "./session-owners-layout";
 import { type SessionOwnershipTestHookSlot, sessionOwnershipTestHookSlot } from "./session-ownership-mode";
 import {
 	assertAppendLockHomeNotSharedWritable,
@@ -35,8 +41,8 @@ import {
 	type RuntimeLockDirectory,
 } from "./session-storage";
 
-const SIDECAR_SUFFIX = ".session-owner";
-const RECORD_SUFFIX = ".owner.json";
+const SIDECAR_SUFFIX = SESSION_OWNER_SIDECAR_SUFFIX;
+const RECORD_SUFFIX = SESSION_OWNER_RECORD_SUFFIX;
 const RECORD_VERSION = 1;
 const RECORD_MAX_BYTES = 4096;
 /** Every native call answers within this budget, or reports `timed_out`. */
@@ -49,8 +55,6 @@ const SAFE_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
 const SAFE_VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
 /** A UTC instant as `Date#toISOString` writes it; anything else in a record is not shown. */
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
-/** A sidecar or record file name's key, as {@link sessionOwnerKey} produces it. */
-const KEY_NAME = /^(?:h-[0-9a-f]{32}|(?!h-)[a-z0-9_-]{1,128})$/;
 
 export const SESSION_OWNER_SURFACES = ["app", "terminal", "print", "sdk-host", "acp-host", "sdk"] as const;
 export type SessionOwnerBaseSurface = (typeof SESSION_OWNER_SURFACES)[number];
@@ -164,14 +168,14 @@ function trustedHome(): string {
 }
 
 export function sessionOwnersDirectory(): string {
-	return path.join(trustedHome(), ".gjc", "runtime", "session-owners");
+	return path.join(trustedHome(), SESSION_OWNERS_RELATIVE_DIR);
 }
 
 /** The append lock's checks without creating anything; `undefined` when no claim was ever made here. */
 function inspectOwnersDirectory(): string | undefined {
 	const home = trustedHome();
 	assertAppendLockHomeNotSharedWritable(home);
-	const owners = path.join(home, ".gjc", "runtime", "session-owners");
+	const owners = path.join(home, SESSION_OWNERS_RELATIVE_DIR);
 	assertNoReparsePath(owners);
 	try {
 		if (!fs.lstatSync(owners).isDirectory()) throw new Error("session_owners_not_directory");
@@ -689,9 +693,13 @@ function describeRecord(
 /**
  * Every held sidecar under the owners directory, with its checked holder, plus the directory's
  * counts. Read-only: it probes and reads, never claims, writes, unlinks or creates the directory.
+ * `keys` limits the probes (and the counts) to those sidecars, for a second look at suspects; this
+ * process's own claims, read from the registry, are always included.
  * Throws `SessionOwnershipError` when the directory fails the append lock's safety checks.
  */
-export async function inspectSessionOwners(): Promise<SessionOwnersInventory> {
+export async function inspectSessionOwners(
+	options: { readonly keys?: readonly string[] } = {},
+): Promise<SessionOwnersInventory> {
 	const current = registry();
 	let owners: string | undefined;
 	try {
@@ -712,18 +720,20 @@ export async function inspectSessionOwners(): Promise<SessionOwnersInventory> {
 	const counts = { sidecars: 0, records: 0, unrecognized: 0, diskBytes: 0 };
 	if (!owners) return { directory: "missing", ...counts, held };
 	const keys: string[] = [];
-	for (const name of [".", ...fs.readdirSync(owners)]) {
+	const names = options.keys ? options.keys.map(key => `${key}${SIDECAR_SUFFIX}`) : [".", ...fs.readdirSync(owners)];
+	for (const name of names) {
+		let isFile = false;
 		try {
 			const stat = fs.lstatSync(path.join(owners, name));
 			counts.diskBytes += stat.blocks ? stat.blocks * 512 : stat.size;
+			isFile = stat.isFile();
 		} catch {}
 		if (name === ".") continue;
-		const sidecarKey = name.endsWith(SIDECAR_SUFFIX) ? name.slice(0, -SIDECAR_SUFFIX.length) : undefined;
-		const recordKey = name.endsWith(RECORD_SUFFIX) ? name.slice(0, -RECORD_SUFFIX.length) : undefined;
-		if (sidecarKey !== undefined && KEY_NAME.test(sidecarKey)) {
+		const entry = classifySessionOwnerEntry(name, isFile);
+		if (entry.kind === "sidecar") {
 			counts.sidecars += 1;
-			if (!self.has(sidecarKey)) keys.push(sidecarKey);
-		} else if (recordKey !== undefined && KEY_NAME.test(recordKey)) counts.records += 1;
+			if (!self.has(entry.key)) keys.push(entry.key);
+		} else if (entry.kind === "record") counts.records += 1;
 		else counts.unrecognized += 1;
 	}
 	const directory = owners;
