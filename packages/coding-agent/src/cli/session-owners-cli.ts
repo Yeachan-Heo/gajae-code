@@ -10,6 +10,7 @@ import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import {
 	inspectSessionOwners,
 	type SessionOwnerSidecar,
+	SessionOwnershipError,
 	type SessionOwnersInventory,
 } from "../session/session-ownership";
 
@@ -82,4 +83,36 @@ export function renderSessionOwnersText(report: SessionOwnersReport): string[] {
 	lines.push("Held by this process tree:", ...(tree.length > 0 ? tree.map(ownerLine) : ["  none"]));
 	lines.push("Held by other processes:", ...(others.length > 0 ? others.map(ownerLine) : ["  none"]));
 	return lines;
+}
+
+/** A refusal the operator can act on: a fixed message and a machine code, never a stack or a path. */
+function commandFailure(error: unknown): { code: string; message: string } | undefined {
+	if (error instanceof SessionOwnershipError) return { code: error.code, message: error.operatorMessage };
+	const errno = (error as { code?: unknown } | undefined)?.code;
+	if (typeof errno === "string" && /^E[A-Z0-9]+$/.test(errno))
+		return { code: errno, message: `gjc could not read the session owners directory (${errno}).` };
+	return undefined;
+}
+
+/** `gjc session owners [--json]`. A refused or unreadable directory exits 1 with its code. */
+export async function runSessionOwnersCommand(json: boolean): Promise<void> {
+	let report: SessionOwnersReport;
+	try {
+		report = await collectSessionOwnersReport();
+	} catch (error) {
+		const failure = commandFailure(error);
+		if (!failure) throw error;
+		if (json)
+			process.stdout.write(
+				`${JSON.stringify({ ok: false, reason: "session_owners_unavailable", code: failure.code }, null, 2)}\n`,
+			);
+		else process.stderr.write(`${failure.message}\n`);
+		process.exitCode = 1;
+		return;
+	}
+	process.stdout.write(
+		json
+			? `${JSON.stringify({ ok: true, ...report }, null, 2)}\n`
+			: `${renderSessionOwnersText(report).join("\n")}\n`,
+	);
 }

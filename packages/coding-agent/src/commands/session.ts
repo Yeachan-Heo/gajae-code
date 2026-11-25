@@ -1,5 +1,5 @@
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
-import { collectSessionOwnersReport, renderSessionOwnersText } from "../cli/session-owners-cli";
+import { runSessionOwnersCommand } from "../cli/session-owners-cli";
 import {
 	attachGjcTmuxSession,
 	createGjcTmuxSession,
@@ -119,9 +119,7 @@ export default class Session extends Command {
 			}
 
 			if (action === "owners") {
-				const report = await collectSessionOwnersReport();
-				if (json) writeJson({ ok: true, ...report });
-				else writeText(renderSessionOwnersText(report));
+				await runSessionOwnersCommand(json);
 				return;
 			}
 

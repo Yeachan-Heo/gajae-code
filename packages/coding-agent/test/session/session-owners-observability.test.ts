@@ -10,7 +10,6 @@ import { collectSessionOwnersReport, renderSessionOwnersText } from "../../src/c
 import { countSessionOwnerEntries } from "../../src/session/session-owners-layout";
 import {
 	claimSessionOwner,
-	heldSessionClaims,
 	type SessionOwnerClaim,
 	SessionOwnershipTestHooks,
 	sessionOwnerKey,
@@ -192,15 +191,35 @@ describe("gjc session owners without an owners directory", () => {
 
 describe.if(supported)("gjc session owners", () => {
 	it(
+		"refuses an unsafe home with the operator message and code, and no stack or crash record",
+		async () => {
+			await fs.chmod(home, 0o777);
+			const text = await runCli(["session", "owners"]);
+			expect(text.exitCode).toBe(1);
+			expect(text.stdout).toBe("");
+			expect(text.stderr).toContain("gjc could not check safely whether another process has this session open");
+			expect(text.stderr).not.toContain("Uncaught");
+			expect(text.stderr).not.toContain(home);
+			const json = await runCli(["session", "owners", "--json"]);
+			expect(json.exitCode).toBe(1);
+			expect(JSON.parse(json.stdout)).toEqual({
+				ok: false,
+				reason: "session_owners_unavailable",
+				code: "owners_directory_unsafe",
+			});
+			const files = await fs.readdir(home, { recursive: true });
+			expect(files.filter(name => name.includes("crash"))).toEqual([]);
+		},
+		TIMEOUT_MS,
+	);
+
+	it(
 		"lists this process tree's claims apart from other holders, in text and --json",
 		async () => {
 			const other = await startHolder("other-session", "print");
 			const own = await claimSessionOwner("own-session", { surface: "terminal" });
 			if (own.status !== "claimed") throw new Error(own.status);
 			claims.push(own.claim);
-			expect(heldSessionClaims()).toEqual([
-				expect.objectContaining({ sessionId: "own-session", surface: "terminal", shares: 1 }),
-			]);
 
 			const report = await collectSessionOwnersReport();
 			expect(report).toMatchObject({ directory: "present", sidecars: 2, records: 2, unrecognized: 0 });

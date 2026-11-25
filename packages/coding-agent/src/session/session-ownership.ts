@@ -625,25 +625,6 @@ export async function probeSessionOwner(sessionId: string): Promise<SessionOwner
 // Inventory (read-only; design §2.9)
 // =============================================================================
 
-/** A claim this process holds, as the registry knows it. */
-export interface HeldSessionClaim {
-	readonly sessionId: string;
-	readonly surface: SessionOwnerSurface;
-	readonly claimedAt: string;
-	/** How many claims in this process share the lock. */
-	readonly shares: number;
-}
-
-/** This process's claims. A snapshot: nothing in the registry changes. */
-export function heldSessionClaims(): HeldSessionClaim[] {
-	return [...registry().entries.values()].map(entry => ({
-		sessionId: entry.sessionId,
-		surface: entry.surface,
-		claimedAt: entry.claimedAt,
-		shares: entry.holders,
-	}));
-}
-
 /**
  * What the record beside a held sidecar says: `verified` (its holder checks out), `holder_gone` (a
  * process on this host that no longer exists, impossible under a kernel lock and so a bug signal),
