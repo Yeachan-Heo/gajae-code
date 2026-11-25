@@ -185,18 +185,42 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		expect(await held(id)).toBe(false);
 	});
 
-	it("cold-sidecar manager swap: the claims move, and the old manager's close unlocks nothing", async () => {
+	it("cold-sidecar manager swap of one session: the claim moves, and the old manager's close unlocks nothing", async () => {
 		const previous = await persisted();
 		const id = previous.manager.getSessionId();
 		previous.claims.add(await claim(id));
-		const successor = await persisted();
-		previous.claims.moveTo(successor.claims);
+		const successor = await SessionManager.open(previous.manager.getSessionFile()!, previous.destination);
+		managers.push(successor);
+		const successorClaims = sessionClaimSetOf(successor);
+		previous.claims.moveTo(successorClaims);
 		expect(previous.claims.sessionIds).toEqual([]);
 		await previous.manager.close();
 		expect(await held(id)).toBe(true);
-		expect(successor.claims.has(id)).toBe(true);
-		await successor.manager.close();
+		expect(successorClaims.sessionIds).toEqual([id]);
+		await successor.close();
 		expect(await held(id)).toBe(false);
+	});
+
+	it("swap to a fork's manager: the predecessor is released once moved, unless a deferred hold keeps it", async () => {
+		const previous = await persisted();
+		const predecessor = previous.manager.getSessionId();
+		previous.claims.add(await claim(predecessor));
+		const fork = await persisted("managed", previous);
+		fork.claims.add(await claim(fork.manager.getSessionId()));
+		previous.claims.moveTo(fork.claims);
+		expect(await held(predecessor)).toBe(false);
+		expect(fork.claims.sessionIds).toEqual([fork.manager.getSessionId()]);
+
+		const held2 = await persisted("managed", previous);
+		const heldId = held2.manager.getSessionId();
+		held2.claims.add(await claim(heldId));
+		const finalization = Promise.withResolvers<void>();
+		held2.claims.holdUntil(heldId, finalization.promise);
+		held2.claims.moveTo(fork.claims);
+		expect(await held(heldId)).toBe(true);
+		finalization.resolve();
+		await finalization.promise;
+		expect(await held(heldId)).toBe(false);
 	});
 
 	it("deferred owner shutdown: the predecessor waits for finalization, at most the cap", async () => {

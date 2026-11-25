@@ -118,7 +118,10 @@ export class SessionClaimSet {
 
 	/**
 	 * Cold-sidecar manager swap: every claim and hold moves to `target`, and this set is emptied
-	 * without unlocking anything.
+	 * without unlocking anything. The target then settles: a claim for its current id and any held
+	 * claim survive, everything else is released (a fork's predecessor, once the swap commits).
+	 * Open transitions are not carried across: a caller that swaps inside a transition must call
+	 * this after that transition ends, or open one on the target.
 	 */
 	moveTo(target: SessionClaimSet): void {
 		if (target === this) return;
@@ -133,6 +136,7 @@ export class SessionClaimSet {
 			target.#holds.set(sessionId, hold);
 		}
 		this.#holds.clear();
+		target.settle();
 	}
 
 	/**
