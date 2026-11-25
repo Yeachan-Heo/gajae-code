@@ -403,9 +403,11 @@ async function checkpointOf(source: string) {
 }
 
 /**
- * Writers that write only a staged transcript at a name no resume or listing picks up; the step
- * that publishes it is checked or deferred as named. Each runs, and every transcript it changes
- * (measured before close, which may discard it) must be such a staged one.
+ * Writers that write only a staged transcript: one below `.staging`, or at a dot-prefixed name.
+ * The step that publishes it is checked or deferred as named. Each runs, and every transcript it
+ * changes (measured before close, which may discard it) must be such a staged one. A managed
+ * restore's dot-prefixed transcript still shows in the managed listing and `continueRecent` until
+ * PR #8049 (hide staged memory-guard restore transcripts from managed listing) lands.
  */
 const STAGED_WRITERS: Record<string, { readonly reason: string; readonly run: Run }> = {
 	openStaged: {
