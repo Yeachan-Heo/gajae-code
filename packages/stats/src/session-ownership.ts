@@ -22,6 +22,10 @@ export const SESSION_OWNERSHIP_WRITE_BUSY_TIMEOUT_MS = 1_000;
  * Never creates a directory: a missing parent fails, like any other failure, with an error the
  * caller drops. A table from before `report_id` gains the column here, inside the write's
  * transaction; the reader never alters it.
+ *
+ * The transaction is IMMEDIATE: it takes the write lock first, waiting under the busy timeout. The
+ * writer reads (the table check and its columns) before it inserts, and a deferred transaction that
+ * has read cannot upgrade once another process has committed: it fails at once, without waiting.
  */
 export function recordSessionOwnershipCounts(
 	dbPath: string,

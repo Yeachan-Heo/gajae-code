@@ -39,17 +39,26 @@ async function freshDb(): Promise<string> {
  * Another process that holds the database's write lock for `holdMs`. Resolves once the lock is
  * taken (a marker file, not stdout, which a child may flush only at exit) to the child's exit.
  */
-async function holdWriteLock(dbPath: string, holdMs: number): Promise<{ readonly exited: Promise<number> }> {
+async function holdWriteLock(
+	dbPath: string,
+	holdMs: number,
+	options: { readonly commitWrite?: boolean } = {},
+): Promise<{ readonly exited: Promise<number> }> {
 	const marker = `${dbPath}.locked`;
 	const script = `const { Database } = require("bun:sqlite");
 const fs = require("node:fs");
 const db = new Database(process.argv[1]);
 db.exec("BEGIN IMMEDIATE");
+if (process.argv[4] === "write") {
+	db.exec("CREATE TABLE IF NOT EXISTS lock_holder_writes (x)");
+	db.exec("INSERT INTO lock_holder_writes VALUES (1)");
+}
 fs.writeFileSync(process.argv[3], "");
 Bun.sleepSync(Number(process.argv[2]));
 db.exec("COMMIT");
 db.close();`;
-	const child = Bun.spawn([process.execPath, "-e", script, dbPath, String(holdMs), marker], {
+	const args = [dbPath, String(holdMs), marker, options.commitWrite ? "write" : "hold"];
+	const child = Bun.spawn([process.execPath, "-e", script, ...args], {
 		env: { PATH: process.env.PATH, HOME: tempDir?.path() ?? os.tmpdir() },
 		stdout: "ignore",
 		stderr: "pipe",
@@ -124,6 +133,18 @@ describe("session ownership counters in the stats database", () => {
 				"0.23.0": { reports: 1, counters: { claim_released: 1, claim_taken: 1 } },
 			},
 		});
+	});
+
+	it("an exit write to an existing table waits out another process that writes and commits", async () => {
+		const dbPath = await freshDb();
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(1_000));
+		// The holder commits a change while the exit write waits: a deferred transaction that has
+		// already read could not upgrade after that commit, and would fail without waiting.
+		const holder = await holdWriteLock(dbPath, 300, { commitWrite: true });
+		expect(writeLocked(dbPath)).toBe(true);
+		recordSessionOwnershipCounts(dbPath, { claim_taken: 1 }, meta(1_000));
+		expect(await holder.exited).toBe(0);
+		expect(read(dbPath)).toMatchObject({ counters: { claim_taken: 2 }, reports: 2 });
 	});
 
 	it("counts two processes that exit in the same millisecond as two reports", async () => {
