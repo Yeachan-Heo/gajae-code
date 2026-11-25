@@ -87,6 +87,8 @@ interface Staged {
 	readonly run: (manager: SessionManager, context: Context, prepared: unknown) => unknown;
 	/** Start from a manager whose transcript is not on disk yet. */
 	readonly fresh?: boolean;
+	/** Skip the flush after `setup`, so `run` is the first flush of its writes. */
+	readonly unflushed?: boolean;
 }
 type Writer = Invoke | Staged;
 const always = () => true;
@@ -205,39 +207,72 @@ const SUCCESSOR_WRITERS: Record<string, Writer> = {
  * attribution check, without the requirement to write.
  */
 interface IndirectWriter {
-	/** The checked funnel its writes go through. */
-	readonly funnel: string;
-	/** Whether it writes in this scenario. If it does, the write must be reported at `funnel`. */
-	readonly writes: boolean;
+	/**
+	 * The checked funnel its writes go through, per destination, where it writes in this scenario;
+	 * such a write must be reported at that funnel. Without an entry it must write nothing. An
+	 * explicit destination's lines go through the persist writer, checked when it opened.
+	 */
+	readonly funnel: Partial<Record<Kind, string>>;
 	readonly writer: Writer;
 }
+/** A completed turn, so a recap of it is accepted. */
+function completedTurn(m: SessionManager) {
+	const requestEntryId = m.appendMessage(user("request"));
+	const sourceEntryId = m.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "answer" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	} as never);
+	return {
+		text: "recap",
+		sourceEntryId,
+		requestEntryId,
+		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+		generatedAt: "2026-11-02T07:12:00.000Z",
+	};
+}
+const APPEND_FUNNELS = { managed: "managed append", explicit: "persist writer open" } as const;
 const INDIRECT_WRITERS: Record<string, IndirectWriter> = {
 	appendSessionRecap: {
-		funnel: "managed append",
-		writes: false,
-		writer: m => m.appendSessionRecap({ recap: "r" } as never),
+		funnel: APPEND_FUNNELS,
+		writer: { setup: completedTurn, run: (m, _context, recap) => m.appendSessionRecap(recap as never) },
 	},
+	// Shared publications are managed-only; an explicit destination rejects them unwritten.
 	appendSessionRecapSharingSession: {
-		funnel: "managed append",
-		writes: false,
-		writer: m => m.appendSessionRecapSharingSession({ recap: "r" } as never),
+		funnel: { managed: "managed append" },
+		writer: { setup: completedTurn, run: (m, _context, recap) => m.appendSessionRecapSharingSession(recap as never) },
 	},
 	appendThinkingLevelChangeSharingSession: {
-		funnel: "managed append",
-		writes: false,
+		funnel: {},
 		writer: m => m.appendThinkingLevelChangeSharingSession("high", true, always),
 	},
-	newSession: { funnel: "new session successor", writes: false, writer: m => m.newSession() },
-	flush: { funnel: "managed append", writes: false, writer: m => m.flush() },
-	flushBeforeLeaving: { funnel: "managed append", writes: false, writer: m => m.flushBeforeLeaving() },
-	close: { funnel: "rewrite", writes: false, writer: m => m.close() },
-	closeStrict: { funnel: "rewrite", writes: false, writer: m => m.closeStrict() },
-	flushAndCloseStrict: { funnel: "rewrite", writes: false, writer: m => m.flushAndCloseStrict() },
-	recoverPersistenceFailure: { funnel: "rewrite", writes: false, writer: m => m.recoverPersistenceFailure() },
+	newSession: { funnel: {}, writer: m => m.newSession() },
+	// Managed appends and persist-writer lines land synchronously, so a flush only drains queued
+	// rewrites and patch publications, each checked at its own funnel when it runs.
+	flush: { funnel: {}, writer: { unflushed: true, setup: m => m.appendMessage(user("queued")), run: m => m.flush() } },
+	flushBeforeLeaving: {
+		funnel: {},
+		writer: { unflushed: true, setup: m => m.appendMessage(user("queued")), run: m => m.flushBeforeLeaving() },
+	},
+	close: { funnel: {}, writer: m => m.close() },
+	closeStrict: { funnel: {}, writer: m => m.closeStrict() },
+	flushAndCloseStrict: { funnel: {}, writer: m => m.flushAndCloseStrict() },
+	recoverPersistenceFailure: { funnel: {}, writer: m => m.recoverPersistenceFailure() },
 	// A missing or empty target file is created through the rewrite funnel.
 	setSessionFile: {
-		funnel: "rewrite",
-		writes: true,
+		funnel: { managed: "rewrite", explicit: "rewrite" },
 		writer: (m, { file }) => m.setSessionFile(path.join(path.dirname(file), "missing-target.jsonl")),
 	},
 };
@@ -412,7 +447,7 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 	let prepared: unknown;
 	try {
 		prepared = await staged.setup?.(manager, context);
-		await manager.flush();
+		if (!staged.unflushed) await manager.flush();
 	} catch (error) {
 		throw new Error(`setup failed: ${String(error)}`);
 	}
@@ -476,14 +511,15 @@ describe("session ownership writer inventory", () => {
 	});
 
 	const writers = { ...CURRENT_WRITERS, ...SUCCESSOR_WRITERS };
-	for (const [name, { funnel, writes, writer }] of Object.entries(INDIRECT_WRITERS)) {
+	for (const [name, { funnel: funnels, writer }] of Object.entries(INDIRECT_WRITERS)) {
 		for (const kind of ["managed", "explicit"] as const) {
-			it(`${name} (${kind}): ${writes ? `writes through ${funnel}, reported` : "writes nothing here"}`, async () => {
+			const funnel = funnels[kind];
+			it(`${name} (${kind}): ${funnel ? `writes through ${funnel}, reported` : "writes nothing here"}`, async () => {
 				detectorLogs = [];
 				const result = await attribute(kind, writer);
-				expect(result.wrote).toBe(writes);
+				expect(result.wrote).toBe(funnel !== undefined);
 				expect(result.unattributed).toEqual([]);
-				if (writes) expect((detectorLogs as { site: string }[]).some(log => log.site === funnel)).toBe(true);
+				if (funnel) expect((detectorLogs as { site: string }[]).map(log => log.site)).toContain(funnel);
 			});
 		}
 	}
