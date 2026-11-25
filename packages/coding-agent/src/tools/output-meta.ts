@@ -1137,8 +1137,15 @@ async function enforceInlineResultBackstop(
 	toolName: string,
 	context: AgentToolContext | undefined,
 ): Promise<AgentToolResult> {
-	const { maxInlineBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	const { maxInlineBytes, tailLines } = getSpillConfig(context?.settings);
 	if (maxInlineBytes <= 0) return result;
+
+	// Bash uses its own retention budgets, not the shared artifact spill keys.
+	// Respect those settings to avoid reapplying the shared policy.
+	const headBytes =
+		toolName === "bash" && context?.settings
+			? resolveBashOutputSinkHeadBytes(context.settings)
+			: getSpillConfig(context?.settings).headBytes;
 
 	const textParts: string[] = [];
 	for (const block of result.content) {

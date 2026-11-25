@@ -125,4 +125,19 @@ describe("output truncation metadata plumbing", () => {
 			expect(notice).toContain("artifact://art-full");
 		}
 	});
+
+	test("Bash settings don't leak into shared artifact budgets", () => {
+		// Verify that setting shared keys to 20 KB doesn't affect Bash's 1 KB default
+		const bashSettings = Settings.isolated({
+			"tools.bashOutputTailBytes": 1,
+			"tools.bashOutputHeadBytes": 0,
+			"tools.artifactTailBytes": 20,
+			"tools.artifactHeadBytes": 20,
+		});
+		expect(resolveBashOutputSinkTailBytes(bashSettings)).toBe(1024);
+		expect(resolveBashOutputSinkHeadBytes(bashSettings)).toBe(0);
+		// But shared settings stay at 20 KB
+		const shared = bashSettings.get("tools.artifactHeadBytes");
+		expect(shared).toBe(20);
+	});
 });
