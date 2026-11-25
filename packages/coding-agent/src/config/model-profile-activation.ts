@@ -1965,10 +1965,22 @@ export async function prepareModelProfileActivation(
 			const configuredDefaults = normalizeModelSelectorValue(bindings.defaultSelector);
 			// Distinguish authentication failures from genuine catalog misses:
 			// - If all skips are auth-related (credential_unavailable, unauthenticated), it's authentication_failed
+			// - If a skip has reason unknown_model but the selector exists in the full catalog,
+			//   it means the model is filtered out due to missing credentials, so it's authentication_failed
 			// - Otherwise, selectors don't exist in the catalog, so it's invalid_input
 			const authRelatedSkipReasons = new Set(["credential_unavailable", "unauthenticated"]);
-			const hasUnknownModelSkip = defaultResolutionSkips.some(skip => !authRelatedSkipReasons.has(skip.reason));
-			const errorCode = hasUnknownModelSkip ? "invalid_input" : "authentication_failed";
+			const fullCatalog = options.modelRegistry.getAll(credentialSessionId);
+			const fullCatalogIndex = createRegistrySelectorIndex(fullCatalog);
+			const hasGenuinelyUnknownSelector = defaultResolutionSkips.some(skip => {
+				if (authRelatedSkipReasons.has(skip.reason)) return false;
+				// Check if this unknown_model selector actually exists in the full catalog
+				if (skip.reason === "unknown_model") {
+					// If the selector exists in the full catalog, it's auth-filtered, not genuinely unknown
+					return !fullCatalogIndex.exact.has(skip.selector.trim().toLowerCase());
+				}
+				return true;
+			});
+			const errorCode = hasGenuinelyUnknownSelector ? "invalid_input" : "authentication_failed";
 			if (configuredDefaults.length === 1) {
 				if (errorCode === "authentication_failed") {
 					// Preserve credential errors through proper class rather than a typed plain Error

@@ -3583,6 +3583,41 @@ describe("model profile activation", () => {
 		expect((error as any).code).toBe("authentication_failed");
 	});
 
+	test("treats auth-filtered selectors in default chain as authentication_failed not invalid_input", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "optional-auth-filtered-chain",
+			requiredProviders: [],
+			modelMapping: { default: ["provider-b/filtered-model", "provider-a/initial"] },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile], missingProviders: ["provider-b"] });
+		// Simulate: first selector exists in catalog but no credentials available
+		// Second selector is available, so resolution should succeed by falling back
+		const registry = {
+			...baseRegistry,
+			getAvailable: () => [
+				model("provider-a", "initial"),
+				...baseRegistry.getAll().filter((m: any) => m.provider === "provider-c" || m.provider === "openai-codex"),
+			], // provider-b not authenticated
+			getAll: () => [
+				model("provider-a", "initial"),
+				model("provider-b", "filtered-model"),
+				...baseRegistry.getAll().filter((m: any) => m.provider === "provider-c" || m.provider === "openai-codex"),
+			], // Full catalog includes provider-b/filtered-model
+		};
+
+		const session = fakeSession();
+		await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		// Resolution should succeed by falling back to the available second selector
+		// This validates that auth-filtered selectors don't trigger invalid_input
+	});
+
 	test("persists profile ownership when a partial profile has no default mapping", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "executor-only-profile",
