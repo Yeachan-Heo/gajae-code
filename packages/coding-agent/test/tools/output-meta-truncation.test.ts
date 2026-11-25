@@ -10,6 +10,7 @@ import {
 	outputMeta,
 	resolveBashOutputSinkHeadBytes,
 	resolveBashOutputSinkTailBytes,
+	stripOutputNotice,
 	wrapToolWithMetaNotice,
 } from "../../src/tools/output-meta";
 import { ToolError } from "../../src/tools/tool-errors";
@@ -129,55 +130,128 @@ describe("output truncation metadata plumbing", () => {
 	});
 });
 
-describe("inline backstop excerpt shape follows the tool's own head budget", () => {
+describe("inline backstop excerpt follows the result's retention policy", () => {
 	const HEAD = "HEADMARK";
 	const TAIL = "TAILMARK";
-	// ~4 KiB body: well above the 1 KiB cap used below, well below the 50 KiB
-	// threshold spill, so only enforceInlineResultBackstop reshapes it.
-	const body = `${HEAD}\n${Array.from({ length: 200 }, (_, i) => `line-${String(i).padStart(3, "0")} ${"x".repeat(12)}`).join("\n")}\n${TAIL}`;
+	const LINE_BYTES = 32;
+	// Bodies stay below the 50 KiB threshold spill so only the backstop reshapes them.
+	function bodyOf(lines: number): string {
+		const line = (i: number) => `line-${String(i).padStart(5, "0")}${"x".repeat(LINE_BYTES - 11)}`;
+		return `${HEAD}\n${Array.from({ length: lines }, (_, i) => line(i)).join("\n")}\n${TAIL}`;
+	}
 
-	function tool(name: string): AgentTool {
-		const result: AgentToolResult = { content: [{ type: "text", text: body }] };
+	function tool(name: string, text: string, retention?: "bash"): AgentTool {
+		const result: AgentToolResult = {
+			content: [{ type: "text", text }],
+			...(retention ? { details: { meta: { retention } } } : {}),
+		};
 		return { name, description: "", parameters: {}, execute: async () => result } as unknown as AgentTool;
 	}
 
-	async function excerpt(name: string, overrides: Record<string, number>): Promise<string> {
+	async function excerpt(
+		subject: AgentTool,
+		overrides: Record<string, number>,
+	): Promise<{ text: string; bodyBytes: number }> {
 		const manager = SessionManager.inMemory();
 		const save = vi.spyOn(manager, "saveArtifact").mockImplementation(async () => "art-backstop");
 		try {
 			const context = {
-				settings: Settings.isolated({ "tools.maxInlineResultBytes": 1, ...overrides }),
+				settings: Settings.isolated(overrides),
 				sessionManager: createReadonlySessionManager(manager),
 			} as AgentToolContext;
-			const result = await wrapToolWithMetaNotice(tool(name)).execute("c", {}, undefined, undefined, context);
+			const result = await wrapToolWithMetaNotice(subject).execute("c", {}, undefined, undefined, context);
 			expect(save).toHaveBeenCalledTimes(1);
-			return result.content
+			const text = result.content
 				.filter((block): block is { type: "text"; text: string } => block.type === "text")
 				.map(block => block.text)
 				.join("\n");
+			const body = stripOutputNotice(text, result.details?.meta);
+			return { text, bodyBytes: Buffer.byteLength(body, "utf-8") };
 		} finally {
 			save.mockRestore();
 		}
 	}
 
-	test("bash keeps a head when tools.bashOutputHeadBytes is set even if the shared head is 0", async () => {
-		const text = await excerpt("bash", { "tools.bashOutputHeadBytes": 1, "tools.artifactHeadBytes": 0 });
+	const small = bodyOf(120); // ~4 KiB
+
+	test("bash output keeps a head when tools.bashOutputHeadBytes is set even if the shared head is 0", async () => {
+		const { text } = await excerpt(tool("bash", small, "bash"), {
+			"tools.maxInlineResultBytes": 1,
+			"tools.bashOutputHeadBytes": 1,
+			"tools.artifactHeadBytes": 0,
+		});
 		expect(text).toContain(HEAD);
 		expect(text).toContain(TAIL);
 	});
 
-	test("bash stays tail-only by default even if the shared head is 20 KB", async () => {
-		const text = await excerpt("bash", { "tools.artifactHeadBytes": 20 });
+	test("bash output stays tail-only by default even if the shared head is 20 KB", async () => {
+		const { text } = await excerpt(tool("bash", small, "bash"), {
+			"tools.maxInlineResultBytes": 1,
+			"tools.artifactHeadBytes": 20,
+		});
 		expect(text).not.toContain(HEAD);
 		expect(text).toContain(TAIL);
 	});
 
-	test("non-bash tools still follow the shared head budget", async () => {
-		const tailOnly = await excerpt("search", { "tools.artifactHeadBytes": 0, "tools.bashOutputHeadBytes": 1 });
-		expect(tailOnly).not.toContain(HEAD);
-		expect(tailOnly).toContain(TAIL);
-		const middle = await excerpt("search", { "tools.artifactHeadBytes": 1, "tools.bashOutputHeadBytes": 0 });
-		expect(middle).toContain(HEAD);
-		expect(middle).toContain(TAIL);
+	test("a bash result returned under another tool name (recipe) still follows the bash budgets", async () => {
+		const { text } = await excerpt(tool("recipe", small, "bash"), {
+			"tools.maxInlineResultBytes": 1,
+			"tools.artifactHeadBytes": 20,
+		});
+		expect(text).not.toContain(HEAD);
+		expect(text).toContain(TAIL);
+	});
+
+	test("results without a retention policy follow the shared head budget regardless of tool name", async () => {
+		const tailOnly = await excerpt(tool("search", small), {
+			"tools.maxInlineResultBytes": 1,
+			"tools.artifactHeadBytes": 0,
+			"tools.bashOutputHeadBytes": 1,
+		});
+		expect(tailOnly.text).not.toContain(HEAD);
+		expect(tailOnly.text).toContain(TAIL);
+		const middle = await excerpt(tool("search", small), {
+			"tools.maxInlineResultBytes": 1,
+			"tools.artifactHeadBytes": 1,
+			"tools.bashOutputHeadBytes": 0,
+		});
+		expect(middle.text).toContain(HEAD);
+		expect(middle.text).toContain(TAIL);
+	});
+
+	const large = bodyOf(500); // ~16 KiB: above an 8 KiB cap, below the threshold spill
+
+	test("the shared cap never widens a bash tail past tools.bashOutputTailBytes", async () => {
+		// Default bash policy (1 KB tail, no head) under an 8 KB cap: the cap must
+		// not hand the excerpt 8 KB of tail.
+		const { text, bodyBytes } = await excerpt(tool("bash", large, "bash"), { "tools.maxInlineResultBytes": 8 });
+		expect(text).not.toContain(HEAD);
+		expect(text).toContain(TAIL);
+		expect(bodyBytes).toBeLessThanOrEqual(1024);
+	});
+
+	test("middle elision caps head and tail by their own bash budgets inside the shared cap", async () => {
+		const cap = 8 * 1024;
+		const markerReserve = 256;
+		const headCap = Math.min(4 * 1024, Math.floor((cap - markerReserve) / 2));
+		const { text, bodyBytes } = await excerpt(tool("bash", large, "bash"), {
+			"tools.maxInlineResultBytes": 8,
+			"tools.bashOutputHeadBytes": 4,
+			"tools.bashOutputTailBytes": 1,
+		});
+		expect(text).toContain(HEAD);
+		expect(text).toContain(TAIL);
+		// head <= 4 KB (further clamped to half the budget), tail <= 1 KB, plus the marker line.
+		expect(bodyBytes).toBeLessThanOrEqual(headCap + 1024 + markerReserve);
+		expect(bodyBytes).toBeLessThanOrEqual(cap);
+	});
+
+	test("shared-policy results keep filling the cap with the shared defaults", async () => {
+		const cap = 8 * 1024;
+		const { text, bodyBytes } = await excerpt(tool("search", large), { "tools.maxInlineResultBytes": 8 });
+		expect(text).toContain(HEAD);
+		expect(text).toContain(TAIL);
+		expect(bodyBytes).toBeGreaterThan(cap / 2);
+		expect(bodyBytes).toBeLessThanOrEqual(cap);
 	});
 });

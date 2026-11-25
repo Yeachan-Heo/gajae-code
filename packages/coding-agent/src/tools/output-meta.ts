@@ -114,6 +114,13 @@ export interface OutputMeta {
 	diagnostics?: DiagnosticMeta;
 	limits?: LimitsMeta;
 	eviction?: EvictedToolOutputHandle;
+	/**
+	 * Which settings budget this output's inline excerpt when the result wrapper
+	 * spills or caps it. Bash stamps `"bash"` on every result it builds, so tools
+	 * that return a Bash result under their own name (`recipe`) inherit the Bash
+	 * budgets; absent means the shared `tools.artifact*Bytes` budgets.
+	 */
+	retention?: "bash";
 }
 
 // =============================================================================
@@ -547,6 +554,12 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
+	/** Declare which settings budget this output's inline excerpt. */
+	retention(policy: "bash"): this {
+		this.#meta.retention = policy;
+		return this;
+	}
+
 	/** Get the built OutputMeta, or undefined if empty. */
 	get(): OutputMeta | undefined {
 		return Object.keys(this.#meta).length > 0 ? this.#meta : undefined;
@@ -970,15 +983,18 @@ export function resolveBashOutputSinkHeadBytes(s: Settings | undefined): number 
 
 /**
  * Head/tail byte budgets for the inline excerpt the post-processing wrapper
- * builds (threshold spill and absolute backstop). Bash results keep following
- * the Bash keys here so the shared `tools.artifact*Bytes` keys never reshape a
- * Bash excerpt; every other tool uses the shared spill budgets.
+ * builds (threshold spill and absolute backstop). The policy comes from the
+ * result itself (`meta.retention`), not from the wrapped tool's name, so a
+ * Bash result returned by `recipe` is still budgeted by the Bash keys and the
+ * shared `tools.artifact*Bytes` keys never reshape Bash output. Results
+ * without a policy use the shared spill budgets.
  */
 function resolveInlineExcerptBudgets(
-	toolName: string,
+	result: AgentToolResult,
 	s: Settings | undefined,
 ): { headBytes: number; tailBytes: number } {
-	if (toolName === "bash") {
+	const meta: OutputMeta | undefined = result.details?.meta;
+	if (meta?.retention === "bash") {
 		return { headBytes: resolveBashOutputSinkHeadBytes(s), tailBytes: resolveBashOutputSinkTailBytes(s) };
 	}
 	const { headBytes, tailBytes } = getSpillConfig(s);
@@ -1017,7 +1033,7 @@ async function spillLargeResultToArtifact(
 	const artifactCapability = artifactCapabilityForContext(context);
 	if (!artifactCapability) return result;
 	const { threshold, readThreshold, tailLines } = getSpillConfig(context?.settings);
-	const { headBytes, tailBytes } = resolveInlineExcerptBudgets(toolName, context?.settings);
+	const { headBytes, tailBytes } = resolveInlineExcerptBudgets(result, context?.settings);
 	// `read` manages its own per-range truncation, but the combined multi-range
 	// output has no cap — enforce a read-specific (higher) combined threshold
 	// instead of exempting read entirely. 0 disables read spill (backstop only).
@@ -1149,8 +1165,10 @@ function stripBodyOwnedTruncationFooter(text: string, details: unknown): string 
  * head+tail view that fits the cap. Defaults to 12 KB, chosen by the live
  * tool-result A/B in #5945; a 0 cap, or a context that cannot store an
  * artifact, returns the result untouched. The cap itself is shared by every
- * tool; whether the capped excerpt keeps a head follows the tool's own budget
- * (`tools.bashOutputHeadBytes` for Bash, `tools.artifactHeadBytes` otherwise).
+ * tool; the head and tail inside it are each capped by the result's own
+ * retention budgets (`tools.bashOutput*Bytes` for Bash output,
+ * `tools.artifact*Bytes` otherwise), so a 1 KB Bash tail stays 1 KB even when
+ * the cap would allow more.
  */
 async function enforceInlineResultBackstop(
 	result: AgentToolResult,
@@ -1159,7 +1177,7 @@ async function enforceInlineResultBackstop(
 ): Promise<AgentToolResult> {
 	const { maxInlineBytes, tailLines } = getSpillConfig(context?.settings);
 	if (maxInlineBytes <= 0) return result;
-	const { headBytes } = resolveInlineExcerptBudgets(toolName, context?.settings);
+	const { headBytes, tailBytes } = resolveInlineExcerptBudgets(result, context?.settings);
 
 	const textParts: string[] = [];
 	for (const block of result.content) {
@@ -1188,21 +1206,26 @@ async function enforceInlineResultBackstop(
 
 	// Budget head+tail below the cap, reserving room for the elision marker so the
 	// composed `<head>\n<marker>\n<tail>` view never exceeds the configured cap.
+	// Each side is also capped by the result's own retention budget, so the shared
+	// cap only ever shrinks an excerpt, never widens it past what the tool keeps.
 	const MARKER_RESERVE = 256;
 	const budget = maxInlineBytes - MARKER_RESERVE;
-	const useMiddle = headBytes > 0 && budget > 0;
+	const headBudget = Math.max(0, Math.min(headBytes, Math.floor(budget / 2)));
+	const tailBudget = Math.max(0, Math.min(tailBytes, budget - headBudget));
+	const tailOnlyBytes = Math.min(maxInlineBytes, tailBytes);
+	const useMiddle = headBudget > 0;
 	let truncated = useMiddle
 		? truncateMiddle(fullText, {
-				maxBytes: budget,
+				maxBytes: headBudget + tailBudget,
 				maxLines: tailLines * 2,
-				maxHeadBytes: Math.min(headBytes, Math.floor(budget / 2)),
+				maxHeadBytes: headBudget,
 				maxHeadLines: tailLines,
 			})
-		: truncateTailKeepingUntrustedFence(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+		: truncateTailKeepingUntrustedFence(fullText, { maxBytes: tailOnlyBytes, maxLines: tailLines });
 
 	// Defensive clamp: guarantee the contract even for pathological marker sizes.
 	if (Buffer.byteLength(truncated.content, "utf-8") > maxInlineBytes) {
-		truncated = truncateTailKeepingUntrustedFence(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+		truncated = truncateTailKeepingUntrustedFence(fullText, { maxBytes: tailOnlyBytes, maxLines: tailLines });
 	}
 
 	// Rebuild content preserving original block order while replacing text content.
