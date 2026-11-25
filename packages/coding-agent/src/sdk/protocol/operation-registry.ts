@@ -416,6 +416,7 @@ function controlErrors(id: string): string[] {
 		C50: ["nothing_to_retry", "busy"],
 		C51: ["retry_not_pending"],
 		C52: ["not_foldable", "already_backgrounded", "no_active_bash"],
+		C53: ["invalid_input", "authentication_failed", "unknown_provider", "busy"],
 		C54: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],

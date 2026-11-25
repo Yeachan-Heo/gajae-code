@@ -1590,8 +1590,13 @@ async function resolveAndClampSelectorValue(
 		throw new ModelProfileCredentialError(profileLabel, [...unresolvedKnownBareProviders].sort(), role);
 	}
 	if (options.requireQualifiedResolution && !resolvedAny && unresolvedQualifiedSelectors.length > 0) {
-		throw new Error(
-			`Model profile "${profileLabel}" ${role} selectors do not match any catalog model: ${unresolvedQualifiedSelectors.join(", ")}`,
+		throw Object.assign(
+			new Error(
+				`Model profile "${profileLabel}" ${role} selectors do not match any catalog model: ${unresolvedQualifiedSelectors.join(", ")}`,
+			),
+			{
+				code: "invalid_input",
+			},
 		);
 	}
 	return clamped.length === 1 && typeof selectorValue === "string" ? clamped[0] : clamped;
@@ -1956,11 +1961,17 @@ export async function prepareModelProfileActivation(
 		if (bindings.defaultSelector && !defaultModel) {
 			const configuredDefaults = normalizeModelSelectorValue(bindings.defaultSelector);
 			if (configuredDefaults.length === 1) {
-				throw new Error(
-					`Model profile "${profileLabel}" default selector did not resolve: ${configuredDefaults[0]}`,
+				throw Object.assign(
+					new Error(`Model profile "${profileLabel}" default selector did not resolve: ${configuredDefaults[0]}`),
+					{ code: "invalid_input" },
 				);
 			}
-			throw new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`);
+			throw Object.assign(
+				new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`),
+				{
+					code: "invalid_input",
+				},
+			);
 		}
 
 		const { modelRoles, agentModelOverrides } = await preflightModelProfileRoleBindings({
