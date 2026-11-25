@@ -76,7 +76,11 @@ export class SessionClaimSet {
 		};
 	}
 
-	/** Release every claim whose id is not current and not held for a deferred shutdown. */
+	/**
+	 * Release every claim whose id is not current and not held for a deferred shutdown. Runs when the
+	 * outermost transition ends, so a target added outside any transition stays until the next one
+	 * settles; stage targets inside the transition that rotates to them.
+	 */
 	settle(): void {
 		if (this.#transitions > 0 || this.#current === undefined) return;
 		for (const [sessionId, claim] of [...this.#claims]) {
@@ -100,7 +104,9 @@ export class SessionClaimSet {
 			hold.set.#holds.delete(sessionId);
 			if (timedOut) countSessionOwnershipEvent("release_after_deferred_timeout");
 			if (hold.set.#closed) hold.set.#releaseOne(sessionId);
-			else hold.set.settle();
+			// Only the held id: any other non-current claim (a target staged before its rotation)
+			// waits for the transition that commits or abandons it.
+			else if (hold.set.#transitions === 0 && hold.set.#current !== sessionId) hold.set.#releaseOne(sessionId);
 		};
 		hold.timer = setTimeout(() => end(true), capMs);
 		hold.timer.unref();

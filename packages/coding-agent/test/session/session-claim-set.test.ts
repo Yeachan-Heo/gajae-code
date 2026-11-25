@@ -112,13 +112,25 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		expect(await held(predecessor)).toBe(false);
 		expect(await held(prepared.sessionId)).toBe(true);
 		expect(claims.sessionIds).toEqual([prepared.sessionId]);
+	});
 
-		// Without an enclosing transition, the rotating SessionManager call is the commit.
-		const next = await manager.prepareNewSession();
-		claims.add(await claim(next.sessionId));
-		manager.commitPreparedNewSession(next);
-		expect(await held(prepared.sessionId)).toBe(false);
-		expect(claims.sessionIds).toEqual([next.sessionId]);
+	it("a target staged before its rotation survives until the commit, even when a hold ends first", async () => {
+		const { manager, claims } = await persisted();
+		const predecessor = manager.getSessionId();
+		claims.add(await claim(predecessor));
+		const finalization = Promise.withResolvers<void>();
+		claims.holdUntil(predecessor, finalization.promise);
+		const prepared = await manager.prepareNewSession();
+		// Staged outside any transition: only the rotation that makes it current may settle it.
+		claims.add(await claim(prepared.sessionId));
+		finalization.resolve();
+		await finalization.promise;
+		expect(await held(prepared.sessionId)).toBe(true);
+		expect(await held(predecessor)).toBe(true);
+		manager.commitPreparedNewSession(prepared);
+		expect(await held(prepared.sessionId)).toBe(true);
+		expect(await held(predecessor)).toBe(false);
+		expect(claims.sessionIds).toEqual([prepared.sessionId]);
 	});
 
 	it("hook cancel: a target claimed for the transition is released, the predecessor kept", async () => {
@@ -194,8 +206,11 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		const finalization = Promise.withResolvers<void>();
 		claims.holdUntil(predecessor, finalization.promise);
 		const successor = await manager.prepareNewSession();
-		claims.add(await claim(successor.sessionId));
-		manager.commitPreparedNewSession(successor);
+		{
+			using _rotation = claims.transition();
+			claims.add(await claim(successor.sessionId));
+			manager.commitPreparedNewSession(successor);
+		}
 		expect(await held(predecessor)).toBe(true);
 		finalization.resolve();
 		await finalization.promise;
@@ -205,8 +220,11 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		// A finalization that never settles holds only until the cap, and is counted.
 		claims.holdUntil(successor.sessionId, new Promise<void>(() => {}), 20);
 		const third = await manager.prepareNewSession();
-		claims.add(await claim(third.sessionId));
-		manager.commitPreparedNewSession(third);
+		{
+			using _rotation = claims.transition();
+			claims.add(await claim(third.sessionId));
+			manager.commitPreparedNewSession(third);
+		}
 		expect(await held(successor.sessionId)).toBe(true);
 		await Bun.sleep(80);
 		expect(await held(successor.sessionId)).toBe(false);
