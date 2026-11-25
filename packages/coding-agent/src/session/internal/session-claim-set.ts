@@ -97,14 +97,20 @@ export class SessionClaimSet {
 	 * and this set holds no claim for `sessionId` (the current id unless a successor is named), it
 	 * logs `session_write_without_claim` with the call site and counts it. It never claims, and it
 	 * throws only under the strict test seam. In `off` it returns at once.
+	 *
+	 * A write made before the manager's first bind (a factory publishing a new transcript before it
+	 * adopts it) must name its id: with nothing bound there is no current id, and no mode captured
+	 * by a bind, so the mode is read now.
 	 */
 	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
-		if (this.#mode === "off" || sessionId === undefined || this.#claims.has(sessionId)) return;
+		if (sessionId === undefined) return;
+		const mode = this.#current === undefined ? sessionOwnershipMode() : this.#mode;
+		if (mode === "off" || this.#claims.has(sessionId)) return;
 		countSessionOwnershipEvent("session_write_without_claim");
 		const report = `${sessionId} ${site}`;
 		if (!this.#reported.has(report)) {
 			this.#reported.add(report);
-			logger.warn("session_write_without_claim", { site, sessionId, mode: this.#mode });
+			logger.warn("session_write_without_claim", { site, sessionId, mode });
 		}
 		if (sessionOwnershipTestHookSlot().strictWriteDetection) throw new SessionWriteWithoutClaimError(site);
 	}

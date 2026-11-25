@@ -81,6 +81,7 @@ import {
 	type HeaderPatchRecord,
 	isEntryPatchRecord,
 	isHeaderPatchRecord,
+	isSessionTranscriptFileName,
 	isSupportedSessionVersion,
 	type MutableSessionHeaderFields,
 	parseStoredSessionEntries,
@@ -7135,8 +7136,7 @@ export function listProjectSessionTranscriptFiles(cwd: string): string[] {
 			}
 			if (
 				entry.isFile() &&
-				!entry.name.startsWith(".") &&
-				entry.name.endsWith(".jsonl") &&
+				isSessionTranscriptFileName(entry.name) &&
 				isProjectSessionTranscriptPath(projectGjcDir, entryPath)
 			) {
 				files.push(entryPath);
@@ -23674,6 +23674,8 @@ export class SessionManager {
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return false;
+		// The fork's transcript is published before this manager binds any id, so the check names it.
+		this.#ownershipClaims.checkWrite("fork successor", fresh.sessionId);
 		const staged = this.#storage.openStagedWriter(fresh.sessionFile, {
 			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
 		});
@@ -23874,6 +23876,8 @@ export class SessionManager {
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return undefined;
+		// The fork's transcript is published before this manager binds any id, so the check names it.
+		this.#ownershipClaims.checkWrite("fork successor", fresh.sessionId);
 		const staged = snapshot.storage.openStagedWriter(fresh.sessionFile, {
 			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
 		});
@@ -24757,6 +24761,7 @@ export class SessionManager {
 					manager.#commitResidentTextStoreTransition(prepared, false);
 					manager.#retireEphemeralArtifacts();
 					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
+					manager.#ownershipClaims.checkWrite("open create");
 					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
 					const publishedTranscript = managedInspectionStore.readExpected(path.basename(filePath));
 					if (publishedTranscript?.bytes?.equals(Buffer.from(content, "utf8")) !== true)
