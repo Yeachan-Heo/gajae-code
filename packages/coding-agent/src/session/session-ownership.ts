@@ -26,6 +26,12 @@ import { recordSessionOwnershipCounts } from "@gajae-code/stats/session-ownershi
 import { getStatsDbPath, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
+import {
+	classifySessionOwnerEntry,
+	SESSION_OWNER_RECORD_SUFFIX,
+	SESSION_OWNER_SIDECAR_SUFFIX,
+	SESSION_OWNERS_RELATIVE_DIR,
+} from "./session-owners-layout";
 import { type SessionOwnershipTestHookSlot, sessionOwnershipTestHookSlot } from "./session-ownership-mode";
 import {
 	assertAppendLockHomeNotSharedWritable,
@@ -36,8 +42,8 @@ import {
 	type RuntimeLockDirectory,
 } from "./session-storage";
 
-const SIDECAR_SUFFIX = ".session-owner";
-const RECORD_SUFFIX = ".owner.json";
+const SIDECAR_SUFFIX = SESSION_OWNER_SIDECAR_SUFFIX;
+const RECORD_SUFFIX = SESSION_OWNER_RECORD_SUFFIX;
 const RECORD_VERSION = 1;
 const RECORD_MAX_BYTES = 4096;
 /** Every native call answers within this budget, or reports `timed_out`. */
@@ -48,6 +54,8 @@ const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const PLAIN_KEY = /^[a-z0-9_-]{1,128}$/;
 const SAFE_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
 const SAFE_VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
+/** A UTC instant as `Date#toISOString` writes it; anything else in a record is not shown. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 export const SESSION_OWNER_SURFACES = ["app", "terminal", "print", "sdk-host", "acp-host", "sdk"] as const;
 export type SessionOwnerBaseSurface = (typeof SESSION_OWNER_SURFACES)[number];
@@ -161,14 +169,14 @@ function trustedHome(): string {
 }
 
 export function sessionOwnersDirectory(): string {
-	return path.join(trustedHome(), ".gjc", "runtime", "session-owners");
+	return path.join(trustedHome(), SESSION_OWNERS_RELATIVE_DIR);
 }
 
 /** The append lock's checks without creating anything; `undefined` when no claim was ever made here. */
 function inspectOwnersDirectory(): string | undefined {
 	const home = trustedHome();
 	assertAppendLockHomeNotSharedWritable(home);
-	const owners = path.join(home, ".gjc", "runtime", "session-owners");
+	const owners = path.join(home, SESSION_OWNERS_RELATIVE_DIR);
 	assertNoReparsePath(owners);
 	try {
 		if (!fs.lstatSync(owners).isDirectory()) throw new Error("session_owners_not_directory");
@@ -280,11 +288,18 @@ function writeRecord(recordPath: string, record: OwnerRecord): void {
 	}
 }
 
+/** A record's `claimedAt`, re-serialised, or `undefined` when it is not a plain UTC instant. */
+function safeInstant(value: string): string | undefined {
+	if (!ISO_INSTANT.test(value)) return undefined;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
 /** The holder a record names, if it checks out; otherwise `undefined` ("another gjc process"). */
 function verifiedHolder(record: OwnerRecord | undefined, sessionId: string): SessionOwnerHolder | undefined {
 	if (!record || record.sessionId !== sessionId) return undefined;
 	const gjcVersion = SAFE_VERSION.test(record.gjcVersion) ? record.gjcVersion : undefined;
-	const base = { surface: record.surface, pid: record.pid, gjcVersion, claimedAt: record.claimedAt };
+	const base = { surface: record.surface, pid: record.pid, gjcVersion, claimedAt: safeInstant(record.claimedAt) };
 	// A live pid with a matching start incarnation is this host's process even if the host name
 	// changed since the record was written (macOS renames hosts with the network).
 	if (observeProcess(record.pid, record.processIncarnation ?? undefined) === "alive") return base;
@@ -667,6 +682,121 @@ export async function probeSessionOwner(sessionId: string): Promise<SessionOwner
 	const probe = (await probeSessionOwners([sessionId])).get(sessionId);
 	if (!probe) throw new Error("probe returned no result");
 	return probe;
+}
+
+// =============================================================================
+// Inventory (read-only; design §2.9)
+// =============================================================================
+
+/**
+ * What the record beside a held sidecar says: `verified` (its holder checks out), `holder_gone` (a
+ * process on this host that no longer exists, impossible under a kernel lock and so a bug signal),
+ * `unverified` (alive but unprovable), `absent`, or `invalid` (unreadable, or naming another key).
+ */
+export type SessionOwnerRecordState = "verified" | "holder_gone" | "unverified" | "absent" | "invalid";
+
+/** A held (or unprobeable) sidecar. Every field is checked: records are untrusted input. */
+export interface SessionOwnerSidecar {
+	readonly key: string;
+	readonly state: "held" | "unknown";
+	/** This process holds it. */
+	readonly self: boolean;
+	readonly record: SessionOwnerRecordState;
+	/** The id the record names, only when it maps to this key and is a safe id. */
+	readonly sessionId?: string;
+	readonly holder?: SessionOwnerHolder;
+	/** The pid of a `holder_gone` record. */
+	readonly gonePid?: number;
+}
+
+export interface SessionOwnersInventory {
+	readonly directory: "missing" | "present";
+	readonly sidecars: number;
+	readonly records: number;
+	/** Entries that are neither a sidecar nor a record with a well-formed key. */
+	readonly unrecognized: number;
+	/** Allocated size of the directory and its entries (apparent size where blocks are not reported). */
+	readonly diskBytes: number;
+	readonly held: readonly SessionOwnerSidecar[];
+}
+
+function describeRecord(
+	record: OwnerRecord | undefined,
+	key: string,
+): Omit<SessionOwnerSidecar, "key" | "state" | "self"> {
+	if (!record) return { record: "absent" };
+	if (record.sessionId.length === 0 || sessionOwnerKey(record.sessionId) !== key) return { record: "invalid" };
+	const sessionId = SAFE_ID.test(record.sessionId) ? record.sessionId : undefined;
+	const holder = verifiedHolder(record, record.sessionId);
+	if (holder) return { record: "verified", sessionId, holder };
+	const gone =
+		record.host === os.hostname() && observeProcess(record.pid, record.processIncarnation ?? undefined) === "exited";
+	return gone ? { record: "holder_gone", sessionId, gonePid: record.pid } : { record: "unverified", sessionId };
+}
+
+/**
+ * Every held sidecar under the owners directory, with its checked holder, plus the directory's
+ * counts. Read-only: it probes and reads, never claims, writes, unlinks or creates the directory.
+ * `keys` limits the probes (and the counts) to those sidecars, for a second look at suspects; this
+ * process's own claims, read from the registry, are always included.
+ * Throws `SessionOwnershipError` when the directory fails the append lock's safety checks.
+ */
+export async function inspectSessionOwners(
+	options: { readonly keys?: readonly string[] } = {},
+): Promise<SessionOwnersInventory> {
+	const current = registry();
+	let owners: string | undefined;
+	try {
+		owners = inspectOwnersDirectory();
+	} catch (error) {
+		throw directoryFailure(error);
+	}
+	const self = new Map<string, RegistryEntry>();
+	for (const [sidecar, entry] of current.entries) self.set(path.basename(sidecar, SIDECAR_SUFFIX), entry);
+	const held: SessionOwnerSidecar[] = [...self].map(([key, entry]) => ({
+		key,
+		state: "held",
+		self: true,
+		record: "verified",
+		sessionId: SAFE_ID.test(entry.sessionId) ? entry.sessionId : undefined,
+		holder: selfHolder(entry),
+	}));
+	const counts = { sidecars: 0, records: 0, unrecognized: 0, diskBytes: 0 };
+	if (!owners) return { directory: "missing", ...counts, held };
+	const keys: string[] = [];
+	const names = options.keys ? options.keys.map(key => `${key}${SIDECAR_SUFFIX}`) : [".", ...fs.readdirSync(owners)];
+	for (const name of names) {
+		let isFile = false;
+		try {
+			const stat = fs.lstatSync(path.join(owners, name));
+			counts.diskBytes += stat.blocks ? stat.blocks * 512 : stat.size;
+			isFile = stat.isFile();
+		} catch {}
+		if (name === ".") continue;
+		const entry = classifySessionOwnerEntry(name, isFile);
+		if (entry.kind === "sidecar") {
+			counts.sidecars += 1;
+			if (!self.has(entry.key)) keys.push(entry.key);
+		} else if (entry.kind === "record") counts.records += 1;
+		else counts.unrecognized += 1;
+	}
+	const directory = owners;
+	const inspectOne = async (key: string): Promise<SessionOwnerSidecar | undefined> => {
+		let state: SessionOwnerSidecar["state"] = "unknown";
+		if (current.unavailable === undefined) {
+			const probe = await backend().probe(path.join(directory, `${key}${SIDECAR_SUFFIX}`), NATIVE_BUDGET_MS);
+			if (probe.state === FileLockProbeState.Free) return undefined;
+			if (probe.state === FileLockProbeState.Held) state = "held";
+		}
+		const record = readRecord(path.join(directory, `${key}${RECORD_SUFFIX}`));
+		return { key, state, self: false, ...describeRecord(record, key) };
+	};
+	for (let start = 0; start < keys.length; start += PROBE_CONCURRENCY) {
+		const found = await Promise.all(keys.slice(start, start + PROBE_CONCURRENCY).map(inspectOne));
+		for (const sidecar of found) if (sidecar) held.push(sidecar);
+	}
+	held.sort((a, b) => a.key.localeCompare(b.key));
+	return { directory: "present", ...counts, held };
 }
 
 // =============================================================================
