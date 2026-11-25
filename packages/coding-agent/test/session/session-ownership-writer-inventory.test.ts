@@ -678,6 +678,128 @@ describe("session ownership writer inventory", () => {
 			expect(writes.uncovered).toEqual(["fs.promises.writeFile a.jsonl (header changed)"]);
 		});
 
+		it("an unchecked append after a handle-written open is flagged, however often the ledger is read", async () => {
+			const at = await files();
+			check("session-x");
+			await throughHandle(at("x.jsonl"), "session-x");
+			expect(writes.uncovered).toEqual([]);
+			await fs.appendFile(at("x.jsonl"), `${JSON.stringify({ type: "custom" })}\n`);
+			expect(writes.uncovered).toEqual(["fs.promises.appendFile x.jsonl"]);
+			expect(writes.uncovered).toEqual(["fs.promises.appendFile x.jsonl"]);
+		});
+
+		it("two opens made before either header is written share one check", async () => {
+			const at = await files();
+			check("session-x");
+			const first = await fs.open(at("x1.jsonl"), "wx");
+			const second = await fs.open(at("x2.jsonl"), "wx");
+			await first.writeFile(bytes("x1", "session-x"));
+			await second.writeFile(bytes("x2", "session-x"));
+			await first.close();
+			await second.close();
+			expect(writes.uncovered).toEqual(["fs.promises.open x2.jsonl"]);
+		});
+
+		it("a header written in two appends is one session's, and the second append needs its own check", async () => {
+			const at = await files();
+			const header = JSON.stringify({ type: "session", id: "session-x" });
+			check("session-x");
+			fsSync.appendFileSync(at("x.jsonl"), header.slice(0, 10));
+			fsSync.appendFileSync(at("x.jsonl"), `${header.slice(10)}\n`);
+			expect(writes.uncovered).toEqual(["fs.appendFileSync x.jsonl"]);
+		});
+
+		it("an unchecked append after a new file's write stream is flagged", async () => {
+			const at = await files();
+			check("session-x");
+			const { promise, resolve } = Promise.withResolvers<void>();
+			fsSync.createWriteStream(at("x.jsonl"), { flags: "wx" }).end(bytes("x", "session-x"), resolve);
+			await promise;
+			await fs.appendFile(at("x.jsonl"), `${JSON.stringify({ type: "custom" })}\n`);
+			expect(writes.uncovered).toEqual(["fs.promises.appendFile x.jsonl"]);
+		});
+
+		it("a write whose header never appears is not covered", async () => {
+			const at = await files();
+			check("session-x");
+			const handle = await fs.open(at("x.jsonl"), "wx");
+			await handle.writeFile(`${JSON.stringify({ type: "custom" })}\n`);
+			await handle.close();
+			expect(writes.uncovered).toEqual(["fs.promises.open x.jsonl (no session header)"]);
+		});
+
+		it("a first line that is not a session header names no session", async () => {
+			const at = await files();
+			check("session-x");
+			await fs.writeFile(at("x.jsonl"), `${JSON.stringify({ type: "custom", id: "session-x" })}\n`);
+			expect(writes.uncovered).toEqual(["fs.promises.writeFile x.jsonl (no session header)"]);
+		});
+
+		it("truncating a transcript to nothing is flagged as a header change", async () => {
+			const at = await files("a.jsonl");
+			check();
+			fsSync.truncateSync(at("a.jsonl"), 0);
+			expect(writes.uncovered).toEqual(["fs.truncateSync a.jsonl (header changed)"]);
+		});
+
+		it("a handle-written open is not covered by a reserved check for another session", async () => {
+			const at = await files();
+			check("session-y");
+			await throughHandle(at("x.jsonl"), "session-x");
+			// The reserved check for session-y goes back to pending, and still covers its own write.
+			await fs.writeFile(at("y.jsonl"), bytes("y", "session-y"));
+			expect(writes.uncovered).toEqual(["fs.promises.open x.jsonl"]);
+		});
+
+		it("a check made after a handle-written open does not cover that open", async () => {
+			const at = await files();
+			const handle = await fs.open(at("x.jsonl"), "wx");
+			check("session-x");
+			await handle.writeFile(bytes("x", "session-x"));
+			await handle.close();
+			expect(writes.uncovered).toEqual(["fs.promises.open x.jsonl"]);
+		});
+
+		it("reset drops pending checks", async () => {
+			const at = await files();
+			check("session-x");
+			writes.reset();
+			await fs.writeFile(at("x.jsonl"), bytes("x", "session-x"));
+			expect(writes.uncovered).toEqual(["fs.promises.writeFile x.jsonl"]);
+		});
+
+		it("a new write at a vacated path ends what a later rename could restore there", async () => {
+			const at = await files("a.jsonl");
+			check();
+			await fs.rename(at("a.jsonl"), at("b.jsonl"));
+			check();
+			await fs.writeFile(at("a.jsonl"), bytes("new"));
+			// Renaming the original back over the new transcript is a write, not a restore.
+			await fs.rename(at("b.jsonl"), at("a.jsonl"));
+			expect(writes.uncovered).toEqual(["fs.promises.rename a.jsonl"]);
+		});
+
+		it("a callback write lands when its callback fires, and a failed one uses no check", async () => {
+			const at = await files("a.jsonl");
+			const viaCallback = (write: (done: (error: unknown) => void) => void) => {
+				const { promise, resolve } = Promise.withResolvers<unknown>();
+				write(resolve);
+				return promise;
+			};
+			check("session-b");
+			// The header is compared before and after the write itself, not when the call returns.
+			await viaCallback(done => fsSync.writeFile(at("a.jsonl"), bytes("x", "session-b"), done));
+			expect(writes.uncovered).toEqual(["fs.writeFile a.jsonl (header changed)"]);
+			writes.reset();
+			check("session-y");
+			const failed = await viaCallback(done =>
+				fsSync.appendFile(at("missing/y.jsonl"), bytes("y", "session-y"), done),
+			);
+			expect(failed).toBeInstanceOf(Error);
+			await fs.writeFile(at("y.jsonl"), bytes("y", "session-y"));
+			expect(writes.uncovered).toEqual([]);
+		});
+
 		it("a check with no write of its own covers no later write to another session", async () => {
 			const at = await files();
 			check("session-x");
