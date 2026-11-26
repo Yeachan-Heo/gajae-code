@@ -23038,6 +23038,7 @@ export class AgentSession {
 					try {
 						await forkedManager.close();
 					} catch (closeError) {
+						forkedManager.retryCloseInBackground();
 						cleanupErrors.push(closeError);
 						logger.warn("Bounded fork successor close failed after initialization failure", {
 							error: closeError instanceof Error ? closeError.message : String(closeError),
@@ -23066,6 +23067,7 @@ export class AgentSession {
 				try {
 					await previousManager.close();
 				} catch (error) {
+					previousManager.retryCloseInBackground();
 					logger.warn("Previous session close failed after bounded fork adoption", {
 						error: error instanceof Error ? error.message : String(error),
 					});
