@@ -7225,11 +7225,36 @@ let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
 
-// Session ownership reads its global-only mode from the process settings. Injected, because the
-// session modules sit below config in the import graph.
+/**
+ * The operator's global config.yml as a process that never ran `Settings.init` sees it (an SDK
+ * embedding with isolated settings), read once per path. Sync, because sync session factories resolve
+ * the ownership mode. A missing, unreadable or malformed file reads as empty, as the loader treats it.
+ */
+const operatorGlobalConfigs = new Map<string, RawSettings>();
+function operatorGlobalConfig(configPath: string): RawSettings {
+	const cached = operatorGlobalConfigs.get(configPath);
+	if (cached) return cached;
+	let config: RawSettings = {};
+	try {
+		const parsed: unknown = YAML.parse(fs.readFileSync(configPath, "utf8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) config = parsed as RawSettings;
+	} catch {
+		// Missing or unreadable: the defaults apply.
+	}
+	operatorGlobalConfigs.set(configPath, config);
+	return config;
+}
+
+// Session ownership reads its global-only mode from the process settings or, before they exist, from
+// the agent directory's config file, so the operator's `off` holds in an embedding too. Injected,
+// because the session modules sit below config in the import graph.
 // The global layer only: a project or runtime value, including a null or scalar `session` parent
 // that would replace the user's whole `session` object in the merge, never reaches the mode.
-setSessionOwnershipSettingSource(() => globalInstance?.getGlobal("session.ownership.mode"));
+setSessionOwnershipSettingSource(() =>
+	globalInstance
+		? globalInstance.getGlobal("session.ownership.mode")
+		: getByPath(operatorGlobalConfig(path.join(getAgentDir(), "config.yml")), ["session", "ownership", "mode"]),
+);
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -7244,6 +7269,7 @@ export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
 	globalInitOptions = null;
+	operatorGlobalConfigs.clear();
 }
 
 /**

@@ -148,9 +148,20 @@ export function sessionOwnershipOverrideWasRead(): boolean {
 
 let settingSource: (() => unknown) | undefined;
 
-/** Settings supplies the global-only `session.ownership.mode` value. Without a source the default applies. */
+/**
+ * Settings supplies the operator's global `session.ownership.mode` value: the process settings, or,
+ * before `Settings.init`, the agent directory's config file. Without a source the default applies.
+ */
 export function setSessionOwnershipSettingSource(source: (() => unknown) | undefined): void {
 	settingSource = source;
+}
+
+function readSettingSource(): unknown {
+	try {
+		return settingSource?.();
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -158,27 +169,24 @@ export function setSessionOwnershipSettingSource(source: (() => unknown) | undef
  * so `off` does no work beyond reading the setting.
  */
 export function sessionOwnershipMode(): SessionOwnershipMode {
-	let setting: unknown;
-	try {
-		setting = settingSource?.();
-	} catch {
-		setting = undefined;
-	}
-	return sessionOwnershipModeFor(setting);
+	return sessionOwnershipModeFor(undefined);
 }
 
 /**
  * The mode for a `session.ownership.mode` value read from settings other than the global instance
  * (a launch that opens its session before `Settings.init`, or a scoped load), with the same override.
+ * A missing value, as from settings that never loaded the operator's config file (an embedding's
+ * `Settings.isolated()`), falls back to the setting source, so the operator's `off` still applies.
  */
 export function sessionOwnershipModeFor(setting: unknown): SessionOwnershipMode {
 	const forced = sessionOwnershipTestHookSlot().mode;
 	if (forced !== undefined) return forced;
-	const configured = resolveSessionOwnershipMode(setting, undefined);
+	const value = setting === undefined ? readSettingSource() : setting;
+	const configured = resolveSessionOwnershipMode(value, undefined);
 	// `off` is the kill switch: it returns before the environment is read at all.
 	if (configured === "off") return "off";
 	cachedOverride ??= readOverride();
-	const effective = resolveSessionOwnershipMode(setting, cachedOverride.value);
+	const effective = resolveSessionOwnershipMode(value, cachedOverride.value);
 	reportIgnoredOverride(cachedOverride, configured, effective);
 	return effective;
 }

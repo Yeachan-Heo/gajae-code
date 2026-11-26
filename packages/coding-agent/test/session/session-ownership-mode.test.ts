@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { YAML } from "bun";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
@@ -14,6 +14,7 @@ import {
 	SESSION_OWNERSHIP_MODES,
 	type SessionOwnershipMode,
 	sessionOwnershipMode,
+	sessionOwnershipModeFor,
 	sessionOwnershipOverrideWasRead,
 	sessionOwnershipTestHookSlot,
 	trustedSessionOwnershipOverride,
@@ -175,6 +176,25 @@ describe("the session.ownership.mode setting", () => {
 		expect(() =>
 			Bun.resolveSync("@gajae-code/coding-agent/session/session-ownership-mode", import.meta.dir),
 		).toThrow();
+	});
+
+	it("without Settings.init, the operator's config file decides, for isolated settings too", async () => {
+		const root = await tempRoot();
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ session: { ownership: { mode: "observe" } } }),
+		);
+		const previous = getAgentDir();
+		setAgentDir(agentDir);
+		try {
+			// An embedding's settings never loaded config.yml, so they carry no value of their own.
+			expect(sessionOwnershipModeFor(Settings.isolated().getGlobal("session.ownership.mode"))).toBe("observe");
+			expect(sessionOwnershipMode()).toBe("observe");
+		} finally {
+			setAgentDir(previous);
+		}
 	});
 
 	it("cannot be raised from a project file when the user left it at off", async () => {
