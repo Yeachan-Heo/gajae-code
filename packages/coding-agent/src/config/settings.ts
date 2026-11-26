@@ -7229,11 +7229,13 @@ let globalInitOptions: SettingsOptions | null = null;
  * The operator's `session.ownership.mode` from the agent directory's config.yml, for a process that
  * never ran `Settings.init` (an SDK embedding with isolated settings), read once per path. Sync,
  * because sync session factories resolve the mode. A missing or malformed file reads as unset, as the
- * loader treats it. Any other read error (EACCES, a directory in the file's place) resolves to `off`:
- * deliberately more conservative than the loader, so a file that cannot be read never lifts an `off`
- * the operator may have set in it.
+ * loader treats it. Any other read error (EACCES, EMFILE, a directory in the file's place) resolves to
+ * `off`: deliberately more conservative than the loader, so a file that cannot be read never lifts an
+ * `off` the operator may have set in it. That answer is not cached, because the error may be
+ * transient: the next read tries the file again. The warning is logged once per path.
  */
 const operatorOwnershipModes = new Map<string, unknown>();
+const operatorOwnershipUnreadableWarned = new Set<string>();
 function operatorOwnershipMode(configPath: string): unknown {
 	if (operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
 	let mode: unknown;
@@ -7242,11 +7244,14 @@ function operatorOwnershipMode(configPath: string): unknown {
 		content = fs.readFileSync(configPath, "utf8");
 	} catch (error) {
 		if (!isEnoent(error)) {
-			mode = "off";
-			logger.warn("Session ownership is off: the global config could not be read", {
-				configPath,
-				error: error instanceof Error ? error.message : String(error),
-			});
+			if (!operatorOwnershipUnreadableWarned.has(configPath)) {
+				operatorOwnershipUnreadableWarned.add(configPath);
+				logger.warn("Session ownership is off: the global config could not be read", {
+					configPath,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return "off";
 		}
 	}
 	if (content !== undefined) {
@@ -7287,6 +7292,7 @@ export function resetSettingsForTest(): void {
 	globalInstancePromise = null;
 	globalInitOptions = null;
 	operatorOwnershipModes.clear();
+	operatorOwnershipUnreadableWarned.clear();
 }
 
 /**

@@ -228,6 +228,32 @@ describe("the session.ownership.mode setting", () => {
 		expect(warnings).toEqual(["Session ownership is off: the global config could not be read"]);
 	});
 
+	it("a read failure is not remembered: the next read retries the file, and the warning stays at one", async () => {
+		const warnings: string[] = [];
+		vi.spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(message);
+		});
+		const agentDir = path.join(await tempRoot(), "agent");
+		const configPath = path.join(agentDir, "config.yml");
+		await fs.mkdir(configPath, { recursive: true });
+		const previous = process.env.GJC_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		try {
+			expect(sessionOwnershipMode()).toBe("off");
+			expect(isolatedMode()).toBe("off");
+			// The failure was transient: the file is readable now, and its value applies at once.
+			await fs.rmdir(configPath);
+			await Bun.write(configPath, YAML.stringify(fileMode("enforce")));
+			expect(sessionOwnershipMode()).toBe("enforce");
+		} finally {
+			if (previous === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previous;
+			resetAgentDirFromEnvironment();
+		}
+		// One warning for the path, however many reads failed there.
+		expect(warnings).toEqual(["Session ownership is off: the global config could not be read"]);
+	});
+
 	it("cannot be raised from a project file when the user left it at off", async () => {
 		await initSettings({}, { session: { ownership: { mode: "enforce" } } });
 		expect(sessionOwnershipMode()).toBe("off");
