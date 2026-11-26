@@ -294,6 +294,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
+	"scripts/test-preload.ts": ["scripts/test-home-isolation.test.ts"],
+	"scripts/test-home-isolation.ts": ["scripts/test-home-isolation.test.ts"],
+	"scripts/test-home-isolation.test.ts": ["scripts/test-home-isolation.test.ts"],
+	"scripts/fixtures/home-isolation-probe.ts": ["scripts/test-home-isolation.test.ts"],
 	"packages/coding-agent/src/tools/tool-catalog.generated.ts": [
 		"packages/coding-agent/test/tools/tool-catalog.test.ts",
 		"packages/coding-agent/test/tools/discoverable-description-stable.test.ts",
