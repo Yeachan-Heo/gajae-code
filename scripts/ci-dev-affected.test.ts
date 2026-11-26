@@ -262,6 +262,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
+		expect(windowsJob).toContain(
+			"bun test ./packages/coding-agent/test/session/session-ownership.windows.test.ts\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+		);
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
 		const authorityRegressionCommand = "bun test ./packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts";
@@ -1444,6 +1447,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
 			"packages/natives/test/windows-shell-path.windows.test.ts",
 			"packages/natives/test/windows-runtime-install.windows.test.ts",
+			// Session ownership fails open on Windows (no native lock); only windows-latest runs it.
+			"packages/coding-agent/src/session/session-ownership.ts",
+			"packages/coding-agent/src/session/session-ownership-mode.ts",
+			"packages/coding-agent/src/session/internal/session-claim-set.ts",
+			"packages/coding-agent/test/session/session-ownership.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1452,6 +1460,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(isWindowsSessionPathRegressionPath("packages/utils/src/logger.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/utils/test/env.test.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
+		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-owners-layout.json")).toBe(false);
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
