@@ -105,8 +105,8 @@
 								"observe",
 								"enforce"
 							],
-							"description": "Not yet active; reserved for single-owner session claims.",
-							"default": "off"
+							"description": "Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything.",
+							"default": "observe"
 						}
 					},
 					"additionalProperties": false

@@ -589,6 +589,27 @@ C initially covers **the official `api.anthropic.com` endpoint with API-key auth
 
 Right before the final `fetch` hand-off (after transport transforms such as gzip), the root settings and main message prefix of the C request are compared against the observed main request. A mismatch blocks the request before network I/O. Credentials and URL/header comparison values are kept only as in-process HMACs and are never written to logs or transcripts. When C produces text, only that text is shown; A is called once only when C shows no text. Caller cancellation, timeouts, and errors after partial text never re-answer through A.
 
+## Session ownership (single-owner claims)
+
+A process that opens a persisted session for writing takes a claim on it: a kernel lock on a sidecar under `~/.gjc/runtime/session-owners/`, with a small holder record beside it. The lock ends when the holder exits, however it exits, so a crashed or killed `gjc` leaves no lock behind. The sidecar file itself stays: one `.session-owner` sidecar accumulates per session ever opened, until sidecar pruning lands. Remote clients (ACP editors, `gjc sdk`, the notification daemons) attach to the endpoint of the process that owns the session and never claim. When no process is running the session, the host the broker launches for it is that owner and claims it as `sdk-host`.
+
+The global setting `session.ownership.mode` decides what claims do:
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` | No claims and no lock calls. The process is invisible to other processes' claims. |
+| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. |
+| `enforce` | Reserved for refusals. It currently behaves exactly like `observe`: nothing refuses yet. |
+
+On Windows there is no native lock yet, so every claim fails open: the session opens without a claim, `gjc session owners` is always empty, and each claim attempt counts `fail_open`.
+
+Operator notes:
+
+- **Kill switch:** `gjc config set session.ownership.mode off` writes the global config (`config.yml` in the agent directory). The setting is global-only: a project `.gjc/settings.json` or `config.yml` cannot change it, and SDK `config.patch` refuses it.
+- **Environment override:** `GJC_SESSION_OWNERSHIP=off` (or `observe`) can only lower the configured mode, never raise it. A value that comes from a project `.env` is ignored. A value set in your shell applies only to processes started from that shell. Hosts launched by the SDK broker (ACP sessions, `gjc sdk`, Telegram and other daemon sessions) take the broker's environment, not the shell of the client that asked for them, so use `config.yml` to change their mode.
+- **When a change applies:** restart running gjc processes after changing the mode; processes started afterwards use the new mode. A running TUI keeps claiming under the mode it started with, for `/new`, `/resume` and `/fork` too, even on Linux, where it hot-reloads other `config.yml` settings. An SDK embedding without process settings reads `config.yml` once.
+- **Where to look:** `gjc session owners` (or `--json`) lists the sessions held right now and their holder's surface and pid. `gjc stats --summary` and `gjc stats --json` show the ownership counters (`claim_taken`, `claim_released`, `claim_conflict`, `held_at_exit`, `session_write_without_claim`, and others), per gjc version. A process adds its counts only when it exits cleanly, so the totals are a lower bound and a long-running process reports when it stops.
+
 ## Related but Distinct: Prompt History Storage
 
 `HistoryStorage` (`history-storage.ts`) is a separate SQLite subsystem for prompt recall/search, not session replay.

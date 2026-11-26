@@ -386,6 +386,7 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 describe("missed-release signals", () => {
 	it("counts an id change outside any transition, only when ownership is on", () => {
 		const count = () => sessionOwnershipCounters().bind_outside_transition;
+		SessionOwnershipTestHooks.mode = "off";
 		const off = new SessionClaimSet();
 		off.bind("a");
 		off.bind("b");
@@ -409,6 +410,7 @@ describe("missed-release signals", () => {
 
 	it.if(supported)("counts a target staged outside any transition, only when ownership is on", async () => {
 		const count = () => sessionOwnershipCounters().target_staged_outside_transition;
+		SessionOwnershipTestHooks.mode = "off";
 		const off = new SessionClaimSet();
 		off.bind("staged-current");
 		off.add(await claim("staged-off"));
@@ -458,7 +460,8 @@ describe("missed-release signals", () => {
 describe("the detector uses the mode its factory read", () => {
 	it("checks a named id before the first bind and the bound id after it, under one mode", () => {
 		const count = () => sessionOwnershipCounters().session_write_without_claim;
-		// Ownership off (the default): nothing is counted, bound or not, whatever the mode is later.
+		// Ownership off: nothing is counted, bound or not, whatever the mode is later.
+		SessionOwnershipTestHooks.mode = "off";
 		const off = new SessionClaimSet();
 		SessionOwnershipTestHooks.mode = "observe";
 		try {
@@ -535,7 +538,7 @@ describe("the identity helper", () => {
 	});
 });
 
-describe("with ownership off (the default)", () => {
+describe("with ownership off", () => {
 	it("a full session lifecycle makes no claim, no lock call and no owners directory", async () => {
 		const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-claim-set-off-")));
 		roots.push(home);
@@ -543,6 +546,7 @@ describe("with ownership off (the default)", () => {
 		const lockCalls: string[] = [];
 		const exitListeners = process.listenerCount("exit");
 		SessionOwnershipTestHooks.homeOverride = home;
+		SessionOwnershipTestHooks.mode = "off";
 		SessionOwnershipTestHooks.lockBackend = {
 			tryAcquire: async sidecar => {
 				lockCalls.push(`acquire ${sidecar}`);
@@ -580,6 +584,7 @@ describe("with ownership off (the default)", () => {
 			expect(process.listenerCount("exit")).toBe(exitListeners);
 		} finally {
 			SessionOwnershipTestHooks.homeOverride = preloadHome;
+			delete SessionOwnershipTestHooks.mode;
 			delete SessionOwnershipTestHooks.lockBackend;
 		}
 	});
