@@ -40,7 +40,9 @@ describe.skipIf(process.platform !== "win32")("session ownership on Windows, def
 		expect(SessionOwnershipTestHooks.mode).toBeUndefined();
 		expect(sessionOwnershipMode()).toBe("observe");
 
-		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ownership-win-")));
+		// The spelling under os.tmpdir(), as the other Windows suites use it: a realpath expands the 8.3
+		// short name (C:\Users\RUNNER~1) that safe cleanup does not recognise as the temp root.
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ownership-win-"));
 		roots.push(root);
 		const cwd = path.join(root, "workspace");
 		const agentDir = path.join(root, "agent");
