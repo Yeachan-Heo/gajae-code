@@ -197,6 +197,8 @@ import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
 import {
+import { sessionOwnerSurface } from "../session/session-ownership";
+import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
 	type StartupAuthConfigSnapshot,
@@ -2085,7 +2087,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager =
 			suppliedSessionManager ??
 			(await logger.time("sessionManager", async () => {
-				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+				// The mode comes from this session's settings, like createSessionManager's: a broker-launched
+				// host or an embedding may have no global Settings.
+				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir), undefined, {
+					surface: sessionOwnerSurface(),
+					mode: sessionOwnershipModeFor(settings.getGlobal("session.ownership.mode")),
+				});
 			}));
 		liveSessionManager = sessionManager;
 		const logicalSessionId = sessionManager.getSessionId();

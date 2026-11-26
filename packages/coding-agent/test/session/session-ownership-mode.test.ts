@@ -16,7 +16,6 @@ import {
 	sessionOwnershipMode,
 	sessionOwnershipOverrideWasRead,
 	sessionOwnershipTestHookSlot,
-	setSessionOwnershipSettingFallback,
 	trustedSessionOwnershipOverride,
 } from "../../src/session/session-ownership-mode";
 
@@ -123,13 +122,6 @@ describe("the session.ownership.mode setting", () => {
 		const settings = await initSettings({}, {});
 		expect(settings.get("session.ownership.mode")).toBe("off");
 		expect(sessionOwnershipMode()).toBe("off");
-	});
-
-	it("a process without global settings reads the value its session host supplied; global settings win", async () => {
-		setSessionOwnershipSettingFallback("observe");
-		expect(sessionOwnershipMode()).toBe("observe");
-		await initSettings(userEnforce, {});
-		expect(sessionOwnershipMode()).toBe("enforce");
 	});
 
 	it("is global-only: project files and runtime overrides cannot set it", async () => {
