@@ -293,12 +293,12 @@ describe("AuthStorage openai-codex workspaces", () => {
 			return row?.id ?? -1;
 		}
 
-		async function refreshLegacy(legacyId: number, workspaceId: string): Promise<void> {
+		async function refreshLegacy(legacyId: number, workspaceId: string): Promise<OAuthCredential> {
 			const legacy = stored().find(row => row.id === legacyId)?.credential;
 			if (!legacy) throw new Error("legacy row missing");
 			backend.workspaceId = workspaceId;
 			backend.suffix = "legacy-refreshed";
-			await authStorage.forceRefreshOAuthCredential("openai-codex", legacy);
+			return await authStorage.forceRefreshOAuthCredential("openai-codex", legacy);
 		}
 
 		it("is not replaced by a login to another workspace and learns its workspace on refresh", async () => {
@@ -403,8 +403,9 @@ describe("AuthStorage openai-codex workspaces", () => {
 				}
 				return completed;
 			};
+			let returned: OAuthCredential;
 			try {
-				await refreshLegacy(legacyId, TEAM.id);
+				returned = await refreshLegacy(legacyId, TEAM.id);
 			} finally {
 				peer.close();
 			}
@@ -412,6 +413,12 @@ describe("AuthStorage openai-codex workspaces", () => {
 			const persisted = stored().find(row => row.id === legacyId)?.credential;
 			expect([persisted?.access, persisted?.refresh]).toEqual([peerAccess, "refresh-peer"]);
 			expect([persisted?.organizationId, persisted?.organizationName]).toEqual([TEAM.id, TEAM.name]);
+			// The caller and the cache get the stored row, not this refresh's older snapshot.
+			expect([returned.access, returned.organizationName]).toEqual([peerAccess, TEAM.name]);
+			const cached = authStorage.getAll()["openai-codex"];
+			expect(Array.isArray(cached) ? undefined : cached?.type === "oauth" ? cached.access : undefined).toBe(
+				peerAccess,
+			);
 		});
 
 		it("caches the name a peer wrote first when the carried name loses its condition", async () => {
@@ -517,7 +524,7 @@ describe("AuthStorage openai-codex workspaces", () => {
 			await login(TEAM.id, "team");
 			const loginId = stored().find(row => row.id !== legacyId)?.id ?? -1;
 			// The conditional write loses, and re-reading the row fails, so whether it is still active is unknown.
-			store.setOAuthOrganizationNameIfUnset = () => false;
+			store.setOAuthOrganizationNameIfUnset = () => undefined;
 			const list = store.listAuthCredentials.bind(store);
 			let failReads = false;
 			const completeLease = store.completeOAuthRefreshLease.bind(store);
@@ -543,6 +550,117 @@ describe("AuthStorage openai-codex workspaces", () => {
 			expect(stored().find(row => row.id === legacyId)?.credential.access).toBe(
 				codexAccessToken(TEAM.id, "legacy-refreshed"),
 			);
+		});
+
+		it("serves the stored key when a peer rotates the row after this request's refresh lease", async () => {
+			const startMs = Date.now();
+			let clockMs = startMs;
+			vi.spyOn(Date, "now").mockImplementation(() => clockMs);
+			const legacyId = await seedLegacy(TEAM.id, startMs + 120_000);
+			await login(TEAM.id, "team");
+			backend.suffix = "legacy-refreshed";
+			backend.usedPercentByWorkspace[TEAM.id] = 5;
+			const usageLookup = global.fetch;
+			global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input instanceof Request ? input.url : input);
+				if (url.endsWith("/wham/usage")) clockMs = startMs + 90_000;
+				return usageLookup(input, init);
+			}) as typeof fetch;
+			const peer = await SqliteAuthCredentialStore.open(dbPath);
+			const peerAccess = codexAccessToken(TEAM.id, "peer");
+			const completeLease = store.completeOAuthRefreshLease.bind(store);
+			store.completeOAuthRefreshLease = (lease, credential) => {
+				const completed = completeLease(lease, credential);
+				if (completed) {
+					peer.updateAuthCredential(legacyId, {
+						...credential,
+						access: peerAccess,
+						refresh: "refresh-peer",
+						expires: clockMs + 3_600_000,
+						organizationId: TEAM.id,
+					});
+				}
+				return completed;
+			};
+			let apiKey: string | undefined;
+			try {
+				apiKey = await authStorage.getApiKey("openai-codex", "session", {
+					credentialSelector: { kind: "id", value: String(legacyId) },
+				});
+			} finally {
+				peer.close();
+			}
+
+			expect(apiKey).toBe(peerAccess);
+			expect(stored().map(row => [row.id, row.credential.access, row.credential.organizationName])).toEqual([
+				[legacyId, peerAccess, TEAM.name],
+			]);
+		});
+
+		it("does not serve or disable a peer-rotated row that is already expired", async () => {
+			const startMs = Date.now();
+			let clockMs = startMs;
+			vi.spyOn(Date, "now").mockImplementation(() => clockMs);
+			const legacyId = await seedLegacy(TEAM.id, startMs + 120_000);
+			await login(TEAM.id, "team");
+			backend.suffix = "legacy-refreshed";
+			backend.usedPercentByWorkspace[TEAM.id] = 5;
+			const usageLookup = global.fetch;
+			global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input instanceof Request ? input.url : input);
+				if (url.endsWith("/wham/usage")) clockMs = startMs + 90_000;
+				return usageLookup(input, init);
+			}) as typeof fetch;
+			const peer = await SqliteAuthCredentialStore.open(dbPath);
+			const peerAccess = codexAccessToken(TEAM.id, "peer");
+			const completeLease = store.completeOAuthRefreshLease.bind(store);
+			store.completeOAuthRefreshLease = (lease, credential) => {
+				const completed = completeLease(lease, credential);
+				if (completed) {
+					peer.updateAuthCredential(legacyId, {
+						...credential,
+						access: peerAccess,
+						refresh: "refresh-peer",
+						expires: clockMs - 1_000,
+						organizationId: TEAM.id,
+					});
+				}
+				return completed;
+			};
+			let apiKey: string | undefined;
+			try {
+				apiKey = await authStorage.getApiKey("openai-codex", "session", {
+					credentialSelector: { kind: "id", value: String(legacyId) },
+				});
+			} finally {
+				peer.close();
+			}
+
+			// The expired peer key is not served (the next resolution refreshes the row), and the row is not classified
+			// as a failed refresh and disabled.
+			expect(apiKey).toBeUndefined();
+			expect(stored().map(row => row.id)).toEqual([legacyId]);
+		});
+
+		it("keeps a duplicate in memory when the store could not retire it", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			const loginId = stored().find(row => row.id !== legacyId)?.id ?? -1;
+			store.setOAuthOrganizationNameIfUnset = () => {
+				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+			};
+			// The store swallows delete failures, so the duplicate stays active on disk.
+			store.deleteAuthCredential = () => {};
+
+			await refreshLegacy(legacyId, TEAM.id);
+
+			expect(stored().map(row => row.id)).toEqual([legacyId, loginId]);
+			// Memory matches the store instead of publishing a pruned view.
+			const cached = authStorage.getAll()["openai-codex"];
+			expect(Array.isArray(cached) ? cached.length : 1).toBe(2);
+			expect(
+				authStorage.resolveOAuthPinTarget("openai-codex", { kind: "id", value: String(loginId) }).credentialId,
+			).toBe(loginId);
 		});
 	});
 });
