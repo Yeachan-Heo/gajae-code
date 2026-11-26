@@ -222,15 +222,7 @@ function textOf(result: ReadResult): string {
 		.join("\n");
 }
 
-type HashlineAnchor = { line: number; hash: string; content: string };
 
-function parseHashlineAnchors(text: string): HashlineAnchor[] {
-	return text
-		.split("\n")
-		.map(line => /^(\d+)([a-z]{2})\|(.*)$/.exec(line))
-		.filter((match): match is RegExpExecArray => match !== null)
-		.map(match => ({ line: Number(match[1]), hash: match[2], content: match[3] }));
-}
 
 function createSession(cwd: string, settings: Settings, artifactDir: string, bridgeText?: string): ToolSession {
 	const sessionDir = path.join(cwd, "session-output");

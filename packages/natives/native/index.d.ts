@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -1704,8 +1703,6 @@ export interface GrepResult {
   /** Whether the limit/offset stopped the search early. */
   limitReached?: boolean
 }
-
-export declare function h06FormatHashLines(text: string, startLine?: number | undefined | null): string
 
 /**
  * Quick check if content matches a pattern.

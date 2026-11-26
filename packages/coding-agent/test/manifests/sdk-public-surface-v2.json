@@ -220,7 +220,6 @@
     "formatAccessibleKeyHints",
     "formatFullAnchorRequirement",
     "formatHashLine",
-    "formatHashLines",
     "formatKeyHint",
     "formatKeyHints",
     "formatLineHash",

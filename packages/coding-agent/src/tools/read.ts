@@ -424,7 +424,7 @@ function formatOversizedLineWarning(
 	maxBytes: number,
 	fullFileLines: number,
 ): string {
-	return `[Line ${lineNumber} is ${formatBytes(lineBytes)}, exceeds ${formatBytes(maxBytes)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview. Re-read ${readPath}:1-${fullFileLines} or ${readPath}:raw for the full file]`;
+	return `[Line ${lineNumber} is ${formatBytes(lineBytes)}, exceeds ${formatBytes(maxBytes)} limit. Unable to display a full line. Re-read ${readPath}:1-${fullFileLines} or ${readPath}:raw for the full file]`;
 }
 
 function formatListingTruncationNotice(
@@ -1268,8 +1268,8 @@ export interface ReadToolDetails {
 	spillEligible?: boolean;
 
 	/** Raw text + start line for user-visible TUI rendering, set when content is text-like.
-	 * Mirrors the same lines the model receives but without hashline/line-number prefixes,
-	 * so the TUI can render the file content with its own gutter without re-parsing the formatted text. */
+	 * Mirrors the same lines the model receives without formatting prefixes,
+	 * so the TUI can render the file content with its own gutter without re-parsing. */
 	displayContent?: { text: string; startLine: number };
 	summary?: { lines: number; elidedSpans: number; elidedLines: number };
 	/** Number of unresolved git conflicts surfaced by this read (TUI uses for inline `⚠ N` badge). */
@@ -1739,7 +1739,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		// Preserve the historical head byte-cap oversized-line behavior. The
 		// directional window model is used for tail/both; head remains the old
-		// oracle so existing hashline and snippet contracts stay byte-identical.
+		// oracle so existing snippet contracts stay byte-identical.
 		if (!receipt && direction === "head" && legacyHeadByteCeiling !== undefined) {
 			const legacy = truncateHead(rangeText, {
 				maxBytes: legacyHeadByteCeiling,
@@ -3396,8 +3396,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	/**
 	 * Render a `conflict://<N>` (or `conflict://<N>/<scope>`) region as
 	 * regular file content. The lines are emitted with their original
-	 * file line numbers so hashline anchors line up with the source
-	 * file, and no truncation footer is appended.
+	 * file line numbers, and no truncation footer is appended.
 	 */
 	async #readConflictRegion(id: number, scope: ConflictScope | undefined): Promise<AgentToolResult<ReadToolDetails>> {
 		const entry: ConflictEntry | undefined = getConflictHistory(this.session).get(id);
@@ -3681,7 +3680,7 @@ export const readToolRenderer = {
 		const details = result.details;
 		const rawText = result.content?.find(c => c.type === "text")?.text ?? "";
 		// Prefer structured `displayContent` from details when available so the TUI
-		// shows clean file content (no model-only hashline anchors) without parsing the formatted text.
+		// shows clean file content without parsing the formatted text.
 		// Fall back to the raw text, but strip the LLM-facing notice so it doesn't
 		// echo next to the styled warning line below.
 		const contentText = details?.displayContent?.text ?? stripOutputNotice(rawText, details?.meta);

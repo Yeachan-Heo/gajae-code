@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { formatHashLines } from "../../src/edit/line-hash";
+
 import {
 	formatMiddleElisionMarker,
 	type ReadSegment,
@@ -136,11 +136,8 @@ function headWindowFromStream(result: Awaited<ReturnType<typeof streamLinesFromF
 	);
 }
 
-function renderWindow(window: ReadWindow, hashLines: boolean): string {
-	const render = (segment: ReadSegment): string =>
-		hashLines && segment.kind === "lines"
-			? formatHashLines(segment.content, segment.origin.startLine)
-			: segment.content;
+function renderWindow(window: ReadWindow): string {
+	const render = (segment: ReadSegment): string => segment.content;
 	if (window.kind === "full") return window.head ? render(window.head) : "";
 	if (window.kind === "head-only") return window.head ? render(window.head) : "";
 	if (window.kind === "tail-only") return window.tail ? render(window.tail) : "";
@@ -301,7 +298,7 @@ describe("streaming ReadWindow parity with truncateMiddleWindows and directional
 					fixture.endExclusive,
 				);
 				expect(windowShape(actual)).toEqual(windowShape(expected));
-				expect(renderWindow(actual, false)).toBe(renderWindow(expected, false));
+				expect(renderWindow(actual)).toBe(renderWindow(expected));
 			});
 		}
 	}

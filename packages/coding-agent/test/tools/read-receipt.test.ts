@@ -235,7 +235,6 @@ describe("read receipt by default", () => {
 		const settings = receiptSettings({
 			"read.summarize.enabled": true,
 			"read.summaryMaxBytes": 1,
-			readHashLines: true,
 		});
 		for (const truncation of ["head", "last", "both"] as const) {
 			const result = await read(file, settings, { truncation });
@@ -248,11 +247,7 @@ describe("read receipt by default", () => {
 			expect(indexes(bodyOf(result))).toEqual(expected);
 			expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(1024);
 			expect(Buffer.from(body, "utf8").toString("utf8")).toBe(body);
-			const anchors = [...body.matchAll(/^(\d+)[a-z]{2}-(\d+)[a-z]{2}\|/gm)].map(match => [
-				Number(match[1]),
-				Number(match[2]),
-			]);
-			expect(anchors).toEqual(expected.map(index => [index * 5 + 1, index * 5 + 5]));
+
 			expect(body.match(/\{ \.\. \}/g)).toHaveLength(3);
 			const omitted = truncation === "head" ? "16-50" : truncation === "last" ? "1-35" : "11-45";
 			expect(body).toContain(`[… source lines ${omitted} omitted …]`);
@@ -406,11 +401,10 @@ describe("read receipt by default", () => {
 			{ kind: "elided", startLine: 3, endLine: 8 },
 			{ kind: "code", startLine: 9, endLine: 10, text: "ninth\ntenth" },
 		];
-		const settings = receiptSettings({ "read.summarize.enabled": true, readHashLines: true });
+		const settings = receiptSettings({ "read.summarize.enabled": true });
 		for (const truncation of ["head", "last", "both"] as const) {
 			const result = await read(file, settings, { truncation });
-			const anchors = [...textOf(result).matchAll(/^(\d+)[a-z]{2}\|/gm)].map(match => Number(match[1]));
-			expect(anchors).toEqual([1, 2, 9, 10]);
+
 			expect(bodyOf(result)).toBe("first\nsecond\n...\nninth\ntenth");
 			expect(result.details?.summary).toMatchObject({ elidedSpans: 1, elidedLines: 6 });
 		}

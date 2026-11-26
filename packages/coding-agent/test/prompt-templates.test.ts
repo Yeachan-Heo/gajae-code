@@ -235,51 +235,6 @@ describe("parseCommandArgs + substituteArgs integration", () => {
 	});
 });
 
-// ============================================================================
-// Hashline prompt helpers
-// ============================================================================
-
-describe("hashline prompt helpers", () => {
-	function createPromptTemplate(content: string): PromptTemplate {
-		return {
-			name: "test-template",
-			description: "Test template",
-			content,
-			source: "test",
-		};
-	}
-
-	function expandPrompt(content: string): string {
-		return expandPromptTemplate("/test-template", [createPromptTemplate(content)]);
-	}
-
-	test("href and hrefr should reuse anchors remembered from hline", () => {
-		const result = expandPrompt(
-			'{{hline 2 "const timeout = 5000;"}}\nquoted={{href 2}}\nraw={{hrefr 2}}\nlast={{hrefr}}',
-		);
-		const [line, quoted, raw, last] = result.split("\n");
-		const ref = line.split("|", 1)[0];
-
-		expect(line).toBe(`${ref}|const timeout = 5000;`);
-		expect(quoted).toBe(`quoted="${ref}"`);
-		expect(raw).toBe(`raw=${ref}`);
-		expect(last).toBe(`last=${ref}`);
-	});
-
-	test("href and hrefr should still support explicit content without hline state", () => {
-		const result = expandPrompt('quoted={{href 5 "\treturn clean;"}}\nraw={{hrefr 5 "\treturn clean;"}}');
-		const [quoted, raw] = result.split("\n");
-		const ref = raw.slice("raw=".length);
-
-		expect(quoted).toBe(`quoted="${ref}"`);
-		expect(ref).toMatch(/^5[a-z]{2}$/);
-	});
-
-	test("href should not reuse hline state across prompt renders", () => {
-		expect(expandPrompt('{{hline 1 "const x = 1;"}}\n{{hrefr}}')).toMatch(/^1[a-z]{2}\|const x = 1;\n1[a-z]{2}$/);
-		expect(() => expandPrompt("{{hrefr}}")).toThrow("previous {{hline}}");
-	});
-});
 
 describe("tool prompt descriptions", () => {
 	test("retains browser safety, structured-action, and shipped-reference contracts", () => {

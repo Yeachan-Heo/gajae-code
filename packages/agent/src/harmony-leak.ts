@@ -3,9 +3,8 @@
  *
  * Background and policy: see `docs/ERRATA-GPT5-HARMONY.md`. This module
  * implements §3 of that document: detection by signal fusion, plus a
- * truncate-and-resume primitive for the `edit` tool when its input is in
- * hashline DSL form. Other tools and surfaces fall through to
- * abort-and-retry handled by the agent loop.
+ * truncate-and-resume primitive for the `edit` tool. Other tools and surfaces
+ * fall through to abort-and-retry handled by the agent loop.
  */
 import type { AssistantMessage, Model, ToolCall } from "@gajae-code/ai";
 
@@ -52,14 +51,14 @@ const SCRIPT_CLASS =
 const SCRIPT_RUN_RE = new RegExp(`[${SCRIPT_CLASS}]{2,}`, "u");
 
 // Recovery registry. Each entry's parser must recognize the configured
-// sentinel (per-tool, see eval/parse.ts and hashline/parser.ts) and surface
-// a warning to the model so it knows to re-issue any remaining work.
-// `accepts` gates on input shape: tools whose contaminated input doesn't
-// match the parser's expected DSL fall through to abort-and-retry.
+// sentinel (per-tool, see eval/parse.ts) and surface a warning to the model
+// so it knows to re-issue any remaining work. `accepts` gates on input shape:
+// tools whose contaminated input doesn't match the parser's expected DSL fall
+// through to abort-and-retry.
 //
-// • `edit`: hashline DSL input begins with `@<path>`. Apply_patch envelopes
-//   (`*** Begin Patch …`) and JSON-schema variants are not recoverable —
-//   their parsers don't recognize `*** Abort`.
+// • `edit`: edit DSL input includes the edit path and content. Apply_patch
+//   envelopes (`*** Begin Patch …`) and JSON-schema variants are not
+//   recoverable — their parsers don't recognize `*** Abort`.
 // • `eval`: any string is a parseable cell sequence (the parser is lenient
 //   and falls back to implicit-cell mode on bare strings).
 interface RecoveryConfig {

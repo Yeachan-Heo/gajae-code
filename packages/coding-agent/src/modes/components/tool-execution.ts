@@ -471,7 +471,7 @@ function previewPayloadKey(args: unknown): string | undefined {
 /**
  * Drop trailing removal/hunk-header lines that appear in a streaming diff
  * before the matching `+added` lines have arrived. Without this, a partial
- * apply_patch / hashline preview shows `-old` first and then visibly grows
+ * apply_patch preview shows `-old` first and then visibly grows
  * the `+new` block beneath it — the "removals first, additions catching up"
  * jitter. Once the next streaming tick brings the additions in, the trailing
  * block reappears alongside them.

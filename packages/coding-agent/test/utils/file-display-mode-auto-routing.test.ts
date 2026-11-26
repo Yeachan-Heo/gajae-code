@@ -70,11 +70,11 @@ describe("resolveFileDisplayMode", () => {
 		expect(raw.lineNumbers).toBe(false);
 	});
 
-	test("immutable reads suppress line numbers", () => {
+	test("immutable reads respect readLineNumbers setting", () => {
 		const immutable = resolveFileDisplayMode(
 			makeSession({ model: "zai/glm-4.7", readLineNumbers: true }),
 			{ immutable: true },
 		);
-		expect(immutable.lineNumbers).toBe(false);
+		expect(immutable.lineNumbers).toBe(true);
 	});
 });

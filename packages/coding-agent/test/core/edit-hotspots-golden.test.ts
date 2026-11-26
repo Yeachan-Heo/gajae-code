@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { replaceText } from "../../src/edit/diff";
 import { findMatch, seekSequence } from "../../src/edit/modes/replace";
 import { normalizeToLF } from "../../src/edit/normalize";
-import { formatHashLines } from "../../src/edit/line-hash";
+
 
 const longLine = `${"a".repeat(512)} TARGET ${"b".repeat(512)}`;
 
@@ -100,7 +100,6 @@ async function runCase(c: (typeof cases)[number]) {
 	}
 	return {
 		name: c.name,
-		formatHashLines: formatHashLines(c.content, c.startLine),
 		findMatchStrict: stable(await findMatch(c.content, c.target, { allowFuzzy: false, threshold: c.threshold })),
 		findMatchFuzzy: stable(await findMatch(c.content, c.target, { allowFuzzy: true, threshold: c.threshold })),
 		replaceText: replaceResult,

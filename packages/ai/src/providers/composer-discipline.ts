@@ -9,7 +9,7 @@ import cursorComposerEditDisciplinePrompt from "../prompts/cursor-composer-edit-
  * cursor composer-*).
  *
  * Composer models are trained on a proprietary coding-agent harness
- * (Cursor / Grok Build) and carry habits that break this agent's hashline
+ * (Cursor / Grok Build) and carry habits that can break this agent's
  * edit workflow when driven through a generic provider. Observed in live
  * sessions with grok-composer-2.5-fast:
  *
@@ -79,7 +79,7 @@ export const CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT = cursorComposerBashPol
 
 export const COMPOSER_EDIT_DISCIPLINE_PROMPT = `File-editing discipline for this Composer harness (this OVERRIDES contrary habits from your training):
 
-- Discover file names ONLY with the find tool; search file contents ONLY with the search tool; read file bodies or line ranges ONLY with the read tool. NEVER inspect repository files through shell commands (ls, find, fd, cat, sed, awk, grep, rg, head, tail, less, more) or scripts — that output carries no hashline anchors and bypasses the agent's safety limits.
+- Discover file names ONLY with the find tool; search file contents ONLY with the search tool; read file bodies or line ranges ONLY with the read tool. NEVER inspect repository files through shell commands (ls, find, fd, cat, sed, awk, grep, rg, head, tail, less, more) or scripts — that output bypasses the agent's safety limits.
 - Modify files ONLY with the edit/write tools. NEVER mutate files through shell redirection, tee, sed -i, perl -pi, inline python/node/bun scripts, or other out-of-band writes — those writes invalidate every known anchor and break edit recovery.
 - A line anchor (e.g. "42sr") is a line number plus a 2-char content hash. You CANNOT compute the hash yourself: copy anchors verbatim from the MOST RECENT read/search/edit output of that exact file. NEVER guess, renumber, or arithmetically shift an anchor.
 - After ANY edit to a file (including your own), anchors you saw earlier are stale. Re-read the edited region, or copy the fresh anchors printed in the edit result, before issuing the next edit.

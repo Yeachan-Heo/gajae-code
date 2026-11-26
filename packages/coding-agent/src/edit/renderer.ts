@@ -140,11 +140,10 @@ export interface EditRenderArgs {
 	rename?: string;
 	diff?: string;
 	/**
-	 * Computed preview diff (used when tool args don't include a diff, e.g. hashline mode).
+	 * Computed preview diff (used when tool args don't include a diff).
 	 */
 	previewDiff?: string;
 	__partialJson?: string;
-	// Hashline mode fields
 	edits?: EditRenderEntry[];
 }
 

@@ -147,8 +147,6 @@ describe("SearchTool internal URL resolution", () => {
 
 		const text = getResultText(result);
 		expect(text).toContain("needle");
-		// No hashline anchors (LINE+ID|content) for immutable sources
-		expect(text).not.toMatch(/^\*?\s*\d+[a-z]{2}\|/m);
 	});
 
 	it("resolves local:// URLs before file-name lookup", async () => {
@@ -169,7 +167,7 @@ describe("SearchTool internal URL resolution", () => {
 		expect(text).toContain("PLAN.md");
 	});
 
-	it("keeps hashline anchors when searching mutable local:// sources", async () => {
+	it("searches mutable local:// sources", async () => {
 		const localRoot = path.join(artifactsDir, "local");
 		await fs.mkdir(localRoot, { recursive: true });
 		await Bun.write(path.join(localRoot, "plan.md"), "alpha line\nbeta needle line\ngamma line\n");
@@ -186,11 +184,9 @@ describe("SearchTool internal URL resolution", () => {
 
 		const text = getResultText(result);
 		expect(text).toContain("needle");
-		// Hashline anchor (LINE+ID|content) is kept for mutable local:// sources
-		expect(text).toMatch(/^\*?\s*\d+[a-z]{2}\|/m);
 	});
 
-	it("keeps hashlines on mutable files when mixed with immutable artifact:// inputs", async () => {
+	it("searches mutable files mixed with immutable artifact:// inputs", async () => {
 		const content = "alpha line\nbeta needle line\ngamma line\n";
 		await Bun.write(path.join(artifactsDir, "11.bash.log"), content);
 		await Bun.write(path.join(tmpDir, "mixed.txt"), "mixed needle line\n");
@@ -205,8 +201,6 @@ describe("SearchTool internal URL resolution", () => {
 
 		const text = getResultText(result);
 		expect(text).toContain("needle");
-		// Mutable mixed.txt keeps hashlines somewhere in the output
-		expect(text).toMatch(/^\*?\s*\d+[a-z]{2}\|.*mixed needle/m);
 	});
 
 	it("throws on nonexistent artifact ID", async () => {
