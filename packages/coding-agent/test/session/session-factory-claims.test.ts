@@ -360,10 +360,13 @@ describe.if(supported)("factory claims", () => {
 		const write = vi.spyOn(FileSessionStorage.prototype, "openWriter").mockImplementation(() => {
 			throw new Error("disk full");
 		});
-		await expect(SessionManager.open(missing, SessionManager.explicitDestination(place.root))).rejects.toThrow(
-			"disk full",
-		);
-		write.mockRestore();
+		try {
+			await expect(SessionManager.open(missing, SessionManager.explicitDestination(place.root))).rejects.toThrow(
+				"disk full",
+			);
+		} finally {
+			write.mockRestore();
+		}
 		expect(sessionOwnershipCounters().claim_taken).toBe(taken + 1);
 		expect((await inspectSessionOwners()).held).toEqual([]);
 	});
