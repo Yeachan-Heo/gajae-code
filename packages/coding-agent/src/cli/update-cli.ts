@@ -1944,7 +1944,6 @@ export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
 export type PostUpdateRecoverySupportCheck = (runtimePath: string) => Promise<boolean>;
 export type LegacyRecoveryDaemonKinds = () => Promise<NotificationProvider[]>;
 
-
 /**
  * A complete, non-quarantined provider with provider-level desired intent is a
  * durable managed-notify setup. The global switch is deliberately excluded:

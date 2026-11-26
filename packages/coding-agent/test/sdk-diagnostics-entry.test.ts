@@ -1267,6 +1267,4 @@ describe("ordinary entry graph is preserved (B1 controls)", () => {
 			expect(source).not.toContain(`"${forbidden}`);
 		}
 	});
-
-
 });
