@@ -2310,17 +2310,31 @@ export class InputController {
 		let effectiveImages = this.#selectedImagesByNumber(text, pendingImages);
 		let resultText = text;
 		if (runner?.hasHandlers("input")) {
+			// `InputEvent.images` is mutable and the runner reports no change when the handler
+			// returns the same array, so compare against a copy taken before the call.
+			const imagesBefore = inputImages ? [...inputImages] : undefined;
 			const result = await runner.emitInput(text, inputImages, "interactive");
 			if (result?.handled) {
 				return { handled: true, handledText: result.text === undefined ? "" : sanitizeText(result.text).trim() };
 			}
 			if (result?.text !== undefined) resultText = result.text.trim();
-			if (result?.images !== undefined) {
-				inputImages = result.images;
-				effectiveImages = this.#alignReplacedImages(text, pendingImages, result.images);
+			if (result?.images !== undefined) inputImages = result.images;
+			if (inputImages !== undefined && !this.#sameImages(imagesBefore, inputImages)) {
+				effectiveImages = this.#alignReplacedImages(text, pendingImages, inputImages);
 			}
 		}
 		return { handled: false, text: resultText, inputImages, effectiveImages };
+	}
+
+	#sameImages(
+		before: InteractiveModeContext["pendingImages"] | undefined,
+		after: InteractiveModeContext["pendingImages"],
+	): boolean {
+		return (
+			before !== undefined &&
+			before.length === after.length &&
+			before.every((image, index) => image === after[index])
+		);
 	}
 
 	#nextImagePlaceholder(): string {

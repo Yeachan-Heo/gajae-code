@@ -579,4 +579,61 @@ describe("InputController skill command images", () => {
 
 		expect(stub.ctx.queueCompactionMessage).toHaveBeenCalledTimes(1);
 	});
+
+	it("sends the image an input extension filtered in place, not the original", async () => {
+		const redacted = { type: "image" as const, data: "REDACTED", mimeType: "image/png" };
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			// Mirrors the runner: the handler mutates the event array and returns it, so no result is reported.
+			emitInput: vi.fn(async (_text: string, images: PendingImages | undefined) => {
+				if (images) images[0] = redacted;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], extensionRunner });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.("/skill:test-skill look at [image 1]");
+
+		expect(stub.customMessages.flatMap(message => imageBlocks(message.content))).toEqual([redacted]);
+	});
+
+	it("sends the in-place filtered image on the Alt+Enter skill path too", async () => {
+		const redacted = { type: "image" as const, data: "REDACTED", mimeType: "image/png" };
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async (_text: string, images: PendingImages | undefined) => {
+				if (images) images[0] = redacted;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		await controller.handleFollowUp();
+
+		expect(stub.customMessages.flatMap(message => imageBlocks(message.content))).toEqual([redacted]);
+	});
+
+	it("rejects the submission when an extension removes an image in place instead of leaking another", async () => {
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async (_text: string, images: PendingImages | undefined) => {
+				images?.splice(0, 1);
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE, OTHER_IMAGE], extensionRunner });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.("/skill:test-skill compare [image 1] and [image 2]");
+
+		const sent = stub.customMessages.flatMap(message => imageBlocks(message.content));
+		expect(sent).not.toContainEqual(IMAGE);
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+		expect(stub.customMessages).toHaveLength(0);
+	});
 });

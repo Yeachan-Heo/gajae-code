@@ -5,3 +5,4 @@
 - `[image N]` text inside a `source="..."` path is no longer read as a placeholder when validating a submission.
 - A message restored from the queue no longer silently picks up a newer pending image through its `[image N]` placeholder; the pending attachments are dropped with a warning so the image is attached again.
 - Alt+Enter keeps a newer draft or image typed while an input extension is running, and applies input extensions before queueing during compaction.
+- An input extension that filters or redacts an image in place (mutating the event array and returning it) now also applies to `/skill:<name> ... [image N]` messages, so the original image no longer reaches the model.
