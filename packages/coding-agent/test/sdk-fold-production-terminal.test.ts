@@ -53,7 +53,7 @@ describe("SDK production ACP fold path", () => {
 				"async.enabled": true,
 				"bash.autoBackground.enabled": false,
 				"compaction.enabled": false,
-				"tools.artifactTailBytes": 32 * 1024,
+				"tools.bashOutputTailBytes": 32 * 1024,
 			}),
 			model: mock.model,
 			disableExtensionDiscovery: true,
