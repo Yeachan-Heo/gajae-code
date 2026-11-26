@@ -964,6 +964,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasAstEdit: this.session.settings.get("astEdit.enabled"),
 			hasSearch: this.session.settings.get("search.enabled"),
 			hasFind: this.session.settings.get("find.enabled"),
+			isWindows: process.platform === "win32",
 			restrictedAllowedPrefixes: this.session.bashAllowedPrefixes,
 			restrictionProfile: this.session.bashRestrictionProfile,
 		});
