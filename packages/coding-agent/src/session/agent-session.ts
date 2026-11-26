@@ -2682,6 +2682,9 @@ const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
  */
 const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
 const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
+// A shared custom-message append refused as `stale/transcript_moved` committed nothing and is published again
+// against the relocated transcript; bounded so repeated relocations cannot loop.
+const SHARED_CUSTOM_APPEND_RELOCATION_RETRIES = 2;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -17622,14 +17625,40 @@ export class AgentSession {
 				observationId,
 			);
 		}
-		const outcome = await this.sessionManager.appendCustomMessageEntrySharingSession(
-			customType,
-			content,
-			display,
-			details,
-			attribution,
-			observationId,
-		);
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const publish = () =>
+			manager.appendCustomMessageEntrySharingSession(
+				customType,
+				content,
+				display,
+				details,
+				attribution,
+				observationId,
+			);
+		let outcome = await publish();
+		// A relocation of this session's transcript (a task child following its parent's session move) between the
+		// append capturing its path and its transaction refuses the append before any write. Nothing was committed, so
+		// it is published again against the relocated transcript; the caller's in-memory message is not touched. Only
+		// for the same manager, session id and identity generation, and outside every session transition: a switch or
+		// copy reports the same reason and must not receive this entry, and while it is being adopted the successor's
+		// transcript can already be in place before the id or generation changes. Every other outcome stays final,
+		// since an `unknown` one may already be committed.
+		for (
+			let retry = 0;
+			retry < SHARED_CUSTOM_APPEND_RELOCATION_RETRIES &&
+			outcome.kind === "stale" &&
+			outcome.reason === "transcript_moved" &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.sessionManager === manager &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionIdentityGeneration() === identityGeneration;
+			retry++
+		) {
+			outcome = await publish();
+		}
 		if (outcome.kind !== "committed") {
 			throw new Error(
 				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,

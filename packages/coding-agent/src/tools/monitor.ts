@@ -484,7 +484,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 					}
 					// Not retried: the session may already hold the message (an idle append adds it to the live
 					// context before the transcript write, a waking send has already run its turn, and a shared
-					// append can end with an unknown outcome), so a resend could report the exit twice. The
+					// append can end with an unknown outcome), so a resend could report the exit twice. A shared
+					// append that a transcript relocation refused before writing is published again by the session
+					// itself (AgentSession custom-message persistence), so it does not reach this branch. The
 					// suppressed async-result would not cover this either: its idle injection goes through the
 					// same transcript, and the yield queue drains it before injecting, without a retry.
 					logger.warn("Monitor exit notification delivery failed", {
