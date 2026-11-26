@@ -947,8 +947,16 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	const err = new Error("LSP client shutdown");
 	rejectPendingRequests(client, err);
 
-	const shutdown = sendRequest(client, "shutdown", null, undefined, 5_000).catch(() => {});
-	await Promise.race([shutdown, Bun.sleep(5_000)]);
+	// LSP shutdown sequence: the `shutdown` request, then the `exit` notification that
+	// tells the server to terminate itself. Process teardown only runs for a server
+	// that has not exited by the deadline.
+	const exited = client.proc.exited.catch(() => undefined);
+	const graceful = (async () => {
+		await sendRequest(client, "shutdown", null, undefined, 5_000);
+		await sendNotification(client, "exit", undefined);
+		await exited;
+	})().catch(() => {});
+	await Promise.race([graceful, Bun.sleep(5_000)]);
 	await client.owner?.dispose();
 	await client.owner?.awaitExit({ timeoutMs: 1_000 });
 	await Promise.race([client.proc.exited.catch(() => undefined), Bun.sleep(1_000)]);

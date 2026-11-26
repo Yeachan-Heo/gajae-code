@@ -264,6 +264,7 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
   - Every request has an abortable timeout signal.
   - Aborting an in-flight LSP request sends `$/cancelRequest`.
   - Background message readers persist for each live client until process exit/shutdown.
+  - Stopping a client sends `shutdown`, then the `exit` notification, and waits up to `5_000ms` for the server to exit on its own before disposing its process group.
 
 ## Limits & Caps
 - Tool timeout clamp: default `20`, min `5`, max `60` seconds — `TOOL_TIMEOUTS.lsp` in `packages/coding-agent/src/tools/tool-timeouts.ts`.
