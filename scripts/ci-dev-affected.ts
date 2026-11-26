@@ -113,6 +113,25 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
 ] as const;
 
+// The single-owner attach contract spans processes: a TUI owns the session claim, and ACP and SDK
+// clients attach to its endpoint through the broker without claiming. Its one end-to-end test is
+// named after none of these sources, so basename matching never reaches it. Every file under the
+// SDK host, bus, broker, Router, client, transport, ACP adapter and SDK CLI, and under ACP mode,
+// selects it; so do the ownership modules, session factories and the ownership counter writer
+// listed in BEHAVIORAL_OWNER_TESTS.
+const SESSION_OWNER_ATTACH_TEST = "packages/coding-agent/test/session-owner-remote-attach.test.ts";
+const SESSION_OWNER_ATTACH_PREFIXES = [
+	"packages/coding-agent/src/sdk/host/",
+	"packages/coding-agent/src/sdk/bus/",
+	"packages/coding-agent/src/sdk/broker/",
+	"packages/coding-agent/src/sdk/router/",
+	"packages/coding-agent/src/sdk/client/",
+	"packages/coding-agent/src/sdk/transport/",
+	"packages/coding-agent/src/sdk/acp/",
+	"packages/coding-agent/src/sdk/cli/",
+	"packages/coding-agent/src/modes/acp/",
+] as const;
+
 // These inputs produce, transform, or define the bundled model catalog. Partial
 // owner-test mapping misses catalog-wide contracts, so changes to these surfaces
 // run the full AI suite.
@@ -216,10 +235,19 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/natives/test/fd-workspace-golden.test.ts",
 		"packages/coding-agent/test/workspace-tree.test.ts",
 	],
-	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts", SESSION_OWNER_ATTACH_TEST],
 	// The broker lifecycle e2e suite is not named after lifecycle.ts, so basename
 	// mapping misses its Linux-only regressions on lifecycle changes (#6145 review).
 	"packages/coding-agent/src/sdk/broker/lifecycle.ts": ["packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts"],
+	"packages/coding-agent/src/session/session-ownership.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/session/session-ownership-mode.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/session/session-owners-layout.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/session/internal/session-claim-set.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/cli/session-owners-cli.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/commands/session.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/commands/acp.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/commands/sdk.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/stats/src/session-ownership.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	// The prompt-deadline docs guard derives its expected figure from this schema's
@@ -236,6 +264,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	// contract is not basename-matched and needs explicit behavioral-owner coverage.
 	"packages/coding-agent/src/session/session-manager.ts": [
 		"packages/coding-agent/test/session/session-memory-integration.test.ts",
+		SESSION_OWNER_ATTACH_TEST,
 	],
 	// The managed-scope owner-only self-heal budget/latency contract is verified by
 	// a dedicated suite that exercises the bounded walk, targeted repair, and
@@ -283,6 +312,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/sdk/session.ts": [
 		...EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
+		SESSION_OWNER_ATTACH_TEST,
 	],
 };
 
@@ -1424,7 +1454,9 @@ function behavioralTestsFor(changedPath: string): readonly string[] {
 		changedPath.startsWith("packages/coding-agent/src/prompts/agents/") ||
 		changedPath.startsWith("packages/coding-agent/src/defaults/gjc/")
 	)) return ["packages/coding-agent/test/default-gjc-definitions.test.ts"];
-	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
+	const owners = BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
+	const attachPath = SESSION_OWNER_ATTACH_PREFIXES.some(prefix => changedPath.startsWith(prefix));
+	return attachPath && !owners.includes(SESSION_OWNER_ATTACH_TEST) ? [...owners, SESSION_OWNER_ATTACH_TEST] : owners;
 }
 
 function isCodingAgentShardOneCoveragePath(changedPath: string): boolean {
