@@ -569,6 +569,7 @@ import {
 	FoldCoordinator,
 	type ForegroundFoldOutcome,
 } from "./fold-coordinator";
+import { sessionClaimSetOf } from "./internal/session-claim-set";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -5278,6 +5279,13 @@ export class AgentSession {
 		error: unknown;
 	}> = [];
 	#sessionTransitionCommitted = false;
+	/**
+	 * The claim-set transition this session transition holds open (single-owner design §2.5): no claim
+	 * is released until it ends, so the predecessor stays claimed until the switch commits, and a
+	 * rollback or hook cancel releases the target instead. Kept as a handle, not looked up at the end,
+	 * because a bounded fork swaps the manager inside the transition.
+	 */
+	#sessionClaimTransition: Disposable | undefined;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
 	#queuedDeliveryPendingWhileTransition = false;
@@ -5357,6 +5365,8 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		// First fallible step, before any side effect: a throw here leaves no transition half begun.
+		const claimTransition = sessionClaimSetOf(this.sessionManager).transition();
 		if (["new-session", "switch-session", "clear-context", "fork", "branch", "navigate-tree"].includes(kind)) {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
@@ -5366,6 +5376,7 @@ export class AgentSession {
 		this.#btwPrefixScopes = new WeakMap();
 		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
+		this.#sessionClaimTransition = claimTransition;
 		const completion = Promise.withResolvers<void>();
 		this.#sessionTransitionCompletion = completion.promise;
 		this.#resolveSessionTransitionCompletion = completion.resolve;
@@ -5427,6 +5438,14 @@ export class AgentSession {
 	}
 
 	#endSessionTransition(): void {
+		const claimTransition = this.#sessionClaimTransition;
+		this.#sessionClaimTransition = undefined;
+		try {
+			claimTransition?.[Symbol.dispose]();
+		} catch (error) {
+			// A failed unlock must not keep the transition lease busy.
+			logger.warn("Session claim settle failed at transition end", { error: String(error) });
+		}
 		this.#sessionTransitionKind = undefined;
 		this.#sessionTransitionCommitted = false;
 		const resolveCompletion = this.#resolveSessionTransitionCompletion;
@@ -8296,6 +8315,7 @@ export class AgentSession {
 		lease: OwnerSubagentShutdownLease,
 		ownerId: string,
 		predecessorEndpointId: string,
+		predecessorSessionId: string,
 	): void {
 		const finalization = (async () => {
 			while (!this.#isDisposed) {
@@ -8327,6 +8347,9 @@ export class AgentSession {
 		})();
 		this.#deferredOwnerShutdownFinalizations.add(finalization);
 		void finalization.finally(() => this.#deferredOwnerShutdownFinalizations.delete(finalization));
+		// The predecessor's claim waits for this finalization, at most the cap (design §2.5). Scheduled
+		// inside the switch's open claim-set transition, so the claim is still in the set to hold.
+		sessionClaimSetOf(this.sessionManager).holdUntil(predecessorSessionId, finalization);
 	}
 
 	#suppressOwnAsyncJobDeliveries(): void {
@@ -35815,6 +35838,7 @@ export class AgentSession {
 								ownerShutdownLease,
 								ownerId,
 								predecessorEndpointId,
+								previousSessionState.sessionId,
 							);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
