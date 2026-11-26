@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { canContinuePersistedHistory } from "@gajae-code/agent-core";
+import { sessionClaimSetOf } from "../session/internal/session-claim-set";
 import { type SessionDestinationInput, SessionManager } from "../session/session-manager";
 import { parseClaudeCodeTranscript, parseClaudeExport } from "./claude";
 import { detectSessionImportFormat } from "./detect";
@@ -374,6 +375,9 @@ export async function materializeExternalSessionImport(
 	}
 	const importedAt = (options.now?.() ?? new Date()).toISOString();
 	const manager = SessionManager.create(options.cwd, options.destination);
+	// The import's claim gate: enforce (5a) refuses a `held` or `failed` outcome here.
+	const claims = sessionClaimSetOf(manager);
+	if (claims.claiming) await claims.settled();
 	const destination = manager.getDestinationForFork();
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) {

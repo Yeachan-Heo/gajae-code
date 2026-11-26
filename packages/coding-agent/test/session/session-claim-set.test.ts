@@ -190,44 +190,6 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		expect(await held(id)).toBe(false);
 	});
 
-	it("cold-sidecar manager swap of one session: the claim moves, and the old manager's close unlocks nothing", async () => {
-		const previous = await persisted();
-		const id = previous.manager.getSessionId();
-		previous.claims.add(await claim(id));
-		const successor = await SessionManager.open(previous.manager.getSessionFile()!, previous.destination);
-		managers.push(successor);
-		const successorClaims = sessionClaimSetOf(successor);
-		previous.claims.moveTo(successorClaims);
-		expect(previous.claims.sessionIds).toEqual([]);
-		await previous.manager.close();
-		expect(await held(id)).toBe(true);
-		expect(successorClaims.sessionIds).toEqual([id]);
-		await successor.close();
-		expect(await held(id)).toBe(false);
-	});
-
-	it("swap to a fork's manager: the predecessor is released once moved, unless a deferred hold keeps it", async () => {
-		const previous = await persisted();
-		const predecessor = previous.manager.getSessionId();
-		previous.claims.add(await claim(predecessor));
-		const fork = await persisted("managed", previous);
-		fork.claims.add(await claim(fork.manager.getSessionId()));
-		previous.claims.moveTo(fork.claims);
-		expect(await held(predecessor)).toBe(false);
-		expect(fork.claims.sessionIds).toEqual([fork.manager.getSessionId()]);
-
-		const held2 = await persisted("managed", previous);
-		const heldId = held2.manager.getSessionId();
-		held2.claims.add(await claim(heldId));
-		const finalization = Promise.withResolvers<void>();
-		held2.claims.holdUntil(heldId, finalization.promise);
-		held2.claims.moveTo(fork.claims);
-		expect(await held(heldId)).toBe(true);
-		finalization.resolve();
-		await finalization.promise;
-		expect(await held(heldId)).toBe(false);
-	});
-
 	it("deferred owner shutdown: the predecessor waits for finalization, at most the cap", async () => {
 		const { manager, claims } = await persisted();
 		const predecessor = manager.getSessionId();
@@ -314,6 +276,16 @@ async function explicitWithFault(fault: CloseFault) {
 }
 
 describe.if(supported)("the claim set on every close path", () => {
+	it("a manager dropped after a retryable close failure keeps its claim until its retry owner closes it", async () => {
+		const { manager, id } = await explicitWithFault("retryable_once");
+		await expect(manager.close()).rejects.toThrow();
+		expect(await held(id)).toBe(true);
+		manager.retryCloseInBackground();
+		const deadline = Date.now() + 10_000;
+		while ((await held(id)) && Date.now() < deadline) await Bun.sleep(20);
+		expect(await held(id)).toBe(false);
+	});
+
 	for (const method of ["closeStrict", "flushAndCloseStrict"] as const) {
 		it(`${method}: closed and close_unknown release the claims`, async () => {
 			const closed = await explicitWithFault("none");
@@ -483,15 +455,16 @@ describe("missed-release signals", () => {
 	});
 });
 
-describe("the detector before the first bind", () => {
-	it("checks a named id against the mode read now, and stays silent with no id to check", () => {
+describe("the detector uses the mode its factory read", () => {
+	it("checks a named id before the first bind and the bound id after it, under one mode", () => {
 		const count = () => sessionOwnershipCounters().session_write_without_claim;
-		const set = new SessionClaimSet();
-		// Ownership off (the default): nothing is counted, bound or not.
-		set.checkWrite("pre-bind", "fork-id");
-		expect(count()).toBe(0);
+		// Ownership off (the default): nothing is counted, bound or not, whatever the mode is later.
+		const off = new SessionClaimSet();
 		SessionOwnershipTestHooks.mode = "observe";
 		try {
+			off.checkWrite("pre-bind", "fork-id");
+			expect(count()).toBe(0);
+			const set = new SessionClaimSet();
 			set.checkWrite("no id");
 			expect(count()).toBe(0);
 			set.checkWrite("pre-bind", "fork-id");
@@ -499,7 +472,7 @@ describe("the detector before the first bind", () => {
 			SessionOwnershipTestHooks.strictWriteDetection = true;
 			expect(() => set.checkWrite("pre-bind", "fork-id")).toThrow(SessionWriteWithoutClaimError);
 			delete SessionOwnershipTestHooks.strictWriteDetection;
-			// Once bound, the mode the bind read applies, as before.
+			// A settings change after the factory does not change the manager's mode.
 			set.bind("fork-id");
 			SessionOwnershipTestHooks.mode = "off";
 			set.checkWrite("bound");

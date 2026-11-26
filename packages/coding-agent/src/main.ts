@@ -106,6 +106,8 @@ import {
 	SessionTranscriptOversizedError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
+import { type SessionOwnerSurface, sessionOwnerSurface, setSessionOwnerSurface } from "./session/session-ownership";
+import { sessionOwnershipModeFor } from "./session/session-ownership-mode";
 import { resolveStartupAuthConfig } from "./session/startup-auth-config";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
 import {
@@ -1387,7 +1389,10 @@ export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	activeSettings: Settings = settings,
+	surface: SessionOwnerSurface = sessionOwnerSurface(),
 ): Promise<SessionManager | undefined> {
+	// Read once, from the settings this launch uses, for whichever factory runs below.
+	const ownership = { surface, mode: sessionOwnershipModeFor(activeSettings.getGlobal("session.ownership.mode")) };
 	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	const sessionMemoryMode = activeSettings.get("sessionMemory.mode");
 	const sessionDestination = () =>
@@ -1410,6 +1415,7 @@ export async function createSessionManager(
 				undefined,
 				migrationPolicy,
 				sessionMemoryMode,
+				ownership,
 			);
 		}
 		const match = await resolveResumableSession(
@@ -1429,6 +1435,7 @@ export async function createSessionManager(
 			undefined,
 			migrationPolicy,
 			sessionMemoryMode,
+			ownership,
 		);
 	}
 
@@ -1441,7 +1448,14 @@ export async function createSessionManager(
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
 				: SessionManager.explicitDestination(path.dirname(sessionArg));
-			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode);
+			return await SessionManager.open(
+				sessionArg,
+				destination,
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+				ownership,
+			);
 		}
 		const match = await resolveResumableSession(
 			sessionArg,
@@ -1468,6 +1482,7 @@ export async function createSessionManager(
 					undefined,
 					migrationPolicy,
 					sessionMemoryMode,
+					ownership,
 				);
 			}
 		}
@@ -1477,6 +1492,7 @@ export async function createSessionManager(
 			undefined,
 			migrationPolicy,
 			sessionMemoryMode,
+			ownership,
 		);
 	}
 	if (parsed.continue) {
@@ -1486,12 +1502,13 @@ export async function createSessionManager(
 			undefined,
 			migrationPolicy,
 			sessionMemoryMode,
+			ownership,
 		);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, SessionManager.explicitDestination(parsed.sessionDir));
+		return SessionManager.create(cwd, SessionManager.explicitDestination(parsed.sessionDir), undefined, ownership);
 	}
 	// A lifecycle `/session_create` child must start a FRESH session that adopts
 	// the pre-allocated id (GJC_SESSION_ID), never auto-resume existing history in
@@ -1515,13 +1532,19 @@ export async function createSessionManager(
 			undefined,
 			migrationPolicy,
 			sessionMemoryMode,
+			ownership,
 		);
 		if (manager.hasHistoryEntries()) {
 			parsed.continue = true;
 		}
 		return manager;
 	}
-	return SessionManager.create(cwd, SessionManager.managedDestination(cwd, activeSettings.getAgentDir()));
+	return SessionManager.create(
+		cwd,
+		SessionManager.managedDestination(cwd, activeSettings.getAgentDir()),
+		undefined,
+		ownership,
+	);
 }
 
 async function maybeAutoChdir(parsed: Args): Promise<void> {
@@ -2172,6 +2195,7 @@ export async function runRootCommand(
 				scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 			let opened: StrictSessionOpenResult;
 			try {
+				// Opened before Settings.init, so the mode comes from the scoped settings.
 				opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
 					selection.identity,
 					parsedArgs.sessionDir
@@ -2179,6 +2203,11 @@ export async function runRootCommand(
 						: SessionManager.managedDestination(resumeCwd, scopedSettings.getAgentDir()),
 					undefined,
 					resumeMigrationPolicy,
+					undefined,
+					{
+						surface: "terminal",
+						mode: sessionOwnershipModeFor(scopedSettings.getGlobal("session.ownership.mode")),
+					},
 				);
 			} catch (error) {
 				process.stderr.write(`${operatorFacingSessionOpenMessage(error) ?? BARE_RESUME_OPEN_ERROR}\n`);
@@ -2343,6 +2372,7 @@ export async function runRootCommand(
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
+	if (mode !== "acp") setSessionOwnerSurface(isInteractive ? "terminal" : "print");
 	// One-shot print runs (`gjc -p`, auto-print) never display provider usage, so
 	// credential selection must not probe usage endpoints from every short-lived
 	// process; it reuses reports that long-lived hosts already cached (#5939).

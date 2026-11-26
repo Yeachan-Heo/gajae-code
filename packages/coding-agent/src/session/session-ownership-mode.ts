@@ -158,14 +158,22 @@ export function setSessionOwnershipSettingSource(source: (() => unknown) | undef
  * so `off` does no work beyond reading the setting.
  */
 export function sessionOwnershipMode(): SessionOwnershipMode {
-	const forced = sessionOwnershipTestHookSlot().mode;
-	if (forced !== undefined) return forced;
 	let setting: unknown;
 	try {
 		setting = settingSource?.();
 	} catch {
 		setting = undefined;
 	}
+	return sessionOwnershipModeFor(setting);
+}
+
+/**
+ * The mode for a `session.ownership.mode` value read from settings other than the global instance
+ * (a launch that opens its session before `Settings.init`, or a scoped load), with the same override.
+ */
+export function sessionOwnershipModeFor(setting: unknown): SessionOwnershipMode {
+	const forced = sessionOwnershipTestHookSlot().mode;
+	if (forced !== undefined) return forced;
 	const configured = resolveSessionOwnershipMode(setting, undefined);
 	// `off` is the kill switch: it returns before the environment is read at all.
 	if (configured === "off") return "off";
