@@ -10,6 +10,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
+import type { Args } from "../../src/cli/args";
+import { Settings } from "../../src/config/settings";
+import { createSessionManager } from "../../src/main";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
@@ -139,6 +142,23 @@ describe.if(supported)("factory claims", () => {
 			expect(sessionOwnershipCounters().claim_failed).toBeGreaterThan(0);
 		});
 	}
+
+	it("gjc acp keeps an in-memory manager: autoResume never opens, or contends for, the cwd's newest session", async () => {
+		const place = await workspace();
+		const settings = Settings.isolated({ autoResume: true });
+		const destination = SessionManager.managedDestination(place.cwd, settings.getAgentDir());
+		if (destination.kind !== "managed") throw new Error("expected a managed destination");
+		const { id } = await committed({ ...place, destination });
+		SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
+		const acp = keep((await createSessionManager({ mode: "acp" } as Args, place.cwd, settings))!);
+		expect([acp.getSessionId() === id, acp.isPersisted(), sessionClaimSetOf(acp).sessionIds]).toEqual([
+			false,
+			false,
+			[],
+		]);
+		expect(sessionOwnershipCounters().claim_conflict).toBe(0);
+		expect((await inspectSessionOwners()).held).toEqual([]);
+	});
 
 	it("off: no factory or prepare makes a lock call", async () => {
 		const place = await workspace();

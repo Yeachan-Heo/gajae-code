@@ -1391,6 +1391,9 @@ export async function createSessionManager(
 	activeSettings: Settings = settings,
 	surface: SessionOwnerSurface = sessionOwnerSurface(),
 ): Promise<SessionManager | undefined> {
+	// `gjc acp` never builds an agent here: its sessions run in broker-launched hosts, or in the
+	// process that owns them. A persisting manager would open, and claim, a session it never uses.
+	if (parsed.mode === "acp") return SessionManager.inMemory(cwd);
 	// Read once, from the settings this launch uses, for whichever factory runs below.
 	const ownership = { surface, mode: sessionOwnershipModeFor(activeSettings.getGlobal("session.ownership.mode")) };
 	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
