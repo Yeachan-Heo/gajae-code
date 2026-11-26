@@ -4510,6 +4510,12 @@ export class AgentSession {
 		message: BashExecutionMessage;
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
+		/**
+		 * Set to `#deferredRefusalSequence` when this row's own save was refused (and
+		 * reported), so a transition drops it without a retry. In practice only lease
+		 * contention under shared publication refuses one.
+		 */
+		refusedAt?: number;
 	}> = [];
 	/**
 	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
@@ -4670,7 +4676,17 @@ export class AgentSession {
 		message: PythonExecutionMessage;
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
+		/**
+		 * Set to `#deferredRefusalSequence` when this row's own save was refused (and
+		 * reported), so a transition drops it without a retry. In practice only lease
+		 * contention under shared publication refuses one.
+		 */
+		refusedAt?: number;
 	}> = [];
+	/** Counts refused deferred command-result saves; see `refusedAt`. */
+	#deferredRefusalSequence = 0;
+	/** `#deferredRefusalSequence` when the current session transition began. */
+	#transitionRefusalFloor = 0;
 	/** The one in-flight deferred command-result drain; later drains join it first. */
 	#executionMessageDrain: Promise<void> | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
@@ -5377,6 +5393,8 @@ export class AgentSession {
 		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
 		this.#sessionClaimTransition = claimTransition;
+		// Refusals after this point (the transition's own abort included) bound its settle.
+		this.#transitionRefusalFloor = this.#deferredRefusalSequence;
 		const completion = Promise.withResolvers<void>();
 		this.#sessionTransitionCompletion = completion.promise;
 		this.#resolveSessionTransitionCompletion = completion.resolve;
@@ -5395,6 +5413,80 @@ export class AgentSession {
 		// predecessor history/identity mutation. A bounded failure retains the real
 		// work owner and leaves the predecessor generation valid.
 		await awaitBtwSettlement(this.#joinBtwTurns());
+	}
+
+	/**
+	 * Settle the predecessor before a history transition mutates its history or
+	 * identity: its deferred command results, then its /btw turns. Call only after the
+	 * main-agent abort. `/clear` keeps its own background-publication join.
+	 */
+	async #settlePredecessorForSessionTransition(): Promise<void> {
+		await this.#settlePredecessorPublicationsForTransition();
+		await this.#settleBtwForSessionTransition();
+	}
+
+	/**
+	 * Save the predecessor's deferred `!`/`$` results to the predecessor before a
+	 * transition replaces its history or session. The abort only waits for them while
+	 * the turn is live; once it has ended, its drain can still be publishing through
+	 * the shared lease and would append its later rows to the successor's agent state
+	 * and transcript. Join that whole flush (it is one tracked background publication,
+	 * both kinds), then publish every queued row whose own save has not been refused,
+	 * so each result lands once where it was typed.
+	 *
+	 * Nothing unsaved stays queued past this point, whether or not the transition then
+	 * commits, so no refused row is re-appended behind rows saved now. A row whose own
+	 * save was refused showed its notice and is dropped without a retry. A kind refused
+	 * since the transition began (by its own abort's flush, or by the drain joined here)
+	 * is not attempted again: under a lease
+	 * another writer keeps holding, each attempt costs a full lock-wait budget, so this
+	 * bounds the settle at one budget per kind. Every other row left unsaved is dropped
+	 * with a notice of its own.
+	 */
+	async #settlePredecessorPublicationsForTransition(): Promise<void> {
+		await this.#joinBackgroundPublications();
+		const blocked = "an earlier command result could not be saved";
+		const keepUnrefused = <T extends { refusedAt?: number }>(queue: T[]): void => {
+			const refusedSinceTransition = queue.some(pending => (pending.refusedAt ?? 0) > this.#transitionRefusalFloor);
+			const kept = queue.filter(pending => {
+				if (pending.refusedAt !== undefined) return false;
+				if (refusedSinceTransition) this.#reportBackgroundRefusal("deferred command result", blocked);
+				return !refusedSinceTransition;
+			});
+			queue.splice(0, queue.length, ...kept);
+		};
+		keepUnrefused(this.#pendingBashMessages);
+		keepUnrefused(this.#pendingPythonMessages);
+		try {
+			await this.#flushPendingPromptMessages();
+		} catch (error) {
+			logger.warn("Deferred command results were not saved before the session transition", {
+				error: String(error),
+			});
+		} finally {
+			// Rows queued behind a row refused just now were never attempted: report them too.
+			for (const pending of [...this.#pendingBashMessages, ...this.#pendingPythonMessages]) {
+				if (pending.refusedAt === undefined) this.#reportBackgroundRefusal("deferred command result", blocked);
+			}
+			this.#pendingBashMessages.length = 0;
+			this.#pendingPythonMessages.length = 0;
+		}
+	}
+
+	/**
+	 * At a transition's commit, drop deferred results still queued for the
+	 * predecessor, each with its notice. The settle leaves nothing queued; this only
+	 * catches a result recorded between the settle and the commit (an auto-triggered
+	 * handoff's prompt lifecycle), which the next prompt would otherwise append to the
+	 * successor.
+	 */
+	#dropUnsavedDeferredResultsAtCommit(): void {
+		const unsaved = this.#pendingBashMessages.length + this.#pendingPythonMessages.length;
+		for (let row = 0; row < unsaved; row++) {
+			this.#reportBackgroundRefusal("deferred command result", "the session changed before it could be saved");
+		}
+		this.#pendingBashMessages.length = 0;
+		this.#pendingPythonMessages.length = 0;
 	}
 
 	#commitSessionTransition(): void {
@@ -6320,7 +6412,16 @@ export class AgentSession {
 		return false;
 	}
 
-	async #flushPendingPromptMessages(): Promise<void> {
+	/**
+	 * The whole flush is one tracked background publication, so
+	 * {@link #joinBackgroundPublications} covers rows its drain has not reached yet,
+	 * not only the row currently at the lease.
+	 */
+	#flushPendingPromptMessages(): Promise<void> {
+		return this.#trackBackgroundPublication(this.#drainPendingPromptMessages());
+	}
+
+	async #drainPendingPromptMessages(): Promise<void> {
 		const errors: unknown[] = [];
 		try {
 			await this.#flushPendingBashMessages();
@@ -17865,12 +17966,31 @@ export class AgentSession {
 	 * the attempted id: the caller must never re-append it under a new id.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
+		// Every failed save is reported, so a row the caller drops is never dropped silently.
+		const reportThrown = (error: unknown): never => {
+			this.#reportBackgroundRefusal(label, error instanceof Error ? error.message : String(error));
+			throw error;
+		};
 		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendMessage(message);
+			try {
+				this.sessionManager.appendMessage(message);
+			} catch (error) {
+				reportThrown(error);
+			}
 			return;
 		}
-		const outcome = await this.#trackBackgroundPublication(this.sessionManager.appendMessageSharingSession(message));
-		if (outcome.kind !== "committed") {
+		const outcome = await this.#trackBackgroundPublication(
+			this.sessionManager.appendMessageSharingSession(message),
+		).catch(reportThrown);
+		if (outcome.kind === "unknown") {
+			// The entry may already be durable: do not report it as unsaved.
+			if (!this.#isDisposed)
+				this.emitNotice(
+					"warning",
+					`The ${label} may not have been saved to this session (outcome unknown).`,
+					"session-publication",
+				);
+		} else if (outcome.kind !== "committed") {
 			const cause = describeSharedAppendFailure(outcome);
 			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
 		}
@@ -22446,7 +22566,7 @@ export class AgentSession {
 					await Bun.sleep(10);
 				}
 			}
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
@@ -22485,6 +22605,7 @@ export class AgentSession {
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
+			this.#dropUnsavedDeferredResultsAtCommit();
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.#initializeNewSessionState(nextDiscoverySessionNonMCPToolNames, previousSessionFile);
 			if (options?.drop && previousSessionFile) {
@@ -22531,7 +22652,7 @@ export class AgentSession {
 				return false;
 			}
 
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId))) {
 				throw new Error("Owned async deliveries did not settle before session replacement.");
 			}
@@ -22575,6 +22696,7 @@ export class AgentSession {
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
+			this.#dropUnsavedDeferredResultsAtCommit();
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.#initializeNewSessionState(nextDiscoverySessionNonMCPToolNames, previousSessionFile);
 			if (options?.drop && previousSessionFile) {
@@ -22987,7 +23109,7 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flushBeforeLeaving();
@@ -28261,7 +28383,7 @@ export class AgentSession {
 			}
 
 			try {
-				await this.#settleBtwForSessionTransition();
+				await this.#settlePredecessorForSessionTransition();
 			} catch (error) {
 				// Retirement can refuse before the transaction owns rollback. Preserve
 				// the generated document without wrapping its unknown-effect error.
@@ -28352,6 +28474,7 @@ export class AgentSession {
 				this.#steeringMessages = [];
 				this.#followUpMessages = [];
 				this.#pendingNextTurnMessages = [];
+				this.#dropUnsavedDeferredResultsAtCommit();
 				this.#scheduledHiddenNextTurnGeneration = undefined;
 				this.#todoReminderCount = 0;
 				this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "handoff" } });
@@ -34235,7 +34358,7 @@ export class AgentSession {
 	 * only what the earlier one left queued, behind the entry that failed.
 	 */
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean; refusedAt?: number }>,
 		kind: "bash" | "python",
 	): Promise<void> {
 		while (this.#executionMessageDrain) {
@@ -34253,7 +34376,7 @@ export class AgentSession {
 	}
 
 	async #drainPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean; refusedAt?: number }>,
 		kind: "bash" | "python",
 	): Promise<void> {
 		const total = pendingMessages.length;
@@ -34300,7 +34423,10 @@ export class AgentSession {
 				// session closes below with that receipt instead.
 				if (error instanceof SharedControlPublicationError && error.outcome.kind === "unknown")
 					unconfirmed.push(...error.outcome.ids);
-				else remaining.push(pending);
+				else {
+					pending.refusedAt = ++this.#deferredRefusalSequence;
+					remaining.push(pending);
+				}
 				continue;
 			}
 
@@ -34322,7 +34448,7 @@ export class AgentSession {
 			unconfirmed.length > 0
 				? `Could not confirm ${unconfirmed.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"} (attempted ids: ${unconfirmed.join(", ")}); ${persistedCount} persisted, ${remaining.length} not written; the session was closed to protect its history`
 				: persistenceFailureCount > 0
-					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them`
 					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
@@ -35423,7 +35549,7 @@ export class AgentSession {
 				while (this.isCompacting) await Bun.sleep(10);
 			}
 
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flushBeforeLeaving();
 			const previousSessionState = await this.sessionManager.captureRollbackState();
@@ -35817,8 +35943,7 @@ export class AgentSession {
 					// Deferred bash and python rows belong to the predecessor file.
 					// Leaving them queued lets the next prompt append that command
 					// text to the successor transcript.
-					this.#pendingBashMessages.length = 0;
-					this.#pendingPythonMessages.length = 0;
+					this.#dropUnsavedDeferredResultsAtCommit();
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -36196,7 +36321,7 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flushBeforeLeaving();
@@ -36554,7 +36679,11 @@ export class AgentSession {
 			if (!targetEntry) {
 				throw new Error(`Entry ${targetId} not found`);
 			}
-			// Collect entries to summarize (from old leaf to common ancestor).
+			// Collect entries to summarize (from old leaf to common ancestor). Deferred `!`/`$`
+			// rows the settle saves onto this branch later are not in it: the settle must follow
+			// the abort below, which must follow the cancellable `session_before_tree` hook, and
+			// that hook receives these entries and may return its own summary from them, so
+			// collecting again after the abort would split what it saw from what is summarized.
 			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
 				this.sessionManager,
 				oldLeafId,
@@ -36670,7 +36799,7 @@ export class AgentSession {
 				newLeafId = targetId;
 			}
 
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch

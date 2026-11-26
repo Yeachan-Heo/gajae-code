@@ -120,11 +120,13 @@ describe("AgentSession deferred execution across switchSession", () => {
 		return { cwd, modelRegistry };
 	}
 
-	it("switchSession to another file leaves deferred bash and python out of that session", async () => {
+	it("switchSession to another file saves deferred bash and python to the session they came from", async () => {
 		const { cwd, modelRegistry } = await fixture();
 		const sessionA = SessionManager.create(cwd, cwd);
 		sessionA.appendMessage({ role: "user", content: "A-1", timestamp: 1 });
 		await sessionA.ensureOnDisk();
+		const sessionAFile = sessionA.getSessionFile();
+		if (!sessionAFile) throw new Error("Expected session A file");
 
 		const sessionB = SessionManager.create(cwd, cwd);
 		sessionB.appendMessage({ role: "user", content: "B-1", timestamp: 1 });
@@ -161,8 +163,12 @@ describe("AgentSession deferred execution across switchSession", () => {
 		expect(live.includes("deferred-python-marker")).toBe(false);
 		expect(stored.includes("deferred-bash-marker")).toBe(false);
 		expect(stored.includes("deferred-python-marker")).toBe(false);
-		expect(bashPersisted).toBe(false);
-		expect(pythonPersisted).toBe(false);
+		// The rows were typed in A, so the switch saved them there exactly once.
+		const predecessor = await Bun.file(sessionAFile).text();
+		expect(predecessor.split("echo deferred-bash-marker").length - 1).toBe(1);
+		expect(predecessor.split("print('deferred-python-marker')").length - 1).toBe(1);
+		expect(bashPersisted).toBe(true);
+		expect(pythonPersisted).toBe(true);
 		expect(session.hasPendingBashMessages).toBe(false);
 		expect(session.hasPendingPythonMessages).toBe(false);
 	}, 30_000);
@@ -205,7 +211,7 @@ describe("AgentSession deferred execution across switchSession", () => {
 		expect(session.hasPendingPythonMessages).toBe(false);
 	}, 30_000);
 
-	it("keeps deferred bash after a switch to the same session file", async () => {
+	it("saves deferred bash once across a switch to the same session file", async () => {
 		const { cwd, modelRegistry } = await fixture();
 		const manager = SessionManager.create(cwd, cwd);
 		manager.appendMessage({ role: "user", content: "S-1", timestamp: 1 });
@@ -220,11 +226,11 @@ describe("AgentSession deferred execution across switchSession", () => {
 		expect(session.hasPendingBashMessages).toBe(true);
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
-		expect(session.hasPendingBashMessages).toBe(true);
+		expect(session.hasPendingBashMessages).toBe(false);
 		await flushByNextPrompt(session);
 
 		const stored = await sessionText(session);
-		expect(stored).toContain("echo same-file-bash");
+		expect(stored.split("echo same-file-bash").length - 1).toBe(1);
 		expect(session.hasPendingBashMessages).toBe(false);
 	}, 30_000);
 
