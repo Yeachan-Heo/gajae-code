@@ -591,7 +591,7 @@ Right before the final `fetch` hand-off (after transport transforms such as gzip
 
 ## Session ownership (single-owner claims)
 
-A process that opens a persisted session for writing takes a claim on it: a kernel lock on a sidecar under `~/.gjc/runtime/session-owners/`, with a small holder record beside it. The lock ends when the holder exits, however it exits, so a crashed or killed `gjc` leaves no lock behind. The sidecar file itself stays: one `.session-owner` sidecar accumulates per session ever opened, until sidecar pruning lands. Remote clients (ACP editors, `gjc sdk`, the notification daemons) attach to the endpoint of the process that owns the session and never claim. When no process is running the session, the host the broker launches for it is that owner and claims it as `sdk-host`.
+A process that opens a persisted session for writing takes a claim on it: a kernel lock on a sidecar under `~/.gjc/runtime/session-owners/`, with a small holder record beside it. The lock ends when the holder exits, however it exits, so a crashed or killed `gjc` leaves no lock behind. The sidecar file itself stays: one `.session-owner` sidecar accumulates per session ever opened, until sidecar pruning lands. The sidecars are empty and harmless; do not delete them by hand while gjc runs, because a deleted sidecar lets a second process lock a new one for the same session. `gjc doctor` warns only above 100,000 of them. Remote clients (ACP editors, `gjc sdk`, the notification daemons) attach to the endpoint of the process that owns the session and never claim. When no process is running the session, the host the broker launches for it is that owner and claims it as `sdk-host`.
 
 The global setting `session.ownership.mode` decides what claims do:
 
@@ -601,7 +601,7 @@ The global setting `session.ownership.mode` decides what claims do:
 | `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. |
 | `enforce` | Reserved for refusals. It currently behaves exactly like `observe`: nothing refuses yet. |
 
-On Windows there is no native lock yet, so every claim fails open: the session opens without a claim, `gjc session owners` is always empty, and each claim attempt counts `fail_open`.
+A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. One lock timeout (a stalled network filesystem, for example) turns claims off for the rest of that process, so later opens never wait for the lock again.
 
 Operator notes:
 

@@ -29,6 +29,7 @@ const {
 	sessionOwnerHolderPhrase,
 	sessionOwnerKey,
 	sessionOwnersDirectory,
+	sessionOwnershipCounters,
 } = ownership;
 
 const supported = process.platform === "linux" || process.platform === "darwin";
@@ -530,22 +531,30 @@ describe("narrow fail-open", () => {
 		expect(warnings).toEqual([]);
 	});
 
-	it.if(supported)("timed_out skips that one claim and the next claim tries again", async () => {
-		let first = true;
-		const calls = backend(sidecar => {
-			if (!first) return tryAcquireFileLock(sidecar);
-			first = false;
+	it("one timeout turns claims off for the process: later claims fail open without waiting", async () => {
+		const STALL_MS = 200;
+		const calls = backend(async () => {
+			await Bun.sleep(STALL_MS);
 			return { status: FileLockAcquireStatus.TimedOut, code: "timed_out" };
 		});
+		const stalled = Date.now();
 		expect(await claimSessionOwner("f4", { surface: "terminal" })).toEqual({
 			status: "skipped",
 			reason: "timed_out",
 			code: "timed_out",
 		});
-		const claim = await claimed("f4");
-		expect(claim.shared).toBe(false);
-		expect(calls.acquire).toBe(2);
-		expect(warnings).toEqual(["Session ownership claim timed out; this claim is skipped"]);
+		expect(Date.now() - stalled).toBeGreaterThanOrEqual(STALL_MS - 5);
+		const later = Date.now();
+		for (const id of ["f4", "f4-new", "f4-fork"])
+			expect(await claimSessionOwner(id, { surface: "terminal" })).toEqual({
+				status: "skipped",
+				reason: "timed_out",
+				code: "timed_out",
+			});
+		expect(Date.now() - later).toBeLessThan(STALL_MS);
+		expect(calls.acquire).toBe(1);
+		expect(sessionOwnershipCounters().fail_open).toBe(4);
+		expect(warnings).toEqual(["Session ownership claim timed out; claims are off for this process"]);
 	});
 
 	it("any other lock failure refuses, open/permission EACCES included", async () => {

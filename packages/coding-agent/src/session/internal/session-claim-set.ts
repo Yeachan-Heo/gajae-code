@@ -216,7 +216,9 @@ export class SessionClaimSet {
 			this.#pending.delete(sessionId);
 			const coveredSite = this.#coveredByPending.get(sessionId);
 			this.#coveredByPending.delete(sessionId);
-			if (coveredSite !== undefined && status !== "claimed")
+			// Only a session another process holds is a write without a claim; a fail-open or failed
+			// claim (no lock on this platform, a stall, an owners-directory failure) is not.
+			if (coveredSite !== undefined && status === "held")
 				this.#reportWithoutClaim(`claim in flight: ${coveredSite}`, sessionId);
 		}
 	}
@@ -268,6 +270,10 @@ export class SessionClaimSet {
 	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
 		if (sessionId === undefined) return;
 		if (this.#mode === "off" || this.#claims.has(sessionId)) return;
+		// The claim for this id failed open (`none` while claiming) or failed: nothing to detect, and
+		// counting it would make every Windows or stalled-filesystem process report writes.
+		const outcome = this.#outcomes.get(sessionId);
+		if (outcome === "none" || outcome === "failed") return;
 		if (this.#pending.has(sessionId)) {
 			if (!this.#coveredByPending.has(sessionId)) this.#coveredByPending.set(sessionId, site);
 			return;

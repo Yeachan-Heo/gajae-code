@@ -71,6 +71,8 @@ describe.skipIf(process.platform !== "win32")("session ownership on Windows, def
 		expect(counts.claim_failed).toBe(0);
 		expect(counts.claim_taken).toBe(0);
 		expect(counts.claim_conflict).toBe(0);
+		// A write after a fail-open claim is not a write without a claim: Windows reports none.
+		expect(counts.session_write_without_claim).toBe(0);
 
 		const inventory = await inspectSessionOwners();
 		expect(inventory.held).toEqual([]);

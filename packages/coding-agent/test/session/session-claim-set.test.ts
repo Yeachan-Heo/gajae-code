@@ -7,6 +7,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FileLockAcquireStatus, FileLockProbeState } from "@gajae-code/natives";
 import {
 	SessionClaimSet,
 	SessionWriteWithoutClaimError,
@@ -483,6 +484,42 @@ describe("the detector uses the mode its factory read", () => {
 		} finally {
 			delete SessionOwnershipTestHooks.mode;
 			delete SessionOwnershipTestHooks.strictWriteDetection;
+		}
+	});
+});
+
+describe.if(supported)("the detector after a claim that did not lock", () => {
+	it("is quiet for a fail-open or failed claim, and still counts a session held elsewhere", async () => {
+		const count = () => sessionOwnershipCounters().session_write_without_claim;
+		// A failed claim first: an `unavailable` answer latches, and later claims would not ask again.
+		const answers = [FileLockAcquireStatus.Failed, FileLockAcquireStatus.Unavailable];
+		SessionOwnershipTestHooks.mode = "observe";
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => ({ status: answers.shift() ?? FileLockAcquireStatus.Held, code: "ENOLCK" }),
+			probe: async () => ({ state: FileLockProbeState.Free }),
+		};
+		try {
+			const outcomes: string[] = [];
+			for (const id of ["failed", "fail-open"]) {
+				const set = new SessionClaimSet();
+				outcomes.push(await set.claim(id));
+				set.bind(id);
+				set.checkWrite("managed append");
+				set.checkWrite("rewrite", id);
+			}
+			expect(outcomes).toEqual(["failed", "none"]);
+			expect(count()).toBe(0);
+			// A session another process holds is the case the detector exists for: still counted.
+			resetSessionOwnershipForTests();
+			answers.splice(0, answers.length, FileLockAcquireStatus.Held);
+			const held = new SessionClaimSet();
+			expect(await held.claim("held")).toBe("held");
+			held.bind("held");
+			held.checkWrite("managed append");
+			expect(count()).toBe(1);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.lockBackend;
 		}
 	});
 });
