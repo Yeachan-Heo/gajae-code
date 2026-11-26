@@ -103,11 +103,9 @@ export function generateReport(result: BenchmarkResult): string {
 	lines.push(
 		`| Edit Fuzzy Threshold | ${config.editFuzzyThreshold === undefined ? "auto" : config.editFuzzyThreshold} |`,
 	);
-	lines.push(`| Guided Mode | ${config.guided === false ? "no" : "yes"} |`);
 	lines.push(`| Max Attempts | ${config.maxAttempts ?? 1} |`);
 	lines.push(`| Max Turns | ${config.maxTurns ?? "unset"} |`);
 	lines.push(`| No-op Retry Limit | ${config.noOpRetryLimit ?? 2} |`);
-	lines.push(`| Mutation Scope Window | ${config.mutationScopeWindow ?? 20} |`);
 	lines.push(`| Require Edit Tool | ${config.requireEditToolCall ? "yes" : "no"} |`);
 	lines.push(`| Require Read Tool | ${config.requireReadToolCall ? "yes" : "no"} |`);
 	lines.push(`| No-Edit Baseline | ${config.noEditRequired ? "yes" : "no"} |`);
@@ -173,8 +171,6 @@ export function generateReport(result: BenchmarkResult): string {
 	lines.push(`| Duration | ${formatDuration(summary.totalDuration)} | ${formatDuration(summary.avgDurationPerRun)} |`);
 	lines.push(`| **Avg Indent Score** | — | **${formatScore(summary.avgIndentScore)}** |`);
 	lines.push("");
-
-
 
 	const totalCategorizedEditFailures = EDIT_FAILURE_CATEGORIES.reduce(
 		(sum, category) => sum + (summary.editFailureCategories[category] ?? 0),

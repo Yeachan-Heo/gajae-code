@@ -4,6 +4,7 @@
  */
 
 export type ScenarioId =
+	| "read-edit-hashline"
 	| "three-turn-tools"
 	| "bash-discipline"
 	| "file-discovery-discipline"
@@ -12,6 +13,7 @@ export type ScenarioId =
 	| "grok-sanitize-replay"
 	| "multi-file-search-edit"
 	| "multi-file-search-edit-bad-anchor"
+	| "bad-anchor-recovery"
 	| "tool-json-malformed-recovery"
 	| "multi-turn-yield-discipline"
 	| "timeout-handling"
@@ -94,8 +96,14 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 				expectedEditText: "recovered-anchor-ok",
 				requireSuccess: true,
 			};
-
-
+		case "read-edit-hashline":
+			return {
+				targetPath: "fixtures/workspace/src/foo.ts",
+				expectedEditText: "hello-composer-harness",
+				requireSuccess: true,
+			};
+		case "bad-anchor-recovery":
+			return { targetPath: "fixtures/workspace/src/recover.ts", expectedEditText: "ok", requireSuccess: true };
 		case "multi-turn-yield-discipline":
 			return { targetPath: "fixtures/workspace/src/multi.ts", expectedEditText: "-done", requireSuccess: true };
 		case "hard-guard-feedback":
@@ -126,6 +134,7 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 }
 
 export const COMPOSER_SCENARIOS_V1_IDS = [
+	"read-edit-hashline",
 	"three-turn-tools",
 	"bash-discipline",
 	"file-discovery-discipline",
@@ -134,12 +143,24 @@ export const COMPOSER_SCENARIOS_V1_IDS = [
 	"grok-sanitize-replay",
 	"multi-file-search-edit",
 	"multi-file-search-edit-bad-anchor",
+	"bad-anchor-recovery",
 	"tool-json-malformed-recovery",
 	"multi-turn-yield-discipline",
 	"timeout-handling",
 ] as const satisfies readonly ScenarioId[];
 
 export const COMPOSER_SCENARIOS: ScenarioDefinition[] = [
+	{
+		id: "read-edit-hashline",
+		description: "Read anchored file contents, then apply one hashline edit.",
+		turns: "2-3",
+		fixture: "fixtures/workspace/src/foo.ts",
+		obligation: "final file matches golden and file IO uses read/edit tools only",
+		userPrompt:
+			"In this repo workspace, read fixtures/workspace/src/foo.ts with the read tool, then change the exported greeting string to exactly `hello-composer-harness` using the edit tool and hashline anchors from your read output. Do not use shell commands to read or write files.",
+		failureClass: "bad-anchor-unrecovered",
+		recovery: false,
+	},
 	{
 		id: "three-turn-tools",
 		description: "Chain read, search, and edit across three tool turns.",
@@ -228,7 +249,17 @@ export const COMPOSER_SCENARIOS: ScenarioDefinition[] = [
 		failureClass: "bad-anchor-unrecovered",
 		recovery: true,
 	},
-
+	{
+		id: "bad-anchor-recovery",
+		description: "Recover from a stale anchor in a single-file edit.",
+		turns: "3-5",
+		fixture: "fixtures/workspace/src/recover.ts",
+		obligation: "failed edit is followed by re-anchor read and successful edit",
+		userPrompt:
+			"Edit fixtures/workspace/src/recover.ts to set STATUS to `ok` using hashline edit. If anchors mismatch, use the rejection message's fresh anchors or re-read before retrying.",
+		failureClass: "bad-anchor-unrecovered",
+		recovery: true,
+	},
 	{
 		id: "tool-json-malformed-recovery",
 		description: "Recover after one malformed tool-argument payload.",

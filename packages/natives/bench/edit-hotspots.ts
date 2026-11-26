@@ -35,12 +35,6 @@ const editedContent = editLines
 	.map((line, index) => (index % 53 === 0 ? `${line} // edited ${index}` : line))
 	.filter((_, index) => index % 211 !== 7)
 	.join("\n");
-const hashText = Array.from({ length: 2500 }, (_, index) => {
-	if (index % 97 === 0) return "";
-	if (index % 89 === 0) return `tabs\tand unicode “quotes” ${index}`;
-	if (index % 83 === 0) return `${"z".repeat(1024)} ${index}`;
-	return `hash line ${index} trailing   `;
-}).join("\n");
 
 const candidates: Candidate[] = [
 	{
@@ -64,7 +58,6 @@ const candidates: Candidate[] = [
 		dimensions: { lines: editLines.length, bytes: Buffer.byteLength(editContent), editedBytes: Buffer.byteLength(editedContent) },
 		run: () => generateDiffString(editContent, editedContent),
 	},
-
 ];
 
 function stats(samples: number[]): { median: number; p95: number } {

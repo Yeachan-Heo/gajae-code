@@ -84,12 +84,10 @@ export interface BenchmarkConfig {
 	editVariant?: string;
 	editFuzzy?: boolean | "auto";
 	editFuzzyThreshold?: number | "auto";
-	guided?: boolean;
 	maxAttempts?: number;
 	noOpRetryLimit?: number;
 	maxTimeoutRetries?: number;
 	maxProviderFailureRetries?: number;
-	mutationScopeWindow?: number;
 	conversationDumpDir?: string;
 	/** Use in-process agent sessions instead of spawning CLI subprocesses. Default: true */
 	inProcess?: boolean;
@@ -246,7 +244,6 @@ function countEditFailureCategories(runs: TaskRunResult[]): Record<EditFailureCa
 	return counts;
 }
 
-
 const BENCHMARK_TOOL_NAMES = ["read", "edit", "write", "apply_patch"] as const;
 const EDIT_TOOL_NAMES = ["edit", "apply_patch"] as const;
 
@@ -257,8 +254,6 @@ function isEditTool(toolName: unknown): toolName is (typeof EDIT_TOOL_NAMES)[num
 function isMutationTool(toolName: unknown): boolean {
 	return isEditTool(toolName) || toolName === "write";
 }
-
-
 
 async function collectOriginalFileContents(cwd: string, files: string[]): Promise<Map<string, string>> {
 	const originals = new Map<string, string>();
@@ -271,24 +266,6 @@ async function collectOriginalFileContents(cwd: string, files: string[]): Promis
 		}
 	}
 	return originals;
-}
-
-/**
- * Compute a 2-character hash of a single line for display in mutation previews.
- * The hash depends only on the line's content; line index is ignored so anchors
- * remain stable across line shifts.
- */
-function computeLineHashForPreview(line: string): string {
-	const hashText = line.replace(/\r/g, "").trimEnd();
-	// Using a simple character sum based hash for display purposes
-	let hash = 0;
-	for (let i = 0; i < Math.min(hashText.length, 20); i++) {
-		hash = ((hash << 5) - hash) + hashText.charCodeAt(i);
-	}
-	const base = 26;
-	const c1 = String.fromCharCode(97 + (Math.abs(hash) % base));
-	const c2 = String.fromCharCode(97 + (Math.abs(Math.floor(hash / base)) % base));
-	return `${c1}${c2}`;
 }
 
 function buildMutationPreviewAgainstOriginal(original: string, current: string): string | null {
@@ -307,16 +284,14 @@ function buildMutationPreviewAgainstOriginal(original: string, current: string):
 
 		if (change.removed) {
 			for (const line of lines) {
-				const hash = computeLineHashForPreview(line);
-				preview.push(`${lineNum}#${hash}|-${line}`);
+				preview.push(`${lineNum}|-${line}`);
 				lineNum += 1;
 			}
 			continue;
 		}
 
 		for (const line of lines) {
-			const hash = computeLineHashForPreview(line);
-			preview.push(`${lineNum}#${hash}|+${line}`);
+			preview.push(`${lineNum}|+${line}`);
 		}
 	}
 
@@ -526,21 +501,6 @@ async function evaluateMutationIntent(
 	};
 }
 
-
-
-
-
-async function buildGuidedContext(
-	_task: EditTask,
-	_cwd: string,
-	_expectedDir: string,
-	config: BenchmarkConfig,
-): Promise<string | null> {
-	if (!config.guided) return null;
-	// Guided context generation is no longer supported
-	return null;
-}
-
 function buildInstructions(config: BenchmarkConfig): string {
 	return config.noEditRequired
 		? "Read the relevant files first, then apply the fix."
@@ -559,41 +519,28 @@ function buildBenchmarkSystemPrompt(params: { multiFile: boolean; config: Benchm
 	});
 }
 
-function buildInitialBenchmarkPrompt(params: { taskPrompt: string; guidedContext?: string | null }): string {
-	return prompt.render(benchmarkTaskPrompt, {
-		task_prompt: params.taskPrompt,
-		guided_context: params.guidedContext ?? undefined,
-	});
+function buildInitialBenchmarkPrompt(taskPrompt: string): string {
+	return prompt.render(benchmarkTaskPrompt, { task_prompt: taskPrompt });
 }
 
-function buildRetryBenchmarkPrompt(params: { retryContext: string; guidedContext?: string | null }): string {
-	return prompt.render(benchmarkRetryPrompt, {
-		retry_context: params.retryContext,
-		guided_context: params.guidedContext ?? undefined,
-	});
+function buildRetryBenchmarkPrompt(retryContext: string): string {
+	return prompt.render(benchmarkRetryPrompt, { retry_context: retryContext });
 }
 
 function buildBenchmarkPromptDelivery(params: {
 	taskPrompt: string;
-	guidedContext?: string | null;
 	retryContext?: string | null;
 }): BenchmarkPromptDelivery {
 	if (params.retryContext) {
 		return {
 			kind: "followUp",
-			message: buildRetryBenchmarkPrompt({
-				retryContext: params.retryContext,
-				guidedContext: params.guidedContext,
-			}),
+			message: buildRetryBenchmarkPrompt(params.retryContext),
 		};
 	}
 
 	return {
 		kind: "prompt",
-		message: buildInitialBenchmarkPrompt({
-			taskPrompt: params.taskPrompt,
-			guidedContext: params.guidedContext,
-		}),
+		message: buildInitialBenchmarkPrompt(params.taskPrompt),
 	};
 }
 
@@ -603,7 +550,6 @@ function buildBenchmarkProviderSessionId(params: {
 	config: BenchmarkConfig;
 	task: EditTask;
 	multiFile: boolean;
-	initialGuidedContext?: string | null;
 }): string {
 	const keyMaterial = [
 		`version:${BENCHMARK_PROVIDER_SESSION_VERSION}`,
@@ -611,27 +557,21 @@ function buildBenchmarkProviderSessionId(params: {
 		`model:${params.config.model}`,
 		`task:${params.task.id}`,
 		`system:${buildBenchmarkSystemPrompt({ multiFile: params.multiFile, config: params.config })}`,
-		`initial:${buildInitialBenchmarkPrompt({ taskPrompt: params.task.prompt, guidedContext: params.initialGuidedContext })}`,
+		`initial:${buildInitialBenchmarkPrompt(params.task.prompt)}`,
 	].join("\n");
 	return `reb_${Bun.hash(keyMaterial).toString(36)}`;
 }
 
-async function prepareBenchmarkSessionSetup(params: {
-	config: BenchmarkConfig;
-	task: EditTask;
-	cwd: string;
-	expectedDir: string;
-	multiFile: boolean;
-}): Promise<{ initialGuidedContext: string | null; providerSessionId: string; rpcArgs: string[] }> {
-	const initialGuidedContext = await buildGuidedContext(params.task, params.cwd, params.expectedDir, params.config);
+function prepareBenchmarkSessionSetup(params: { config: BenchmarkConfig; task: EditTask; multiFile: boolean }): {
+	providerSessionId: string;
+	rpcArgs: string[];
+} {
 	const providerSessionId = buildBenchmarkProviderSessionId({
 		config: params.config,
 		task: params.task,
 		multiFile: params.multiFile,
-		initialGuidedContext,
 	});
 	return {
-		initialGuidedContext,
 		providerSessionId,
 		rpcArgs: buildBenchmarkRpcArgs(params.config, params.multiFile, providerSessionId),
 	};
@@ -836,7 +776,7 @@ async function runSingleTask(
 	let diff: string | undefined;
 	const editFailures: EditFailure[] = [];
 	const editWarnings: string[] = [];
-	let editAutocorrectCount = 0;
+	const editAutocorrectCount = 0;
 	let timeoutTelemetry: PromptAttemptTelemetry | undefined;
 	let mutationIntentValidation: MutationIntentValidation | null = null;
 	let earlyStoppedByMatch = false;
@@ -852,7 +792,6 @@ async function runSingleTask(
 		totalInputChars: 0,
 	};
 
-
 	const logFile = path.join(TMP, `run-${task.id}-${runIndex}.jsonl`);
 	const logEvent = async (event: unknown) => {
 		await fs.promises.appendFile(logFile, `${JSON.stringify(event)}\n`);
@@ -863,13 +802,7 @@ async function runSingleTask(
 	let providerFailureRetries = 0;
 
 	try {
-		const sessionSetup = await prepareBenchmarkSessionSetup({
-			config,
-			task,
-			cwd,
-			expectedDir,
-			multiFile: false,
-		});
+		const sessionSetup = prepareBenchmarkSessionSetup({ config, task, multiFile: false });
 		await fs.promises.appendFile(
 			logFile,
 			`{"type":"meta","task":"${task.id}","run":${runIndex},"workDir":"${cwd}","providerSessionId":${JSON.stringify(sessionSetup.providerSessionId)}}\n`,
@@ -915,13 +848,8 @@ async function runSingleTask(
 			let allEvents: Array<{ type: string; [key: string]: unknown }> = [];
 
 			for (let attempt = 0; attempt < maxAttempts; attempt++) {
-				const guidedContext =
-					attempt === 0
-						? sessionSetup.initialGuidedContext
-						: await buildGuidedContext(task, cwd, expectedDir, config);
 				const delivery = buildBenchmarkPromptDelivery({
 					taskPrompt: task.prompt,
-					guidedContext,
 					retryContext,
 				});
 
@@ -1073,7 +1001,6 @@ async function runSingleTask(
 							} else {
 								toolStats.editSuccesses++;
 								if (e.toolName === "edit") {
-
 								}
 							}
 						}
@@ -1204,8 +1131,6 @@ function extractToolText(result: unknown): string | null {
 	}
 	return null;
 }
-
-
 
 function extractToolErrorMessage(result: unknown): string {
 	const text = extractToolText(result);
@@ -1652,8 +1577,6 @@ export function buildBenchmarkResult(params: {
 			? runsWithMutationIntent.filter(r => r.mutationIntentMatched).length / runsWithMutationIntent.length
 			: undefined;
 	const editFailureCategories = countEditFailureCategories(nonGhostRuns);
-
-
 
 	const denom = effectiveRuns || 1;
 	const summary: BenchmarkSummary = {

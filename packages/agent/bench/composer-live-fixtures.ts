@@ -22,6 +22,9 @@ export async function seedScenarioWorkdir(workdir: string, scenarioId: ScenarioI
 		case "bash-discipline":
 			await write(path.join(ws, "src", "secret.ts"), "export const SECRET = 'LIVE_SECRET_7319';\n");
 			break;
+		case "read-edit-hashline":
+			await write(path.join(ws, "src", "foo.ts"), "export const greeting = 'hello-old';\n");
+			break;
 		case "three-turn-tools":
 			await write(path.join(ws, "src", "a.ts"), "export const TARGET_MARKER = 'pending';\n");
 			await write(path.join(ws, "src", "b.ts"), "// secondary\n");
@@ -48,7 +51,9 @@ export async function seedScenarioWorkdir(workdir: string, scenarioId: ScenarioI
 		case "multi-file-search-edit-bad-anchor":
 			await write(path.join(ws, "src", "target.ts"), "export const STATUS = 'pending';\n");
 			break;
-
+		case "bad-anchor-recovery":
+			await write(path.join(ws, "src", "recover.ts"), "export const STATUS = 'pending';\n");
+			break;
 		case "tool-json-malformed-recovery":
 			await mkdir(transcripts, "tool-json-malformed-recovery");
 			await write(path.join(transcripts, "tool-json-malformed-recovery", "sample.json"), "{}\n");

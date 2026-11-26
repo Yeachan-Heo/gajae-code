@@ -126,8 +126,6 @@ Options:
   --edit-fuzzy <bool>       Fuzzy matching: true, false, auto (default: auto)
   --edit-fuzzy-threshold <n> Fuzzy threshold 0-1 or auto (default: auto)
   --auto-format             Auto-format output files after verify (debug only)
-  --guided                  Include an authoritative suggested edit payload (default: false)
-  --no-guided               Disable guided mode
   --max-attempts <n>        Max prompt attempts per run (default: 1)
   --no-op-retry-limit <n>   Stop after repeated preventable no-op failures (default: 2)
 
@@ -226,13 +224,10 @@ async function main(): Promise<void> {
 			format: { type: "string", default: "markdown" },
 			"check-fixtures": { type: "boolean", default: false },
 			"auto-format": { type: "boolean", default: false },
-			guided: { type: "boolean", default: false },
-			"no-guided": { type: "boolean", default: false },
 			"max-attempts": { type: "string", default: "1" },
 			"no-op-retry-limit": { type: "string", default: "2" },
 			"max-timeout-retries": { type: "string", default: "3" },
 			"max-provider-retries": { type: "string", default: "3" },
-			"mutation-scope-window": { type: "string", default: "20" },
 			"require-edit-tool-call": { type: "boolean", default: false },
 			"require-read-tool-call": { type: "boolean", default: false },
 			"no-edit-required": { type: "boolean", default: false },
@@ -330,7 +325,6 @@ async function main(): Promise<void> {
 	const noOpRetryLimit = parseInt(values["no-op-retry-limit"] ?? "2", 10);
 	const maxTimeoutRetries = parseInt(values["max-timeout-retries"] ?? "3", 10);
 	const maxProviderRetries = parseInt(values["max-provider-retries"] ?? "3", 10);
-	const mutationScopeWindow = parseInt(values["mutation-scope-window"] ?? "20", 10);
 	const connectionTimeout = parseInt(values["connection-timeout"] ?? "30000", 10);
 
 	let tasksToRun = allTasks;
@@ -388,8 +382,6 @@ async function main(): Promise<void> {
 		}
 	}
 
-	const guided = values["no-guided"] ? false : values.guided;
-
 	const formatType = values.format === "json" ? "json" : "markdown";
 	const config: BenchmarkConfig = {
 		provider,
@@ -400,7 +392,6 @@ async function main(): Promise<void> {
 		maxTurns,
 		taskConcurrency,
 		autoFormat: values["auto-format"],
-		guided,
 		maxAttempts,
 		requireEditToolCall: values["require-edit-tool-call"],
 		requireReadToolCall: values["require-read-tool-call"],
@@ -411,7 +402,6 @@ async function main(): Promise<void> {
 		noOpRetryLimit,
 		maxTimeoutRetries,
 		maxProviderFailureRetries: maxProviderRetries,
-		mutationScopeWindow,
 		connectionTimeout,
 		inProcess: !values["no-in-process"],
 		earlyStopOnMatch: !values["no-early-stop-on-match"],
@@ -432,7 +422,6 @@ async function main(): Promise<void> {
 	if (config.autoFormat) {
 		console.log("Auto-format: enabled");
 	}
-	console.log(`Guided mode: ${config.guided ? "enabled" : "disabled"}`);
 	console.log(`Max attempts: ${config.maxAttempts}`);
 	if (config.maxTurns !== undefined) {
 		console.log(`Max turns per attempt: ${config.maxTurns}`);
