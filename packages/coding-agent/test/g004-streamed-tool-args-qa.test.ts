@@ -253,7 +253,7 @@ describe("G004 streamed tool args QA", () => {
 
 	it("COALESCE-SKIP recomputes and renders same-length changed edit previews", async () => {
 		const editModule = await import("../src/edit/index");
-		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
+		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).replace;
 		const originalCompute = strategy.computeDiffPreview;
 		const pending: Array<{ resolve: (value: unknown) => void }> = [];
 		strategy.computeDiffPreview = () => {
@@ -299,7 +299,7 @@ describe("G004 streamed tool args QA", () => {
 
 	it("COALESCE-SKIP retains a preview for an unchanged streamed payload", async () => {
 		const editModule = await import("../src/edit/index");
-		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
+		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).replace;
 		const originalCompute = strategy.computeDiffPreview;
 		const pending: Array<{ resolve: (value: unknown) => void }> = [];
 		strategy.computeDiffPreview = () => {
