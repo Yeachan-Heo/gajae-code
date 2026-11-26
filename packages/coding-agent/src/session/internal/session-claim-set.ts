@@ -227,10 +227,19 @@ export class SessionClaimSet {
 	 */
 	claimInBackground(sessionId: string): void {
 		if (!this.claiming) return;
-		void this.claim(sessionId).then(() => {
-			// Landed after a rotation already settled away from it: release it now, not at the next settle.
-			if (this.#current !== sessionId && this.#transitions === 0) this.settle();
-		});
+		void this.claim(sessionId)
+			.then(() => {
+				// Landed after a rotation already settled away from it: release it now, not at the next settle.
+				if (this.#current !== sessionId && this.#transitions === 0) this.settle();
+			})
+			// `claim` never throws, but handing it a claim already released (`add`) or the settle can:
+			// a background claim must not become an unhandled rejection in the process that started it.
+			.catch(error => {
+				logger.warn("Background session claim failed", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 	}
 
 	/** Record the outcome of a claim taken before this set existed (a strict open's, handed over). */
