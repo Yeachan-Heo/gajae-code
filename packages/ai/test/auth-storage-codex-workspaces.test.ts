@@ -503,5 +503,32 @@ describe("AuthStorage openai-codex workspaces", () => {
 			await refreshLegacy(legacyId, TEAM.id);
 			expect(stored().map(row => [row.id, row.credential.organizationName])).toEqual([[legacyId, TEAM.name]]);
 		});
+
+		it("keeps the named duplicate when a lease-backed store has no name-only writer", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			const loginId = stored().find(row => row.id !== legacyId)?.id ?? -1;
+			// A custom store may implement the refresh lease hooks without the optional name-only writer.
+			Object.defineProperty(store, "setOAuthOrganizationNameIfUnset", { value: undefined, configurable: true });
+
+			await refreshLegacy(legacyId, TEAM.id);
+
+			// The lease persisted the refreshed row without a name, so the duplicate stays as the durable name source,
+			// on disk and after a reload.
+			expect(stored().map(row => [row.id, row.credential.organizationName])).toEqual([
+				[legacyId, undefined],
+				[loginId, TEAM.name],
+			]);
+			expect(stored().find(row => row.id === legacyId)?.credential.access).toBe(
+				codexAccessToken(TEAM.id, "legacy-refreshed"),
+			);
+			expect(authStorage.resolveOAuthPinTarget("openai-codex", { kind: "org", value: TEAM.name }).credentialId).toBe(
+				loginId,
+			);
+			await authStorage.reload();
+			expect(authStorage.resolveOAuthPinTarget("openai-codex", { kind: "org", value: TEAM.name }).credentialId).toBe(
+				loginId,
+			);
+		});
 	});
 });

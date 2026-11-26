@@ -555,6 +555,7 @@ export interface AuthCredentialStore {
 	/**
 	 * Atomically adds a display name to the active OAuth row `id` when it belongs to `organizationId` and has no name.
 	 * Every other stored field, tokens included, is left as the row currently holds it.
+	 * A store with refresh lease hooks but without this writer keeps a duplicate that holds the name instead of pruning it.
 	 */
 	setOAuthOrganizationNameIfUnset?(id: number, organizationId: string, organizationName: string): boolean;
 	deleteAuthCredential(id: number, disabledCause: string): void;
@@ -3898,9 +3899,9 @@ export class AuthStorage {
 	 * - condition lost because a peer named the row first or changed its workspace: the name the row holds now, prune.
 	 * - condition lost because the row is no longer active: the refreshed credential, and keep the duplicate, since
 	 *   pruning it would leave no active row for the identity.
-	 * - write or re-read failed: the refreshed credential without the carried name, and keep the duplicate that still
-	 *   holds the name so a later refresh carries it again. The tokens are already committed, so the refresh itself
-	 *   succeeds.
+	 * - store has no name-only writer, or the write or re-read failed: the refreshed credential without the carried name,
+	 *   and keep the duplicate that still holds the name so a later refresh carries it again. The tokens are already
+	 *   committed, so the refresh itself succeeds.
 	 */
 	#persistCarriedOrganizationName<T extends AuthCredential>(
 		provider: string,
@@ -3910,8 +3911,9 @@ export class AuthStorage {
 		organizationId: string,
 		carriedName: string,
 	): { credential: T; pruneDuplicates: boolean } {
+		if (!this.#store.setOAuthOrganizationNameIfUnset) return { credential, pruneDuplicates: false };
 		try {
-			if (this.#store.setOAuthOrganizationNameIfUnset?.(id, organizationId, carriedName) !== false) {
+			if (this.#store.setOAuthOrganizationNameIfUnset(id, organizationId, carriedName)) {
 				return { credential: named, pruneDuplicates: true };
 			}
 			const current = this.#store.listAuthCredentials(provider).find(entry => entry.id === id)?.credential;
