@@ -2,20 +2,97 @@
  * The per-manager claim set (design §2.5): the session claims one SessionManager holds, keyed by
  * session id, with every release point of the design's table.
  *
- * Bookkeeping only. It never claims; factories and transitions claim, then hand the claim in. It
- * releases a claim only when its id is no longer the manager's current id and no transition is open,
- * so a predecessor stays claimed until its rotation commits, and a rollback that restores the
- * predecessor releases the target instead. With no claim in the set, every operation is a no-op,
- * which is what `off` gives: nothing ever adds a claim.
+ * Factories and transitions claim through {@link SessionClaimSet.claim}, the one place a manager
+ * takes a claim; the detector never claims. It releases a claim only when its id is no longer the
+ * manager's current id and no transition is open, so a predecessor stays claimed until its rotation
+ * commits, and a rollback that restores the predecessor releases the target instead. In `off`, and
+ * for an exempt manager, nothing is ever claimed and every operation is a no-op.
  */
 import { logger } from "@gajae-code/utils";
 import type { SessionManager } from "../session-manager";
-import { countSessionOwnershipEvent, type SessionOwnerClaim } from "../session-ownership";
+import {
+	claimSessionOwner,
+	countSessionOwnershipEvent,
+	type SessionOwnerClaim,
+	type SessionOwnerSurface,
+	sessionOwnerHolderPhrase,
+	sessionOwnerSurface,
+} from "../session-ownership";
 import {
 	type SessionOwnershipMode,
 	sessionOwnershipMode,
 	sessionOwnershipTestHookSlot,
 } from "../session-ownership-mode";
+
+/**
+ * A factory's ownership decision (design §2.4): claim under `surface`, or never claim (`exempt`).
+ * `mode` is the mode as the factory read it; a factory reads it once and hands it on.
+ */
+export type SessionOwnershipDecision =
+	| "exempt"
+	| { readonly surface: SessionOwnerSurface; readonly mode?: SessionOwnershipMode };
+
+/**
+ * The decision a persisting manager is constructed with. Required by the constructor, so a factory
+ * cannot build a manager without deciding.
+ */
+export type ResolvedSessionOwnership =
+	| "exempt"
+	| { readonly surface: SessionOwnerSurface; readonly mode: SessionOwnershipMode };
+
+/** Read the mode once, for one factory; without a decision, claim as this process's surface. */
+export function resolveSessionOwnership(
+	decision: SessionOwnershipDecision = { surface: sessionOwnerSurface() },
+): ResolvedSessionOwnership {
+	if (decision === "exempt") return "exempt";
+	return { surface: decision.surface, mode: decision.mode ?? sessionOwnershipMode() };
+}
+
+/**
+ * Whether `ownership` takes claims at all. Callers check this before awaiting a claim, so `off` and
+ * exempt managers add no await and keep their ordering exactly as before ownership existed.
+ */
+export function claimsUnder(ownership: ResolvedSessionOwnership): boolean {
+	return ownership !== "exempt" && ownership.mode !== "off";
+}
+
+/**
+ * The outcome of one claim attempt. `none`: nothing was attempted (off, exempt) or the platform
+ * failed open; `failed`: a failure enforce will refuse (counted `claim_failed`); `held`: another
+ * process holds the session (counted `claim_conflict`).
+ */
+export type SessionClaimAttempt =
+	| { readonly status: "claimed"; readonly claim: SessionOwnerClaim }
+	| { readonly status: "held" | "failed" | "none" };
+export type SessionClaimStatus = SessionClaimAttempt["status"];
+
+/**
+ * One claim attempt under `ownership`, never throwing (design §13 M2). Nothing refuses yet: a held
+ * session (counted `claim_conflict`) and an owners-directory failure (counted `claim_failed`, which
+ * enforce will refuse) are logged, and the caller goes on without a claim.
+ */
+export async function attemptSessionClaim(
+	ownership: ResolvedSessionOwnership,
+	sessionId: string,
+): Promise<SessionClaimAttempt> {
+	if (ownership === "exempt" || ownership.mode === "off") return { status: "none" };
+	try {
+		const result = await claimSessionOwner(sessionId, { surface: ownership.surface });
+		if (result.status === "claimed") return result;
+		if (result.status === "held") {
+			logger.warn("Session is open for writing in another process; continuing without a claim", {
+				mode: ownership.mode,
+				holder: sessionOwnerHolderPhrase(result.holder),
+			});
+			return { status: "held" };
+		}
+	} catch (error) {
+		countSessionOwnershipEvent("claim_failed");
+		logger.warn("Session claim failed; continuing without a claim", { mode: ownership.mode, error: String(error) });
+		return { status: "failed" };
+	}
+	return { status: "none" };
+}
 
 /** How long a deferred owner shutdown may keep its predecessor's claim (design §2.5). */
 export const DEFERRED_RELEASE_CAP_MS = 60_000;
@@ -34,8 +111,6 @@ export class SessionWriteWithoutClaimError extends Error {
 
 interface DeferredHold {
 	readonly sessionId: string;
-	/** The set that holds the claim now; a manager swap moves holds with their claims. */
-	set: SessionClaimSet;
 	timer: NodeJS.Timeout | undefined;
 }
 
@@ -54,16 +129,37 @@ const abandonedSets = new FinalizationRegistry<Map<string, SessionOwnerClaim>>(c
 export class SessionClaimSet {
 	readonly #claims = new Map<string, SessionOwnerClaim>();
 	readonly #holds = new Map<string, DeferredHold>();
+	/** Claims in flight, by id. The detector counts them as covered: a factory started them before any write. */
+	readonly #pending = new Map<string, Promise<unknown>>();
+	/** Ids whose write a pending claim covered: if that claim does not land, the write is counted then. */
+	readonly #coveredByPending = new Map<string, string>();
+	/** The last claim outcome per id, read by the gates that will refuse in enforce (5a). */
+	readonly #outcomes = new Map<string, SessionClaimStatus>();
 	#current: string | undefined;
 	#transitions = 0;
 	#closed = false;
-	/** Read once per bind, so a settings reload never changes the mode under a bound session. */
-	#mode: SessionOwnershipMode = "off";
+	/** The factory's decision, with the mode it read once; a settings reload never changes it under a manager. */
+	readonly #ownership: ResolvedSessionOwnership;
 	/** Detector reports already logged, as `<id> <site>`: log once, count every time. */
 	readonly #reported = new Set<string>();
 
-	constructor() {
+	constructor(ownership: ResolvedSessionOwnership = resolveSessionOwnership()) {
+		this.#ownership = ownership;
 		abandonedSets.register(this, this.#claims);
+	}
+
+	/** False in `off` and for an exempt manager: check it before awaiting {@link claim} or {@link settled}. */
+	get claiming(): boolean {
+		return this.#mode !== "off";
+	}
+
+	/** The decision this set claims under, for a scoped claim made on the manager's behalf. */
+	get ownership(): ResolvedSessionOwnership {
+		return this.#ownership;
+	}
+
+	get #mode(): SessionOwnershipMode {
+		return this.#ownership === "exempt" ? "off" : this.#ownership.mode;
 	}
 
 	/** The session id the manager's identity helper last bound. */
@@ -80,16 +176,75 @@ export class SessionClaimSet {
 	}
 
 	/**
-	 * The identity helper's record of the manager's id. It never claims and never releases. A change
-	 * of id outside any transition is counted (when ownership is on): nothing settles after it.
+	 * The identity helper's record of the manager's id. It never claims. A change of id outside any
+	 * transition is counted (when ownership is on): nothing settles after it. The first bind settles,
+	 * so a claim a factory took for an id it did not adopt (a fork attempt that fell back) goes.
 	 */
 	bind(sessionId: string): void {
 		const previous = this.#current;
 		this.#current = sessionId;
-		this.#mode = sessionOwnershipMode();
+		if (previous === undefined) this.settle();
 		if (this.#mode === "off" || previous === undefined || previous === sessionId || this.#transitions > 0) return;
 		countSessionOwnershipEvent("bind_outside_transition");
 		logger.debug("Session id changed outside a claim-set transition", { mode: this.#mode });
+	}
+
+	/**
+	 * Claim `sessionId` into this set (design §2.4): a factory's id before its first write, or a
+	 * transition's target before its rotation. Never throws and never refuses (see
+	 * {@link attemptSessionClaim}); a no-op in `off`, for an exempt manager, and for
+	 * an id already held.
+	 */
+	async claim(sessionId: string): Promise<SessionClaimStatus> {
+		if (this.#mode === "off" || this.#closed) return "none";
+		if (this.#claims.has(sessionId)) return "claimed";
+		const inFlight = this.#pending.get(sessionId);
+		if (inFlight) {
+			await inFlight;
+			return this.#outcomes.get(sessionId) ?? "none";
+		}
+		const attempt = attemptSessionClaim(this.#ownership, sessionId);
+		this.#pending.set(sessionId, attempt);
+		let status: SessionClaimStatus = "none";
+		try {
+			const result = await attempt;
+			status = result.status;
+			this.#outcomes.set(sessionId, status);
+			if (result.status === "claimed") this.add(result.claim);
+			return status;
+		} finally {
+			this.#pending.delete(sessionId);
+			const coveredSite = this.#coveredByPending.get(sessionId);
+			this.#coveredByPending.delete(sessionId);
+			if (coveredSite !== undefined && status !== "claimed")
+				this.#reportWithoutClaim(`claim in flight: ${coveredSite}`, sessionId);
+		}
+	}
+
+	/**
+	 * A sync factory's claim (`create`): started now, settled later. A write made while it is in flight
+	 * is covered, because the id is fresh and no other process can hold it.
+	 */
+	claimInBackground(sessionId: string): void {
+		if (!this.claiming) return;
+		void this.claim(sessionId).then(() => {
+			// Landed after a rotation already settled away from it: release it now, not at the next settle.
+			if (this.#current !== sessionId && this.#transitions === 0) this.settle();
+		});
+	}
+
+	/** Record the outcome of a claim taken before this set existed (a strict open's, handed over). */
+	noteOutcome(sessionId: string, status: SessionClaimStatus): void {
+		this.#outcomes.set(sessionId, status);
+	}
+
+	/**
+	 * Wait for the claims in flight, then the outcome for the current id: the gate where enforce will
+	 * refuse a `held` or `failed` session (5a). `undefined` when nothing was attempted.
+	 */
+	async settled(): Promise<SessionClaimStatus | undefined> {
+		await Promise.all(this.#pending.values());
+		return this.#current === undefined ? undefined : this.#outcomes.get(this.#current);
 	}
 
 	/**
@@ -99,20 +254,25 @@ export class SessionClaimSet {
 	 * throws only under the strict test seam. In `off` it returns at once.
 	 *
 	 * A write made before the manager's first bind (a factory publishing a new transcript before it
-	 * adopts it) must name its id: with nothing bound there is no current id, and no mode captured
-	 * by a bind, so the mode is read now.
+	 * adopts it) must name its id: with nothing bound there is no current id.
 	 */
 	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
 		if (sessionId === undefined) return;
-		const mode = this.#current === undefined ? sessionOwnershipMode() : this.#mode;
-		if (mode === "off" || this.#claims.has(sessionId)) return;
+		if (this.#mode === "off" || this.#claims.has(sessionId)) return;
+		if (this.#pending.has(sessionId)) {
+			if (!this.#coveredByPending.has(sessionId)) this.#coveredByPending.set(sessionId, site);
+			return;
+		}
+		this.#reportWithoutClaim(site, sessionId);
+		if (sessionOwnershipTestHookSlot().strictWriteDetection) throw new SessionWriteWithoutClaimError(site);
+	}
+
+	#reportWithoutClaim(site: string, sessionId: string): void {
 		countSessionOwnershipEvent("session_write_without_claim");
 		const report = `${sessionId} ${site}`;
-		if (!this.#reported.has(report)) {
-			this.#reported.add(report);
-			logger.warn("session_write_without_claim", { site, sessionId, mode });
-		}
-		if (sessionOwnershipTestHookSlot().strictWriteDetection) throw new SessionWriteWithoutClaimError(site);
+		if (this.#reported.has(report)) return;
+		this.#reported.add(report);
+		logger.warn("session_write_without_claim", { site, sessionId, mode: this.#mode });
 	}
 
 	/**
@@ -175,17 +335,17 @@ export class SessionClaimSet {
 	 */
 	holdUntil(sessionId: string, finalization: Promise<unknown>, capMs = DEFERRED_RELEASE_CAP_MS): void {
 		if (!this.#claims.has(sessionId) || this.#holds.has(sessionId)) return;
-		const hold: DeferredHold = { sessionId, set: this, timer: undefined };
+		const hold: DeferredHold = { sessionId, timer: undefined };
 		this.#holds.set(sessionId, hold);
 		const end = (timedOut: boolean) => {
-			if (hold.set.#holds.get(sessionId) !== hold) return;
+			if (this.#holds.get(sessionId) !== hold) return;
 			if (hold.timer) clearTimeout(hold.timer);
-			hold.set.#holds.delete(sessionId);
+			this.#holds.delete(sessionId);
 			if (timedOut) countSessionOwnershipEvent("release_after_deferred_timeout");
-			if (hold.set.#closed) hold.set.#releaseOne(sessionId);
+			if (this.#closed) this.#releaseOne(sessionId);
 			// Only the held id: any other non-current claim (a target staged before its rotation)
 			// waits for the transition that commits or abandons it.
-			else if (hold.set.#transitions === 0 && hold.set.#current !== sessionId) hold.set.#releaseOne(sessionId);
+			else if (this.#transitions === 0 && this.#current !== sessionId) this.#releaseOne(sessionId);
 		};
 		hold.timer = setTimeout(() => end(true), capMs);
 		hold.timer.unref();
@@ -196,31 +356,9 @@ export class SessionClaimSet {
 	}
 
 	/**
-	 * Cold-sidecar manager swap: every claim and hold moves to `target`, and this set is emptied
-	 * without unlocking anything. The target then settles: a claim for its current id and any held
-	 * claim survive, everything else is released (a fork's predecessor, once the swap commits).
-	 * Open transitions are not carried across: a caller that swaps inside a transition must call
-	 * this after that transition ends, or open one on the target.
-	 */
-	moveTo(target: SessionClaimSet): void {
-		if (target === this) return;
-		for (const claim of this.#claims.values()) target.add(claim);
-		this.#claims.clear();
-		for (const [sessionId, hold] of this.#holds) {
-			if (target.#holds.has(sessionId)) {
-				if (hold.timer) clearTimeout(hold.timer);
-				continue;
-			}
-			hold.set = target;
-			target.#holds.set(sessionId, hold);
-		}
-		this.#holds.clear();
-		target.settle();
-	}
-
-	/**
 	 * `close()`: release every claim. A claim under a deferred hold is released when its hold ends,
-	 * at most the cap later; nothing can be added afterwards.
+	 * at most the cap later; nothing can be added afterwards, and a claim still in flight is released
+	 * when it lands.
 	 */
 	releaseAll(): void {
 		this.#closed = true;

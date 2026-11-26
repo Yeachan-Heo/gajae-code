@@ -93,6 +93,8 @@ import {
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
+import { setSessionOwnerSurface } from "../session/session-ownership";
+import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
@@ -491,6 +493,11 @@ export async function openLifecycleSessionManager(
 		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
+	// A broker-launched host claims as `sdk-host`, with the mode from the settings it opens under.
+	const ownership = {
+		surface: "sdk-host" as const,
+		mode: sessionOwnershipModeFor(lifecycleSettings.getGlobal("session.ownership.mode")),
+	};
 	let sessionManager: SessionManager | undefined;
 	let result: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
 	let operationError: unknown;
@@ -509,7 +516,7 @@ export async function openLifecycleSessionManager(
 				// Ephemeral sessions keep transcripts in memory only
 				sessionManager = SessionManager.inMemory(cwd);
 			} else {
-				sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+				sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings, ownership.surface);
 			}
 		} else {
 			const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
@@ -520,6 +527,7 @@ export async function openLifecycleSessionManager(
 					undefined,
 					migrationPolicy,
 					lifecycleSettings.get("sessionMemory.mode"),
+					ownership,
 				);
 				if (opened.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host opened it.");
@@ -533,6 +541,7 @@ export async function openLifecycleSessionManager(
 					migrationPolicy,
 					lifecycleSettings.get("sessionMemory.mode"),
 					request.sourceEntryId,
+					ownership,
 				);
 				if (forked.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host forked it.");
@@ -662,6 +671,8 @@ export async function runSessionHost(
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
 	} = {},
 ): Promise<void> {
+	// Factories this host runs without a decision (`createAgentSession`'s lifecycle create) claim as `sdk-host`.
+	setSessionOwnerSurface("sdk-host");
 	const now = timing.now ?? Date.now;
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;

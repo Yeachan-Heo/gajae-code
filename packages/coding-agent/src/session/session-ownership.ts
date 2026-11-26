@@ -5,8 +5,8 @@
  * (the native `FileLock`), so it ends when its holder exits, however it exits. A holder record
  * beside it names the holder for warnings; the lock is the truth and the record only a label.
  *
- * Dormant: no caller outside this module and its tests yet. The claim set, the mode setting and
- * the factory wiring arrive in later steps of the single-owner programme.
+ * The session factories claim through the claim set (`internal/session-claim-set.ts`); nothing
+ * refuses yet, so a held session only logs and counts until enforcement lands.
  */
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -146,6 +146,24 @@ function directoryFailure(error: unknown): SessionOwnershipError {
 	if (typeof errno === "string" && /^E[A-Z0-9]+$/.test(errno))
 		return new SessionOwnershipError("owners_directory_io", { cause: error, errno });
 	return new SessionOwnershipError("owners_directory_unsafe", { cause: error });
+}
+
+// =============================================================================
+// Process surface
+// =============================================================================
+
+let processSurface: SessionOwnerBaseSurface = "sdk";
+
+/**
+ * The surface this process claims sessions as when a factory is not told one (design §1): the CLI
+ * sets it once at startup (`terminal`, `print`, `sdk-host`); an embedding keeps `sdk`.
+ */
+export function setSessionOwnerSurface(surface: SessionOwnerBaseSurface): void {
+	processSurface = surface;
+}
+
+export function sessionOwnerSurface(): SessionOwnerBaseSurface {
+	return processSurface;
 }
 
 // =============================================================================
@@ -374,6 +392,8 @@ export const SESSION_OWNERSHIP_COUNTERS = [
 	"claim_conflict",
 	/** A claim skipped by the narrow fail-open policy (design §2.7). */
 	"fail_open",
+	/** A claim that would refuse the session in enforce (an owners-directory failure), only logged before then. */
+	"claim_failed",
 	/** Locks this process still held when it exited: a missed release. */
 	"held_at_exit",
 	"release_after_deferred_timeout",
