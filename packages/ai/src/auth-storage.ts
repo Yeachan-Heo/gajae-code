@@ -570,6 +570,14 @@ export interface AuthCredentialStore {
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
 	/**
+	 * Optional ownership predicate for OAuth refresh. When present, `AuthStorage`
+	 * checks this before using the `refreshOAuthCredential` hook. If a credential
+	 * is NOT owned by this store (returns false), the local per-provider refresh
+	 * path is used instead. Hybrid stores use this to claim broker rows (true)
+	 * and decline local rows (false); local stores omit this (implicitly false).
+	 */
+	ownsOAuthRefresh?(credentialId: number): boolean;
+	/**
 	 * Optional store-supplied OAuth refresh. When present, `AuthStorage` uses
 	 * it before the per-provider local refresh path. `RemoteAuthCredentialStore`
 	 * implements this against the broker; SQLite stores leave it undefined.
@@ -6777,11 +6785,14 @@ export class AuthStorage {
 			}
 		};
 
-		// Caller override > store-level hook > local per-provider refresh.
+		// Caller override > store-level hook (if owned) > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
 		// routes refresh through the broker without explicit wiring.
+		// Hybrid stores use `ownsOAuthRefresh` to claim broker rows and decline local rows.
 		const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
-		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
+		const storeOwnsRefresh =
+			credentialId !== undefined ? (this.#store.ownsOAuthRefresh?.(credentialId) ?? !!storeRefresh) : false;
+		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? (storeOwnsRefresh ? storeRefresh : undefined);
 		if (overrideRefresh && credentialId !== undefined) {
 			refreshPromise = overrideRefresh(provider, credentialId, credential, signal, expectedRevision);
 		} else {
@@ -7924,7 +7935,11 @@ export class AuthStorage {
 			const stale: OAuthCredential = { ...target.credential, expires: 0 };
 			let refreshed: RefreshedOAuthCredentials;
 			const remoteRefresh = this.#store.refreshMCPOAuthCredential?.bind(this.#store);
-			if (target.credential.mcpBinding && remoteRefresh) {
+			// P4: Gate forced MCP refresh by store ownership, not just method presence.
+			// Hybrid stores use ownsOAuthRefresh to claim broker rows and decline local rows.
+			// A local MCP-bound credential should reach its local token endpoint, not retain expired tokens.
+			const storeOwnsMCPRefresh = remoteRefresh && (this.#store.ownsOAuthRefresh?.(id) ?? !!remoteRefresh);
+			if (target.credential.mcpBinding && storeOwnsMCPRefresh) {
 				// Remote (broker) stores refresh MCP-bound rows server-side; the
 				// server runs the guarded local path against its own row.
 				assertMCPOAuthBindingTransportAdmitted(target.credential.mcpBinding);
@@ -8118,7 +8133,7 @@ type SerializedCredentialRecord = {
 	identityKey: string | null;
 };
 
-const AUTH_SCHEMA_VERSION = 5;
+const AUTH_SCHEMA_VERSION = 6;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
 function normalizeStoredAccountId(accountId: string | null | undefined): string | null {
@@ -8471,6 +8486,20 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_oauth_refresh_leases_expires ON oauth_refresh_leases(expires_at);
+			CREATE TABLE IF NOT EXISTS auth_broker_local_providers (
+				broker_authority TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (broker_authority, provider)
+			);
+			CREATE TABLE IF NOT EXISTS auth_broker_pending_revocations (
+				broker_authority TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				broker_credential_id INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				PRIMARY KEY (broker_authority, provider, broker_credential_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_auth_broker_pending_revocations_authority ON auth_broker_pending_revocations(broker_authority);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {
@@ -8571,6 +8600,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		if (fromVersion < 5) {
 			this.#migrateAuthSchemaV4ToV5();
 		}
+		if (fromVersion < 6) {
+			this.#migrateAuthSchemaV5ToV6();
+		}
 	}
 
 	#migrateAuthSchemaV0ToV1(): void {
@@ -8660,6 +8692,84 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		);
 		if (columns.some(column => column.name === "revision")) return;
 		this.#db.run("ALTER TABLE auth_credentials ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+	}
+
+	#migrateAuthSchemaV5ToV6(): void {
+		try {
+			const migrate = this.#db.transaction(() => {
+				// Check if auth_broker_local_providers exists
+				const tableExists = this.#withStatement(
+					"SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_broker_local_providers'",
+					statement => statement.get() as { [key: string]: number } | undefined,
+				);
+
+				if (!tableExists) {
+					// Table doesn't exist yet, nothing to migrate
+					return;
+				}
+
+				// Check if the table has the new schema (with broker_authority column)
+				const columns = this.#withStatement(
+					"PRAGMA table_info(auth_broker_local_providers)",
+					statement => statement.all() as Array<{ name?: string }>,
+				);
+				const hasBrokerAuthority = columns.some(col => col.name === "broker_authority");
+
+				if (hasBrokerAuthority) {
+					// Schema is already up to date
+					return;
+				}
+
+				// Schema is old (provider PK without broker_authority), need to migrate
+				// Rename old table and create new one with correct schema
+				this.#db.run("ALTER TABLE auth_broker_local_providers RENAME TO auth_broker_local_providers_v5");
+				this.#db.run(`
+				CREATE TABLE auth_broker_local_providers (
+					broker_authority TEXT NOT NULL,
+					provider TEXT NOT NULL,
+					created_at INTEGER NOT NULL,
+					PRIMARY KEY (broker_authority, provider)
+				)
+			`);
+
+				// Migrate old markers with a legacy authority value that hybrid stores can recognize
+				const legacyAuthority = "legacy-default";
+				this.#db.run(`
+				INSERT INTO auth_broker_local_providers (broker_authority, provider, created_at)
+				SELECT '${legacyAuthority}', provider, created_at FROM auth_broker_local_providers_v5
+				ON CONFLICT DO NOTHING
+			`);
+
+				// Drop the old table now that migration is complete
+				this.#db.run("DROP TABLE auth_broker_local_providers_v5");
+
+				// Also check if auth_broker_pending_revocations needs migration
+				const pendingRevTableExists = this.#withStatement(
+					"SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_broker_pending_revocations'",
+					statement => statement.get() as { [key: string]: number } | undefined,
+				);
+
+				if (!pendingRevTableExists) {
+					// Create the new pending revocations table with correct schema
+					this.#db.run(`
+					CREATE TABLE auth_broker_pending_revocations (
+						broker_authority TEXT NOT NULL,
+						provider TEXT NOT NULL,
+						broker_credential_id INTEGER NOT NULL,
+						created_at INTEGER NOT NULL,
+						PRIMARY KEY (broker_authority, provider, broker_credential_id)
+					)
+				`);
+					this.#db.run(
+						"CREATE INDEX IF NOT EXISTS idx_auth_broker_pending_revocations_authority ON auth_broker_pending_revocations(broker_authority)",
+					);
+				}
+			});
+			migrate.immediate();
+		} catch (error) {
+			logger.error("Failed to migrate auth schema v5 to v6", { error: String(error) });
+			throw error;
+		}
 	}
 
 	#backfillCredentialIdentityKeys(): void {
@@ -9173,6 +9283,113 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		} catch {
 			// Ignore cache set failures
 		}
+	}
+
+	/**
+	 * List providers that the broker stores but does not serve (and thus are kept
+	 * locally in agent.db) for a specific broker authority.
+	 * Maintained by {@link markBrokerLocalProvider} and {@link unmarkBrokerLocalProvider}.
+	 */
+	listBrokerLocalProviders(brokerAuthority?: string): string[] {
+		if (!brokerAuthority) return [];
+		// Try new schema first (with broker_authority column)
+		try {
+			const rows = this.#db
+				.query<{ provider: string }, [string]>(
+					"SELECT provider FROM auth_broker_local_providers WHERE broker_authority = ?",
+				)
+				.all(brokerAuthority);
+			return rows.map(row => row.provider);
+		} catch (error) {
+			// If the query fails (old schema), try to query the old schema (provider PK only)
+			if (error instanceof Error && error.message.includes("no such column: broker_authority")) {
+				try {
+					// Fall back to querying old schema for the given authority
+					// This is a temporary compatibility path for pre-migration databases
+					if (brokerAuthority === "legacy-default" || brokerAuthority === "") {
+						const rows = this.#db
+							.query<{ provider: string }, []>("SELECT provider FROM auth_broker_local_providers")
+							.all();
+						return rows.map(row => row.provider);
+					}
+				} catch {
+					// If both queries fail, return empty list
+					return [];
+				}
+			}
+			throw error;
+		}
+	}
+
+	/** Record `provider` in {@link listBrokerLocalProviders} for a specific broker authority; a no-op when already listed. */
+	markBrokerLocalProvider(brokerAuthority: string, provider: string): void {
+		const now = Math.floor(Date.now() / 1000);
+		this.#db
+			.query(
+				"INSERT OR IGNORE INTO auth_broker_local_providers (broker_authority, provider, created_at) VALUES (?, ?, ?)",
+			)
+			.run(brokerAuthority, provider, now);
+	}
+
+	/** Drop `provider` from {@link listBrokerLocalProviders} for a specific broker authority, so its next login tries the broker again. */
+	unmarkBrokerLocalProvider(brokerAuthority: string, provider: string): void {
+		this.#db
+			.query("DELETE FROM auth_broker_local_providers WHERE broker_authority = ? AND provider = ?")
+			.run(brokerAuthority, provider);
+	}
+
+	/** Drop `provider` marker only if it has no remaining credentials, atomically in one transaction. Returns false if marker was deleted, true if rows remain. */
+	unmarkBrokerLocalProviderIfEmpty(brokerAuthority: string, provider: string): boolean {
+		// P2-5: Check and delete in one atomic transaction to prevent race condition where
+		// a concurrent upsert could commit after the check but before the delete, leaving
+		// an orphaned marker without any credentials.
+		const performDelete = this.#db.transaction(() => {
+			const stillHasRows =
+				this.#db
+					.query<{ count: number }, [string]>(
+						"SELECT COUNT(*) as count FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL",
+					)
+					.get(provider)?.count ?? 0;
+			if (stillHasRows > 0) return false;
+			this.#db
+				.query("DELETE FROM auth_broker_local_providers WHERE broker_authority = ? AND provider = ?")
+				.run(brokerAuthority, provider);
+			return true;
+		});
+		const markerWasDeleted = performDelete.immediate();
+		return !markerWasDeleted; // Return true if rows remain, false if marker was deleted
+	}
+
+	/** Record a pending revocation for a broker credential that failed to disable. */
+	writePendingRevocation(brokerAuthority: string, provider: string, brokerCredentialId: number): void {
+		const now = Math.floor(Date.now() / 1000);
+		this.#db
+			.query(
+				"INSERT OR IGNORE INTO auth_broker_pending_revocations (broker_authority, provider, broker_credential_id, created_at) VALUES (?, ?, ?, ?)",
+			)
+			.run(brokerAuthority, provider, brokerCredentialId, now);
+	}
+
+	/** Remove a pending revocation after successful disable. */
+	deletePendingRevocation(brokerAuthority: string, provider: string, brokerCredentialId: number): void {
+		this.#db
+			.query(
+				"DELETE FROM auth_broker_pending_revocations WHERE broker_authority = ? AND provider = ? AND broker_credential_id = ?",
+			)
+			.run(brokerAuthority, provider, brokerCredentialId);
+	}
+
+	/** List all pending revocations for a broker authority. */
+	listPendingRevocations(brokerAuthority: string): Array<{ provider: string; brokerCredentialId: number }> {
+		const rows = this.#db
+			.query<{ provider: string; broker_credential_id: number }, [string]>(
+				"SELECT provider, broker_credential_id FROM auth_broker_pending_revocations WHERE broker_authority = ?",
+			)
+			.all(brokerAuthority);
+		return rows.map(row => ({
+			provider: row.provider,
+			brokerCredentialId: row.broker_credential_id,
+		}));
 	}
 
 	tryAcquireUsageFetchLease(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined {
