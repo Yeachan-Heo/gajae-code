@@ -177,7 +177,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		let completionAcknowledged = false;
 		// The newest line already sent, so an exit notification can take over a
 		// line notification that is still queued instead of waking a second time.
-		let lastSent: { line: string; count: number } | undefined;
+		let lastSent: { line: string; count: number; notificationId: string } | undefined;
 		// Line sends whose sendCustomMessage has not settled yet (waiting for queue
 		// admission, or running the idle turn they started).
 		let unsettledSends = 0;
@@ -263,16 +263,24 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			// (the returned totals omit the deferred SDK follow-up store); each stands
 			// for its own line plus the lines it already coalesced.
 			let takenLines = 0;
+			let lastSentTaken = false;
 			const takeQueuedLines = () =>
 				this.session.purgeQueuedCustomMessages?.(message => {
 					if (!isMonitorMessage(message)) return false;
-					takenLines += 1 + ((message.details as { coalescedCount?: number } | undefined)?.coalescedCount ?? 0);
+					const details = message.details as { coalescedCount?: number; notificationId?: string } | undefined;
+					takenLines += 1 + (details?.coalescedCount ?? 0);
+					if (details?.notificationId === lastSent?.notificationId) lastSentTaken = true;
 					return true;
 				});
-			// A line rejected after the ack decided (between run() returning and
-			// onTerminal) never reached the agent: the exit carries it as a wake.
-			if (line === undefined && lineDeliveryFailed && lastSent) ({ line, count } = lastSent);
-			else if (line !== undefined) {
+			if (line === undefined && lineDeliveryFailed && lastSent) {
+				// A line rejected after the ack decided (between run() returning and
+				// onTerminal) never reached the agent: the exit carries the newest sent
+				// line as a wake and takes over the older lines still queued, counting
+				// them (the newest line itself when it was among them).
+				takeQueuedLines();
+				line = lastSent.line;
+				count = lastSentTaken ? takenLines - 1 : lastSent.count + takenLines;
+			} else if (line !== undefined) {
 				// The newest line is still pending: older queued lines are counted in it.
 				takeQueuedLines();
 				count += takenLines;
@@ -280,7 +288,10 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				// The newest sent line is still queued: the exit replaces it and counts
 				// the older lines removed with it.
 				takeQueuedLines();
-				if (takenLines > 0) ({ line, count } = { line: lastSent.line, count: takenLines - 1 });
+				if (takenLines > 0) {
+					line = lastSent.line;
+					count = lastSentTaken ? takenLines - 1 : lastSent.count + takenLines;
+				}
 			}
 			sequence += 1;
 			sendNotification(line, currentJobId, count, line === undefined ? "silent" : "wake");
@@ -308,8 +319,8 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		) => {
 			const exited = exit !== undefined;
 			if (controller.closed && !afterClose) return;
-			if (line !== undefined) lastSent = { line, count };
 			const notificationId = `${jobId}:${sequence}`;
+			if (line !== undefined) lastSent = { line, count, notificationId };
 			const suffix = count > 0 ? `\n(+${count} earlier lines)` : "";
 			const notificationLine = line === undefined ? undefined : formatMonitorNotificationLine(line);
 			// The description is model-supplied and may echo attacker-influenced text. It stays out of the reminder
@@ -471,7 +482,13 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 						setTimeout(() => attempt(Math.min(delayMs * 2, EXIT_DELIVERY_RETRY_MAX_DELAY_MS)), delayMs).unref();
 						return;
 					}
+					// Not retried: the session may already hold the message (an idle append adds it to the live
+					// context before the transcript write, a waking send has already run its turn, and a shared
+					// append can end with an unknown outcome), so a resend could report the exit twice. The
+					// suppressed async-result would not cover this either: its idle injection goes through the
+					// same transcript, and the yield queue drains it before injecting, without a retry.
 					logger.warn("Monitor exit notification delivery failed", {
+						taskId: currentJobId,
 						error: error instanceof Error ? error.message : String(error),
 					});
 				});

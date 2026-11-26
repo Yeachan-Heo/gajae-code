@@ -924,6 +924,57 @@ describe("MonitorTool", () => {
 			expect(completions).toEqual([]);
 		}, 15_000);
 
+		it("takes over older queued lines when a line send is rejected between the ack and the exit report", async () => {
+			const secondSend = Promise.withResolvers<void>();
+			const held: Steered[] = [];
+			let lineSends = 0;
+			let secondInFlight = false;
+			const session = createSession(settings);
+			// Streaming-path shape: FIRST lands in the queue; SECOND stays in flight until the completion ack.
+			session.sendCustomMessage = ((msg: Steered, options?: unknown) => {
+				const waking = (options as { triggerTurn?: boolean } | undefined)?.triggerTurn === true;
+				if (waking && !msg.content.includes(EXIT_MARKER) && lineSends++ === 1) {
+					secondInFlight = true;
+					return secondSend.promise;
+				}
+				held.push({ ...msg, options });
+				return Promise.resolve();
+			}) as typeof session.sendCustomMessage;
+			session.purgeQueuedCustomMessages = (predicate => {
+				held.splice(0, held.length, ...held.filter(message => !predicate(message as never)));
+				return {
+					agentSteering: 0,
+					agentFollowUp: 0,
+					pendingNextTurn: 0,
+					displaySteering: 0,
+					displayFollowUp: 0,
+					totalExecutable: 0,
+				};
+			}) as typeof session.purgeQueuedCustomMessages;
+			// The ack reads the client bridge; the in-flight SECOND is rejected right after it, before onTerminal.
+			session.getClientBridge = (() => {
+				if (secondInFlight) secondSend.reject(new Error("handoff transition in progress"));
+				return undefined;
+			}) as typeof session.getClientBridge;
+			const tool = MonitorTool.createIf(session)!;
+			await tool.execute("call", {
+				command: "printf 'FIRST\\n'; sleep 0.6; printf 'SECOND\\n'; sleep 0.8",
+				kind: "log",
+				description: "late rejection with a queued line",
+				persistent: true,
+			});
+			await waitUntil(() => secondInFlight);
+			await settle();
+
+			// One waking notification: the rejected line with the exit, the queued FIRST taken over and counted.
+			expect(held).toHaveLength(1);
+			expect(held[0]!.options).toEqual(WAKE);
+			expect(held[0]!.content).toContain("SECOND");
+			expect(held[0]!.content).toContain(EXIT_MARKER);
+			expect(held[0]!.content).toContain("(+1 earlier lines)");
+			expect(completions).toEqual([]);
+		}, 15_000);
+
 		it("stops a busy retry of a silent exit once a late line rejection re-reports the exit as a wake", async () => {
 			const release = Promise.withResolvers<void>();
 			const state = { busy: false, refusals: 0 };
