@@ -1063,6 +1063,7 @@ export class InputController {
 			if (!text) return;
 			if (!text.startsWith("/")) {
 				if (this.#rejectUnattachedImageReferences(text, this.ctx.pendingImages, composer)) return;
+				if (this.#rejectImagesForBtw(text, this.ctx.pendingImages, composer)) return;
 				const result = await this.ctx.handleBtwFollowUp(text);
 				if (result === "accepted" && this.#canModifyComposer(composer)) {
 					this.ctx.editor.setText("");
@@ -1106,42 +1107,27 @@ export class InputController {
 			return;
 		}
 
-		const runner = this.ctx.session.extensionRunner;
 		const pendingImages = this.ctx.pendingImages;
-		const submittedText = text;
-		let inputImages = this.#visiblePendingImagesForText(text);
-		// What `[image N]` resolves to after input extensions ran. `pendingImages` stays the
-		// original snapshot: it only decides whether this submission still owns the composer.
-		let effectiveImages = pendingImages;
-
-		if (runner?.hasHandlers("input")) {
-			const result = await runner.emitInput(text, inputImages, "interactive");
-			if (result?.handled) {
-				const handledText = result.text === undefined ? "" : sanitizeText(result.text).trim();
-				if (handledText) {
-					this.ctx.addMessageToChat({
-						role: "custom",
-						customType: "extension-input-result",
-						content: handledText,
-						display: true,
-						timestamp: Date.now(),
-					});
-					this.ctx.ui.requestRender();
-				}
-				if (this.#canModifyComposer(composer)) {
-					this.ctx.editor.setText("");
-				}
-				this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
-				return;
+		const extensionResult = await this.#applyInputExtensions(text, pendingImages);
+		if (extensionResult.handled) {
+			if (extensionResult.handledText) {
+				this.ctx.addMessageToChat({
+					role: "custom",
+					customType: "extension-input-result",
+					content: extensionResult.handledText,
+					display: true,
+					timestamp: Date.now(),
+				});
+				this.ctx.ui.requestRender();
 			}
-			if (result?.text !== undefined) {
-				text = result.text.trim();
+			if (this.#canModifyComposer(composer)) {
+				this.ctx.editor.setText("");
 			}
-			if (result?.images !== undefined) {
-				inputImages = result.images;
-				effectiveImages = this.#alignReplacedImages(submittedText, pendingImages, result.images);
-			}
+			this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
+			return;
 		}
+		text = extensionResult.text;
+		const { inputImages, effectiveImages } = extensionResult;
 
 		if (!text) return;
 
@@ -1834,15 +1820,16 @@ export class InputController {
 
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
-		const text = this.ctx.editor.getText().trim();
-		if (!text) return;
+		const draft = this.ctx.editor.getText().trim();
+		if (!draft) return;
 		// The draft stays in the editor here, so rejecting needs no restore. It must come
 		// before the /btw and compaction routes, which queue text without its images.
-		if (this.#rejectUnattachedImageReferences(text)) return;
+		if (this.#rejectUnattachedImageReferences(draft)) return;
 		// While /btw is open, plain text stays in the side chat. Slash-origin
 		// input keeps normal dispatch so commands remain available.
-		if (this.ctx.hasActiveBtw() && !text.startsWith("/")) {
-			if ((await this.ctx.handleBtwFollowUp(text)) === "accepted") {
+		if (this.ctx.hasActiveBtw() && !draft.startsWith("/")) {
+			if (this.#rejectImagesForBtw(draft, this.ctx.pendingImages)) return;
+			if ((await this.ctx.handleBtwFollowUp(draft)) === "accepted") {
 				this.ctx.editor.setText("");
 			}
 			return;
@@ -1857,13 +1844,34 @@ export class InputController {
 				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
 				return;
 			}
-			this.ctx.queueCompactionMessage(text, "followUp");
-			this.#titleQueuedCompactionText(text);
+			this.ctx.queueCompactionMessage(draft, "followUp");
+			this.#titleQueuedCompactionText(draft);
 			return;
 		}
 
-		const visibleImages = this.#visiblePendingImagesForText(text);
-		const images = visibleImages ? [...visibleImages] : undefined;
+		// Same input-extension pass Enter runs, so Alt+Enter cannot send an image an extension
+		// would have replaced or refused.
+		const pendingImages = this.ctx.pendingImages;
+		const extensionResult = await this.#applyInputExtensions(draft, pendingImages);
+		if (extensionResult.handled) {
+			if (extensionResult.handledText) {
+				this.ctx.addMessageToChat({
+					role: "custom",
+					customType: "extension-input-result",
+					content: extensionResult.handledText,
+					display: true,
+					timestamp: Date.now(),
+				});
+				this.ctx.ui.requestRender();
+			}
+			this.ctx.editor.setText("");
+			if (this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
+			return;
+		}
+		const text = extensionResult.text;
+		if (!text) return;
+		if (this.#rejectUnattachedImageReferences(text, extensionResult.effectiveImages)) return;
+		const images = extensionResult.inputImages ? [...extensionResult.inputImages] : undefined;
 
 		// Foreground bash/eval owns the process fence. Queue all prompt text,
 		// including slash skill input, until the process settles instead of
@@ -1888,7 +1896,7 @@ export class InputController {
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// explicit queue shortcuts route them as `followUp`.
-		if (await this.#invokeSkillCommand(text, "followUp")) {
+		if (await this.#invokeSkillCommand(text, "followUp", undefined, pendingImages, extensionResult.effectiveImages)) {
 			return;
 		}
 
@@ -2225,6 +2233,43 @@ export class InputController {
 		}
 	}
 
+	/**
+	 * Runs input extensions over a submission and resolves what `[image N]` points at afterwards.
+	 * Shared by Enter and the queued follow-up shortcut so both honor the same transformations.
+	 * Returns undefined when an extension handled the input; the caller must stop.
+	 */
+	async #applyInputExtensions(
+		text: string,
+		pendingImages: InteractiveModeContext["pendingImages"],
+	): Promise<
+		| { handled: true; handledText: string }
+		| {
+				handled: false;
+				text: string;
+				inputImages: InteractiveModeContext["pendingImages"] | undefined;
+				effectiveImages: InteractiveModeContext["pendingImages"];
+		  }
+	> {
+		const runner = this.ctx.session.extensionRunner;
+		let inputImages = this.#visiblePendingImagesForText(text, pendingImages);
+		// Only the images the submitted text selected qualify, so an extension that rewrites the
+		// text cannot pull in another pending attachment.
+		let effectiveImages = this.#selectedImagesByNumber(text, pendingImages);
+		let resultText = text;
+		if (runner?.hasHandlers("input")) {
+			const result = await runner.emitInput(text, inputImages, "interactive");
+			if (result?.handled) {
+				return { handled: true, handledText: result.text === undefined ? "" : sanitizeText(result.text).trim() };
+			}
+			if (result?.text !== undefined) resultText = result.text.trim();
+			if (result?.images !== undefined) {
+				inputImages = result.images;
+				effectiveImages = this.#alignReplacedImages(text, pendingImages, result.images);
+			}
+		}
+		return { handled: false, text: resultText, inputImages, effectiveImages };
+	}
+
 	#nextImagePlaceholder(): string {
 		return `[image ${this.ctx.pendingImages.length}]`;
 	}
@@ -2252,6 +2297,23 @@ export class InputController {
 	}
 
 	/**
+	 * The side chat takes text only. A draft that names an attached image would reach it as a
+	 * bare placeholder, so keep the draft and say why instead of reporting it as sent.
+	 */
+	#rejectImagesForBtw(
+		text: string,
+		pendingImages: InteractiveModeContext["pendingImages"],
+		composer?: ComposerSubmissionOptions,
+	): boolean {
+		if (this.#visiblePendingImagesForText(text, pendingImages) === undefined) return false;
+		if (composer && this.#canModifyComposer(composer) && this.ctx.editor.getText().trim().length === 0) {
+			this.ctx.editor.setText(text);
+		}
+		this.ctx.showWarning("The /btw side chat takes text only. Close it or remove the [image N] reference.");
+		return true;
+	}
+
+	/**
 	 * An input extension returns replacement images as a flat list, in the order the
 	 * submitted text references them. Re-key that list by placeholder number so each
 	 * `[image N]` resolves to its replacement. Images the text never referenced are not
@@ -2272,6 +2334,19 @@ export class InputController {
 			if (replacement) aligned[index] = replacement;
 		}
 		return aligned;
+	}
+
+	/** The attached images `text` names, kept at their `[image N]` slot so later lookups by number still work. */
+	#selectedImagesByNumber(
+		text: string,
+		pendingImages: InteractiveModeContext["pendingImages"],
+	): InteractiveModeContext["pendingImages"] {
+		const selected: InteractiveModeContext["pendingImages"] = [];
+		for (const number of imageReferenceNumbers(text)) {
+			const image = pendingImages[number - 1];
+			if (image) selected[number - 1] = image;
+		}
+		return selected;
 	}
 
 	#visiblePendingImagesForText(

@@ -391,7 +391,16 @@ function findSourceValueSpans(line: string): Array<{ start: number; end: number 
  * images its text already names.
  */
 export function imageReferenceNumbers(text: string): number[] {
-	return Array.from(text.matchAll(/\[image ([1-9]\d*)\]/g), match => Number.parseInt(match[1] ?? "", 10));
+	const numbers: number[] = [];
+	for (const line of text.split("\n")) {
+		const sourceValueSpans = findSourceValueSpans(line);
+		for (const match of line.matchAll(/\[image ([1-9]\d*)\]/g)) {
+			// A placeholder-looking token inside a validated `source="…"` path is part of the path.
+			if (sourceValueSpans.some(span => match.index >= span.start && match.index < span.end)) continue;
+			numbers.push(Number.parseInt(match[1] ?? "", 10));
+		}
+	}
+	return numbers;
 }
 
 export function locatePastedImageReferenceAroundCursor(

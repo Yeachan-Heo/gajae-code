@@ -278,4 +278,73 @@ describe("InputController skill command images", () => {
 		const result = await runner.emitInput("look at [image 1]", [IMAGE], "interactive");
 		expect(result.images).toEqual([redacted]);
 	});
+
+	it("does not let a text-only extension rewrite pull in an unselected pending image", async () => {
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ text: "/skill:test-skill use [image 2]" })),
+		};
+		const stub = createContext({
+			skillCommands,
+			pendingImages: [IMAGE, OTHER_IMAGE],
+			extensionRunner,
+		});
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.("/skill:test-skill use [image 1]");
+
+		expect(stub.customMessages.flatMap(message => imageBlocks(message.content))).not.toContainEqual(OTHER_IMAGE);
+	});
+
+	it("does not read a placeholder inside a source path as an image reference", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE] });
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => 'describe [image 1] source="/tmp/[image 2].png"';
+		await controller.handleFollowUp();
+
+		expect(stub.showWarning).not.toHaveBeenCalled();
+		expect(stub.prompts[0]?.options?.images).toEqual([IMAGE]);
+	});
+
+	it("runs input extensions on the queued follow-up shortcut and sends the replacement", async () => {
+		const redacted = { ...IMAGE, data: "REDACTED" };
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ images: [redacted] })),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], streaming: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => "look at [image 1]";
+		await controller.handleFollowUp();
+
+		expect(extensionRunner.emitInput).toHaveBeenCalledTimes(1);
+		expect(stub.prompts[0]?.options?.images).toEqual([redacted]);
+	});
+
+	it("sends the replacement image with a skill command on the follow-up shortcut", async () => {
+		const redacted = { ...IMAGE, data: "REDACTED" };
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ images: [redacted] })),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], streaming: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => "/skill:test-skill look at [image 1]";
+		await controller.handleFollowUp();
+
+		expect(imageBlocks(stub.customMessages[0]?.content)).toEqual([redacted]);
+	});
+
+	it("rejects an attached image for an active /btw instead of sending only its placeholder", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], activeBtw: true });
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => "look at [image 1]";
+		await controller.handleFollowUp();
+
+		expect(stub.ctx.handleBtwFollowUp).not.toHaveBeenCalled();
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+	});
 });
