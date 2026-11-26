@@ -137,6 +137,19 @@ function completeControlledStream(call: ControlledStreamCall, text: string): voi
 }
 const sessions: AgentSession[] = [];
 
+/** Resolves once streamed bash output contains `marker`; the sink may split it across chunks. */
+function waitForBashOutput(marker: string): { onChunk: (chunk: string) => void; seen: Promise<void> } {
+	const seen = Promise.withResolvers<void>();
+	let output = "";
+	return {
+		onChunk: chunk => {
+			output += chunk;
+			if (output.includes(marker)) seen.resolve();
+		},
+		seen: seen.promise,
+	};
+}
+
 it("idle close refuses a btw credential preflight", async () => {
 	const key = Promise.withResolvers<string>();
 	const { session } = createHarness({ getApiKey: () => key.promise });
@@ -170,11 +183,9 @@ it("idle close refuses a running btw provider", async () => {
 
 it("idle close refuses a real foreground bash command", async () => {
 	const { session } = createHarness();
-	const entered = Promise.withResolvers<void>();
-	const pending = session.executeBash("printf started; sleep 30", chunk => {
-		if (chunk.includes("started")) entered.resolve();
-	});
-	await Promise.race([entered.promise, pending]);
+	const entered = waitForBashOutput("started");
+	const pending = session.executeBash("printf started; sleep 30", entered.onChunk);
+	await Promise.race([entered.seen, pending]);
 	try {
 		expect(session.isBashRunning).toBe(true);
 		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
@@ -210,11 +221,9 @@ it("idle close sees foreground bash output split across chunks", async () => {
 	].join(" ");
 	setShellFactoryForTests(options => new IsolatedShell(options, { workerArgv: [process.execPath, "-e", worker] }));
 	const { session } = createHarness();
-	const entered = Promise.withResolvers<void>();
-	const pending = session.executeBash("printf started; sleep 30", chunk => {
-		if (chunk.includes("started")) entered.resolve();
-	});
-	await Promise.race([entered.promise, pending]);
+	const entered = waitForBashOutput("started");
+	const pending = session.executeBash("printf started; sleep 30", entered.onChunk);
+	await Promise.race([entered.seen, pending]);
 	try {
 		expect(session.isBashRunning).toBe(true);
 		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
