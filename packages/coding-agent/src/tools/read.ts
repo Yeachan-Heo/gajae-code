@@ -2124,7 +2124,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const output = results.length > 0 ? results.join("\n") : "(empty archive directory)";
 		const window = selectReadWindow(output, results, direction, Number.MAX_SAFE_INTEGER, DEFAULT_MAX_BYTES);
-		const rendered = prependSuffixResolutionNotice(renderReadWindow(window, false, false), details.suffixResolution);
+		const rendered = prependSuffixResolutionNotice(renderReadWindow(window, false), details.suffixResolution);
 		const directoryDetails: ReadToolDetails = {
 			...details,
 			isDirectory: true,
@@ -2277,7 +2277,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						DEFAULT_MAX_BYTES,
 					);
 					const rendered = prependSuffixResolutionNotice(
-						renderReadWindow(window, false, false),
+						renderReadWindow(window, false),
 						resolvedSqlitePath.suffixResolution,
 					);
 					details.truncation = window.kind !== "full" ? makeWindowResult(window, body) : undefined;
@@ -3125,7 +3125,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							baseWindowResult && partialTailWarning
 								? { ...baseWindowResult, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
 								: baseWindowResult;
-						const rawWindow = renderReadWindow(window, false, false, directionalMaxColumns);
+						const rawWindow = renderReadWindow(window, false, directionalMaxColumns);
 						let outputText = partialTailWarning
 							? formatOversizedLineWarning(
 									localReadPath,
@@ -3584,7 +3584,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const shownSegments = windowSegments(window);
 		const shownBytes =
 			shownSegments.reduce((sum, segment) => sum + segment.bytes, 0) + Math.max(0, shownSegments.length - 1);
-		let output = renderReadWindow(window, false, false);
+		let output = renderReadWindow(window, false);
 		if (window.kind !== "full" || tree.truncated) {
 			output += `\n\n${formatListingTruncationNotice(shownLines, shownBytes, absolutePath, direction)}`;
 		}
