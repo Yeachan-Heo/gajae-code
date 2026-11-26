@@ -319,6 +319,80 @@ describe("bare resume startup gating", () => {
 		expect(listedAgentDir).toBeUndefined();
 		expect(openedDestination).toEqual({ kind: "explicit", directory: "/explicit" });
 	});
+
+	describe("metadata-only sessions (#8028)", () => {
+		function writeTranscript(dir: string, name: string, records: readonly object[]): SessionInfo {
+			const file = path.join(dir, `${name}.jsonl`);
+			fs.writeFileSync(file, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+			return {
+				path: file,
+				id: name,
+				cwd: "/worktree",
+				starred: false,
+				created: new Date(0),
+				modified: new Date(0),
+				messageCount: records.filter(record => (record as { type?: string }).type === "message").length,
+				size: fs.statSync(file).size,
+				firstMessage: "(no messages)",
+				allMessagesText: "",
+			};
+		}
+
+		function startupOnly(dir: string, name: string): SessionInfo {
+			return writeTranscript(dir, name, [
+				{ type: "session", id: name, version: 5, cwd: "/worktree", timestamp: "2026-11-24T00:00:00.000Z" },
+				{ type: "model_change", id: "e1", parentId: null, model: "test/model", role: "default" },
+				{ type: "thinking_level_change", id: "e2", parentId: "e1", thinkingLevel: "low" },
+			]);
+		}
+
+		it("leaves startup-only sessions out of the bare --resume picker", async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-metadata-only-"));
+			try {
+				const hidden = startupOnly(dir, "startup-only");
+				const conversation = writeTranscript(dir, "conversation", [
+					{ type: "session", id: "conversation", version: 5, cwd: "/worktree" },
+					{ type: "message", id: "m1", parentId: null, message: { role: "user", content: "hi", timestamp: 1 } },
+				]);
+				let offered: SessionInfo[] | undefined;
+				await runRootCommand(bareArgs({ sessionDir: dir }), [], {
+					suppressProcessExit: true,
+					isResumePickerTerminal: () => true,
+					listForResumePickerReadOnly: async () => [hidden, conversation],
+					selectResumeSession: async sessions => {
+						offered = sessions;
+						return { kind: "cancelled" };
+					},
+				});
+				expect(offered).toEqual([conversation]);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("reports no sessions when every listed session is startup-only", async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-metadata-only-"));
+			const stdoutWrite = spyOn(process.stdout, "write").mockImplementation(() => true);
+			try {
+				let pickerCalls = 0;
+				await runRootCommand(bareArgs(), [], {
+					suppressProcessExit: true,
+					isResumePickerTerminal: () => true,
+					resolveManagedAgentDirForScope: () => dir,
+					listManagedForResumePickerReadOnly: async () => [startupOnly(dir, "startup-only")],
+					selectResumeSession: async () => {
+						pickerCalls++;
+						return { kind: "cancelled" };
+					},
+				});
+				expect(pickerCalls).toBe(0);
+				expect(stdoutWrite.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain("No sessions found");
+			} finally {
+				stdoutWrite.mockRestore();
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	});
 });
 
 describe("explicit resume destination authority", () => {

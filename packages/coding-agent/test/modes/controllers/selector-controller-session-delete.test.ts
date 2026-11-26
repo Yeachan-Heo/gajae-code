@@ -1,4 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { SessionSelectorComponent } from "@gajae-code/coding-agent/modes/components/session-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -395,6 +398,44 @@ describe("SelectorController session deletion", () => {
 		await controller.showSessionSelector();
 
 		expect(listForResumePickerReadOnly).toHaveBeenCalledWith();
+	});
+
+	it("leaves startup-only sessions out of the /resume selector (#8028)", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-selector-metadata-only-"));
+		try {
+			const startupFile = path.join(dir, "startup-only.jsonl");
+			await Bun.write(
+				startupFile,
+				`${[
+					{ type: "session", id: "startup-only", version: 5, cwd: "/tmp/project" },
+					{ type: "model_change", id: "e1", parentId: null, model: "test/model", role: "default" },
+				]
+					.map(record => JSON.stringify(record))
+					.join("\n")}\n`,
+			);
+			const startupOnly: SessionInfo = {
+				...makeSessionInfo(startupFile),
+				title: undefined,
+				messageCount: 0,
+				size: (await fs.stat(startupFile)).size,
+				firstMessage: "(no messages)",
+			};
+			const conversation = makeSessionInfo("/tmp/project/sessions/conversation.jsonl");
+			const { ctx, listForResumePickerReadOnly } = createContext(conversation.path);
+			listForResumePickerReadOnly.mockResolvedValue([startupOnly, conversation]);
+			const controller = new SelectorController(ctx);
+
+			await controller.showSessionSelector();
+			const selector = ctx.editorContainer.children[0];
+			if (!(selector instanceof SessionSelectorComponent)) {
+				throw new Error("Expected session selector component");
+			}
+
+			const sessionList = selector.getSessionList() as unknown as { allSessions: SessionInfo[] };
+			expect(sessionList.allSessions.map(session => session.path)).toEqual([conversation.path]);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("detaches the active session before selector deletion removes it", async () => {

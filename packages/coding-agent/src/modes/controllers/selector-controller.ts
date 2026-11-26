@@ -82,6 +82,7 @@ import {
 	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { excludeMetadataOnlySessions } from "../../session/resume-picker-filter";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -2401,7 +2402,8 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
+		// Picker-only visibility rule (#8028): the manager's inventory stays complete.
+		const sessions = await excludeMetadataOnlySessions(await this.ctx.sessionManager.listForResumePickerReadOnly());
 		if (this.ctx.isStopped?.()) return;
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
