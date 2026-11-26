@@ -53,7 +53,6 @@ export interface EditToolPerFileResult {
 	move?: string;
 	isError?: boolean;
 	errorText?: string;
-
 	meta?: OutputMeta;
 	/** Source-of-truth content before the edit; `undefined` for create operations. */
 	oldText?: string;

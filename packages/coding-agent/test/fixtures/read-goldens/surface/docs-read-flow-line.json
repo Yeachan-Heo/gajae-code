@@ -1,0 +1,6 @@
+{
+  "text": "1. `ReadTool.execute()` accepts `{ path, truncation? }`. `file://...` inputs are expanded first with `expandPath()`.\n   - `gjc read <path> --truncation head|last|both` passes the explicit direction through to the same tool payload.\n2. It tries URL handling first via `parseReadUrlTarget()` from `packages/coding-agent/src/tools/fetch.ts`.",
+  "displayContent": null,
+  "truncation": null,
+  "meta": null
+}

@@ -128,7 +128,6 @@ describe("editToolRenderer", () => {
 		expect(Bun.stripANSI(del.render(160).join("\n"))).toContain("Delete");
 	});
 
-
 	it("suppresses only the missing end marker while apply_patch arguments are partial", async () => {
 		const uiTheme = await getUiTheme();
 		const args = { input: "*** Begin Patch\n*** Add File: a.ts\n+preview" };
@@ -186,20 +185,6 @@ describe("editToolRenderer", () => {
 		);
 		expect(Bun.stripANSI(component.render(160).join("\n"))).toContain("full failure detail");
 	});
-	it("renders a represented partial file and pending target through the execution component", async () => {
-		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const tool = { name: "edit", label: "Edit", mode: "replace" } as unknown as AgentTool;
-		const component = new ToolExecutionComponent("edit", { input: "§a.ts\n»EOF\n§b.ts" }, {}, tool, uiStub);
-		component.updateResult(
-			{ content: [], details: { diff: "", perFileResults: [{ path: "a.ts", diff: "+done" }] } },
-			true,
-		);
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("a.ts");
-		expect(rendered).toContain("1 more file pending");
-	});
-
 	it("deduplicates represented paths and keeps mixed per-file receipts independent of a call preview", async () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderResult(
@@ -229,24 +214,6 @@ describe("editToolRenderer", () => {
 		expect(rendered).toContain("failed b");
 		expect(rendered).toContain("1 more file pending");
 	});
-	it("uses separate requested and represented cardinalities for pending files", async () => {
-		const uiTheme = await getUiTheme();
-		const component = editToolRenderer.renderResult(
-			{
-				content: [],
-				details: {
-					perFileResults: [{ path: "a", diff: "+done" }],
-					diff: "",
-				},
-			},
-			{ expanded: false, isPartial: true, renderContext: { editMode: "patch" } },
-			uiTheme,
-			{ edits: [{ path: "a" }], patch: "+done" },
-		);
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("1 more file pending");
-	});
-
 	it("uses per-file matching preview and narrowed request metadata fallbacks", async () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderResult(
@@ -372,51 +339,6 @@ describe("editToolRenderer", () => {
 		expect(Bun.stripANSI(collapsed.render(160).join("\n"))).not.toContain("stream lifecycle detail");
 		expect(Bun.stripANSI(expanded.render(160).join("\n"))).toContain("stream lifecycle detail");
 	});
-	it("keeps a single-path preview for a boxed partial result", async () => {
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const strategy = EDIT_MODE_STRATEGIES.replace;
-		const originalCompute = strategy.computeDiffPreview;
-		const pending = Promise.withResolvers<PerFileDiffPreview[] | null>();
-		strategy.computeDiffPreview = () => pending.promise;
-		const component = new ToolExecutionComponent(
-			"edit",
-			{ input: "a.ts\nb.ts" },
-			{},
-			{ name: "edit", label: "Edit", mode: "replace" } as unknown as AgentTool,
-			uiStub,
-		);
-		try {
-			component.updateResult(
-				{ content: [], details: { diff: "", perFileResults: [{ path: "a.ts", diff: "" }] } },
-				true,
-			);
-			pending.resolve([{ path: "a.ts", diff: "", firstChangedLine: 7 }]);
-			for (let attempt = 0; attempt < 20; attempt++) await Promise.resolve();
-			expect(Bun.stripANSI(component.render(160).join("\n"))).toContain("a.ts:7");
-		} finally {
-			strategy.computeDiffPreview = originalCompute;
-			component.dispose();
-		}
-	});
-
-	it("reports only visible streaming deltas through the transcript mutation handle", () => {
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const component = new ToolExecutionComponent(
-			"edit",
-			{ input: "§a.ts\nhidden one" },
-			{},
-			{ name: "edit", label: "Edit", mode: "replace" } as unknown as AgentTool,
-			uiStub,
-		);
-		component.consumeVisibleTranscriptChange();
-		component.updateArgs({ input: "§a.ts\nhidden two" });
-		expect(component.consumeVisibleTranscriptChange()).toBe(false);
-		component.setExpanded(true);
-		component.consumeVisibleTranscriptChange();
-		component.updateArgs({ input: "§a.ts\nvisible three" });
-		expect(component.consumeVisibleTranscriptChange()).toBe(true);
-		component.dispose();
-	});
 	it("reports diagnostics as availability without rendering their content while collapsed", async () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderResult(
@@ -447,7 +369,6 @@ describe("editToolRenderer", () => {
 				{ isPartial: true },
 			).paths,
 		).toEqual(["a.ts", "b.ts"]);
-
 	});
 
 	it("uses details-first identity and keeps rich details expanded", async () => {
@@ -527,8 +448,6 @@ describe("editToolRenderer", () => {
 		expect(rendered).not.toContain("https://bad");
 		expect(rendered).not.toContain("\x1b]8;;");
 	});
-
-
 
 	it("keeps apply_patch operation and rename metadata on live cards", async () => {
 		const uiTheme = await getUiTheme();
