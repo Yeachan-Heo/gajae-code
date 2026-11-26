@@ -671,7 +671,7 @@ export async function runSessionHost(
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
 	} = {},
 ): Promise<void> {
-	// Subagents of this host claim as `sdk-host (subagent)`.
+	// Factories this host runs without a decision (`createAgentSession`'s lifecycle create) claim as `sdk-host`.
 	setSessionOwnerSurface("sdk-host");
 	const now = timing.now ?? Date.now;
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));

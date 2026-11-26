@@ -49,6 +49,14 @@ export function resolveSessionOwnership(
 }
 
 /**
+ * Whether `ownership` takes claims at all. Callers check this before awaiting a claim, so `off` and
+ * exempt managers add no await and keep their ordering exactly as before ownership existed.
+ */
+export function claimsUnder(ownership: ResolvedSessionOwnership): boolean {
+	return ownership !== "exempt" && ownership.mode !== "off";
+}
+
+/**
  * The outcome of one claim attempt. `none`: nothing was attempted (off, exempt) or the platform
  * failed open; `failed`: a failure enforce will refuse (counted `claim_failed`); `held`: another
  * process holds the session (counted `claim_conflict`).
@@ -140,6 +148,11 @@ export class SessionClaimSet {
 		abandonedSets.register(this, this.#claims);
 	}
 
+	/** False in `off` and for an exempt manager: check it before awaiting {@link claim} or {@link settled}. */
+	get claiming(): boolean {
+		return this.#mode !== "off";
+	}
+
 	/** The decision this set claims under, for a scoped claim made on the manager's behalf. */
 	get ownership(): ResolvedSessionOwnership {
 		return this.#ownership;
@@ -213,6 +226,7 @@ export class SessionClaimSet {
 	 * is covered, because the id is fresh and no other process can hold it.
 	 */
 	claimInBackground(sessionId: string): void {
+		if (!this.claiming) return;
 		void this.claim(sessionId).then(() => {
 			// Landed after a rotation already settled away from it: release it now, not at the next settle.
 			if (this.#current !== sessionId && this.#transitions === 0) this.settle();

@@ -376,7 +376,8 @@ export async function materializeExternalSessionImport(
 	const importedAt = (options.now?.() ?? new Date()).toISOString();
 	const manager = SessionManager.create(options.cwd, options.destination);
 	// The import's claim gate: enforce (5a) refuses a `held` or `failed` outcome here.
-	await sessionClaimSetOf(manager).settled();
+	const claims = sessionClaimSetOf(manager);
+	if (claims.claiming) await claims.settled();
 	const destination = manager.getDestinationForFork();
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) {

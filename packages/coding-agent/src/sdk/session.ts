@@ -2098,7 +2098,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		liveSessionManager = sessionManager;
 		// The claim gate for both a supplied manager and the one created here: enforce (5a) refuses a
 		// `held` or `failed` outcome at this point. Until then the outcome is only waited for.
-		await sessionClaimSetOf(sessionManager).settled();
+		const claims = sessionClaimSetOf(sessionManager);
+		if (claims.claiming) await claims.settled();
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same

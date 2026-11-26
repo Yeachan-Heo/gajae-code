@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
-import { SessionManager } from "../../src/session/session-manager";
+import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	inspectSessionOwners,
 	probeSessionOwner,
@@ -38,6 +38,7 @@ afterEach(async () => {
 	} finally {
 		delete SessionOwnershipTestHooks.mode;
 		delete SessionOwnershipTestHooks.lockBackend;
+		delete SessionManagerTestHooks.beforeExistingSessionHydration;
 		vi.restoreAllMocks();
 		resetSessionOwnershipForTests();
 	}
@@ -268,5 +269,46 @@ describe.if(supported)("factory claims", () => {
 		await sessionClaimSetOf(manager).settled();
 		await Bun.sleep(0);
 		expect([await state(first), sessionClaimSetOf(manager).sessionIds]).toEqual(["free", [manager.getSessionId()]]);
+	});
+	it("setSessionFile (the /resume switch) claims an existing or a fresh target; a held target still switches, counted", async () => {
+		const place = await workspace();
+		const a = await committed(place);
+		const b = await committed(place);
+		const c = await committed(place);
+		const manager = keep(await SessionManager.open(a.file, place.destination));
+		await manager.setSessionFile(b.file);
+		expect([await state(a.id), await state(b.id), sessionClaimSetOf(manager).sessionIds]).toEqual([
+			"free",
+			"held",
+			[b.id],
+		]);
+		await manager.setSessionFile(path.join(path.dirname(a.file), "2026-01-01T00-00-00-000Z_fresh.jsonl"));
+		expect([await state(b.id), sessionClaimSetOf(manager).sessionIds]).toEqual(["free", [manager.getSessionId()]]);
+		expect(await state(manager.getSessionId())).toBe("held");
+		// Observe never refuses: a target held elsewhere is switched to, without a claim, and counted.
+		SessionOwnershipTestHooks.lockBackend = heldElsewhere(c.id);
+		await manager.setSessionFile(c.file);
+		expect([manager.getSessionId(), sessionClaimSetOf(manager).sessionIds]).toEqual([c.id, []]);
+		expect(sessionOwnershipCounters().claim_conflict).toBe(1);
+	});
+
+	it("a failed open, or a strict open that returns early, keeps no claim", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionManagerTestHooks.beforeExistingSessionHydration = () => {
+			throw new Error("hydration failed");
+		};
+		await expect(SessionManager.open(file, place.destination)).rejects.toThrow("hydration failed");
+		await expect(SessionManager.open(file, SessionManager.explicitDestination(path.dirname(file)))).rejects.toThrow(
+			"hydration failed",
+		);
+		expect(await state(id)).toBe("free");
+		delete SessionManagerTestHooks.beforeExistingSessionHydration;
+		const capture = SessionManager.captureTranscriptStrict(file);
+		if (capture.kind !== "captured") throw new Error(`capture failed: ${capture.reason}`);
+		const stale = { ...capture.snapshot.identity, sha256: "0".repeat(64) };
+		capture.snapshot.close();
+		expect((await SessionManager.openExistingStrict(stale, place.destination)).kind).toBe("error");
+		expect(await state(id)).toBe("free");
 	});
 });
