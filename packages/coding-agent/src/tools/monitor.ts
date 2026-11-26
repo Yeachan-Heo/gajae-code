@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -156,17 +155,16 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// Endpoint scope for owned-registration lookups: concurrent sessions reuse
 		// manager-local job ids (review thread P2).
 		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local";
-		// The session identity this monitor reports to. A session switch adopts the successor's id (or, for a copied
-		// session, only its transcript path) before it cancels the predecessor's jobs, and a cwd move relocates the
-		// transcript under the same id. When the identity differs from the origin at exit, the monitor does not take
-		// over the job's completion: the ordinary async-result stays and is routed by the session as before. After
-		// the monitor took it over, an identity change abandons the exit report instead of delivering it elsewhere.
+		// The logical session this monitor reports to. A session switch adopts the successor's id (or, for a copied
+		// session, only its transcript) before it cancels the predecessor's jobs, and bumps the identity generation;
+		// a cwd move relocates the transcript of the same session and keeps both. When the identity differs from the
+		// origin at exit, the monitor does not take over the job's completion: the ordinary async-result stays and is
+		// routed by the session as before. After the monitor took it over, an identity change abandons the exit report.
 		const originSessionId = this.session.getSessionId?.() ?? null;
-		const sessionFileKey = (file: string | null | undefined) => (file ? path.resolve(file) : null);
-		const originSessionFile = sessionFileKey(this.session.getSessionFile());
+		const originIdentityGeneration = this.session.getSessionIdentityGeneration?.() ?? null;
 		const sessionIdentityUnchanged = () =>
 			(this.session.getSessionId?.() ?? null) === originSessionId &&
-			sessionFileKey(this.session.getSessionFile()) === originSessionFile;
+			(this.session.getSessionIdentityGeneration?.() ?? null) === originIdentityGeneration;
 		const bash = new BashTool(this.session);
 		let deliveredFirstLine = false;
 		const controller = { closed: false };
@@ -193,6 +191,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// An explicit cancel or post-eviction purge: no exit report may be
 		// re-sent or retried after the user dropped this monitor's notifications.
 		let explicitlyPurged = false;
+		// Bumped by every exit send, so a busy-retry chain stops once a later exit
+		// report (the waking re-report of a silent exit) replaced it.
+		let exitDeliveryGeneration = 0;
 		// Generation of the exited job, so a late exit report still finds the owned
 		// registration after the job record is evicted.
 		let terminalGeneration: string | undefined;
@@ -257,20 +258,29 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			coalescedCount = 0;
 			flushScheduled = false;
 			terminalGeneration = manager.getJob(currentJobId)?.generation;
+			// Line notifications still queued for this monitor are taken over by the
+			// exit so the agent wakes once. Removals are counted through the predicate
+			// (the returned totals omit the deferred SDK follow-up store); each stands
+			// for its own line plus the lines it already coalesced.
+			let takenLines = 0;
+			const takeQueuedLines = () =>
+				this.session.purgeQueuedCustomMessages?.(message => {
+					if (!isMonitorMessage(message)) return false;
+					takenLines += 1 + ((message.details as { coalescedCount?: number } | undefined)?.coalescedCount ?? 0);
+					return true;
+				});
 			// A line rejected after the ack decided (between run() returning and
 			// onTerminal) never reached the agent: the exit carries it as a wake.
 			if (line === undefined && lineDeliveryFailed && lastSent) ({ line, count } = lastSent);
-			else if (line === undefined && lastSent) {
-				// Count removals through the predicate: the returned totals omit
-				// messages held in the deferred SDK follow-up store.
-				let taken = 0;
-				this.session.purgeQueuedCustomMessages?.(message => {
-					if (!isMonitorMessage(message)) return false;
-					taken += 1;
-					return true;
-				});
-				// Older queued lines removed with it are reported in the count.
-				if (taken > 0) ({ line, count } = { line: lastSent.line, count: lastSent.count + taken - 1 });
+			else if (line !== undefined) {
+				// The newest line is still pending: older queued lines are counted in it.
+				takeQueuedLines();
+				count += takenLines;
+			} else if (lastSent) {
+				// The newest sent line is still queued: the exit replaces it and counts
+				// the older lines removed with it.
+				takeQueuedLines();
+				if (takenLines > 0) ({ line, count } = { line: lastSent.line, count: takenLines - 1 });
 			}
 			sequence += 1;
 			sendNotification(line, currentJobId, count, line === undefined ? "silent" : "wake");
@@ -426,6 +436,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			options: NonNullable<Parameters<NonNullable<ToolSession["sendCustomMessage"]>>[1]>,
 		) => {
 			const deadline = Date.now() + EXIT_DELIVERY_RETRY_WINDOW_MS;
+			exitDeliveryGeneration += 1;
+			const generation = exitDeliveryGeneration;
+			const superseded = () => generation !== exitDeliveryGeneration;
 			// An identity transition (clear, new or switched session, handoff) drops
 			// the old session's async-results; a disposed session also refuses with
 			// "busy". The exit report follows the same rules instead of retrying, and
@@ -433,13 +446,14 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			// the first send and every retry.
 			const abandoned = () =>
 				explicitlyPurged ||
+				superseded() ||
 				!this.session.sendCustomMessage ||
 				this.session.isSessionDisposed?.() === true ||
 				!sessionIdentityUnchanged();
 			const attempt = (delayMs: number) => {
 				const send = this.session.sendCustomMessage;
 				if (!send || abandoned()) {
-					if (!explicitlyPurged) {
+					if (!explicitlyPurged && !superseded()) {
 						logger.warn("Monitor exit notification abandoned: the session ended or changed identity", {
 							taskId: currentJobId,
 						});

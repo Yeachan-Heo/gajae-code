@@ -280,6 +280,8 @@ export interface ToolSession {
 	waitForFollowUpQueued?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Changes only when a different session identity or transcript is adopted; a cwd move keeps it. */
+	getSessionIdentityGeneration?: () => number;
 	/**
 	 * Opaque async-job ownership/lookup endpoint key. This is not a workflow or
 	 * path identity: workflow/session consumers must use getSessionId(). Only

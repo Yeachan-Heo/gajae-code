@@ -3494,6 +3494,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return promise;
 			},
 			getSessionId: () => sessionManager.getSessionId(),
+			getSessionIdentityGeneration: () => sessionManager.getSessionIdentityGeneration(),
 			// Subagents inherit the parent's manager; its registered endpoint is
 			// authoritative for owned-registration keying and endpoint-first
 			// manager lookup (the child's own id is never registered), so tools
