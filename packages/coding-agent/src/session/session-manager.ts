@@ -18016,24 +18016,14 @@ export class SessionManager {
 
 	/**
 	 * Take over a manager its holder dropped after `close()` failed (a bounded fork's swap or rollback):
-	 * retry the close while the writer is retryable, then release the claims, so they live exactly as
-	 * long as the writer. A close that failed for any other reason leaves nothing to retry.
+	 * retry only the writer close while it is retryable, then release its resources and claims, so a
+	 * claim lives exactly as long as the writer. Never a full `close()`: that could rewrite a
+	 * transcript the holder has already discarded.
 	 * @internal
 	 */
 	retryCloseInBackground(): void {
-		void (async () => {
-			for (let attempt = 0; this.#persistWriter?.getCloseState() === "close_failed_retryable"; attempt++) {
-				await unrefDelay(Math.min(100 * 2 ** Math.min(attempt, 6), 5_000));
-				try {
-					await this.close();
-					return;
-				} catch (error) {
-					logger.warn("Dropped session manager close retry failed", { error: toError(error).message });
-				}
-			}
-			this.#ownershipClaims.releaseAll();
-		})().catch(error => {
-			logger.warn("Dropped session manager close retry loop failed", { error: toError(error).message });
+		void this.#retryRejectedOpenWriterCleanup().catch(error => {
+			logger.warn("Dropped session manager writer cleanup failed", { error: toError(error).message });
 		});
 	}
 
