@@ -32,8 +32,11 @@ describe("offline stealth benchmark (integration)", () => {
 		}
 
 		let browser: Browser | undefined;
+		let createdUserDataDir: string | undefined;
 		try {
-			browser = await launchHeadlessBrowser({ headless: true });
+			const launchResult = await launchHeadlessBrowser({ headless: true });
+			browser = launchResult.browser;
+			createdUserDataDir = launchResult.createdUserDataDir;
 			const page = await browser.newPage();
 			await applyStealthPatches(browser, page, {
 				browserSession: null as CDPSession | null,
@@ -116,6 +119,14 @@ describe("offline stealth benchmark (integration)", () => {
 			expect(fs.existsSync(shot)).toBe(true);
 		} finally {
 			await browser?.close();
+			// Clean up the created userDataDir if any
+			if (createdUserDataDir) {
+				try {
+					fs.rmSync(createdUserDataDir, { recursive: true, force: true });
+				} catch {
+					// Ignore cleanup errors in test
+				}
+			}
 		}
 	}, 120_000);
 });

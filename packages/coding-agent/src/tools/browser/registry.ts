@@ -17,6 +17,7 @@ import {
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
 	canDecryptProfileCookies,
+	cleanupProfileDirWithRetry,
 	headlessExecutableForProfileReuse,
 	launchHeadlessBrowser,
 	loadPuppeteer,
@@ -74,6 +75,14 @@ const browserOpenPromises = new Map<string, Promise<BrowserHandle>>();
  * prefix check would not prove ownership; an entry in this map does.
  */
 const ownedWarmupDirs = new WeakMap<BrowserHandle, string>();
+
+/**
+ * Directories registered for deferred cleanup when immediate removal fails with EBUSY.
+ * These are cleaned up opportunistically: on module initialization, on new browser acquire,
+ * or when explicitly requested. This avoids leaking temp dirs when Chrome is still holding
+ * file handles after launch failures.
+ */
+const deferredCleanupDirs = new Set<string>();
 
 /**
  * Upper bound on the CDP `browser.close()` round-trip during a forced (signal-path)
@@ -143,6 +152,40 @@ export function createOwnedWarmupDirForTest(handle: BrowserHandle): string {
 	return dir;
 }
 
+/**
+ * Register a directory for deferred cleanup when immediate removal fails with EBUSY.
+ * This is called when launch.ts fails to clean up a profile after a failed browser launch.
+ * The cleanup is attempted opportunistically: on new browser acquire or via manual request.
+ *
+ * @internal Used by launch.ts when cleanup fails with EBUSY
+ */
+export async function deferProfileDirCleanup(dir: string): Promise<void> {
+	deferredCleanupDirs.add(dir);
+}
+
+/**
+ * Attempt to clean up deferred dirs that may no longer be held by Chrome processes.
+ * Best-effort: logs failures but does not throw.
+ *
+ * @internal Called opportunistically during acquire and disposal
+ */
+async function processDeferredCleanup(): Promise<void> {
+	const dirs = Array.from(deferredCleanupDirs);
+	for (const dir of dirs) {
+		try {
+			const result = await cleanupProfileDirWithRetry(dir);
+			if (result.removed) {
+				deferredCleanupDirs.delete(dir);
+			}
+		} catch (err) {
+			logger.debug("Failed to clean up deferred profile dir (EBUSY after retries)", {
+				dir,
+				error: (err as Error).message,
+			});
+		}
+	}
+}
+
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	const geo = kind.kind === "headless" ? normalizeGeo(opts.geo) : undefined;
 	const key = browserKey(kind, geo, opts.profileReuse);
@@ -154,6 +197,10 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 	}
 	const pending = browserOpenPromises.get(key);
 	if (pending) return await pending;
+
+	// Opportunistically clean up any deferred dirs when acquiring a new browser.
+	// This ensures they don't pile up across multiple browser sessions.
+	await processDeferredCleanup();
 
 	const opening = openBrowserHandle(kind, opts, geo, key).then(handle => {
 		browsers.set(key, handle);
@@ -199,17 +246,37 @@ async function openBrowserHandle(
 			}
 		}
 		let browser: Browser;
+		let createdUserDataDir: string | undefined;
 		try {
-			browser = await launchHeadlessBrowser({
+			const launchResult = await launchHeadlessBrowser({
 				headless: kind.headless,
 				viewport: opts.viewport,
 				profileWarmupDir,
 				...(geo ? { geo } : {}),
 			});
+			browser = launchResult.browser;
+			createdUserDataDir = launchResult.createdUserDataDir;
 		} catch (error) {
-			// Launch failed after the warm-up copy landed: drop the temp dir here,
-			// because no handle will exist to carry it into releaseBrowser().
-			removeWarmupDir(profileWarmupDir);
+			// Launch failed: drop the warm-up copy or created temp dir here,
+			// because no handle will exist to carry them into releaseBrowser().
+			// Use retry cleanup in case Chrome is still holding files from startup.
+			if (profileWarmupDir) {
+				try {
+					const cleanupResult = await cleanupProfileDirWithRetry(profileWarmupDir);
+					if (!cleanupResult.removed) {
+						logger.debug("Failed to clean up profile warmup dir after launch failure", {
+							dir: profileWarmupDir,
+							error: cleanupResult.error.message,
+						});
+					}
+				} catch (cleanupErr) {
+					// EBUSY after retries: log but don't mask original error
+					logger.debug("Failed to clean up profile warmup dir (EBUSY after retries)", {
+						dir: profileWarmupDir,
+						error: (cleanupErr as Error).message,
+					});
+				}
+			}
 			throw error;
 		}
 		const handle: BrowserHandle = {
@@ -224,8 +291,10 @@ async function openBrowserHandle(
 		};
 		// Record ownership only here, where this module created the dir. Disposal
 		// deletes solely what this map holds, so a caller-supplied path is never
-		// a deletion target.
-		if (profileWarmupDir) ownedWarmupDirs.set(handle, profileWarmupDir);
+		// a deletion target. Track both profileWarmupDir (caller-supplied) and
+		// createdUserDataDir (gjc-created) under the same ownership key.
+		const ownedDir = createdUserDataDir || profileWarmupDir;
+		if (ownedDir) ownedWarmupDirs.set(handle, ownedDir);
 		return handle;
 	}
 	if (kind.kind === "connected") {
@@ -485,25 +554,26 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
  * Delete the warm-up dir this module created for `handle`, if any.
  *
  * The path comes from `ownedWarmupDirs`, never from the caller, so recursive deletion
- * can only ever target a dir this registry made. The entry is consumed first, making a
- * second call a no-op even if disposal runs twice.
+ * can only ever target a dir this registry made. The entry is consumed only after
+ * removal succeeds, ensuring a failed removal can be retried.
  *
  * Best-effort: a leftover temp dir is preferable to a teardown that throws.
+ * Uses bounded retry on transient EBUSY errors to handle Chrome still holding files.
  */
-function removeOwnedWarmupDir(handle: BrowserHandle): void {
+async function removeOwnedWarmupDir(handle: BrowserHandle): Promise<void> {
 	const dir = ownedWarmupDirs.get(handle);
 	if (dir === undefined) return;
-	ownedWarmupDirs.delete(handle);
-	removeWarmupDir(dir);
-}
-
-/** Delete a dir this module created. Callers must have proven ownership first. */
-function removeWarmupDir(dir: string | undefined): void {
-	if (!dir) return;
+	// Use retry cleanup in case Chrome is still holding files after close().
+	// Only delete the entry after successful removal. If removal fails even with retry,
+	// log and move on (best-effort cleanup to avoid propagating errors during teardown).
 	try {
-		fs.rmSync(dir, { recursive: true, force: true });
+		const cleanupResult = await cleanupProfileDirWithRetry(dir);
+		if (cleanupResult.removed) {
+			ownedWarmupDirs.delete(handle);
+		}
 	} catch (err) {
-		logger.debug("Failed to remove Chrome profile warm-up dir", {
+		// EBUSY after retries: log but don't mask other cleanup/teardown operations
+		logger.debug("Failed to remove owned warmup dir (EBUSY after retries)", {
 			dir,
 			error: (err as Error).message,
 		});
@@ -530,7 +600,8 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 		if (opts.kill && proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid);
 		// Chrome owns files under the warm-up dir until the process is gone, so this
 		// runs after close()/kill rather than alongside them.
-		removeOwnedWarmupDir(handle);
+		// Use bounded retry on transient EBUSY to ensure cleanup completes.
+		await removeOwnedWarmupDir(handle);
 		return;
 	}
 	if (handle.kind.kind === "connected") {
