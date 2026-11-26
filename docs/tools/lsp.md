@@ -259,7 +259,7 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
   - Caches LSP clients per `command:cwd`, with `pendingRequests`, `diagnostics`, `openFiles`, `serverCapabilities`, and project-load state.
   - Caches custom linter clients by `serverName:cwd`.
   - Updates client `lastActivity`; optional idle-timeout cleanup is driven by `setIdleTimeout()`.
-  - Each `openFiles` entry records `lastUsedAt` (open, sync, refresh, save). Before sending a `didOpen`, the client sends `didClose` for documents unused for `OPEN_FILE_IDLE_MS` that have no in-flight file operation, and drops their cached diagnostics, so servers unload projects the session stopped using. Refreshing a tracked document whose file was deleted also closes it.
+  - Each `openFiles` entry records `lastUsedAt` (open, sync, refresh, save). Before sending a `didOpen`, the client sends `didClose` for documents unused for `OPEN_FILE_IDLE_MS` that have no in-flight file operation, and drops their cached diagnostics. Whether a server then frees memory is up to the server: typescript-language-server unloads the tsconfig project of the closed documents once none of its documents is open, and other servers are not guaranteed to release anything on `didClose`. Refreshing a tracked document whose file was deleted also closes it.
 - Background work / cancellation
   - Every request has an abortable timeout signal.
   - Aborting an in-flight LSP request sends `$/cancelRequest`.
