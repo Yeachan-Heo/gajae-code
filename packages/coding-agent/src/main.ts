@@ -95,6 +95,7 @@ import {
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
+import { excludeMetadataOnlySessions } from "./session/resume-picker-filter";
 import {
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
@@ -2147,7 +2148,7 @@ export async function runRootCommand(
 		const managedAgentDir = parsedArgs.sessionDir
 			? undefined
 			: (deps.resolveManagedAgentDirForScope ?? resolveManagedAgentDirForScope)(resumeCwd);
-		const sessions = parsedArgs.sessionDir
+		const listedSessions = parsedArgs.sessionDir
 			? await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
 					resumeCwd,
 					parsedArgs.sessionDir,
@@ -2156,6 +2157,8 @@ export async function runRootCommand(
 					resumeCwd,
 					managedAgentDir,
 				);
+		// Picker-only visibility rule (#8028): the inventory above stays complete.
+		const sessions = await excludeMetadataOnlySessions(listedSessions);
 		if (sessions.length === 0) {
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
