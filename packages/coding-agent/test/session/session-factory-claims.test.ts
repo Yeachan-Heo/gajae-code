@@ -151,13 +151,26 @@ describe.if(supported)("factory claims", () => {
 		if (destination.kind !== "managed") throw new Error("expected a managed destination");
 		const { id } = await committed({ ...place, destination });
 		SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
-		const acp = keep((await createSessionManager({ mode: "acp" } as Args, place.cwd, settings))!);
+		const args = { mode: "acp" } as Args;
+		const acp = keep((await createSessionManager(args, place.cwd, settings))!);
 		expect([acp.getSessionId() === id, acp.isPersisted(), sessionClaimSetOf(acp).sessionIds]).toEqual([
 			false,
 			false,
 			[],
 		]);
+		// A resumed history marked the launch `--continue`, which the ACP option check refuses at startup.
+		expect(args.continue).toBeUndefined();
 		expect(sessionOwnershipCounters().claim_conflict).toBe(0);
+		expect((await inspectSessionOwners()).held).toEqual([]);
+	});
+
+	it("gjc acp with autoResume off (the default) creates no persisting session and claims no fresh id", async () => {
+		const place = await workspace();
+		const acp = keep(
+			(await createSessionManager({ mode: "acp" } as Args, place.cwd, Settings.isolated({ autoResume: false })))!,
+		);
+		expect([acp.isPersisted(), await sessionClaimSetOf(acp).settled()]).toEqual([false, undefined]);
+		expect(sessionOwnershipCounters().claim_taken).toBe(0);
 		expect((await inspectSessionOwners()).held).toEqual([]);
 	});
 
