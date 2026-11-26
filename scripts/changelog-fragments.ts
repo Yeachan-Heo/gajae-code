@@ -407,8 +407,106 @@ function report(errors: readonly ChangelogError[]): void {
 	for (const error of errors) console.error(`::error file=${error.file}::${error.message}`);
 }
 
+/**
+ * Scan the repository for orphan changelog fragments outside packages/PKG/changelog.d.
+ * Fragments must live in packages/PKG/changelog.d to be discovered and folded by the release script.
+ */
+export async function findOrphanFragments(root = "."): Promise<ChangelogError[]> {
+	const errors: ChangelogError[] = [];
+	const validFragmentPattern = /^packages\/[^\/]+\/changelog\.d\//;
+	const orphanFragmentPattern = /(\/|^)changelog\.d\//;
+
+	const foundFiles = new Set<string>();
+
+	// First try to scan using git to get both tracked and untracked files
+	const gitResult = await $`git -C ${root} ls-files -o -c --exclude-standard`.quiet().nothrow();
+	if (gitResult.exitCode === 0) {
+		// Parse git output: tracked and untracked files, excluding gitignored
+		const gitFiles = gitResult
+			.text()
+			.trim()
+			.split("\n")
+			.filter(f => f.length > 0 && f.includes("changelog.d/"));
+
+		for (const file of gitFiles) {
+			foundFiles.add(file);
+		}
+	}
+
+	// Also scan the filesystem for changelog.d directories (to catch orphans in all locations)
+	// This covers root, packages, plugins, nested paths, and crates
+	try {
+		// Use a simple find-like scan for all changelog.d directories
+		const scanDirectory = async (dir: string, relativePath: string): Promise<void> => {
+			try {
+				const entries = await fs.readdir(dir, { withFileTypes: true });
+				for (const entry of entries) {
+					if (entry.name.startsWith(".")) continue; // Skip hidden files and .git, .gitignore, etc.
+					if (entry.name === "node_modules") continue; // Skip node_modules
+					const fullPath = path.join(dir, entry.name);
+					const relPath = relativePath ? path.join(relativePath, entry.name).split(path.sep).join("/") : entry.name;
+
+					if (entry.isDirectory()) {
+						if (entry.name === FRAGMENT_DIRECTORY) {
+							// Found a changelog.d directory
+							try {
+								const files = await listFragmentFilesInDirectory(fullPath);
+								for (const file of files) {
+									// Make the path relative to root
+									const relativizedPath = path.relative(root, file).split(path.sep).join("/");
+									foundFiles.add(relativizedPath);
+								}
+							} catch (error) {
+								if (!isMissingPath(error)) {
+									errors.push(asChangelogError(error, relPath));
+								}
+							}
+						} else {
+							// Recurse into subdirectories
+							await scanDirectory(fullPath, relPath);
+						}
+					}
+				}
+			} catch (error) {
+				if (!isMissingPath(error)) {
+					throw error;
+				}
+			}
+		};
+
+		await scanDirectory(root, "");
+	} catch (error) {
+		// If scanning fails, it's not a fatal error unless git also failed
+		if (gitResult.exitCode !== 0) {
+			throw error;
+		}
+	}
+
+	// Check all found changelog.d files and report orphans
+	for (const file of foundFiles) {
+		// Skip valid fragments under packages/*/changelog.d/
+		if (validFragmentPattern.test(file)) continue;
+
+		// Check if it's a fragment (file under any changelog.d directory)
+		if (orphanFragmentPattern.test(file)) {
+			errors.push({
+				file,
+				message:
+					`orphan fragment outside packages/*/changelog.d/; ` +
+					`move it to packages/PKG/changelog.d/ where its changelog lives. ` +
+					`Fragments are folded only from packages/*/changelog.d/ during release.`,
+			});
+		}
+	}
+
+	return errors;
+}
+
 export async function runCheck(): Promise<number> {
 	const { packages, errors } = await collectPackageFragments();
+	const orphanErrors = await findOrphanFragments();
+	errors.push(...orphanErrors);
+
 	if (errors.length === 0) {
 		for (const entry of packages) {
 			try {
@@ -452,6 +550,9 @@ export async function collectPullRequestFragmentViolations(
 			errors.push(asChangelogError(error, entry.changelog));
 		}
 	}
+	// Check for orphan fragments outside packages/*/changelog.d/
+	const orphanErrors = await findOrphanFragments();
+	errors.push(...orphanErrors);
 	return errors;
 }
 

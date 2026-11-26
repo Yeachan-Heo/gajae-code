@@ -26,7 +26,7 @@ Both eventually use `executeBash()` in `src/exec/bash-executor.ts` for non-PTY e
 - extracts a leading `cd <path> && ...` into `cwd` when `cwd` was not supplied,
 - rejects `async: true` when `async.enabled` is false,
 - optionally removes harmless trailing `| head ...` / `| tail ...` limiters through `applyBashFixups()` when `bash.stripTrailingHeadTail` is enabled,
-- leaves output-window selection to `OutputSink`: a 1 KiB tail by default, an explicitly configured `tools.artifactTailBytes` tail budget, or head+tail when `tools.artifactHeadBytes` is explicitly configured.
+- leaves output-window selection to `OutputSink`: the `tools.bashOutputTailBytes` tail budget (1 KiB by default), plus head+tail middle elision when `tools.bashOutputHeadBytes` is non-zero (0 by default). The shared `tools.artifactTailBytes` / `tools.artifactHeadBytes` keys do not apply to Bash output: every final Bash result carries `details.meta.retention = "bash"`, and the post-processing wrapper (`wrapToolWithMetaNotice` threshold spill and the `tools.maxInlineResultBytes` inline backstop) reads that stamp rather than the wrapped tool's name, so a Bash result returned by `recipe` is budgeted the same way. Inside the shared size cap (`tools.maxInlineResultBytes`, 12 KB by default) the backstop caps head and tail independently by the Bash keys, so the cap only ever shrinks a Bash excerpt. Only the cap itself and `tools.artifactTailLines` remain shared.
 
 ## 2) Optional interception (blocked-command path)
 
@@ -154,9 +154,8 @@ Both PTY and non-PTY paths use `OutputSink`.
 
 ## OutputSink semantics
 
-- keeps a small in-memory UTF-8-safe tail buffer (1 KiB by default),
-- uses an explicitly configured `tools.artifactTailBytes` value to set the Bash tail budget,
-- retains no head window by default; explicitly configuring `tools.artifactHeadBytes` opts Bash into head+tail middle elision,
+- keeps a small in-memory UTF-8-safe tail buffer sized by `tools.bashOutputTailBytes` (1 KiB by default),
+- retains a head window sized by `tools.bashOutputHeadBytes` (0 by default); a non-zero value opts Bash into head+tail middle elision,
 - tracks total bytes/lines seen,
 - if an artifact path exists and output overflows (or the file is already active), writes the stream up to the artifact hard cap; any omitted bytes are counted and disclosed instead of calling the artifact complete,
 - when memory threshold overflows, trims the in-memory buffer to the tail (UTF-8 boundary safe),
@@ -173,11 +172,11 @@ Both PTY and non-PTY paths use `OutputSink`.
 
 ### Long-output caveat
 
-`BashTool` supplies a 1 KiB byte threshold to `OutputSink` by default, overridden by an explicit `tools.artifactTailBytes` setting. Direct user bang commands continue to use the executor's shared 50 KiB tail plus configured head window. Neither path enforces a hard line-count cap.
+`BashTool` supplies the `tools.bashOutputTailBytes` budget (1 KiB by default) to `OutputSink`. Direct user bang commands continue to use the executor's shared 50 KiB tail plus the shared `tools.artifactHeadBytes` head window. Neither path enforces a hard line-count cap.
 
 ## Live tool updates and async jobs
 
-Foreground streamed updates, PTY capture, managed async jobs, and monitor jobs all use the Bash retention policy resolved from the active `ToolSession`: a 1 KiB UTF-8-safe tail by default, an explicit `tools.artifactTailBytes` tail budget, and optional `tools.artifactHeadBytes` head retention for final captured output. Foreground, async, and monitor progress callbacks use bounded tail previews; PTY live rendering remains in the custom overlay while its final capture uses the same `OutputSink` budgets.
+Foreground streamed updates, PTY capture, managed async jobs, and monitor jobs all use the Bash retention policy resolved from the active `ToolSession`: the `tools.bashOutputTailBytes` UTF-8-safe tail (1 KiB by default) and `tools.bashOutputHeadBytes` head retention (0 by default) for final captured output. Foreground, async, and monitor progress callbacks use bounded tail previews; PTY live rendering remains in the custom overlay while its final capture uses the same `OutputSink` budgets.
 
 When `async.enabled` is true and the call passes `async: true`, `BashTool` starts a managed Bash job, returns a running job result with a job id, and stores bounded completion output through the session managed-job path. Auto-backgrounding can start the same path after `bash.autoBackground.thresholdMs`.
 
@@ -186,8 +185,8 @@ When `async.enabled` is true and the call passes `async: true`, `BashTool` start
 When the connected client owns terminal execution, GJC requests the same bounded Bash output contract through `outputByteLimit`:
 
 - the default request retains the last 1 KiB; ACP truncates from the beginning at a UTF-8 character boundary,
-- an explicit `tools.artifactTailBytes` value sets that requested tail limit,
-- an explicit `tools.artifactHeadBytes` value omits the client-side byte limit so GJC can receive the complete returned stream, apply local head+tail middle elision, and save the full returned output when artifact storage is available,
+- `tools.bashOutputTailBytes` sets that requested tail limit,
+- a non-zero `tools.bashOutputHeadBytes` value omits the client-side byte limit so GJC can receive the complete returned stream, apply local head+tail middle elision, and save the full returned output when artifact storage is available,
 - if the client itself reports `truncated: true`, the returned bytes are already incomplete and GJC does not label an artifact made from that partial value as the full capture,
 - poll updates and timeout output use the same local retention policy; a complete oversized timeout capture is saved before the bounded error is surfaced when artifact storage is available.
 
@@ -201,7 +200,7 @@ After execution:
    - if abort signal is aborted -> throw `ToolAbortError` (abort semantics),
    - else -> throw `ToolError` (treated as tool failure).
 2. PTY `timedOut` -> throw `ToolError`.
-3. retain only the final 1 KiB output window by default (or use explicit `tools.artifactTailBytes` / `tools.artifactHeadBytes` retention budgets).
+3. retain only the final 1 KiB output window by default (or the configured `tools.bashOutputTailBytes` / `tools.bashOutputHeadBytes` retention budgets).
 4. empty output becomes `(no output)`.
 5. attach truncation metadata via `toolResult(...).truncationFromSummary(result, { direction: "tail" })`.
 6. exit-code mapping:

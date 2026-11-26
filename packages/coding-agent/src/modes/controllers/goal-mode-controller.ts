@@ -78,6 +78,7 @@ export class GoalModeController {
 	#goalHeldSnapshotKey: string | undefined;
 	#goalTimeoutFingerprint: string | undefined;
 	#goalIdenticalTimeoutStreak = 0;
+	#completedExit: Promise<void> | undefined;
 
 	constructor(private readonly ctx: GoalModeControllerContext) {}
 
@@ -123,8 +124,19 @@ export class GoalModeController {
 
 	async beforeGetUserInput(): Promise<void> {
 		if (this.ctx.session.getGoalModeState()?.mode === "exiting") {
-			await this.exit({ reason: "completed", silent: true });
+			await this.#exitCompletedGoal();
 		}
+	}
+
+	/**
+	 * agent_end and the next input prompt both observe the "exiting" state before the
+	 * exit clears it; they must share one exit instead of racing two tool restores.
+	 */
+	#exitCompletedGoal(): Promise<void> {
+		this.#completedExit ??= this.exit({ reason: "completed", silent: true }).finally(() => {
+			this.#completedExit = undefined;
+		});
+		return this.#completedExit;
 	}
 
 	scheduleContinuation(): void {
@@ -258,7 +270,7 @@ export class GoalModeController {
 			this.#resetTimeoutHold();
 		}
 		if (this.ctx.session.getGoalModeState()?.mode === "exiting") {
-			await this.exit({ reason: "completed", silent: true });
+			await this.#exitCompletedGoal();
 			return;
 		}
 		this.scheduleContinuation();

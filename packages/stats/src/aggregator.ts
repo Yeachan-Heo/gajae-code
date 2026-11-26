@@ -15,6 +15,7 @@ import {
 	getModelPerformanceSeries,
 	getModelTimeSeries,
 	getOverallStats,
+	getSessionOwnershipStats,
 	getStatsByAgent,
 	getStatsByFolder,
 	getStatsByModel,
@@ -36,7 +37,13 @@ import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // source as `with { type: "file" }` is NOT sufficient — that copies the file
 // as a raw asset and does not bundle the worker's relative imports, so the
 // worker would crash on first `import` (issue #1011, PR #1027).
-import type { BehaviorDashboardStats, DashboardStats, MessageStats, RequestDetails } from "./types";
+import type {
+	BehaviorDashboardStats,
+	DashboardStats,
+	MessageStats,
+	RequestDetails,
+	SessionOwnershipStats,
+} from "./types";
 
 /**
  * Apply a freshly parsed result to the database. Runs entirely on the
@@ -383,7 +390,14 @@ export async function getDashboardStats(range?: string | null): Promise<Dashboar
 		modelPerformanceSeries: getModelPerformanceSeries(modelPerformanceDays, cutoff, modelPerformanceBucketMs),
 		costSeries: getCostTimeSeries(costSeriesDays, cutoff),
 		cacheMissAttribution: getCacheMissAttribution(cutoff ?? undefined),
+		// All-time, not the range: a gate reads these over a release, and `firstAt`/`lastAt` give the span.
+		...withSessionOwnership(getSessionOwnershipStats()),
 	};
+}
+
+/** The key is left out when nothing was recorded, so the dashboard JSON is unchanged until then. */
+function withSessionOwnership(stats: SessionOwnershipStats | undefined): Pick<DashboardStats, "sessionOwnership"> {
+	return stats ? { sessionOwnership: stats } : {};
 }
 
 export async function getOverviewStats(range?: string | null): Promise<Pick<DashboardStats, "overall" | "timeSeries">> {

@@ -95,6 +95,22 @@
 					],
 					"default": "copy-retain"
 				},
+				"ownership": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"off",
+								"observe",
+								"enforce"
+							],
+							"description": "Not yet active; reserved for single-owner session claims.",
+							"default": "off"
+						}
+					},
+					"additionalProperties": false
+				},
 				"resumeModelBehavior": {
 					"type": "string",
 					"enum": [
@@ -854,13 +870,23 @@
 				},
 				"artifactTailBytes": {
 					"type": "number",
-					"description": "Amount of tail content kept inline when output spills to artifact",
+					"description": "Amount of tail content kept inline when a tool result spills to an artifact. The Bash tool uses `tools.bashOutputTailBytes` instead.",
 					"default": 20
 				},
 				"artifactHeadBytes": {
 					"type": "number",
-					"description": "Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+					"description": "Amount of head content kept inline alongside the tail when a tool result spills to an artifact (middle elision). 0 disables — keep tail only. The Bash tool uses `tools.bashOutputHeadBytes` instead.",
 					"default": 20
+				},
+				"bashOutputTailBytes": {
+					"type": "number",
+					"description": "Tail window the Bash tool keeps inline from command output; the full stream is saved as an artifact when storage is available. Deliberately small so callers prefer focused commands and the search/find tools.",
+					"default": 1
+				},
+				"bashOutputHeadBytes": {
+					"type": "number",
+					"description": "Head window the Bash tool keeps inline alongside the tail (middle elision) so the start of long command output stays visible. 0 keeps the tail only.",
+					"default": 0
 				},
 				"outputMaxColumns": {
 					"type": "number",

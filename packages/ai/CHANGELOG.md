@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+### Fixed
+
+- OpenAI Codex logins now keep one credential per ChatGPT workspace. One ChatGPT login can belong to several workspaces (a personal plan and Team or Business workspaces), each with its own usage limits. The workspace id (`chatgpt_account_id`) is recorded as the credential's organization, and the workspace name is looked up once at login as its display name, so logging in to a second workspace no longer replaces the first, and usage is reported per workspace instead of being merged under the shared email. Token refresh does not repeat the name lookup. Rows stored before this change keep working and are deduplicated once their next refresh records the workspace.
+
+## [0.22.1] - 2026-11-24
+
+### Added
+
+- Google Gemini CLI OAuth login now shows an explicit account-suspension risk warning before the OAuth flow starts, recommending the Google API key or Vertex AI as safer alternatives (#7900).
+
+- Gemini reasoning-summary header runaway detection via `GeminiHeaderRunDetector` class with `GEMINI_HEADER_RUNAWAY_THRESHOLD = 64`. This detects when Gemini models emit consecutive reasoning-summary headers without tool calls and can be used to interrupt degenerate reasoning loops (#7915).
+
+### Changed
+
+- Raised stream idle and first-event timeout defaults from 120s/100s to 900s. This gives long-running reasoning chains, model startups, and input processing more time before aborting with a stream timeout. Provider-specific overrides (Anthropic: 600s idle, Alibaba: 600s first-event, Ollama Cloud/LM Studio: 300s first-event, etc.) still take precedence over the new defaults (#7912).
+
+### Fixed
+
+- Anthropic Messages requests (including the Anthropic web search request) keep a query-bearing base URL intact, for example a signed proxy URL like `https://gateway.example.com/anthropic/v1?sig=...`: `/v1/messages` is now added to the path once and the original query is sent unchanged, instead of the route being appended inside the query.
+
+- DeepSeek tool calls leaked into message text as DSML markup are now recovered as tool calls, and the markup is stripped from visible output.
+- Each structured tool call suppresses at most one otherwise-eligible recovered call with identical name and arguments.
+- Recovered DSML calls respect the request's tool choice: none are kept for `none`, and only the named tool is kept for a named choice. This also applies when the host cannot express `tool_choice` and the field is omitted from the request.
+- Recovered DSML calls are limited to tools both registered locally and present in the final submitted payload, including after payload hooks.
+- A distinct recovered DSML call is published before structured calls first seen after it completed, rather than being marked incomplete just because both forms appeared in the same response.
+- Incomplete recovered DSML invocations are discarded before publishing call events or final content, so response encoders cannot expose their partial arguments as executable calls.
+- An unterminated DSML tag no longer hides the rest of the response: text outside a tool call is released after a bounded hold.
+- Venice DeepSeek malformed wrapperless calls are rejected when tools are enabled and no executable call remains. Tool-disabled turns keep wrapperless text unchanged. The agent retries the rejected completion at most once only in unmanaged sessions before publication. Managed fallback sessions surface this error without a same-model retry; it is not a transport failure.
+
+- Codex Responses requests no longer send the legacy `conversation_id` header; the session identifier goes out only as `session_id`, matching the Codex CLI behavior and ensuring compatibility with proxies that reject underscore header names.
+
+- Tool argument validation now correctly handles nullable properties: JSON `null` is preserved when the schema accepts it (instead of applying defaults or deleting); the string sentinel `"null"` is always removed for optional fields (meaning "no value"); and local `$ref` references are resolved correctly during null validation (#7916).
+- Added regression tests for nullable normalization invariants across schema variants (`anyOf`, `oneOf`, `allOf`, nested objects, and local `$ref` definitions).
+
+- Fixed Gemini and Vertex `MALFORMED_RESPONSE` finishes showing as "Unhandled stop reason" and dropping that turn's token usage; RPC prompt errors now report them as retryable (#7919).
+
+- Fixed Codex WebSocket turns sending a delta `input` after a pooled socket reconnected (closed, idle eviction, token refresh, or stale reuse) or when `onPayload` deleted `previous_response_id`, losing accumulated context and causing incomplete or divergent responses (#7921).
+
+- Rate limit errors with HTTP 402 status (payment required) combined with overflow-like prose (e.g., "too many tokens") are no longer misclassified as context overflow. Both 402 and 429 status codes now prevent overflow classification regardless of error message text, keeping these non-overflow failures fail-fast (#7922).
+
 ## [0.22.0] - 2026-11-19
 
 ### Added

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+## [0.22.1] - 2026-11-24
+
+### Fixed
+
+- Emit queue change notifications AFTER steering and follow-up message removal, not before. When messages are dequeued via `popLastSteer`, `removeSteerAt`, `moveSteer`, `popLastFollowUp`, `removeFollowUpAt`, `moveFollowUp`, or `removeQueuedMessages`, queue change listeners are now notified that the queue state has changed. This ensures that observers see the final state of the queue after claim and delivery transitions are complete, preventing exposure of stale message snapshots. (#7920)
+
+- IRC-sourced steering exchanges are now deferred to the next natural tool boundary instead of immediately interrupting tool execution, allowing sibling tools to complete naturally without being skipped.
+- Skip result messages now correctly identify the source of steering: for IRC exchanges, the peer name is included (e.g., "Skipped due to incoming IRC message from <peer>"), and for real user interrupts, "user message" is used.
+
 ## [0.22.0] - 2026-11-19
 
 ## [0.21.1] - 2026-11-17

@@ -41,6 +41,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "../sdk/bus/config";
 import { AgentStorage } from "../session/agent-storage";
+import { setSessionOwnershipSettingSource } from "../session/session-ownership-mode";
 import { type EditMode, type EditVariantMatch, normalizeEditMode } from "../utils/edit-mode";
 import {
 	type AtomicYamlConfigTransaction,
@@ -527,6 +528,16 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	// Operator consent for the plan-mode write guard. A project file or runtime override must not flip it.
 	"plan.enabled",
 ]);
+
+/**
+ * Session ownership settings (`session.ownership.*`) are global-only as a namespace, so a sub-flag
+ * added later is covered without a new entry here. A project or runtime layer must not lower
+ * another process's protection.
+ */
+const SESSION_OWNERSHIP_SETTINGS_NAMESPACE = "session.ownership";
+function isSessionOwnershipSettingsPath(path: string): boolean {
+	return path === SESSION_OWNERSHIP_SETTINGS_NAMESPACE || path.startsWith(`${SESSION_OWNERSHIP_SETTINGS_NAMESPACE}.`);
+}
 /**
  * Project-layer values ignored at merge.
  * User config and runtime overrides still apply.
@@ -539,6 +550,47 @@ const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>([
 	// Operator extension disable list. A project file must not clear or replace it.
 	"disabledExtensions",
 ]);
+/** Global values the project layer must not erase: global-only, project-denied and credential-selection paths. */
+const PROJECT_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [
+	...GLOBAL_ONLY_SETTINGS,
+	SESSION_OWNERSHIP_SETTINGS_NAMESPACE,
+	...PROJECT_LAYER_DENIED_SETTINGS,
+	...[...GLOBAL_ONLY_AUTH_SETTING_KEYS].map(key => `auth.${key}`),
+].map(settingPath => settingPath.split("."));
+/** Global values the runtime layer must not erase. */
+const RUNTIME_PROTECTED_SETTING_SEGMENTS: readonly string[][] = [
+	...GLOBAL_ONLY_SETTINGS,
+	SESSION_OWNERSHIP_SETTINGS_NAMESPACE,
+].map(settingPath => settingPath.split("."));
+
+/**
+ * Put back protected global values that a merged layer erased by replacing an ancestor with a
+ * non-object (null, a scalar or an array). Deleting the protected leaf before the merge covers object
+ * ancestors only. Every other key under that ancestor keeps the layer's replacement, as before.
+ */
+function restoreProtectedGlobalValues(
+	merged: RawSettings,
+	global: RawSettings,
+	protectedPaths: readonly string[][],
+): void {
+	for (const segments of protectedPaths) {
+		const globalValue = getByPath(global, segments);
+		if (globalValue === undefined || getByPath(merged, segments) !== undefined) continue;
+		let current = merged;
+		for (const segment of segments.slice(0, -1)) {
+			// Copy on write: merged objects can share nested objects with the global layer.
+			const next: RawSettings = { ...rawSettingsRecord(current[segment]) };
+			Object.defineProperty(current, segment, { configurable: true, enumerable: true, value: next, writable: true });
+			current = next;
+		}
+		Object.defineProperty(current, segments[segments.length - 1]!, {
+			configurable: true,
+			enumerable: true,
+			value: structuredClone(globalValue),
+			writable: true,
+		});
+	}
+}
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
@@ -942,7 +994,10 @@ export class Settings implements NotificationSettingsReader {
 				previous = effective;
 			}
 			const allowedLayers: SettingsLayer[] = ["global"];
-			const globalOnly = GLOBAL_ONLY_SETTINGS.has(settingPath) || isNotificationSettingsPath(settingPath);
+			const globalOnly =
+				GLOBAL_ONLY_SETTINGS.has(settingPath) ||
+				isNotificationSettingsPath(settingPath) ||
+				isSessionOwnershipSettingsPath(settingPath);
 			if (!globalOnly) {
 				if (
 					!PROJECT_LAYER_DENIED_SETTINGS.has(settingPath) &&
@@ -2421,6 +2476,12 @@ export class Settings implements NotificationSettingsReader {
 				bypassCache,
 			});
 			let merged: RawSettings = {};
+
+			// Log any warnings from settings discovery (parse failures, unreadable files, etc.)
+			for (const warning of result.warnings) {
+				logger.warn(`Settings: ${warning}`, { cwd: this.#cwd });
+			}
+
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;
 				// Retained project settings.json remains discoverable for non-workflow
@@ -2458,6 +2519,11 @@ export class Settings implements NotificationSettingsReader {
 			) {
 				throw error;
 			}
+			// Log the error when project settings loading fails (issue #8034)
+			logger.warn(
+				`Settings: project settings discovery failed but layer is tolerated; some project settings may be unavailable`,
+				{ error: error instanceof Error ? error.message : String(error), cwd: this.#cwd },
+			);
 			return {};
 		}
 	}
@@ -6326,8 +6392,8 @@ export class Settings implements NotificationSettingsReader {
 		}
 
 		// task.isolation.enabled (boolean) -> task.isolation.mode (enum)
-		const taskObj = raw.task as Record<string, unknown> | undefined;
-		const isolationObj = taskObj?.isolation as Record<string, unknown> | undefined;
+		const taskObj = rawSettingsRecord(raw.task);
+		const isolationObj = taskObj ? rawSettingsRecord(taskObj.isolation) : undefined;
 		if (isolationObj && "enabled" in isolationObj) {
 			if (typeof isolationObj.enabled === "boolean") {
 				isolationObj.mode = isolationObj.enabled ? "auto" : "none";
@@ -6352,27 +6418,41 @@ export class Settings implements NotificationSettingsReader {
 			}
 		}
 
+		// Ensure taskObj (now potentially modified) is updated back to raw
+		if (taskObj) {
+			if (isolationObj) {
+				taskObj.isolation = isolationObj;
+			}
+			// Drop malformed (non-object) task.isolation before merging so it doesn't
+			// mask the global value (issue #8034)
+			if ("isolation" in taskObj && !rawSettingsRecord(taskObj.isolation)) {
+				delete taskObj.isolation;
+			}
+			raw.task = taskObj;
+		}
+
 		// edit.mode: removed "atom" variant is now "hashline"
-		const editObj = raw.edit as Record<string, unknown> | undefined;
+		const editObj = rawSettingsRecord(raw.edit);
 		if (editObj) {
 			if (editObj.mode === "atom") {
 				editObj.mode = "hashline";
 			}
-			const modelVariants = editObj.modelVariants as Record<string, unknown> | undefined;
-			if (modelVariants && typeof modelVariants === "object" && !Array.isArray(modelVariants)) {
+			const modelVariants = rawSettingsRecord(editObj.modelVariants);
+			if (modelVariants) {
 				for (const [pattern, variant] of Object.entries(modelVariants)) {
 					if (variant === "atom") {
 						modelVariants[pattern] = "hashline";
 					}
 				}
 			}
+			raw.edit = editObj;
 		}
 		if (raw["edit.mode"] === "atom") {
 			raw["edit.mode"] = "hashline";
 		}
 
 		// statusLine: rename "plan_mode" segment to "mode"
-		const statusLineObj = raw.statusLine as Record<string, unknown> | undefined;
+		const statusLineObj = rawSettingsRecord(raw.statusLine);
 		if (statusLineObj) {
 			for (const key of ["leftSegments", "rightSegments"] as const) {
 				const segments = statusLineObj[key];
@@ -6380,22 +6460,23 @@ export class Settings implements NotificationSettingsReader {
 					statusLineObj[key] = segments.map(seg => (seg === "plan_mode" ? "mode" : seg));
 				}
 			}
-			const segmentOptions = statusLineObj.segmentOptions as Record<string, unknown> | undefined;
+			const segmentOptions = rawSettingsRecord(statusLineObj.segmentOptions);
 			if (segmentOptions && "plan_mode" in segmentOptions && !("mode" in segmentOptions)) {
 				segmentOptions.mode = segmentOptions.plan_mode;
 				delete segmentOptions.plan_mode;
 			}
+			raw.statusLine = statusLineObj;
 		}
 
 		// Map legacy `memories.enabled` boolean to the explicit `memory.backend`
 		// enum if the latter hasn't been set yet. Idempotent: subsequent
 		// migrations are no-ops once memory.backend is materialised.
-		const memoryBackendObj = raw.memory as Record<string, unknown> | undefined;
+		const memoryBackendObj = rawSettingsRecord(raw.memory);
 		const memoryBackendSet = memoryBackendObj && typeof memoryBackendObj.backend === "string";
-		const memoriesObj = raw.memories as Record<string, unknown> | undefined;
+		const memoriesObj = rawSettingsRecord(raw.memories);
 		if (!memoryBackendSet && memoriesObj && typeof memoriesObj.enabled === "boolean") {
 			const next = memoriesObj.enabled ? "local" : "off";
-			const memoryRoot = (memoryBackendObj ?? {}) as Record<string, unknown>;
+			const memoryRoot = memoryBackendObj ?? {};
 			memoryRoot.backend = next;
 			raw.memory = memoryRoot;
 		}
@@ -6407,7 +6488,7 @@ export class Settings implements NotificationSettingsReader {
 		// - hindsight.agentName was only used as the agent slot in the legacy
 		//   dynamic tuple; if the user customised it we surface it as the new
 		//   bankId base when no explicit bankId is set.
-		const hindsightObj = raw.hindsight as Record<string, unknown> | undefined;
+		const hindsightObj = rawSettingsRecord(raw.hindsight);
 		if (hindsightObj) {
 			if ("dynamicBankId" in hindsightObj) {
 				if (!("scoping" in hindsightObj) && hindsightObj.dynamicBankId === true) {
@@ -6427,6 +6508,7 @@ export class Settings implements NotificationSettingsReader {
 				}
 				delete hindsightObj.agentName;
 			}
+			raw.hindsight = hindsightObj;
 		}
 
 		// Migrate legacy providers.image* settings into modelRoles.image.
@@ -6939,6 +7021,8 @@ export class Settings implements NotificationSettingsReader {
 		const overrides = structuredClone(overrideLayer);
 		// A non-object project clipboard value would replace the user clipboard
 		// object. Drop that parent; nested objects still lose only the denied leaves.
+		// The restore after each merge stage protects every leaf below. The searxng guard stays because
+		// dropping its parent also keeps non-global searxng keys; the clipboard guard is now redundant.
 		const projectClipboard = project.clipboard;
 		if (
 			projectClipboard !== undefined &&
@@ -6955,16 +7039,40 @@ export class Settings implements NotificationSettingsReader {
 				delete layer.searxng;
 			}
 		}
+		// A non-object hindsight value would replace the global hindsight object and drop
+		// the global-only hindsight.apiUrl. A non-object compaction value would similarly
+		// replace the compaction object and drop the global-only compaction.remoteEndpoint.
+		// A non-object task.isolation value would mask the global task.isolation object.
+		// Drop malformed parents; nested objects still lose only the global-only child paths.
+		// An explicit null is not malformed: it resets the section's non-protected keys to
+		// their defaults while the merge keeps global-only children.
+		for (const layer of [project, overrides]) {
+			for (const section of ["hindsight", "compaction"] as const) {
+				const value = layer[section];
+				if (value !== undefined && value !== null && (typeof value !== "object" || Array.isArray(value))) {
+					delete layer[section];
+				}
+			}
+			// Drop malformed task.isolation (issue #8034)
+			const taskObj = rawSettingsRecord(layer.task);
+			if (taskObj && "isolation" in taskObj && !rawSettingsRecord(taskObj.isolation)) {
+				delete taskObj.isolation;
+			}
+		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
 			deleteByPath(project, segments);
 			deleteByPath(overrides, segments);
 		}
+		for (const layer of [project, overrides]) deleteByPath(layer, SESSION_OWNERSHIP_SETTINGS_NAMESPACE.split("."));
 		for (const settingPath of PROJECT_LAYER_DENIED_SETTINGS) {
 			deleteByPath(project, settingPath.split("."));
 		}
 		const merged = this.#deepMerge(this.#deepMerge({}, global), project);
-		return this.#deepMerge(merged, overrides);
+		restoreProtectedGlobalValues(merged, global, PROJECT_PROTECTED_SETTING_SEGMENTS);
+		const result = this.#deepMerge(merged, overrides);
+		restoreProtectedGlobalValues(result, global, RUNTIME_PROTECTED_SETTING_SEGMENTS);
+		return result;
 	}
 
 	#fireAllHooks(): void {
@@ -7116,6 +7224,12 @@ export function onAppendOnlyModeChanged(cb: (value: string) => void): () => void
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
+
+// Session ownership reads its global-only mode from the process settings. Injected, because the
+// session modules sit below config in the import graph.
+// The global layer only: a project or runtime value, including a null or scalar `session` parent
+// that would replace the user's whole `session` object in the merge, never reaches the mode.
+setSessionOwnershipSettingSource(() => globalInstance?.getGlobal("session.ownership.mode"));
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;

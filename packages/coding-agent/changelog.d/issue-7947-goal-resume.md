@@ -1,4 +1,0 @@
-### Fixed
-
-- SDK sessions now properly restore native goal state when resuming a saved session and set up the accounting baseline for active goals. Previously, closing a session with an active or paused goal and then resuming it would lose the goal mode state, requiring users to manually recreate the goal, and token accounting would not be initialized for active goals. The goal mode state is now recovered from the durable session branch during initialization, and `onThreadResumed()` is called to establish the token accounting baseline, matching the behavior of interactive goal mode (#7947).
-- When an SDK session is created with explicit empty tool selection (`--no-tools`), persisted goals are no longer restored to prevent automatic continuation attempts with no way to interact with the goal tool. Goals remain accessible through interactive goal mode where the command interface is available (#7947).

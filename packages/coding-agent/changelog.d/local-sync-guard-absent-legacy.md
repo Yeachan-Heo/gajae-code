@@ -1,4 +1,0 @@
-### Fixed
-
-- Synchronous `local://` resolution (transcript links, edits, session plan paths) no longer fails with `local:// legacy migration must complete before path resolution` for a managed session that has no legacy `artifacts/<id>/local` tree. The resolver now records the `absent` marker for a provably missing legacy tree instead of leaving a marker-less `gjc-local/<id>` directory; sessions that may hold legacy data, or are mid cwd move, still wait for the async migration.
-- A synchronous `C:UsersSJAppDataLocalTempgjc-local01a1e8cb-4652-71fc-91ab-68153b216f06` resolution refused by a pending legacy migration no longer creates an empty `gjc-local/<session-id>` directory first. Each refusal used to leave one marker-less root behind, and local-root cleanup never removed it because it only prunes marker-only roots.

@@ -35,6 +35,7 @@ pub mod doctor_link;
 
 pub mod edit;
 pub mod fd;
+pub mod file_lock;
 pub mod fs_cache;
 pub mod glob;
 pub mod glob_util;
@@ -281,7 +282,7 @@ mod runtime_tests {
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_22_0")]
+#[napi(js_name = "__piNativesV0_22_2")]
 pub const fn pi_natives_version_sentinel() {}
 
 /// Publish-result wire-contract sentinel.
