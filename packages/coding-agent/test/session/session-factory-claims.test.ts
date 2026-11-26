@@ -25,6 +25,7 @@ import {
 	sessionOwnerKey,
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
+import { FileSessionStorage } from "../../src/session/session-storage";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
@@ -339,5 +340,18 @@ describe.if(supported)("factory claims", () => {
 		capture.snapshot.close();
 		expect((await SessionManager.openExistingStrict(stale, place.destination)).kind).toBe("error");
 		expect(await state(id)).toBe("free");
+
+		// A missing path creates a fresh session, claimed before its header write, which fails here.
+		const missing = path.join(place.root, "missing.jsonl");
+		const taken = sessionOwnershipCounters().claim_taken;
+		const write = vi.spyOn(FileSessionStorage.prototype, "openWriter").mockImplementation(() => {
+			throw new Error("disk full");
+		});
+		await expect(SessionManager.open(missing, SessionManager.explicitDestination(place.root))).rejects.toThrow(
+			"disk full",
+		);
+		write.mockRestore();
+		expect(sessionOwnershipCounters().claim_taken).toBe(taken + 1);
+		expect((await inspectSessionOwners()).held).toEqual([]);
 	});
 });
