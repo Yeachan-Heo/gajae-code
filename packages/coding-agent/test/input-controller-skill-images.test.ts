@@ -429,4 +429,105 @@ describe("InputController skill command images", () => {
 		expect(stub.prompts).toHaveLength(0);
 		expect(stub.showWarning).toHaveBeenCalledTimes(1);
 	});
+
+	it("does not bind a restored skill placeholder to a newer pending image", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [OTHER_IMAGE], realEditor: true });
+		stub.ctx.compactionQueuedMessages = [{ text: "/skill:test-skill look at [image 1]", mode: "followUp" }];
+		const controller = new InputController(stub.ctx);
+
+		expect(controller.restoreLatestQueuedMessageToEditor()).toBe(1);
+		expect(stub.ctx.editor.getText()).toBe("/skill:test-skill look at [image 1]");
+		expect(stub.ctx.pendingImages).toEqual([]);
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+
+		await controller.handleFollowUp();
+		expect(stub.customMessages).toHaveLength(0);
+	});
+
+	it("keeps pending images when the restored message names none", () => {
+		const stub = createContext({ skillCommands, pendingImages: [OTHER_IMAGE], realEditor: true });
+		stub.ctx.compactionQueuedMessages = [{ text: "plain text", mode: "followUp" }];
+		const controller = new InputController(stub.ctx);
+
+		controller.restoreLatestQueuedMessageToEditor();
+		expect(stub.ctx.pendingImages).toEqual([OTHER_IMAGE]);
+		expect(stub.showWarning).not.toHaveBeenCalled();
+	});
+
+	it("keeps the composer when the same placeholder is retyped over a swapped image during a slow extension", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("look at [image 1]");
+		const submitted = controller.handleFollowUp();
+		stub.ctx.pendingImages = [OTHER_IMAGE];
+		stub.ctx.editor.setText("look at [image 1]");
+		release.resolve();
+		await submitted;
+
+		expect(stub.ctx.editor.getText()).toBe("look at [image 1]");
+		expect(stub.ctx.pendingImages).toEqual([OTHER_IMAGE]);
+	});
+
+	it("keeps the composer when the skill path runs after a swapped image during a slow extension", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		const submitted = controller.handleFollowUp();
+		stub.ctx.pendingImages = [OTHER_IMAGE];
+		release.resolve();
+		await submitted;
+
+		expect(stub.ctx.editor.getText()).toBe("/skill:test-skill look at [image 1]");
+		expect(stub.ctx.pendingImages).toEqual([OTHER_IMAGE]);
+	});
+
+	it("queues the extension-rewritten text when Alt+Enter runs during compaction", async () => {
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ text: "rewritten by extension" })),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [], compacting: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => "original";
+		await controller.handleFollowUp();
+
+		expect(extensionRunner.emitInput).toHaveBeenCalledTimes(1);
+		expect(stub.ctx.queueCompactionMessage).toHaveBeenCalledTimes(1);
+		const queueCall = (stub.ctx.queueCompactionMessage as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+		expect(queueCall?.[0]).toBe("rewritten by extension");
+	});
+
+	it("does not queue input an extension handled when Alt+Enter runs during compaction", async () => {
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ handled: true })),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [], compacting: true, extensionRunner });
+		stub.ctx.addMessageToChat = vi.fn();
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => "original";
+		await controller.handleFollowUp();
+
+		expect(stub.ctx.queueCompactionMessage).not.toHaveBeenCalled();
+	});
 });

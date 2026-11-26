@@ -1642,6 +1642,17 @@ export class InputController {
 		return true;
 	}
 
+	/**
+	 * A queued message keeps its `[image N]` text but not the image behind it. Restoring it while
+	 * another attachment is pending would let slot N silently resolve to that unrelated image, so
+	 * drop the pending attachments and make the user attach the image again.
+	 */
+	#invalidateImagesForRestoredText(restoredText: string): void {
+		if (this.ctx.pendingImages.length === 0 || imageReferenceNumbers(restoredText).length === 0) return;
+		this.ctx.pendingImages = [];
+		this.ctx.showWarning("A restored message names an image that was not restored. Paste the image again.");
+	}
+
 	#restoreQueuedMessageToEditor(entry: QueuedMessageEditEntry | undefined): number {
 		if (!entry) {
 			this.ctx.updatePendingMessagesDisplay();
@@ -1654,6 +1665,7 @@ export class InputController {
 		}
 
 		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
+		this.#invalidateImagesForRestoredText(queuedText);
 		this.ctx.editor.setText(queuedText);
 		this.ctx.updatePendingMessagesDisplay();
 		return 1;
@@ -1749,13 +1761,13 @@ export class InputController {
 			return visible ? [...visible] : undefined;
 		});
 		const ownsComposer = !options || this.#canModifyComposer(options);
-		if (ownsComposer) {
-			this.ctx.editor.addToHistory(text);
-			// Without composer options this is the queued follow-up shortcut, which awaits input
-			// extensions first: the user may have typed something newer meanwhile, so only clear
-			// the editor while it still holds this submission's draft.
-			if (options || this.ctx.editor.getText().trim() === (draftText ?? text)) this.ctx.editor.setText("");
-		}
+		// Without composer options this is the queued follow-up shortcut, which awaits input
+		// extensions first: the user may have typed or re-attached something newer meanwhile, so
+		// it only clears a composer that still holds this submission's draft and attachments.
+		const clearsComposer =
+			ownsComposer && (options !== undefined || this.#composerStillHolds(draftText ?? text, pendingImages));
+		if (ownsComposer) this.ctx.editor.addToHistory(text);
+		if (clearsComposer) this.ctx.editor.setText("");
 		try {
 			for (let index = 0; index < invocations.length; index += 1) {
 				const invocation = invocations[index];
@@ -1811,7 +1823,7 @@ export class InputController {
 						: { streamingBehavior, steerQueuePolicy: "sequential" },
 				);
 			}
-			if (ownsComposer && this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
+			if (clearsComposer && this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
 			if (this.ctx.session.isStreaming) {
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
@@ -1843,18 +1855,13 @@ export class InputController {
 		// commands in the compaction-local queue. `flushCompactionQueue`
 		// replays skill entries through the custom-message skill path after
 		// compaction finishes so they are not degraded into plain prompts.
-		if (this.ctx.session.isCompacting) {
-			if (this.ctx.pendingImages.length > 0) {
-				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
-				return;
-			}
-			this.ctx.queueCompactionMessage(draft, "followUp");
-			this.#titleQueuedCompactionText(draft);
+		if (this.ctx.session.isCompacting && this.ctx.pendingImages.length > 0) {
+			this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
 			return;
 		}
 
 		// Same input-extension pass Enter runs, so Alt+Enter cannot send an image an extension
-		// would have replaced or refused.
+		// would have replaced or refused, and a compaction-queued message is the transformed text.
 		const pendingImages = this.ctx.pendingImages;
 		const extensionResult = await this.#applyInputExtensions(draft, pendingImages);
 		if (extensionResult.handled) {
@@ -1874,6 +1881,15 @@ export class InputController {
 		const text = extensionResult.text;
 		if (!text) return;
 		if (this.#rejectUnattachedImageReferences(text, extensionResult.effectiveImages)) return;
+		if (this.ctx.session.isCompacting) {
+			// The extension await let the user keep typing; only an untouched composer is cleared.
+			this.ctx.queueCompactionMessage(text, "followUp", {
+				ownsComposer: this.#composerStillHolds(draft, pendingImages),
+				editor: this.ctx.editor,
+			});
+			this.#titleQueuedCompactionText(text);
+			return;
+		}
 		const images = extensionResult.inputImages ? [...extensionResult.inputImages] : undefined;
 
 		// Foreground bash/eval owns the process fence. Queue all prompt text,
@@ -1954,6 +1970,7 @@ export class InputController {
 		}
 
 		this.ctx.locallySubmittedUserSignatures.delete(`${queuedText}\u00000`);
+		this.#invalidateImagesForRestoredText(queuedText);
 		this.ctx.editor.setText(queuedText);
 		this.ctx.updatePendingMessagesDisplay();
 		return 1;
@@ -1973,6 +1990,7 @@ export class InputController {
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
+		this.#invalidateImagesForRestoredText(queuedText);
 		const currentText = options?.currentText ?? this.ctx.editor.getText();
 		const combinedText = [queuedText, currentText].filter(t => t.trim()).join("\n\n");
 		this.ctx.editor.setText(combinedText);
@@ -2248,8 +2266,18 @@ export class InputController {
 	 * the meantime; that newer state must survive.
 	 */
 	#clearFollowUpComposer(draft: string, pendingImages: InteractiveModeContext["pendingImages"]): void {
-		if (this.ctx.editor.getText().trim() === draft) this.ctx.editor.setText("");
-		if (this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
+		if (!this.#composerStillHolds(draft, pendingImages)) return;
+		this.ctx.editor.setText("");
+		this.ctx.pendingImages = [];
+	}
+
+	/**
+	 * The composer still holds exactly what was submitted: the same text and the same attachment
+	 * array. Text alone is not enough, because the user can swap an image and retype the same
+	 * placeholder while an extension is pending.
+	 */
+	#composerStillHolds(draft: string, pendingImages: InteractiveModeContext["pendingImages"]): boolean {
+		return this.ctx.editor.getText().trim() === draft && this.ctx.pendingImages === pendingImages;
 	}
 
 	/**

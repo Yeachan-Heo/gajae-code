@@ -724,6 +724,7 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession, deq
 		pendingPythonComponents: [],
 		session,
 		compactionQueuedMessages: [],
+		pendingImages: [],
 		keybindings: {
 			getDisplayString: (_action: string) => dequeueDisplay,
 		},
