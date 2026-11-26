@@ -110,7 +110,7 @@ describe.if(supported)("factory claims", () => {
 	});
 
 	for (const mode of ["observe", "enforce"] as const) {
-		it(`${mode}: a session held elsewhere, or an owners-directory failure, opens without a claim and is counted`, async () => {
+		it(`${mode}: a session held elsewhere, or a lock failure enforce would refuse, opens without a claim and is counted`, async () => {
 			const place = await workspace();
 			const { file, id } = await committed(place);
 			SessionOwnershipTestHooks.mode = mode;
