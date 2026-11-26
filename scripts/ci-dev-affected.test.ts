@@ -1535,16 +1535,17 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const keys = tasks.map(task => task.key);
 		expect(keys).toEqual([
 			"test:packages/coding-agent/test/startup-update-contract.test.ts",
+			"test:packages/coding-agent/test/session-owner-remote-attach.test.ts",
 			"check:@gajae-code/coding-agent",
 			"cli-smoke",
 			"native-linux-x64",
 		]);
 		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/coding-agent/test/startup-update-contract.test.ts"]);
-		expect(tasks[1]).toMatchObject({
+		expect(tasks[2]).toMatchObject({
 			command: ["bun", "run", "check"],
 			cwd: resolvePackageCwd("packages/coding-agent"),
 		});
-		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
+		expect(tasks[3]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 	test("model selector changes schedule adjacent preset and smart-routing regressions", () => {
@@ -1762,6 +1763,55 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");
+	});
+	test("ownership, SDK host, broker, Router, ACP and SDK CLI changes select the owner-attach e2e test", () => {
+		const testKey = "test:packages/coding-agent/test/session-owner-remote-attach.test.ts";
+		for (const source of [
+			"packages/coding-agent/src/main.ts",
+			"packages/coding-agent/src/session/session-ownership.ts",
+			"packages/coding-agent/src/session/session-ownership-mode.ts",
+			"packages/coding-agent/src/session/session-owners-layout.ts",
+			"packages/coding-agent/src/session/internal/session-claim-set.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/src/cli/session-owners-cli.ts",
+			"packages/coding-agent/src/commands/session.ts",
+			"packages/coding-agent/src/commands/acp.ts",
+			"packages/coding-agent/src/commands/sdk.ts",
+			"packages/coding-agent/src/session/agent-session.ts",
+			"packages/coding-agent/src/sdk/startup-capability.ts",
+			"packages/coding-agent/src/sdk/session-activation.ts",
+			"packages/coding-agent/src/modes/interactive-mode.ts",
+			"packages/coding-agent/src/sdk/lifecycle/client.ts",
+			"packages/coding-agent/src/sdk/lifecycle/broker-client.ts",
+			"crates/pi-natives/src/file_lock/mod.rs",
+			"crates/pi-natives/src/file_lock/unix.rs",
+			"packages/stats/src/session-ownership.ts",
+			"packages/coding-agent/src/sdk/session.ts",
+			"packages/coding-agent/src/sdk/host/host.ts",
+			"packages/coding-agent/src/sdk/host/control/dispatch.ts",
+			"packages/coding-agent/src/sdk/bus/index.ts",
+			"packages/coding-agent/src/sdk/broker/broker.ts",
+			"packages/coding-agent/src/sdk/broker/discovery.ts",
+			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
+			"packages/coding-agent/src/sdk/router/session-router.ts",
+			"packages/coding-agent/src/sdk/client/client.ts",
+			"packages/coding-agent/src/sdk/transport/index.ts",
+			"packages/coding-agent/src/sdk/acp/adapter.ts",
+			"packages/coding-agent/src/sdk/cli/session-cli.ts",
+			"packages/coding-agent/src/modes/acp/acp-agent.ts",
+			"packages/coding-agent/src/modes/acp/acp-mode.ts",
+		]) {
+			const tasks = targeted([source]);
+			expect(tasks.filter(task => task.key === testKey).map(task => task.command)).toEqual([
+				["bun", "test", "packages/coding-agent/test/session-owner-remote-attach.test.ts"],
+			]);
+		}
+		for (const unrelated of [
+			"packages/coding-agent/src/session/session-storage.ts",
+			"packages/coding-agent/src/tools/read.ts",
+			"packages/coding-agent/src/modes/components/model-selector.ts",
+		])
+			expect(targeted([unrelated]).map(task => task.key)).not.toContain(testKey);
 	});
 	test("broker lifecycle changes select the lifecycle e2e suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/broker/lifecycle.ts"]);
