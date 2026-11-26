@@ -3552,6 +3552,11 @@ export class AgentSession {
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
 
+	/** Transcript file size immediately after a transcriptFile emergency compaction.
+	 *  Used to prevent re-triggering compaction on every prompt when the file cannot
+	 *  shrink further; allows 50% growth margin before re-triggering. */
+	#transcriptFileSizeAfterLastCompaction: number | undefined;
+
 	#rebuildEventListenerSnapshot(): void {
 		this.#eventListenerSnapshot = Object.freeze([...this.#eventListeners]);
 		__agentSessionPerfCounters.listenerSnapshotRebuilds += 1;
@@ -29105,6 +29110,8 @@ export class AgentSession {
 		// call and a compaction entry to every prompt and reach the managed cap sooner.
 		const emergencyReason = emergencyCompactionReason(
 			this.#usesSharedSessionPublication() ? { ...sample, transcriptFileBytes: undefined } : sample,
+			undefined, // use default limits
+			this.#usesSharedSessionPublication() ? undefined : this.#transcriptFileSizeAfterLastCompaction,
 		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
@@ -29113,6 +29120,18 @@ export class AgentSession {
 				deferHandoffMaintenance: false,
 				force: true,
 			});
+			// Update tracking for transcriptFile compactions to prevent re-triggering on every
+			// prompt when the file cannot shrink further
+			if (emergencyReason === "transcriptFile" && this.sessionManager.getSessionFile()) {
+				const sessionFile = this.sessionManager.getSessionFile();
+				if (sessionFile && !this.#usesSharedSessionPublication()) {
+					try {
+						this.#transcriptFileSizeAfterLastCompaction = fs.statSync(sessionFile).size;
+					} catch {
+						// Best effort; if we can't stat the file, don't update the tracking
+					}
+				}
+			}
 			return;
 		}
 		const compactionSettings = this.settings.getGroup("compaction");

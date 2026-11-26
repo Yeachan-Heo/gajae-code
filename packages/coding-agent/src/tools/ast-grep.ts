@@ -292,8 +292,8 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 					path: filePath,
 					count: fileMatchCounts.get(filePath) ?? 0,
 				})),
-				displayContent: displayLines.join("\n"),
 			};
+			// displayContent intentionally not persisted
 			if (result.limitReached) {
 				outputLines.push("", "Result limit reached; narrow paths or increase limit.");
 			}

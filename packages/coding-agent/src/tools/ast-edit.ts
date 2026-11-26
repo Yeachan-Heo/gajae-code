@@ -453,8 +453,8 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const details: AstEditToolDetails = {
 				...baseDetails,
 				fileReplacements,
-				displayContent: displayLines.join("\n"),
 			};
+			// displayContent intentionally not persisted
 			// Line clips (120 chars) are already applied. Frame the joined preview once.
 			return toolResult(details)
 				.text(wrapUntrustedContent(outputLines.join("\n")))

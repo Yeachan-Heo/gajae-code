@@ -671,7 +671,6 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const rawOutput = outputLines.join("\n");
 				const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 				const output = truncation.content;
-				const displayText = displayLines.join("\n");
 				const truncated = Boolean(
 					fileLimitReached || perFileLimitReached || result.limitReached || truncation.truncated || linesTruncated,
 				);
@@ -692,7 +691,6 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						: perFileLimitReached
 							? perFileMatchCap
 							: undefined,
-					displayContent: displayText,
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};
 				if (truncation.truncated) details.truncation = truncation;
