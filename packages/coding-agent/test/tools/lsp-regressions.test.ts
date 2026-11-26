@@ -359,7 +359,7 @@ describe("lsp regressions", () => {
 				requestId: 0,
 				diagnostics: new Map([[targetUri, { diagnostics: [staleDiagnostic], version: null }]]),
 				diagnosticsVersion: 1,
-				openFiles: new Map([[targetUri, { version: 1, languageId: "typescript" }]]),
+				openFiles: new Map([[targetUri, { version: 1, languageId: "typescript", lastUsedAt: Date.now() }]]),
 				pendingRequests: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
