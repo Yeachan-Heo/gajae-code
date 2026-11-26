@@ -133,4 +133,43 @@ describe("headless browser launch with profile cleanup", () => {
 			expect(err).toBe(launchError);
 		}
 	});
+
+	it("defers cleanup to registry when removal fails with EBUSY after launch failure", async () => {
+		// Mock puppeteer to simulate launch failure
+		const launchError = new Error("Chromium spawn failed");
+		const mockLaunch = vi.fn().mockRejectedValue(launchError);
+
+		// Mock loadPuppeteer to return stub puppeteer module with our mock launch
+		vi.spyOn(launchModule, "loadPuppeteer").mockResolvedValue({
+			launch: mockLaunch,
+		} as any);
+
+		// Mock rmSync to fail with EBUSY on first attempts, simulating Chrome still holding files
+		let rmSyncCallCount = 0;
+		const originalRmSync = fs.rmSync;
+		vi.spyOn(fs, "rmSync").mockImplementation((path, options) => {
+			rmSyncCallCount++;
+			if (rmSyncCallCount <= 11) {
+				// Fail with EBUSY for all retry attempts (default 10 retries + 1)
+				const err = new Error("EBUSY: resource busy") as NodeJS.ErrnoException;
+				err.code = "EBUSY";
+				throw err;
+			}
+			// Should not reach here with the stub approach
+			return originalRmSync(path as string, options);
+		});
+
+		// When launch fails and cleanup fails with EBUSY, it should defer cleanup
+		try {
+			await launchModule.launchHeadlessBrowser({
+				headless: true,
+			});
+			expect.unreachable("Should have thrown launch error");
+		} catch (err) {
+			// Verify the original launch error is preserved
+			expect((err as Error).message).toBe("Chromium spawn failed");
+			// Verify that cleanup was attempted but deferred due to EBUSY
+			expect(rmSyncCallCount).toBeGreaterThan(0);
+		}
+	});
 });

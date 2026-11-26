@@ -514,12 +514,38 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		// If launch fails and we created or were given a userDataDir, attempt cleanup with retry.
 		// Chrome may still be starting up and holding files when launch fails,
 		// so a transient EBUSY error should trigger a bounded retry, not abandon cleanup.
-		// Preserve the original launch error regardless of cleanup outcome.
-		// For createdUserDataDir (GJC-owned), always retry. For profileWarmupDir (caller-supplied
-		// but GJC-owns cleanup after failed launch), also retry on failure.
+		// If cleanup fails with EBUSY even after retries, hand off to deferred cleanup
+		// to prevent leaking temp directories. Preserve the original launch error regardless
+		// of cleanup outcome.
 		const dirToCleanup = createdUserDataDir || opts.profileWarmupDir;
 		if (dirToCleanup) {
-			await cleanupProfileDirWithRetry(dirToCleanup);
+			try {
+				await cleanupProfileDirWithRetry(dirToCleanup);
+			} catch (cleanupErr) {
+				// If cleanup failed with EBUSY despite retries, defer the cleanup
+				const cleanupError = cleanupErr as Error;
+				if (cleanupError.message.includes("EBUSY")) {
+					try {
+						// Dynamically import registry to avoid circular dependency
+						const registry = await import("./registry");
+						await registry.deferProfileDirCleanup(dirToCleanup);
+						logger.debug("Deferred profile directory cleanup due to EBUSY", {
+							dir: dirToCleanup,
+						});
+					} catch (deferErr) {
+						logger.warn("Failed to defer profile directory cleanup", {
+							dir: dirToCleanup,
+							error: (deferErr as Error).message,
+						});
+					}
+				} else {
+					// Not a transient EBUSY error, just log it
+					logger.debug("Failed to clean up profile directory after launch failure", {
+						dir: dirToCleanup,
+						error: cleanupError.message,
+					});
+				}
+			}
 		}
 		throw err;
 	}
