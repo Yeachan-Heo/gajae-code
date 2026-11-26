@@ -398,7 +398,17 @@ export interface LaunchHeadlessOptions {
 	geo?: { timezone?: string; locale?: string };
 }
 
-export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
+export interface LaunchHeadlessResult {
+	browser: Browser;
+	/**
+	 * The userDataDir gjc created when profileWarmupDir was not provided.
+	 * undefined if profileWarmupDir was used (caller-supplied dir).
+	 * When set, gjc owns this dir and must remove it after Chrome exits.
+	 */
+	createdUserDataDir?: string;
+}
+
+export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
 	const initialViewport = {
 		width: vp.width,
@@ -406,6 +416,17 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
 	};
 	const puppeteer = await loadPuppeteer();
+
+	// Create userDataDir if not provided. This prevents puppeteer from creating
+	// its own temp profile which can fail to clean up with EBUSY on Windows (#8076).
+	// When we pass userDataDir to puppeteer.launch(), it won't try to remove it.
+	let userDataDir = opts.profileWarmupDir;
+	let createdUserDataDir: string | undefined;
+	if (!userDataDir) {
+		userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-headless-profile-"));
+		createdUserDataDir = userDataDir;
+	}
+
 	const launchArgs = [
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
@@ -415,11 +436,8 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		// interface only; 15_stealth_webrtc.txt adds a candidate-level guard.
 		"--force-webrtc-ip-handling-policy=default_public_interface_only",
 		`--window-size=${initialViewport.width},${initialViewport.height}`,
+		`--user-data-dir=${userDataDir}`,
 	];
-	if (opts.profileWarmupDir) {
-		// Isolated copy only (caller guarantees). Never point this at a live profile.
-		launchArgs.push(`--user-data-dir=${opts.profileWarmupDir}`);
-	}
 	const proxy = trustedBrowserEnv("PUPPETEER_PROXY");
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);
@@ -442,15 +460,35 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	// cannot load into Chromium.
 	const launchEnv: Record<string, string> = projectSafeSpawnEnv();
 	if (opts.geo?.timezone) launchEnv.TZ = opts.geo.timezone;
-	return await puppeteer.launch({
-		headless: opts.headless,
-		defaultViewport: opts.headless ? initialViewport : null,
-		executablePath: await ensureChromiumExecutable(),
-		args: launchArgs,
-		env: launchEnv,
-		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
-		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
-	});
+
+	try {
+		const browser = await puppeteer.launch({
+			headless: opts.headless,
+			userDataDir,
+			defaultViewport: opts.headless ? initialViewport : null,
+			executablePath: await ensureChromiumExecutable(),
+			args: launchArgs,
+			env: launchEnv,
+			ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
+			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+		});
+		return { browser, createdUserDataDir };
+	} catch (err) {
+		// If launch fails and we created the userDataDir, clean it up.
+		// This prevents leaving orphaned dirs when launch fails.
+		if (createdUserDataDir) {
+			try {
+				fs.rmSync(createdUserDataDir, { recursive: true, force: true });
+			} catch (cleanupErr) {
+				// Log but don't mask the original launch error.
+				logger.debug("Failed to clean up headless profile dir after launch failure", {
+					dir: createdUserDataDir,
+					error: (cleanupErr as Error).message,
+				});
+			}
+		}
+		throw err;
+	}
 }
 
 export async function applyViewport(

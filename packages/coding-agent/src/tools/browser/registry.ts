@@ -199,16 +199,19 @@ async function openBrowserHandle(
 			}
 		}
 		let browser: Browser;
+		let createdUserDataDir: string | undefined;
 		try {
-			browser = await launchHeadlessBrowser({
+			const launchResult = await launchHeadlessBrowser({
 				headless: kind.headless,
 				viewport: opts.viewport,
 				profileWarmupDir,
 				...(geo ? { geo } : {}),
 			});
+			browser = launchResult.browser;
+			createdUserDataDir = launchResult.createdUserDataDir;
 		} catch (error) {
-			// Launch failed after the warm-up copy landed: drop the temp dir here,
-			// because no handle will exist to carry it into releaseBrowser().
+			// Launch failed: drop the warm-up copy or created temp dir here,
+			// because no handle will exist to carry them into releaseBrowser().
 			removeWarmupDir(profileWarmupDir);
 			throw error;
 		}
@@ -224,8 +227,10 @@ async function openBrowserHandle(
 		};
 		// Record ownership only here, where this module created the dir. Disposal
 		// deletes solely what this map holds, so a caller-supplied path is never
-		// a deletion target.
-		if (profileWarmupDir) ownedWarmupDirs.set(handle, profileWarmupDir);
+		// a deletion target. Track both profileWarmupDir (caller-supplied) and
+		// createdUserDataDir (gjc-created) under the same ownership key.
+		const ownedDir = createdUserDataDir || profileWarmupDir;
+		if (ownedDir) ownedWarmupDirs.set(handle, ownedDir);
 		return handle;
 	}
 	if (kind.kind === "connected") {
