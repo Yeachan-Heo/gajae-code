@@ -540,7 +540,6 @@ export interface ToolExecutionOptions {
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	editFuzzyThreshold?: number;
 	editAllowFuzzy?: boolean;
-	hashlineAutoDropPureInsertDuplicates?: boolean;
 	/** Internal observer for visible asynchronous renderer mutations. */
 	onVisibleTranscriptMutation?: () => void;
 }
@@ -592,7 +591,6 @@ export class ToolExecutionComponent extends Container {
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
-	#hashlineAutoDropPureInsertDuplicates: boolean | undefined;
 	#isPartial = true;
 	#tool?: AgentTool;
 	#ui: TUI;
@@ -658,7 +656,6 @@ export class ToolExecutionComponent extends Container {
 		this.#showImages = options.showImages ?? true;
 		this.#editFuzzyThreshold = options.editFuzzyThreshold;
 		this.#editAllowFuzzy = options.editAllowFuzzy;
-		this.#hashlineAutoDropPureInsertDuplicates = options.hashlineAutoDropPureInsertDuplicates;
 		this.#onVisibleTranscriptMutation = options.onVisibleTranscriptMutation;
 
 		this.#tool = tool;
@@ -760,7 +757,6 @@ export class ToolExecutionComponent extends Container {
 				signal: controller.signal,
 				fuzzyThreshold: this.#editFuzzyThreshold,
 				allowFuzzy: this.#editAllowFuzzy,
-				hashlineAutoDropPureInsertDuplicates: this.#hashlineAutoDropPureInsertDuplicates,
 				isStreaming,
 			});
 			if (this.#disposed || controller.signal.aborted) return;

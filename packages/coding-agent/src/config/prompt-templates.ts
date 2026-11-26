@@ -9,7 +9,7 @@ import {
 	prompt,
 } from "@gajae-code/utils";
 
-import { computeLineHash } from "../edit/line-hash";
+import { computeLineHash, HL_BODY_SEP } from "../edit/line-hash";
 import { jtdToTypeScript } from "../tools/jtd-to-typescript";
 import { parseCommandArgs, substituteArgs } from "../utils/command-args";
 

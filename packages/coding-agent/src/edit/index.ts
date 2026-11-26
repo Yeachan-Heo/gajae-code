@@ -269,9 +269,8 @@ async function executeApplyPatchPerFile(
 			if (text) contentTexts.push(text);
 		} catch (err) {
 			const errorText = err instanceof Error ? err.message : String(err);
-			const displayErrorText = err instanceof HashlineMismatchError ? err.displayMessage : undefined;
-			perFileResults.push({ path, diff: "", isError: true, errorText, displayErrorText });
-			contentTexts.push(`Error editing ${path}: ${errorText}`);
+			perFileResults.push({ path, diff: "", isError: true, errorText });
+			contentTexts.push(`Error editing ${path}: ${errorText}`)
 		}
 
 		// Emit partial result after each file so UI shows progressive completion

@@ -119,7 +119,7 @@ function fakeSession() {
 				previousModel: session.model,
 				previousThinkingLevel: session.thinkingLevel,
 				previousThinkingLevelMutationRevision: 0,
-				previousEditMode: "hashline",
+				previousEditMode: "replace",
 				signal,
 			};
 		},

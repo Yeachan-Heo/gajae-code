@@ -3,7 +3,7 @@ import type { ScenarioId } from "../bench/composer-scenarios";
 import { type CliOptions, classifyTraceRecord, run, type TraceRecord } from "../bench/composer-stability-v3";
 
 const MUTATION_SCENARIOS = [
-	"read-edit-hashline",
+
 	"three-turn-tools",
 	"shell-write-discipline",
 	"multi-file-search-edit",

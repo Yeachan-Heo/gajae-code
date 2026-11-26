@@ -20,7 +20,7 @@ function extractPromptFixturePaths(prompt: string): string[] {
 }
 
 const MUTATION_TARGET_SCENARIOS = [
-	{ id: "read-edit-hashline", targetPath: "fixtures/workspace/src/foo.ts" },
+
 	{ id: "three-turn-tools", targetPath: "fixtures/workspace/src/a.ts" },
 	{ id: "shell-write-discipline", targetPath: "fixtures/workspace/src/write-target.ts" },
 	{ id: "multi-file-search-edit", targetPath: "fixtures/workspace/src/pkg/alpha.ts" },

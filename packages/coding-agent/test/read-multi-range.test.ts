@@ -170,12 +170,10 @@ describe("read tool multi-range selector", () => {
 		for (const truncation of [undefined, "head", "last", "both"] as const) {
 			const diskSession = createSession(tmpDir);
 			diskSession.settings.set("readLineNumbers", true);
-			diskSession.settings.set("readHashLines", false);
 			const bridgeSession = createSession(tmpDir, {
 				capabilities: { readTextFile: true },
 				readTextFile: async () => source,
 			});
-			bridgeSession.settings.set("readHashLines", false);
 			bridgeSession.settings.set("readLineNumbers", true);
 			const request = {
 				path: `${filePath}:10-20,50-200`,
@@ -237,7 +235,7 @@ describe("read tool multi-range selector", () => {
 
 		for (const hashline of [false, true]) {
 			const configure = (session: ToolSession) => {
-				session.settings.set("readHashLines", hashline);
+
 				session.settings.set("readLineNumbers", !hashline);
 				return session;
 			};

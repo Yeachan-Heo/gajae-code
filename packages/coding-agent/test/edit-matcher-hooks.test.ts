@@ -50,20 +50,6 @@ describe("edit matcher hooks", () => {
 		]);
 	});
 
-	// Ported from oh-my-pi crates/pi-edit/src/modes/hashline/mod.rs
-	// `inspect_extracts_paths_and_added_lines_from_partial_input`. Upstream input
-	// `[*** Update File: src/a.ts#ABCD]\nPUT 1.=1:\n+new\n[src/b.ts]\nCUT 2.=2` is
-	// omp's hashline grammar; this is the same payload in gajae's grammar: an
-	// insertion into src/a.ts followed by a src/b.ts section whose deletion op is
-	// still streaming. Expected entries are identical to upstream.
-	test("inspect_extracts_paths_and_added_lines_from_partial_input (oh-my-pi parity)", () => {
-		const tool = new EditTool(makeSession(), "hashline");
-		const anchor = computeLineHash(1, "existing");
-		for (const tail of ["≔2", "≔", ""]) {
-			const input = `§src/a.ts\n»1${anchor}\nnew\n§src/b.ts\n${tail}`;
-			expect(tool.matcherEntries({ input })).toEqual([{ path: "src/a.ts", digest: "new" }]);
-		}
-	});
 
 	test("replace projects new_text from each edit, never old_text or the argument encoding", () => {
 		const tool = new EditTool(makeSession(), "replace");
@@ -196,7 +182,7 @@ describe("edit matcher hooks", () => {
 		);
 	});
 
-	for (const mode of ["replace", "patch", "hashline", "apply_patch", "vim"] satisfies EditMode[]) {
+	for (const mode of ["replace", "patch", "apply_patch", "vim"] satisfies EditMode[]) {
 		test(`${mode} returns undefined for missing, malformed, and unusable partial arguments`, () => {
 			const tool = new EditTool(makeSession(), mode);
 			for (const args of [

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { replaceText } from "../../src/edit/diff";
 import { findMatch, seekSequence } from "../../src/edit/modes/replace";
 import { normalizeToLF } from "../../src/edit/normalize";
-import { formatHashLines } from "../../src/hashline/hash";
+import { formatHashLines } from "../../src/edit/line-hash";
 
 const longLine = `${"a".repeat(512)} TARGET ${"b".repeat(512)}`;
 

@@ -72,7 +72,6 @@ function makeCtx(tools: Record<string, AgentTool> = {}) {
 				if (key === "terminal.showImages") return false;
 				if (key === "edit.fuzzyMatch") return false;
 				if (key === "edit.fuzzyThreshold") return undefined;
-				if (key === "edit.hashlineAutoDropPureInsertDuplicates") return false;
 				if (key === "read.toolResultPreview") return false;
 				return undefined;
 			},
@@ -267,7 +266,7 @@ describe("G004 streamed tool args QA", () => {
 			"edit",
 			args,
 			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as any,
+			{ name: "edit", label: "Edit", mode: "replace" } as any,
 			ui,
 		);
 		component.setExpanded(true);
@@ -313,7 +312,7 @@ describe("G004 streamed tool args QA", () => {
 			"edit",
 			args,
 			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as any,
+			{ name: "edit", label: "Edit", mode: "replace" } as any,
 			ui,
 		);
 		try {

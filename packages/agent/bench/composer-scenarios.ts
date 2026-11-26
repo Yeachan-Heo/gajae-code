@@ -95,12 +95,7 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 				expectedEditText: "recovered-anchor-ok",
 				requireSuccess: true,
 			};
-		case "read-edit-hashline":
-			return {
-				targetPath: "fixtures/workspace/src/foo.ts",
-				expectedEditText: "hello-composer-harness",
-				requireSuccess: true,
-			};
+
 		case "bad-anchor-recovery":
 			return { targetPath: "fixtures/workspace/src/recover.ts", expectedEditText: "ok", requireSuccess: true };
 		case "multi-turn-yield-discipline":

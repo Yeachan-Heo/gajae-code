@@ -5,7 +5,6 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { isEnoent, isRecord, pathIsWithin, prompt, sanitizeText, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { stripHashlinePrefixes } from "../edit";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -79,13 +78,8 @@ export interface WriteToolDetails {
  * prefixes in read output and sometimes copies them into write content.
  */
 function stripWriteContent(session: ToolSession, content: string): { text: string; stripped: boolean } {
-	if (!resolveFileDisplayMode(session).hashLines) {
-		return { text: content, stripped: false };
-	}
-	const lines = content.split("\n");
-	const cleaned = stripHashlinePrefixes(lines);
-	if (cleaned === lines) return { text: content, stripped: false };
-	return { text: cleaned.join("\n"), stripped: true };
+	// Hashline prefixes are never added in display now, so there's nothing to strip
+	return { text: content, stripped: false };
 }
 
 /**
