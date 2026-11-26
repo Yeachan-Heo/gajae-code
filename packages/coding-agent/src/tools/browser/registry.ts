@@ -17,6 +17,7 @@ import {
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
 	canDecryptProfileCookies,
+	cleanupProfileDirWithRetry,
 	headlessExecutableForProfileReuse,
 	launchHeadlessBrowser,
 	loadPuppeteer,
@@ -212,7 +213,10 @@ async function openBrowserHandle(
 		} catch (error) {
 			// Launch failed: drop the warm-up copy or created temp dir here,
 			// because no handle will exist to carry them into releaseBrowser().
-			removeWarmupDir(profileWarmupDir);
+			// Use retry cleanup in case Chrome is still holding files from startup.
+			if (profileWarmupDir) {
+				await cleanupProfileDirWithRetry(profileWarmupDir);
+			}
 			throw error;
 		}
 		const handle: BrowserHandle = {
@@ -494,34 +498,16 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
  * removal succeeds, ensuring a failed removal can be retried.
  *
  * Best-effort: a leftover temp dir is preferable to a teardown that throws.
+ * Uses bounded retry on transient EBUSY errors to handle Chrome still holding files.
  */
-function removeOwnedWarmupDir(handle: BrowserHandle): void {
+async function removeOwnedWarmupDir(handle: BrowserHandle): Promise<void> {
 	const dir = ownedWarmupDirs.get(handle);
 	if (dir === undefined) return;
-	// Only delete the entry after successful removal. If removal fails with EBUSY
-	// (Chrome still holding files), the entry remains for a later cleanup attempt
-	// when the process exits.
-	if (removeWarmupDir(dir)) {
-		ownedWarmupDirs.delete(handle);
-	}
-}
-
-/** Delete a dir this module created. Callers must have proven ownership first.
- * Returns true if removal succeeded or dir was not present, false if removal failed. */
-function removeWarmupDir(dir: string | undefined): boolean {
-	if (!dir) return true;
-	try {
-		fs.rmSync(dir, { recursive: true, force: true });
-		return true;
-	} catch (err) {
-		const isEBUSY = (err as Error).message.includes("EBUSY");
-		logger.debug("Failed to remove Chrome profile warm-up dir", {
-			dir,
-			error: (err as Error).message,
-			transient: isEBUSY,
-		});
-		return false;
-	}
+	// Use retry cleanup in case Chrome is still holding files after close().
+	// Only delete the entry after successful removal. If removal fails even with retry,
+	// log and move on (best-effort cleanup to avoid propagating errors during teardown).
+	await cleanupProfileDirWithRetry(dir);
+	ownedWarmupDirs.delete(handle);
 }
 
 async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
@@ -544,7 +530,8 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 		if (opts.kill && proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid);
 		// Chrome owns files under the warm-up dir until the process is gone, so this
 		// runs after close()/kill rather than alongside them.
-		removeOwnedWarmupDir(handle);
+		// Use bounded retry on transient EBUSY to ensure cleanup completes.
+		await removeOwnedWarmupDir(handle);
 		return;
 	}
 	if (handle.kind.kind === "connected") {

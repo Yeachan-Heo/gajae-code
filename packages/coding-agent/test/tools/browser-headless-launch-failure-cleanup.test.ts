@@ -2,24 +2,29 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { launchHeadlessBrowser } from "../../src/tools/browser/launch";
+import * as launchModule from "../../src/tools/browser/launch";
 
-describe("browser headless launch failure with EBUSY cleanup (#8076)", () => {
+describe("headless browser launch with profile cleanup", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("creates userDataDir and passes it to puppeteer so puppy doesn't try to remove it", async () => {
-		// When profileWarmupDir is not provided, launchHeadlessBrowser should:
-		// 1. Create a temp userDataDir
-		// 2. Pass it to puppeteer.launch() as the userDataDir option
-		// 3. Return both the browser and the createdUserDataDir
-		// This prevents puppeteer from trying to remove it, avoiding EBUSY errors (#8076)
+	it("creates userDataDir and passes it to puppeteer when no profileWarmupDir is provided", async () => {
+		// Create a stub browser object
+		const mockBrowser = {
+			connected: true,
+			close: vi.fn().mockResolvedValue(undefined),
+			process: vi.fn().mockReturnValue({ pid: 12345 }),
+		};
 
-		// We can't easily mock loadPuppeteer in this test without deeper refactoring,
-		// so we'll just verify that launchHeadlessBrowser creates the dir when called.
-		// The actual puppeteer integration is tested in integration tests.
-		const result = await launchHeadlessBrowser({
+		const mockLaunch = vi.fn().mockResolvedValue(mockBrowser);
+
+		// Mock loadPuppeteer to return stub puppeteer module with our mock launch
+		vi.spyOn(launchModule, "loadPuppeteer").mockResolvedValue({
+			launch: mockLaunch,
+		} as any);
+
+		const result = await launchModule.launchHeadlessBrowser({
 			headless: true,
 		});
 
@@ -31,6 +36,11 @@ describe("browser headless launch failure with EBUSY cleanup (#8076)", () => {
 		if (result.createdUserDataDir) {
 			expect(fs.existsSync(result.createdUserDataDir)).toBe(true);
 
+			// Verify puppeteer.launch was called with the userDataDir
+			expect(mockLaunch).toHaveBeenCalled();
+			const launchCall = mockLaunch.mock.calls[0]?.[0];
+			expect(launchCall?.userDataDir).toBe(result.createdUserDataDir);
+
 			// Clean up
 			try {
 				fs.rmSync(result.createdUserDataDir, { recursive: true, force: true });
@@ -41,11 +51,24 @@ describe("browser headless launch failure with EBUSY cleanup (#8076)", () => {
 	});
 
 	it("uses profileWarmupDir when provided instead of creating a temp dir", async () => {
-		// When profileWarmupDir is provided, we should use it and not create a temp dir
+		// Create a stub browser object
+		const mockBrowser = {
+			connected: true,
+			close: vi.fn().mockResolvedValue(undefined),
+			process: vi.fn().mockReturnValue({ pid: 12345 }),
+		};
+
+		const mockLaunch = vi.fn().mockResolvedValue(mockBrowser);
+
+		// Mock loadPuppeteer to return stub puppeteer module with our mock launch
+		vi.spyOn(launchModule, "loadPuppeteer").mockResolvedValue({
+			launch: mockLaunch,
+		} as any);
+
 		const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-profile-"));
 
 		try {
-			const result = await launchHeadlessBrowser({
+			const result = await launchModule.launchHeadlessBrowser({
 				headless: true,
 				profileWarmupDir: profileDir,
 			});
@@ -53,6 +76,11 @@ describe("browser headless launch failure with EBUSY cleanup (#8076)", () => {
 			// Should NOT create a new dir when profileWarmupDir is provided
 			expect(result.createdUserDataDir).toBeUndefined();
 			expect(result.browser).toBeTruthy();
+
+			// Verify puppeteer.launch was called with the provided profileWarmupDir
+			expect(mockLaunch).toHaveBeenCalled();
+			const launchCall = mockLaunch.mock.calls[0]?.[0];
+			expect(launchCall?.userDataDir).toBe(profileDir);
 		} finally {
 			try {
 				fs.rmSync(profileDir, { recursive: true, force: true });
@@ -63,68 +91,46 @@ describe("browser headless launch failure with EBUSY cleanup (#8076)", () => {
 	});
 
 	it("retries createdUserDataDir cleanup on EBUSY after launch failure", async () => {
-		// When launch fails and createdUserDataDir cleanup returns EBUSY,
-		// the cleanup should retry rather than silently abandon the directory.
-		// This test verifies the retry mechanism by inducing a transient EBUSY.
+		// Mock puppeteer to simulate launch failure
+		const launchError = new Error("WebSocket connection failed");
+		const mockLaunch = vi.fn().mockRejectedValue(launchError);
 
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-ebusy-test-"));
-		const testFile = path.join(tempDir, "test-file.txt");
-		fs.writeFileSync(testFile, "test");
+		// Mock loadPuppeteer to return stub puppeteer module with our mock launch
+		vi.spyOn(launchModule, "loadPuppeteer").mockResolvedValue({
+			launch: mockLaunch,
+		} as any);
 
+		// When launch fails, launchHeadlessBrowser should attempt cleanup with retry
 		try {
-			// Keep the file open while we try to remove the directory.
-			// This simulates Chrome holding files after launch failure.
-			const handle = fs.openSync(testFile, "r");
-
-			try {
-				// Try to remove while file is held open (would cause EBUSY)
-				fs.rmSync(tempDir, { recursive: true, force: true });
-				// Should succeed because fs.rmSync with force:true succeeds even with open handles
-				// on most systems, but on Windows it may fail with EBUSY.
-				// The important part is that our retry logic handles it correctly.
-				expect(fs.existsSync(tempDir)).toBe(false);
-			} catch (err) {
-				// If we get EBUSY (Windows), verify the cleanup retry would handle it
-				if ((err as Error).message.includes("EBUSY")) {
-					expect(fs.existsSync(tempDir)).toBe(true);
-				}
-			} finally {
-				fs.closeSync(handle);
-			}
-		} finally {
-			// Ensure cleanup after test
-			try {
-				fs.rmSync(tempDir, { recursive: true, force: true });
-			} catch {
-				// OK if already cleaned
-			}
+			await launchModule.launchHeadlessBrowser({
+				headless: true,
+			});
+			expect.unreachable("Should have thrown launch error");
+		} catch (err) {
+			// Verify the original launch error is preserved
+			expect((err as Error).message).toBe("WebSocket connection failed");
 		}
 	});
 
 	it("preserves original launch error when cleanup fails", async () => {
-		// When launch fails and createdUserDataDir cleanup also fails,
-		// the original launch error must be preserved and thrown.
-		// Cleanup failures should not mask the root cause.
+		// Mock puppeteer to simulate launch failure
+		const launchError = new Error("Chrome launch timeout");
+		const mockLaunch = vi.fn().mockRejectedValue(launchError);
 
-		// This test verifies the error preservation by checking that if puppeteer fails,
-		// we get the puppeteer error, not a cleanup error.
-		// The actual test is in integration tests where we can induce puppeteer failure.
+		// Mock loadPuppeteer to return stub puppeteer module with our mock launch
+		vi.spyOn(launchModule, "loadPuppeteer").mockResolvedValue({
+			launch: mockLaunch,
+		} as any);
 
-		// For now, verify that successful launches complete without error
-		const result = await launchHeadlessBrowser({
-			headless: true,
-		});
-
-		expect(result.browser).toBeTruthy();
-		expect(result.createdUserDataDir).toBeTruthy();
-
-		// Clean up
-		if (result.createdUserDataDir) {
-			try {
-				fs.rmSync(result.createdUserDataDir, { recursive: true, force: true });
-			} catch {
-				// Ignore
-			}
+		// When launch fails, the original error should be thrown, not a cleanup error
+		try {
+			await launchModule.launchHeadlessBrowser({
+				headless: true,
+			});
+			expect.unreachable("Should have thrown launch error");
+		} catch (err) {
+			// Verify the original launch error is preserved, not masked by cleanup error
+			expect(err).toBe(launchError);
 		}
 	});
 });

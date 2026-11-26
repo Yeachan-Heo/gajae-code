@@ -414,7 +414,7 @@ export interface LaunchHeadlessResult {
  * with brief delays before giving up. Logs removal attempts and errors but does not
  * throw to avoid masking the caller's original error.
  */
-async function cleanupProfileDirWithRetry(dir: string, maxRetries = 10, delay = 50): Promise<void> {
+export async function cleanupProfileDirWithRetry(dir: string, maxRetries = 10, delay = 50): Promise<void> {
 	let lastErr: Error | undefined;
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		try {
@@ -511,12 +511,15 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		});
 		return { browser, createdUserDataDir };
 	} catch (err) {
-		// If launch fails and we created the userDataDir, attempt cleanup with retry.
+		// If launch fails and we created or were given a userDataDir, attempt cleanup with retry.
 		// Chrome may still be starting up and holding files when launch fails,
 		// so a transient EBUSY error should trigger a bounded retry, not abandon cleanup.
 		// Preserve the original launch error regardless of cleanup outcome.
-		if (createdUserDataDir) {
-			await cleanupProfileDirWithRetry(createdUserDataDir);
+		// For createdUserDataDir (GJC-owned), always retry. For profileWarmupDir (caller-supplied
+		// but GJC-owns cleanup after failed launch), also retry on failure.
+		const dirToCleanup = createdUserDataDir || opts.profileWarmupDir;
+		if (dirToCleanup) {
+			await cleanupProfileDirWithRetry(dirToCleanup);
 		}
 		throw err;
 	}
