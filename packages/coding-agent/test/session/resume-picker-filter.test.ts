@@ -79,6 +79,14 @@ describe("isMetadataOnlyTranscript", () => {
 		expect(isMetadataOnlyTranscript(jsonl([header("a", cwd), configuredModelChain]))).toBe(true);
 	});
 
+	it("keeps a thinking level the operator chose, and hides an automatic one (#8067 review)", () => {
+		const operatorChoice = { ...thinkingChange, operatorIntent: true };
+		expect(isMetadataOnlyTranscript(jsonl([header("a", cwd), modelChange("e1", null), operatorChoice]))).toBe(false);
+		expect(isMetadataOnlyTranscript(jsonl([header("a", cwd), { ...thinkingChange, operatorIntent: false }]))).toBe(
+			true,
+		);
+	});
+
 	it("keeps a header-only transcript, which has no startup metadata", () => {
 		expect(isMetadataOnlyTranscript(jsonl([header("a", cwd)]))).toBe(false);
 		expect(isMetadataOnlyTranscript("")).toBe(false);
@@ -219,6 +227,26 @@ describe("excludeMetadataOnlySessions", () => {
 		await fs.appendFile(file, jsonl(growth));
 
 		expect((await excludeMetadataOnlySessions(listed)).map(session => session.id)).toEqual(["growing"]);
+	});
+
+	it("keeps a BOM-prefixed session whose growth past the bound ends the read on a control record (#8067 review)", async () => {
+		const bom = "\uFEFF";
+		const first = `${bom}${jsonl([header("bom-growing", cwd), modelChange("e1", null)])}`;
+		const file = path.join(sessionDir, "bom-growing.jsonl");
+		await Bun.write(file, first);
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		expect(listed.map(session => session.id)).toEqual(["bom-growing"]);
+
+		// Grow the file so the bounded read (bound + 1 bytes) ends exactly after a
+		// complete control record; a message follows beyond the read.
+		const firstBytes = Buffer.byteLength(first, "utf8");
+		const shell = JSON.stringify(modelChange("pad", null, ""));
+		const fill = RESUME_PICKER_METADATA_SCAN_BYTES + 1 - firstBytes - Buffer.byteLength(shell, "utf8") - 1;
+		const padded = JSON.stringify(modelChange("pad", null, "p".repeat(fill)));
+		await fs.appendFile(file, `${padded}\n${JSON.stringify(userMessage)}\n`);
+		expect(firstBytes + Buffer.byteLength(padded, "utf8") + 1).toBe(RESUME_PICKER_METADATA_SCAN_BYTES + 1);
+
+		expect((await excludeMetadataOnlySessions(listed)).map(session => session.id)).toEqual(["bom-growing"]);
 	});
 
 	it("keeps a session whose transcript cannot be read", async () => {
