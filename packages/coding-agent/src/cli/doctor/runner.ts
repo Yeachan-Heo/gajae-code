@@ -8,6 +8,7 @@ import { collectDoctorProbe } from "./probe-client";
 import { executeSelectedDoctorRepair, planSelectedDoctorRepair, refuseUnsettledDoctorRepair } from "./repairs";
 import { finalizeReport } from "./report";
 import { collectServiceTargets } from "./service-targets";
+import { SESSION_COLLECTOR } from "./session-owners";
 import type { DoctorCheck, DoctorCoverage, DoctorRepair, DoctorReport } from "./types";
 
 const NATIVE_COLLECTOR: DoctorCollector = {
@@ -68,6 +69,7 @@ const COLLECTORS: readonly DoctorCollector[] = [
 	PLUGIN_COLLECTOR,
 	NATIVE_COLLECTOR,
 	PROJECTION_COLLECTOR,
+	SESSION_COLLECTOR,
 ];
 
 function coverage(checks: readonly DoctorCheck[], requested: number): DoctorCoverage {
@@ -162,7 +164,10 @@ function selectedCollectors(options: DoctorOptions): { collectors: DoctorCollect
 	};
 	if (options.checks.length === 0) {
 		for (const collector of COLLECTORS)
-			if (options.mode !== "dry-run" || (collector.id !== "native" && collector.id !== "projection"))
+			if (
+				options.mode !== "dry-run" ||
+				(collector.id !== "native" && collector.id !== "projection" && collector.id !== "session")
+			)
 				add(collector.id);
 	} else {
 		for (const selector of options.checks) {

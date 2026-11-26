@@ -11,10 +11,26 @@
 import { logger } from "@gajae-code/utils";
 import type { SessionManager } from "../session-manager";
 import { countSessionOwnershipEvent, type SessionOwnerClaim } from "../session-ownership";
-import { type SessionOwnershipMode, sessionOwnershipMode } from "../session-ownership-mode";
+import {
+	type SessionOwnershipMode,
+	sessionOwnershipMode,
+	sessionOwnershipTestHookSlot,
+} from "../session-ownership-mode";
 
 /** How long a deferred owner shutdown may keep its predecessor's claim (design §2.5). */
 export const DEFERRED_RELEASE_CAP_MS = 60_000;
+
+/** Thrown only under the strict test seam, for a write the detector flags. */
+export class SessionWriteWithoutClaimError extends Error {
+	readonly code = "session_write_without_claim";
+	readonly site: string;
+
+	constructor(site: string) {
+		super(`session_write_without_claim: ${site}`);
+		this.name = "SessionWriteWithoutClaimError";
+		this.site = site;
+	}
+}
 
 interface DeferredHold {
 	readonly sessionId: string;
@@ -43,6 +59,8 @@ export class SessionClaimSet {
 	#closed = false;
 	/** Read once per bind, so a settings reload never changes the mode under a bound session. */
 	#mode: SessionOwnershipMode = "off";
+	/** Detector reports already logged, as `<id> <site>`: log once, count every time. */
+	readonly #reported = new Set<string>();
 
 	constructor() {
 		abandonedSets.register(this, this.#claims);
@@ -75,6 +93,29 @@ export class SessionClaimSet {
 	}
 
 	/**
+	 * The write-path detector (design §2.5), called before a transcript write. When ownership is on
+	 * and this set holds no claim for `sessionId` (the current id unless a successor is named), it
+	 * logs `session_write_without_claim` with the call site and counts it. It never claims, and it
+	 * throws only under the strict test seam. In `off` it returns at once.
+	 *
+	 * A write made before the manager's first bind (a factory publishing a new transcript before it
+	 * adopts it) must name its id: with nothing bound there is no current id, and no mode captured
+	 * by a bind, so the mode is read now.
+	 */
+	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
+		if (sessionId === undefined) return;
+		const mode = this.#current === undefined ? sessionOwnershipMode() : this.#mode;
+		if (mode === "off" || this.#claims.has(sessionId)) return;
+		countSessionOwnershipEvent("session_write_without_claim");
+		const report = `${sessionId} ${site}`;
+		if (!this.#reported.has(report)) {
+			this.#reported.add(report);
+			logger.warn("session_write_without_claim", { site, sessionId, mode });
+		}
+		if (sessionOwnershipTestHookSlot().strictWriteDetection) throw new SessionWriteWithoutClaimError(site);
+	}
+
+	/**
 	 * Take ownership of a claim: a factory's, or a transition's target claimed before the rotation.
 	 * The key is the id, so a second claim of an id already here is released at once (one claim per id).
 	 */
@@ -85,6 +126,15 @@ export class SessionClaimSet {
 			return;
 		}
 		this.#claims.set(claim.sessionId, claim);
+		// A target staged outside the transition that rotates to it is exposed to any unrelated
+		// transition's settle. Visible in observe; off stays inert.
+		if (
+			this.#mode !== "off" &&
+			this.#current !== undefined &&
+			claim.sessionId !== this.#current &&
+			this.#transitions === 0
+		)
+			countSessionOwnershipEvent("target_staged_outside_transition");
 	}
 
 	/**

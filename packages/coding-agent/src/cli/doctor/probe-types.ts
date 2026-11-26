@@ -10,7 +10,7 @@ export const PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024;
  */
 export const PROJECTION_RECEIPT_BUDGET_BYTES = PROBE_OUTPUT_LIMIT_BYTES - 1024;
 
-export type DoctorProbeKind = "native" | "projection";
+export type DoctorProbeKind = "native" | "projection" | "session-owners";
 
 export interface DoctorProbeReceipt {
 	readonly schemaVersion: 1;

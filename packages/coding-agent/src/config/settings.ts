@@ -7044,10 +7044,12 @@ export class Settings implements NotificationSettingsReader {
 		// replace the compaction object and drop the global-only compaction.remoteEndpoint.
 		// A non-object task.isolation value would mask the global task.isolation object.
 		// Drop malformed parents; nested objects still lose only the global-only child paths.
+		// An explicit null is not malformed: it resets the section's non-protected keys to
+		// their defaults while the merge keeps global-only children.
 		for (const layer of [project, overrides]) {
 			for (const section of ["hindsight", "compaction"] as const) {
 				const value = layer[section];
-				if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value))) {
+				if (value !== undefined && value !== null && (typeof value !== "object" || Array.isArray(value))) {
 					delete layer[section];
 				}
 			}

@@ -7,12 +7,17 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionClaimSet, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import {
+	SessionClaimSet,
+	SessionWriteWithoutClaimError,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import { type SessionDestination, SessionManager } from "../../src/session/session-manager";
 import {
 	claimSessionOwner,
 	probeSessionOwner,
 	resetSessionOwnershipForTests,
+	SESSION_OWNERSHIP_COUNTERS,
 	type SessionOwnerClaim,
 	SessionOwnershipTestHooks,
 	sessionOwnersDirectory,
@@ -349,6 +354,29 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 		expect(await held("not-yet-held")).toBe(false);
 	});
 
+	it("a hold that ends inside a transition keeps its id for that transition to decide", async () => {
+		const set = new SessionClaimSet();
+		set.bind("held-a");
+		set.add(await claim("held-a"));
+		const finalization = Promise.withResolvers<void>();
+		set.holdUntil("held-a", finalization.promise);
+		{
+			using _transition = set.transition();
+			set.add(await claim("target-b"));
+			set.bind("target-b");
+			finalization.resolve();
+			await finalization.promise;
+			// The transition is still open, so its outcome is not known yet.
+			expect(await held("held-a")).toBe(true);
+			// It rotates back to the held id, which must still be claimed when it settles.
+			set.bind("held-a");
+		}
+		expect(await held("held-a")).toBe(true);
+		expect(await held("target-b")).toBe(false);
+		set.releaseAll();
+		expect(await held("held-a")).toBe(false);
+	});
+
 	it("refuses a released claim, and releases a claim handed to a closed manager", async () => {
 		const { manager, claims } = await persisted();
 		const released = await claim("released-first");
@@ -407,13 +435,43 @@ describe("missed-release signals", () => {
 		}
 	});
 
-	it.if(supported)("counts claims left on a claim set that was garbage-collected", async () => {
+	it.if(supported)("counts a target staged outside any transition, only when ownership is on", async () => {
+		const count = () => sessionOwnershipCounters().target_staged_outside_transition;
+		const off = new SessionClaimSet();
+		off.bind("staged-current");
+		off.add(await claim("staged-off"));
+		expect(count()).toBe(0);
+		off.releaseAll();
+		SessionOwnershipTestHooks.mode = "observe";
+		const set = new SessionClaimSet();
+		try {
+			set.add(await claim("unbound"));
+			set.bind("staged-current");
+			set.add(await claim("staged-current"));
+			{
+				using _transition = set.transition();
+				set.add(await claim("staged-inside"));
+			}
+			expect(count()).toBe(0);
+			set.add(await claim("staged-outside"));
+			expect(count()).toBe(1);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			set.releaseAll();
+		}
+	});
+
+	it.if(supported)("counts only the unreleased claims left on a claim set that was garbage-collected", async () => {
 		let kept: SessionOwnerClaim | undefined;
 		await (async () => {
 			const set = new SessionClaimSet();
 			set.bind("abandoned");
 			kept = await claim("abandoned");
 			set.add(kept);
+			// Released directly, so the set still lists it: it is not a missed release.
+			const done = await claim("abandoned-but-released");
+			set.add(done);
+			done.release();
 		})();
 		for (let attempt = 0; attempt < 100 && sessionOwnershipCounters().claims_abandoned === 0; attempt++) {
 			Bun.gc(true);
@@ -422,6 +480,34 @@ describe("missed-release signals", () => {
 		expect(sessionOwnershipCounters().claims_abandoned).toBe(1);
 		// The lock stays until the process exits; release it here for the next test.
 		kept?.release();
+	});
+});
+
+describe("the detector before the first bind", () => {
+	it("checks a named id against the mode read now, and stays silent with no id to check", () => {
+		const count = () => sessionOwnershipCounters().session_write_without_claim;
+		const set = new SessionClaimSet();
+		// Ownership off (the default): nothing is counted, bound or not.
+		set.checkWrite("pre-bind", "fork-id");
+		expect(count()).toBe(0);
+		SessionOwnershipTestHooks.mode = "observe";
+		try {
+			set.checkWrite("no id");
+			expect(count()).toBe(0);
+			set.checkWrite("pre-bind", "fork-id");
+			expect(count()).toBe(1);
+			SessionOwnershipTestHooks.strictWriteDetection = true;
+			expect(() => set.checkWrite("pre-bind", "fork-id")).toThrow(SessionWriteWithoutClaimError);
+			delete SessionOwnershipTestHooks.strictWriteDetection;
+			// Once bound, the mode the bind read applies, as before.
+			set.bind("fork-id");
+			SessionOwnershipTestHooks.mode = "off";
+			set.checkWrite("bound");
+			expect(count()).toBe(3);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.strictWriteDetection;
+		}
 	});
 });
 
@@ -482,6 +568,7 @@ describe("with ownership off (the default)", () => {
 		roots.push(home);
 		const preloadHome = SessionOwnershipTestHooks.homeOverride;
 		const lockCalls: string[] = [];
+		const exitListeners = process.listenerCount("exit");
 		SessionOwnershipTestHooks.homeOverride = home;
 		SessionOwnershipTestHooks.lockBackend = {
 			tryAcquire: async sidecar => {
@@ -515,12 +602,9 @@ describe("with ownership off (the default)", () => {
 			expect(lockCalls).toEqual([]);
 			expect(await Bun.file(sessionOwnersDirectory()).exists()).toBe(false);
 			expect(await fs.readdir(home)).toEqual([]);
-			expect(sessionOwnershipCounters()).toEqual({
-				release_after_deferred_timeout: 0,
-				session_write_without_claim: 0,
-				claims_abandoned: 0,
-				bind_outside_transition: 0,
-			});
+			expect(Object.values(sessionOwnershipCounters())).toEqual(SESSION_OWNERSHIP_COUNTERS.map(() => 0));
+			// Nothing counted, so no exit write was armed.
+			expect(process.listenerCount("exit")).toBe(exitListeners);
 		} finally {
 			SessionOwnershipTestHooks.homeOverride = preloadHome;
 			delete SessionOwnershipTestHooks.lockBackend;

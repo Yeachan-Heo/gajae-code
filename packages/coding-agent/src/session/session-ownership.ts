@@ -22,9 +22,16 @@ import {
 	probeFileLock,
 	tryAcquireFileLock,
 } from "@gajae-code/natives";
-import { getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
+import { recordSessionOwnershipCounts } from "@gajae-code/stats/session-ownership";
+import { getStatsDbPath, getTrustedHomeDir, isEnoent, logger } from "@gajae-code/utils";
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
+import {
+	classifySessionOwnerEntry,
+	SESSION_OWNER_RECORD_SUFFIX,
+	SESSION_OWNER_SIDECAR_SUFFIX,
+	SESSION_OWNERS_RELATIVE_DIR,
+} from "./session-owners-layout";
 import { type SessionOwnershipTestHookSlot, sessionOwnershipTestHookSlot } from "./session-ownership-mode";
 import {
 	assertAppendLockHomeNotSharedWritable,
@@ -35,8 +42,8 @@ import {
 	type RuntimeLockDirectory,
 } from "./session-storage";
 
-const SIDECAR_SUFFIX = ".session-owner";
-const RECORD_SUFFIX = ".owner.json";
+const SIDECAR_SUFFIX = SESSION_OWNER_SIDECAR_SUFFIX;
+const RECORD_SUFFIX = SESSION_OWNER_RECORD_SUFFIX;
 const RECORD_VERSION = 1;
 const RECORD_MAX_BYTES = 4096;
 /** Every native call answers within this budget, or reports `timed_out`. */
@@ -47,6 +54,8 @@ const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const PLAIN_KEY = /^[a-z0-9_-]{1,128}$/;
 const SAFE_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
 const SAFE_VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
+/** A UTC instant as `Date#toISOString` writes it; anything else in a record is not shown. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 export const SESSION_OWNER_SURFACES = ["app", "terminal", "print", "sdk-host", "acp-host", "sdk"] as const;
 export type SessionOwnerBaseSurface = (typeof SESSION_OWNER_SURFACES)[number];
@@ -160,14 +169,14 @@ function trustedHome(): string {
 }
 
 export function sessionOwnersDirectory(): string {
-	return path.join(trustedHome(), ".gjc", "runtime", "session-owners");
+	return path.join(trustedHome(), SESSION_OWNERS_RELATIVE_DIR);
 }
 
 /** The append lock's checks without creating anything; `undefined` when no claim was ever made here. */
 function inspectOwnersDirectory(): string | undefined {
 	const home = trustedHome();
 	assertAppendLockHomeNotSharedWritable(home);
-	const owners = path.join(home, ".gjc", "runtime", "session-owners");
+	const owners = path.join(home, SESSION_OWNERS_RELATIVE_DIR);
 	assertNoReparsePath(owners);
 	try {
 		if (!fs.lstatSync(owners).isDirectory()) throw new Error("session_owners_not_directory");
@@ -279,11 +288,18 @@ function writeRecord(recordPath: string, record: OwnerRecord): void {
 	}
 }
 
+/** A record's `claimedAt`, re-serialised, or `undefined` when it is not a plain UTC instant. */
+function safeInstant(value: string): string | undefined {
+	if (!ISO_INSTANT.test(value)) return undefined;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
 /** The holder a record names, if it checks out; otherwise `undefined` ("another gjc process"). */
 function verifiedHolder(record: OwnerRecord | undefined, sessionId: string): SessionOwnerHolder | undefined {
 	if (!record || record.sessionId !== sessionId) return undefined;
 	const gjcVersion = SAFE_VERSION.test(record.gjcVersion) ? record.gjcVersion : undefined;
-	const base = { surface: record.surface, pid: record.pid, gjcVersion, claimedAt: record.claimedAt };
+	const base = { surface: record.surface, pid: record.pid, gjcVersion, claimedAt: safeInstant(record.claimedAt) };
 	// A live pid with a matching start incarnation is this host's process even if the host name
 	// changed since the record was written (macOS renames hosts with the network).
 	if (observeProcess(record.pid, record.processIncarnation ?? undefined) === "alive") return base;
@@ -314,6 +330,8 @@ interface SessionOwnerRegistry {
 	unavailable: string | undefined;
 	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
 	counters?: Map<SessionOwnershipCounter, number>;
+	/** Counts already written to the stats database, and whether the exit write is armed. */
+	persisted?: { readonly counts: Map<SessionOwnershipCounter, number>; armed: boolean };
 }
 
 /** Versioned, so two copies of this module in one realm share one registry (design §2.5). */
@@ -337,36 +355,93 @@ export function resetSessionOwnershipForTests(): void {
 	const current = registry();
 	current.unavailable = undefined;
 	current.counters?.clear();
+	current.persisted?.counts.clear();
 	const leaked = [...current.entries.values()];
 	current.entries.clear();
 	for (const entry of leaked) entry.lock.release();
 	if (leaked.length > 0) throw new Error(`${leaked.length} session claim(s) were never released`);
 }
 
-/** Events counted for the observe phase (design §2.9). In-process only until the stats step lands. */
-export type SessionOwnershipCounter =
-	| "release_after_deferred_timeout"
-	| "session_write_without_claim"
+/**
+ * Events counted for the observe phase (design §2.9). Lock-level: `claim_taken` and
+ * `claim_released` count locks, not shared references, so a clean process ends with
+ * taken - released - held_at_exit = 0.
+ */
+export const SESSION_OWNERSHIP_COUNTERS = [
+	"claim_taken",
+	"claim_released",
+	/** A claim refused because another process holds the session. */
+	"claim_conflict",
+	/** A claim skipped by the narrow fail-open policy (design §2.7). */
+	"fail_open",
+	/** Locks this process still held when it exited: a missed release. */
+	"held_at_exit",
+	"release_after_deferred_timeout",
+	"session_write_without_claim",
 	/** Claims still in the claim set of a manager that was garbage-collected: a missed release. */
-	| "claims_abandoned"
+	"claims_abandoned",
 	/** A manager's session id changed outside any transition, so no settle followed it. */
-	| "bind_outside_transition";
+	"bind_outside_transition",
+	/** A claim for a non-current id was added outside any transition: an unrelated settle could drop it. */
+	"target_staged_outside_transition",
+] as const;
+export type SessionOwnershipCounter = (typeof SESSION_OWNERSHIP_COUNTERS)[number];
 
-export function countSessionOwnershipEvent(name: SessionOwnershipCounter): void {
+/**
+ * Count an event. The first count of a process arms one write of its counts to the local stats
+ * database at exit, so a process that never counts (mode `off`) writes nothing.
+ */
+export function countSessionOwnershipEvent(name: SessionOwnershipCounter, by = 1): void {
 	const current = registry();
 	current.counters ??= new Map();
-	current.counters.set(name, (current.counters.get(name) ?? 0) + 1);
+	current.counters.set(name, (current.counters.get(name) ?? 0) + by);
+	current.persisted ??= { counts: new Map(), armed: false };
+	if (current.persisted.armed) return;
+	current.persisted.armed = true;
+	process.once("exit", () => persistSessionOwnershipCounters({ atExit: true }));
 }
 
 /** A snapshot of this process's counts; a name never counted reads 0. */
 export function sessionOwnershipCounters(): Readonly<Record<SessionOwnershipCounter, number>> {
 	const counters = registry().counters;
-	return {
-		release_after_deferred_timeout: counters?.get("release_after_deferred_timeout") ?? 0,
-		claims_abandoned: counters?.get("claims_abandoned") ?? 0,
-		bind_outside_transition: counters?.get("bind_outside_transition") ?? 0,
-		session_write_without_claim: counters?.get("session_write_without_claim") ?? 0,
-	};
+	const snapshot = {} as Record<SessionOwnershipCounter, number>;
+	for (const name of SESSION_OWNERSHIP_COUNTERS) snapshot[name] = counters?.get(name) ?? 0;
+	return snapshot;
+}
+
+/** Where counts go: the stats database, or under a test home only the path a test names. */
+function countersDbPath(): string | undefined {
+	if (SessionOwnershipTestHooks.homeOverride !== undefined) return SessionOwnershipTestHooks.statsDbPath;
+	return getStatsDbPath();
+}
+
+/**
+ * Write the counts not yet written to the local stats database (design §2.9). Synchronous, as it
+ * runs from the `exit` handler, which also counts the locks still held as `held_at_exit`; it runs
+ * after the shutdown cleanup that releases them. Any failure drops the counts: they are local
+ * diagnostics, and never leave the machine.
+ */
+export function persistSessionOwnershipCounters(options: { readonly atExit?: boolean } = {}): void {
+	const current = registry();
+	if (options.atExit && current.entries.size > 0) countSessionOwnershipEvent("held_at_exit", current.entries.size);
+	const counters = current.counters;
+	if (!counters) return;
+	current.persisted ??= { counts: new Map(), armed: false };
+	const persisted = current.persisted.counts;
+	const delta: Partial<Record<SessionOwnershipCounter, number>> = {};
+	for (const [name, count] of counters) {
+		const unwritten = count - (persisted.get(name) ?? 0);
+		if (unwritten > 0) delta[name] = unwritten;
+	}
+	if (Object.keys(delta).length === 0) return;
+	try {
+		const dbPath = countersDbPath();
+		if (dbPath === undefined) return;
+		recordSessionOwnershipCounts(dbPath, delta, { timestamp: Date.now(), gjcVersion: VERSION });
+		for (const [name, count] of counters) persisted.set(name, count);
+	} catch (error) {
+		logger.debug("Session ownership counters were not recorded", { error: String(error) });
+	}
 }
 
 function markUnavailable(code: string | undefined): string {
@@ -414,6 +489,7 @@ class Claim implements SessionOwnerClaim {
 		if (entries.get(this.#sidecar) !== entry) return;
 		// Synchronous from here to the unlock, so no claim in this process can meet its own lock.
 		entries.delete(this.#sidecar);
+		countSessionOwnershipEvent("claim_released");
 		// Remove the record before the lock, so a successor's record is never removed; leave a
 		// record whose nonce is not ours.
 		if (readRecord(entry.recordPath)?.claimNonce === entry.nonce) {
@@ -435,6 +511,11 @@ function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
 // Claim and probe
 // =============================================================================
 
+function failOpen(reason: "unavailable" | "timed_out", code: string | undefined): SessionOwnerClaimResult {
+	countSessionOwnershipEvent("fail_open");
+	return { status: "skipped", reason, code };
+}
+
 /**
  * Claim `sessionId` for this process. A session this process already holds is shared (design D10).
  * Throws `SessionOwnershipError` when the owners directory or the lock fails in a way that must
@@ -446,8 +527,7 @@ export async function claimSessionOwner(
 ): Promise<SessionOwnerClaimResult> {
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
-	if (current.unavailable !== undefined)
-		return { status: "skipped", reason: "unavailable", code: current.unavailable };
+	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
 	let directory: RuntimeLockDirectory;
 	try {
 		directory = prepareRuntimeLockDirectory("session-owners", trustedHome());
@@ -467,8 +547,7 @@ export async function claimSessionOwner(
 		await pending;
 	}
 	// The acquire waited on may have found the platform unavailable.
-	if (current.unavailable !== undefined)
-		return { status: "skipped", reason: "unavailable", code: current.unavailable };
+	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
 	try {
@@ -519,19 +598,21 @@ export async function claimSessionOwner(
 					}
 				}
 				current.entries.set(sidecar, entry);
+				countSessionOwnershipEvent("claim_taken");
 				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
 			}
 			case FileLockAcquireStatus.Held:
+				countSessionOwnershipEvent("claim_conflict");
 				return {
 					status: "held",
 					holder: verifiedHolder(readRecord(path.join(owners, `${key}${RECORD_SUFFIX}`)), sessionId),
 				};
 			case FileLockAcquireStatus.Unavailable:
-				return { status: "skipped", reason: "unavailable", code: markUnavailable(result.code) };
+				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
 				// A stall is not a platform property: skip this claim only, and try again next time.
 				logger.warn("Session ownership claim timed out; this claim is skipped", { code: result.code });
-				return { status: "skipped", reason: "timed_out", code: result.code };
+				return failOpen("timed_out", result.code);
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}
@@ -601,6 +682,121 @@ export async function probeSessionOwner(sessionId: string): Promise<SessionOwner
 	const probe = (await probeSessionOwners([sessionId])).get(sessionId);
 	if (!probe) throw new Error("probe returned no result");
 	return probe;
+}
+
+// =============================================================================
+// Inventory (read-only; design §2.9)
+// =============================================================================
+
+/**
+ * What the record beside a held sidecar says: `verified` (its holder checks out), `holder_gone` (a
+ * process on this host that no longer exists, impossible under a kernel lock and so a bug signal),
+ * `unverified` (alive but unprovable), `absent`, or `invalid` (unreadable, or naming another key).
+ */
+export type SessionOwnerRecordState = "verified" | "holder_gone" | "unverified" | "absent" | "invalid";
+
+/** A held (or unprobeable) sidecar. Every field is checked: records are untrusted input. */
+export interface SessionOwnerSidecar {
+	readonly key: string;
+	readonly state: "held" | "unknown";
+	/** This process holds it. */
+	readonly self: boolean;
+	readonly record: SessionOwnerRecordState;
+	/** The id the record names, only when it maps to this key and is a safe id. */
+	readonly sessionId?: string;
+	readonly holder?: SessionOwnerHolder;
+	/** The pid of a `holder_gone` record. */
+	readonly gonePid?: number;
+}
+
+export interface SessionOwnersInventory {
+	readonly directory: "missing" | "present";
+	readonly sidecars: number;
+	readonly records: number;
+	/** Entries that are neither a sidecar nor a record with a well-formed key. */
+	readonly unrecognized: number;
+	/** Allocated size of the directory and its entries (apparent size where blocks are not reported). */
+	readonly diskBytes: number;
+	readonly held: readonly SessionOwnerSidecar[];
+}
+
+function describeRecord(
+	record: OwnerRecord | undefined,
+	key: string,
+): Omit<SessionOwnerSidecar, "key" | "state" | "self"> {
+	if (!record) return { record: "absent" };
+	if (record.sessionId.length === 0 || sessionOwnerKey(record.sessionId) !== key) return { record: "invalid" };
+	const sessionId = SAFE_ID.test(record.sessionId) ? record.sessionId : undefined;
+	const holder = verifiedHolder(record, record.sessionId);
+	if (holder) return { record: "verified", sessionId, holder };
+	const gone =
+		record.host === os.hostname() && observeProcess(record.pid, record.processIncarnation ?? undefined) === "exited";
+	return gone ? { record: "holder_gone", sessionId, gonePid: record.pid } : { record: "unverified", sessionId };
+}
+
+/**
+ * Every held sidecar under the owners directory, with its checked holder, plus the directory's
+ * counts. Read-only: it probes and reads, never claims, writes, unlinks or creates the directory.
+ * `keys` limits the probes (and the counts) to those sidecars, for a second look at suspects; this
+ * process's own claims, read from the registry, are always included.
+ * Throws `SessionOwnershipError` when the directory fails the append lock's safety checks.
+ */
+export async function inspectSessionOwners(
+	options: { readonly keys?: readonly string[] } = {},
+): Promise<SessionOwnersInventory> {
+	const current = registry();
+	let owners: string | undefined;
+	try {
+		owners = inspectOwnersDirectory();
+	} catch (error) {
+		throw directoryFailure(error);
+	}
+	const self = new Map<string, RegistryEntry>();
+	for (const [sidecar, entry] of current.entries) self.set(path.basename(sidecar, SIDECAR_SUFFIX), entry);
+	const held: SessionOwnerSidecar[] = [...self].map(([key, entry]) => ({
+		key,
+		state: "held",
+		self: true,
+		record: "verified",
+		sessionId: SAFE_ID.test(entry.sessionId) ? entry.sessionId : undefined,
+		holder: selfHolder(entry),
+	}));
+	const counts = { sidecars: 0, records: 0, unrecognized: 0, diskBytes: 0 };
+	if (!owners) return { directory: "missing", ...counts, held };
+	const keys: string[] = [];
+	const names = options.keys ? options.keys.map(key => `${key}${SIDECAR_SUFFIX}`) : [".", ...fs.readdirSync(owners)];
+	for (const name of names) {
+		let isFile = false;
+		try {
+			const stat = fs.lstatSync(path.join(owners, name));
+			counts.diskBytes += stat.blocks ? stat.blocks * 512 : stat.size;
+			isFile = stat.isFile();
+		} catch {}
+		if (name === ".") continue;
+		const entry = classifySessionOwnerEntry(name, isFile);
+		if (entry.kind === "sidecar") {
+			counts.sidecars += 1;
+			if (!self.has(entry.key)) keys.push(entry.key);
+		} else if (entry.kind === "record") counts.records += 1;
+		else counts.unrecognized += 1;
+	}
+	const directory = owners;
+	const inspectOne = async (key: string): Promise<SessionOwnerSidecar | undefined> => {
+		let state: SessionOwnerSidecar["state"] = "unknown";
+		if (current.unavailable === undefined) {
+			const probe = await backend().probe(path.join(directory, `${key}${SIDECAR_SUFFIX}`), NATIVE_BUDGET_MS);
+			if (probe.state === FileLockProbeState.Free) return undefined;
+			if (probe.state === FileLockProbeState.Held) state = "held";
+		}
+		const record = readRecord(path.join(directory, `${key}${RECORD_SUFFIX}`));
+		return { key, state, self: false, ...describeRecord(record, key) };
+	};
+	for (let start = 0; start < keys.length; start += PROBE_CONCURRENCY) {
+		const found = await Promise.all(keys.slice(start, start + PROBE_CONCURRENCY).map(inspectOne));
+		for (const sidecar of found) if (sidecar) held.push(sidecar);
+	}
+	held.sort((a, b) => a.key.localeCompare(b.key));
+	return { directory: "present", ...counts, held };
 }
 
 // =============================================================================

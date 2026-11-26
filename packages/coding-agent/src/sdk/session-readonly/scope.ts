@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type * as natives from "@gajae-code/natives";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { hasFsCode } from "@gajae-code/utils";
+import { isSessionTranscriptFileName } from "./format";
 import type { ManagedFileSnapshot } from "./inspection";
 import {
 	captureManagedFileNoFollow,
@@ -655,7 +656,7 @@ function listDirectoryCandidates(
 	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new Error("unsafe directory");
 	return fs
 		.readdirSync(directory, { withFileTypes: true })
-		.filter(entry => entry.name.endsWith(".jsonl"))
+		.filter(entry => isSessionTranscriptFileName(entry.name))
 		.map(entry => {
 			const filePath = path.join(directory, entry.name);
 			const preflight = preflightCandidate(filePath, scope);

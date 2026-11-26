@@ -26,6 +26,16 @@ export interface SessionOwnershipTestHookSlot {
 	homeOverride?: string;
 	/** Replaces the resolved mode. */
 	mode?: SessionOwnershipMode;
+	/**
+	 * The strict seam (design §2.5): a write the detector flags throws `SessionWriteWithoutClaimError`
+	 * instead of only being logged and counted. Entry-path and control-matrix tests turn it on.
+	 */
+	strictWriteDetection?: boolean;
+	/**
+	 * Where ownership counters are written. While `homeOverride` is set (every test process), counts
+	 * go here or nowhere, so a test never writes the operator's stats database.
+	 */
+	statsDbPath?: string;
 }
 
 /**
