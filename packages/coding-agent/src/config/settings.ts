@@ -7228,7 +7228,8 @@ let globalInitOptions: SettingsOptions | null = null;
 /**
  * The operator's global config.yml as a process that never ran `Settings.init` sees it (an SDK
  * embedding with isolated settings), read once per path. Sync, because sync session factories resolve
- * the ownership mode. A missing, unreadable or malformed file reads as empty, as the loader treats it.
+ * the ownership mode. A missing or malformed file reads as empty, as the loader treats it; an
+ * unreadable file also reads as empty here, where the loader would fail.
  */
 const operatorGlobalConfigs = new Map<string, RawSettings>();
 function operatorGlobalConfig(configPath: string): RawSettings {
