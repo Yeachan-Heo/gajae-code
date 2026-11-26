@@ -25,7 +25,6 @@ const MUTATION_TARGET_SCENARIOS = [
 	{ id: "shell-write-discipline", targetPath: "fixtures/workspace/src/write-target.ts" },
 	{ id: "multi-file-search-edit", targetPath: "fixtures/workspace/src/pkg/alpha.ts" },
 	{ id: "multi-file-search-edit-bad-anchor", targetPath: "fixtures/workspace/src/target.ts" },
-	{ id: "bad-anchor-recovery", targetPath: "fixtures/workspace/src/recover.ts" },
 	{ id: "multi-turn-yield-discipline", targetPath: "fixtures/workspace/src/multi.ts" },
 	{ id: "wrong-target-disambiguation", targetPath: "fixtures/workspace/src/disambiguation/target.ts" },
 	{ id: "malformed-edit-recovery", targetPath: "fixtures/workspace/src/malformed-edit.ts" },

@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage, ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import { computeLineHash, formatSessionDumpText } from "@gajae-code/coding-agent";
+import { formatSessionDumpText } from "@gajae-code/coding-agent";
 import { prompt } from "@gajae-code/utils";
 import { diffLines } from "diff";
 import { formatDirectory } from "./formatter";
@@ -246,7 +246,7 @@ function countEditFailureCategories(runs: TaskRunResult[]): Record<EditFailureCa
 	return counts;
 }
 
-const HL_SUBTYPES = ["set", "set_range", "insert"] as const;
+
 const BENCHMARK_TOOL_NAMES = ["read", "edit", "write", "apply_patch"] as const;
 const EDIT_TOOL_NAMES = ["edit", "apply_patch"] as const;
 
@@ -258,22 +258,7 @@ function isMutationTool(toolName: unknown): boolean {
 	return isEditTool(toolName) || toolName === "write";
 }
 
-function countHashlineEditSubtypes(args: unknown): Record<string, number> {
-	const counts: Record<string, number> = Object.fromEntries(HL_SUBTYPES.map(k => [k, 0]));
-	if (!args || typeof args !== "object") return counts;
-	const edits = (args as { edits?: unknown[] }).edits;
-	if (!Array.isArray(edits)) return counts;
-	for (const edit of edits) {
-		if (!edit || typeof edit !== "object") continue;
-		for (const key of HL_SUBTYPES) {
-			if (key in edit) {
-				counts[key]++;
-				break;
-			}
-		}
-	}
-	return counts;
-}
+
 
 async function collectOriginalFileContents(cwd: string, files: string[]): Promise<Map<string, string>> {
 	const originals = new Map<string, string>();
@@ -286,6 +271,24 @@ async function collectOriginalFileContents(cwd: string, files: string[]): Promis
 		}
 	}
 	return originals;
+}
+
+/**
+ * Compute a 2-character hash of a single line for display in mutation previews.
+ * The hash depends only on the line's content; line index is ignored so anchors
+ * remain stable across line shifts.
+ */
+function computeLineHashForPreview(line: string): string {
+	const hashText = line.replace(/\r/g, "").trimEnd();
+	// Using a simple character sum based hash for display purposes
+	let hash = 0;
+	for (let i = 0; i < Math.min(hashText.length, 20); i++) {
+		hash = ((hash << 5) - hash) + hashText.charCodeAt(i);
+	}
+	const base = 26;
+	const c1 = String.fromCharCode(97 + (Math.abs(hash) % base));
+	const c2 = String.fromCharCode(97 + (Math.abs(Math.floor(hash / base)) % base));
+	return `${c1}${c2}`;
 }
 
 function buildMutationPreviewAgainstOriginal(original: string, current: string): string | null {
@@ -304,7 +307,7 @@ function buildMutationPreviewAgainstOriginal(original: string, current: string):
 
 		if (change.removed) {
 			for (const line of lines) {
-				const hash = computeLineHash(lineNum, line);
+				const hash = computeLineHashForPreview(line);
 				preview.push(`${lineNum}#${hash}|-${line}`);
 				lineNum += 1;
 			}
@@ -312,7 +315,7 @@ function buildMutationPreviewAgainstOriginal(original: string, current: string):
 		}
 
 		for (const line of lines) {
-			const hash = computeLineHash(lineNum, line);
+			const hash = computeLineHashForPreview(line);
 			preview.push(`${lineNum}#${hash}|+${line}`);
 		}
 	}
@@ -523,133 +526,19 @@ async function evaluateMutationIntent(
 	};
 }
 
-type GuidedHashlineEdit =
-	| { set: { ref: string; body: string[] } }
-	| { set_range: { beg: string; end: string; body: string[] } }
-	| { insert: { after: string; body: string[] } };
 
-function buildGuidedHashlineEdits(actual: string, expected: string): GuidedHashlineEdit[] {
-	const changes = diffLines(actual, expected);
-	const actualLines = actual.split("\n");
 
-	let line = 1;
-	let pendingStart = 1;
-	let pendingRemoved: string[] = [];
-	let pendingAdded: string[] = [];
-	const edits: GuidedHashlineEdit[] = [];
 
-	const flush = () => {
-		if (pendingRemoved.length === 0 && pendingAdded.length === 0) {
-			return;
-		}
-
-		if (pendingRemoved.length === 0) {
-			const insertLine = pendingStart;
-			if (pendingAdded.length === 0) return;
-			if (insertLine === 1) {
-				const firstLine = actualLines[0] ?? "";
-				const firstRef = `1#${computeLineHash(1, firstLine)}`;
-				edits.push({
-					set: { ref: firstRef, body: [...pendingAdded, firstLine] },
-				});
-			} else if (insertLine <= actualLines.length) {
-				const afterLine = actualLines[insertLine - 2] ?? "";
-				const afterRef = `${insertLine - 1}#${computeLineHash(insertLine - 1, afterLine)}`;
-				edits.push({
-					insert: { after: afterRef, body: [...pendingAdded] },
-				});
-			} else if (insertLine === actualLines.length + 1 && actualLines.length > 0) {
-				const afterLine = actualLines[actualLines.length - 1] ?? "";
-				const afterRef = `${actualLines.length}#${computeLineHash(actualLines.length, afterLine)}`;
-				edits.push({
-					insert: { after: afterRef, body: [...pendingAdded] },
-				});
-			}
-		} else {
-			const startLine = pendingStart;
-			const endLine = pendingStart + pendingRemoved.length - 1;
-			const startContent = actualLines[startLine - 1] ?? "";
-			const startRef = `${startLine}#${computeLineHash(startLine, startContent)}`;
-			if (startLine === endLine) {
-				edits.push({ set: { ref: startRef, body: [...pendingAdded] } });
-			} else {
-				const endContent = actualLines[endLine - 1] ?? "";
-				const endRef = `${endLine}#${computeLineHash(endLine, endContent)}`;
-				edits.push({
-					set_range: {
-						beg: startRef,
-						end: endRef,
-						body: [...pendingAdded],
-					},
-				});
-			}
-		}
-
-		pendingRemoved = [];
-		pendingAdded = [];
-	};
-
-	for (const change of changes) {
-		const lines = splitLines(change.value);
-		if (!change.added && !change.removed) {
-			flush();
-			line += lines.length;
-			continue;
-		}
-		if (pendingRemoved.length === 0 && pendingAdded.length === 0) {
-			pendingStart = line;
-		}
-		if (change.removed) {
-			pendingRemoved.push(...lines);
-			line += lines.length;
-		}
-		if (change.added) {
-			pendingAdded.push(...lines);
-		}
-	}
-	flush();
-
-	return edits;
-}
 
 async function buildGuidedContext(
-	task: EditTask,
-	cwd: string,
-	expectedDir: string,
+	_task: EditTask,
+	_cwd: string,
+	_expectedDir: string,
 	config: BenchmarkConfig,
 ): Promise<string | null> {
 	if (!config.guided) return null;
-	if (config.editVariant !== "hashline") return null;
-
-	const file = task.metadata?.fileName ?? task.files[0];
-	if (!file) return null;
-
-	const actualPath = path.join(cwd, file);
-	const expectedPath = path.join(expectedDir, file);
-	const actual = await Bun.file(actualPath)
-		.text()
-		.catch(() => null);
-	const expected = await Bun.file(expectedPath)
-		.text()
-		.catch(() => null);
-	if (actual === null || expected === null) return null;
-
-	const edits = buildGuidedHashlineEdits(actual, expected);
-	if (edits.length === 0) return null;
-	if (edits.length > 25) return null;
-
-	const args = { path: file, edits };
-	const argsText = JSON.stringify(args, null, 2);
-	if (argsText.length > 20_000) return null;
-	const metaParts: string[] = [];
-	if (typeof task.metadata?.lineNumber === "number") metaParts.push(`Line: ${task.metadata.lineNumber}`);
-	if (typeof task.metadata?.mutationType === "string") metaParts.push(`Mutation: ${task.metadata.mutationType}`);
-
-	return [
-		`Target file: \`${file}\`${metaParts.length > 0 ? ` (${metaParts.join(", ")})` : ""}.`,
-		"Apply this edit tool call (single call; copy/paste args exactly):",
-		`\`\`\`diff\n${argsText}\n\`\`\``,
-	].join("\n\n");
+	// Guided context generation is no longer supported
+	return null;
 }
 
 function buildInstructions(config: BenchmarkConfig): string {
@@ -808,8 +697,6 @@ export interface TaskRunResult {
 	editFailures: EditFailure[];
 	editWarnings: string[];
 	editAutocorrectCount: number;
-	/** Hashline edit subtype counts (replaceLine, replaceLines, etc.) — only when editVariant is hashline */
-	hashlineEditSubtypes?: Record<string, number>;
 	mutationIntentMatched?: boolean;
 	mutationIntentReason?: string;
 	timeoutTelemetry?: PromptAttemptTelemetry;
@@ -874,8 +761,6 @@ export interface BenchmarkSummary {
 	transportFailureRuns: number;
 	mutationIntentMatchRate?: number;
 	editFailureCategories: Record<EditFailureCategory, number>;
-	/** Hashline edit subtype totals — only when editVariant is hashline */
-	hashlineEditSubtypes?: Record<string, number>;
 }
 
 export interface BenchmarkResult {
@@ -966,7 +851,7 @@ async function runSingleTask(
 		editAutocorrects: 0,
 		totalInputChars: 0,
 	};
-	const hashlineSubtypes: Record<string, number> = Object.fromEntries(HL_SUBTYPES.map(k => [k, 0]));
+
 
 	const logFile = path.join(TMP, `run-${task.id}-${runIndex}.jsonl`);
 	const logEvent = async (event: unknown) => {
@@ -1170,12 +1055,7 @@ async function runSingleTask(
 						if (isEditTool(e.toolName) && e.toolCallId && pendingEdits.has(e.toolCallId)) {
 							const args = pendingEdits.get(e.toolCallId) ?? null;
 							pendingEdits.delete(e.toolCallId);
-							if (config.editVariant === "hashline" && args) {
-								const counts = countHashlineEditSubtypes(args);
-								for (const key of HL_SUBTYPES) {
-									hashlineSubtypes[key] += counts[key];
-								}
-							}
+
 							if (e.isError) {
 								toolStats.editFailures++;
 								const error = await appendNoChangeMutationHint(
@@ -1193,15 +1073,7 @@ async function runSingleTask(
 							} else {
 								toolStats.editSuccesses++;
 								if (e.toolName === "edit") {
-									const warningMessages = extractHashlineWarnings(e.result);
-									if (warningMessages.length > 0) {
-										editWarnings.push(...warningMessages);
-										toolStats.editWarnings += warningMessages.length;
-										if (hasHashlineAutocorrectWarning(warningMessages)) {
-											editAutocorrectCount++;
-											toolStats.editAutocorrects++;
-										}
-									}
+
 								}
 							}
 						}
@@ -1306,7 +1178,7 @@ async function runSingleTask(
 		editFailures,
 		editWarnings,
 		editAutocorrectCount,
-		hashlineEditSubtypes: config.editVariant === "hashline" ? hashlineSubtypes : undefined,
+
 		mutationIntentMatched: mutationIntentValidation?.matched,
 		mutationIntentReason: mutationIntentValidation?.reason,
 		timeoutTelemetry,
@@ -1333,22 +1205,7 @@ function extractToolText(result: unknown): string | null {
 	return null;
 }
 
-function extractHashlineWarnings(result: unknown): string[] {
-	const text = extractToolText(result);
-	if (!text) return [];
-	const marker = "Warnings:\n";
-	const markerIndex = text.indexOf(marker);
-	if (markerIndex === -1) return [];
-	return text
-		.slice(markerIndex + marker.length)
-		.split("\n")
-		.map(line => line.trim())
-		.filter(Boolean);
-}
 
-function hasHashlineAutocorrectWarning(warnings: string[]): boolean {
-	return warnings.some(warning => warning.startsWith("Auto-corrected "));
-}
 
 function extractToolErrorMessage(result: unknown): string {
 	const text = extractToolText(result);
@@ -1796,12 +1653,7 @@ export function buildBenchmarkResult(params: {
 			: undefined;
 	const editFailureCategories = countEditFailureCategories(nonGhostRuns);
 
-	const hashlineEditSubtypes: Record<string, number> | undefined =
-		params.config.editVariant === "hashline"
-			? Object.fromEntries(
-					HL_SUBTYPES.map(key => [key, allRuns.reduce((sum, r) => sum + (r.hashlineEditSubtypes?.[key] ?? 0), 0)]),
-				)
-			: undefined;
+
 
 	const denom = effectiveRuns || 1;
 	const summary: BenchmarkSummary = {
@@ -1844,7 +1696,6 @@ export function buildBenchmarkResult(params: {
 		transportFailureRuns,
 		mutationIntentMatchRate,
 		editFailureCategories,
-		hashlineEditSubtypes,
 	};
 
 	return {

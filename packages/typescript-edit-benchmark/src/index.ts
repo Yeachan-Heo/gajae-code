@@ -122,7 +122,7 @@ Options:
   --tasks <ids>             Comma-separated task IDs to run (default: all)
   --max-tasks <n>            Max tasks to sample (default: 80, 0 = all)
   --fixtures <path>         Fixtures directory or .tar.gz archive (default: built-in)
-  --edit-variant <v>        Edit variant: any string (e.g. replace, patch, hashline, vim, atom, apply_patch), or auto (default: auto)
+  --edit-variant <v>        Edit variant: any string (e.g. replace, patch, vim, atom, apply_patch), or auto (default: auto)
   --edit-fuzzy <bool>       Fuzzy matching: true, false, auto (default: auto)
   --edit-fuzzy-threshold <n> Fuzzy threshold 0-1 or auto (default: auto)
   --auto-format             Auto-format output files after verify (debug only)
@@ -130,7 +130,7 @@ Options:
   --no-guided               Disable guided mode
   --max-attempts <n>        Max prompt attempts per run (default: 1)
   --no-op-retry-limit <n>   Stop after repeated preventable no-op failures (default: 2)
-  --mutation-scope-window <n> Allowed line-distance from mutation target for hashline refs (default: 20)
+
   --max-turns <n>           Max turn_start events per attempt before failing (default: 30)
   --output <file>           Output file (default: run_<model>_<variant>_<fuzzy>_<threshold>_<timestamp>.md)
   --format <fmt>            Output format: markdown, json (default: markdown)

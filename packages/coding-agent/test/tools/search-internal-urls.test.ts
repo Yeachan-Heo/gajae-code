@@ -133,7 +133,7 @@ describe("SearchTool internal URL resolution", () => {
 		expect(text).toContain("data");
 	});
 
-	it("suppresses hashline anchors when searching immutable artifact:// sources", async () => {
+	it("searches immutable artifact:// sources", async () => {
 		const content = "alpha line\nbeta needle line\ngamma line\n";
 		await Bun.write(path.join(artifactsDir, "9.bash.log"), content);
 

@@ -12,7 +12,6 @@ export type ScenarioId =
 	| "grok-sanitize-replay"
 	| "multi-file-search-edit"
 	| "multi-file-search-edit-bad-anchor"
-	| "bad-anchor-recovery"
 	| "tool-json-malformed-recovery"
 	| "multi-turn-yield-discipline"
 	| "timeout-handling"
@@ -96,8 +95,7 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 				requireSuccess: true,
 			};
 
-		case "bad-anchor-recovery":
-			return { targetPath: "fixtures/workspace/src/recover.ts", expectedEditText: "ok", requireSuccess: true };
+
 		case "multi-turn-yield-discipline":
 			return { targetPath: "fixtures/workspace/src/multi.ts", expectedEditText: "-done", requireSuccess: true };
 		case "hard-guard-feedback":
@@ -136,7 +134,6 @@ export const COMPOSER_SCENARIOS_V1_IDS = [
 	"grok-sanitize-replay",
 	"multi-file-search-edit",
 	"multi-file-search-edit-bad-anchor",
-	"bad-anchor-recovery",
 	"tool-json-malformed-recovery",
 	"multi-turn-yield-discipline",
 	"timeout-handling",
@@ -231,17 +228,7 @@ export const COMPOSER_SCENARIOS: ScenarioDefinition[] = [
 		failureClass: "bad-anchor-unrecovered",
 		recovery: true,
 	},
-	{
-		id: "bad-anchor-recovery",
-		description: "Recover from a stale anchor in a single-file edit.",
-		turns: "3-5",
-		fixture: "fixtures/workspace/src/recover.ts",
-		obligation: "failed edit is followed by re-anchor read and successful edit",
-		userPrompt:
-			"Edit fixtures/workspace/src/recover.ts to set STATUS to `ok` using hashline edit. If anchors mismatch, use the rejection message's fresh anchors or re-read before retrying.",
-		failureClass: "bad-anchor-unrecovered",
-		recovery: true,
-	},
+
 	{
 		id: "tool-json-malformed-recovery",
 		description: "Recover after one malformed tool-argument payload.",

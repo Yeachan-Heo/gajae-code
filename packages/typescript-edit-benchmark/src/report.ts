@@ -121,13 +121,7 @@ export function generateReport(result: BenchmarkResult): string {
 	lines.push(`| Total Runs | ${summary.totalRuns} |`);
 	lines.push(`| Successful Runs | ${summary.successfulRuns} |`);
 	lines.push(`| **Task Success Rate** | **${formatRate(successRuns, summary.totalRuns)}** |`);
-	if (config.editVariant === "hashline") {
-		lines.push(
-			`| **Autocorrect-Free Success Rate** | **${formatRate(summary.autocorrectFreeSuccessfulRuns, summary.totalRuns)}** |`,
-		);
-		lines.push(`| Autocorrected Runs | ${formatRate(summary.autocorrectedRuns, summary.totalRuns)} |`);
-		lines.push(`| Edit Autocorrect Rate | ${formatPercent(summary.editAutocorrectRate)} |`);
-	}
+
 	lines.push(`| Verified Rate | ${formatRate(verifiedRuns, summary.totalRuns)} |`);
 	lines.push(`| Edit Tool Usage Rate | ${formatRate(editToolRuns, summary.totalRuns)} |`);
 	lines.push(`| **Edit Success Rate** | **${formatPercent(summary.editSuccessRate)}** |`);
@@ -146,7 +140,7 @@ export function generateReport(result: BenchmarkResult): string {
 	if (typeof summary.mutationIntentMatchRate === "number") {
 		lines.push(`| Mutation Intent Match Rate | ${formatPercent(summary.mutationIntentMatchRate)} |`);
 	}
-	if (config.editVariant === "patch" || config.editVariant === "hashline") {
+	if (config.editVariant === "patch") {
 		lines.push(`| Patch Failure Rate | ${formatRate(totalEditFailures, totalEditAttempts)} |`);
 	}
 	lines.push(`| Tasks All Passing | ${summary.tasksWithAllPassing} |`);
@@ -180,23 +174,7 @@ export function generateReport(result: BenchmarkResult): string {
 	lines.push(`| **Avg Indent Score** | — | **${formatScore(summary.avgIndentScore)}** |`);
 	lines.push("");
 
-	if (summary.hashlineEditSubtypes) {
-		const order = ["set", "set_range", "insert"] as const;
-		const total = order.reduce((sum, key) => sum + (summary.hashlineEditSubtypes?.[key] ?? 0), 0);
-		if (total > 0) {
-			lines.push("### Hashline Edit Subtypes");
-			lines.push("");
-			lines.push("| Operation | Count | % |");
-			lines.push("|-----------|-------|---|");
-			for (const key of order) {
-				const count = summary.hashlineEditSubtypes[key] ?? 0;
-				const pct = formatPercent(count / total);
-				lines.push(`| ${key} | ${count} | ${pct} |`);
-			}
-			lines.push(`| **Total** | **${total}** | 100% |`);
-			lines.push("");
-		}
-	}
+
 
 	const totalCategorizedEditFailures = EDIT_FAILURE_CATEGORIES.reduce(
 		(sum, category) => sum + (summary.editFailureCategories[category] ?? 0),

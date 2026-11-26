@@ -158,7 +158,7 @@ describe("read summary", () => {
 		const tool = new ReadTool(createSession(tmpDir));
 		const linesFirst = await tool.execute("read-summary-compound-lines-raw", { path: `${fixture}:2-4:raw` });
 		const linesFirstText = textOutput(linesFirst);
-		// Verbatim: no hashline anchors and no line-number prefix.
+		// Verbatim: no line-number prefix.
 		expect(linesFirstText).toContain("beta");
 		expect(linesFirstText).toContain("gamma");
 		expect(linesFirstText).toContain("delta");

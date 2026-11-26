@@ -401,7 +401,7 @@ describe("column cap plain-secret cut", () => {
 		expect(dumped.output).toContain("2".repeat(8));
 	});
 
-	test("wrapped ReadTool clips configured secrets but preserves raw and hashline output", async () => {
+	test("wrapped ReadTool clips configured secrets but preserves raw output", async () => {
 		const { settings, root } = await loadSettings(true);
 		const cwd = join(root, "project");
 		const file = join(cwd, "secret.txt");

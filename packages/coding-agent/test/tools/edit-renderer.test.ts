@@ -358,7 +358,7 @@ describe("editToolRenderer", () => {
 		expect(rendered).toContain("Diagnostics available");
 		expect(rendered).not.toContain("0 diagnostics");
 	});
-	it("keeps trailing partial targets and ignores hashline headers after terminators", () => {
+	it("keeps trailing partial targets in partial JSON payload", () => {
 		expect(
 			getEditRequestTargetInventory(
 				{

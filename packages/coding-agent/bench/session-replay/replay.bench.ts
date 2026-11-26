@@ -743,7 +743,7 @@ async function runToolScenario(originMs: number): Promise<HarnessMark[]> {
 
 		await mark("tools:ast_grep", "ast_grep", async () => new AstGrepTool(toolSession).execute("bench-ast-grep", { pat: "return $VALUE", paths: [fixtureRoot] }));
 
-		const modes: EditMode[] = ["replace", "patch", "hashline", "vim", "apply_patch"];
+		const modes: EditMode[] = ["replace", "patch", "vim", "apply_patch"];
 		const editDirectory = path.join(fixtureRoot, "bench-edits");
 		await fs.mkdir(editDirectory, { recursive: true });
 		for (const mode of modes) {
@@ -756,9 +756,6 @@ async function runToolScenario(originMs: number): Promise<HarnessMark[]> {
 				}
 				if (mode === "patch") {
 					return edit.execute(`bench-edit-${mode}`, { path: filePath, edits: [{ diff: "@@ -1 +1 @@\n-export const benchValue = 1;\n+export const benchValueUpdated = 1;" }] });
-				}
-				if (mode === "hashline") {
-					return edit.execute(`bench-edit-${mode}`, { path: filePath, input: `§${filePath}\n»BOF\n// hashline benchmark\n` });
 				}
 				if (mode === "vim") {
 					return edit.execute(`bench-edit-${mode}`, { file: filePath, steps: [{ kbd: ["G", "o"], insert: "// vim benchmark" }] });

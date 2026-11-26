@@ -10,16 +10,6 @@
       ]
     },
     {
-      "scenarioId": "bad-anchor-recovery",
-      "modelRole": "candidate",
-      "model": "grok-build/grok-composer-2.5-fast",
-      "trial": 3,
-      "events": [
-        { "type": "tool_execution_end", "toolName": "edit", "status": "error", "message": "Edit rejected: anchors do not match" },
-        { "type": "scenario_result", "status": "failed" }
-      ]
-    },
-    {
       "scenarioId": "tool-json-malformed-recovery",
       "modelRole": "candidate",
       "model": "grok-build/grok-composer-2.5-fast",

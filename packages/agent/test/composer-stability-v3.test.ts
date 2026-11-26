@@ -8,7 +8,6 @@ const MUTATION_SCENARIOS = [
 	"shell-write-discipline",
 	"multi-file-search-edit",
 	"multi-file-search-edit-bad-anchor",
-	"bad-anchor-recovery",
 	"multi-turn-yield-discipline",
 	"wrong-target-disambiguation",
 	"malformed-edit-recovery",
@@ -371,135 +370,7 @@ describe("composer-stability-v3 trace classifier", () => {
 		expect(contaminated.failureClasses).toContain("contaminated-command");
 	});
 
-	it("distinguishes recovered and unrecovered bad anchors", () => {
-		const recovered = classifyTraceRecord(
-			record({
-				scenarioId: "bad-anchor-recovery",
-				expected: { targetPath: "src/recover.ts", requireSuccess: false },
-				events: [
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "error",
-						message: "Edit rejected: anchors do not match",
-					},
-					{
-						type: "tool_execution_end",
-						toolName: "read",
-						status: "success",
-						arguments: { path: "src/recover.ts" },
-					},
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "success",
-						arguments: { path: "src/recover.ts" },
-					},
-				],
-			}),
-		);
-		const unrecovered = classifyTraceRecord(
-			record({
-				scenarioId: "bad-anchor-recovery",
-				expected: { targetPath: "src/recover.ts", requireSuccess: false },
-				events: [
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "error",
-						message: "Edit rejected: anchors do not match",
-					},
-				],
-			}),
-		);
-		const ambiguousRecovery = classifyTraceRecord(
-			record({
-				scenarioId: "bad-anchor-recovery",
-				expected: { targetPath: "src/recover.ts", requireSuccess: false },
-				events: [
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "error",
-						message: "Edit rejected: anchors do not match",
-					},
-					{ type: "tool_execution_end", toolName: "read", arguments: { path: "src/recover.ts" } },
-					{ type: "tool_execution_end", toolName: "edit", arguments: { path: "src/recover.ts" } },
-				],
-			}),
-		);
-		const rejectionOutputRecovery = classifyTraceRecord(
-			record({
-				scenarioId: "bad-anchor-recovery",
-				expected: { targetPath: "src/recover.ts", requireSuccess: false },
-				events: [
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "error",
-						message: "Edit rejected: anchors do not match\n*1pa|export const marker = 'pending';",
-					},
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "success",
-						arguments: { input: "§src/recover.ts\n≔1pa\nexport const marker = 'done';" },
-					},
-				],
-			}),
-		);
-		const wrongOrderRecovery = classifyTraceRecord(
-			record({
-				scenarioId: "bad-anchor-recovery",
-				expected: { targetPath: "src/recover.ts", requireSuccess: false },
-				events: [
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "error",
-						message: "Edit rejected: anchors do not match",
-					},
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "success",
-						arguments: { path: "src/recover.ts" },
-					},
-					{
-						type: "tool_execution_end",
-						toolName: "read",
-						status: "success",
-						arguments: { path: "src/recover.ts" },
-					},
-				],
-			}),
-		);
-		const mismatchedPathRecovery = classifyTraceRecord(
-			record({
-				scenarioId: "bad-anchor-recovery",
-				expected: { targetPath: "src/recover.ts", requireSuccess: false },
-				events: [
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "error",
-						message: "Edit rejected: anchors do not match",
-						arguments: { path: "src/recover.ts" },
-					},
-					{ type: "tool_execution_end", toolName: "read", status: "success", arguments: { path: "src/other.ts" } },
-					{ type: "tool_execution_end", toolName: "edit", status: "success", arguments: { path: "src/other.ts" } },
-				],
-			}),
-		);
 
-		expect(recovered.status).toBe("passed");
-		expect(rejectionOutputRecovery.status).toBe("passed");
-		expect(unrecovered.status).toBe("failed");
-		expect(unrecovered.failureClasses).toContain("bad-anchor-unrecovered");
-		expect(ambiguousRecovery.failureClasses).toContain("bad-anchor-unrecovered");
-		expect(wrongOrderRecovery.failureClasses).toContain("bad-anchor-unrecovered");
-		expect(mismatchedPathRecovery.failureClasses).toContain("bad-anchor-unrecovered");
-	});
 
 	it("distinguishes recovered and unrecovered malformed tool arguments", () => {
 		const recovered = classifyTraceRecord(
@@ -662,11 +533,11 @@ describe("composer-stability-v3 trace classifier", () => {
 
 		expect(output.mode).toBe("trace");
 		expect(output.p1.applicable).toBe(true);
-		expect(output.p1.candidateFailureCount).toBe(16);
-		expect(output.p1.baselineFailureCount).toBe(3);
-		expect(output.p1.parityDelta).toBe(13);
+		expect(output.p1.candidateFailureCount).toBe(14);
+		expect(output.p1.baselineFailureCount).toBe(2);
+		expect(output.p1.parityDelta).toBe(12);
 		expect(output.p1.passed).toBe(false);
-		expect(output.traceArtifacts?.map(artifact => artifact.records).reduce((sum, count) => sum + count, 0)).toBe(26);
+		expect(output.traceArtifacts?.map(artifact => artifact.records).reduce((sum, count) => sum + count, 0)).toBe(23);
 	});
 
 	it("aggregates JSONL event-stream traces before scoring failures", async () => {

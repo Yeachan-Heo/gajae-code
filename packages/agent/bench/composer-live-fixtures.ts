@@ -48,9 +48,7 @@ export async function seedScenarioWorkdir(workdir: string, scenarioId: ScenarioI
 		case "multi-file-search-edit-bad-anchor":
 			await write(path.join(ws, "src", "target.ts"), "export const STATUS = 'pending';\n");
 			break;
-		case "bad-anchor-recovery":
-			await write(path.join(ws, "src", "recover.ts"), "export const STATUS = 'pending';\n");
-			break;
+
 		case "tool-json-malformed-recovery":
 			await mkdir(transcripts, "tool-json-malformed-recovery");
 			await write(path.join(transcripts, "tool-json-malformed-recovery", "sample.json"), "{}\n");
