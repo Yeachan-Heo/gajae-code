@@ -189,6 +189,41 @@ it("idle close refuses a real foreground bash command", async () => {
 	}
 });
 
+it("idle close sees foreground bash output split across chunks", async () => {
+	if (process.platform === "win32") return;
+	const worker = [
+		"let token = '';",
+		"let runId;",
+		"let input = '';",
+		"const write = response => process.stdout.write(JSON.stringify({ ...response, token }) + '\\n');",
+		"process.stdin.on('data', chunk => {",
+		"input += chunk;",
+		"for (const line of input.split('\\n').slice(0, -1)) {",
+		"const request = JSON.parse(line);",
+		"if (request.type === 'init') { token = request.token; write({ type: 'ready' }); }",
+		"if (request.type === 'run') { runId = request.id; write({ type: 'chunk', id: runId, chunk: 's' }); write({ type: 'chunk', id: runId, chunk: 'tarted' }); }",
+		"if (request.type === 'abort') { write({ type: 'result', id: runId, result: { cancelled: true, timedOut: false } }); write({ type: 'void', id: request.id }); }",
+		"if (request.type === 'close') process.stdout.write(JSON.stringify({ type: 'void', id: request.id, token }) + '\\n', () => process.exit(0));",
+		"}",
+		"input = input.slice(input.lastIndexOf('\\n') + 1);",
+		"});",
+	].join(" ");
+	setShellFactoryForTests(options => new IsolatedShell(options, { workerArgv: [process.execPath, "-e", worker] }));
+	const { session } = createHarness();
+	const entered = Promise.withResolvers<void>();
+	const pending = session.executeBash("printf started; sleep 30", chunk => {
+		if (chunk.includes("started")) entered.resolve();
+	});
+	await Promise.race([entered.promise, pending]);
+	try {
+		expect(session.isBashRunning).toBe(true);
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		session.abortBash();
+		expect((await pending).cancelled).toBe(true);
+	}
+});
+
 it("settles a foreground bash command when its worker exits before output", async () => {
 	if (process.platform === "win32") return;
 	const worker = [
