@@ -107,7 +107,7 @@ import {
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
 import { type SessionOwnerSurface, sessionOwnerSurface, setSessionOwnerSurface } from "./session/session-ownership";
-import { sessionOwnershipModeFor } from "./session/session-ownership-mode";
+import { dropProjectSuppliedSessionOwnershipOverride, sessionOwnershipModeFor } from "./session/session-ownership-mode";
 import { resolveStartupAuthConfig } from "./session/startup-auth-config";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
 import {
@@ -2143,6 +2143,7 @@ export async function runRootCommand(
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
 	dropProjectSuppliedHerdrBinPath(process.env);
+	dropProjectSuppliedSessionOwnershipOverride(process.env, startupProjectEnvSnapshot());
 	const parsedArgs = parsed;
 	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;

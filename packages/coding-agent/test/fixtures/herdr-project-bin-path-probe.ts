@@ -110,6 +110,10 @@ if (child.status !== 0) {
 	process.stderr.write(child.stderr ?? "child env probe failed\n");
 	process.exit(1);
 }
+const ownership = spawnSync("/bin/sh", ["-c", 'printf %s "$GJC_SESSION_OWNERSHIP"'], {
+	env: process.env,
+	encoding: "utf8",
+});
 process.stdout.write(
-	`RESULT payload=${payload ? 1 : 0} allowed=${allowed ? 1 : 0} child=${JSON.stringify(child.stdout ?? "")}\n`,
+	`RESULT payload=${payload ? 1 : 0} allowed=${allowed ? 1 : 0} ownership=${JSON.stringify(ownership.stdout ?? "")} child=${JSON.stringify(child.stdout ?? "")}\n`,
 );

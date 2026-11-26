@@ -87,6 +87,20 @@ export function trustedSessionOwnershipOverride(
 }
 
 /**
+ * Remove a project-supplied `GJC_SESSION_OWNERSHIP` from `env` before it reaches a child. A child in
+ * another directory (a `--tmux --worktree` launch runs `--no-env-file` there) checks provenance against
+ * that directory's `.env`, so it would trust this project's value. Called beside the `HERDR_BIN_PATH`
+ * drop, with the same startup snapshot.
+ */
+export function dropProjectSuppliedSessionOwnershipOverride(
+	env: NodeJS.ProcessEnv,
+	snapshot: ProjectEnvSnapshot,
+): void {
+	if (env[SESSION_OWNERSHIP_ENV] === undefined) return;
+	if (trustedCoordinatorEnv(SESSION_OWNERSHIP_ENV, env, snapshot) === undefined) delete env[SESSION_OWNERSHIP_ENV];
+}
+
+/**
  * Bun loads the project `.env` from the launch directory, so provenance is checked there. A launch
  * directory that is already gone leaves no snapshot to check against, and the override is ignored.
  */
