@@ -116,12 +116,6 @@ trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 129' HUP
 
-# Bash's job-spec kill blocks SIGCHLD and skips exited pipeline members. A saved
-# PID is only a wait-status key, never signal authority. There is exactly one
-# asynchronous job here; do not launch another until it has been waited for.
-# Non-Bash shells skip this optional flow (dash's job kill lacks this guarantee).
-# Signals in the asynchronous launch/assignment gap are latched and replayed.
-
 remember_tmp() {
     TMP_FILES="${TMP_FILES}$1
 "
@@ -803,8 +797,6 @@ install_binary() {
 
     echo ""
     echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"
-
-
 
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) echo "Run 'gjc' to get started!" ;;
