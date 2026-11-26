@@ -2083,7 +2083,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			const blockText = collectedLines.join("\n");
-			blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddHashLines, shouldAddLineNumbers));
+			blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddLineNumbers));
 		}
 
 		let outputText = blocks.join("\n\n…\n\n");
@@ -3412,7 +3412,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const shouldAddLineNumbers = displayMode.lineNumbers;
 
 		const rawText = region.lines.join("\n");
-		const formattedText = formatTextWithMode(rawText, region.startLine, shouldAddHashLines, shouldAddLineNumbers);
+		const formattedText = formatTextWithMode(rawText, region.startLine, shouldAddLineNumbers);
 
 		const details: ReadToolDetails = {
 			resolvedPath: entry.absolutePath,

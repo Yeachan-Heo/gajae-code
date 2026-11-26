@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { EditTool, getFileReadCache, computeLineHash } from "@gajae-code/coding-agent/edit";
+import { EditTool, getFileReadCache } from "@gajae-code/coding-agent/edit";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
@@ -613,13 +613,6 @@ describe("read truncation golden harness", () => {
 		expect(actualGoldenFiles("invariant").size).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 	});
 
-	it("keeps hashline golden variants anchored and distinct from plain variants", () => {
-		const hashline = JSON.parse(fs.readFileSync(goldenPath("changed", "local-bare-tail", "hl"), "utf8")) as Captured;
-		const plain = JSON.parse(fs.readFileSync(goldenPath("changed", "local-bare-tail", "plain"), "utf8")) as Captured;
-		expect(hashline.text).toMatch(/(?:^|\n)\d+[a-z]{2}\|/);
-		expect(plain.text).not.toMatch(/(?:^|\n)\d+[a-z]{2}\|/);
-		expect(hashline.text).not.toBe(plain.text);
-	});
 
 	it("keeps archive range fixtures above line and byte budgets", () => {
 		for (const variant of ["hl", "plain"] as const) {
@@ -636,63 +629,6 @@ describe("read truncation golden harness", () => {
 		}
 	});
 
-	it("round-trips tail hashline anchors through ReadTool, cache, and EditTool", async () => {
-		const relativePath = "anchor-roundtrip.txt";
-		const absolutePath = path.join(fixture.root, relativePath);
-		const sourceLines = Array.from({ length: 20 }, () => "duplicate");
-		fs.writeFileSync(absolutePath, sourceLines.join("\n"));
-
-		const settings = Settings.isolated({
-			"read.summarize.enabled": false,
-			"read.receiptBudgetLines": 6,
-			"read.receiptBudgetBytes": 1024,
-			readLineNumbers: false,
-		});
-		const session = createSession(fixture.root, settings, fixture.artifactDir);
-		session.enableLsp = false;
-		const previousPiVariant = Bun.env.PI_EDIT_VARIANT;
-		const previousGjcVariant = Bun.env.GJC_EDIT_VARIANT;
-		Bun.env.PI_EDIT_VARIANT = "hashline";
-		Bun.env.GJC_EDIT_VARIANT = "hashline";
-
-		try {
-			const readResult = (await new ReadTool(session).execute("anchor-roundtrip-read", {
-				path: relativePath,
-			})) as ReadResult;
-			const anchors = parseHashlineAnchors(textOf(readResult));
-			expect(anchors.map(anchor => anchor.line)).toEqual([15, 16, 17, 18, 19, 20]);
-			expect(anchors.every(anchor => anchor.content === "duplicate")).toBe(true);
-			expect(anchors.every(anchor => computeLineHash(anchor.line, anchor.content) === anchor.hash)).toBe(true);
-
-			const snapshot = getFileReadCache(session).get(absolutePath);
-			expect(snapshot).not.toBeNull();
-			expect([...snapshot!.lines.entries()]).toEqual(anchors.map(anchor => [anchor.line, anchor.content]));
-
-			await Settings.init({ inMemory: true, cwd: fixture.root });
-
-			const editTool = new EditTool(session);
-			const targets = [anchors[0]!, anchors[2]!, anchors.at(-1)!];
-			const expectedChanges = new Map<number, string>();
-			for (const target of targets) {
-				const replacement = `edited-${target.line}`;
-				expectedChanges.set(target.line, replacement);
-				await editTool.execute("anchor-roundtrip-edit", {
-					input: [`§${relativePath}`, `≔${target.line}${target.hash}`, replacement].join("\n"),
-				});
-
-				const diskLines = fs.readFileSync(absolutePath, "utf8").split("\n");
-				expect(diskLines[target.line - 1]).toBe(replacement);
-				for (const [lineNumber, line] of diskLines.entries()) {
-					expect(line).toBe(expectedChanges.get(lineNumber + 1) ?? "duplicate");
-				}
-			}
-		} finally {
-			if (previousPiVariant === undefined) delete Bun.env.PI_EDIT_VARIANT;
-			else Bun.env.PI_EDIT_VARIANT = previousPiVariant;
-			if (previousGjcVariant === undefined) delete Bun.env.GJC_EDIT_VARIANT;
-			else Bun.env.GJC_EDIT_VARIANT = previousGjcVariant;
-		}
-	});
 
 	it("rejects phase-1 entries when a phase-0 runner attempts to execute them", () => {
 		const phaseOne = manifest.find(entry => entry.phase === 1);

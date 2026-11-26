@@ -7,7 +7,6 @@ import {
 	computeEditDiff,
 	DEFAULT_FUZZY_THRESHOLD,
 	findMatch,
-	formatLineHash,
 } from "@gajae-code/coding-agent/edit";
 
 describe("findMatch", () => {

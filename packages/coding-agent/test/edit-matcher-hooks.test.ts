@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { type EditMode, EditTool, computeLineHash } from "@gajae-code/coding-agent/edit";
+import { type EditMode, EditTool } from "@gajae-code/coding-agent/edit";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 

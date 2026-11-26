@@ -54,33 +54,19 @@ describe("resolveFileDisplayMode", () => {
 			undefined,
 		]) {
 			const mode = resolveFileDisplayMode(makeSession({ model }));
-			expect(mode.hashLines).toBe(false);
 			expect(mode.lineNumbers).toBe(false);
 		}
 	});
 
 	test("readLineNumbers: true enables line numbers", () => {
 		const mode = resolveFileDisplayMode(makeSession({ model: "openai/gpt-5.4", readLineNumbers: true }));
-		expect(mode.hashLines).toBe(false);
 		expect(mode.lineNumbers).toBe(true);
 	});
 
-	test("hashLines is always false (hashline mode removed)", () => {
-		for (const options of [
-			{},
-			{ model: "openai/gpt-5.4" },
-			{ model: "zai/glm-4.7" },
-			{ readLineNumbers: true },
-			{ editMode: "replace" },
-		]) {
-			const mode = resolveFileDisplayMode(makeSession(options as Parameters<typeof makeSession>[0]));
-			expect(mode.hashLines).toBe(false);
-		}
-	});
+
 
 	test("raw reads suppress line numbers", () => {
 		const raw = resolveFileDisplayMode(makeSession({ model: "zai/glm-4.7", readLineNumbers: true }), { raw: true });
-		expect(raw.hashLines).toBe(false);
 		expect(raw.lineNumbers).toBe(false);
 	});
 
@@ -89,7 +75,6 @@ describe("resolveFileDisplayMode", () => {
 			makeSession({ model: "zai/glm-4.7", readLineNumbers: true }),
 			{ immutable: true },
 		);
-		expect(immutable.hashLines).toBe(false);
 		expect(immutable.lineNumbers).toBe(false);
 	});
 });
