@@ -408,6 +408,43 @@ export interface LaunchHeadlessResult {
 	createdUserDataDir?: string;
 }
 
+/**
+ * Attempt to remove a profile directory with bounded retry on transient EBUSY errors.
+ * Chrome may still hold files when launch fails or during disconnection, so retry
+ * with brief delays before giving up. Logs removal attempts and errors but does not
+ * throw to avoid masking the caller's original error.
+ */
+async function cleanupProfileDirWithRetry(dir: string, maxRetries = 10, delay = 50): Promise<void> {
+	let lastErr: Error | undefined;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+			if (attempt > 0) {
+				logger.debug("Successfully cleaned up headless profile dir after retry", {
+					dir,
+					attempt,
+				});
+			}
+			return;
+		} catch (err) {
+			lastErr = err as Error;
+			const isEBUSY = lastErr.message.includes("EBUSY");
+			if (!isEBUSY || attempt === maxRetries) {
+				// Not a transient EBUSY, or we've exhausted retries. Log and move on.
+				logger.debug("Failed to clean up headless profile dir", {
+					dir,
+					attempt,
+					error: lastErr.message,
+					transient: isEBUSY,
+				});
+				return;
+			}
+			// Transient EBUSY: wait a bit and retry
+			await Bun.sleep(delay);
+		}
+	}
+}
+
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
 	const initialViewport = {
@@ -474,18 +511,12 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		});
 		return { browser, createdUserDataDir };
 	} catch (err) {
-		// If launch fails and we created the userDataDir, clean it up.
-		// This prevents leaving orphaned dirs when launch fails.
+		// If launch fails and we created the userDataDir, attempt cleanup with retry.
+		// Chrome may still be starting up and holding files when launch fails,
+		// so a transient EBUSY error should trigger a bounded retry, not abandon cleanup.
+		// Preserve the original launch error regardless of cleanup outcome.
 		if (createdUserDataDir) {
-			try {
-				fs.rmSync(createdUserDataDir, { recursive: true, force: true });
-			} catch (cleanupErr) {
-				// Log but don't mask the original launch error.
-				logger.debug("Failed to clean up headless profile dir after launch failure", {
-					dir: createdUserDataDir,
-					error: (cleanupErr as Error).message,
-				});
-			}
+			await cleanupProfileDirWithRetry(createdUserDataDir);
 		}
 		throw err;
 	}

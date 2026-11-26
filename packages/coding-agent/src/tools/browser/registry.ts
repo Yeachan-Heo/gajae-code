@@ -490,28 +490,37 @@ export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolea
  * Delete the warm-up dir this module created for `handle`, if any.
  *
  * The path comes from `ownedWarmupDirs`, never from the caller, so recursive deletion
- * can only ever target a dir this registry made. The entry is consumed first, making a
- * second call a no-op even if disposal runs twice.
+ * can only ever target a dir this registry made. The entry is consumed only after
+ * removal succeeds, ensuring a failed removal can be retried.
  *
  * Best-effort: a leftover temp dir is preferable to a teardown that throws.
  */
 function removeOwnedWarmupDir(handle: BrowserHandle): void {
 	const dir = ownedWarmupDirs.get(handle);
 	if (dir === undefined) return;
-	ownedWarmupDirs.delete(handle);
-	removeWarmupDir(dir);
+	// Only delete the entry after successful removal. If removal fails with EBUSY
+	// (Chrome still holding files), the entry remains for a later cleanup attempt
+	// when the process exits.
+	if (removeWarmupDir(dir)) {
+		ownedWarmupDirs.delete(handle);
+	}
 }
 
-/** Delete a dir this module created. Callers must have proven ownership first. */
-function removeWarmupDir(dir: string | undefined): void {
-	if (!dir) return;
+/** Delete a dir this module created. Callers must have proven ownership first.
+ * Returns true if removal succeeded or dir was not present, false if removal failed. */
+function removeWarmupDir(dir: string | undefined): boolean {
+	if (!dir) return true;
 	try {
 		fs.rmSync(dir, { recursive: true, force: true });
+		return true;
 	} catch (err) {
+		const isEBUSY = (err as Error).message.includes("EBUSY");
 		logger.debug("Failed to remove Chrome profile warm-up dir", {
 			dir,
 			error: (err as Error).message,
+			transient: isEBUSY,
 		});
+		return false;
 	}
 }
 
