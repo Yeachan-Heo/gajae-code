@@ -68,6 +68,8 @@ export interface HomeIsolationInput {
 	env: Record<string, string | undefined>;
 	/** The operator's real home and its aliases, resolved without trusting `$HOME`. */
 	realHomeAliases: readonly string[];
+	/** Whether the filesystem folds case, as the safe-cleanup world decided. */
+	caseInsensitive?: boolean;
 	platform?: NodeJS.Platform;
 }
 
@@ -89,9 +91,10 @@ export function decideHomeIsolation(input: HomeIsolationInput): HomeIsolationDec
 	} catch {
 		// A home that does not exist yet cannot alias the real one through a symlink.
 	}
-	const real = new Set(input.realHomeAliases.map(alias => path.resolve(alias)));
+	const key = (value: string): string => (input.caseInsensitive ? value.toLowerCase() : value);
+	const real = new Set(input.realHomeAliases.map(alias => key(path.resolve(alias))));
 	for (const candidate of candidates) {
-		if (real.has(candidate)) return { action: "isolate", reason: "real-home" };
+		if (real.has(key(candidate))) return { action: "isolate", reason: "real-home" };
 	}
 	return { action: "honor", home };
 }

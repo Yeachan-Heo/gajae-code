@@ -230,8 +230,10 @@ try {
 // records in that sink were ACP prompt-watchdog fixture output, which makes the
 // operator's own log useless for diagnosing real failures.
 //
-// Setting this on `process.env` also reaches spawned child fixtures, which is
-// intended: they inherit the same isolated sink.
+// Setting this on `process.env` reaches children spawned through
+// `node:child_process`, `Bun.$`, or an env built from `{ ...process.env }`, which
+// is intended: they inherit the same isolated sink. A `Bun.spawn` without an
+// `env` option does not: it gets the environment this process started with.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
 // on log content), so that is honored untouched when the child replaced its
@@ -305,9 +307,11 @@ process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
 // log-dir and ownership pins instead.
 //
 // FAIL CLOSED: without a temp home, children would use the live one.
+const safeCleanupWorld = getDefaultSafeCleanupWorld();
 const homeIsolation = decideHomeIsolation({
 	env: process.env,
-	realHomeAliases: getDefaultSafeCleanupWorld().homeAliases,
+	realHomeAliases: safeCleanupWorld.homeAliases,
+	caseInsensitive: safeCleanupWorld.caseInsensitive,
 });
 if (homeIsolation.action === "isolate") {
 	try {

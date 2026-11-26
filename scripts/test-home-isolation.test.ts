@@ -59,6 +59,18 @@ describe("test HOME isolation decision", () => {
 		expect(decideHomeIsolation({ env, realHomeAliases, platform: "linux" })).toEqual(expected);
 	});
 
+	it("matches the real home case-insensitively only where the filesystem folds case", () => {
+		const env = { HOME: "/users/OPERATOR", [TEST_ISOLATED_HOME_ENV]: "/users/OPERATOR" };
+		expect(decideHomeIsolation({ env, realHomeAliases: [real], caseInsensitive: true, platform: "linux" })).toEqual({
+			action: "isolate",
+			reason: "real-home",
+		});
+		expect(decideHomeIsolation({ env, realHomeAliases: [real], caseInsensitive: false, platform: "linux" })).toEqual({
+			action: "honor",
+			home: "/users/OPERATOR",
+		});
+	});
+
 	it("treats a symlink to the real home as the real home", async () => {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-home-alias-")));
 		try {
