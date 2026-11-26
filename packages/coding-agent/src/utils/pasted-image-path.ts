@@ -373,7 +373,8 @@ function findJsonStringEnd(text: string, startCol: number): number | null {
  */
 function findSourceValueSpans(line: string): Array<{ start: number; end: number }> {
 	const spans: Array<{ start: number; end: number }> = [];
-	const sourcePattern = /source=/g;
+	// The editor writes `source=` as its own field after a placeholder, so it must start a token.
+	const sourcePattern = /(?<![^\s])source=/g;
 	while (true) {
 		const match = sourcePattern.exec(line);
 		if (!match) return spans;

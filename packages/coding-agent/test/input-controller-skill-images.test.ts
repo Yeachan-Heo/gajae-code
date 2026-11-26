@@ -294,7 +294,27 @@ describe("InputController skill command images", () => {
 		controller.setupEditorSubmitHandler();
 		await stub.editor.onSubmit?.("/skill:test-skill use [image 1]");
 
-		expect(stub.customMessages.flatMap(message => imageBlocks(message.content))).not.toContainEqual(OTHER_IMAGE);
+		const sentImages = stub.customMessages.flatMap(message => imageBlocks(message.content));
+		expect(sentImages).not.toContainEqual(OTHER_IMAGE);
+	});
+
+	it("keeps the selected image when a text-only extension rewrite still names it", async () => {
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ text: "/skill:test-skill rewritten [image 1]" })),
+		};
+		const stub = createContext({
+			skillCommands,
+			pendingImages: [IMAGE, OTHER_IMAGE],
+			extensionRunner,
+		});
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.("/skill:test-skill use [image 1]");
+
+		const sentImages = stub.customMessages.flatMap(message => imageBlocks(message.content));
+		expect(sentImages).toEqual([IMAGE]);
 	});
 
 	it("does not read a placeholder inside a source path as an image reference", async () => {
@@ -345,6 +365,68 @@ describe("InputController skill command images", () => {
 		await controller.handleFollowUp();
 
 		expect(stub.ctx.handleBtwFollowUp).not.toHaveBeenCalled();
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a newer draft and image when an input extension is slow on the follow-up shortcut", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("older [image 1]");
+		const submitted = controller.handleFollowUp();
+		const newerImage = { ...IMAGE, data: "NEWER" };
+		stub.ctx.pendingImages = [...stub.ctx.pendingImages, newerImage];
+		stub.ctx.editor.setText("newer draft [image 2]");
+		release.resolve();
+		await submitted;
+
+		expect(stub.ctx.editor.getText()).toBe("newer draft [image 2]");
+		expect(stub.ctx.pendingImages).toContainEqual(newerImage);
+	});
+
+	it("keeps a newer draft when a slow extension precedes a queued skill command", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({
+			skillCommands,
+			pendingImages: [IMAGE],
+			streaming: true,
+			realEditor: true,
+			extensionRunner,
+		});
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		const submitted = controller.handleFollowUp();
+		stub.ctx.editor.setText("newer draft");
+		release.resolve();
+		await submitted;
+
+		expect(stub.ctx.editor.getText()).toBe("newer draft");
+		expect(imageBlocks(stub.customMessages[0]?.content)).toEqual([IMAGE]);
+	});
+
+	it("still reads a placeholder in an unrelated attribute such as resource=", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [], realEditor: true });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.('look at resource="[image 1]"');
+
+		expect(stub.prompts).toHaveLength(0);
 		expect(stub.showWarning).toHaveBeenCalledTimes(1);
 	});
 });

@@ -1736,6 +1736,7 @@ export class InputController {
 		options?: ComposerSubmissionOptions,
 		pendingImages: InteractiveModeContext["pendingImages"] = this.ctx.pendingImages,
 		effectiveImages: InteractiveModeContext["pendingImages"] = pendingImages,
+		draftText?: string,
 	): Promise<boolean> {
 		const invocations = parseSkillInvocations(text, this.ctx.skillCommands ?? new Map());
 		if (invocations.length === 0) return false;
@@ -1750,7 +1751,10 @@ export class InputController {
 		const ownsComposer = !options || this.#canModifyComposer(options);
 		if (ownsComposer) {
 			this.ctx.editor.addToHistory(text);
-			this.ctx.editor.setText("");
+			// Without composer options this is the queued follow-up shortcut, which awaits input
+			// extensions first: the user may have typed something newer meanwhile, so only clear
+			// the editor while it still holds this submission's draft.
+			if (options || this.ctx.editor.getText().trim() === (draftText ?? text)) this.ctx.editor.setText("");
 		}
 		try {
 			for (let index = 0; index < invocations.length; index += 1) {
@@ -1864,8 +1868,7 @@ export class InputController {
 				});
 				this.ctx.ui.requestRender();
 			}
-			this.ctx.editor.setText("");
-			if (this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
+			this.#clearFollowUpComposer(draft, pendingImages);
 			return;
 		}
 		const text = extensionResult.text;
@@ -1878,8 +1881,7 @@ export class InputController {
 		// expanding a skill and starting a competing model turn.
 		if (this.ctx.session.isBashRunning || this.ctx.session.isEvalRunning) {
 			this.ctx.editor.addToHistory(text);
-			this.ctx.editor.setText("");
-			this.ctx.pendingImages = [];
+			this.#clearFollowUpComposer(draft, pendingImages);
 			await this.ctx.withLocalSubmission(
 				text,
 				() =>
@@ -1896,15 +1898,23 @@ export class InputController {
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// explicit queue shortcuts route them as `followUp`.
-		if (await this.#invokeSkillCommand(text, "followUp", undefined, pendingImages, extensionResult.effectiveImages)) {
+		if (
+			await this.#invokeSkillCommand(
+				text,
+				"followUp",
+				undefined,
+				pendingImages,
+				extensionResult.effectiveImages,
+				draft,
+			)
+		) {
 			return;
 		}
 
 		this.maybeGenerateSessionTitle(text);
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
-			this.ctx.editor.setText("");
-			this.ctx.pendingImages = [];
+			this.#clearFollowUpComposer(draft, pendingImages);
 			await this.ctx.withLocalSubmission(
 				text,
 				() =>
@@ -1922,8 +1932,7 @@ export class InputController {
 
 		// Not streaming — just submit normally
 		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
-		this.ctx.pendingImages = [];
+		this.#clearFollowUpComposer(draft, pendingImages);
 		await this.ctx.withLocalSubmission(
 			text,
 			() => (images ? this.ctx.session.prompt(text, { images }) : this.ctx.session.prompt(text)),
@@ -2231,6 +2240,16 @@ export class InputController {
 		} else if (text !== deletion.afterText) {
 			this.#imagePlaceholderDeletionUndo = undefined;
 		}
+	}
+
+	/**
+	 * Clears the composer after a queued follow-up, but only what still belongs to it. An input
+	 * extension can take a while, and the user may type a new draft or attach another image in
+	 * the meantime; that newer state must survive.
+	 */
+	#clearFollowUpComposer(draft: string, pendingImages: InteractiveModeContext["pendingImages"]): void {
+		if (this.ctx.editor.getText().trim() === draft) this.ctx.editor.setText("");
+		if (this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
 	}
 
 	/**
