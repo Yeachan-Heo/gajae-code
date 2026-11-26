@@ -10,16 +10,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
+import { CustomEditor } from "@gajae-code/coding-agent/modes/components/custom-editor";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { TempDir } from "@gajae-code/utils";
+import { defaultEditorTheme } from "../../tui/test/test-themes";
 
 const IMAGE = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
 const OTHER_IMAGE = { type: "image" as const, data: "BBBB", mimeType: "image/png" };
 
 type PendingImages = InteractiveModeContext["pendingImages"];
 
-function createContext(opts: { skillCommands: Map<string, Skill>; pendingImages: PendingImages; streaming?: boolean }) {
+function createContext(opts: {
+	skillCommands: Map<string, Skill>;
+	pendingImages: PendingImages;
+	streaming?: boolean;
+	realEditor?: boolean;
+	extensionRunner?: unknown;
+}) {
 	const customMessages: { content: unknown }[] = [];
 	const prompts: { text: string; options: { images?: PendingImages } | undefined }[] = [];
 	const followUps: { text: string; images: PendingImages | undefined }[] = [];
@@ -28,7 +36,7 @@ function createContext(opts: { skillCommands: Map<string, Skill>; pendingImages:
 	// The real editor reports onChange("") when its buffer is emptied, which defers
 	// a pendingImages reset to a microtask. A controller that reads the images
 	// after an await would find them already gone.
-	const editor = {
+	const stubEditor = {
 		setText(text: string) {
 			if (text.length > 0) return;
 			const images = ctx.pendingImages;
@@ -40,9 +48,10 @@ function createContext(opts: { skillCommands: Map<string, Skill>; pendingImages:
 		addToHistory: vi.fn(),
 		onSubmit: undefined as undefined | ((text: string) => Promise<void>),
 	};
+	const editor = opts.realEditor ? new CustomEditor(defaultEditorTheme) : stubEditor;
 
 	const ctx = {
-		editor,
+		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: { requestRender: vi.fn() },
 		skillCommands: opts.skillCommands,
 		session: {
@@ -51,7 +60,7 @@ function createContext(opts: { skillCommands: Map<string, Skill>; pendingImages:
 			isCompacting: false,
 			isBashRunning: false,
 			isEvalRunning: false,
-			extensionRunner: undefined,
+			extensionRunner: opts.extensionRunner,
 			enqueueCustomMessageDisplay: vi.fn(() => "sk-test-0"),
 			sendCustomMessage: vi.fn(async (message: { content: unknown }) => {
 				customMessages.push({ content: message.content });
@@ -82,7 +91,7 @@ function createContext(opts: { skillCommands: Map<string, Skill>; pendingImages:
 		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, customMessages, prompts, followUps, showWarning };
+	return { ctx, editor: editor as typeof stubEditor, customMessages, prompts, followUps, showWarning };
 }
 
 function imageBlocks(content: unknown): unknown[] {
@@ -174,5 +183,34 @@ describe("InputController skill command images", () => {
 
 		const sent = stub.prompts[0];
 		expect(sent?.options?.images).toEqual([IMAGE]);
+	});
+
+	it("sends the images an input extension substituted, not the originals", async () => {
+		const redacted = { ...IMAGE, data: "REDACTED" };
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => ({ images: [redacted] })),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], extensionRunner });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.("/skill:test-skill look at [image 1]");
+
+		expect(imageBlocks(stub.customMessages[0]?.content)).toEqual([redacted]);
+	});
+
+	it("keeps the draft in the composer when the real editor submits an unattached placeholder", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [], realEditor: true });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		const draft = "/skill:test-skill look at [image 1]";
+		stub.ctx.editor.setText(draft);
+		stub.ctx.editor.handleInput("\r");
+		await Bun.sleep(20);
+
+		expect(stub.customMessages).toHaveLength(0);
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+		expect(stub.ctx.editor.getText()).toBe(draft);
 	});
 });

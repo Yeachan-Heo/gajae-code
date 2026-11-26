@@ -1107,7 +1107,11 @@ export class InputController {
 
 		const runner = this.ctx.session.extensionRunner;
 		const pendingImages = this.ctx.pendingImages;
+		const submittedText = text;
 		let inputImages = this.#visiblePendingImagesForText(text);
+		// What `[image N]` resolves to after input extensions ran. `pendingImages` stays the
+		// original snapshot: it only decides whether this submission still owns the composer.
+		let effectiveImages = pendingImages;
 
 		if (runner?.hasHandlers("input")) {
 			const result = await runner.emitInput(text, inputImages, "interactive");
@@ -1134,6 +1138,7 @@ export class InputController {
 			}
 			if (result?.images !== undefined) {
 				inputImages = result.images;
+				effectiveImages = this.#alignReplacedImages(submittedText, pendingImages, result.images);
 			}
 		}
 
@@ -1153,14 +1158,16 @@ export class InputController {
 			text = slashResult;
 		}
 
-		if (this.#rejectUnattachedImageReferences(text, pendingImages)) return;
+		if (this.#rejectUnattachedImageReferences(text, effectiveImages, composer)) return;
 
 		// Handle skill commands (/skill:name [args]). While streaming, Enter
 		// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
 		// runs after it completes (matches the free-text Enter semantics applied
 		// a few lines below at the streaming branch). Explicit queue shortcuts
 		// route through `handleFollowUp` and dispatch as `followUp`.
-		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer, pendingImages)) {
+		if (
+			await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer, pendingImages, effectiveImages)
+		) {
 			return;
 		}
 
@@ -1741,6 +1748,7 @@ export class InputController {
 		streamingBehavior: "steer" | "followUp",
 		options?: ComposerSubmissionOptions,
 		pendingImages: InteractiveModeContext["pendingImages"] = this.ctx.pendingImages,
+		effectiveImages: InteractiveModeContext["pendingImages"] = pendingImages,
 	): Promise<boolean> {
 		const invocations = parseSkillInvocations(text, this.ctx.skillCommands ?? new Map());
 		if (invocations.length === 0) return false;
@@ -1749,7 +1757,7 @@ export class InputController {
 		// before its first await: clearing the editor makes onChange("") schedule a
 		// microtask that empties `ctx.pendingImages`, so reading it here finds nothing.
 		const imagesByInvocation = invocations.map(invocation => {
-			const visible = this.#visiblePendingImagesForText(invocation.args, pendingImages);
+			const visible = this.#visiblePendingImagesForText(invocation.args, effectiveImages);
 			return visible ? [...visible] : undefined;
 		});
 		const ownsComposer = !options || this.#canModifyComposer(options);
@@ -2220,19 +2228,44 @@ export class InputController {
 
 	/**
 	 * A restored queued message keeps its `[image N]` text but not the pasted image.
-	 * Warns and returns true so the caller leaves the draft in the composer instead
-	 * of sending bare text.
+	 * Warns and returns true so the caller sends nothing. The editor empties its buffer
+	 * before `onSubmit`, so a submission that still owns the composer puts its text back.
 	 */
 	#rejectUnattachedImageReferences(
 		text: string,
 		pendingImages: InteractiveModeContext["pendingImages"] = this.ctx.pendingImages,
+		composer?: ComposerSubmissionOptions,
 	): boolean {
 		const missing = imageReferenceNumbers(text).find(number => pendingImages[number - 1] === undefined);
 		if (missing === undefined) return false;
+		if (composer && this.#canModifyComposer(composer)) this.ctx.editor.setText(text);
 		this.ctx.showWarning(
 			`[image ${missing}] has no attached image. Paste the image again or remove the placeholder.`,
 		);
 		return true;
+	}
+
+	/**
+	 * An input extension returns replacement images as a flat list, in the order the
+	 * submitted text references them. Re-key that list by placeholder number so each
+	 * `[image N]` resolves to its replacement. Images the text never referenced are not
+	 * carried over, so an unredacted original cannot leak in through a rewritten prompt.
+	 */
+	#alignReplacedImages(
+		submittedText: string,
+		pendingImages: InteractiveModeContext["pendingImages"],
+		replacements: InteractiveModeContext["pendingImages"],
+	): InteractiveModeContext["pendingImages"] {
+		const aligned: InteractiveModeContext["pendingImages"] = [];
+		let next = 0;
+		for (const number of imageReferenceNumbers(submittedText)) {
+			const index = number - 1;
+			if (index < 0 || index >= pendingImages.length || aligned[index] !== undefined) continue;
+			const replacement = replacements[next];
+			next += 1;
+			if (replacement) aligned[index] = replacement;
+		}
+		return aligned;
 	}
 
 	#visiblePendingImagesForText(
