@@ -1,0 +1,3 @@
+### Removed
+
+- **Edit mode: Hashline**. The hashline edit mode and all associated infrastructure have been removed. The model-family-based edit mode routing now maps MiniMax, GLM, and Kimi/Moonshot models to `replace` mode instead of the retired `hashline` mode. Persisted settings with `edit.mode: hashline` or `edit.modelVariants` values set to `hashline` are automatically migrated to `auto` and `replace` respectively on session start. The `readHashLines` setting has been removed; read output now displays optional line numbers based on the `readLineNumbers` setting instead of hashline anchors.

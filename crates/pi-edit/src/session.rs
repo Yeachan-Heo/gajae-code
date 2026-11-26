@@ -13,12 +13,12 @@ use async_trait::async_trait;
 
 use crate::{
 	diff_string::{CompactDiffOptions, build_compact_diff_preview},
-	engine::{EditMode, FileOp, FileOpIntent, HeaderKind, ModeEngine, PreviewFile, StagedFile},
+	engine::{EditMode, FileOp, FileOpIntent, ModeEngine, PreviewFile, StagedFile},
 	error::{EditError, EditResult},
 	files::{FileCache, FileSource},
 	notebook,
 	path_policy::{PathPolicy, UrlResolution, canonical_key},
-	store::{EditStore, Snapshot, file_hash, seen_lines_from_body},
+	store::{EditStore, Snapshot, seen_lines_from_body},
 	stream_json::ArgStream,
 	text::{normalize_to_lf, strip_bom, utf16_len},
 };
@@ -328,7 +328,7 @@ impl Session {
 					.await?
 			};
 
-			let mut tag: Option<String> = None;
+			let mut _tag: Option<String> = None;
 			// Updated files register their response rows (plus still-valid prior
 			// provenance) against the minted tag: (store key, carried lines, drifted).
 			let mut provenance: Option<(PathBuf, Vec<u32>, bool)> = None;
@@ -336,7 +336,7 @@ impl Session {
 				FileOp::Delete => self.store.invalidate(&canonical),
 				FileOp::Noop => {
 					if file.record_snapshot {
-						tag = Some(self.store.record(&canonical, &file.after, None));
+						_tag = Some(self.store.record(&canonical, &file.after, None));
 					}
 				},
 				FileOp::Create | FileOp::Update => {
@@ -357,7 +357,7 @@ impl Session {
 							file.warnings.push(write_drift_warning(&file.display));
 						}
 						let key = dest_canonical.unwrap_or_else(|| canonical.clone());
-						tag = Some(self.store.record(&key, &recorded, None));
+						_tag = Some(self.store.record(&key, &recorded, None));
 						if track_provenance {
 							let carried = carried_seen_lines(&file.before, &recorded, prior.as_ref());
 							provenance = Some((key, carried, drifted));
@@ -374,10 +374,7 @@ impl Session {
 				.move_to
 				.as_ref()
 				.map_or(file.display.as_str(), |m| m.display.as_str());
-			let response_tag = match file.header {
-				HeaderKind::HashlineTag => Some(tag.unwrap_or_else(|| file_hash(&file.after))),
-				HeaderKind::Path => None,
-			};
+			let response_tag: Option<String> = None;
 			let header = response_tag
 				.as_ref()
 				.map_or_else(|| format!("[{header_path}]"), |tag| format!("[{header_path}#{tag}]"));

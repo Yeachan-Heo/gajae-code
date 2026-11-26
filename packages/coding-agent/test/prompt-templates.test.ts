@@ -13,7 +13,6 @@ import { expandPromptTemplate, type PromptTemplate } from "@gajae-code/coding-ag
 import { expandSlashCommand, type FileSlashCommand } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { parseCommandArgs, substituteArgs } from "@gajae-code/coding-agent/utils/command-args";
 import browserDescription from "../src/prompts/tools/browser.md" with { type: "text" };
-import hashlineDescription from "../src/prompts/tools/hashline.md" with { type: "text" };
 
 // ============================================================================
 // substituteArgs
@@ -297,16 +296,7 @@ describe("tool prompt descriptions", () => {
 		expect(browserDescription).toContain('"action":"run"');
 	});
 
-	test("retains hashline anchor, boundary, and operation-discovery contracts", () => {
-		expect(hashlineDescription).toContain("Anchors reference the file as last read");
-		expect(hashlineDescription).toContain("replay past B");
-		expect(hashlineDescription).toContain("Touching a multiline construct? Widen to the whole thing");
-		expect(hashlineDescription).toContain("To keep a blank line, include one explicit empty payload line");
-		expect(hashlineDescription).toContain("`»{{hrefr 4}}`");
-		expect(hashlineDescription).toContain("`«{{hrefr 5}}`");
-		expect(hashlineDescription).toContain("`≔{{hrefr 5}}`");
-		expect(hashlineDescription).toContain("Copy anchors verbatim");
-	});
+
 });
 
 // ============================================================================

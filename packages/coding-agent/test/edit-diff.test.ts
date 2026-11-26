@@ -5,7 +5,6 @@ import * as path from "node:path";
 import {
 	adjustIndentation,
 	computeEditDiff,
-	computeHashlineDiff,
 	DEFAULT_FUZZY_THRESHOLD,
 	findMatch,
 	formatLineHash,
@@ -215,55 +214,6 @@ describe("adjustIndentation", () => {
 		const result = adjustIndentation(oldText, actualText, newText);
 		// Should remove up to 4 chars, but line only has 2, so remove 2
 		expect(result).toBe("bar");
-	});
-});
-
-describe("computeHashlineDiff", () => {
-	let tempDir = "";
-
-	beforeEach(async () => {
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "edit-diff-hashline-"));
-	});
-
-	afterEach(async () => {
-		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
-		}
-	});
-
-	test("returns no-op error for unchanged content when move is absent", async () => {
-		const sourcePath = path.join(tempDir, "source.txt");
-		const line = "unchanged content";
-		await Bun.write(sourcePath, `${line}\n`);
-
-		// `≔1<hash>` with the same line as payload is a true no-op: the edit
-		// fires through computeHashlineDiff but produces identical content.
-		const anchor = formatLineHash(1, line);
-		const input = `§${sourcePath}\n≔${anchor}\n${line}\n`;
-		const result = await computeHashlineDiff({ input }, tempDir);
-		expect("error" in result).toBe(true);
-		if ("error" in result) {
-			expect(result.error).toContain("No changes would be made");
-		}
-	});
-
-	test("accepts hashline input edits", async () => {
-		const sourcePath = path.join(tempDir, "source.txt");
-		await Bun.write(sourcePath, "first\n");
-
-		const result = await computeHashlineDiff({ input: `§${sourcePath}\n»EOF\nsecond` }, tempDir);
-		expect("diff" in result).toBe(true);
-		if ("diff" in result) {
-			expect(result.diff).toContain("second");
-		}
-	});
-	test("returns a handled error when the source path is a local URL", async () => {
-		const result = await computeHashlineDiff({ input: "§local://PLAN.md\n»EOF\n" }, tempDir);
-
-		expect("error" in result).toBe(true);
-		if ("error" in result) {
-			expect(result.error).toContain('internal scheme "local://"');
-		}
 	});
 });
 

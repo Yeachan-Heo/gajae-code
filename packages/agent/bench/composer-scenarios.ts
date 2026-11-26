@@ -4,7 +4,6 @@
  */
 
 export type ScenarioId =
-	| "read-edit-hashline"
 	| "three-turn-tools"
 	| "bash-discipline"
 	| "file-discovery-discipline"
@@ -134,7 +133,6 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 }
 
 export const COMPOSER_SCENARIOS_V1_IDS = [
-	"read-edit-hashline",
 	"three-turn-tools",
 	"bash-discipline",
 	"file-discovery-discipline",
@@ -150,17 +148,6 @@ export const COMPOSER_SCENARIOS_V1_IDS = [
 ] as const satisfies readonly ScenarioId[];
 
 export const COMPOSER_SCENARIOS: ScenarioDefinition[] = [
-	{
-		id: "read-edit-hashline",
-		description: "Read anchored file contents, then apply one hashline edit.",
-		turns: "2-3",
-		fixture: "fixtures/workspace/src/foo.ts",
-		obligation: "final file matches golden and file IO uses read/edit tools only",
-		userPrompt:
-			"In this repo workspace, read fixtures/workspace/src/foo.ts with the read tool, then change the exported greeting string to exactly `hello-composer-harness` using the edit tool and hashline anchors from your read output. Do not use shell commands to read or write files.",
-		failureClass: "bad-anchor-unrecovered",
-		recovery: false,
-	},
 	{
 		id: "three-turn-tools",
 		description: "Chain read, search, and edit across three tool turns.",

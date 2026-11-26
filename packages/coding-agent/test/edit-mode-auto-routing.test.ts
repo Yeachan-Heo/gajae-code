@@ -193,9 +193,9 @@ describe("resolveEditModeDetails precedence", () => {
 		expect(details.family).toBe("unknown");
 	});
 
-	test("missing model falls back to hashline under auto", () => {
+	test("missing model falls back to replace under auto", () => {
 		const details = resolveEditModeDetails(makeSession({ editMode: "auto" }));
-		expect(details.mode).toBe("hashline");
+		expect(details.mode).toBe("replace");
 		expect(details.source).toBe("fallback");
 	});
 
@@ -203,8 +203,8 @@ describe("resolveEditModeDetails precedence", () => {
 		// Schema default is now `auto`; no explicit edit.mode configured.
 		expect(resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toBe("apply_patch");
 		expect(resolveEditMode(makeSession({ model: "deepseek/deepseek-v3.2" }))).toBe("replace");
-		expect(resolveEditMode(makeSession({ model: "zai/glm-4.7" }))).toBe("hashline");
-		expect(resolveEditMode(makeSession({}))).toBe("hashline");
+		expect(resolveEditMode(makeSession({ model: "zai/glm-4.7" }))).toBe("replace");
+		expect(resolveEditMode(makeSession({}))).toBe("replace");
 	});
 
 	test("invalid environment value fails fast", () => {

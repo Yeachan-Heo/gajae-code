@@ -12,7 +12,7 @@ import type { ImageContent } from "@gajae-code/ai/core";
 import type { glob as globFn } from "@gajae-code/natives";
 import { fuzzyMatch } from "@gajae-code/tui";
 import { formatAge, formatBytes, pathIsWithin, readImageMetadata, resolveEquivalentPath } from "@gajae-code/utils";
-import { formatHashLines } from "../hashline/hash";
+import { formatHashLines } from "../edit/line-hash";
 import type { FileMentionMessage } from "../session/messages";
 import {
 	DEFAULT_MAX_BYTES,

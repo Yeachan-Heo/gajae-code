@@ -29,7 +29,6 @@ interface DescriptionSettings {
 			| "eval.py"
 			| "eval.js"
 			| "readLineNumbers"
-			| "readHashLines"
 			| "edit.mode",
 	): unknown;
 	getEffectiveAutorouting(): { active: boolean };

@@ -61,7 +61,6 @@ function receiptSettings(extra: Record<string, unknown> = {}): Settings {
 		"tools.maxInlineResultBytes": 0,
 		"tools.readArtifactSpillThreshold": 1,
 		"read.summarize.enabled": false,
-		readHashLines: false,
 		...extra,
 	});
 }

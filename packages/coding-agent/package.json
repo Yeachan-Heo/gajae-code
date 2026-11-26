@@ -333,14 +333,6 @@
 			"types": "./src/edit/modes/*.ts",
 			"import": "./src/edit/modes/*.ts"
 		},
-		"./hashline": {
-			"types": "./src/hashline/index.ts",
-			"import": "./src/hashline/index.ts"
-		},
-		"./hashline/*": {
-			"types": "./src/hashline/*.ts",
-			"import": "./src/hashline/*.ts"
-		},
 		"./exec/*": {
 			"types": "./src/exec/*.ts",
 			"import": "./src/exec/*.ts"

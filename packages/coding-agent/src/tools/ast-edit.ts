@@ -6,7 +6,7 @@ import { Text } from "@gajae-code/tui";
 import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
+import { computeLineHash, HL_BODY_SEP } from "../edit/line-hash";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
 import { wrapUntrustedContent } from "../session/messages";

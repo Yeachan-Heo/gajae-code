@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { type EditMode, EditTool } from "@gajae-code/coding-agent/edit";
-import { computeLineHash } from "@gajae-code/coding-agent/hashline";
+import { type EditMode, EditTool, computeLineHash } from "@gajae-code/coding-agent/edit";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 
@@ -125,41 +124,6 @@ describe("edit matcher hooks", () => {
 		}
 		expect(tool.matcherEntries({ path: "a.ts", edits: [{ diff: "@@\n+" }] })).toEqual([{ path: "a.ts", digest: "" }]);
 		expect(tool.matcherDigest({ path: "a.ts", edits: [{ diff: "@@\n+" }] })).toBeUndefined();
-	});
-
-	test("hashline isolates multi-file sections, including repeated paths and replacement payloads", () => {
-		const tool = new EditTool(makeSession(), "hashline");
-		const args = {
-			input: [
-				"§src/a.ts",
-				"»EOF",
-				"const first = 1;",
-				"§notes.md",
-				"«BOF",
-				"# Only Markdown",
-				"§src/a.ts",
-				"≔1aa..2bb",
-				"const second = 2;",
-			].join("\n"),
-		};
-		expect(tool.matcherEntries(args)).toEqual([
-			{ path: "src/a.ts", digest: "const first = 1;\nconst second = 2;" },
-			{ path: "notes.md", digest: "# Only Markdown" },
-		]);
-		expect(tool.matcherDigest(args)).toBe("const first = 1;\nconst second = 2;\n# Only Markdown");
-	});
-
-	test("hashline honors fallback paths, inline insertions, and anchor echoes", () => {
-		const tool = new EditTool(makeSession(), "hashline");
-		expect(tool.matcherEntries({ path: "fallback.ts", input: "»EOF|inline()" })).toEqual([
-			{ path: "fallback.ts", digest: "inline()" },
-		]);
-		const oldText = "unchanged()";
-		const hash = computeLineHash(1, oldText);
-		expect(tool.matcherEntries({ input: `§a.ts\n»1${hash}|${oldText}\nintroduced()` })).toEqual([
-			{ path: "a.ts", digest: "introduced()" },
-		]);
-		expect(tool.matcherEntries({ input: `§a.ts\n≔1${hash}|${oldText}` })).toBeUndefined();
 	});
 
 	test("apply_patch includes full Add File content, update additions, and move destination, never deletions", () => {

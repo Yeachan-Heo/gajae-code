@@ -12,9 +12,8 @@
   - `packages/coding-agent/src/tools/fetch.ts` — URL parsing, fetch/render pipeline, URL cache/artifacts.
   - `packages/coding-agent/src/internal-urls/router.ts` — resolve public internal URLs (`agent://`, `artifact://`, `local://`, `gjc://`, and `rule://`) plus legacy non-public compatibility handlers.
   - `packages/coding-agent/src/edit/notebook.ts` — convert `.ipynb` to editable `# %% [...] cell:N` text.
-  - `packages/coding-agent/src/utils/file-display-mode.ts` — decide hashline vs line-number vs raw display.
+  - `packages/coding-agent/src/utils/file-display-mode.ts` — decide line-number vs raw display.
   - `packages/coding-agent/src/workspace-tree.ts` — render directory trees.
-  - `packages/coding-agent/src/edit/file-read-cache.ts` — cache read lines for later hashline edit recovery.
   - `packages/coding-agent/src/tools/descriptors.ts` — registers `read: s => new ReadTool(s)`.
 
 ## Inputs
@@ -92,7 +91,7 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
    - structural summary for parseable code/prose
    - streamed text/line-range read
 9. Local text reads are streamed by `streamLinesFromFile()` rather than loading the whole file. The tool adds up to 3 lines of context before/after explicit bounded ranges.
-10. Non-empty contiguous local reads are recorded into `getFileReadCache(session)` for later hashline edit recovery.
+10. Non-empty contiguous local reads are recorded in the file-read cache for edit recovery.
 11. If suffix resolution happened, the first text block is prefixed with `[Path '...' not found; resolved to '...' via suffix match]`.
 
 ## Modes / Variants
@@ -110,11 +109,8 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
   - Converted documents, notebooks, URLs, and directory listings default to head; explicit `truncation` selects another end when that route supports it.
   - Explicit ranges expand by `RANGE_LEADING_CONTEXT_LINES = 1` / `RANGE_TRAILING_CONTEXT_LINES = 3` on the constrained sides only.
   - Non-raw output uses `resolveFileDisplayMode()`:
-    - hashline anchors when edit mode is hashline, read is not raw, source is mutable, edit tool exists, and `readHashLines !== false`
-    - otherwise optional line numbers when `readLineNumbers === true`
+    - optional line numbers when `readLineNumbers === true`
     - raw mode suppresses both
-- Prefix format in hashline mode is `lineNumber + 2-char line hash + "|"`, e.g. `41th|def alpha():`, from `formatHashLine()` in `packages/coding-agent/src/hashline/hash.ts`.
-- Those anchors are what the `edit`/hashline path consumes later; immutable sources and `:raw` intentionally suppress them.
 
 ### Directory listings
 - `#readDirectory()` calls `buildDirectoryTree()` with:

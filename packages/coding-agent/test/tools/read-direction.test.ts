@@ -151,7 +151,7 @@ describe("read truncation direction resolution", () => {
 		const file = path.join(tempDir, "source.txt");
 		const wide = Array.from({ length: 900 }, (_, index) => `line-${index + 1} ${"x".repeat(1100)}`).join("\n");
 		await fs.writeFile(file, wide);
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		const tool = new ReadTool(createSession(tempDir, settings));
 
 		const defaultRange = textOf(await tool.execute("direction-range-default", { path: `${file}:50-200` }));
@@ -200,7 +200,6 @@ describe("read truncation direction resolution", () => {
 			"read.summarize.enabled": false,
 			"read.receiptBudgetLines": 50,
 			"read.receiptBudgetBytes": 10,
-			readHashLines: true,
 		});
 		const result = await new ReadTool(createSession(tempDir, settings)).execute("middle-partial-tail", {
 			path: file,
@@ -224,7 +223,6 @@ describe("read truncation direction resolution", () => {
 			"read.summarize.enabled": false,
 			"read.receiptBudgetLines": 50,
 			"read.receiptBudgetBytes": 10,
-			readHashLines: false,
 		});
 		const result = await new ReadTool(createSession(tempDir, settings)).execute("middle-partial-tail-plain", {
 			path: file,
@@ -247,7 +245,7 @@ describe("read truncation direction resolution", () => {
 				`export function fn${index}(): number {\n\tconst one = ${index};\n\tconst two = 2;\n\treturn one + two;\n}`,
 		).join("\n\n");
 		await fs.writeFile(file, source);
-		const settings = Settings.isolated({ readHashLines: false });
+		const settings = Settings.isolated({});
 		const tool = new ReadTool(createSession(tempDir, settings));
 
 		const baseline = textOf(await tool.execute("direction-summary-default", { path: file }));
@@ -261,7 +259,7 @@ describe("read truncation direction resolution", () => {
 	});
 
 	test("passes explicit head through unchanged on every unsupported-direction route", async () => {
-		const settings = Settings.isolated({ readHashLines: false });
+		const settings = Settings.isolated({});
 		const tool = new ReadTool(createSession(tempDir, settings));
 		const textOf = (result: { content: Array<{ type: string; text?: string }> }) =>
 			result.content
@@ -308,7 +306,6 @@ describe("read truncation direction resolution", () => {
 			"read.summarize.enabled": false,
 			"read.receiptBudgetLines": 3,
 			"read.receiptBudgetBytes": 1,
-			readHashLines: false,
 		});
 		const tool = new ReadTool(createSession(tempDir, settings));
 		const head = await tool.execute("direction-dir-head", { path: directory, truncation: "head" });
@@ -334,7 +331,6 @@ describe("read truncation direction resolution", () => {
 			"read.summarize.enabled": false,
 			"read.receiptBudgetLines": 50,
 			"read.receiptBudgetBytes": 10,
-			readHashLines: false,
 		});
 		const disk = await new ReadTool(createSession(tempDir, settings)).execute("direction-disk-head", {
 			path: file,
@@ -361,7 +357,6 @@ describe("read truncation direction resolution", () => {
 		const settings = Settings.isolated({
 			"read.summarize.enabled": false,
 			"read.truncation": "head",
-			readHashLines: false,
 		});
 		const disk = await new ReadTool(createSession(tempDir, settings)).execute("giant-disk-head", {
 			path: file,
@@ -388,7 +383,7 @@ describe("read truncation direction resolution", () => {
 
 	test("keeps explicit range context windows bounded and EOF-clamped across disk and ACP directional reads", async () => {
 		const file = path.join(tempDir, "acp-range-context.txt");
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		for (const totalLines of [300, 202]) {
 			const source = Array.from({ length: totalLines }, (_, index) => `line-${index + 1}`).join("\n");
 			await fs.writeFile(file, source);
@@ -416,7 +411,7 @@ describe("read truncation direction resolution", () => {
 		const file = path.join(tempDir, "ranged-direction-metadata.txt");
 		const source = Array.from({ length: 900 }, (_, index) => `line-${index + 1} ${"x".repeat(1100)}`).join("\n");
 		await fs.writeFile(file, source);
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		for (const truncationDirection of ["last", "both"] as const) {
 			const result = await new ReadTool(createSession(tempDir, settings)).execute("ranged-direction-metadata", {
 				path: `${file}:100-200`,
@@ -444,7 +439,7 @@ describe("read truncation direction resolution", () => {
 				expect(Number(match[2])).toBeLessThanOrEqual(truncation?.totalLines ?? 0);
 			}
 		}
-		const hashSettings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: true });
+		const hashSettings = Settings.isolated({ "read.summarize.enabled": false});
 		const hashResult = await new ReadTool(createSession(tempDir, hashSettings)).execute(
 			"ranged-direction-hashlines",
 			{
@@ -468,7 +463,7 @@ describe("read truncation direction resolution", () => {
 			archiveEntries[`dir/entry-${String(index).padStart(4, "0")}-${"x".repeat(90)}.txt`] = "x";
 		}
 		await Bun.write(archivePath, await new Bun.Archive(archiveEntries, { compress: "gzip" }).bytes());
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		const tool = new ReadTool(createSession(tempDir, settings));
 		const head = await tool.execute("direction-archive-head", { path: `${archivePath}:dir`, truncation: "head" });
 		const last = await tool.execute("direction-archive-last", { path: `${archivePath}:dir`, truncation: "last" });
@@ -486,7 +481,7 @@ describe("read truncation direction resolution", () => {
 		);
 		await Bun.write(archivePath, await new Bun.Archive({ "docs/member.txt": member }, { compress: "gzip" }).bytes());
 
-		const tailSettings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const tailSettings = Settings.isolated({ "read.summarize.enabled": false});
 		const tailTool = new ReadTool(createSession(tempDir, tailSettings));
 		const defaultTail = textOf(
 			await tailTool.execute("archive-default-tail", { path: `${archivePath}:docs/member.txt` }),
@@ -497,7 +492,6 @@ describe("read truncation direction resolution", () => {
 		const headSettings = Settings.isolated({
 			"read.summarize.enabled": false,
 			"read.truncation": "head",
-			readHashLines: false,
 		});
 		const configuredHead = textOf(
 			await new ReadTool(createSession(tempDir, headSettings)).execute("archive-configured-head", {
@@ -537,7 +531,7 @@ describe("read truncation direction resolution", () => {
 		} finally {
 			db.close();
 		}
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		const tool = new ReadTool(createSession(tempDir, settings));
 		const head = await tool.execute("direction-sqlite-head", { path: databasePath, truncation: "head" });
 		const last = await tool.execute("direction-sqlite-last", { path: databasePath, truncation: "last" });
@@ -551,7 +545,7 @@ describe("read truncation direction resolution", () => {
 	test("rejects explicit directions for conflicts indexes to preserve their preamble", async () => {
 		const file = path.join(tempDir, "conflicts.txt");
 		await fs.writeFile(file, "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs");
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		const tool = new ReadTool(createSession(tempDir, settings));
 
 		await expect(
@@ -571,7 +565,7 @@ describe("read truncation direction resolution", () => {
 		} finally {
 			db.close();
 		}
-		const settings = Settings.isolated({ "read.summarize.enabled": false, readHashLines: false });
+		const settings = Settings.isolated({ "read.summarize.enabled": false});
 		const tool = new ReadTool(createSession(tempDir, settings));
 		for (const pathSelector of [
 			`${databasePath}:users:1`,

@@ -2060,7 +2060,7 @@ export class Settings implements NotificationSettingsReader {
 
 	/**
 	 * Get the edit variant for a specific model.
-	 * Returns "patch", "replace", "hashline", "vim", "apply_patch", or null (use global default).
+	 * Returns "patch", "replace", "vim", "apply_patch", or null (use global default).
 	 * Skips invalid values; prefer `matchEditVariantForModel` when invalid
 	 * matches must fail closed instead of falling through.
 	 */
@@ -6431,24 +6431,24 @@ export class Settings implements NotificationSettingsReader {
 			raw.task = taskObj;
 		}
 
-		// edit.mode: removed "atom" variant is now "hashline"
+		// edit.mode: removed "atom" variant is now "replace"
 		const editObj = rawSettingsRecord(raw.edit);
 		if (editObj) {
 			if (editObj.mode === "atom") {
-				editObj.mode = "hashline";
+				editObj.mode = "replace";
 			}
 			const modelVariants = rawSettingsRecord(editObj.modelVariants);
 			if (modelVariants) {
 				for (const [pattern, variant] of Object.entries(modelVariants)) {
 					if (variant === "atom") {
-						modelVariants[pattern] = "hashline";
+						modelVariants[pattern] = "replace";
 					}
 				}
 			}
 			raw.edit = editObj;
 		}
 		if (raw["edit.mode"] === "atom") {
-			raw["edit.mode"] = "hashline";
+			raw["edit.mode"] = "replace";
 		}
 
 		// statusLine: rename "plan_mode" segment to "mode"

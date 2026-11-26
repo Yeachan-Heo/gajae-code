@@ -1,17 +1,7 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
 import type * as z from "zod/v4";
-import {
-	executeHashlineSingle,
-	type HashlineEdit,
-	HashlineMismatchError,
-	type HashlineParams,
-	hashlineEditParamsSchema,
-	parseHashline,
-	splitHashlineInputs,
-} from "../hashline";
-import hashlineGrammarTemplate from "../hashline/grammar.lark" with { type: "text" };
-import { resolveHashlineGrammarPlaceholders } from "../hashline/hash";
+
 import {
 	createLspWritethrough,
 	type FileDiagnosticsResult,
@@ -20,7 +10,6 @@ import {
 	writethroughNoop,
 } from "../lsp";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
-import hashlineDescription from "../prompts/tools/hashline.md" with { type: "text" };
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
 import type { ToolSession } from "../tools";
@@ -52,11 +41,9 @@ export { DEFAULT_EDIT_MODE, type EditMode, normalizeEditMode } from "../utils/ed
 export * from "./apply-patch";
 export * from "./diff";
 export * from "./file-read-cache";
+export * from "./line-hash";
 
-// Resolve the `$HFMT$`, `$HOP_*$`, `$HOP_CHARS$`, and `$HFILE$` placeholders in the hashline Lark grammar.
-const hashlineGrammar = resolveHashlineGrammarPlaceholders(hashlineGrammarTemplate);
 
-export * from "../hashline";
 export * from "./modes/apply-patch";
 export * from "./modes/patch";
 export * from "./modes/replace";
@@ -67,12 +54,11 @@ export * from "./streaming";
 type TInput =
 	| typeof replaceEditSchema
 	| typeof patchEditSchema
-	| typeof hashlineEditParamsSchema
 	| typeof vimSchema
 	| typeof applyPatchSchema;
 
 type VimParams = z.infer<typeof vimSchema>;
-type EditParams = ReplaceParams | PatchParams | HashlineParams | VimParams | ApplyPatchParams;
+type EditParams = ReplaceParams | PatchParams | VimParams | ApplyPatchParams;
 type EditToolResultDetails = EditToolDetails | VimToolDetails;
 
 /** Diff bodies introduce only `+` rows, not unified-diff file headers. */
@@ -480,27 +466,7 @@ export class EditTool implements AgentTool<TInput> {
 					}
 					break;
 				}
-				case "hashline": {
-					const parsed = hashlineEditParamsSchema.safeParse(args);
-					if (!parsed.success) return undefined;
-					for (const section of splitHashlineInputs(parsed.data.input, {
-						path: parsed.data.path,
-						cwd: this.session.cwd,
-					})) {
-						// A section still streaming (e.g. a trailing op with no anchor yet)
-						// does not parse; it contributes nothing, but earlier complete
-						// sections keep their entries (as pi-edit's hashline inspect does).
-						let edits: HashlineEdit[];
-						try {
-							edits = parseHashline(section.diff);
-						} catch {
-							continue;
-						}
-						const inserted = edits.filter(edit => edit.kind === "insert");
-						if (inserted.length > 0) add(section.path, inserted.map(edit => edit.text).join("\n"));
-					}
-					break;
-				}
+
 				case "apply_patch": {
 					const parsed = applyPatchSchema.safeParse(args);
 					if (!parsed.success) return undefined;
@@ -536,7 +502,6 @@ export class EditTool implements AgentTool<TInput> {
 	 */
 	get customFormat(): { syntax: "lark"; definition: string } | undefined {
 		if (this.mode === "apply_patch") return { syntax: "lark", definition: applyPatchGrammar };
-		if (this.mode === "hashline") return { syntax: "lark", definition: hashlineGrammar };
 		return undefined;
 	}
 
@@ -646,28 +611,7 @@ export class EditTool implements AgentTool<TInput> {
 					return executeApplyPatchPerFile(perFile, batchRequest, onUpdate);
 				},
 			},
-			hashline: {
-				description: () => prompt.render(hashlineDescription),
-				parameters: hashlineEditParamsSchema,
-				execute: (
-					tool: EditTool,
-					params: EditParams,
-					signal: AbortSignal | undefined,
-					batchRequest: LspBatchRequest | undefined,
-					_onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-				) => {
-					const { input, path } = params as HashlineParams & { path?: string };
-					return executeHashlineSingle({
-						session: tool.session,
-						input,
-						path,
-						signal,
-						batchRequest,
-						writethrough: tool.#writethrough,
-						beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-					});
-				},
-			},
+
 			replace: {
 				description: () => prompt.render(replaceDescription),
 				parameters: replaceEditSchema,

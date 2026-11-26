@@ -1,19 +1,18 @@
 import { $pickenv } from "@gajae-code/utils/env";
 
-export type EditMode = "replace" | "patch" | "hashline" | "vim" | "apply_patch";
+export type EditMode = "replace" | "patch" | "vim" | "apply_patch";
 
 /** Setting value for `edit.mode`: an executable mode or `auto` (model-family routing). */
 export type EditModeSetting = "auto" | EditMode;
 
 /** Fallback executable mode used when automatic routing cannot identify the model. */
-export const DEFAULT_EDIT_MODE: EditMode = "hashline";
+export const DEFAULT_EDIT_MODE: EditMode = "replace";
 
 /** Default `edit.mode` setting value. */
 export const DEFAULT_EDIT_MODE_SETTING: EditModeSetting = "auto";
 
 const EDIT_MODE_IDS = {
 	apply_patch: "apply_patch",
-	hashline: "hashline",
 	patch: "patch",
 	replace: "replace",
 	vim: "vim",
@@ -38,9 +37,8 @@ export type ModelEditFamily = "gpt" | "codex" | "claude" | "deepseek" | "qwen" |
  * Built-in family → edit mode mapping used by `edit.mode: auto`.
  *
  * GPT/Codex models are trained on the OpenAI patch grammar; Claude, DeepSeek,
- * and Qwen perform best with exact search/replace; MiniMax, GLM, and
- * Kimi/Moonshot benchmark best with hash-anchored edits. Unknown models fall
- * back to hashline, the safest fail-closed default.
+ * and Qwen perform best with exact search/replace. Unknown models fall back to
+ * replace, the most compatible default.
  */
 const FAMILY_EDIT_MODES: Record<Exclude<ModelEditFamily, "unknown">, EditMode> = {
 	gpt: "apply_patch",
@@ -48,9 +46,9 @@ const FAMILY_EDIT_MODES: Record<Exclude<ModelEditFamily, "unknown">, EditMode> =
 	claude: "replace",
 	deepseek: "replace",
 	qwen: "replace",
-	minimax: "hashline",
-	glm: "hashline",
-	kimi: "hashline",
+	minimax: "replace",
+	glm: "replace",
+	kimi: "replace",
 };
 
 /**
@@ -165,7 +163,7 @@ export function resolveForcedEnvEditMode(): EditMode | undefined {
  * 3. Explicit `edit.mode` setting when it is not `auto`.
  * 4. Model-catalog edit recommendation, when the session exposes one.
  * 5. Built-in model-family mapping.
- * 6. `hashline` fallback.
+ * 6. `replace` fallback.
  */
 export function resolveEditModeDetails(session: EditModeSessionLike): ResolvedEditModeDetails {
 	const modelId = session.getActiveModelString?.();

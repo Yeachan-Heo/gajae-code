@@ -44,13 +44,13 @@ Single-shot result.
   - Plain file write: `Successfully wrote <bytes> bytes to <relative-path>`.
   - Archive write: `Successfully wrote <bytes> bytes to <relative-archive-path>:<entry-path>`.
   - SQLite write: one of `Inserted row into <table>`, `Updated row '<key>' in <table>`, `No row updated ...`, `Deleted row ...`, `No row deleted ...`.
-- If hashline prefixes were copied from `read` output and stripped first, the first text block gets an extra note.
+- If line prefixes were stripped from previous read output, the first text block may get an extra note.
 - Plain file writes may also return `details.diagnostics` plus `details.meta.diagnostics` when LSP diagnostics-on-write is enabled.
 - SQLite writes use `toolResult(...).sourcePath(...)`, so `details.meta.sourcePath` points at the database file.
 - Archive writes return empty `details`.
 
 ## Flow
-1. `WriteTool.execute()` in `packages/coding-agent/src/tools/write.ts` strips `LINE+ID|` hashline prefixes from `content` when the session is in hashline display mode.
+1. `WriteTool.execute()` in `packages/coding-agent/src/tools/write.ts` processes `content` before writing.
 2. It calls `#resolveArchiveWritePath()` first. That uses `parseArchivePathCandidates()` from `packages/coding-agent/src/tools/archive-reader.ts`, checks candidate archive files on disk, and falls back to the longest matching archive suffix even when the archive file does not exist yet.
 3. Archive writes call `enforcePlanModeWrite(..., { op: exists ? "update" : "create" })`, then `#writeArchiveEntry()`.
    - `.zip` archives are read with `fflate.unzipSync()`, the target entry is replaced in an in-memory map, and the complete archive is reconstructed with `fflate.zipSync()` and published through the same guarded sibling-temp atomic writer as plain files.
@@ -187,4 +187,4 @@ Destination symlinks are followed: the referent is replaced and the link is pres
 - ZIP entry content is encoded with `new TextEncoder().encode(content)` in `#writeArchiveEntry()`. Non-ZIP archive entries are reconstructed with `Bun.Archive.bytes()` and both formats publish through `writeFileAtomically()`.
 - The prompt forbids two common anti-patterns: using `write` for routine edits that should use `edit`, and creating `*.md` / `README` files unless explicitly requested. It also forbids emojis unless requested.
 - Plain file writes report byte count using `cleanContent.length`, which is UTF-16 code units in JS, not an on-disk byte measurement.
-- `stripWriteContent()` only removes hashline prefixes when the session’s file display mode has `hashLines` enabled; otherwise content is written unchanged.
+- Content is written to the target file as provided.

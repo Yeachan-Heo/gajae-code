@@ -270,8 +270,8 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 	});
 
 	it.each([
-		["line-number display", { readLineNumbers: true, readHashLines: false } as Partial<Record<SettingPath, unknown>>],
-		["plain display", { readLineNumbers: false, readHashLines: false } as Partial<Record<SettingPath, unknown>>],
+		["line-number display", { readLineNumbers: true } as Partial<Record<SettingPath, unknown>>],
+		["plain display", { readLineNumbers: false } as Partial<Record<SettingPath, unknown>>],
 	])("#given a %s session #when search loads #then its advertised description does not change", async (_label, overrides) => {
 		// given
 		const toolSession = session(overrides);

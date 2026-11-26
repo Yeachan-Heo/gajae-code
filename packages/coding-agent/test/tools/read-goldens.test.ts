@@ -5,8 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { EditTool, getFileReadCache } from "@gajae-code/coding-agent/edit";
-import { computeLineHash } from "@gajae-code/coding-agent/hashline/hash";
+import { EditTool, getFileReadCache, computeLineHash } from "@gajae-code/coding-agent/edit";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
@@ -510,7 +509,9 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 			continue;
 		}
 		assertRunnable(entry, currentPhase);
-		for (const hashLines of entry.hashLines) {
+		// hashLines is now always false (hashline mode removed)
+		const hashLines = false;
+		for (const _ of entry.hashLines) {
 			const variant = variantFor(hashLines);
 			const settings = Settings.isolated({
 				// Goldens pin the read tool's own rendering. The universal inline-result
@@ -519,7 +520,6 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 				"tools.maxInlineResultBytes": 0,
 				...(entry.settings ?? {}),
 				...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
-				readHashLines: hashLines,
 			});
 			const bridgeText =
 				entry.name === "acp-bare-parity"
@@ -646,7 +646,6 @@ describe("read truncation golden harness", () => {
 			"read.summarize.enabled": false,
 			"read.receiptBudgetLines": 6,
 			"read.receiptBudgetBytes": 1024,
-			readHashLines: true,
 			readLineNumbers: false,
 		});
 		const session = createSession(fixture.root, settings, fixture.artifactDir);

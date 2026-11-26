@@ -2634,7 +2634,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "editing",
 			label: "Edit Mode",
 			description:
-				"Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
+				"Select the edit tool variant (auto routes by model family; replace, patch, vim, or apply_patch)",
 		},
 	},
 	"edit.modelVariants": {
@@ -2705,16 +2705,6 @@ export const SETTINGS_SCHEMA = {
 			tab: "editing",
 			label: "Line Numbers",
 			description: "Prepend line numbers to read tool output by default",
-		},
-	},
-
-	readHashLines: {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "editing",
-			label: "Hash Lines",
-			description: "Include line hashes in read output for hashline edit mode (LINE+ID|content)",
 		},
 	},
 
@@ -4651,6 +4641,29 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 		if (value === undefined) continue;
 		const definition = SETTINGS_SCHEMA[path];
 		let next = value;
+		// Migrate retired edit.mode value: hashline -> auto
+		if (path === "edit.mode" && value === "hashline") {
+			next = "auto";
+			issues.push({
+				path,
+				kind: "coerced",
+				detail: "Retired edit mode 'hashline' mapped to 'auto' (routed by model family).",
+			});
+		}
+		// Migrate retired edit.modelVariants values: hashline -> replace
+		if (path === "edit.modelVariants" && typeof next === "object" && next !== null && !Array.isArray(next)) {
+			const modelVariants = next as Record<string, unknown>;
+			for (const [key, val] of Object.entries(modelVariants)) {
+				if (val === "hashline") {
+					modelVariants[key] = "replace";
+					issues.push({
+						path: `edit.modelVariants.${key}`,
+						kind: "coerced",
+						detail: "Retired edit mode 'hashline' mapped to 'replace'.",
+					});
+				}
+			}
+		}
 		if (definition.type === "boolean" && (value === "true" || value === "false")) next = value === "true";
 		if (
 			definition.type === "number" &&
