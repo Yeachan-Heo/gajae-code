@@ -7225,11 +7225,53 @@ let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
 
-// Session ownership reads its global-only mode from the process settings. Injected, because the
-// session modules sit below config in the import graph.
+/**
+ * The operator's `session.ownership.mode` from the agent directory's config.yml, for a process that
+ * never ran `Settings.init` (an SDK embedding with isolated settings), read once per path. Sync,
+ * because sync session factories resolve the mode. A missing or malformed file reads as unset, as the
+ * loader treats it. Any other read error (EACCES, a directory in the file's place) resolves to `off`:
+ * deliberately more conservative than the loader, so a file that cannot be read never lifts an `off`
+ * the operator may have set in it.
+ */
+const operatorOwnershipModes = new Map<string, unknown>();
+function operatorOwnershipMode(configPath: string): unknown {
+	if (operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
+	let mode: unknown;
+	let content: string | undefined;
+	try {
+		content = fs.readFileSync(configPath, "utf8");
+	} catch (error) {
+		if (!isEnoent(error)) {
+			mode = "off";
+			logger.warn("Session ownership is off: the global config could not be read", {
+				configPath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	if (content !== undefined) {
+		try {
+			const parsed: unknown = YAML.parse(content);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+				mode = getByPath(parsed as RawSettings, ["session", "ownership", "mode"]);
+		} catch {
+			// Malformed YAML: the default applies, as it does for the loader.
+		}
+	}
+	operatorOwnershipModes.set(configPath, mode);
+	return mode;
+}
+
+// Session ownership reads its global-only mode from the process settings or, before they exist, from
+// the agent directory's config file, so the operator's `off` holds in an embedding too. Injected,
+// because the session modules sit below config in the import graph.
 // The global layer only: a project or runtime value, including a null or scalar `session` parent
 // that would replace the user's whole `session` object in the merge, never reaches the mode.
-setSessionOwnershipSettingSource(() => globalInstance?.getGlobal("session.ownership.mode"));
+setSessionOwnershipSettingSource(() =>
+	globalInstance
+		? globalInstance.getGlobal("session.ownership.mode")
+		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml")),
+);
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -7244,6 +7286,7 @@ export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
 	globalInitOptions = null;
+	operatorOwnershipModes.clear();
 }
 
 /**

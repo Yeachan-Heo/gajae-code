@@ -87,6 +87,20 @@ export function trustedSessionOwnershipOverride(
 }
 
 /**
+ * Remove a project-supplied `GJC_SESSION_OWNERSHIP` from `env` before it reaches a child. A child in
+ * another directory (a `--tmux --worktree` launch runs `--no-env-file` there) checks provenance against
+ * that directory's `.env`, so it would trust this project's value. Called beside the `HERDR_BIN_PATH`
+ * drop, with the same startup snapshot.
+ */
+export function dropProjectSuppliedSessionOwnershipOverride(
+	env: NodeJS.ProcessEnv,
+	snapshot: ProjectEnvSnapshot,
+): void {
+	if (env[SESSION_OWNERSHIP_ENV] === undefined) return;
+	if (trustedCoordinatorEnv(SESSION_OWNERSHIP_ENV, env, snapshot) === undefined) delete env[SESSION_OWNERSHIP_ENV];
+}
+
+/**
  * Bun loads the project `.env` from the launch directory, so provenance is checked there. A launch
  * directory that is already gone leaves no snapshot to check against, and the override is ignored.
  */
@@ -148,9 +162,20 @@ export function sessionOwnershipOverrideWasRead(): boolean {
 
 let settingSource: (() => unknown) | undefined;
 
-/** Settings supplies the global-only `session.ownership.mode` value. Without a source the default applies. */
+/**
+ * Settings supplies the operator's global `session.ownership.mode` value: the process settings, or,
+ * before `Settings.init`, the agent directory's config file. Without a source the default applies.
+ */
 export function setSessionOwnershipSettingSource(source: (() => unknown) | undefined): void {
 	settingSource = source;
+}
+
+function readSettingSource(): unknown {
+	try {
+		return settingSource?.();
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -158,27 +183,25 @@ export function setSessionOwnershipSettingSource(source: (() => unknown) | undef
  * so `off` does no work beyond reading the setting.
  */
 export function sessionOwnershipMode(): SessionOwnershipMode {
-	let setting: unknown;
-	try {
-		setting = settingSource?.();
-	} catch {
-		setting = undefined;
-	}
-	return sessionOwnershipModeFor(setting);
+	return sessionOwnershipModeFor(undefined);
 }
 
 /**
  * The mode for a `session.ownership.mode` value read from settings other than the global instance
  * (a launch that opens its session before `Settings.init`, or a scoped load), with the same override.
+ * A missing or invalid value, as from settings that never loaded the operator's config file (an
+ * embedding's `Settings.isolated()`), falls back to the setting source, so the operator's `off` still
+ * applies. A valid explicit value wins.
  */
 export function sessionOwnershipModeFor(setting: unknown): SessionOwnershipMode {
 	const forced = sessionOwnershipTestHookSlot().mode;
 	if (forced !== undefined) return forced;
-	const configured = resolveSessionOwnershipMode(setting, undefined);
+	const value = parseMode(setting) === undefined ? readSettingSource() : setting;
+	const configured = resolveSessionOwnershipMode(value, undefined);
 	// `off` is the kill switch: it returns before the environment is read at all.
 	if (configured === "off") return "off";
 	cachedOverride ??= readOverride();
-	const effective = resolveSessionOwnershipMode(setting, cachedOverride.value);
+	const effective = resolveSessionOwnershipMode(value, cachedOverride.value);
 	reportIgnoredOverride(cachedOverride, configured, effective);
 	return effective;
 }

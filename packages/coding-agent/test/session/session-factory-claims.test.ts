@@ -10,6 +10,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
+import type { Args } from "../../src/cli/args";
+import { Settings } from "../../src/config/settings";
+import { createSessionManager } from "../../src/main";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
@@ -22,6 +25,7 @@ import {
 	sessionOwnerKey,
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
+import { FileSessionStorage } from "../../src/session/session-storage";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
@@ -139,6 +143,36 @@ describe.if(supported)("factory claims", () => {
 			expect(sessionOwnershipCounters().claim_failed).toBeGreaterThan(0);
 		});
 	}
+
+	it("gjc acp keeps an in-memory manager: autoResume never opens, or contends for, the cwd's newest session", async () => {
+		const place = await workspace();
+		const settings = Settings.isolated({ autoResume: true });
+		const destination = SessionManager.managedDestination(place.cwd, settings.getAgentDir());
+		if (destination.kind !== "managed") throw new Error("expected a managed destination");
+		const { id } = await committed({ ...place, destination });
+		SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
+		const args = { mode: "acp" } as Args;
+		const acp = keep((await createSessionManager(args, place.cwd, settings))!);
+		expect([acp.getSessionId() === id, acp.isPersisted(), sessionClaimSetOf(acp).sessionIds]).toEqual([
+			false,
+			false,
+			[],
+		]);
+		// A resumed history marked the launch `--continue`, which the ACP option check refuses at startup.
+		expect(args.continue).toBeUndefined();
+		expect(sessionOwnershipCounters().claim_conflict).toBe(0);
+		expect((await inspectSessionOwners()).held).toEqual([]);
+	});
+
+	it("gjc acp with autoResume off (the default) creates no persisting session and claims no fresh id", async () => {
+		const place = await workspace();
+		const acp = keep(
+			(await createSessionManager({ mode: "acp" } as Args, place.cwd, Settings.isolated({ autoResume: false })))!,
+		);
+		expect([acp.isPersisted(), await sessionClaimSetOf(acp).settled()]).toEqual([false, undefined]);
+		expect(sessionOwnershipCounters().claim_taken).toBe(0);
+		expect((await inspectSessionOwners()).held).toEqual([]);
+	});
 
 	it("off: no factory or prepare makes a lock call", async () => {
 		const place = await workspace();
@@ -319,5 +353,21 @@ describe.if(supported)("factory claims", () => {
 		capture.snapshot.close();
 		expect((await SessionManager.openExistingStrict(stale, place.destination)).kind).toBe("error");
 		expect(await state(id)).toBe("free");
+
+		// A missing path creates a fresh session, claimed before its header write, which fails here.
+		const missing = path.join(place.root, "missing.jsonl");
+		const taken = sessionOwnershipCounters().claim_taken;
+		const write = vi.spyOn(FileSessionStorage.prototype, "openWriter").mockImplementation(() => {
+			throw new Error("disk full");
+		});
+		try {
+			await expect(SessionManager.open(missing, SessionManager.explicitDestination(place.root))).rejects.toThrow(
+				"disk full",
+			);
+		} finally {
+			write.mockRestore();
+		}
+		expect(sessionOwnershipCounters().claim_taken).toBe(taken + 1);
+		expect((await inspectSessionOwners()).held).toEqual([]);
 	});
 });
