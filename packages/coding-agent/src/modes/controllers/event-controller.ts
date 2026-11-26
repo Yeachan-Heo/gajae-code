@@ -1110,7 +1110,21 @@ export class EventController {
 		};
 		clearInteractiveActivityIndicator(this.ctx);
 		const reasonText =
-			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
+			event.reason === "threshold"
+				? "Compaction triggered, "
+				: event.reason === "idle"
+					? "Idle "
+					: event.reason === "transcriptFile"
+						? "Transcript size floor exceeded, "
+						: event.reason === "heap" || event.reason === "retainedMemory"
+							? "Memory pressure detected, "
+							: event.reason === "providerBytes" || event.reason === "imageBytes"
+								? "Resource limit exceeded, "
+								: event.reason === "messageCount"
+									? "Entry count limit exceeded, "
+									: event.reason === "overflow"
+										? "Context overflow detected, "
+										: "";
 		const actionLabel = event.action === "handoff" ? "Auto-handoff" : "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,

@@ -65,6 +65,7 @@ import {
 	type CompactionPreparation,
 	type CompactionResult,
 	type CompactionSettings,
+	type CompactionTriggerReason,
 	calculateContextTokens,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
@@ -958,7 +959,20 @@ export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_r
 
 export type AgentSessionEvent =
 	| AgentEvent
-	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
+	| {
+			type: "auto_compaction_start";
+			reason:
+				| "threshold"
+				| "overflow"
+				| "idle"
+				| "transcriptFile"
+				| "heap"
+				| "retainedMemory"
+				| "providerBytes"
+				| "imageBytes"
+				| "messageCount";
+			action: "context-full" | "handoff";
+	  }
 	| {
 			type: "auto_compaction_end";
 			action: "context-full" | "handoff";
@@ -12907,7 +12921,11 @@ export class AgentSession {
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "auto_compaction_start") {
 				await this.#extensionRunner.emit(
-					{ type: "auto_compaction_start", reason: event.reason, action: event.action },
+					{
+						type: "auto_compaction_start",
+						reason: event.reason as "threshold" | "overflow" | "idle",
+						action: event.action,
+					},
 					undefined,
 					deliveryScope,
 				);
@@ -29115,11 +29133,19 @@ export class AgentSession {
 		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
-			await this.#runAutoCompaction("overflow", false, false, {
-				continueAfterMaintenance: false,
-				deferHandoffMaintenance: false,
-				force: true,
-			});
+			await this.#runAutoCompaction(
+				emergencyReason as Extract<
+					CompactionTriggerReason,
+					"heap" | "retainedMemory" | "transcriptFile" | "providerBytes" | "imageBytes" | "messageCount"
+				>,
+				false,
+				false,
+				{
+					continueAfterMaintenance: false,
+					deferHandoffMaintenance: false,
+					force: true,
+				},
+			);
 			// Update tracking for transcriptFile compactions to prevent re-triggering on every
 			// prompt when the file cannot shrink further
 			if (emergencyReason === "transcriptFile" && this.sessionManager.getSessionFile()) {
@@ -30535,7 +30561,16 @@ export class AgentSession {
 	 * Internal: Run auto-compaction with events.
 	 */
 	#runAutoCompaction(
-		reason: "overflow" | "threshold" | "idle",
+		reason:
+			| "overflow"
+			| "threshold"
+			| "idle"
+			| "heap"
+			| "retainedMemory"
+			| "transcriptFile"
+			| "providerBytes"
+			| "imageBytes"
+			| "messageCount",
 		willRetry: boolean,
 		deferred = false,
 		options?: {
@@ -30556,7 +30591,16 @@ export class AgentSession {
 	}
 
 	async #runAutoCompactionImpl(
-		reason: "overflow" | "threshold" | "idle",
+		reason:
+			| "overflow"
+			| "threshold"
+			| "idle"
+			| "heap"
+			| "retainedMemory"
+			| "transcriptFile"
+			| "providerBytes"
+			| "imageBytes"
+			| "messageCount",
 		willRetry: boolean,
 		deferred = false,
 		options?: {

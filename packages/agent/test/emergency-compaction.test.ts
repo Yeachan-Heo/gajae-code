@@ -123,4 +123,33 @@ describe("emergencyCompactionReason (W4 / F6)", () => {
 			}),
 		).toBe("transcriptFile");
 	});
+
+	it("prevents emergency compaction loop: requires 50% growth since last compaction", () => {
+		// Initial trigger when no previous compaction state
+		const floor = LIM.transcriptFileBytes!;
+		const currentSize = floor + 1; // Exceeds floor
+
+		expect(
+			emergencyCompactionReason(
+				{ ...under, transcriptFileBytes: currentSize },
+				LIM,
+				undefined, // No previous compaction
+			),
+		).toBe("transcriptFile");
+
+		// After compaction, file stayed large (couldn't shrink enough)
+		const afterCompactionSize = floor + 5_000_000; // Still over floor but recorded as baseline
+
+		// File grew to exactly 1.5x - should NOT trigger (need STRICTLY greater than 1.5x)
+		const slightGrowth = Math.floor(afterCompactionSize * 1.5);
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: slightGrowth }, LIM, afterCompactionSize),
+		).toBeNull();
+
+		// File grew to > 1.5x - SHOULD trigger
+		const significantGrowth = Math.floor(afterCompactionSize * 1.5) + 1;
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: significantGrowth }, LIM, afterCompactionSize),
+		).toBe("transcriptFile");
+	});
 });

@@ -415,12 +415,18 @@ export function emergencyCompactionReason(
 		tuiChatChildren >= (limits.tuiChatChildren ?? EMERGENCY_TUI_CHAT_CHILDREN)
 	)
 		return "retainedMemory";
-	if (sample.transcriptFileBytes && sample.transcriptFileBytes > (limits.transcriptFileBytes ?? EMERGENCY_TRANSCRIPT_FILE_BYTES)) {
+	if (
+		sample.transcriptFileBytes &&
+		sample.transcriptFileBytes > (limits.transcriptFileBytes ?? EMERGENCY_TRANSCRIPT_FILE_BYTES)
+	) {
 		// Prevent emergency compaction loop: only trigger if no previous compaction has happened,
 		// or if the file has grown significantly since the last transcriptFile compaction.
 		// Allow 50% growth margin to avoid re-triggering on every prompt when the file
 		// cannot shrink further (e.g., most content is essential and cannot be compacted).
-		if (!previousTranscriptFileBytesAfterCompaction || sample.transcriptFileBytes > previousTranscriptFileBytesAfterCompaction * 1.5) {
+		if (
+			!previousTranscriptFileBytesAfterCompaction ||
+			sample.transcriptFileBytes > previousTranscriptFileBytesAfterCompaction * 1.5
+		) {
 			return "transcriptFile";
 		}
 	}
