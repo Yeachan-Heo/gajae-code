@@ -116,8 +116,9 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 // The single-owner attach contract spans processes: a TUI owns the session claim, and ACP and SDK
 // clients attach to its endpoint through the broker without claiming. Its one end-to-end test is
 // named after none of these sources, so basename matching never reaches it. Every file under the
-// SDK host, bus, broker, Router, client, transport, ACP adapter and SDK CLI, and under ACP mode,
-// selects it; so do the ownership modules, session factories and the ownership counter writer
+// SDK host, bus, broker, Router, client, transport, lifecycle client, ACP adapter and SDK CLI,
+// under ACP mode and under the native file lock, selects it; so do the ownership modules, session
+// factories, the interactive mode, SDK startup and activation, and the ownership counter writer
 // listed in BEHAVIORAL_OWNER_TESTS.
 const SESSION_OWNER_ATTACH_TEST = "packages/coding-agent/test/session-owner-remote-attach.test.ts";
 const SESSION_OWNER_ATTACH_PREFIXES = [
@@ -129,7 +130,10 @@ const SESSION_OWNER_ATTACH_PREFIXES = [
 	"packages/coding-agent/src/sdk/transport/",
 	"packages/coding-agent/src/sdk/acp/",
 	"packages/coding-agent/src/sdk/cli/",
+	"packages/coding-agent/src/sdk/lifecycle/",
 	"packages/coding-agent/src/modes/acp/",
+	// The native lock primitive under the session claim; Rust paths reach behavioralTestsFor too.
+	"crates/pi-natives/src/file_lock/",
 ] as const;
 
 // These inputs produce, transform, or define the bundled model catalog. Partial
@@ -247,6 +251,9 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/commands/session.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/commands/acp.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/commands/sdk.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/sdk/startup-capability.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/sdk/session-activation.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/modes/interactive-mode.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/stats/src/session-ownership.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
@@ -259,6 +266,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts",
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
+		SESSION_OWNER_ATTACH_TEST,
 	],
 	// Session-manager owns the in-memory session lifecycle, whose integration
 	// contract is not basename-matched and needs explicit behavioral-owner coverage.
