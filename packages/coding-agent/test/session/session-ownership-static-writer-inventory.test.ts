@@ -394,10 +394,9 @@ const DEFERRED_WRITERS: Record<string, string> = {
 	deleteManagedCandidate: "deletes a session; delete ownership is the scoped-claim step (4d)",
 	prepareManagedCandidateForWrite:
 		"migration of a legacy-directory candidate under a scoped claim, read in place for a held fork source (session-factory-claims.test.ts)",
-	openNestedManaged:
-		"a child under its parent's store, claiming its own id as a subagent (session-factory-claims.test.ts)",
-	stagedNestedManaged: "a staged child, claiming at commit (session-factory-claims.test.ts)",
-	openStagedNestedManaged: "a staged child, claiming at commit (session-factory-claims.test.ts)",
+	openNestedManaged: "a subagent child: exempt until per-child claims (design §13 L2; session-factory-claims.test.ts)",
+	stagedNestedManaged: "a staged subagent child: exempt until per-child claims (design §13 L2)",
+	openStagedNestedManaged: "a staged subagent child: exempt until per-child claims (design §13 L2)",
 };
 
 /** A memory-guard checkpoint of `source`, taken outside the measured tree. */
@@ -436,7 +435,7 @@ async function checkpointOf(source: string) {
  */
 const STAGED_WRITERS: Record<string, { readonly reason: string; readonly run: Run }> = {
 	openStaged: {
-		reason: "an unpublished staged child below .staging; staged sessions claim at commit (4b)",
+		reason: "an unpublished staged subagent child below .staging; exempt until per-child claims (design §13 L2)",
 		run: f => SessionManager.openStaged(f.missing),
 	},
 	restoreMemoryGuardCheckpoint: {

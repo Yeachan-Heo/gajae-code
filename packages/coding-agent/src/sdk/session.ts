@@ -193,12 +193,13 @@ import {
 	type SessionMcpDeclaredServer,
 } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
+import { sessionClaimSetOf } from "../session/internal/session-claim-set";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
-import {
 import { sessionOwnerSurface } from "../session/session-ownership";
 import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
+import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
 	type StartupAuthConfigSnapshot,
@@ -2095,6 +2096,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 			}));
 		liveSessionManager = sessionManager;
+		// The claim gate for both a supplied manager and the one created here: enforce (5a) refuses a
+		// `held` or `failed` outcome at this point. Until then the outcome is only waited for.
+		await sessionClaimSetOf(sessionManager).settled();
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same

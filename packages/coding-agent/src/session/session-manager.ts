@@ -188,9 +188,9 @@ import {
 	type ResolvedSessionOwnership,
 	resolveSessionOwnership,
 	SessionClaimSet,
+	type SessionClaimStatus,
 	type SessionOwnershipDecision,
 	sessionClaimSetCapability,
-	subagentSessionOwnership,
 } from "./internal/session-claim-set";
 import {
 	applyReducerDelta,
@@ -24181,7 +24181,8 @@ export class SessionManager {
 			getProjectDir(),
 			stagingDir,
 			true,
-			SessionManager.#stagedOwnership(),
+			// Subagent children claim nothing yet (single-owner design §13 L2: per-child claims deferred).
+			"exempt",
 			storage,
 			finalDestination,
 		);
@@ -24212,12 +24213,6 @@ export class SessionManager {
 		}
 	}
 
-	/** A staged child claims nothing and detects nothing until `commitStaged` makes its id public. */
-	static #stagedOwnership(): ResolvedSessionOwnership {
-		const owner = subagentSessionOwnership();
-		return owner === "exempt" ? owner : { ...owner, staged: true };
-	}
-
 	/** Managed-authority variant of {@link openStaged}. */
 	static async stagedNestedManaged(
 		finalSessionFile: string,
@@ -24245,7 +24240,8 @@ export class SessionManager {
 			getProjectDir(),
 			stagedDir,
 			true,
-			SessionManager.#stagedOwnership(),
+			// Subagent children claim nothing yet (single-owner design §13 L2: per-child claims deferred).
+			"exempt",
 			storage,
 			stagedDestination,
 		);
@@ -24295,9 +24291,6 @@ export class SessionManager {
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
 		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
-		// The staged id becomes public here: claim it before the final flush and the publish.
-		this.#ownershipClaims.endStaging();
-		await this.#ownershipClaims.claim(this.#sessionId);
 		await this.flush();
 		await this.#closePersistWriter();
 		this.assertLegacyMutationAllowed("commit staged session");
@@ -25080,9 +25073,9 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: SessionMemoryMode = "shadow",
-		ownership?: SessionOwnershipDecision,
 	): Promise<SessionManager> {
-		const owner = subagentSessionOwnership(ownership);
+		// A subagent child claims nothing yet (single-owner design §13 L2: per-child claims deferred).
+		const owner: ResolvedSessionOwnership = "exempt";
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
 		const resolved = path.resolve(filePath);
@@ -25115,7 +25108,6 @@ export class SessionManager {
 				const openedFromSidecar = await boundedManager.#tryInitSessionFileFromSidecar(resolved);
 				const openedBounded = openedFromSidecar || (await boundedManager.#tryBoundedFirstOpen(resolved));
 				if (openedBounded) {
-					await boundedManager.#ownershipClaims.claim(boundedManager.#sessionId);
 					const header = boundedManager.#fileEntries.find(entry => entry.type === "session") as
 						| SessionHeader
 						| undefined;
@@ -25188,7 +25180,6 @@ export class SessionManager {
 			if (entries.length > 0) {
 				const migrationApplied = capturedMigrationApplied || cwdChanged;
 				transcriptChanged = migrationApplied;
-				await manager.#ownershipClaims.claim(header!.id);
 				await manager.#hydrateExistingSession(
 					resolved,
 					entries,
@@ -25211,7 +25202,6 @@ export class SessionManager {
 				manager.#commitResidentTextStoreTransition(transition);
 				manager.#retireEphemeralArtifacts();
 				writeTerminalBreadcrumb(manager.cwd, resolved);
-				await manager.#ownershipClaims.claim(fresh.sessionId);
 				await manager.#rewriteFile();
 				manager.#flushed = true;
 				manager.#ensuredOnDisk = true;
@@ -26201,7 +26191,7 @@ export class SessionManager {
 		// Claimed before the migration and the sanitize persist; handed to the manager once it exists,
 		// and released on every path that ends before that.
 		const attempt = await attemptSessionClaim(owner, identity.sessionId);
-		const pending = { claim: attempt.status === "claimed" ? attempt.claim : undefined };
+		const pending = { claim: attempt.status === "claimed" ? attempt.claim : undefined, status: attempt.status };
 		try {
 			return await SessionManager.#openExistingStrictClaimed(
 				identity,
@@ -26224,7 +26214,7 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy,
 		sessionMemoryMode: SessionMemoryMode,
 		owner: ResolvedSessionOwnership,
-		pending: { claim: SessionOwnerClaim | undefined },
+		pending: { claim: SessionOwnerClaim | undefined; readonly status: SessionClaimStatus },
 	): Promise<StrictSessionOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -26265,6 +26255,7 @@ export class SessionManager {
 		const header = entries[0] as SessionHeader;
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, owner, storage, destination);
+		manager.#ownershipClaims.noteOutcome(identity.sessionId, pending.status);
 		if (pending.claim) manager.#ownershipClaims.add(pending.claim);
 		pending.claim = undefined;
 		manager.#sessionMemoryMode = sessionMemoryMode;

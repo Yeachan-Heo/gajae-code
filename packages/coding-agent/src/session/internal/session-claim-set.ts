@@ -34,12 +34,11 @@ export type SessionOwnershipDecision =
 
 /**
  * The decision a persisting manager is constructed with. Required by the constructor, so a factory
- * cannot build a manager without deciding. `staged` defers claims and detection to `commitStaged`,
- * when the staged id becomes public.
+ * cannot build a manager without deciding.
  */
 export type ResolvedSessionOwnership =
 	| "exempt"
-	| { readonly surface: SessionOwnerSurface; readonly mode: SessionOwnershipMode; readonly staged?: boolean };
+	| { readonly surface: SessionOwnerSurface; readonly mode: SessionOwnershipMode };
 
 /** Read the mode once, for one factory; without a decision, claim as this process's surface. */
 export function resolveSessionOwnership(
@@ -49,17 +48,15 @@ export function resolveSessionOwnership(
 	return { surface: decision.surface, mode: decision.mode ?? sessionOwnershipMode() };
 }
 
-/** A subagent child claims its own id with its parent's surface plus ` (subagent)` (design §1 #19). */
-export function subagentSessionOwnership(decision?: SessionOwnershipDecision): ResolvedSessionOwnership {
-	const resolved = resolveSessionOwnership(decision);
-	if (resolved === "exempt" || resolved.surface.endsWith(" (subagent)")) return resolved;
-	return { ...resolved, surface: `${resolved.surface} (subagent)` as SessionOwnerSurface };
-}
-
-/** The outcome of one claim attempt: `none` when nothing was claimed and nothing holds it (off, fail-open). */
+/**
+ * The outcome of one claim attempt. `none`: nothing was attempted (off, exempt) or the platform
+ * failed open; `failed`: a failure enforce will refuse (counted `claim_failed`); `held`: another
+ * process holds the session (counted `claim_conflict`).
+ */
 export type SessionClaimAttempt =
 	| { readonly status: "claimed"; readonly claim: SessionOwnerClaim }
-	| { readonly status: "held" | "none" };
+	| { readonly status: "held" | "failed" | "none" };
+export type SessionClaimStatus = SessionClaimAttempt["status"];
 
 /**
  * One claim attempt under `ownership`, never throwing (design §13 M2). Nothing refuses yet: a held
@@ -84,6 +81,7 @@ export async function attemptSessionClaim(
 	} catch (error) {
 		countSessionOwnershipEvent("claim_failed");
 		logger.warn("Session claim failed; continuing without a claim", { mode: ownership.mode, error: String(error) });
+		return { status: "failed" };
 	}
 	return { status: "none" };
 }
@@ -127,18 +125,18 @@ export class SessionClaimSet {
 	readonly #pending = new Map<string, Promise<unknown>>();
 	/** Ids whose write a pending claim covered: if that claim does not land, the write is counted then. */
 	readonly #coveredByPending = new Map<string, string>();
+	/** The last claim outcome per id, read by the gates that will refuse in enforce (5a). */
+	readonly #outcomes = new Map<string, SessionClaimStatus>();
 	#current: string | undefined;
 	#transitions = 0;
 	#closed = false;
 	/** The factory's decision, with the mode it read once; a settings reload never changes it under a manager. */
 	readonly #ownership: ResolvedSessionOwnership;
-	#staged: boolean;
 	/** Detector reports already logged, as `<id> <site>`: log once, count every time. */
 	readonly #reported = new Set<string>();
 
 	constructor(ownership: ResolvedSessionOwnership = resolveSessionOwnership()) {
 		this.#ownership = ownership;
-		this.#staged = ownership !== "exempt" && ownership.staged === true;
 		abandonedSets.register(this, this.#claims);
 	}
 
@@ -148,7 +146,7 @@ export class SessionClaimSet {
 	}
 
 	get #mode(): SessionOwnershipMode {
-		return this.#ownership === "exempt" || this.#staged ? "off" : this.#ownership.mode;
+		return this.#ownership === "exempt" ? "off" : this.#ownership.mode;
 	}
 
 	/** The session id the manager's identity helper last bound. */
@@ -181,23 +179,24 @@ export class SessionClaimSet {
 	/**
 	 * Claim `sessionId` into this set (design §2.4): a factory's id before its first write, or a
 	 * transition's target before its rotation. Never throws and never refuses (see
-	 * {@link attemptSessionClaim}); a no-op in `off`, for an exempt or still-staged manager, and for
+	 * {@link attemptSessionClaim}); a no-op in `off`, for an exempt manager, and for
 	 * an id already held.
 	 */
-	async claim(sessionId: string): Promise<SessionClaimAttempt["status"]> {
+	async claim(sessionId: string): Promise<SessionClaimStatus> {
 		if (this.#mode === "off" || this.#closed) return "none";
 		if (this.#claims.has(sessionId)) return "claimed";
 		const inFlight = this.#pending.get(sessionId);
 		if (inFlight) {
 			await inFlight;
-			return this.#claims.has(sessionId) ? "claimed" : "none";
+			return this.#outcomes.get(sessionId) ?? "none";
 		}
 		const attempt = attemptSessionClaim(this.#ownership, sessionId);
 		this.#pending.set(sessionId, attempt);
-		let status: SessionClaimAttempt["status"] = "none";
+		let status: SessionClaimStatus = "none";
 		try {
 			const result = await attempt;
 			status = result.status;
+			this.#outcomes.set(sessionId, status);
 			if (result.status === "claimed") this.add(result.claim);
 			return status;
 		} finally {
@@ -214,17 +213,24 @@ export class SessionClaimSet {
 	 * is covered, because the id is fresh and no other process can hold it.
 	 */
 	claimInBackground(sessionId: string): void {
-		void this.claim(sessionId);
+		void this.claim(sessionId).then(() => {
+			// Landed after a rotation already settled away from it: release it now, not at the next settle.
+			if (this.#current !== sessionId && this.#transitions === 0) this.settle();
+		});
 	}
 
-	/** Wait for the claims in flight. */
-	async settled(): Promise<void> {
+	/** Record the outcome of a claim taken before this set existed (a strict open's, handed over). */
+	noteOutcome(sessionId: string, status: SessionClaimStatus): void {
+		this.#outcomes.set(sessionId, status);
+	}
+
+	/**
+	 * Wait for the claims in flight, then the outcome for the current id: the gate where enforce will
+	 * refuse a `held` or `failed` session (5a). `undefined` when nothing was attempted.
+	 */
+	async settled(): Promise<SessionClaimStatus | undefined> {
 		await Promise.all(this.#pending.values());
-	}
-
-	/** A staged manager's id became public (`commitStaged`): from here it claims and detects like any other. */
-	endStaging(): void {
-		this.#staged = false;
+		return this.#current === undefined ? undefined : this.#outcomes.get(this.#current);
 	}
 
 	/**

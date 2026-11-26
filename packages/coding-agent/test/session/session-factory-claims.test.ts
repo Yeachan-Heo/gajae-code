@@ -101,7 +101,7 @@ describe.if(supported)("factory claims", () => {
 		const manager = keep(SessionManager.create(place.cwd, place.destination));
 		manager.appendMessage(user("same tick"));
 		await manager.ensureOnDisk();
-		await sessionClaimSetOf(manager).settled();
+		expect(await sessionClaimSetOf(manager).settled()).toBe("claimed");
 		expect(sessionOwnershipCounters().session_write_without_claim).toBe(0);
 		const owners = await inspectSessionOwners();
 		expect(owners.held.map(sidecar => [sidecar.sessionId, sidecar.self])).toEqual([[manager.getSessionId(), true]]);
@@ -116,7 +116,12 @@ describe.if(supported)("factory claims", () => {
 			SessionOwnershipTestHooks.mode = mode;
 			SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
 			const held = keep(await SessionManager.open(file, place.destination));
-			expect([held.getSessionId(), sessionClaimSetOf(held).has(id)]).toEqual([id, false]);
+			// The gate where enforce will refuse (5a) can tell the outcomes apart.
+			expect([
+				held.getSessionId(),
+				sessionClaimSetOf(held).has(id),
+				await sessionClaimSetOf(held).settled(),
+			]).toEqual([id, false, "held"]);
 			expect(sessionOwnershipCounters().claim_conflict).toBeGreaterThan(0);
 			await held.close();
 
@@ -125,7 +130,11 @@ describe.if(supported)("factory claims", () => {
 				probe: async () => ({ state: FileLockProbeState.Free }),
 			};
 			const failed = keep(await SessionManager.open(file, place.destination));
-			expect([failed.getSessionId(), sessionClaimSetOf(failed).has(id)]).toEqual([id, false]);
+			expect([
+				failed.getSessionId(),
+				sessionClaimSetOf(failed).has(id),
+				await sessionClaimSetOf(failed).settled(),
+			]).toEqual([id, false, "failed"]);
 			expect(sessionOwnershipCounters().claim_failed).toBeGreaterThan(0);
 		});
 	}
@@ -213,7 +222,7 @@ describe.if(supported)("factory claims", () => {
 		});
 	});
 
-	it("children: a nested child claims its own id as a subagent; a staged child claims only at commit", async () => {
+	it("children are exempt for now (design §13 L2): a nested or staged child claims nothing, before or after commit", async () => {
 		const place = await workspace();
 		const parent = new ManagedSessionDescendantStore(
 			place.destination.securityContext.rootAuthority,
@@ -227,22 +236,37 @@ describe.if(supported)("factory claims", () => {
 		const nested = keep(
 			await SessionManager.openNestedManaged(path.join(store.dir, "task.jsonl"), destination, store),
 		);
-		const owners = await inspectSessionOwners();
-		expect(owners.held.find(sidecar => sidecar.sessionId === nested.getSessionId())?.holder?.surface).toBe(
-			"sdk (subagent)",
-		);
-
 		const staged = keep(
 			await SessionManager.stagedNestedManaged(path.join(store.dir, "staged.jsonl"), destination, store),
 		);
 		staged.appendMessage(user("staged"));
 		await staged.flush();
-		expect([
-			sessionClaimSetOf(staged).has(staged.getSessionId()),
-			sessionOwnershipCounters().session_write_without_claim,
-		]).toEqual([false, 0]);
 		await staged.commitStaged();
-		expect(await state(staged.getSessionId())).toBe("held");
-		expect(sessionClaimSetOf(staged).has(staged.getSessionId())).toBe(true);
+		nested.appendMessage(user("nested"));
+		await nested.flush();
+		expect((await inspectSessionOwners()).held).toEqual([]);
+		expect(sessionOwnershipCounters().session_write_without_claim).toBe(0);
+	});
+
+	it("a background claim that lands after the manager rotated away is released at once", async () => {
+		const place = await workspace();
+		// Hold back the first claim until the rotation has settled.
+		const gate = Promise.withResolvers<void>();
+		let calls = 0;
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				// The first acquire is create's background claim.
+				if (calls++ === 0) await gate.promise;
+				return tryAcquireFileLock(sidecar, timeoutMs);
+			},
+			probe: (sidecar, timeoutMs) => probeFileLock(sidecar, timeoutMs),
+		};
+		const manager = keep(SessionManager.create(place.cwd, place.destination));
+		const first = manager.getSessionId();
+		await manager.newSession();
+		gate.resolve();
+		await sessionClaimSetOf(manager).settled();
+		await Bun.sleep(0);
+		expect([await state(first), sessionClaimSetOf(manager).sessionIds]).toEqual(["free", [manager.getSessionId()]]);
 	});
 });

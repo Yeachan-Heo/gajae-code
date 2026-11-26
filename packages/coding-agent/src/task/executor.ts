@@ -61,7 +61,6 @@ import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../sessio
 import { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import type { ClientBridge } from "../session/client-bridge";
-import { subagentSessionOwnership } from "../session/internal/session-claim-set";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
@@ -2059,7 +2058,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 											? "disabled"
 											: "copy-retain",
 										subagentSettings.get("sessionMemory.mode"),
-										subagentSessionOwnership(),
+										// Subagent children claim nothing yet (single-owner design §13 L2).
+										"exempt",
 									),
 								)
 							: SessionManager.inMemory(worktree ?? cwd);
