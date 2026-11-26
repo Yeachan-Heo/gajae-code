@@ -4,7 +4,7 @@
  * Every mutation-shaped SessionManager method on the live prototype is classified: a writer of the
  * current session's transcript, a writer of a successor's transcript, or not a transcript writer
  * (with the reason). Each writer then runs against a real transcript with ownership on and every
- * claim failing open (the factories' and prepares' claims time out), so no claim is held, and every
+ * claim refused (the factories' and prepares' claims find the session held), so no claim is held, and every
  * transcript byte it changes must have been seen by the detector first. With claims working, each
  * successor writer claims its successor before writing it (single-owner design §2.4). A method
  * added later fails the classification until it is listed here, and a writer that reaches the disk
@@ -49,9 +49,12 @@ import {
 import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
-/** Every claim times out, so managers go on without one and the detector alone guards the writes. */
-const FAIL_OPEN_LOCKS = {
-	tryAcquire: async () => ({ status: natives.FileLockAcquireStatus.TimedOut, code: "timed_out" }),
+/**
+ * Every claim finds the session held elsewhere, so managers go on without one and the detector alone
+ * guards the writes. Not a fail-open answer: the detector is quiet for a claim that failed open.
+ */
+const UNCLAIMED_LOCKS = {
+	tryAcquire: async () => ({ status: natives.FileLockAcquireStatus.Held }),
 	probe: async () => ({ state: natives.FileLockProbeState.Free }),
 };
 
@@ -74,7 +77,7 @@ let writes: TranscriptWriteLedger;
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
-	SessionOwnershipTestHooks.lockBackend = FAIL_OPEN_LOCKS;
+	SessionOwnershipTestHooks.lockBackend = UNCLAIMED_LOCKS;
 	writes = spyOnTranscriptWrites();
 	// The detector's log line stays in memory: the logger's file sink lives under the real home.
 	detectorLogs = [];

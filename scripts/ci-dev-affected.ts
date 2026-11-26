@@ -706,6 +706,11 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/sdk-secure-local-controls.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
+		// Session ownership: the native file lock has no Windows implementation, so every
+		// claim fails open there. Only the windows-latest job can run that path.
+		(changedPath.startsWith("packages/coding-agent/src/session/session-ownership") && changedPath.endsWith(".ts")) ||
+		changedPath === "packages/coding-agent/src/session/internal/session-claim-set.ts" ||
+		changedPath === "packages/coding-agent/test/session/session-ownership.windows.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/session-index.ts" ||
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
 		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||

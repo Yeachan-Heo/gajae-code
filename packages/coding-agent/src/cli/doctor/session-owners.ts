@@ -12,8 +12,14 @@ import { canonicalDigest } from "./ids";
 import { collectDoctorProbe, type DoctorProbeResult } from "./probe-client";
 import type { DoctorCheck } from "./types";
 
-/** Above this many sidecars, gc pruning is not keeping up (design §2.9). */
-export const SESSION_OWNER_SIDECAR_LIMIT = 10_000;
+/**
+ * Above this many sidecars the doctor warns. Sidecar pruning is not implemented yet, so one empty
+ * `.session-owner` file per session ever opened accumulates; they are harmless, and must not be
+ * deleted by hand while gjc runs (a deleted sidecar lets a second process lock a new one). 100,000
+ * is years of heavy use (about 50 sessions a day for five years), so the warning means an outlier
+ * worth reporting, not ordinary use; 10,000 fired within a year for heavy users.
+ */
+export const SESSION_OWNER_SIDECAR_LIMIT = 100_000;
 
 /** The sidecar count, from `readdir` alone, so it stands even when the lock probe times out. */
 function sidecarCheck(targetId: string, counts: SessionOwnerEntryCounts | { readonly errno?: string }): DoctorCheck {

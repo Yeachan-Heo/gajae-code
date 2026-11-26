@@ -53,7 +53,10 @@ afterEach(async () => {
 describe("resolveSessionOwnershipMode", () => {
 	it("takes the setting, and lets the override only lower it", () => {
 		const cases: [unknown, string | undefined, SessionOwnershipMode][] = [
-			[undefined, undefined, "off"],
+			// Unset: the default, which the override can lower to off.
+			[undefined, undefined, "observe"],
+			[undefined, "off", "off"],
+			[undefined, "enforce", "observe"],
 			["observe", undefined, "observe"],
 			["enforce", undefined, "enforce"],
 			["enforce", "observe", "observe"],
@@ -63,8 +66,8 @@ describe("resolveSessionOwnershipMode", () => {
 			["off", "enforce", "off"],
 			["observe", "enforce", "observe"],
 			// An invalid setting reads as the default; an invalid override is ignored.
-			["on", undefined, "off"],
-			[true, "observe", "off"],
+			["on", undefined, "observe"],
+			[true, "enforce", "observe"],
 			["enforce", "disabled", "enforce"],
 		];
 		for (const [setting, override, expected] of cases)
@@ -117,11 +120,17 @@ describe("the session.ownership.mode setting", () => {
 	}
 	const userEnforce = { session: { ownership: { mode: "enforce" } } };
 
-	it("defaults to off, with or without process settings", async () => {
+	it("defaults to observe, with or without process settings", async () => {
 		expect(sessionOwnershipTestHookSlot().mode).toBeUndefined();
-		expect(sessionOwnershipMode()).toBe("off");
+		expect(sessionOwnershipMode()).toBe("observe");
 		const settings = await initSettings({}, {});
-		expect(settings.get("session.ownership.mode")).toBe("off");
+		expect(settings.get("session.ownership.mode")).toBe("observe");
+		expect(settings.getGlobal("session.ownership.mode")).toBeUndefined();
+		expect(sessionOwnershipMode()).toBe("observe");
+	});
+
+	it("an operator off in the global config turns the default off", async () => {
+		await initSettings({ session: { ownership: { mode: "off" } } }, {});
 		expect(sessionOwnershipMode()).toBe("off");
 	});
 
@@ -228,9 +237,40 @@ describe("the session.ownership.mode setting", () => {
 		expect(warnings).toEqual(["Session ownership is off: the global config could not be read"]);
 	});
 
-	it("cannot be raised from a project file when the user left it at off", async () => {
-		await initSettings({}, { session: { ownership: { mode: "enforce" } } });
+	it("a read failure is not remembered: the next read retries the file, and the warning stays at one", async () => {
+		const warnings: string[] = [];
+		vi.spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(message);
+		});
+		const agentDir = path.join(await tempRoot(), "agent");
+		const configPath = path.join(agentDir, "config.yml");
+		await fs.mkdir(configPath, { recursive: true });
+		const previous = process.env.GJC_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		try {
+			expect(sessionOwnershipMode()).toBe("off");
+			expect(isolatedMode()).toBe("off");
+			// The failure was transient: the file is readable now, and its value applies at once.
+			await fs.rmdir(configPath);
+			await Bun.write(configPath, YAML.stringify(fileMode("enforce")));
+			expect(sessionOwnershipMode()).toBe("enforce");
+		} finally {
+			if (previous === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previous;
+			resetAgentDirFromEnvironment();
+		}
+		// One warning for the path, however many reads failed there.
+		expect(warnings).toEqual(["Session ownership is off: the global config could not be read"]);
+	});
+
+	it("cannot be raised from a project file when the user set it to off", async () => {
+		await initSettings({ session: { ownership: { mode: "off" } } }, { session: { ownership: { mode: "enforce" } } });
 		expect(sessionOwnershipMode()).toBe("off");
+	});
+
+	it("cannot be raised from a project file when the user left it at the default", async () => {
+		await initSettings({}, { session: { ownership: { mode: "enforce" } } });
+		expect(sessionOwnershipMode()).toBe("observe");
 	});
 });
 

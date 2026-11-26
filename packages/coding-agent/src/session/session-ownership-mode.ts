@@ -17,7 +17,12 @@ import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 
 export const SESSION_OWNERSHIP_MODES = ["off", "observe", "enforce"] as const;
 export type SessionOwnershipMode = (typeof SESSION_OWNERSHIP_MODES)[number];
-export const DEFAULT_SESSION_OWNERSHIP_MODE: SessionOwnershipMode = "off";
+/**
+ * The mode when the operator set none. It is the effective default: `Settings.getGlobal` returns no
+ * value for an unset key, so the resolver falls back to this, and the schema default only mirrors it
+ * for display (a test keeps the two equal).
+ */
+export const DEFAULT_SESSION_OWNERSHIP_MODE: SessionOwnershipMode = "observe";
 export const SESSION_OWNERSHIP_ENV = "GJC_SESSION_OWNERSHIP";
 
 /** Test-only seams shared by the ownership modules. Code, not environment, so a project `.env` cannot reach them. */
