@@ -139,6 +139,7 @@ function reportIgnoredOverride(read: OverrideRead, configured: SessionOwnershipM
 export function resetSessionOwnershipModeForTests(): void {
 	cachedOverride = undefined;
 	reportedOverride = false;
+	settingFallback = undefined;
 }
 
 /** Test-only: whether this process has read `GJC_SESSION_OWNERSHIP` since the last reset. */
@@ -147,10 +148,21 @@ export function sessionOwnershipOverrideWasRead(): boolean {
 }
 
 let settingSource: (() => unknown) | undefined;
+/** The setting value for a process with no global Settings (a broker-launched session host). */
+let settingFallback: unknown;
 
 /** Settings supplies the global-only `session.ownership.mode` value. Without a source the default applies. */
 export function setSessionOwnershipSettingSource(source: (() => unknown) | undefined): void {
 	settingSource = source;
+}
+
+/**
+ * A process that never runs `Settings.init` (a session host opens under scoped settings) supplies
+ * its `session.ownership.mode` value here once, so its later factories (a lifecycle create, its
+ * subagents) read the same mode. The global settings, when present, win.
+ */
+export function setSessionOwnershipSettingFallback(value: unknown): void {
+	settingFallback = value;
 }
 
 /**
@@ -164,7 +176,7 @@ export function sessionOwnershipMode(): SessionOwnershipMode {
 	} catch {
 		setting = undefined;
 	}
-	return sessionOwnershipModeFor(setting);
+	return sessionOwnershipModeFor(setting ?? settingFallback);
 }
 
 /**

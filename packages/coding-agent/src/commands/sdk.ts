@@ -94,7 +94,7 @@ import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
 import { setSessionOwnerSurface } from "../session/session-ownership";
-import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
+import { sessionOwnershipModeFor, setSessionOwnershipSettingFallback } from "../session/session-ownership-mode";
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
@@ -493,11 +493,11 @@ export async function openLifecycleSessionManager(
 		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
-	// A broker-launched host claims as `sdk-host`, with the mode from the settings it opens under.
-	const ownership = {
-		surface: "sdk-host" as const,
-		mode: sessionOwnershipModeFor(lifecycleSettings.getGlobal("session.ownership.mode")),
-	};
+	// A broker-launched host claims as `sdk-host`, with the mode from the settings it opens under;
+	// the host has no global Settings, so its later factories (a lifecycle create, subagents) read it too.
+	const modeSetting = lifecycleSettings.getGlobal("session.ownership.mode");
+	setSessionOwnershipSettingFallback(modeSetting);
+	const ownership = { surface: "sdk-host" as const, mode: sessionOwnershipModeFor(modeSetting) };
 	let sessionManager: SessionManager | undefined;
 	let result: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
 	let operationError: unknown;
