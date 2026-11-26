@@ -530,4 +530,53 @@ describe("InputController skill command images", () => {
 
 		expect(stub.ctx.queueCompactionMessage).not.toHaveBeenCalled();
 	});
+
+	it("keeps an image-bearing draft when compaction starts during a slow input extension", async () => {
+		const release = Promise.withResolvers<void>();
+		let stub: ReturnType<typeof createContext> | undefined;
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				(stub?.ctx.session as unknown as { isCompacting: boolean }).isCompacting = true;
+				return {};
+			}),
+		};
+		stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		const submitted = controller.handleFollowUp();
+		release.resolve();
+		await submitted;
+
+		expect(stub.ctx.queueCompactionMessage).not.toHaveBeenCalled();
+		expect(stub.ctx.editor.getText()).toBe("/skill:test-skill look at [image 1]");
+		expect(stub.ctx.pendingImages).toEqual([IMAGE]);
+		expect(stub.ctx.showStatus).toHaveBeenCalledWith(
+			"Compaction in progress. Retry after it completes to send images.",
+		);
+	});
+
+	it("still queues a text-only draft when compaction starts during a slow input extension", async () => {
+		const release = Promise.withResolvers<void>();
+		let stub: ReturnType<typeof createContext> | undefined;
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				(stub?.ctx.session as unknown as { isCompacting: boolean }).isCompacting = true;
+				return {};
+			}),
+		};
+		stub = createContext({ skillCommands, pendingImages: [], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("plain follow-up");
+		const submitted = controller.handleFollowUp();
+		release.resolve();
+		await submitted;
+
+		expect(stub.ctx.queueCompactionMessage).toHaveBeenCalledTimes(1);
+	});
 });

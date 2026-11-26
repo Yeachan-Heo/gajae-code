@@ -1882,6 +1882,12 @@ export class InputController {
 		if (!text) return;
 		if (this.#rejectUnattachedImageReferences(text, extensionResult.effectiveImages)) return;
 		if (this.ctx.session.isCompacting) {
+			// Compaction may have started during the extension await, after the pre-await image
+			// check. The queue stores text only, so an image-bearing draft stays in the composer.
+			if ((extensionResult.inputImages?.length ?? 0) > 0 || extensionResult.effectiveImages.some(Boolean)) {
+				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
+				return;
+			}
 			// The extension await let the user keep typing; only an untouched composer is cleared.
 			this.ctx.queueCompactionMessage(text, "followUp", {
 				ownsComposer: this.#composerStillHolds(draft, pendingImages),
