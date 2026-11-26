@@ -189,13 +189,14 @@ export function sessionOwnershipMode(): SessionOwnershipMode {
 /**
  * The mode for a `session.ownership.mode` value read from settings other than the global instance
  * (a launch that opens its session before `Settings.init`, or a scoped load), with the same override.
- * A missing value, as from settings that never loaded the operator's config file (an embedding's
- * `Settings.isolated()`), falls back to the setting source, so the operator's `off` still applies.
+ * A missing or invalid value, as from settings that never loaded the operator's config file (an
+ * embedding's `Settings.isolated()`), falls back to the setting source, so the operator's `off` still
+ * applies. A valid explicit value wins.
  */
 export function sessionOwnershipModeFor(setting: unknown): SessionOwnershipMode {
 	const forced = sessionOwnershipTestHookSlot().mode;
 	if (forced !== undefined) return forced;
-	const value = setting === undefined ? readSettingSource() : setting;
+	const value = parseMode(setting) === undefined ? readSettingSource() : setting;
 	const configured = resolveSessionOwnershipMode(value, undefined);
 	// `off` is the kill switch: it returns before the environment is read at all.
 	if (configured === "off") return "off";

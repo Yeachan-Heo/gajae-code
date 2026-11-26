@@ -7226,24 +7226,40 @@ let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
 
 /**
- * The operator's global config.yml as a process that never ran `Settings.init` sees it (an SDK
- * embedding with isolated settings), read once per path. Sync, because sync session factories resolve
- * the ownership mode. A missing or malformed file reads as empty, as the loader treats it; an
- * unreadable file also reads as empty here, where the loader would fail.
+ * The operator's `session.ownership.mode` from the agent directory's config.yml, for a process that
+ * never ran `Settings.init` (an SDK embedding with isolated settings), read once per path. Sync,
+ * because sync session factories resolve the mode. A missing or malformed file reads as unset, as the
+ * loader treats it. Any other read error (EACCES, a directory in the file's place) resolves to `off`:
+ * deliberately more conservative than the loader, so a file that cannot be read never lifts an `off`
+ * the operator may have set in it.
  */
-const operatorGlobalConfigs = new Map<string, RawSettings>();
-function operatorGlobalConfig(configPath: string): RawSettings {
-	const cached = operatorGlobalConfigs.get(configPath);
-	if (cached) return cached;
-	let config: RawSettings = {};
+const operatorOwnershipModes = new Map<string, unknown>();
+function operatorOwnershipMode(configPath: string): unknown {
+	if (operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
+	let mode: unknown;
+	let content: string | undefined;
 	try {
-		const parsed: unknown = YAML.parse(fs.readFileSync(configPath, "utf8"));
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) config = parsed as RawSettings;
-	} catch {
-		// Missing or unreadable: the defaults apply.
+		content = fs.readFileSync(configPath, "utf8");
+	} catch (error) {
+		if (!isEnoent(error)) {
+			mode = "off";
+			logger.warn("Session ownership is off: the global config could not be read", {
+				configPath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
-	operatorGlobalConfigs.set(configPath, config);
-	return config;
+	if (content !== undefined) {
+		try {
+			const parsed: unknown = YAML.parse(content);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+				mode = getByPath(parsed as RawSettings, ["session", "ownership", "mode"]);
+		} catch {
+			// Malformed YAML: the default applies, as it does for the loader.
+		}
+	}
+	operatorOwnershipModes.set(configPath, mode);
+	return mode;
 }
 
 // Session ownership reads its global-only mode from the process settings or, before they exist, from
@@ -7254,7 +7270,7 @@ function operatorGlobalConfig(configPath: string): RawSettings {
 setSessionOwnershipSettingSource(() =>
 	globalInstance
 		? globalInstance.getGlobal("session.ownership.mode")
-		: getByPath(operatorGlobalConfig(path.join(getAgentDir(), "config.yml")), ["session", "ownership", "mode"]),
+		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml")),
 );
 
 export function isSettingsInitialized(): boolean {
@@ -7270,7 +7286,7 @@ export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
 	globalInitOptions = null;
-	operatorGlobalConfigs.clear();
+	operatorOwnershipModes.clear();
 }
 
 /**
