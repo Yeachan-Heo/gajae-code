@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
@@ -155,6 +156,17 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// Endpoint scope for owned-registration lookups: concurrent sessions reuse
 		// manager-local job ids (review thread P2).
 		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local";
+		// The session identity this monitor reports to. A session switch adopts the successor's id (or, for a copied
+		// session, only its transcript path) before it cancels the predecessor's jobs, and a cwd move relocates the
+		// transcript under the same id. When the identity differs from the origin at exit, the monitor does not take
+		// over the job's completion: the ordinary async-result stays and is routed by the session as before. After
+		// the monitor took it over, an identity change abandons the exit report instead of delivering it elsewhere.
+		const originSessionId = this.session.getSessionId?.() ?? null;
+		const sessionFileKey = (file: string | null | undefined) => (file ? path.resolve(file) : null);
+		const originSessionFile = sessionFileKey(this.session.getSessionFile());
+		const sessionIdentityUnchanged = () =>
+			(this.session.getSessionId?.() ?? null) === originSessionId &&
+			sessionFileKey(this.session.getSessionFile()) === originSessionFile;
 		const bash = new BashTool(this.session);
 		let deliveredFirstLine = false;
 		const controller = { closed: false };
@@ -416,16 +428,24 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			const deadline = Date.now() + EXIT_DELIVERY_RETRY_WINDOW_MS;
 			// An identity transition (clear, new or switched session, handoff) drops
 			// the old session's async-results; a disposed session also refuses with
-			// "busy". The exit report follows the same rules instead of retrying.
-			const sessionId = this.session.getSessionId?.();
+			// "busy". The exit report follows the same rules instead of retrying, and
+			// compares against the identity the monitor started under, checked before
+			// the first send and every retry.
 			const abandoned = () =>
 				explicitlyPurged ||
 				!this.session.sendCustomMessage ||
 				this.session.isSessionDisposed?.() === true ||
-				this.session.getSessionId?.() !== sessionId;
+				!sessionIdentityUnchanged();
 			const attempt = (delayMs: number) => {
 				const send = this.session.sendCustomMessage;
-				if (!send || abandoned()) return;
+				if (!send || abandoned()) {
+					if (!explicitlyPurged) {
+						logger.warn("Monitor exit notification abandoned: the session ended or changed identity", {
+							taskId: currentJobId,
+						});
+					}
+					return;
+				}
 				send.call(this.session, message, options).catch(error => {
 					const busy = (error as { code?: unknown } | undefined)?.code === "busy";
 					if (busy && !abandoned() && Date.now() + delayMs <= deadline) {
@@ -467,14 +487,16 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				// other exit keeps the async-result because it is then the only exit
 				// report: failures, timeouts, no stdout line, a rejected line send, no
 				// custom-message router, and clients that defer agent-initiated turns (a
-				// task-notification there does not wake the agent).
+				// task-notification there does not wake the agent), and a session whose
+				// identity changed since the monitor started.
 				shouldAcknowledgeCompletion: () => {
 					completionAcknowledged =
 						deliveredFirstLine &&
 						!lineDeliveryFailed &&
 						!controller.closed &&
 						this.session.sendCustomMessage !== undefined &&
-						this.session.getClientBridge?.()?.deferAgentInitiatedTurns !== true;
+						this.session.getClientBridge?.()?.deferAgentInitiatedTurns !== true &&
+						sessionIdentityUnchanged();
 					return completionAcknowledged;
 				},
 				onRawLine: (line, jobId) => {

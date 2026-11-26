@@ -777,6 +777,53 @@ describe("MonitorTool", () => {
 			}
 		}, 20_000);
 
+		it("keeps the async-result instead of reporting the exit when the session identity changed first", async () => {
+			// A session switch adopts the successor identity before it cancels the predecessor's jobs, and a cwd move
+			// relocates the transcript under the same id. A monitor that exits after either must not send its own exit
+			// report (a retry would land in the successor); the job's async-result stays, as for any other exit.
+			for (const change of ["id", "path"] as const) {
+				completions.length = 0;
+				let busy = false;
+				let refusals = 0;
+				let sessionId = "test-session";
+				let sessionFile = "/sessions/predecessor.jsonl";
+				const sent: Steered[] = [];
+				const session = createSession(settings);
+				session.getSessionId = () => sessionId;
+				session.getSessionFile = () => sessionFile;
+				session.sendCustomMessage = (async (msg: Steered, options?: unknown) => {
+					if (busy) {
+						refusals += 1;
+						throw Object.assign(new Error("session transition in progress"), { code: "busy" });
+					}
+					sent.push({ ...msg, options });
+				}) as typeof session.sendCustomMessage;
+				const tool = MonitorTool.createIf(session)!;
+				const result = expectText(
+					await tool.execute("call", {
+						command: "printf 'ALIVE\\n'; sleep 1.2",
+						kind: "poll",
+						description: `identity ${change} changes before exit`,
+						persistent: true,
+					}),
+				);
+				await waitUntil(() => sent.length === 1);
+				// The identity changes and ingress is refused while the monitor still runs.
+				busy = true;
+				if (change === "id") sessionId = "successor-session";
+				else sessionFile = "/sessions/successor.jsonl";
+				await waitUntil(() => manager.getJob(result.details.taskId)?.status === "completed");
+				await settle();
+				// Ingress reopens; no exit report may arrive, and no retry may be pending.
+				busy = false;
+				await new Promise(resolve => setTimeout(resolve, 300));
+
+				expect(refusals).toBe(0);
+				expect(exitNotifications(sent)).toEqual([]);
+				expect(completions).toEqual([result.details.taskId]);
+			}
+		}, 20_000);
+
 		it("keeps the async-result when the monitor fails after delivering lines", async () => {
 			const steered: Steered[] = [];
 			const tool = MonitorTool.createIf(createSession(settings, { steered }))!;
