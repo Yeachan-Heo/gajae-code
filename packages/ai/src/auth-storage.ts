@@ -555,7 +555,8 @@ export interface AuthCredentialStore {
 	/**
 	 * Atomically adds a display name to the active OAuth row `id` when it belongs to `organizationId` and has no name.
 	 * Every other stored field, tokens included, is left as the row currently holds it.
-	 * A store with refresh lease hooks but without this writer keeps a duplicate that holds the name instead of pruning it.
+	 * A store with refresh lease hooks but without this writer does not carry a duplicate's name on refresh: the
+	 * refreshed row stays authoritative and the duplicate is pruned.
 	 */
 	setOAuthOrganizationNameIfUnset?(id: number, organizationId: string, organizationName: string): boolean;
 	deleteAuthCredential(id: number, disabledCause: string): void;
@@ -3899,9 +3900,12 @@ export class AuthStorage {
 	 * - condition lost because a peer named the row first or changed its workspace: the name the row holds now, prune.
 	 * - condition lost because the row is no longer active: the refreshed credential, and keep the duplicate, since
 	 *   pruning it would leave no active row for the identity.
-	 * - store has no name-only writer, or the write or re-read failed: the refreshed credential without the carried name,
-	 *   and keep the duplicate that still holds the name so a later refresh carries it again. The tokens are already
-	 *   committed, so the refresh itself succeeds.
+	 * - store has no name-only writer, or the write failed: the refreshed credential without the carried name, prune.
+	 *   The row holding the lease-committed tokens stays authoritative: a kept duplicate would win the next reload's
+	 *   dedupe (it keeps the later row) with its older, possibly rotated-out tokens. The name is then lost as it was
+	 *   before names were carried, and the refresh itself succeeds.
+	 * - condition lost and the row cannot be re-read: the refreshed credential, and keep the duplicate, since the row
+	 *   may no longer be active.
 	 */
 	#persistCarriedOrganizationName<T extends AuthCredential>(
 		provider: string,
@@ -3911,11 +3915,20 @@ export class AuthStorage {
 		organizationId: string,
 		carriedName: string,
 	): { credential: T; pruneDuplicates: boolean } {
-		if (!this.#store.setOAuthOrganizationNameIfUnset) return { credential, pruneDuplicates: false };
+		if (!this.#store.setOAuthOrganizationNameIfUnset) return { credential, pruneDuplicates: true };
+		let written: boolean;
 		try {
-			if (this.#store.setOAuthOrganizationNameIfUnset(id, organizationId, carriedName)) {
-				return { credential: named, pruneDuplicates: true };
-			}
+			written = this.#store.setOAuthOrganizationNameIfUnset(id, organizationId, carriedName);
+		} catch (error) {
+			logger.warn("OAuth refresh could not persist the workspace name carried from a duplicate credential", {
+				provider,
+				credentialId: id,
+				error: String(error),
+			});
+			return { credential, pruneDuplicates: true };
+		}
+		if (written) return { credential: named, pruneDuplicates: true };
+		try {
 			const current = this.#store.listAuthCredentials(provider).find(entry => entry.id === id)?.credential;
 			if (!current) return { credential, pruneDuplicates: false };
 			const organizationName =
@@ -3927,7 +3940,9 @@ export class AuthStorage {
 				pruneDuplicates: true,
 			};
 		} catch (error) {
-			logger.warn("OAuth refresh could not persist the workspace name carried from a duplicate credential", {
+			// The conditional write lost and the row cannot be read back, so it may no longer be active: keep the
+			// duplicate rather than risk leaving the identity without an active row.
+			logger.warn("OAuth refresh could not re-read a credential after its workspace name write lost", {
 				provider,
 				credentialId: id,
 				error: String(error),
