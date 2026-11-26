@@ -2,11 +2,30 @@
  * Per-write attribution for the ownership write-path detector (single-owner design §12, before G1).
  *
  * Spies on the detector itself and, in order, on the write primitives listed below when they
- * target a transcript (`*.jsonl`). Each commit must follow a detector call made since the previous
- * commit, so a writer that makes one checked write and one that goes around the detector is caught
- * even though the operation as a whole was seen. Explicit destinations are checked when the persist
- * writer opens, so the open is the commit and the lines written through that handle are not
- * counted again.
+ * target a transcript (`*.jsonl`). Each commit must follow a detector call for the same session,
+ * made since that session's previous commit, so a writer that makes one checked write and one that
+ * goes around the detector is caught even though the operation as a whole was seen, and a check
+ * for one session never covers a write to another. Explicit destinations are checked when the
+ * persist writer opens, so the open is the commit and the lines written through that handle are
+ * not counted again.
+ *
+ * A commit's session is the id in the session header (the first line, `type: "session"`) of the
+ * transcript at its target path, read once the commit has landed: when a promise settles, a sync
+ * call returns, or a callback form's callback fires (before the caller's callback runs). A commit
+ * that did not land (it threw, rejected, called back with an error, or was a native no-replace
+ * result that did not commit) is not attributed and uses up no check. One rule covers an append, a
+ * rewrite, a rename or publish of a new file, and a fork's new transcript. It is enforced, not
+ * assumed:
+ * - When a transcript was already at the target, the commit must leave the same session's header
+ *   there; otherwise it is uncovered as `(header changed)` (a restore excepted).
+ * - A commit whose session cannot be determined is uncovered as `(no session header)`.
+ * - A commit that lands before its header exists (an open whose bytes follow through the handle)
+ *   moves the checks pending then into a reservation, and is decided once its header can be read:
+ *   at the next check, at the next commit that lands, or when the ledger is read. It is covered
+ *   only by a reserved check for its own session. Reading the ledger settles a deferred commit
+ *   whose header is already readable; one whose header is still missing is reported as
+ *   `(no session header)` without being settled.
+ * A check's session is the id it names, or the manager's bound id.
  *
  * Spied: SessionStorage writes, renames, exact replaces and writer opens; staged-writer publishes;
  * the managed store's publish, replace, append and move; the natives' no-replace rename and link;
@@ -20,9 +39,11 @@
  *
  * Transcripts are keyed by full path. A rename or move commits to its target and vacates its
  * source; a later commit that puts the vacated transcript back (the same file renamed back from
- * where it went, or the exact bytes a managed removal took, republished) is a restore, such as a
- * failed move's rollback, and needs no check of its own. Removals are recorded, so the byte check
- * sees them, but are not commits: deletes are outside G1 (design §12, "Before G1" item 4).
+ * where it went, or the exact bytes a managed removal took, republished), still carrying the same
+ * session id, is a restore, such as a failed move's rollback, and needs no check of its own. Any
+ * other commit that lands at a vacated path ends that vacancy.
+ * Removals are recorded, so the byte check sees them, but are not commits: deletes are outside G1
+ * (design §12, "Before G1" item 4).
  *
  * Also outside G1: directory-level renames that carry a transcript inside them (a fork's private
  * staging directory, an explicit staged child's commit). Their target is a directory, not a
@@ -48,10 +69,20 @@ import {
 } from "../../src/session/session-storage";
 
 export interface TranscriptWriteLedger {
-	/** Ordered `check <site>` and `<primitive> <basename>` events, for failure messages. */
+	/**
+	 * Ordered events, for failure messages: `check <site> <id>` (`(no id)` when the check had none),
+	 * `<primitive> <basename>` when a commit or removal starts, and `restore <primitive> <basename>`
+	 * when a commit lands as a restore.
+	 */
 	readonly events: string[];
-	/** Commits no detector call covered, as `<primitive> <basename>`. */
+	/**
+	 * Commits no check for their own session covered, as `<primitive> <basename>`, ending in
+	 * ` (no session header)` when the session could not be read, or ` (header changed)` when the
+	 * commit replaced another session's transcript at that path.
+	 */
 	readonly uncovered: string[];
+	/** The full paths of the `uncovered` commits, in the same order. */
+	readonly uncoveredFiles: string[];
 	/** Full paths of transcripts a spied primitive committed to, vacated or removed. */
 	readonly written: Set<string>;
 	/** Detector calls that had no session id to check, so they returned without looking. */
@@ -87,26 +118,73 @@ function transcriptPath(target: unknown, self?: unknown): string | undefined {
 	return base === undefined ? path.resolve(target) : path.resolve(base, target);
 }
 
-/** What a vacated transcript held: the bytes a managed removal took, or where a rename moved it. */
-type Vacated = { readonly kind: "renamed"; readonly to: string } | { readonly kind: "removed"; readonly bytes: Buffer };
+/** The session id in a transcript's header line, or undefined when there is none to read. */
+function headerId(bytes: Uint8Array | undefined): string | undefined {
+	if (bytes === undefined) return undefined;
+	const text = Buffer.from(bytes).toString("utf8");
+	const end = text.indexOf("\n");
+	try {
+		const header = JSON.parse(end < 0 ? text : text.slice(0, end)) as { type?: unknown; id?: unknown };
+		return header.type === "session" && typeof header.id === "string" ? header.id : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function readHeaderId(file: string): string | undefined {
+	try {
+		return headerId(fs.readFileSync(file));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * What a vacated transcript held, and its session id: the bytes a managed removal took, or where a
+ * rename moved the file.
+ */
+type Vacated =
+	| { readonly kind: "renamed"; readonly to: string; readonly id: string | undefined }
+	| { readonly kind: "removed"; readonly bytes: Buffer; readonly id: string | undefined };
+
+/**
+ * Whether a primitive's write landed: it did not throw or reject, and a native no-replace result's
+ * mutation committed.
+ */
+function landed(result: unknown): boolean {
+	const state = (result as { mutationState?: unknown } | null)?.mutationState;
+	return state === undefined || state === "committed";
+}
 
 export function spyOnTranscriptWrites(): TranscriptWriteLedger {
+	const uncoveredEntries: { readonly label: string; readonly file: string }[] = [];
 	const ledger = {
 		events: [] as string[],
-		uncovered: [] as string[],
+		/**
+		 * Read through getters, which settle each deferred commit whose header is already readable,
+		 * and report each one still waiting as uncovered without settling it.
+		 */
+		get uncovered(): string[] {
+			return reported().map(entry => entry.label);
+		},
+		get uncoveredFiles(): string[] {
+			return reported().map(entry => entry.file);
+		},
 		written: new Set<string>(),
 		unbound: [] as string[],
 		exempt: new Map<string, string>(),
 		reset() {
 			ledger.events.length = 0;
-			ledger.uncovered.length = 0;
+			uncoveredEntries.length = 0;
+			deferred.length = 0;
 			ledger.written.clear();
 			ledger.unbound.length = 0;
 			vacated.clear();
-			pending = false;
+			pending.clear();
 		},
 	};
-	let pending = false;
+	/** Session ids checked since the last commit to each. */
+	const pending = new Set<string>();
 	const inFlight = new Map<string, number>();
 	const vacated = new Map<string, Vacated>();
 
@@ -116,45 +194,127 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 		site: string,
 		sessionId?: string,
 	) {
-		if ((sessionId ?? this.currentSessionId) === undefined) ledger.unbound.push(site);
-		else pending = true;
-		ledger.events.push(`check ${site}`);
+		const id = sessionId ?? this.currentSessionId;
+		resolveDeferred();
+		if (id === undefined) ledger.unbound.push(site);
+		else pending.add(id);
+		ledger.events.push(`check ${site} ${id ?? "(no id)"}`);
 		return checkWrite.call(this, site, sessionId);
 	});
 
 	const exempt = (file: string) =>
 		[...ledger.exempt.keys()].some(directory => file.startsWith(`${directory}${path.sep}`));
 
-	/** Run `call` as the outermost primitive on `file`; nested primitives on the same file merge into it. */
-	const outermost = (file: string, record: () => void, call: () => unknown): unknown => {
-		if (!inFlight.has(file)) record();
-		inFlight.set(file, (inFlight.get(file) ?? 0) + 1);
-		const done = () => {
-			const left = (inFlight.get(file) ?? 1) - 1;
-			if (left === 0) inFlight.delete(file);
-			else inFlight.set(file, left);
+	/**
+	 * Run `call` as the outermost primitive on `file`. A primitive called on the same file while the
+	 * outer one is still running synchronously (a storage method calling `node:fs` underneath) merges
+	 * into it; once the outer call has returned, any other call is its own commit, even while the
+	 * outer one's promise or callback is still pending. `record` runs before the call and returns
+	 * what to do once it has completed, with whether the write landed. For a callback form
+	 * (`callbackArgs`, the arguments `call` passes on), it completes when its callback fires, before
+	 * the caller's callback runs; an error there means the write did not land.
+	 */
+	const outermost = (
+		file: string,
+		record: () => (didLand: boolean) => void,
+		call: () => unknown,
+		callbackArgs?: unknown[],
+	): unknown => {
+		const finish = inFlight.has(file) ? undefined : record();
+		let ended = false;
+		const done = (didLand: boolean) => {
+			if (ended) return;
+			ended = true;
+			finish?.(didLand);
 		};
+		const last = callbackArgs === undefined ? -1 : callbackArgs.length - 1;
+		const callback = callbackArgs?.[last];
+		const viaCallback = callbackArgs !== undefined && typeof callback === "function";
+		if (viaCallback) {
+			const caller = callback as (error: unknown, ...rest: unknown[]) => unknown;
+			callbackArgs[last] = (error: unknown, ...rest: unknown[]) => {
+				done(!error);
+				return caller(error, ...rest);
+			};
+		}
+		inFlight.set(file, (inFlight.get(file) ?? 0) + 1);
 		let result: unknown;
 		try {
 			result = call();
 		} catch (error) {
-			done();
+			done(false);
 			throw error;
+		} finally {
+			const left = (inFlight.get(file) ?? 1) - 1;
+			if (left === 0) inFlight.delete(file);
+			else inFlight.set(file, left);
 		}
-		if (result instanceof Promise) return result.finally(done);
-		done();
+		if (viaCallback) return result;
+		if (result instanceof Promise)
+			return result.then(
+				value => {
+					done(landed(value));
+					return value;
+				},
+				error => {
+					done(false);
+					throw error;
+				},
+			);
+		done(landed(result));
 		return result;
+	};
+
+	const flag = (label: string, file: string) => uncoveredEntries.push({ label, file });
+
+	/** A commit to the transcript of `id` is covered by a pending check for that id, which it uses up. */
+	const attribute = (label: string, file: string, id: string | undefined) => {
+		if (id !== undefined && pending.delete(id)) return;
+		flag(id === undefined ? `${label} (no session header)` : label, file);
+	};
+
+	/**
+	 * Commits whose transcript had no header yet when they landed: an open whose bytes follow
+	 * through the handle. Each takes the checks pending when it landed out of `pending`, reserving
+	 * them, and is decided once its header can be read: at the next check, at the next commit that
+	 * lands, or when the ledger is read. It is covered only by a reserved check for its own session,
+	 * which it uses up; the reserved checks it did not use go back to `pending`. One whose header
+	 * never appears is reported uncovered.
+	 */
+	const deferred: { readonly label: string; readonly file: string; readonly reserved: Set<string> }[] = [];
+	/** Decide the deferred commits whose header can now be read. */
+	const resolveDeferred = () => {
+		for (const entry of [...deferred]) {
+			const id = readHeaderId(entry.file);
+			if (id === undefined) continue;
+			deferred.splice(deferred.indexOf(entry), 1);
+			if (!entry.reserved.delete(id)) flag(entry.label, entry.file);
+			for (const unused of entry.reserved) pending.add(unused);
+		}
+	};
+	const reported = () => {
+		resolveDeferred();
+		return [
+			...uncoveredEntries,
+			...deferred.map(entry => ({ label: `${entry.label} (no session header)`, file: entry.file })),
+		];
 	};
 
 	/**
 	 * Record a commit to `target` and run it. `source` is what a rename moves away; `restores` says
-	 * whether this commit puts back what an earlier primitive vacated.
+	 * whether this commit puts back what an earlier primitive vacated. The commit is attributed once
+	 * it lands, to the session id in the header of the transcript it produced.
 	 */
 	const commit = (
 		primitive: string,
 		target: unknown,
 		call: () => unknown,
-		options: { self?: unknown; source?: unknown; restores?: (gone: Vacated, from?: string) => boolean } = {},
+		options: {
+			self?: unknown;
+			source?: unknown;
+			restores?: (gone: Vacated, from?: string) => boolean;
+			callbackArgs?: unknown[];
+		} = {},
 	): unknown => {
 		const file = transcriptPath(target, options.self);
 		const source = transcriptPath(options.source, options.self);
@@ -164,40 +324,44 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 			() => {
 				const name = path.basename(file);
 				ledger.written.add(file);
-				const gone = vacated.get(file);
-				if (gone && options.restores?.(gone, source)) {
-					ledger.events.push(`restore ${primitive} ${name}`);
-					vacated.delete(file);
-				} else {
-					ledger.events.push(`${primitive} ${name}`);
-					if (pending) pending = false;
-					else ledger.uncovered.push(`${primitive} ${name}`);
-				}
 				if (source !== undefined) ledger.written.add(source);
+				// The session whose transcript is there now, if any; the write must not change it.
+				const before = readHeaderId(file);
+				ledger.events.push(`${primitive} ${name}`);
+				return didLand => {
+					if (!didLand) return;
+					resolveDeferred();
+					const label = `${primitive} ${name}`;
+					const id = readHeaderId(file);
+					// A restore puts back the same session's transcript, from where it went.
+					const gone = vacated.get(file);
+					const restoring = gone !== undefined && options.restores?.(gone, source) === true && gone.id === id;
+					// Whatever lands at a vacated path ends what a later restore could put back.
+					vacated.delete(file);
+					if (restoring) ledger.events.push(`restore ${label}`);
+					else if (before !== undefined && id !== before) flag(`${label} (header changed)`, file);
+					else if (id === undefined) {
+						deferred.push({ label, file, reserved: new Set(pending) });
+						pending.clear();
+					} else attribute(label, file, id);
+					// Only a rename that moved the file vacates its source.
+					if (source !== undefined) vacated.set(source, { kind: "renamed", to: file, id });
+				};
 			},
-			// Only a rename that moved the file vacates its source.
-			source === undefined
-				? call
-				: () => afterSuccess(call, () => vacated.set(source, { kind: "renamed", to: file })),
+			call,
+			options.callbackArgs,
 		);
 	};
 
-	/**
-	 * Run `call`, then `onSuccess` once it has completed: not when it throws or rejects, and not when
-	 * it returns a native no-replace result whose mutation did not commit.
-	 */
-	const afterSuccess = (call: () => unknown, onSuccess: () => void): unknown => {
-		const settle = (result: unknown) => {
-			const state = (result as { mutationState?: unknown } | null)?.mutationState;
-			if (state === undefined || state === "committed") onSuccess();
-			return result;
-		};
-		const result = call();
-		return result instanceof Promise ? result.then(settle) : settle(result);
-	};
-
 	/** A removal changes the transcript's bytes but is not a commit; a managed one keeps what it took. */
-	const remove = (primitive: string, target: unknown, call: () => unknown, self?: unknown, bytes?: unknown) => {
+	const remove = (
+		primitive: string,
+		target: unknown,
+		call: () => unknown,
+		self?: unknown,
+		bytes?: unknown,
+		callbackArgs?: unknown[],
+	) => {
 		const file = transcriptPath(target, self);
 		if (file === undefined || exempt(file)) return call();
 		return outermost(
@@ -205,10 +369,13 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 			() => {
 				ledger.events.push(`${primitive} ${path.basename(file)}`);
 				ledger.written.add(file);
+				return didLand => {
+					if (didLand && bytes instanceof Uint8Array)
+						vacated.set(file, { kind: "removed", bytes: Buffer.from(bytes), id: headerId(bytes) });
+				};
 			},
-			bytes instanceof Uint8Array
-				? () => afterSuccess(call, () => vacated.set(file, { kind: "removed", bytes: Buffer.from(bytes) }))
-				: call,
+			call,
+			callbackArgs,
 		);
 	};
 
@@ -277,23 +444,25 @@ export function spyOnTranscriptWrites(): TranscriptWriteLedger {
 	wrap(natives, "renameNoReplacePath", renameAt("natives.renameNoReplacePath"));
 	wrap(natives, "linkNoReplacePath", at(1)("natives.linkNoReplacePath"));
 
-	// Sync and callback forms. A write stream commits when it is created, like a writer open.
-	for (const name of [
-		"writeFileSync",
-		"appendFileSync",
-		"truncateSync",
-		"writeFile",
-		"appendFile",
-		"truncate",
-		"createWriteStream",
-	])
+	// Sync forms. A write stream commits when it is created, like a writer open.
+	for (const name of ["writeFileSync", "appendFileSync", "truncateSync", "createWriteStream"])
 		wrap(fs, name, at(0)(`fs.${name}`));
-	for (const name of ["renameSync", "rename"]) wrap(fs, name, renameAt(`fs.${name}`));
-	for (const name of ["linkSync", "copyFileSync", "link", "copyFile"]) wrap(fs, name, at(1)(`fs.${name}`));
-	for (const name of ["unlinkSync", "unlink", "rmSync"])
-		wrap(fs, name, (call, args) => remove(`fs.${name}`, args[0], call));
+	wrap(fs, "renameSync", renameAt("fs.renameSync"));
+	for (const name of ["linkSync", "copyFileSync"]) wrap(fs, name, at(1)(`fs.${name}`));
+	for (const name of ["unlinkSync", "rmSync"]) wrap(fs, name, (call, args) => remove(`fs.${name}`, args[0], call));
 	wrap(fs, "openSync", (call, args) => (writeFlags(args[1]) ? commit("fs.openSync", args[0], call) : call()));
-	wrap(fs, "open", (call, args) => (writeFlags(args[1]) ? commit("fs.open", args[0], call) : call()));
+	// Callback forms return before they write; each lands when its callback fires.
+	for (const name of ["writeFile", "appendFile", "truncate"])
+		wrap(fs, name, (call, args) => commit(`fs.${name}`, args[0], call, { callbackArgs: args }));
+	wrap(fs, "rename", (call, args) =>
+		commit("fs.rename", args[1], call, { source: args[0], restores: renamedBack, callbackArgs: args }),
+	);
+	for (const name of ["link", "copyFile"])
+		wrap(fs, name, (call, args) => commit(`fs.${name}`, args[1], call, { callbackArgs: args }));
+	wrap(fs, "unlink", (call, args) => remove("fs.unlink", args[0], call, undefined, undefined, args));
+	wrap(fs, "open", (call, args) =>
+		writeFlags(args[1]) ? commit("fs.open", args[0], call, { callbackArgs: args }) : call(),
+	);
 
 	// Bun's own writers: Bun.write, and a file's writer, which commits when it is created.
 	const named = (target: unknown) =>

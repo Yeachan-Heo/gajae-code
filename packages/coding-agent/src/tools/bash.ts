@@ -1033,6 +1033,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		const resultBuilder = toolResult(details)
 			.text(outputText)
+			.retention("bash")
 			.truncationFromSummary(result, {
 				direction: "tail",
 				...(shortArtifactInBody ? { noticeOwner: "body" } : {}),
@@ -1057,6 +1058,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const details: BashToolDetails = {
 			timeoutSeconds: timeoutSec,
 			async: { state: "running", jobId, type: "bash" },
+			meta: { retention: "bash" },
 		};
 		// A folded client terminal keeps its remote handle, so the editor's live
 		// terminal card stays bound to the same id after the fold.

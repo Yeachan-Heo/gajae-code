@@ -5,10 +5,11 @@
  *
  * Every own property of the SessionManager constructor is classified. Each writer then runs
  * against real transcripts with ownership `observe` and no claim, in each scenario that reaches a
- * different write path. Every transcript it changes must have been reported under that
- * transcript's own session id, and no detector call may go unanswered for want of a bound id
- * (a factory writes before its manager binds). In `off`, with the strict seam on, the same
- * scenarios count and log nothing. Writers a later step covers are listed with that step.
+ * different write path. Each write to a transcript must follow a detector call for that
+ * transcript's own session id (the write ledger), every changed transcript must have been
+ * reported under its id, and no detector call may go unanswered for want of a bound id (a factory
+ * writes before its manager binds). In `off`, with the strict seam on, the same scenarios count
+ * and log nothing. Writers a later step covers are listed with that step.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsSync from "node:fs";
@@ -17,8 +18,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
-import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
-import { SessionClaimSet } from "../../src/session/internal/session-claim-set";
 import type { MemoryGuardSessionManagerCheckpointV1 } from "../../src/session/memory-guard-checkpoint-participant";
 import { type SessionDestination, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
@@ -27,36 +26,32 @@ import {
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
 import { isStagedSessionPath } from "../../src/session/session-staging-paths";
-import { FileSessionStorage } from "../../src/session/session-storage";
+import { expectStrictDetections, outsideStrictSeam, useStrictWriteDetection } from "./strict-write-detection";
+import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
 const managers: SessionManager[] = [];
 let detectorLogs: { site: string; sessionId: string }[] = [];
-/** Detector calls that had no id to check: silent, so a write behind them goes unreported. */
-let unbound: string[] = [];
+let writes: TranscriptWriteLedger;
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
 	detectorLogs = [];
-	unbound = [];
-	const checkWrite = SessionClaimSet.prototype.checkWrite;
-	vi.spyOn(SessionClaimSet.prototype, "checkWrite").mockImplementation(function (
-		this: SessionClaimSet,
-		site: string,
-		sessionId?: string,
-	) {
-		if ((sessionId ?? this.currentSessionId) === undefined) unbound.push(site);
-		return checkWrite.call(this, site, sessionId);
-	});
+	writes = spyOnTranscriptWrites();
 	vi.spyOn(logger, "warn").mockImplementation((message, context) => {
 		if (message === "session_write_without_claim") detectorLogs.push(context as never);
 	});
 });
 
+/** Close every manager the test opened, so writes left for close are made (and counted) now. */
+async function closeManagers(): Promise<void> {
+	for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
+}
+
 afterEach(async () => {
 	try {
-		for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
+		await closeManagers();
 		for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 	} finally {
 		delete SessionOwnershipTestHooks.mode;
@@ -186,6 +181,13 @@ async function transcripts(directory: string): Promise<Map<string, string>> {
 	return found;
 }
 
+/** Full paths, under `root`, of the transcripts whose bytes differ (a removed one included). */
+function changedPaths(root: string, before: Map<string, string>, after: Map<string, string>): string[] {
+	return [...new Set([...before.keys(), ...after.keys()])]
+		.filter(name => before.get(name) !== after.get(name))
+		.map(name => path.join(root, name));
+}
+
 /** Session ids of the transcripts whose bytes differ, from their headers. */
 function changedSessions(before: Map<string, string>, after: Map<string, string>): string[] {
 	return [...new Set([...before.keys(), ...after.keys()])]
@@ -209,7 +211,7 @@ async function attribute(kind: Kind, run: Run) {
 	const before = await transcripts(f.root);
 	const detectedBefore = sessionOwnershipCounters().session_write_without_claim;
 	detectorLogs = [];
-	unbound = [];
+	writes.reset();
 	let error: unknown;
 	try {
 		keep(await run(f));
@@ -217,8 +219,9 @@ async function attribute(kind: Kind, run: Run) {
 		error = caught;
 	}
 	// Close may pay rewrite debt an open left behind.
-	for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
-	const touched = changedSessions(before, await transcripts(f.root));
+	await closeManagers();
+	const after = await transcripts(f.root);
+	const touched = changedSessions(before, after);
 	const reported = new Set(detectorLogs.map(log => log.sessionId));
 	return {
 		touched,
@@ -226,10 +229,17 @@ async function attribute(kind: Kind, run: Run) {
 		detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore,
 		/** Changed transcripts whose session id the detector never reported. */
 		unreported: touched.filter(id => !reported.has(id)),
-		unbound: [...unbound],
+		/** Commits no check for their own session covered, and changes no spied primitive made. */
+		unattributed: [
+			...writes.uncovered,
+			...changedPaths(f.root, before, after)
+				.filter(file => !writes.written.has(file))
+				.map(file => `unspied ${path.basename(file)}`),
+		],
+		unbound: [...writes.unbound],
+		events: [...writes.events],
 	};
 }
-
 const identity = (file: string) => {
 	const capture = SessionManager.captureTranscriptStrict(file);
 	if (capture.kind !== "captured") throw new Error(`capture failed: ${capture.reason}`);
@@ -379,6 +389,7 @@ const DEFERRED_WRITERS: Record<string, string> = {
 async function checkpointOf(source: string) {
 	const checkpointRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-static-checkpoint-")));
 	roots.push(checkpointRoot);
+	writes.exempt.set(checkpointRoot, "a memory-guard checkpoint copy, not a session transcript");
 	const manager = await SessionManager.open(source);
 	const ingressLease = manager.acquireMemoryGuardParticipantIngressLease();
 	let checkpoint: MemoryGuardSessionManagerCheckpointV1;
@@ -405,9 +416,8 @@ async function checkpointOf(source: string) {
 /**
  * Writers that write only a staged transcript: one below `.staging`, or at a dot-prefixed name.
  * The step that publishes it is checked or deferred as named. Each runs, and every transcript it
- * changes (measured before close, which may discard it) must be such a staged one. A managed
- * restore's dot-prefixed transcript still shows in the managed listing and `continueRecent` until
- * PR #8049 (hide staged memory-guard restore transcripts from managed listing) lands.
+ * changes (measured before close, which may discard it) must be such a staged one, which the
+ * managed listing and `continueRecent` do not pick up.
  */
 const STAGED_WRITERS: Record<string, { readonly reason: string; readonly run: Run }> = {
 	openStaged: {
@@ -450,21 +460,16 @@ describe.if(supported)("session ownership static writer inventory", () => {
 					const result = await attribute(kind, run);
 					expect(result.error).toBeUndefined();
 					expect(result.unreported).toEqual([]);
-					expect(result.unbound).toEqual([]);
+					// Each write follows a check for its own session; the events are in the failure message.
+					expect({ unattributed: result.unattributed, unbound: result.unbound }).toEqual({
+						unattributed: [],
+						unbound: [],
+						...(result.unattributed.length + result.unbound.length > 0 ? { events: result.events } : {}),
+					});
 					if (result.touched.length > 0) {
 						wrote.add(name);
 						expect(result.detected).toBeGreaterThan(0);
 					}
-				});
-
-				it(`${name} (${scenario}, ${kind}): in off, nothing is counted or logged, even under the strict seam`, async () => {
-					const result = await attribute(kind, async f => {
-						SessionOwnershipTestHooks.mode = "off";
-						SessionOwnershipTestHooks.strictWriteDetection = true;
-						return run(f);
-					});
-					expect(result.error).toBeUndefined();
-					expect([result.detected, detectorLogs]).toEqual([0, []]);
 				});
 			}
 		}
@@ -474,7 +479,7 @@ describe.if(supported)("session ownership static writer inventory", () => {
 		it(`${name}: writes no transcript bytes`, async () => {
 			for (const kind of ["managed", "explicit"] as const) {
 				const result = await attribute(kind, run);
-				expect([kind, result.touched, result.error]).toEqual([kind, [], undefined]);
+				expect([kind, result.touched, result.error, result.unattributed]).toEqual([kind, [], undefined, []]);
 			}
 		});
 	}
@@ -484,6 +489,8 @@ describe.if(supported)("session ownership static writer inventory", () => {
 			for (const kind of ["managed", "explicit"] as const) {
 				const f = await fixture(kind);
 				const before = await transcripts(f.root);
+				// Checks the fixture left pending must not cover the writer's writes.
+				writes.reset();
 				keep(await run(f));
 				const after = await transcripts(f.root);
 				const changed = [...after.keys()].filter(name => before.get(name) !== after.get(name));
@@ -493,57 +500,39 @@ describe.if(supported)("session ownership static writer inventory", () => {
 					changed.length > 0,
 					[...before.keys()].every(name => after.get(name) === before.get(name)),
 				]).toEqual([kind, true, true]);
-				const staged = (name: string) =>
-					isStagedSessionPath(path.join(f.root, name)) || path.basename(name).startsWith(".");
-				expect([kind, changed.filter(name => !staged(name))]).toEqual([kind, []]);
+				const staged = (file: string) => isStagedSessionPath(file) || path.basename(file).startsWith(".");
+				expect([kind, changed.filter(name => !staged(path.join(f.root, name)))]).toEqual([kind, []]);
+				// A write the ledger could not attribute is a staged one: these publish later, checked.
+				expect([kind, writes.uncoveredFiles.filter(file => !staged(file))]).toEqual([kind, []]);
+				// Nothing resumes or lists the staged transcript.
+				const surfaced = (file: string) => changed.some(name => path.join(f.root, name) === file);
+				const listed =
+					kind === "managed"
+						? await SessionManager.listManagedForResumePickerReadOnly(f.cwd, f.agentDir)
+						: await SessionManager.listForResumePickerReadOnly(f.cwd, path.dirname(f.existing));
+				expect([kind, listed.map(info => info.path).filter(surfaced)]).toEqual([kind, []]);
+				const continued = keep(await SessionManager.continueRecent(f.cwd, f.destination())) as SessionManager;
+				expect([kind, surfaced(continued.getSessionFile()!)]).toEqual([kind, false]);
 			}
 		});
 	}
 
-	describe("under the strict seam, each factory publish is refused before it writes", () => {
-		/**
-		 * Record every publish of a transcript, as it happens: the end state alone cannot tell a
-		 * refusal before the publish from a publish its failure cleanup later deleted.
-		 */
-		function spyOnPublishes(): string[] {
-			const published: string[] = [];
-			const record = (primitive: string, target: unknown) => {
-				if (typeof target === "string" && target.endsWith(".jsonl"))
-					published.push(`${primitive} ${path.basename(target)}`);
-			};
-			const storage = FileSessionStorage.prototype;
-			const openStagedWriter = storage.openStagedWriter;
-			vi.spyOn(storage, "openStagedWriter").mockImplementation(function (this: FileSessionStorage, ...args) {
-				const writer = openStagedWriter.apply(this, args);
-				const publish = writer.publishNoReplace.bind(writer);
-				writer.publishNoReplace = () => {
-					record("stagedPublish", args[0]);
-					publish();
-				};
-				return writer;
-			});
-			for (const name of ["renameSync", "rename", "writeTextSync", "writeText"] as const) {
-				const original = storage[name] as (...args: never[]) => unknown;
-				const at = name.startsWith("rename") ? 1 : 0;
-				vi.spyOn(storage, name).mockImplementation(function (this: FileSessionStorage, ...args: never[]) {
-					record(name, args[at]);
-					return original.apply(this, args);
-				} as never);
+	describe("under the strict seam", () => {
+		useStrictWriteDetection(closeManagers);
+
+		for (const [name, scenarios] of Object.entries(CHECKED_WRITERS)) {
+			for (const [scenario, run] of Object.entries(scenarios)) {
+				for (const kind of ["managed", "explicit"] as const) {
+					it(`${name} (${scenario}, ${kind}): in off, nothing is counted or logged`, async () => {
+						const result = await attribute(kind, async f => {
+							SessionOwnershipTestHooks.mode = "off";
+							return run(f);
+						});
+						expect(result.error).toBeUndefined();
+						expect([result.detected, detectorLogs]).toEqual([0, []]);
+					});
+				}
 			}
-			const store = ManagedSessionDescendantStore.prototype;
-			for (const name of [
-				"publishNoReplace",
-				"publishNoReplaceSync",
-				"replaceSync",
-				"replaceExpectedIdentitySync",
-			] as const) {
-				const original = store[name] as (...args: never[]) => unknown;
-				vi.spyOn(store, name).mockImplementation(function (this: ManagedSessionDescendantStore, ...args: never[]) {
-					record(`store.${name}`, args[0]);
-					return original.apply(this, args);
-				} as never);
-			}
-			return published;
 		}
 
 		const publishes: Record<string, { readonly run: Run; readonly site: Record<Kind, string> }> = {
@@ -560,19 +549,26 @@ describe.if(supported)("session ownership static writer inventory", () => {
 				run: f => forkCaptured(f.compacted, f, "enabled"),
 				site: { managed: "fork successor", explicit: "fork successor" },
 			},
+			// The eager captured fork streams its transcript through the staged writer.
+			"forkFromCaptured (streaming publish)": {
+				run: f => forkCaptured(f.existing, f),
+				site: { managed: "fork successor", explicit: "fork successor" },
+			},
 		};
 		for (const [name, { run, site }] of Object.entries(publishes)) {
 			for (const kind of ["managed", "explicit"] as const) {
-				it(`${name} (${kind})`, async () => {
-					const f = await fixture(kind);
+				it(`${name} (${kind}) is refused before it publishes`, async () => {
+					const f = await outsideStrictSeam(() => fixture(kind));
 					const before = await transcripts(f.root);
-					const published = spyOnPublishes();
-					SessionOwnershipTestHooks.strictWriteDetection = true;
+					writes.reset();
 					await expect(run(f).then(keep)).rejects.toMatchObject({
 						name: "SessionWriteWithoutClaimError",
 						site: site[kind],
 					});
-					expect(published).toEqual([]);
+					expectStrictDetections(1);
+					// No transcript commit happened at all, as the ledger saw it: the end state alone cannot
+					// tell a refusal before the publish from a publish its failure cleanup later deleted.
+					expect(writes.events.filter(event => !event.startsWith("check "))).toEqual([]);
 					expect(await transcripts(f.root)).toEqual(before);
 				});
 			}

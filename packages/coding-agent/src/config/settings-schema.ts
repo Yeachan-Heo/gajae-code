@@ -1140,7 +1140,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "Artifact tail size (KB)",
-			description: "Amount of tail content kept inline when output spills to artifact",
+			description:
+				"Amount of tail content kept inline when a tool result spills to an artifact. The Bash tool uses `tools.bashOutputTailBytes` instead.",
 			options: [
 				{ value: "1", label: "1 KB", description: "~250 tokens" },
 				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
@@ -1160,7 +1161,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Artifact head size (KB)",
 			description:
-				"Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+				"Amount of head content kept inline alongside the tail when a tool result spills to an artifact (middle elision). 0 disables — keep tail only. The Bash tool uses `tools.bashOutputHeadBytes` instead.",
 			options: [
 				{ value: "0", label: "0 KB", description: "Disabled; tail-only truncation" },
 				{ value: "1", label: "1 KB", description: "~250 tokens" },
@@ -1171,6 +1172,45 @@ export const SETTINGS_SCHEMA = {
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 				{ value: "100", label: "100 KB", description: "~25K tokens" },
 				{ value: "200", label: "200 KB", description: "~50K tokens" },
+			],
+		},
+	},
+	"tools.bashOutputTailBytes": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "tools",
+			label: "Bash output tail size (KB)",
+			description:
+				"Tail window the Bash tool keeps inline from command output; the full stream is saved as an artifact when storage is available. Deliberately small so callers prefer focused commands and the search/find tools.",
+			options: [
+				{ value: "1", label: "1 KB", description: "Default; ~250 tokens" },
+				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "200", label: "200 KB", description: "~50K tokens" },
+			],
+		},
+	},
+	"tools.bashOutputHeadBytes": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Bash output head size (KB)",
+			description:
+				"Head window the Bash tool keeps inline alongside the tail (middle elision) so the start of long command output stays visible. 0 keeps the tail only.",
+			options: [
+				{ value: "0", label: "0 KB", description: "Default; tail-only truncation" },
+				{ value: "1", label: "1 KB", description: "~250 tokens" },
+				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 			],
 		},
 	},
