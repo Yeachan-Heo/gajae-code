@@ -11,7 +11,6 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead } from "../session/streaming-output";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import {
 	type ArchiveReader,
@@ -232,7 +231,7 @@ export interface SearchToolDetails {
 	error?: string;
 	/** Pre-formatted text for the user-visible TUI render. Mirrors the model-facing
 	 * `result.text` lines but uses a `│` gutter and `*` to mark match lines (vs space for
-	 * context). The TUI uses this directly so it never parses model-facing hashline anchors. */
+	 * context). The TUI uses this directly so it never parses model-facing text. */
 	displayContent?: string;
 	/** Absolute base directory used during search. Used by the renderer to resolve
 	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
@@ -346,13 +345,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					mcpManager: this.session.getMcpManager?.(),
 					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 					internalUrlAction: "search",
-					trackImmutableSources: true,
 					surfaceExactFilePaths: true,
 					multipathStatHint: " (`paths` entries must each exist relative to cwd)",
 					signal: combinedSignal,
 				});
 				throwIfSearchCancelled();
-				const { searchPath, isDirectory, multiTargets, exactFilePaths, missingPaths, immutableSourcePaths } = scope;
+				const { searchPath, isDirectory, multiTargets, exactFilePaths, missingPaths } = scope;
 				// When the only input was an archive selector, surface that selector instead
 				// of the temp scratch path the resolver substituted in.
 				const scopePath =
@@ -369,8 +367,6 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					);
 				}
 				const { globFilter } = scope;
-				const baseDisplayMode = resolveFileDisplayMode(this.session);
-				const immutableDisplayMode = resolveFileDisplayMode(this.session, { immutable: true });
 
 				const { GrepOutputMode, grep: nativeGrep } = await searchNatives();
 				const grep = this.options.grep ?? nativeGrep;
@@ -595,10 +591,6 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					const modelOut: string[] = [];
 					const displayOut: string[] = [];
 					const fileMatches = matchesByFile.get(relativePath) ?? [];
-					const absoluteFilePath = path.resolve(this.session.cwd, relativePath);
-					const useHashLines = immutableSourcePaths.has(absoluteFilePath)
-						? immutableDisplayMode.hashLines
-						: baseDisplayMode.hashLines;
 					const lineNumberWidth = fileMatches.reduce((width, match) => {
 						let nextWidth = Math.max(width, String(match.lineNumber).length);
 						for (const ctx of match.contextBefore ?? []) {
@@ -618,7 +610,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								modelOut.push("...");
 								displayOut.push(`${gutterPad}│...`);
 							}
-							modelOut.push(formatMatchLine(lineNumber, line, isMatch, { useHashLines }));
+							modelOut.push(formatMatchLine(lineNumber, line, isMatch));
 							displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
 							if (recordable) cacheEntries.push([lineNumber, line] as const);
 							lastEmittedLine = lineNumber;

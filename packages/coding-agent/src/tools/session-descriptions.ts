@@ -82,8 +82,7 @@ export function evalToolDescriptionForSession(session: DescriptionSession | null
 export function searchToolDescriptionForSession(session: DescriptionSession): string {
 	const displayMode = resolveFileDisplayMode(session);
 	return prompt.render(searchDescription, {
-		IS_HL_MODE: displayMode.hashLines,
-		IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
+		IS_LINE_NUMBER_MODE: displayMode.lineNumbers,
 	});
 }
 

@@ -312,4 +312,4 @@ Notes: ...
 - URL cache keys are session-scoped and normalized by requested URL + raw/rendered mode; both requested URL and final redirected URL are cached.
 - URL line-range reads request `ensureArtifact: true, preferCached: true` so a later paginated read can reopen the same rendered body from artifact storage.
 - Raw SQLite `q=` uses the same single explicit `SELECT` validator at selector parsing and execution; readonly and verified query-only connection modes remain defense in depth.
-- The file-read cache is not a read acceleration cache. It exists to recover hashline edits when the file changed after the read.
+- The file-read cache is not a read acceleration cache. It tracks contiguous file regions to support tool coordination when files change.

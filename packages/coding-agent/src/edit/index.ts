@@ -41,9 +41,6 @@ export { DEFAULT_EDIT_MODE, type EditMode, normalizeEditMode } from "../utils/ed
 export * from "./apply-patch";
 export * from "./diff";
 export * from "./file-read-cache";
-export * from "./line-hash";
-
-
 export * from "./modes/apply-patch";
 export * from "./modes/patch";
 export * from "./modes/replace";

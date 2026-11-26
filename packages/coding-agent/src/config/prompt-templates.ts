@@ -9,7 +9,6 @@ import {
 	prompt,
 } from "@gajae-code/utils";
 
-import { computeLineHash, HL_BODY_SEP } from "../edit/line-hash";
 import { jtdToTypeScript } from "../tools/jtd-to-typescript";
 import { parseCommandArgs, substituteArgs } from "../utils/command-args";
 
@@ -31,129 +30,7 @@ prompt.registerHelper("jtdToTypeScript", (schema: unknown): string => {
 	}
 });
 
-function formatHashlineRef(lineNum: unknown, content: unknown): { num: number; text: string; ref: string } {
-	const num = typeof lineNum === "number" ? lineNum : Number.parseInt(String(lineNum), 10);
-	const raw = typeof content === "string" ? content : String(content ?? "");
-	const text = raw.replace(/\\t/g, "\t").replace(/\\n/g, "\n").replace(/\\r/g, "\r");
-	const ref = `${num}${computeLineHash(num, text)}`;
-	return { num, text, ref };
-}
 
-interface HashlineHelperRef {
-	line: number;
-	ref: string;
-}
-
-interface HashlineHelperState {
-	last?: HashlineHelperRef;
-	byLine: Map<number, HashlineHelperRef>;
-}
-
-const HL_HELPER_STATE = Symbol("hashlineHelperState");
-
-interface HashlineHelperStateHolder {
-	[HL_HELPER_STATE]?: HashlineHelperState;
-}
-
-function isHelperOptions(value: unknown): value is prompt.HelperOptions {
-	return typeof value === "object" && value !== null && "hash" in value;
-}
-
-function splitHelperArgs(args: unknown[]): { positional: unknown[]; options?: prompt.HelperOptions } {
-	const maybeOptions = args.at(-1);
-	if (!isHelperOptions(maybeOptions)) return { positional: args };
-	return { positional: args.slice(0, -1), options: maybeOptions };
-}
-
-function getHashlineHelperState(context: unknown, options: prompt.HelperOptions | undefined): HashlineHelperState {
-	const data = options?.data;
-	const root = data?.root;
-	const holderTarget = data && typeof data === "object" ? data : root && typeof root === "object" ? root : context;
-	if (!holderTarget || typeof holderTarget !== "object") {
-		throw new Error("hashline prompt helpers require an object render context");
-	}
-
-	const holder = holderTarget as HashlineHelperStateHolder;
-	if (!holder[HL_HELPER_STATE]) {
-		holder[HL_HELPER_STATE] = { byLine: new Map() };
-	}
-	return holder[HL_HELPER_STATE];
-}
-
-function isLineNumberArg(value: unknown): boolean {
-	const num = typeof value === "number" ? value : Number.parseInt(String(value), 10);
-	return Number.isFinite(num);
-}
-
-function rememberHashlineRef(state: HashlineHelperState, line: number, ref: string): void {
-	const entry = { line, ref };
-	state.last = entry;
-	state.byLine.set(line, entry);
-}
-
-function requireStoredHashlineRef(state: HashlineHelperState, lineArg?: unknown): string {
-	if (lineArg === undefined) {
-		if (!state.last) {
-			throw new Error("{{href}} requires a previous {{hline}} call in the same prompt render");
-		}
-		return state.last.ref;
-	}
-
-	const line = typeof lineArg === "number" ? lineArg : Number.parseInt(String(lineArg), 10);
-	const entry = state.byLine.get(line);
-	if (!entry) {
-		throw new Error(`{{href ${line}}} requires a previous {{hline ${line} ...}} call in the same prompt render`);
-	}
-	return entry.ref;
-}
-
-function wrapHashlineRef(ref: string, args: unknown[]): string {
-	const preStr = typeof args[0] === "string" ? args[0] : "";
-	const postStr = typeof args[1] === "string" ? args[1] : "";
-	return `${preStr}${ref}${postStr}`;
-}
-
-function resolveHashlineRef(state: HashlineHelperState, args: unknown[]): string {
-	if (args.length === 0) return requireStoredHashlineRef(state);
-	const [first, second, ...rest] = args;
-	if (isLineNumberArg(first)) {
-		if (second === undefined) return requireStoredHashlineRef(state, first);
-		const { ref } = formatHashlineRef(first, second);
-		return wrapHashlineRef(ref, rest);
-	}
-	return wrapHashlineRef(requireStoredHashlineRef(state), args);
-}
-
-/**
- * {{href lineNum "content"}} — compute a real hashline ref for prompt examples.
- * {{href lineNum}} — quote the ref remembered by the earlier {{hline lineNum "..."}}
- * {{href}} — quote the ref from the previous {{hline}} call.
- * {{href "[" "]"}} — wrap the previous {{hline}} ref with pre/post chars.
- * Returns `"lineNumBIGRAM"` (e.g., `"42nd"`), or `"[42nd]"` when pre/post are supplied.
- */
-prompt.registerHelper("href", function (this: unknown, ...args: unknown[]): string {
-	const { positional, options } = splitHelperArgs(args);
-	const state = getHashlineHelperState(this, options);
-	return JSON.stringify(resolveHashlineRef(state, positional));
-});
-prompt.registerHelper("hrefr", function (this: unknown, ...args: unknown[]): string {
-	const { positional, options } = splitHelperArgs(args);
-	const state = getHashlineHelperState(this, options);
-	return resolveHashlineRef(state, positional);
-});
-
-/**
- * {{hline lineNum "content"}} — format a full read-style line with prefix.
- * Returns `"lineNumBIGRAM|content"` (pipe between anchor and content).
- */
-prompt.registerHelper("hline", function (this: unknown, ...args: unknown[]): string {
-	const { positional, options } = splitHelperArgs(args);
-	const [lineNum, content] = positional;
-	const { num, ref, text } = formatHashlineRef(lineNum, content);
-	const state = getHashlineHelperState(this, options);
-	rememberHashlineRef(state, num, ref);
-	return `${ref}${HL_BODY_SEP}${text}`;
-});
 
 const INLINE_ARG_SHELL_PATTERN = /\$(?:ARGUMENTS|@(?:\[\d+(?::\d*)?\])?|\d+)/;
 const INLINE_ARG_TEMPLATE_PATTERN = /\{\{[\s\S]*?(?:\b(?:arguments|ARGUMENTS|args)\b|\barg\s+[^}]+)[\s\S]*?\}\}/;

@@ -9,7 +9,6 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
 import { Ellipsis, renderStatusLine, truncateToWidth } from "../tui";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
@@ -234,7 +233,6 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 					.done();
 			}
 
-			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
 			const outputLines: string[] = [];
 			const displayLines: string[] = [];
 			const renderMatchesForFile = (relativePath: string): { model: string[]; display: string[] } => {
@@ -255,7 +253,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						const lineNumber = match.startLine + index;
 						const isMatch = index === 0;
 						const line = matchLines[index] ?? "";
-						modelOut.push(formatMatchLine(lineNumber, line, isMatch, { useHashLines }));
+						modelOut.push(formatMatchLine(lineNumber, line, isMatch));
 						displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
 					}
 					if (match.metaVariables && Object.keys(match.metaVariables).length > 0) {

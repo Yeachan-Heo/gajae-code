@@ -6,7 +6,6 @@ import { resolveEditMode } from "./edit-mode";
 
 export interface FileDisplayMode {
 	lineNumbers: boolean;
-	hashLines: boolean;
 }
 
 /** Session-like object providing settings and tool availability for display mode resolution. */
@@ -27,7 +26,6 @@ export function resolveFileDisplayMode(
 	const { settings } = session;
 	const raw = options?.raw === true;
 	return {
-		hashLines: false,
 		lineNumbers: !raw && settings.get("readLineNumbers") === true,
 	};
 }

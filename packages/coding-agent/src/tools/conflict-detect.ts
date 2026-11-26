@@ -457,8 +457,7 @@ function markerLine(prefix: string, label: string | undefined): string {
  * Returns:
  * - `lines`: the lines to render, ordered top-to-bottom.
  * - `startLine`: the 1-indexed file line number `lines[0]` corresponds
- *   to, so the read formatter can label hashline anchors with the
- *   original file positions.
+ *   to, so the read formatter can label the original file positions.
  *
  * Bare (no scope) returns the full block including marker lines. A
  * scoped view returns only that side's body — `base` throws when the

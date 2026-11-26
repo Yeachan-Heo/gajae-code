@@ -2,11 +2,8 @@
  * Per-session cache of file contents as they were rendered to the model by
  * the `read` and `search` tools in the current agent session.
  *
- * Used by hashline-mode anchor-stale recovery: if the model authored anchors
- * against a version of the file that no longer matches what is on disk —
- * because a subagent, the user, a linter, or a formatter modified the file
- * between the read and the edit — we replay the edits against the cached
- * pre-edit snapshot and 3-way-merge the result onto the live file.
+ * Retains the content observed before later changes made by a subagent,
+ * the user, a linter, or a formatter between a read and an edit.
  *
  * Scoped per `ToolSession`: the cache lives on the session object itself, so
  * different sessions never share snapshots and entries get reclaimed when
@@ -17,10 +14,8 @@
  *
  * When newly observed lines disagree with the newest generation (the file
  * changed, e.g. because this session just edited it), the previous generation
- * is retained behind the new one instead of being discarded. A model commonly
- * issues a follow-up edit with anchors from its original read after its own
- * edit shifted lines; recovery replays those anchors against the older
- * generation they were authored for.
+ * is retained behind the new one instead of being discarded, preserving the
+ * content and line positions from earlier reads even after edits shift lines.
  */
 import { LRUCache } from "lru-cache/raw";
 import type { ToolSession } from "../tools";

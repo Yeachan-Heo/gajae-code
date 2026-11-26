@@ -11,7 +11,7 @@
   - `packages/coding-agent/src/tools/path-utils.ts` — path/glob parsing and multi-path resolution
   - `packages/coding-agent/src/tools/render-utils.ts` — parse-error dedupe and display caps
   - `packages/coding-agent/src/tools/match-line-format.ts` — anchor-prefixed match rendering
-  - `packages/coding-agent/src/utils/file-display-mode.ts` — hashline vs line-number output mode
+  - `packages/coding-agent/src/utils/file-display-mode.ts` — line-number output mode
   - `packages/natives/native/index.d.ts` — JS-visible native binding contract
 
 ## Inputs
@@ -36,7 +36,7 @@ Pattern grammar and language support exposed to the model:
 - Single-shot tool result.
 - Model-facing `content` is one text block:
   - grouped by file for directory/multi-file searches,
-  - match lines rendered as `*LINE+HASH|text` in hashline mode or `*LINE|text` otherwise,
+  - match lines rendered as `*LINE|text`,
   - continuation lines for multi-line matches rendered with a leading space,
   - optional `meta: NAME=value` lines when ast-grep captured metavariables.
 - If no matches are found, text is `No matches found` or `No matches found. Parse issues mean the query may be mis-scoped; narrow paths before concluding absence.` plus formatted parse issues.
@@ -70,7 +70,6 @@ Pattern grammar and language support exposed to the model:
 - Directory + optional glob: native scan walks the directory, then filters by compiled glob.
 - Multiple explicit paths/globs: wrapper unions them into one synthetic scope or runs per-target native calls when paths only meet at root.
 - Internal URL inputs: only supported when the router can resolve them to a backing file path.
-- Hashline output mode vs plain line-number mode: controlled by `resolveFileDisplayMode()`; hashline mode requires the edit tool and non-raw, mutable sources.
 
 ## Side Effects
 - Filesystem
@@ -109,4 +108,4 @@ Pattern grammar and language support exposed to the model:
 - Pattern compilation is per language present in the candidate set. One pattern can succeed for some languages and generate per-file parse errors for others in the same run.
 - A file with tree-sitter error nodes still gets searched; the syntax warning is additive, not a skip condition.
 - For glob semantics, `*.ts` matches only direct children while `**/*.ts` recurses; this is covered by native tests in `crates/pi-natives/src/ast.rs`.
-- Output anchors are intended for follow-up tools, but the exact anchor format depends on session edit mode (`hashline` vs line-number mode).
+- Output anchors use line and column positions for follow-up tool reference.

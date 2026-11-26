@@ -6,13 +6,11 @@ import { Text } from "@gajae-code/tui";
 import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { computeLineHash, HL_BODY_SEP } from "../edit/line-hash";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
 import { wrapUntrustedContent } from "../session/messages";
 import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-mutation-guard";
 import { Ellipsis, renderStatusLine, truncateToWidth } from "../tui";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import {
 	AST_EDIT_OUTSIDE_ROOT_MESSAGE,
@@ -175,7 +173,7 @@ export interface AstEditToolDetails {
 	fileReplacements?: Array<{ path: string; count: number }>;
 	meta?: OutputMeta;
 	/** Pre-formatted text for the user-visible TUI render. Mirrors `result.text` lines but uses
-	 * a `│` gutter (no model-only hashline anchors). The TUI uses this directly so it never parses model-facing text. */
+	 * a `│` gutter. The TUI uses this directly so it never parses model-facing text. */
 	displayContent?: string;
 	/** Absolute base directory used during the edit. Used by the renderer to resolve
 	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
@@ -302,7 +300,6 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					.done();
 			}
 
-			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
 			const outputLines: string[] = [];
 			const displayLines: string[] = [];
 			const renderChangesForFile = (relativePath: string): { model: string[]; display: string[] } => {
@@ -318,15 +315,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					const afterFirstLine = change.after.split("\n", 1)[0] ?? "";
 					const beforeLine = beforeFirstLine.slice(0, 120);
 					const afterLine = afterFirstLine.slice(0, 120);
-					const beforeRef = useHashLines
-						? `${change.startLine}${computeLineHash(change.startLine, beforeFirstLine)}`
-						: `${change.startLine}:${change.startColumn}`;
-					const afterRef = useHashLines
-						? `${change.startLine}${computeLineHash(change.startLine, afterFirstLine)}`
-						: `${change.startLine}:${change.startColumn}`;
-					const lineSeparator = useHashLines ? HL_BODY_SEP : " ";
-					modelOut.push(`-${beforeRef}${lineSeparator}${beforeLine}`);
-					modelOut.push(`+${afterRef}${lineSeparator}${afterLine}`);
+					const location = `${change.startLine}:${change.startColumn}`;
+					modelOut.push(`-${location} ${beforeLine}`);
+					modelOut.push(`+${location} ${afterLine}`);
 					displayOut.push(formatCodeFrameLine("-", change.startLine, beforeLine, lineNumberWidth));
 					displayOut.push(formatCodeFrameLine("+", change.startLine, afterLine, lineNumberWidth));
 				}

@@ -12,7 +12,7 @@ import type { ImageContent } from "@gajae-code/ai/core";
 import type { glob as globFn } from "@gajae-code/natives";
 import { fuzzyMatch } from "@gajae-code/tui";
 import { formatAge, formatBytes, pathIsWithin, readImageMetadata, resolveEquivalentPath } from "@gajae-code/utils";
-import { formatHashLines } from "../edit/line-hash";
+
 import type { FileMentionMessage } from "../session/messages";
 import {
 	DEFAULT_MAX_BYTES,
@@ -342,7 +342,6 @@ export async function generateFileMentionMessages(
 	cwd: string,
 	options?: {
 		autoResizeImages?: boolean;
-		useHashLines?: boolean;
 		/** Inline byte cap for auto-read text. Default: DEFAULT_FILE_MENTION_INLINE_BYTES. */
 		maxInlineBytes?: number;
 		/**
@@ -461,10 +460,7 @@ export async function generateFileMentionMessages(
 			}
 
 			const content = await Bun.file(canonicalPath).text();
-			let { output, lineCount } = buildTextOutput(content, options?.maxInlineBytes);
-			if (options?.useHashLines) {
-				output = formatHashLines(output);
-			}
+			const { output, lineCount } = buildTextOutput(content, options?.maxInlineBytes);
 			files.push({ path: resolvedPath, content: output, lineCount });
 		} catch {
 			// File doesn't exist or isn't readable - skip silently

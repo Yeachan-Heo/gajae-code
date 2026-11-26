@@ -18808,7 +18808,6 @@ export class AgentSession {
 						}
 						fileMentionMessages = await generateFileMentionMessages(fileMentions, cwd, {
 							autoResizeImages: this.settings.get("images.autoResize"),
-							useHashLines: resolveFileDisplayMode(this).hashLines,
 							maxInlineBytes: this.settings.get("tools.fileMentionInlineBytes") * 1024,
 							recentlyShownPaths,
 						});
