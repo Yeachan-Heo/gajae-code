@@ -496,7 +496,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const batchRequest = getLspBatchRequest(context?.toolCall);
 		const diagnostics = await this.#writethrough(absolutePath, newContent, signal, undefined, batchRequest);
 		invalidateFsScanAfterWrite(absolutePath);
-		this.session.fileReadCache?.invalidate(absolutePath);
 		this.session.conflictHistory?.invalidate(entry.id);
 
 		const range =
@@ -613,7 +612,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			const diagnostics = await this.#writethrough(absolutePath, text, signal, undefined, batchRequest);
 			invalidateFsScanAfterWrite(absolutePath);
-			this.session.fileReadCache?.invalidate(absolutePath);
 			for (const entry of fileEntries) history.invalidate(entry.id);
 			succeededFiles.push({ displayPath: sample.displayPath, count: fileEntries.length });
 			totalResolvedIds += fileEntries.length;
@@ -738,7 +736,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					throw new ToolError(formatFileWriteError(error, absolutePath));
 				}
 				invalidateFsScanAfterWrite(absolutePath);
-				this.session.fileReadCache?.invalidate(absolutePath);
 				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 				const resultText = `Successfully wrote ${content.length} bytes to ${displayPath}`;
 				return { content: [{ type: "text", text: resultText }], details: {} };
@@ -751,7 +748,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				throw new ToolError(formatFileWriteError(error, absolutePath));
 			}
 			invalidateFsScanAfterWrite(absolutePath);
-			this.session.fileReadCache?.invalidate(absolutePath);
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 			const resultText = `Successfully wrote ${content.length} bytes to ${displayPath}`;

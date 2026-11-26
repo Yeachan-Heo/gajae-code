@@ -441,10 +441,6 @@ export interface ToolSession {
 	/** Set or clear active checkpoint state. */
 	setCheckpointState?: (state: CheckpointState | null) => void;
 
-	/** Per-session cache of file contents as last shown to the model by
-	 *  `read`/`search`. Lazily initialized by `getFileReadCache`. */
-	fileReadCache?: import("../edit/file-read-cache").FileReadCache;
-
 	/** Per-session log of unresolved git merge conflict regions surfaced by
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`
 	 *  to splice the recorded region with replacement content. Lazily initialized

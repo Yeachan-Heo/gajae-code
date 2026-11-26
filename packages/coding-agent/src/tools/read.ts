@@ -8,7 +8,6 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { getFileReadCache } from "../edit/file-read-cache";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getActiveSkills } from "../extensibility/skills";
@@ -1581,7 +1580,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			truncationMetadataBodyRelative?: boolean;
 			/** Preserve this leading URL preamble while truncating only the selected body. */
 			protectedPrefixChars?: number;
-			cacheLinesFor?: string;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
@@ -1621,7 +1619,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const direction = options.truncationDirection ?? "head";
 		const receipt = options.receiptPath !== undefined;
-		const exposeReceiptHeadMeta = receipt && options.cacheLinesFor !== undefined;
 		const bodyFooterPath = options.receiptPath ?? options.bodyFooterPath;
 		const preservePrefix =
 			direction !== "head" && options.protectedPrefixChars !== undefined && options.protectedPrefixChars > 0;
@@ -1686,7 +1683,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		let usedLegacyHeadTruncation = false;
 		let outputText = renderedWindow;
 		let truncationResult: TruncationResult | undefined;
-		if (window.kind !== "full" && (!receipt || direction !== "head" || exposeReceiptHeadMeta)) {
+		if (window.kind !== "full" && (!receipt || direction !== "head")) {
 			const windowResult = makeWindowResult(metadataWindow, selectedContent);
 			const baseTruncation =
 				!receipt && direction === "head"
@@ -1761,19 +1758,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		details.spillEligible =
 			options.spillEligible === true && selectedContent.length > 0 && !windowHasPartialSegment(window);
-		if (options.cacheLinesFor && !windowHasPartialSegment(window)) {
-			for (const segment of windowSegments(window)) {
-				if (segment.kind === "lines" && segment.lines > 0) {
-					getFileReadCache(this.session).recordContiguous(
-						options.cacheLinesFor,
-						segment.origin.startLine,
-						linesOfSegment(segment),
-					);
-				}
-			}
-		}
 		resultBuilder.text(options.wrapUntrusted ? wrapUntrustedContent(outputText) : outputText);
-		if (window.kind !== "full" && (!receipt || direction !== "head" || exposeReceiptHeadMeta)) {
+		if (window.kind !== "full" && (!receipt || direction !== "head")) {
 			const receiptHead = receipt && direction === "head";
 			if (receiptHead && truncationResult?.truncated) {
 				const diskLike = {
@@ -1831,7 +1817,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			immutable?: boolean;
 			wrapUntrusted?: boolean;
 			truncationDirection?: TruncationDirection;
-			cacheLinesFor?: string;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
@@ -1904,17 +1889,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				blockOutput = `${blockOutput}\n\n${formatDirectionalFooter(disclosurePath, window)}`;
 			}
 			parts.push(blockOutput);
-			if (options.cacheLinesFor && !windowHasPartialSegment(window)) {
-				for (const segment of windowSegments(window)) {
-					if (segment.kind === "lines" && segment.lines > 0) {
-						getFileReadCache(this.session).recordContiguous(
-							options.cacheLinesFor,
-							segment.origin.startLine,
-							linesOfSegment(segment),
-						);
-					}
-				}
-			}
 		}
 
 		const outputText = parts.length > 0 ? parts.join("\n\n…\n\n") : "";
@@ -1964,7 +1938,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					entityLabel: "file",
 					raw: rawSelector,
 					truncationDirection: direction,
-					cacheLinesFor: absolutePath,
 				});
 				if (suffixResolution) {
 					const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
@@ -1989,7 +1962,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				entityLabel: "file",
 				raw: rawSelector,
 				truncationDirection: direction,
-				cacheLinesFor: absolutePath,
 			});
 			const firstText = result.content.find((content): content is TextContent => content.type === "text");
 			if (suffixResolution && firstText) {
@@ -2030,7 +2002,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			const collectedLines = streamResult.lines;
-			const cacheLines = collectedLines.slice();
 			if (!rawSelector && maxColumns > 0) {
 				const clipped = truncateTextWithSecretAwareness(collectedLines.join("\n"), maxColumns);
 				if (clipped.wasTruncated) {
@@ -2040,9 +2011,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			contentLineCount += collectedLines.length;
-			if (cacheLines.length > 0) {
-				getFileReadCache(this.session).recordContiguous(absolutePath, range.startLine, cacheLines);
-			}
 
 			const blockText = collectedLines.join("\n");
 			blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddLineNumbers));
@@ -2378,7 +2346,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					entityLabel: "file",
 					raw: isRawSelector(parsed),
 					truncationDirection: direction,
-					cacheLinesFor: absolutePath,
 				});
 			}
 			const { offset, limit } = selToOffsetLimit(parsed);
@@ -2387,7 +2354,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				sourcePath: absolutePath,
 				entityLabel: "file",
 				raw: isRawSelector(parsed),
-				cacheLinesFor: absolutePath,
 				truncationDirection: direction,
 			});
 		} catch (error) {
@@ -2972,7 +2938,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								sourcePath: absolutePath,
 								entityLabel: "file",
 								raw: isRawSelector(parsed),
-								cacheLinesFor: absolutePath,
 								truncationDirection: localDirection,
 							});
 							if (suffixResolution) {
@@ -3110,17 +3075,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							spillEligible: !isBareReceipt && selectedContent.length > 0 && !directionalPartial,
 						};
 						if (bodyFooter) rememberBodyTruncationFooter(details, bodyFooter);
-						if (!directionalPartial) {
-							for (const segment of windowSegments(window)) {
-								if (segment.kind === "lines" && segment.lines > 0) {
-									getFileReadCache(this.session).recordContiguous(
-										absolutePath,
-										segment.origin.startLine,
-										linesOfSegment(segment),
-									);
-								}
-							}
-						}
+
 						const conflictBlocks = windowSegments(window).flatMap(segment =>
 							segment.kind === "lines"
 								? scanConflictLines(linesOfSegment(segment), segment.origin.startLine)
@@ -3192,9 +3147,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							firstLineExceedsLimit,
 						};
 
-						if (collectedLines.length > 0 && !firstLineExceedsLimit) {
-							getFileReadCache(this.session).recordContiguous(absolutePath, startLineDisplay, collectedLines);
-						}
+
 
 						const shouldAddLineNumbers = rawSelector ? false : displayMode.lineNumbers;
 						let capturedDisplayContent: { text: string; startLine: number } | undefined;

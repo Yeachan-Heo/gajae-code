@@ -6,7 +6,6 @@ import type { GrepMatch, GrepResult, grep as grepFn } from "@gajae-code/natives"
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import * as z from "zod/v4";
-import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead } from "../session/streaming-output";
@@ -601,19 +600,17 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						}
 						return nextWidth;
 					}, 0);
-					const cacheEntries: Array<readonly [number, string]> = [];
-					let lastEmittedLine: number | undefined;
-					const gutterPad = " ".repeat(lineNumberWidth + 1);
-					for (const match of fileMatches) {
-						const pushLine = (lineNumber: number, line: string, isMatch: boolean, recordable: boolean) => {
-							if (lastEmittedLine !== undefined && lineNumber > lastEmittedLine + 1) {
-								modelOut.push("...");
-								displayOut.push(`${gutterPad}│...`);
-							}
-							modelOut.push(formatMatchLine(lineNumber, line, isMatch));
-							displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
-							if (recordable) cacheEntries.push([lineNumber, line] as const);
-							lastEmittedLine = lineNumber;
+				let lastEmittedLine: number | undefined;
+				const gutterPad = " ".repeat(lineNumberWidth + 1);
+				for (const match of fileMatches) {
+					const pushLine = (lineNumber: number, line: string, isMatch: boolean, recordable: boolean) => {
+						if (lastEmittedLine !== undefined && lineNumber > lastEmittedLine + 1) {
+							modelOut.push("...");
+							displayOut.push(`${gutterPad}│...`);
+						}
+						modelOut.push(formatMatchLine(lineNumber, line, isMatch));
+						displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
+						lastEmittedLine = lineNumber;
 						};
 						if (match.contextBefore) {
 							for (const ctx of match.contextBefore) {
@@ -630,9 +627,6 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 							}
 						}
 						fileMatchCounts.set(relativePath, (fileMatchCounts.get(relativePath) ?? 0) + 1);
-					}
-					if (cacheEntries.length > 0 && !archiveDisplaySet.has(relativePath)) {
-						getFileReadCache(this.session).recordSparse(path.resolve(searchPath, relativePath), cacheEntries);
 					}
 					return { model: modelOut, display: displayOut };
 				};

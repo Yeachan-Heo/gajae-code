@@ -8,7 +8,7 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import type { ReadToolDetails } from "@gajae-code/coding-agent/tools/read";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
-import { getFileReadCache } from "../src/edit/file-read-cache";
+
 
 function textOutput(result: AgentToolResult<ReadToolDetails>): string {
 	return result.content
@@ -190,15 +190,7 @@ describe("read tool multi-range selector", () => {
 			if (truncation === "last") expect(textOutput(diskResult)).not.toContain(`50|50|${"x".repeat(20)}`);
 			else expect(textOutput(diskResult)).toContain(`50|50|${"x".repeat(20)}`);
 
-			const diskSnapshot = getFileReadCache(diskSession).get(filePath);
-			const bridgeSnapshot = getFileReadCache(bridgeSession).get(filePath);
-			expect(diskSnapshot?.lines).toBeDefined();
-			expect(bridgeSnapshot?.lines).toBeDefined();
-			expect([...bridgeSnapshot!.lines.keys()]).toEqual([...diskSnapshot!.lines.keys()]);
-			for (const [lineNumber, line] of diskSnapshot!.lines) {
-				expect(line).toBe(sourceLines[lineNumber - 1]);
-				expect(bridgeSnapshot!.lines.get(lineNumber)).toBe(line);
-			}
+
 		}
 	});
 
@@ -263,11 +255,7 @@ describe("read tool multi-range selector", () => {
 				expect(text).not.toMatch(/^\d+[a-z]{2}\|Z/m);
 				expect(result.details?.meta?.limits?.columnTruncated?.maxColumn).toBe(768);
 			expect(result.details?.spillEligible).toBe(false);
-			if (testCase.name !== "archive") {
-				const snapshot = getFileReadCache(testCase.session).get(filePath);
-				expect(snapshot?.lines.has(2)).toBe(false);
-				expect(snapshot?.lines.get(4)).toBe("delta");
-			}
+
 		}
 	});
 

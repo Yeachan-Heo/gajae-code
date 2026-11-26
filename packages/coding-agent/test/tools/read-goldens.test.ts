@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { EditTool, getFileReadCache } from "@gajae-code/coding-agent/edit";
+import { EditTool } from "@gajae-code/coding-agent/edit";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
@@ -26,7 +26,6 @@ const GOLDEN_BUCKETS_TO_CHECK: readonly Bucket[] =
 	FORCE_TRUNCATION === "head" ? ["invariant"] : ["invariant", "changed", "surface"];
 
 type Bucket = "invariant" | "changed" | "surface";
-type Variant = "hl" | "plain";
 
 const EXPECTED_MANIFEST_COUNTS: Record<Bucket, number> = {
 	invariant: 29,
@@ -79,7 +78,7 @@ const EXPECTED_MANIFEST_NAMES: Record<Bucket, readonly string[]> = {
 	],
 	surface: ["docs-read-flow-line", "cli-read-help", "prompt-read-default-surface", "prompt-read-head-surface"],
 };
-const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 58; // phase 0 only has invariant (29 * 2 variants)
+const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 29; // phase 0 only has invariant
 type Request = { path: string; [key: string]: unknown };
 type Entry = {
 	bucket: Bucket;
@@ -88,7 +87,6 @@ type Entry = {
 	request: Request;
 	capturedAs?: Request;
 	settings?: Record<string, unknown>;
-	hashLines: boolean[];
 	reason?: string;
 };
 type Captured = {
@@ -118,12 +116,8 @@ let urlPageSpy: ReturnType<typeof vi.spyOn> | undefined;
 let markitConvertSpy: { mockRestore(): void } | undefined;
 let artifactCounter = 0;
 
-function variantFor(hashLines: boolean): Variant {
-	return hashLines ? "hl" : "plain";
-}
-
-function goldenPath(bucket: Bucket, name: string, variant: Variant): string {
-	return path.join(GOLDEN_ROOT, bucket, `${name}.${variant}.json`);
+function goldenPath(bucket: Bucket, name: string): string {
+	return path.join(GOLDEN_ROOT, bucket, `${name}.json`);
 }
 
 function stableJson(value: unknown): string {
@@ -134,7 +128,7 @@ function deepEqual(left: unknown, right: unknown): boolean {
 	return stableJson(left) === stableJson(right);
 }
 
-function writeGolden(bucket: Bucket, name: string, variant: Variant, value: Captured): void {
+function writeGolden(bucket: Bucket, name: string, value: Captured): void {
 	if (bucket !== "changed") {
 		throw new Error(
 			`refusing to write ${bucket}/${name}: update mode may only write changed/. Drift here is an implementation bug, not a golden bug.`,
@@ -142,58 +136,57 @@ function writeGolden(bucket: Bucket, name: string, variant: Variant, value: Capt
 	}
 	if (!UPDATE) throw new Error("writeGolden called without GJC_UPDATE_READ_GOLDENS=1");
 	fs.mkdirSync(path.join(GOLDEN_ROOT, bucket), { recursive: true });
-	fs.writeFileSync(goldenPath(bucket, name, variant), `${stableJson(value)}\n`);
+	fs.writeFileSync(goldenPath(bucket, name), `${stableJson(value)}\n`);
 }
 
-function seedGolden(bucket: Bucket, name: string, variant: Variant, value: Captured): void {
+function seedGolden(bucket: Bucket, name: string, value: Captured): void {
 	if (bucket === "changed") throw new Error(`seeding is not allowed for changed/${name}`);
 	if (!SEED_INVARIANT) throw new Error("seedGolden called without GJC_SEED_READ_GOLDENS=1");
-	const target = goldenPath(bucket, name, variant);
-	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing ${bucket}/${name}.${variant}.json`);
+	const target = goldenPath(bucket, name);
+	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing ${bucket}/${name}.json`);
 	fs.mkdirSync(path.join(GOLDEN_ROOT, bucket), { recursive: true });
 	fs.writeFileSync(target, `${stableJson(value)}\n`);
 }
 
-function seedSurfaceGolden(name: string, variant: Variant, value: Captured): void {
+function seedSurfaceGolden(name: string, value: Captured): void {
 	if (!SEED_SURFACE) throw new Error("seedSurfaceGolden called without GJC_SEED_READ_SURFACE_GOLDENS=1");
-	const target = goldenPath("surface", name, variant);
-	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing surface/${name}.${variant}.json`);
+	const target = goldenPath("surface", name);
+	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing surface/${name}.json`);
 	fs.mkdirSync(path.join(GOLDEN_ROOT, "surface"), { recursive: true });
 	fs.writeFileSync(target, `${stableJson(value)}\n`);
 }
 
 function compareGolden(
 	entry: Entry,
-	variant: Variant,
 	value: Captured,
 	currentPhase: 0 | 1,
 ): "compared" | "seeded" | "updated" | "skipped" {
-	const target = goldenPath(entry.bucket, entry.name, variant);
+	const target = goldenPath(entry.bucket, entry.name);
 	const exists = fs.existsSync(target);
 	if (!exists && entry.phase === 1 && currentPhase === 0) return "skipped";
 	if (!exists) {
 		if (entry.bucket === "surface" && SEED_SURFACE) {
-			seedSurfaceGolden(entry.name, variant, value);
+			seedSurfaceGolden(entry.name, value);
 			return "seeded";
 		}
 		if (entry.bucket !== "changed" && SEED_INVARIANT) {
-			seedGolden(entry.bucket, entry.name, variant, value);
+			seedGolden(entry.bucket, entry.name, value);
 			return "seeded";
 		}
 		if (entry.bucket === "changed" && UPDATE) {
-			writeGolden(entry.bucket, entry.name, variant, value);
+			writeGolden(entry.bucket, entry.name, value);
 			return "updated";
 		}
-		throw new Error(`missing golden ${entry.bucket}/${entry.name}.${variant}.json`);
+		throw new Error(`missing golden ${entry.bucket}/${entry.name}.json`);
 	}
 
 	const expected = JSON.parse(fs.readFileSync(target, "utf8")) as Captured;
 	if (!deepEqual(expected, value)) {
 		if (entry.bucket === "changed" && UPDATE) {
-			writeGolden(entry.bucket, entry.name, variant, value);
+			writeGolden(entry.bucket, entry.name, value);
 			return "updated";
 		}
-		throw new Error(`golden drift in ${entry.bucket}/${entry.name}.${variant}.json`);
+		throw new Error(`golden drift in ${entry.bucket}/${entry.name}.json`);
 	}
 	return "compared";
 }
@@ -299,7 +292,7 @@ function expectedGoldenFiles(currentPhase: GoldenPhase): Map<Bucket, Set<string>
 	]);
 	for (const entry of manifest.filter(candidate => candidate.phase <= currentPhase)) {
 		const files = expected.get(entry.bucket)!;
-		for (const hashLines of entry.hashLines) files.add(`${entry.name}.${variantFor(hashLines)}.json`);
+		files.add(`${entry.name}.json`);
 	}
 	return expected;
 }
@@ -307,9 +300,7 @@ function expectedGoldenFiles(currentPhase: GoldenPhase): Map<Bucket, Set<string>
 function phaseOneGoldensReady(): boolean {
 	return manifest
 		.filter(entry => entry.phase === 1)
-		.every(entry =>
-			entry.hashLines.every(hashLines => fs.existsSync(goldenPath(entry.bucket, entry.name, variantFor(hashLines)))),
-		);
+		.every(entry => fs.existsSync(goldenPath(entry.bucket, entry.name)));
 }
 const REQUESTED_PHASE = process.env.GJC_READ_GOLDENS_PHASE;
 const CURRENT_PHASE: GoldenPhase =
@@ -501,40 +492,35 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 			continue;
 		}
 		assertRunnable(entry, currentPhase);
-		// hashLines is now always false (hashline mode removed)
-		const hashLines = false;
-		for (const _ of entry.hashLines) {
-			const variant = variantFor(hashLines);
-			const settings = Settings.isolated({
-				// Goldens pin the read tool's own rendering. The universal inline-result
-				// backstop is a separate wrapper layer with its own tests
-				// (inline-result-backstop.test.ts); entries opt in via entry.settings.
-				"tools.maxInlineResultBytes": 0,
-				...(entry.settings ?? {}),
-				...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
-			});
-			const bridgeText =
-				entry.name === "acp-bare-parity"
-					? fs.readFileSync(path.join(fixture.root, "prose.txt"), "utf8")
-					: undefined;
-			const session = createSession(fixture.root, settings, fixture.artifactDir, bridgeText);
-			const tool = wrapToolWithMetaNotice(new ReadTool(session));
-			const value =
-				entry.bucket === "surface"
-					? await captureSurface(entry, new ReadTool(session))
-					: capture(
-							(await tool.execute(
-								`read-golden-${entry.name}-${variant}`,
-								materializeRequest(entry.capturedAs ?? entry.request) as Parameters<
-									InstanceType<typeof ReadTool>["execute"]
-								>[1],
-								undefined,
-								undefined,
-								createContext(settings),
-							)) as ReadResult,
-						);
-			compareGolden(entry, variant, value, currentPhase);
-		}
+		const settings = Settings.isolated({
+			// Goldens pin the read tool's own rendering. The universal inline-result
+			// backstop is a separate wrapper layer with its own tests
+			// (inline-result-backstop.test.ts); entries opt in via entry.settings.
+			"tools.maxInlineResultBytes": 0,
+			...(entry.settings ?? {}),
+			...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
+		});
+		const bridgeText =
+			entry.name === "acp-bare-parity"
+				? fs.readFileSync(path.join(fixture.root, "prose.txt"), "utf8")
+				: undefined;
+		const session = createSession(fixture.root, settings, fixture.artifactDir, bridgeText);
+		const tool = wrapToolWithMetaNotice(new ReadTool(session));
+		const value =
+			entry.bucket === "surface"
+				? await captureSurface(entry, new ReadTool(session))
+				: capture(
+						(await tool.execute(
+							`read-golden-${entry.name}`,
+							materializeRequest(entry.capturedAs ?? entry.request) as Parameters<
+								InstanceType<typeof ReadTool>["execute"]
+							>[1],
+							undefined,
+							undefined,
+							createContext(settings),
+						)) as ReadResult,
+					);
+		compareGolden(entry, value, currentPhase);
 	}
 	return skipped;
 }
@@ -599,26 +585,23 @@ describe("read truncation golden harness", () => {
 
 		expect(manifest).toHaveLength(43);
 		const phaseZeroGoldenFiles = manifest
-			.filter(entry => entry.phase === 0)
-			.reduce((total, entry) => total + entry.hashLines.length, 0);
+			.filter(entry => entry.phase === 0).length;
 		expect(phaseZeroGoldenFiles).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 		expect(actualGoldenFiles("invariant").size).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 	});
 
 
 	it("keeps archive range fixtures above line and byte budgets", () => {
-		for (const variant of ["hl", "plain"] as const) {
-			const large = JSON.parse(
-				fs.readFileSync(goldenPath("invariant", "archive-large-ranged", variant), "utf8"),
-			) as Captured;
-			const bytes = JSON.parse(
-				fs.readFileSync(goldenPath("invariant", "archive-bytes-ranged", variant), "utf8"),
-			) as Captured;
-			expect(large.text.length).toBeGreaterThan(0);
-			expect((large.truncation as { totalLines: number }).totalLines).toBe(3_200);
-			expect(bytes.text.length).toBeGreaterThan(0);
-			expect((bytes.truncation as { totalBytes: number }).totalBytes).toBeGreaterThanOrEqual(60 * 1024);
-		}
+		const large = JSON.parse(
+			fs.readFileSync(goldenPath("invariant", "archive-large-ranged"), "utf8"),
+		) as Captured;
+		const bytes = JSON.parse(
+			fs.readFileSync(goldenPath("invariant", "archive-bytes-ranged"), "utf8"),
+		) as Captured;
+		expect(large.text.length).toBeGreaterThan(0);
+		expect((large.truncation as { totalLines: number }).totalLines).toBe(3_200);
+		expect(bytes.text.length).toBeGreaterThan(0);
+		expect((bytes.truncation as { totalBytes: number }).totalBytes).toBeGreaterThanOrEqual(60 * 1024);
 	});
 
 
@@ -629,10 +612,10 @@ describe("read truncation golden harness", () => {
 	});
 
 	it("keeps writeGolden restricted to changed/ and update mode", () => {
-		expect(() => writeGolden("invariant", "guard", "hl", {} as Captured)).toThrow(
+		expect(() => writeGolden("invariant", "guard", {} as Captured)).toThrow(
 			/refusing to write invariant\/guard/,
 		);
-		expect(() => writeGolden("surface", "guard", "plain", {} as Captured)).toThrow(
+		expect(() => writeGolden("surface", "guard", {} as Captured)).toThrow(
 			/refusing to write surface\/guard/,
 		);
 	});
