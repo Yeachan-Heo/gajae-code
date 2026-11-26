@@ -1153,12 +1153,14 @@ export class InputController {
 			text = slashResult;
 		}
 
+		if (this.#rejectUnattachedImageReferences(text, pendingImages)) return;
+
 		// Handle skill commands (/skill:name [args]). While streaming, Enter
 		// honors `busyPromptMode`: "steer" interrupts the active turn, "queue"
 		// runs after it completes (matches the free-text Enter semantics applied
 		// a few lines below at the streaming branch). Explicit queue shortcuts
 		// route through `handleFollowUp` and dispatch as `followUp`.
-		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer)) {
+		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer, pendingImages)) {
 			return;
 		}
 
@@ -1738,10 +1740,20 @@ export class InputController {
 		text: string,
 		streamingBehavior: "steer" | "followUp",
 		options?: ComposerSubmissionOptions,
+		pendingImages: InteractiveModeContext["pendingImages"] = this.ctx.pendingImages,
 	): Promise<boolean> {
 		const invocations = parseSkillInvocations(text, this.ctx.skillCommands ?? new Map());
 		if (invocations.length === 0) return false;
-		if (!options || this.#canModifyComposer(options)) {
+		// The skill prompt is a custom message, so the pasted images behind `[image N]`
+		// in the args must travel with it. They come from the snapshot `submitText` took
+		// before its first await: clearing the editor makes onChange("") schedule a
+		// microtask that empties `ctx.pendingImages`, so reading it here finds nothing.
+		const imagesByInvocation = invocations.map(invocation => {
+			const visible = this.#visiblePendingImagesForText(invocation.args, pendingImages);
+			return visible ? [...visible] : undefined;
+		});
+		const ownsComposer = !options || this.#canModifyComposer(options);
+		if (ownsComposer) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");
 		}
@@ -1773,10 +1785,14 @@ export class InputController {
 					details.__pendingDisplayTag = tag;
 				}
 				const isLast = index === invocations.length - 1;
+				const images = imagesByInvocation[index];
+				const content = images?.length
+					? [{ type: "text" as const, text: built.message }, ...images]
+					: built.message;
 				if (!this.ctx.session.isStreaming && !isLast) {
 					await this.ctx.session.sendCustomMessage({
 						customType: SKILL_PROMPT_MESSAGE_TYPE,
-						content: built.message,
+						content,
 						display: true,
 						details,
 						attribution: "user",
@@ -1786,7 +1802,7 @@ export class InputController {
 				await this.ctx.session.promptCustomMessage(
 					{
 						customType: SKILL_PROMPT_MESSAGE_TYPE,
-						content: built.message,
+						content,
 						display: true,
 						details,
 						attribution: "user",
@@ -1796,6 +1812,7 @@ export class InputController {
 						: { streamingBehavior, steerQueuePolicy: "sequential" },
 				);
 			}
+			if (ownsComposer && this.ctx.pendingImages === pendingImages) this.ctx.pendingImages = [];
 			if (this.ctx.session.isStreaming) {
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
@@ -1833,16 +1850,24 @@ export class InputController {
 			return;
 		}
 
+		if (this.#rejectUnattachedImageReferences(text)) return;
+		const visibleImages = this.#visiblePendingImagesForText(text);
+		const images = visibleImages ? [...visibleImages] : undefined;
+
 		// Foreground bash/eval owns the process fence. Queue all prompt text,
 		// including slash skill input, until the process settles instead of
 		// expanding a skill and starting a competing model turn.
 		if (this.ctx.session.isBashRunning || this.ctx.session.isEvalRunning) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");
-			await this.ctx.withLocalSubmission(text, () =>
-				this.ctx.session.followUp(text, undefined, {
-					followUpQueuePolicy: "sequential",
-				}),
+			this.ctx.pendingImages = [];
+			await this.ctx.withLocalSubmission(
+				text,
+				() =>
+					this.ctx.session.followUp(text, images, {
+						followUpQueuePolicy: "sequential",
+					}),
+				{ imageCount: images?.length ?? 0 },
 			);
 			this.maybeGenerateSessionTitle(text);
 			this.ctx.updatePendingMessagesDisplay();
@@ -1860,11 +1885,16 @@ export class InputController {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");
-			await this.ctx.withLocalSubmission(text, () =>
-				this.ctx.session.prompt(text, {
-					streamingBehavior: "followUp",
-					followUpQueuePolicy: "sequential",
-				}),
+			this.ctx.pendingImages = [];
+			await this.ctx.withLocalSubmission(
+				text,
+				() =>
+					this.ctx.session.prompt(text, {
+						streamingBehavior: "followUp",
+						images,
+						followUpQueuePolicy: "sequential",
+					}),
+				{ imageCount: images?.length ?? 0 },
 			);
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
@@ -1874,7 +1904,12 @@ export class InputController {
 		// Not streaming — just submit normally
 		this.ctx.editor.addToHistory(text);
 		this.ctx.editor.setText("");
-		await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text));
+		this.ctx.pendingImages = [];
+		await this.ctx.withLocalSubmission(
+			text,
+			() => (images ? this.ctx.session.prompt(text, { images }) : this.ctx.session.prompt(text)),
+			{ imageCount: images?.length ?? 0 },
+		);
 	}
 
 	/** Send editor text explicitly as a queued next-turn message. */
@@ -2183,8 +2218,28 @@ export class InputController {
 		return `[image ${this.ctx.pendingImages.length}]`;
 	}
 
-	#visiblePendingImagesForText(text: string): InteractiveModeContext["pendingImages"] | undefined {
-		if (this.ctx.pendingImages.length === 0) {
+	/**
+	 * A restored queued message keeps its `[image N]` text but not the pasted image.
+	 * Warns and returns true so the caller leaves the draft in the composer instead
+	 * of sending bare text.
+	 */
+	#rejectUnattachedImageReferences(
+		text: string,
+		pendingImages: InteractiveModeContext["pendingImages"] = this.ctx.pendingImages,
+	): boolean {
+		const missing = imageReferenceNumbers(text).find(number => pendingImages[number - 1] === undefined);
+		if (missing === undefined) return false;
+		this.ctx.showWarning(
+			`[image ${missing}] has no attached image. Paste the image again or remove the placeholder.`,
+		);
+		return true;
+	}
+
+	#visiblePendingImagesForText(
+		text: string,
+		pendingImages: InteractiveModeContext["pendingImages"] = this.ctx.pendingImages,
+	): InteractiveModeContext["pendingImages"] | undefined {
+		if (pendingImages.length === 0) {
 			return undefined;
 		}
 
@@ -2192,10 +2247,10 @@ export class InputController {
 		const seenImageIndexes = new Set<number>();
 		for (const placeholderNumber of imageReferenceNumbers(text)) {
 			const imageIndex = placeholderNumber - 1;
-			if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length || seenImageIndexes.has(imageIndex)) {
+			if (imageIndex < 0 || imageIndex >= pendingImages.length || seenImageIndexes.has(imageIndex)) {
 				continue;
 			}
-			const image = this.ctx.pendingImages[imageIndex];
+			const image = pendingImages[imageIndex];
 			if (!image) continue;
 			images.push(image);
 			seenImageIndexes.add(imageIndex);
