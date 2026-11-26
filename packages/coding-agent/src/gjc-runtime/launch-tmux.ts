@@ -2,12 +2,13 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
-import { isCompiledBinary } from "@gajae-code/utils/env";
+import { isCompiledBinary, startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Args } from "../cli/args";
 import { macOSMallocEnvUnsetArgs } from "../cli/malloc-env-guard";
 import { dropProjectSuppliedHerdrBinPath } from "../main";
+import { dropProjectSuppliedSessionOwnershipOverride } from "../session/session-ownership-mode";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -1557,6 +1558,7 @@ function emitOptionalProfileDiagnostics(profile: GjcTmuxProfileResult, diagnosti
 export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	// Judge with this process's startup snapshot, including after a worktree chdir.
 	dropProjectSuppliedHerdrBinPath(context.env ?? process.env);
+	dropProjectSuppliedSessionOwnershipOverride(context.env ?? process.env, startupProjectEnvSnapshot());
 	const env = context.env ?? process.env;
 	// Planning performs only applicability checks. It must precede both the ambient
 	// window rename and provider refusal so inapplicable root launches reach main
@@ -1666,6 +1668,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
 	const spawnEnv = { ...tmuxLaunchIdentityEnv(env, plan.cwd) };
 	dropProjectSuppliedHerdrBinPath(spawnEnv);
+	dropProjectSuppliedSessionOwnershipOverride(spawnEnv, startupProjectEnvSnapshot());
 	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	Object.assign(spawnEnv, signingEnv);

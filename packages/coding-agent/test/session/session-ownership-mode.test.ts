@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { logger, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { YAML } from "bun";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
@@ -14,6 +14,7 @@ import {
 	SESSION_OWNERSHIP_MODES,
 	type SessionOwnershipMode,
 	sessionOwnershipMode,
+	sessionOwnershipModeFor,
 	sessionOwnershipOverrideWasRead,
 	sessionOwnershipTestHookSlot,
 	trustedSessionOwnershipOverride,
@@ -175,6 +176,56 @@ describe("the session.ownership.mode setting", () => {
 		expect(() =>
 			Bun.resolveSync("@gajae-code/coding-agent/session/session-ownership-mode", import.meta.dir),
 		).toThrow();
+	});
+
+	/** Run `check` with the process agent dir at a fresh one whose config.yml is `config` (or, for "unreadable", a directory). */
+	async function withOperatorConfig(config: unknown, check: () => void): Promise<void> {
+		const agentDir = path.join(await tempRoot(), "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		if (config === "unreadable") await fs.mkdir(path.join(agentDir, "config.yml"));
+		else await Bun.write(path.join(agentDir, "config.yml"), YAML.stringify(config));
+		const previous = process.env.GJC_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		try {
+			check();
+		} finally {
+			if (previous === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previous;
+			resetAgentDirFromEnvironment();
+			resetSettingsForTest();
+		}
+	}
+	const isolatedMode = (mode?: string) =>
+		sessionOwnershipModeFor(
+			Settings.isolated(mode === undefined ? {} : { "session.ownership.mode": mode }).getGlobal(
+				"session.ownership.mode",
+			),
+		);
+	const fileMode = (mode: SessionOwnershipMode) => ({ session: { ownership: { mode } } });
+
+	it("without Settings.init, the operator's config file decides, for isolated settings too", async () => {
+		await withOperatorConfig(fileMode("observe"), () => {
+			// An embedding's settings never loaded config.yml, so they carry no value of their own.
+			expect(isolatedMode()).toBe("observe");
+			expect(sessionOwnershipMode()).toBe("observe");
+		});
+	});
+
+	it("a valid explicit value in isolated settings wins; an invalid one falls back to the config file", async () => {
+		await withOperatorConfig(fileMode("off"), () => expect(isolatedMode("observe")).toBe("observe"));
+		await withOperatorConfig(fileMode("observe"), () => expect(isolatedMode("bogus")).toBe("observe"));
+	});
+
+	it("an unreadable config file resolves to off, and says so once", async () => {
+		const warnings: string[] = [];
+		vi.spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(message);
+		});
+		await withOperatorConfig("unreadable", () => {
+			expect(isolatedMode()).toBe("off");
+			expect(sessionOwnershipMode()).toBe("off");
+		});
+		expect(warnings).toEqual(["Session ownership is off: the global config could not be read"]);
 	});
 
 	it("cannot be raised from a project file when the user left it at off", async () => {

@@ -24758,7 +24758,7 @@ export class SessionManager {
 							destination,
 						);
 						manager.#sessionMemoryMode = sessionMemoryMode;
-						await manager.#initSessionFile(filePath, true);
+						await SessionManager.#initializeMissingForOpen(manager, filePath);
 						return manager;
 					}
 					if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
@@ -24805,7 +24805,7 @@ export class SessionManager {
 						destination,
 					);
 					manager.#sessionMemoryMode = sessionMemoryMode;
-					await manager.#initSessionFile(filePath, true);
+					await SessionManager.#initializeMissingForOpen(manager, filePath);
 					return manager;
 				}
 				if (inspected.error.reason === "oversized")
@@ -25044,7 +25044,7 @@ export class SessionManager {
 					destination,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
-				await manager.#initSessionFile(filePath, true);
+				await SessionManager.#initializeMissingForOpen(manager, filePath);
 				return manager;
 			}
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
@@ -25063,6 +25063,19 @@ export class SessionManager {
 			throw SessionManager.#typedStrictOpenError(opened) ?? new Error(`Could not open session: ${opened.reason}`);
 		}
 		return opened.manager;
+	}
+
+	/**
+	 * `open` of a missing path: a fresh session, claimed before its header is written. A failed
+	 * open keeps no claim: if the header write throws, the lock goes with the manager that never opened.
+	 */
+	static async #initializeMissingForOpen(manager: SessionManager, filePath: string): Promise<void> {
+		try {
+			await manager.#initSessionFile(filePath, true);
+		} catch (error) {
+			manager.#ownershipClaims.releaseAll();
+			throw error;
+		}
 	}
 
 	/**

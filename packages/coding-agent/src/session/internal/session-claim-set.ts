@@ -191,9 +191,9 @@ export class SessionClaimSet {
 
 	/**
 	 * Claim `sessionId` into this set (design §2.4): a factory's id before its first write, or a
-	 * transition's target before its rotation. Never throws and never refuses (see
-	 * {@link attemptSessionClaim}); a no-op in `off`, for an exempt manager, and for
-	 * an id already held.
+	 * transition's target before its rotation. Never refuses (see {@link attemptSessionClaim}), and
+	 * catches lock errors, but rejects if `add` throws `session_claim_released`; a no-op in `off`,
+	 * for an exempt manager, and for an id already held.
 	 */
 	async claim(sessionId: string): Promise<SessionClaimStatus> {
 		if (this.#mode === "off" || this.#closed) return "none";
@@ -227,10 +227,19 @@ export class SessionClaimSet {
 	 */
 	claimInBackground(sessionId: string): void {
 		if (!this.claiming) return;
-		void this.claim(sessionId).then(() => {
-			// Landed after a rotation already settled away from it: release it now, not at the next settle.
-			if (this.#current !== sessionId && this.#transitions === 0) this.settle();
-		});
+		void this.claim(sessionId)
+			.then(() => {
+				// Landed after a rotation already settled away from it: release it now, not at the next settle.
+				if (this.#current !== sessionId && this.#transitions === 0) this.settle();
+			})
+			// `claim` catches lock errors but rejects if `add` throws `session_claim_released`; the settle
+			// can throw too. A background claim must not become an unhandled rejection in any process.
+			.catch(error => {
+				logger.warn("Background session claim failed", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 	}
 
 	/** Record the outcome of a claim taken before this set existed (a strict open's, handed over). */
