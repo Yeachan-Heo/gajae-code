@@ -26243,12 +26243,13 @@ export class SessionManager {
 		let sessionPath = identity.canonicalPath;
 		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
 			try {
+				// The claim taken above covers this migration; a second attempt would only count twice.
 				sessionPath = await SessionManager.prepareManagedCandidateForWrite(
 					sessionPath,
 					migrationPolicy,
 					destination,
 					identity,
-					{ ownership: owner },
+					{ ownership: "exempt" },
 				);
 			} catch (error) {
 				if (error instanceof SessionMigrationPolicyError)
