@@ -25,6 +25,7 @@ import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type
 import stealthPermissionsScript from "../puppeteer/14_stealth_permissions.txt" with { type: "text" };
 import stealthWebrtcScript from "../puppeteer/15_stealth_webrtc.txt" with { type: "text" };
 import { ToolError } from "../tool-errors";
+import * as deferredProfileCleanup from "./deferred-profile-cleanup";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
 
@@ -548,9 +549,7 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 				const cleanupError = cleanupErr as Error;
 				if (cleanupError.message.includes("EBUSY")) {
 					try {
-						// Dynamically import registry to avoid circular dependency
-						const registry = await import("./registry");
-						await registry.deferProfileDirCleanup(dirToCleanup);
+						deferredProfileCleanup.deferProfileDirCleanup(dirToCleanup);
 						logger.debug("Deferred profile directory cleanup due to EBUSY", {
 							dir: dirToCleanup,
 						});
