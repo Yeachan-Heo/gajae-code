@@ -14,6 +14,7 @@ import {
 	killExistingByPath,
 	waitForCdp,
 } from "./attach";
+import { deferredProfileDirSnapshot, forgetDeferredProfileDir } from "./deferred-profile-cleanup";
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
 	canDecryptProfileCookies,
@@ -75,14 +76,6 @@ const browserOpenPromises = new Map<string, Promise<BrowserHandle>>();
  * prefix check would not prove ownership; an entry in this map does.
  */
 const ownedWarmupDirs = new WeakMap<BrowserHandle, string>();
-
-/**
- * Directories registered for deferred cleanup when immediate removal fails with EBUSY.
- * These are cleaned up opportunistically: on module initialization, on new browser acquire,
- * or when explicitly requested. This avoids leaking temp dirs when Chrome is still holding
- * file handles after launch failures.
- */
-const deferredCleanupDirs = new Set<string>();
 
 /**
  * Upper bound on the CDP `browser.close()` round-trip during a forced (signal-path)
@@ -153,29 +146,18 @@ export function createOwnedWarmupDirForTest(handle: BrowserHandle): string {
 }
 
 /**
- * Register a directory for deferred cleanup when immediate removal fails with EBUSY.
- * This is called when launch.ts fails to clean up a profile after a failed browser launch.
- * The cleanup is attempted opportunistically: on new browser acquire or via manual request.
- *
- * @internal Used by launch.ts when cleanup fails with EBUSY
- */
-export async function deferProfileDirCleanup(dir: string): Promise<void> {
-	deferredCleanupDirs.add(dir);
-}
-
-/**
  * Attempt to clean up deferred dirs that may no longer be held by Chrome processes.
  * Best-effort: logs failures but does not throw.
  *
  * @internal Called opportunistically during acquire and disposal
  */
 async function processDeferredCleanup(): Promise<void> {
-	const dirs = Array.from(deferredCleanupDirs);
+	const dirs = deferredProfileDirSnapshot();
 	for (const dir of dirs) {
 		try {
 			const result = await cleanupProfileDirWithRetry(dir);
 			if (result.removed) {
-				deferredCleanupDirs.delete(dir);
+				forgetDeferredProfileDir(dir);
 			}
 		} catch (err) {
 			logger.debug("Failed to clean up deferred profile dir (EBUSY after retries)", {

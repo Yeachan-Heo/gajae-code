@@ -159,9 +159,8 @@ describe("headless browser launch with profile cleanup", () => {
 			return originalRmSync(path as string, options);
 		});
 
-		// Mock registry.deferProfileDirCleanup to verify it's called
-		const registryModule = await import("../../src/tools/browser/registry");
-		const deferSpy = vi.spyOn(registryModule, "deferProfileDirCleanup").mockResolvedValue(undefined);
+		const deferredModule = await import("../../src/tools/browser/deferred-profile-cleanup");
+		const deferSpy = vi.spyOn(deferredModule, "deferProfileDirCleanup").mockReturnValue(undefined);
 
 		// When launch fails and cleanup fails with EBUSY, it should defer cleanup
 		try {
