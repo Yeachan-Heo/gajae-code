@@ -212,6 +212,15 @@ describe.if(supported)("factory claims", () => {
 			expect([await state(id), await state(fork.getSessionId())]).toEqual(["free", "held"]);
 		});
 
+		it("a source whose id no sidecar can name still forks in observe", async () => {
+			const { place, legacy } = await legacySource();
+			const lines = (await fs.readFile(legacy, "utf8")).split("\n");
+			lines[0] = JSON.stringify({ ...JSON.parse(lines[0]!), id: "" });
+			await fs.writeFile(legacy, lines.join("\n"));
+			const fork = keep(await SessionManager.forkFrom(legacy, place.cwd, place.destination));
+			expect(sessionClaimSetOf(fork).has(fork.getSessionId())).toBe(true);
+		});
+
 		it("held elsewhere: is read in place, never migrated, never contended", async () => {
 			const { place, legacy, id } = await legacySource();
 			SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
