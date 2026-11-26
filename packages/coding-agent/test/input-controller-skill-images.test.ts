@@ -27,6 +27,8 @@ function createContext(opts: {
 	streaming?: boolean;
 	realEditor?: boolean;
 	extensionRunner?: unknown;
+	compacting?: boolean;
+	activeBtw?: boolean;
 }) {
 	const customMessages: { content: unknown }[] = [];
 	const prompts: { text: string; options: { images?: PendingImages } | undefined }[] = [];
@@ -57,7 +59,7 @@ function createContext(opts: {
 		session: {
 			sessionId: "stub-session",
 			isStreaming: opts.streaming ?? false,
-			isCompacting: false,
+			isCompacting: opts.compacting ?? false,
 			isBashRunning: false,
 			isEvalRunning: false,
 			extensionRunner: opts.extensionRunner,
@@ -88,7 +90,9 @@ function createContext(opts: {
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
-		hasActiveBtw: () => false,
+		hasActiveBtw: () => opts.activeBtw ?? false,
+		handleBtwFollowUp: vi.fn(async () => "accepted" as const),
+		queueCompactionMessage: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor: editor as typeof stubEditor, customMessages, prompts, followUps, showWarning };
@@ -212,5 +216,66 @@ describe("InputController skill command images", () => {
 		expect(stub.customMessages).toHaveLength(0);
 		expect(stub.showWarning).toHaveBeenCalledTimes(1);
 		expect(stub.ctx.editor.getText()).toBe(draft);
+	});
+
+	it("rejects an unattached placeholder before queueing it during compaction", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [], compacting: true });
+		const controller = new InputController(stub.ctx);
+		stub.editor.getText = () => "/skill:test-skill look at [image 1]";
+		await controller.handleFollowUp();
+
+		expect(stub.ctx.queueCompactionMessage).not.toHaveBeenCalled();
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects an unattached placeholder before forwarding it to an active /btw", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [], activeBtw: true });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		await stub.editor.onSubmit?.("look at [image 1]");
+
+		expect(stub.ctx.handleBtwFollowUp).not.toHaveBeenCalled();
+		expect(stub.showWarning).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not overwrite a newer draft when a rejected submission restores its text", async () => {
+		const stub = createContext({ skillCommands, pendingImages: [], realEditor: true });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		const submit = stub.ctx.editor.onSubmit?.("/skill:test-skill look at [image 1]");
+		stub.ctx.editor.setText("newer draft");
+		await submit;
+
+		expect(stub.ctx.editor.getText()).toBe("newer draft");
+	});
+
+	it("applies an image-only extension replacement through the real runner", async () => {
+		const { ExtensionRunner } = await import("@gajae-code/coding-agent/extensibility/extensions/runner");
+		const { ExtensionRuntime } = await import("@gajae-code/coding-agent/extensibility/extensions/loader");
+		const { SessionManager } = await import("@gajae-code/coding-agent/session/session-manager");
+		const redacted = { ...IMAGE, data: "REDACTED" };
+		const extension = {
+			path: "image-only-extension",
+			resolvedPath: "image-only-extension",
+			label: "image-only-extension",
+			handlers: new Map([["input", [async () => ({ images: [redacted] })]]]),
+			tools: new Map(),
+			messageRenderers: new Map(),
+			commands: new Map(),
+			flags: new Map(),
+			shortcuts: new Map(),
+			functionHooks: new Map(),
+		};
+		const runner = new ExtensionRunner(
+			[extension as never],
+			new ExtensionRuntime(),
+			process.cwd(),
+			SessionManager.inMemory(),
+			{} as never,
+		);
+
+		const result = await runner.emitInput("look at [image 1]", [IMAGE], "interactive");
+		expect(result.images).toEqual([redacted]);
 	});
 });

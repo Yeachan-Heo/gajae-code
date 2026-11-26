@@ -1062,6 +1062,7 @@ export class InputController {
 		if (this.ctx.hasActiveBtw()) {
 			if (!text) return;
 			if (!text.startsWith("/")) {
+				if (this.#rejectUnattachedImageReferences(text, this.ctx.pendingImages, composer)) return;
 				const result = await this.ctx.handleBtwFollowUp(text);
 				if (result === "accepted" && this.#canModifyComposer(composer)) {
 					this.ctx.editor.setText("");
@@ -1835,6 +1836,9 @@ export class InputController {
 	async handleFollowUp(): Promise<void> {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
+		// The draft stays in the editor here, so rejecting needs no restore. It must come
+		// before the /btw and compaction routes, which queue text without its images.
+		if (this.#rejectUnattachedImageReferences(text)) return;
 		// While /btw is open, plain text stays in the side chat. Slash-origin
 		// input keeps normal dispatch so commands remain available.
 		if (this.ctx.hasActiveBtw() && !text.startsWith("/")) {
@@ -1858,7 +1862,6 @@ export class InputController {
 			return;
 		}
 
-		if (this.#rejectUnattachedImageReferences(text)) return;
 		const visibleImages = this.#visiblePendingImagesForText(text);
 		const images = visibleImages ? [...visibleImages] : undefined;
 
@@ -2229,7 +2232,8 @@ export class InputController {
 	/**
 	 * A restored queued message keeps its `[image N]` text but not the pasted image.
 	 * Warns and returns true so the caller sends nothing. The editor empties its buffer
-	 * before `onSubmit`, so a submission that still owns the composer puts its text back.
+	 * before `onSubmit`, so a submission that still owns the composer puts its text back,
+	 * unless the user already typed something new while the submission was pending.
 	 */
 	#rejectUnattachedImageReferences(
 		text: string,
@@ -2238,7 +2242,9 @@ export class InputController {
 	): boolean {
 		const missing = imageReferenceNumbers(text).find(number => pendingImages[number - 1] === undefined);
 		if (missing === undefined) return false;
-		if (composer && this.#canModifyComposer(composer)) this.ctx.editor.setText(text);
+		if (composer && this.#canModifyComposer(composer) && this.ctx.editor.getText().trim().length === 0) {
+			this.ctx.editor.setText(text);
+		}
 		this.ctx.showWarning(
 			`[image ${missing}] has no attached image. Paste the image again or remove the placeholder.`,
 		);
