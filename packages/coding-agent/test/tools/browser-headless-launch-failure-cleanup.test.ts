@@ -144,7 +144,7 @@ describe("headless browser launch with profile cleanup", () => {
 			launch: mockLaunch,
 		} as any);
 
-		// Mock rmSync to fail with EBUSY on first attempts, simulating Chrome still holding files
+		// Track rmSync calls to verify retries
 		let rmSyncCallCount = 0;
 		const originalRmSync = fs.rmSync;
 		vi.spyOn(fs, "rmSync").mockImplementation((path, options) => {
@@ -155,9 +155,13 @@ describe("headless browser launch with profile cleanup", () => {
 				err.code = "EBUSY";
 				throw err;
 			}
-			// Should not reach here with the stub approach
+			// After retries exhausted, succeed
 			return originalRmSync(path as string, options);
 		});
+
+		// Mock registry.deferProfileDirCleanup to verify it's called
+		const registryModule = await import("../../src/tools/browser/registry");
+		const deferSpy = vi.spyOn(registryModule, "deferProfileDirCleanup").mockResolvedValue(undefined);
 
 		// When launch fails and cleanup fails with EBUSY, it should defer cleanup
 		try {
@@ -166,10 +170,46 @@ describe("headless browser launch with profile cleanup", () => {
 			});
 			expect.unreachable("Should have thrown launch error");
 		} catch (err) {
-			// Verify the original launch error is preserved
+			// (a) Verify the original launch error is preserved
 			expect((err as Error).message).toBe("Chromium spawn failed");
-			// Verify that cleanup was attempted but deferred due to EBUSY
-			expect(rmSyncCallCount).toBeGreaterThan(0);
+			// Verify that cleanup was attempted with retries
+			expect(rmSyncCallCount).toBeGreaterThan(10);
+			// (a) Verify deferral was registered after EBUSY exhaustion
+			expect(deferSpy).toHaveBeenCalled();
+			const deferredDir = deferSpy.mock.calls[0]?.[0];
+			expect(deferredDir).toBeTruthy();
+		}
+	});
+
+	it("cleanupProfileDirWithRetry returns explicit result on non-EBUSY failure", async () => {
+		// (b) Verify that cleanup returns {removed: false, error} on non-EBUSY errors
+		vi.spyOn(fs, "rmSync").mockImplementation(() => {
+			const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+			err.code = "EACCES";
+			throw err;
+		});
+
+		const result = await launchModule.cleanupProfileDirWithRetry("/some/nonexistent/path");
+		expect(result.removed).toBe(false);
+		if (!result.removed) {
+			expect(result.error.message).toBe("EACCES: permission denied");
+		}
+	});
+
+	it("cleanupProfileDirWithRetry throws on exhausted EBUSY retries", async () => {
+		// (b) Verify that cleanup throws when EBUSY exhausts all retries
+		vi.spyOn(fs, "rmSync").mockImplementation(() => {
+			const err = new Error("EBUSY: resource busy") as NodeJS.ErrnoException;
+			err.code = "EBUSY";
+			throw err;
+		});
+
+		try {
+			await launchModule.cleanupProfileDirWithRetry("/some/nonexistent/path", 2);
+			expect.unreachable("Should have thrown EBUSY error");
+		} catch (err) {
+			const error = err as Error;
+			expect(error.message).toContain("EBUSY");
 		}
 	});
 });

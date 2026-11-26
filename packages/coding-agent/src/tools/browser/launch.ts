@@ -411,10 +411,16 @@ export interface LaunchHeadlessResult {
 /**
  * Attempt to remove a profile directory with bounded retry on transient EBUSY errors.
  * Chrome may still hold files when launch fails or during disconnection, so retry
- * with brief delays before giving up. Logs removal attempts and errors but does not
- * throw to avoid masking the caller's original error.
+ * with brief delays before giving up. Returns explicit result indicating success or failure.
+ *
+ * On EBUSY after exhausting retries, throws to signal to caller that deferral may be needed.
+ * On other errors after first attempt, logs but returns {removed: false, error}.
  */
-export async function cleanupProfileDirWithRetry(dir: string, maxRetries = 10, delay = 50): Promise<void> {
+export async function cleanupProfileDirWithRetry(
+	dir: string,
+	maxRetries = 10,
+	delay = 50,
+): Promise<{ removed: true } | { removed: false; error: Error }> {
 	let lastErr: Error | undefined;
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		try {
@@ -425,24 +431,34 @@ export async function cleanupProfileDirWithRetry(dir: string, maxRetries = 10, d
 					attempt,
 				});
 			}
-			return;
+			return { removed: true };
 		} catch (err) {
 			lastErr = err as Error;
 			const isEBUSY = lastErr.message.includes("EBUSY");
-			if (!isEBUSY || attempt === maxRetries) {
-				// Not a transient EBUSY, or we've exhausted retries. Log and move on.
-				logger.debug("Failed to clean up headless profile dir", {
+			if (!isEBUSY) {
+				// Not a transient EBUSY. Log and return failure.
+				logger.debug("Failed to clean up headless profile dir (non-transient error)", {
 					dir,
 					attempt,
 					error: lastErr.message,
-					transient: isEBUSY,
 				});
-				return;
+				return { removed: false, error: lastErr };
+			}
+			if (attempt === maxRetries) {
+				// Exhausted retries on EBUSY. Log and rethrow to signal deferral.
+				logger.debug("Exhausted retries for profile dir cleanup due to EBUSY", {
+					dir,
+					attempt,
+					error: lastErr.message,
+				});
+				throw lastErr;
 			}
 			// Transient EBUSY: wait a bit and retry
 			await Bun.sleep(delay);
 		}
 	}
+	// Fallthrough (should not reach here with current loop logic)
+	return { removed: false, error: lastErr ?? new Error("Cleanup failed with unknown error") };
 }
 
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
@@ -520,7 +536,13 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		const dirToCleanup = createdUserDataDir || opts.profileWarmupDir;
 		if (dirToCleanup) {
 			try {
-				await cleanupProfileDirWithRetry(dirToCleanup);
+				const cleanupResult = await cleanupProfileDirWithRetry(dirToCleanup);
+				if (!cleanupResult.removed) {
+					logger.debug("Failed to clean up profile directory after launch failure", {
+						dir: dirToCleanup,
+						error: cleanupResult.error.message,
+					});
+				}
 			} catch (cleanupErr) {
 				// If cleanup failed with EBUSY despite retries, defer the cleanup
 				const cleanupError = cleanupErr as Error;
@@ -539,8 +561,8 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 						});
 					}
 				} else {
-					// Not a transient EBUSY error, just log it
-					logger.debug("Failed to clean up profile directory after launch failure", {
+					// Not EBUSY but some other error that wasn't caught above, just log it
+					logger.debug("Unexpected error from cleanup retry", {
 						dir: dirToCleanup,
 						error: cleanupError.message,
 					});

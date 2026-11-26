@@ -173,10 +173,12 @@ async function processDeferredCleanup(): Promise<void> {
 	const dirs = Array.from(deferredCleanupDirs);
 	for (const dir of dirs) {
 		try {
-			await cleanupProfileDirWithRetry(dir);
-			deferredCleanupDirs.delete(dir);
+			const result = await cleanupProfileDirWithRetry(dir);
+			if (result.removed) {
+				deferredCleanupDirs.delete(dir);
+			}
 		} catch (err) {
-			logger.debug("Failed to clean up deferred profile dir", {
+			logger.debug("Failed to clean up deferred profile dir (EBUSY after retries)", {
 				dir,
 				error: (err as Error).message,
 			});
@@ -259,7 +261,21 @@ async function openBrowserHandle(
 			// because no handle will exist to carry them into releaseBrowser().
 			// Use retry cleanup in case Chrome is still holding files from startup.
 			if (profileWarmupDir) {
-				await cleanupProfileDirWithRetry(profileWarmupDir);
+				try {
+					const cleanupResult = await cleanupProfileDirWithRetry(profileWarmupDir);
+					if (!cleanupResult.removed) {
+						logger.debug("Failed to clean up profile warmup dir after launch failure", {
+							dir: profileWarmupDir,
+							error: cleanupResult.error.message,
+						});
+					}
+				} catch (cleanupErr) {
+					// EBUSY after retries: log but don't mask original error
+					logger.debug("Failed to clean up profile warmup dir (EBUSY after retries)", {
+						dir: profileWarmupDir,
+						error: (cleanupErr as Error).message,
+					});
+				}
 			}
 			throw error;
 		}
@@ -550,8 +566,18 @@ async function removeOwnedWarmupDir(handle: BrowserHandle): Promise<void> {
 	// Use retry cleanup in case Chrome is still holding files after close().
 	// Only delete the entry after successful removal. If removal fails even with retry,
 	// log and move on (best-effort cleanup to avoid propagating errors during teardown).
-	await cleanupProfileDirWithRetry(dir);
-	ownedWarmupDirs.delete(handle);
+	try {
+		const cleanupResult = await cleanupProfileDirWithRetry(dir);
+		if (cleanupResult.removed) {
+			ownedWarmupDirs.delete(handle);
+		}
+	} catch (err) {
+		// EBUSY after retries: log but don't mask other cleanup/teardown operations
+		logger.debug("Failed to remove owned warmup dir (EBUSY after retries)", {
+			dir,
+			error: (err as Error).message,
+		});
+	}
 }
 
 async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
