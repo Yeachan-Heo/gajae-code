@@ -17959,7 +17959,15 @@ export class AgentSession {
 		const outcome = await this.#trackBackgroundPublication(
 			this.sessionManager.appendMessageSharingSession(message),
 		).catch(reportThrown);
-		if (outcome.kind !== "committed") {
+		if (outcome.kind === "unknown") {
+			// The entry may already be durable: do not report it as unsaved.
+			if (!this.#isDisposed)
+				this.emitNotice(
+					"warning",
+					`The ${label} may not have been saved to this session (outcome unknown).`,
+					"session-publication",
+				);
+		} else if (outcome.kind !== "committed") {
 			const cause = describeSharedAppendFailure(outcome);
 			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
 		}
@@ -36647,7 +36655,11 @@ export class AgentSession {
 			if (!targetEntry) {
 				throw new Error(`Entry ${targetId} not found`);
 			}
-			// Collect entries to summarize (from old leaf to common ancestor).
+			// Collect entries to summarize (from old leaf to common ancestor). Deferred `!`/`$`
+			// rows the settle saves onto this branch later are not in it: the settle must follow
+			// the abort below, which must follow the cancellable `session_before_tree` hook, and
+			// that hook receives these entries and may return its own summary from them, so
+			// collecting again after the abort would split what it saw from what is summarized.
 			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
 				this.sessionManager,
 				oldLeafId,
