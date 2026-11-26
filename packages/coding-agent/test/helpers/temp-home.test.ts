@@ -5,6 +5,9 @@ import * as path from "node:path";
 import { withTempHome } from "./temp-home";
 
 const originalHome = process.env.HOME;
+// Not `process.env.HOME`: the test preload may point HOME at an isolated directory
+// for spawned children while `os.homedir()` keeps the process's startup home.
+const originalHomedir = os.homedir();
 
 afterEach(() => {
 	if (originalHome === undefined) delete process.env.HOME;
@@ -26,7 +29,7 @@ describe("withTempHome", () => {
 			fs.mkdirSync(path.join(home, ".gjc", "skills"), { recursive: true });
 		});
 		expect(process.env.HOME).toBe(originalHome);
-		expect(os.homedir()).toBe(originalHome ?? os.homedir());
+		expect(os.homedir()).toBe(originalHomedir);
 		expect(seenHome).not.toBe(originalHome);
 		// Cleanup removed the whole owning root.
 		expect(fs.existsSync(seenRoot)).toBe(false);
