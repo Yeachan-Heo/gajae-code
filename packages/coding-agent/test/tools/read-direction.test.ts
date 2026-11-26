@@ -193,30 +193,7 @@ describe("read truncation direction resolution", () => {
 		expect(firstRenderedLine(rangeLast)).not.toBe(firstRenderedLine(defaultRange));
 	});
 
-	test("routes middle partial tails through the oversized-line warning instead of a false middle footer", async () => {
-		const file = path.join(tempDir, "middle-partial-tail.txt");
-		await fs.writeFile(file, `short\n${"Z".repeat(60_000)}`);
-		const settings = Settings.isolated({
-			"read.summarize.enabled": false,
-			"read.receiptBudgetLines": 50,
-			"read.receiptBudgetBytes": 10,
-		});
-		const result = await new ReadTool(createSession(tempDir, settings)).execute("middle-partial-tail", {
-			path: file,
-			truncation: "both",
-		});
-		const text = textOf(result);
-
-		expect(text).toContain("Line 2 is");
-		expect(text).not.toContain("0 lines elided");
-		expect(text).not.toContain("omitted lines 2-1");
-		expect(result.details?.meta?.truncation?.headRange).toBeUndefined();
-		expect(result.details?.meta?.truncation?.tailRange).toBeUndefined();
-		expect(result.details?.meta?.truncation?.partialLine).toMatchObject({ line: 2 });
-		expect(result.details?.spillEligible).not.toBe(true);
-	});
-
-	test("describes a middle partial tail as a byte suffix when hashlines are disabled", async () => {
+	test("describes a middle partial tail as a byte suffix", async () => {
 		const file = path.join(tempDir, "middle-partial-tail-plain.txt");
 		await fs.writeFile(file, `short\n${"Z".repeat(60_000)}`);
 		const settings = Settings.isolated({
@@ -229,10 +206,11 @@ describe("read truncation direction resolution", () => {
 			truncation: "both",
 		});
 		const text = textOf(result);
-		expect(text).toContain("Line");
-		expect(text).toContain("exceeds");
-
-
+		expect(text).toContain("line is");
+		expect(text).toContain("Showing last");
+		expect(text).toContain("of line 2");
+		expect(text).not.toContain("Showing lines 1-1 and 2-2");
+		expect(text).not.toContain("omitted lines 2-1");
 	});
 
 	test("preserves under-budget structural summaries for every direction without duplicates", async () => {

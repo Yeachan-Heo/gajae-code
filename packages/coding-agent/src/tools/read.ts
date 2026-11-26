@@ -142,11 +142,7 @@ function prependLineNumbers(text: string, startNum: number): string {
 	return textLines.map((line, i) => `${startNum + i}|${line}`).join("\n");
 }
 
-function formatTextWithMode(
-	text: string,
-	startNum: number,
-	shouldAddLineNumbers: boolean,
-): string {
+function formatTextWithMode(text: string, startNum: number, shouldAddLineNumbers: boolean): string {
 	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum);
 	return text;
 }
@@ -171,11 +167,7 @@ function canMergeBracePair(headLine: string, tailLine: string): boolean {
 	return BRACE_TAIL_TRAILING_RE.test(tail.slice(closer.length));
 }
 
-function formatSingleLine(
-	line: number,
-	text: string,
-	shouldAddLineNumbers: boolean,
-): string {
+function formatSingleLine(line: number, text: string, shouldAddLineNumbers: boolean): string {
 	if (shouldAddLineNumbers) return `${line}|${text}`;
 	return text;
 }
@@ -239,11 +231,7 @@ function rebaseWindow(window: ReadWindow, offset: number): ReadWindow {
 	return rebased;
 }
 
-function renderReadWindow(
-	window: ReadWindow,
-	shouldAddLineNumbers: boolean,
-	maxColumns = 0,
-): string {
+function renderReadWindow(window: ReadWindow, shouldAddLineNumbers: boolean, maxColumns = 0): string {
 	const renderSegment = (segment: ReadSegment): string => {
 		const renderContent =
 			maxColumns > 0 ? truncateTextWithSecretAwareness(segment.content, maxColumns).text : segment.content;
@@ -415,16 +403,6 @@ function formatDirectionalFooter(readPath: string, window: ReadWindow): string {
 	}
 	const shown = head?.lines ?? 0;
 	return `[Showing first ${shown} of ${total} lines (~${Math.ceil(shownBytes / 1024)} KiB); re-read ${readPath}:1-${total} or ${readPath}:raw for the full file]`;
-}
-
-function formatOversizedLineWarning(
-	readPath: string,
-	lineNumber: number,
-	lineBytes: number,
-	maxBytes: number,
-	fullFileLines: number,
-): string {
-	return `[Line ${lineNumber} is ${formatBytes(lineBytes)}, exceeds ${formatBytes(maxBytes)} limit. Unable to display a full line. Re-read ${readPath}:1-${fullFileLines} or ${readPath}:raw for the full file]`;
 }
 
 function formatListingTruncationNotice(
@@ -1695,12 +1673,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const bodyRenderedWindow = renderReadWindow(window, shouldAddLineNumbers, maxColumns);
 		const rawWindow = preservePrefix ? `${protectedPrefix}${bodyRawWindow}` : bodyRawWindow;
 		const renderedWindow = preservePrefix ? `${protectedPrefix}${bodyRenderedWindow}` : bodyRenderedWindow;
-		const partialTail = partialTailOf(window);
-		const partialTailWarning = partialTail !== undefined && bodyFooterPath !== undefined;
-		if (partialTailWarning) {
-			Object.defineProperty(metadataWindow, "outputLinesOverride", { value: 0, enumerable: false });
-			Object.defineProperty(metadataWindow, "outputBytesOverride", { value: 0, enumerable: false });
-		}
 		const selectedContent = windowSegments(window)
 			.map(segment => segment.content)
 			.join("\n");
@@ -1712,15 +1684,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		};
 
 		let usedLegacyHeadTruncation = false;
-		let outputText = partialTailWarning
-			? formatOversizedLineWarning(
-					bodyFooterPath!,
-					partialTail!.origin.startLine,
-					partialTail!.sourceLineBytes,
-					budgetBytes,
-					totalLines,
-				)
-			: renderedWindow;
+		let outputText = renderedWindow;
 		let truncationResult: TruncationResult | undefined;
 		if (window.kind !== "full" && (!receipt || direction !== "head" || exposeReceiptHeadMeta)) {
 			const windowResult = makeWindowResult(metadataWindow, selectedContent);
@@ -1731,9 +1695,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							truncated: true,
 						}
 					: windowResult;
-			truncationResult = partialTailWarning
-				? { ...baseTruncation, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
-				: baseTruncation;
+			truncationResult = baseTruncation;
 			details.truncation = truncationResult;
 		}
 
@@ -1765,7 +1727,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 
 		const userLimitedLines = limit !== undefined ? endLine - startLine : undefined;
-		if (bodyFooterPath !== undefined && window.kind !== "full" && !partialTailWarning) {
+		if (bodyFooterPath !== undefined && window.kind !== "full") {
 			// A head window only owns a body footer on the historical receipt paths.
 			// Archive members and internal URLs reach here through `bodyFooterPath`
 			// alone; adding a head footer there would emit a second notice beside the
@@ -3111,37 +3073,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const selectedContent = windowSegments(window)
 							.map(segment => segment.content)
 							.join("\n");
-						const partialTail = partialTailOf(window);
-						const partialTailWarning = partialTail !== undefined;
-						if (partialTailWarning) {
-							Object.defineProperty(window, "outputLinesOverride", { value: 0, enumerable: false });
-							Object.defineProperty(window, "outputBytesOverride", { value: 0, enumerable: false });
-							Object.defineProperty(metadataWindow, "outputLinesOverride", { value: 0, enumerable: false });
-							Object.defineProperty(metadataWindow, "outputBytesOverride", { value: 0, enumerable: false });
-						}
-						const baseWindowResult =
-							window.kind === "full" ? undefined : makeWindowResult(metadataWindow, selectedContent);
 						const windowResult =
-							baseWindowResult && partialTailWarning
-								? { ...baseWindowResult, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
-								: baseWindowResult;
+							window.kind === "full" ? undefined : makeWindowResult(metadataWindow, selectedContent);
 						const rawWindow = renderReadWindow(window, false, directionalMaxColumns);
-						let outputText = partialTailWarning
-							? formatOversizedLineWarning(
-									localReadPath,
-									partialTail.origin.startLine,
-									partialTail.sourceLineBytes,
-									maxBytesForRead,
-									totalFileLines,
-								)
-							: renderReadWindow(
-									window,
-									shouldAddDirectionalLineNumbers,
-									directionalMaxColumns,
-								);
+						let outputText = renderReadWindow(window, shouldAddDirectionalLineNumbers, directionalMaxColumns);
 						const windowEnd = Math.min(collectEndExclusive ?? totalFileLines, totalFileLines);
 						let bodyFooter: string | undefined;
-						if (isBareReceipt && window.kind !== "full" && !partialTailWarning) {
+						if (isBareReceipt && window.kind !== "full") {
 							const footer = formatDirectionalFooter(localReadPath, metadataWindow);
 							if (footer) {
 								outputText += `\n\n${footer}`;
@@ -3183,40 +3121,38 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								}
 							}
 						}
-						if (!partialTailWarning) {
-							const conflictBlocks = windowSegments(window).flatMap(segment =>
-								segment.kind === "lines"
-									? scanConflictLines(linesOfSegment(segment), segment.origin.startLine)
-									: [],
-							);
-							if (conflictBlocks.length > 0) {
-								const history = getConflictHistory(this.session);
-								const displayPathForWarning = formatPathRelativeToCwd(absolutePath, this.session.cwd);
-								const entries = conflictBlocks.map(block =>
-									history.register({
-										absolutePath,
-										displayPath: displayPathForWarning,
-										...block,
-									}),
-								);
-								// Cheap full-file scan only when the window already showed
-								// at least one conflict — otherwise pay nothing on clean files.
-								let totalInFile = entries.length;
-								let scanTruncated = false;
-								try {
-									const fileScan = await scanFileForConflicts(absolutePath);
-									totalInFile = Math.max(entries.length, fileScan.blocks.length);
-									scanTruncated = fileScan.scanTruncated;
-								} catch {
-									// Best-effort enrichment; fall back to window-only count.
-								}
-								outputText += formatConflictWarning(entries, {
-									totalInFile,
+						const conflictBlocks = windowSegments(window).flatMap(segment =>
+							segment.kind === "lines"
+								? scanConflictLines(linesOfSegment(segment), segment.origin.startLine)
+								: [],
+						);
+						if (conflictBlocks.length > 0) {
+							const history = getConflictHistory(this.session);
+							const displayPathForWarning = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+							const entries = conflictBlocks.map(block =>
+								history.register({
+									absolutePath,
 									displayPath: displayPathForWarning,
-									scanTruncated,
-								});
-								details.conflictCount = entries.length;
+									...block,
+								}),
+							);
+							// Cheap full-file scan only when the window already showed
+							// at least one conflict — otherwise pay nothing on clean files.
+							let totalInFile = entries.length;
+							let scanTruncated = false;
+							try {
+								const fileScan = await scanFileForConflicts(absolutePath);
+								totalInFile = Math.max(entries.length, fileScan.blocks.length);
+								scanTruncated = fileScan.scanTruncated;
+							} catch {
+								// Best-effort enrichment; fall back to window-only count.
 							}
+							outputText += formatConflictWarning(entries, {
+								totalInFile,
+								displayPath: displayPathForWarning,
+								scanTruncated,
+							});
+							details.conflictCount = entries.length;
 						}
 						sourcePath = absolutePath;
 						content = [{ type: "text", text: outputText }];
