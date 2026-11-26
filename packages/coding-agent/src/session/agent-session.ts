@@ -8474,13 +8474,21 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
+	/**
+	 * Emit an event to all listeners without letting one subscriber poison lifecycle settlement.
+	 * Subscribers run outside this session's admission context: an event emitted inside an
+	 * admitted turn (auto_compaction_end from pre-prompt maintenance) must not hand that turn's
+	 * admission ownership to subscriber continuations, or a UI replay of input queued during
+	 * compaction is refused as same-session reentrancy and stranded.
+	 */
 	#emit(event: AgentSessionEvent): void {
-		for (const listener of this.#eventListenerSnapshot) {
-			deliverSessionEvent(listener, event, error => {
-				logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
-			});
-		}
+		this.#sessionAdmissionContext.exit(() => {
+			for (const listener of this.#eventListenerSnapshot) {
+				deliverSessionEvent(listener, event, error => {
+					logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
+				});
+			}
+		});
 	}
 
 	/** Notify UI projections after a committed session-identity transition. */
@@ -23160,6 +23168,7 @@ export class AgentSession {
 					try {
 						await forkedManager.close();
 					} catch (closeError) {
+						forkedManager.retryCloseInBackground();
 						cleanupErrors.push(closeError);
 						logger.warn("Bounded fork successor close failed after initialization failure", {
 							error: closeError instanceof Error ? closeError.message : String(closeError),
@@ -23188,6 +23197,7 @@ export class AgentSession {
 				try {
 					await previousManager.close();
 				} catch (error) {
+					previousManager.retryCloseInBackground();
 					logger.warn("Previous session close failed after bounded fork adoption", {
 						error: error instanceof Error ? error.message : String(error),
 					});

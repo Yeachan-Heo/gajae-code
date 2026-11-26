@@ -3,8 +3,10 @@
  *
  * Every mutation-shaped SessionManager method on the live prototype is classified: a writer of the
  * current session's transcript, a writer of a successor's transcript, or not a transcript writer
- * (with the reason). Each writer then runs against a real transcript with ownership on and no claim
- * held, and every transcript byte it changes must have been seen by the detector first. A method
+ * (with the reason). Each writer then runs against a real transcript with ownership on and every
+ * claim failing open (the factories' and prepares' claims time out), so no claim is held, and every
+ * transcript byte it changes must have been seen by the detector first. With claims working, each
+ * successor writer claims its successor before writing it (single-owner design §2.4). A method
  * added later fails the classification until it is listed here, and a writer that reaches the disk
  * around the detector fails the attribution check.
  */
@@ -47,6 +49,24 @@ import {
 import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
+/** Every claim times out, so managers go on without one and the detector alone guards the writes. */
+const FAIL_OPEN_LOCKS = {
+	tryAcquire: async () => ({ status: natives.FileLockAcquireStatus.TimedOut, code: "timed_out" }),
+	probe: async () => ({ state: natives.FileLockProbeState.Free }),
+};
+
+/** A real claim of `sessionId`, taken around the fail-open backend. */
+async function claimHeld(sessionId: string) {
+	const backend = SessionOwnershipTestHooks.lockBackend;
+	delete SessionOwnershipTestHooks.lockBackend;
+	try {
+		const result = await claimSessionOwner(sessionId, { surface: "terminal" });
+		if (result.status !== "claimed") throw new Error("expected a claim");
+		return result.claim;
+	} finally {
+		SessionOwnershipTestHooks.lockBackend = backend;
+	}
+}
 const roots: string[] = [];
 const managers: SessionManager[] = [];
 let detectorLogs: unknown[] = [];
@@ -54,6 +74,7 @@ let writes: TranscriptWriteLedger;
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
+	SessionOwnershipTestHooks.lockBackend = FAIL_OPEN_LOCKS;
 	writes = spyOnTranscriptWrites();
 	// The detector's log line stays in memory: the logger's file sink lives under the real home.
 	detectorLogs = [];
@@ -69,6 +90,7 @@ afterEach(async () => {
 	} finally {
 		delete SessionOwnershipTestHooks.mode;
 		delete SessionOwnershipTestHooks.strictWriteDetection;
+		delete SessionOwnershipTestHooks.lockBackend;
 		vi.restoreAllMocks();
 		resetSessionOwnershipForTests();
 	}
@@ -449,9 +471,7 @@ async function attribute(kind: Kind, writer: Writer, claimed = false) {
 	const staged: Staged = typeof writer === "function" ? { run: writer } : writer;
 	const { manager, root, context } = await bound(kind, staged.fresh);
 	if (claimed) {
-		const result = await claimSessionOwner(manager.getSessionId(), { surface: "terminal" });
-		if (result.status !== "claimed") throw new Error("expected a claim");
-		sessionClaimSetOf(manager).add(result.claim);
+		sessionClaimSetOf(manager).add(await claimHeld(manager.getSessionId()));
 	}
 	let prepared: unknown;
 	try {
@@ -943,17 +963,39 @@ describe.if(supported)("successor writes are checked against the successor's id"
 			for (const kind of ["managed", "explicit"] as const) {
 				const { manager, context } = await bound(kind);
 				const current = manager.getSessionId();
-				const result = await claimSessionOwner(current, { surface: "terminal" });
-				if (result.status !== "claimed") throw new Error("expected a claim");
-				sessionClaimSetOf(manager).add(result.claim);
+				sessionClaimSetOf(manager).add(await claimHeld(current));
 				detectorLogs = [];
 				const successor = await run(manager, context.first);
+				// A sync writer's claim is in flight at its write; the write is reported when that claim fails.
+				await sessionClaimSetOf(manager).settled();
 				expect(successor).not.toBe(current);
 				const reported = detectorLogs as { site: string; sessionId: string }[];
 				expect([kind, reported.some(log => log.site.endsWith("successor") && log.sessionId === successor)]).toEqual(
 					[kind, true],
 				);
 				expect(reported.some(log => log.sessionId === current)).toBe(false);
+			}
+		});
+	}
+
+	for (const [name, run] of Object.entries(successors)) {
+		it(`${name}: with claims working, the successor is claimed before it is written`, async () => {
+			for (const kind of ["managed", "explicit"] as const) {
+				delete SessionOwnershipTestHooks.lockBackend;
+				const { manager, context } = await bound(kind);
+				await manager.flush();
+				const claims = sessionClaimSetOf(manager);
+				await claims.settled();
+				expect([kind, claims.has(manager.getSessionId())]).toEqual([kind, true]);
+				detectorLogs = [];
+				writes.reset();
+				const successor = await run(manager, context.first);
+				await manager.flush();
+				await claims.settled();
+				expect([kind, detectorLogs, writes.uncovered]).toEqual([kind, [], []]);
+				// A rotation keeps only the successor; a prepare keeps the target beside the current id.
+				expect([kind, claims.has(successor)]).toEqual([kind, true]);
+				expect([kind, (await probeSessionOwner(successor)).state]).toEqual([kind, "held"]);
 			}
 		});
 	}
@@ -1162,9 +1204,7 @@ describe.if(supported)("the detector", () => {
 		it("is silent for a claimed session", async () => {
 			const claimed = await outsideStrictSeam(async () => {
 				const fixture = await bound("explicit");
-				const result = await claimSessionOwner(fixture.manager.getSessionId(), { surface: "terminal" });
-				if (result.status !== "claimed") throw new Error("expected a claim");
-				sessionClaimSetOf(fixture.manager).add(result.claim);
+				sessionClaimSetOf(fixture.manager).add(await claimHeld(fixture.manager.getSessionId()));
 				return fixture;
 			});
 			const before = await transcripts(claimed.root);

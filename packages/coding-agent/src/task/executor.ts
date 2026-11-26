@@ -2058,6 +2058,8 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 											? "disabled"
 											: "copy-retain",
 										subagentSettings.get("sessionMemory.mode"),
+										// Subagent children claim nothing yet (single-owner design §13 L2).
+										"exempt",
 									),
 								)
 							: SessionManager.inMemory(worktree ?? cwd);
