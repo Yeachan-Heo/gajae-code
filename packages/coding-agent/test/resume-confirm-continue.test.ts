@@ -326,7 +326,7 @@ describe("explicit resume destination authority", () => {
 		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "enabled" : "copy-retain"),
-			getGlobal: () => undefined,
+			getGlobal: (key: SettingPath) => (key === "session.ownership.mode" ? "off" : undefined),
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 		for (const resume of ["/source/session.jsonl", "session.jsonl"]) {
@@ -360,7 +360,7 @@ describe("explicit resume destination authority", () => {
 		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "off" : "copy-retain"),
-			getGlobal: () => undefined,
+			getGlobal: (key: SettingPath) => (key === "session.ownership.mode" ? "off" : undefined),
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 
