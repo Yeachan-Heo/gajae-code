@@ -3843,21 +3843,32 @@ export class AuthStorage {
 		if (expectedId !== undefined && target.id !== expectedId) {
 			throw new Error("Credential authority changed during refresh");
 		}
-		const named = this.#withDuplicateOrganizationName(provider, entries, target.id, credential);
+		let named = this.#withDuplicateOrganizationName(provider, entries, target.id, credential);
+		let pruneDuplicates = true;
 		if (!this.#store.refreshSnapshot) {
 			if (persist) {
 				this.#store.updateAuthCredential(target.id, named);
 			} else if (named !== credential && named.type === "oauth" && named.organizationId && named.organizationName) {
-				// The refresh lease already persisted the tokens, and a peer may have rotated them since. Add only the
-				// carried name to the row as it is now; rewriting the whole row could roll back a newer token pair.
-				this.#store.setOAuthOrganizationNameIfUnset?.(target.id, named.organizationId, named.organizationName);
+				const carried = this.#persistCarriedOrganizationName(
+					provider,
+					target.id,
+					credential,
+					named,
+					named.organizationId,
+					named.organizationName,
+				);
+				named = carried.credential;
+				pruneDuplicates = carried.pruneDuplicates;
 			}
 		}
 		credential = named;
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
-		this.#setStoredCredentials(provider, this.#pruneDuplicateStoredCredentials(provider, updated, target.id));
+		this.#setStoredCredentials(
+			provider,
+			pruneDuplicates ? this.#pruneDuplicateStoredCredentials(provider, updated, target.id) : updated,
+		);
 		// Callers use the refresh generation to discount configuration bumps caused by a refresh, so it only
 		// advances when this refresh bumped configuration; token rotation for a known account does not.
 		if (
@@ -3876,6 +3887,51 @@ export class AuthStorage {
 			);
 		}
 		return credential;
+	}
+
+	/**
+	 * Adds a name carried over from a duplicate row to a row whose refresh lease already persisted the tokens. A peer
+	 * may have rotated those tokens since, so only the name is written, conditionally on the row as it is now.
+	 *
+	 * Returns the credential to cache and whether the duplicate rows of its identity may be pruned:
+	 * - written: the carried name, prune.
+	 * - condition lost because a peer named the row first or changed its workspace: the name the row holds now, prune.
+	 * - condition lost because the row is no longer active: the refreshed credential, and keep the duplicate, since
+	 *   pruning it would leave no active row for the identity.
+	 * - write or re-read failed: the refreshed credential without the carried name, and keep the duplicate that still
+	 *   holds the name so a later refresh carries it again. The tokens are already committed, so the refresh itself
+	 *   succeeds.
+	 */
+	#persistCarriedOrganizationName<T extends AuthCredential>(
+		provider: string,
+		id: number,
+		credential: T,
+		named: T,
+		organizationId: string,
+		carriedName: string,
+	): { credential: T; pruneDuplicates: boolean } {
+		try {
+			if (this.#store.setOAuthOrganizationNameIfUnset?.(id, organizationId, carriedName) !== false) {
+				return { credential: named, pruneDuplicates: true };
+			}
+			const current = this.#store.listAuthCredentials(provider).find(entry => entry.id === id)?.credential;
+			if (!current) return { credential, pruneDuplicates: false };
+			const organizationName =
+				current.type === "oauth" && current.organizationId === organizationId
+					? current.organizationName?.trim() || undefined
+					: undefined;
+			return {
+				credential: organizationName ? { ...named, organizationName } : credential,
+				pruneDuplicates: true,
+			};
+		} catch (error) {
+			logger.warn("OAuth refresh could not persist the workspace name carried from a duplicate credential", {
+				provider,
+				credentialId: id,
+				error: String(error),
+			});
+			return { credential, pruneDuplicates: false };
+		}
 	}
 
 	/**

@@ -413,5 +413,95 @@ describe("AuthStorage openai-codex workspaces", () => {
 			expect([persisted?.access, persisted?.refresh]).toEqual([peerAccess, "refresh-peer"]);
 			expect([persisted?.organizationId, persisted?.organizationName]).toEqual([TEAM.id, TEAM.name]);
 		});
+
+		it("caches the name a peer wrote first when the carried name loses its condition", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			// Another process names the row right after this process's refresh lease completes, so the conditional
+			// name-only write finds a name already set and changes nothing.
+			const peerName = "Acme Renamed";
+			const peer = await SqliteAuthCredentialStore.open(dbPath);
+			const completeLease = store.completeOAuthRefreshLease.bind(store);
+			store.completeOAuthRefreshLease = (lease, credential) => {
+				const completed = completeLease(lease, credential);
+				if (completed) {
+					peer.updateAuthCredential(legacyId, {
+						...credential,
+						organizationId: TEAM.id,
+						organizationName: peerName,
+					});
+				}
+				return completed;
+			};
+			try {
+				await refreshLegacy(legacyId, TEAM.id);
+			} finally {
+				peer.close();
+			}
+
+			expect(stored().map(row => [row.id, row.credential.organizationName])).toEqual([[legacyId, peerName]]);
+			// The in-memory row carries the name on disk, so `org:<name>` (resolved against memory) finds it.
+			expect(
+				authStorage
+					.listCredentialInventory("openai-codex")
+					.filter(row => !row.disabled)
+					.map(row => [row.id, row.identityLabel]),
+			).toEqual([[legacyId, `${EMAIL} (${peerName})`]]);
+			expect(authStorage.resolveOAuthPinTarget("openai-codex", { kind: "org", value: peerName }).credentialId).toBe(
+				legacyId,
+			);
+		});
+
+		it("keeps the named duplicate active when a peer disables the refreshed row before the name is written", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			const loginId = stored().find(row => row.id !== legacyId)?.id ?? -1;
+			// Another process disables the refreshed row right after this process's refresh lease completes, so the
+			// conditional name-only write finds no active row. Pruning the named login row too would leave none active.
+			const peer = await SqliteAuthCredentialStore.open(dbPath);
+			const completeLease = store.completeOAuthRefreshLease.bind(store);
+			store.completeOAuthRefreshLease = (lease, credential) => {
+				const completed = completeLease(lease, credential);
+				if (completed) peer.deleteAuthCredential(legacyId, "deduplicated duplicate credential");
+				return completed;
+			};
+			try {
+				await refreshLegacy(legacyId, TEAM.id);
+			} finally {
+				peer.close();
+			}
+
+			expect(stored().map(row => [row.id, row.credential.organizationName])).toEqual([[loginId, TEAM.name]]);
+		});
+
+		it("completes the refresh and keeps the named duplicate when the carried name cannot be written", async () => {
+			const legacyId = await seedLegacy(TEAM.id);
+			await login(TEAM.id, "team");
+			const loginId = stored().find(row => row.id !== legacyId)?.id ?? -1;
+			const setName = store.setOAuthOrganizationNameIfUnset.bind(store);
+			store.setOAuthOrganizationNameIfUnset = () => {
+				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+			};
+
+			await refreshLegacy(legacyId, TEAM.id);
+
+			// The lease committed the new tokens, so the refresh succeeds; the name stays on the duplicate, on disk and
+			// in memory, and `org:<name>` still resolves to it.
+			expect(stored().map(row => [row.id, row.credential.organizationName])).toEqual([
+				[legacyId, undefined],
+				[loginId, TEAM.name],
+			]);
+			expect(stored().find(row => row.id === legacyId)?.credential.access).toBe(
+				codexAccessToken(TEAM.id, "legacy-refreshed"),
+			);
+			expect(authStorage.resolveOAuthPinTarget("openai-codex", { kind: "org", value: TEAM.name }).credentialId).toBe(
+				loginId,
+			);
+
+			// Once the write succeeds, the next refresh carries the name and prunes the duplicate.
+			store.setOAuthOrganizationNameIfUnset = setName;
+			await refreshLegacy(legacyId, TEAM.id);
+			expect(stored().map(row => [row.id, row.credential.organizationName])).toEqual([[legacyId, TEAM.name]]);
+		});
 	});
 });
