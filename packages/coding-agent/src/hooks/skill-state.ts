@@ -3,6 +3,10 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { resolveSkillScopeTrust, type SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
+import {
+	DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD,
+	resolveConfiguredAmbiguityThreshold,
+} from "../gjc-runtime/deep-interview-threshold";
 import { captureRepositoryBinding, publicRepositoryBinding } from "../gjc-runtime/repository-binding";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
@@ -52,7 +56,6 @@ export interface EffectiveSkillConfigInput {
 }
 
 const SANITIZED_CONFIG_VALUE_LIMIT = 80;
-const DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD = 0.05;
 
 function sanitizeConfigValue(value: string): string {
 	const compact = value.replace(/[\r\n\t]+/g, " ").trim();
@@ -439,8 +442,12 @@ async function seedSkillActivationState(
 		...(repositoryBinding ? { repository_binding: repositoryBinding } : {}),
 	};
 	if (skill === "deep-interview") {
-		modeState.threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
-		modeState.threshold_source = "default";
+		// Seed the same configured threshold the CLI seed resolves, so the skill's
+		// Phase 0 (which trusts pre-resolved state) never reports a configured
+		// value as `default` (#7316).
+		const configured = await resolveConfiguredAmbiguityThreshold(input.cwd);
+		modeState.threshold = configured?.threshold ?? DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
+		modeState.threshold_source = configured?.source ?? "default";
 	}
 
 	const modeWrite = guardedStateWriteReceipt(

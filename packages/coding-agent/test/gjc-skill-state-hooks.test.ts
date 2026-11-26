@@ -392,6 +392,28 @@ describe("GJC native skill-state hooks", () => {
 		expect(modeState.version).toBe(WORKFLOW_STATE_VERSION);
 	});
 
+	it("UserPromptSubmit seeds a configured deep-interview threshold instead of the default (#7316)", async () => {
+		const root = await cwd();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await Bun.write(path.join(root, ".gjc", "config.yml"), "gjc:\n  deepInterview:\n    ambiguityThreshold: 0.2\n");
+		await dispatchGjcNativeSkillHook(
+			{
+				hook_event_name: "UserPromptSubmit",
+				prompt: "$deep-interview clarify this feature",
+				cwd: root,
+				session_id: "session-configured-threshold",
+			},
+			{ effectiveSkillConfig: testEffectiveSkillConfig },
+		);
+
+		const state = await readVisibleSkillActiveState(root, "session-configured-threshold");
+		const modeState = await Bun.file(state?.initialized_state_path ?? "").json();
+		expect(modeState.threshold).toBeCloseTo(0.2);
+		expect(await fs.realpath(modeState.threshold_source)).toBe(
+			await fs.realpath(path.join(root, ".gjc", "config.yml")),
+		);
+	});
+
 	it("repeated activation preserves newer guarded source mode-state and stale-skips active snapshot", async () => {
 		const root = await cwd();
 		const sessionId = "session-repeat-activation";
