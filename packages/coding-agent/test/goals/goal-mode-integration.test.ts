@@ -771,6 +771,36 @@ describe("InteractiveMode goal mode integration", () => {
 		await nextTurn;
 	});
 
+	it("settles a completed-goal exit once when agent_end and the next input prompt race", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness({
+			rebuildSystemPrompt: async () => {
+				await Bun.sleep(5);
+				return { systemPrompt: ["Test"] };
+			},
+		});
+		// Goal exit must restore a different tool set so each exit attempt rebuilds the prompt.
+		await harness.session.setActiveToolsByName(["read"], { explicit: false, persistMCPSelection: false });
+		await harness.mode.goalModeController.handleCommand("Ship the release");
+		const goalTool = harness.session.getToolByName("goal");
+		if (!goalTool) throw new Error("goal tool not registered");
+		await goalTool.execute("call-id", { op: "complete" });
+		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
+
+		const appendCustomEntry = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");
+		const agentEnd = harness.mode.goalModeController.handleSessionEvent({ type: "agent_end", messages: [] } as never);
+		const nextTurn = harness.mode.getUserInput();
+		await expect(agentEnd).resolves.toBeUndefined();
+		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
+			await Bun.sleep(1);
+		}
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.session.getActiveToolNames()).toEqual(["read"]);
+		expect(appendCustomEntry.mock.calls.filter(call => call[0] === "goal-completed")).toHaveLength(1);
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
+		await expect(nextTurn).resolves.toBeDefined();
+	});
+
 	it("completes goal state even when a goal_updated extension hook throws", async () => {
 		await harness.cleanup();
 		const extensionError = new TypeError(
