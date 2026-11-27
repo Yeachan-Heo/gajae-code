@@ -16959,19 +16959,19 @@ export class AgentSession {
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		// A skill always starts a turn; refuse before claiming its epoch or running preflight.
 		this.#assertTranscriptAcceptsTurn();
-		const internalOptions = {
+		const { promptAdmissionFence, promptPrelude } = options ?? {};
+		const promptOptions = {
 			...options,
 			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
+		};
+		const assertPromptAdmission = (): void => {
+			if (promptAdmissionFence) this.#assertPromptAdmissionFence(promptAdmissionFence);
 		};
 		const preparationSignal = promptAdmissionFence
 			? promptOptions.preflightSignal
 				? AbortSignal.any([promptAdmissionFence.signal, promptOptions.preflightSignal])
 				: promptAdmissionFence.signal
 			: promptOptions.preflightSignal;
-		const internalOptions = {
-			...promptOptions,
-			sdkRunToken: readSdkRunCapability(promptOptions.sdkRunCapability),
-		};
 		assertPromptAdmission();
 		if (promptOptions.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
@@ -16995,6 +16995,7 @@ export class AgentSession {
 			preparationSignal,
 		);
 		assertPromptAdmission();
+		const internalOptions = promptOptions;
 		const built = await awaitPromptInvocationPreflight(
 			buildSkillPromptMessage(skill, activation.cleanedArgs, {
 				subskillActivation: activation.activation,
@@ -17027,7 +17028,8 @@ export class AgentSession {
 		// Check if the message will be queued: if streaming or admission is already active.
 		const willBeQueued =
 			this.isStreaming ||
-			(this.#activeSessionAdmission?.kind === "prompt" || this.#sessionAdmissionQueue.some(e => e.kind === "prompt"));
+			this.#activeSessionAdmission?.kind === "prompt" ||
+			this.#sessionAdmissionQueue.some(e => e.kind === "prompt");
 		if (willBeQueued) {
 			pendingDisplayTag = this.enqueueCustomMessageDisplay(
 				`/skill:${skill.name}${activation.cleanedArgs ? " " + activation.cleanedArgs : ""}`,
@@ -18419,11 +18421,6 @@ export class AgentSession {
 		if (options?.synthetic !== true && options?.attribution !== "agent") {
 			invalidateSessionTitleGeneration(this.sessionManager);
 		}
-		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
-		const internalOptions: InternalPromptOptions | undefined = options
-			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
-			: undefined;
-		this.#assertRecoveryHydrationPromoted();
 		this.#assertExternalSessionIngress();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
@@ -18466,7 +18463,6 @@ export class AgentSession {
 				const eagerTodoPrelude =
 					!busySubmission && !hasPendingUserDirective ? this.#createEagerTodoPrelude(text) : undefined;
 				const workflowIntentDiff = buildWorkflowIntentDiff(text) ?? undefined;
-				let skillPromptQueued = false;
 				const skillOptions: SkillInvocationOptions = {
 					...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 					...(options?.onPreflightAcceptCommit
@@ -18474,9 +18470,7 @@ export class AgentSession {
 						: {}),
 					...(options?.onSkillPrepared ? { onSkillPrepared: options.onSkillPrepared } : {}),
 					...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-					...(options?.sdkRunCapability !== undefined
-						? { sdkRunCapability: options.sdkRunCapability }
-						: {}),
+					...(options?.sdkRunCapability !== undefined ? { sdkRunCapability: options.sdkRunCapability } : {}),
 					...(options?.streamingBehavior !== undefined ? { streamingBehavior: options.streamingBehavior } : {}),
 					...(options?.followUpQueuePolicy !== undefined
 						? { followUpQueuePolicy: options.followUpQueuePolicy }
@@ -18490,28 +18484,9 @@ export class AgentSession {
 					promptPrelude: {
 						...(eagerTodoPrelude ? { eagerTodoPrelude } : {}),
 						...(workflowIntentDiff ? { workflowIntentDiff } : {}),
-						onQueued: () => {
-							skillPromptQueued = true;
-						},
 					},
 				};
-				await this.invokeSkill(
-					invocation.skill.name,
-					invocation.args,
-					options?.onPreflightAccepted ||
-						options?.onPreflightAcceptCommit ||
-						options?.preflightSignal ||
-						internalOptions?.sdkRunToken
-						? {
-								...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
-								...(options?.onPreflightAcceptCommit
-									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
-									: {}),
-								...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-								...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
-							}
-						: undefined,
-				);
+				await this.invokeSkill(invocation.skill.name, invocation.args, skillOptions);
 				return;
 			}
 		}
@@ -18881,9 +18856,12 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 			| "sdkRunCapability"
+			| "skipCompactionCheck"
 		> & {
 			/** While streaming, observes the queued follow-up; see `sendCustomMessage`. */
 			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			promptPreflightGuard?: () => void;
+			promptPrelude?: SkillPromptPrelude;
 		},
 	): Promise<void> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
