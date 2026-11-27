@@ -102,6 +102,9 @@ export interface SlashCommandCandidate {
 	content: string;
 }
 
+/** Codes for source-level diagnostics. */
+export type SourceDiagnosticCode = "agent_unsupported_tools_only";
+
 /**
  * Source-level diagnostic for a single source/type pair (e.g. "codex mcp config
  * was malformed"). Distinct from per-item actions so absent/unreadable sources
@@ -112,6 +115,7 @@ export interface SourceDiagnostic {
 	type: Exclude<MigrateItemType, "source"> | "source";
 	status: Extract<MigrationStatus, "skipped_absent_source" | "failed_invalid_source" | "failed_io">;
 	message: string;
+	code?: SourceDiagnosticCode;
 }
 
 /**
