@@ -8,6 +8,6 @@
 
 ### Fixed
 
-- An ACP prompt sent after its session host closed between turns, before the Router attached the session's new owner, failed with "SDK session attachment is stale." or was abandoned as "host closed (replaced)". It now re-attaches the session through the broker and runs there.
+- An ACP prompt sent after its session host closed between turns, before the Router attached the session's new owner, failed with "SDK session attachment is stale." or was abandoned as "host closed (replaced)". It now re-attaches the session through the broker and runs there. If the new owner is not ready yet (a terminal still starting), that one prompt fails as before and the session stays loaded; the next prompt or attachment recovers it without `session/load`. Temporary sessions keep their own recovery.
 - When an idle ACP session's endpoint moved to another process (a terminal that took it over), ACP kept the old host's lifecycle ownership and providers: `session/close` then tried to close the terminal's session. ACP now re-attaches such a session through the broker, so it learns the new host's provenance.
 - Under `enforce`, a broker `session.resume` arriving while a terminal takes a session over (its generation-0 row live, the claim not yet taken) refused at once. It now waits for the terminal's endpoint, as it does for a held claim.
