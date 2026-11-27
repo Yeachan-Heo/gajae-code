@@ -15,7 +15,7 @@ import { formatBytes, sanitizeDisplayLine, sanitizeText } from "@gajae-code/util
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import type { ResumeSessionIdentity } from "../../sdk/session-readonly/storage";
-import type { SessionHandoverOutcome } from "../../session/session-handover";
+import type { SessionHandoverOutcome, SessionHandoverWaitOptions } from "../../session/session-handover";
 import { prioritizeStarredSessions, type ResumeTailInspection, type SessionInfo } from "../../session/session-manager";
 import {
 	type SessionHeldError,
@@ -24,7 +24,7 @@ import {
 } from "../../session/session-ownership";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
-import { createHeldSessionWarning } from "./session-held-warning";
+import { createHeldSessionWarning, SESSION_HOST_WAITING_MESSAGE } from "./session-held-warning";
 
 export interface SelectedSession {
 	kind: "selected";
@@ -56,8 +56,14 @@ export interface HeldSession {
 	 */
 	readonly handOver?: () => Promise<SessionHandoverOutcome>;
 }
-/** Whether another process holds a session, checked when it is chosen (enforce only). */
-export type HeldSessionCheck = (session: SessionInfo) => Promise<HeldSession | undefined>;
+/**
+ * Whether another process holds a session, checked when it is chosen (enforce only). `wait` lets the
+ * picker show the wait for a launched host and stop it when the check is abandoned.
+ */
+export type HeldSessionCheck = (
+	session: SessionInfo,
+	wait?: SessionHandoverWaitOptions,
+) => Promise<HeldSession | undefined>;
 export type SessionInspector = (sessionPath: string) => Promise<ResumeTailInspection>;
 
 /** One picker row. Keep each newline as its own space, then drop terminal controls. */
@@ -278,6 +284,8 @@ export class SessionSelectorComponent extends Container {
 	#state: SelectorState = { kind: "browsing" };
 	#nextToken = 0;
 	#heldCheck: HeldSessionCheck | undefined;
+	/** Stops the held check in flight, and its wait for a session host, when the picker moves on. */
+	#heldCheckAbort: AbortController | undefined;
 
 	constructor(
 		sessions: SessionInfo[],
@@ -374,12 +382,14 @@ export class SessionSelectorComponent extends Container {
 	#cancel(): void {
 		if (this.#state.kind === "settled" || this.#state.kind === "handing-over") return;
 		if (this.#state.kind === "checking") this.#nextToken++;
+		this.#heldCheckAbort?.abort();
 		this.#settle({ kind: "cancelled" });
 	}
 	#exit(): void {
 		// A handover cannot be interrupted (it is bounded); Ctrl+C is ignored until it settles.
 		if (this.#state.kind === "handing-over") return;
 		if (this.#state.kind !== "settled") this.#nextToken++;
+		this.#heldCheckAbort?.abort();
 		this.#state = { kind: "settled" };
 		this.#sessionList.setInputFrozen(true);
 		this.onExit();
@@ -415,10 +425,24 @@ export class SessionSelectorComponent extends Container {
 		this.#sessionList.setInputFrozen(true);
 		this.#clearError();
 		this.#requestRender();
+		const abort = new AbortController();
+		this.#heldCheckAbort = abort;
+		const current = () => this.#state.kind === "checking" && this.#state.token === token;
 		try {
 			// Checked again when chosen: the list's markers are only as fresh as the listing.
-			const held = this.#heldCheck ? await this.#heldCheck(session) : undefined;
-			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
+			const held = this.#heldCheck
+				? await this.#heldCheck(session, {
+						signal: abort.signal,
+						onWaiting: () => {
+							if (!current()) return;
+							this.#messageContainer.clear();
+							this.#messageContainer.addChild(new Text(theme.fg("muted", SESSION_HOST_WAITING_MESSAGE), 1, 0));
+							this.#requestRender();
+						},
+					})
+				: undefined;
+			if (!current()) return;
+			this.#clearError();
 			if (this.#heldCheck)
 				this.#sessionList.setHeldMarker(session.id, held && sessionOwnerHolderMarker(held.error.holder));
 			if (held) {
@@ -428,6 +452,8 @@ export class SessionSelectorComponent extends Container {
 		} catch (error) {
 			this.#failCheck(token, error);
 			return;
+		} finally {
+			if (this.#heldCheckAbort === abort) this.#heldCheckAbort = undefined;
 		}
 		await this.#inspectChosen(session, token, inspector);
 	}

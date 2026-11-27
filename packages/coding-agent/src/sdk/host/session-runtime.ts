@@ -11,8 +11,6 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
-import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
-import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { AsyncJobManager } from "../../async";
 import {
 	getProxyRoutableProviders,
@@ -41,7 +39,6 @@ import {
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { tagSdkLifecycleObserver } from "../../extensibility/extensions/function-hooks-internal";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
-import { trustedCoordinatorEnv } from "../../gjc-runtime/sidecar-bootstrap-env";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
@@ -5369,45 +5366,6 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 	return undefined;
 }
 
-const HOST_REGISTRATION_HOLD_DIR_ENV = "GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR";
-const HOST_REGISTRATION_HOLD_MAX_MS = 60_000;
-
-/**
- * The hold directory from the operator's environment only: a value the project dotenv supplied, in
- * the current directory or in the one this process started in, is ignored and removed from this
- * process's environment, so no child inherits it. An unset variable costs no read.
- */
-function trustedHostRegistrationHoldDirectory(): string | undefined {
-	if (!process.env[HOST_REGISTRATION_HOLD_DIR_ENV]) return undefined;
-	let accepted: string | undefined;
-	for (const snapshot of [projectEnvSnapshot(process.cwd()), startupProjectEnvSnapshot()]) {
-		accepted = trustedCoordinatorEnv(HOST_REGISTRATION_HOLD_DIR_ENV, process.env, snapshot);
-		if (accepted === undefined) {
-			delete process.env[HOST_REGISTRATION_HOLD_DIR_ENV];
-			return undefined;
-		}
-	}
-	return accepted;
-}
-
-/**
- * Test seam: while `<dir>/<sessionId>.hold` exists, defer this host's broker registration (at
- * most 60 s), so a multi-process test can hold an interactive TUI in the window where it holds the
- * session claim but has no endpoint in the index.
- */
-async function awaitHostRegistrationTestHold(sessionId: string): Promise<void> {
-	const directory = trustedHostRegistrationHoldDirectory();
-	if (!directory) return;
-	const hold = path.join(directory, `${sessionId}.hold`);
-	const held = (): Promise<boolean> =>
-		fs.stat(hold).then(
-			() => true,
-			() => false,
-		);
-	const deadline = Date.now() + HOST_REGISTRATION_HOLD_MAX_MS;
-	while (Date.now() < deadline && (await held())) await Bun.sleep(50);
-}
-
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	const acceptedImages = new Map<
@@ -8319,8 +8277,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						pid: process.pid,
 						processIncarnation: effectiveIncarnation,
 					});
-					if (brokerRecoveryStopped) return;
-					await awaitHostRegistrationTestHold(sessionId);
 					if (brokerRecoveryStopped) return;
 					let brokerRegistrationEvent: SessionIndexEvent | undefined;
 					await runtime.registerWithBroker({

@@ -85,7 +85,7 @@ import {
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { probeHeldSessions, resolveSessionOwnership } from "../../session/internal/session-claim-set";
 import { operatorErrorMessage } from "../../session/operator-error-message";
-import { findSessionHandoverTarget, handOverSession } from "../../session/session-handover";
+import { checkSessionHandover, handOverSession, type SessionHandoverCheck } from "../../session/session-handover";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import {
@@ -193,7 +193,11 @@ import {
 } from "../components/provider-onboarding-selector";
 import { ProviderOrderContext } from "../components/provider-order-context";
 import { ProviderOrderEditorComponent } from "../components/provider-order-editor";
-import { heldSessionChoice, heldSessionWarningDialog } from "../components/session-held-warning";
+import {
+	heldSessionChoice,
+	heldSessionWarningDialog,
+	SESSION_HOST_WAITING_MESSAGE,
+} from "../components/session-held-warning";
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
@@ -2716,7 +2720,7 @@ export class SelectorController {
 	 */
 	async #forkHeldSession(
 		sessionPath: string,
-		error: SessionHeldError,
+		probed: SessionHeldError,
 		warning?: { readonly cancelledStatus?: string; readonly continueHere?: boolean },
 	): Promise<
 		| {
@@ -2731,7 +2735,27 @@ export class SelectorController {
 	> {
 		// The session's own agent dir and claim decision, as the launch and this switch's admission use.
 		const agentDir = this.ctx.settings.getAgentDir();
-		const handover = warning?.continueHere === false ? undefined : await findSessionHandoverTarget(error, agentDir);
+		// A refused turn on the current session offers Fork and Cancel only, so it looks up no handover.
+		let check: SessionHandoverCheck = { error: probed, target: undefined };
+		if (warning?.continueHere !== false) {
+			// Waiting for a launched host to publish shows in the status line; quitting ends the wait.
+			const stop = new AbortController();
+			const offStop = this.ctx.onStop?.(() => stop.abort());
+			try {
+				check = await checkSessionHandover(probed, agentDir, {
+					signal: stop.signal,
+					onWaiting: () => this.ctx.showStatus(SESSION_HOST_WAITING_MESSAGE),
+				});
+			} finally {
+				offStop?.();
+			}
+			if (this.ctx.isStopped?.()) return undefined;
+		}
+		// The holder let go while the warning waited: take the switch's admission claim as for an unheld session.
+		if (!check.error)
+			return { kind: "continued", admission: await this.ctx.sessionManager.switchTargetAdmission(sessionPath) };
+		const error = check.error;
+		const handover = check.target;
 		let note: string | undefined;
 		for (;;) {
 			const { title, options } = heldSessionWarningDialog(error, { continueHere: handover !== undefined, note });

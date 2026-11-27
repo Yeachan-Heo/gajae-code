@@ -61,7 +61,11 @@ import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
-import type { HeldSessionChoice, HeldSessionWarningOptions } from "./modes/components/session-held-warning";
+import {
+	type HeldSessionChoice,
+	type HeldSessionWarningOptions,
+	SESSION_HOST_WAITING_MESSAGE,
+} from "./modes/components/session-held-warning";
 import type { HeldSession, SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -99,7 +103,7 @@ import { probeHeldSessions, resolveSessionOwnership } from "./session/internal/s
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
-import { findSessionHandoverTarget, handOverSession } from "./session/session-handover";
+import { checkSessionHandover, handOverSession, type SessionHandoverWaitOptions } from "./session/session-handover";
 import {
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
@@ -1473,6 +1477,8 @@ export interface SessionStartupNotices {
 	readonly held?: {
 		readonly choose: (error: SessionHeldError, options: HeldSessionWarningOptions) => Promise<HeldSessionChoice>;
 		readonly forked: (message: string) => void;
+		/** The warning is waiting for a launched session host to publish before it shows. */
+		readonly waiting?: () => void;
 	};
 }
 
@@ -1569,10 +1575,16 @@ export async function createSessionManager(
 			probe: Promise<SessionHeldError | undefined>,
 			continueHere: boolean,
 		): Promise<HeldStartupResolution | undefined> => {
-			const refusal = await probe;
-			if (!refusal) return undefined;
+			const probed = await probe;
+			if (!probed) return undefined;
 			const agentDir = activeSettings.getAgentDir();
-			const handover = continueHere ? await findSessionHandoverTarget(refusal, agentDir) : undefined;
+			const check = continueHere
+				? await checkSessionHandover(probed, agentDir, { onWaiting: held.waiting })
+				: { error: probed, target: undefined };
+			// The holder let go while the warning waited: open the session as unheld.
+			const refusal = check.error;
+			if (!refusal) return undefined;
+			const handover = check.target;
 			let note: string | undefined;
 			for (;;) {
 				const choice = await held.choose(refusal, { continueHere: handover !== undefined, note });
@@ -2361,10 +2373,13 @@ export async function runRootCommand(
 		const handoverAgentDir = deps.settings?.getAgentDir() ?? getAgentDir();
 		const held = heldProbe && {
 			sessions: await heldProbe,
-			check: async (session: SessionInfo): Promise<HeldSession | undefined> => {
-				const error = await SessionManager.probeHeldTranscript(session.path, heldOwnership);
+			check: async (session: SessionInfo, wait?: SessionHandoverWaitOptions): Promise<HeldSession | undefined> => {
+				const probed = await SessionManager.probeHeldTranscript(session.path, heldOwnership);
+				if (!probed) return undefined;
+				// `error` is `undefined` when the holder let go while the warning waited: resume as unheld.
+				const { error, target } = await checkSessionHandover(probed, handoverAgentDir, wait);
 				if (!error) return undefined;
-				if (!(await findSessionHandoverTarget(error, handoverAgentDir))) return { error };
+				if (!target) return { error };
 				return { error, handOver: () => handOverSession(error, handoverAgentDir, heldOwnership) };
 			},
 		};
@@ -2733,6 +2748,8 @@ export async function runRootCommand(
 										held: {
 											choose: promptHeldSession,
 											forked: (message: string) => notifs.push({ kind: "info", message }),
+											// Before the TUI starts: a line on the terminal, above the warning.
+											waiting: () => process.stderr.write(`${SESSION_HOST_WAITING_MESSAGE}\n`),
 										},
 									}
 								: {}),

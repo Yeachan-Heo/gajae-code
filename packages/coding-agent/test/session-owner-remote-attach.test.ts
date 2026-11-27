@@ -358,9 +358,19 @@ interface Fixture {
  * in the operator's global config, and a fixture broker. Shutdown runs in registration order:
  * release held turns, stop the TUI, ACP and any CLI command, then close the broker lease.
  */
-async function startFixture(mode: "observe" | "enforce", holds: readonly string[]): Promise<Fixture> {
+async function startFixture(
+	mode: "observe" | "enforce",
+	holds: readonly string[],
+	options: { readonly registrationHoldDir?: string } = {},
+): Promise<Fixture> {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-attach-")));
 	const env = buildChildEnv(root);
+	// In the broker's environment, so the hosts it launches inherit the registration test seam.
+	if (options.registrationHoldDir !== undefined) {
+		const holdDir = path.join(root, options.registrationHoldDir);
+		await fs.mkdir(holdDir, { recursive: true, mode: 0o700 });
+		env.GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR = holdDir;
+	}
 	const agentDir = env.GJC_CODING_AGENT_DIR!;
 	const workspace = path.join(root, "workspace");
 	const stubs = path.join(root, "stub-bin");
@@ -1057,6 +1067,124 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		expect((await rowsOf(secondId)).map(row => ({ pid: row.pid, live: row.live }))).toEqual([
 			{ pid: tuiPid, live: true },
 		]);
+		tui?.pty.write("/quit\r");
+		expect(await withTimeout(tui!.done, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
+	}, 300_000);
+
+	// Design §13 H3 meeting §13 L1, Gajae Mobile's tmux-window flow: the bridge's session/load reaches
+	// the broker before `gjc --resume S` claims, so a broker-launched host claims S first. The host's
+	// registration is held through its test seam, so when the TUI warns, the host holds S but has no
+	// index row yet. The warning waits for the row, then offers Continue here, and the takeover works.
+	it("enforce: Continue here is offered while the launched host that claimed first is still publishing", async () => {
+		const PRINT_PROMPT = "attach-print-race";
+		const AFTER_PROMPT = "attach-acp-race";
+		const fixture = await startFixture("enforce", [], { registrationHoldDir: "registration-hold" });
+		const { env, agentDir, workspace, cleanup, started } = fixture;
+
+		// S exists and is free: one `gjc -p` turn claims it and releases it at exit.
+		const printed = await runGjc(env, workspace, [
+			"-p",
+			"--no-mcp",
+			"--no-lsp",
+			"--no-rules",
+			"--model",
+			"fake/fake-model",
+			PRINT_PROMPT,
+		]);
+		expect(printed.exitCode).toBe(0);
+		const sessions = SessionManager.getDefaultSessionDirReadOnly(workspace, agentDir);
+		const files = await transcriptFiles(sessions);
+		expect(files).toHaveLength(1);
+		const transcript = files[0]!;
+		const sessionId = (await readTranscript(transcript)).header.id!;
+		const hold = path.join(env.GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR!, `${sessionId}.hold`);
+		await Bun.write(hold, "");
+
+		let tuiPid: number | undefined;
+		const launchedHosts: LaunchedHost[] = [];
+		registerFixtureRuntime(cleanup, {
+			key: "launched-hosts",
+			requiredOwner: "runtime-and-broker",
+			shutdown: () => closeLaunchedHosts(started.discovery, sessionId, tuiPid ?? -1, launchedHosts),
+		});
+		const rowsForS = async () => (await brokerRows(started.discovery)).filter(row => row.sessionId === sessionId);
+		const endpointPublished = async () => (await rowsForS()).some(row => Number(row.endpointGeneration ?? 0) > 0);
+		const holderOfS = async () =>
+			(await sessionOwners(env, workspace)).find(owner => owner.sessionId === sessionId)?.holder;
+		const acp = startAcp(fixture);
+		const inFlight: Promise<unknown>[] = [];
+		let tui: Tui | undefined;
+		try {
+			await withTimeout(
+				acp.connection.initialize({ protocolVersion: 1, clientCapabilities: {} }),
+				60_000,
+				"ACP initialize",
+			);
+			// The bridge's session/load first: the broker launches a host, which claims S and is held
+			// before it registers.
+			const loaded = acp.connection.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+			inFlight.push(loaded);
+			loaded.catch(() => undefined);
+			let hostPid = 0;
+			await waitFor(
+				async () => {
+					const holder = await holderOfS();
+					if (holder?.surface !== "sdk-host" || typeof holder.pid !== "number") return false;
+					hostPid = holder.pid;
+					return true;
+				},
+				60_000,
+				"the launched host's claim on S",
+			);
+			launchedHosts.push({ pid: hostPid });
+			expect(await endpointPublished()).toBe(false);
+
+			// `gjc --resume S` meets the host that claimed first: the warning says it waits for the host
+			// instead of offering only Fork. The hold goes as soon as the wait shows.
+			tui = startTui(fixture, ["--resume", sessionId]);
+			const view = tui;
+			tuiPid = await view.pid();
+			await waitFor(() => view.screen().includes("Waiting for the session host"), 60_000, "the wait for the host");
+			expect(view.screen()).not.toContain("Fork into a new session");
+			await fs.rm(hold);
+			await waitFor(() => view.screen().includes("Continue here"), 30_000, "Continue here in the warning");
+			expect(view.screen()).toContain("Fork into a new session");
+			await withTimeout(loaded, 60_000, "ACP session/load");
+
+			// Continue here closes the idle host and the TUI owns S; the bridge's next prompt runs in it.
+			view.pty.write("h");
+			await waitFor(async () => (await holderOfS())?.pid === tuiPid, 60_000, "the TUI's claim on S");
+			await waitFor(() => !processAlive(hostPid), 30_000, "the launched host to exit");
+			await waitFor(
+				async () =>
+					(await rowsForS()).some(
+						row => row.pid === tuiPid && row.live === true && Number(row.endpointGeneration) > 0,
+					),
+				30_000,
+				"the TUI's endpoint for S",
+			);
+			// The bridge stays idle until the Router's 2 s reconcile has rebound it to the TUI.
+			await Bun.sleep(3_000);
+			const after = await withTimeout(
+				acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: AFTER_PROMPT }] }),
+				90_000,
+				"the ACP prompt after the handover",
+			);
+			expect(after.stopReason).toBe("end_turn");
+			await waitFor(() => view.screen().includes(`${AFTER_PROMPT}-reply`), 30_000, "the reply in the TUI");
+			expect(await transcriptFiles(sessions)).toEqual([transcript]);
+			expect(messageEntries((await readTranscript(transcript)).entries, `${AFTER_PROMPT}-reply`)).toHaveLength(1);
+			expect((await rowsForS()).map(row => row.pid)).toEqual([tuiPid]);
+		} catch (error) {
+			await fs.rm(hold, { force: true });
+			await Promise.allSettled(inFlight.map(request => withTimeout(request, 30_000, "a request in flight")));
+			const rows = JSON.stringify(await rowsForS().catch(() => "unavailable"));
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)}\n[rows]\n${rows}\n[tui]\n${tui?.screen().slice(-3000) ?? ""}\n[acp stderr]\n${acp.stderr()}`,
+			);
+		}
+		acp.acp.stdin.end();
+		expect(await withTimeout(acp.acp.exited, 20_000, "ACP did not exit after stdin closed")).toBe(0);
 		tui?.pty.write("/quit\r");
 		expect(await withTimeout(tui!.done, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
 	}, 300_000);
