@@ -24,7 +24,10 @@ import { managedSessionTransactionLocksDirectory } from "../src/session/internal
 import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { type SessionInfo, SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
 import { loadTestTheme } from "./helpers/test-theme";
+
+pinSharedPublicationMode();
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];

@@ -2007,6 +2007,20 @@ function isManagedReplaceIdentityMismatch(error: unknown): boolean {
 	return error instanceof Error && error.message === "managed_replace_identity_mismatch";
 }
 
+/**
+ * Whether `observed` is the transcript a manager last wrote or bound (`expected`): the same file
+ * object with the same bytes. Metadata-only drift (a touch) is not a change.
+ */
+function sameManagedTranscript(observed: ManagedFileSnapshot["identity"], expected: ManagedFileIdentity): boolean {
+	return (
+		observed.dev === expected.dev &&
+		observed.ino === expected.ino &&
+		observed.nlink === expected.nlink &&
+		observed.size === expected.size &&
+		(expected.sha256 === undefined || observed.sha256 === expected.sha256)
+	);
+}
+
 /** Title publication has patch evidence, not a conversation-graph entry ID. */
 export type SharedTitleOutcome =
 	| { readonly kind: "committed"; readonly title: string }
@@ -12940,6 +12954,11 @@ export class SessionManager {
 					};
 					managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
 					hadSessionFile = managedTranscript !== null;
+					// The move adopts the copied transcript and rewrites it from resident entries: bytes
+					// this manager never loaded (a writer it cannot see appended them) would be dropped.
+					const persisted = this.#managedPersistExpectedIdentity;
+					if (managedTranscript && persisted && !sameManagedTranscript(managedTranscript.identity, persisted))
+						throw new ManagedAppendIdentityMismatchError(path.basename(oldSessionFile));
 					if (managedTranscript) {
 						await managedDestinationStore.publishNoReplace(
 							path.basename(newSessionFile),
@@ -17424,7 +17443,17 @@ export class SessionManager {
 				}
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+				// The replace returns no identity, so it is read back: only the bytes just written may
+				// become this manager's identity. An append that landed in between is another writer's,
+				// and adopting it would let the next rewrite drop it.
+				const written = this.#captureManagedPersistIdentity(sessionFile);
+				if (
+					written.size !== bytes.byteLength ||
+					written.sha256 !== crypto.createHash("sha256").update(bytes).digest("hex")
+				)
+					// The kept, now stale identity fails every later write closed; undefined would not.
+					throw new ManagedAppendIdentityMismatchError(relativePath);
+				this.#managedPersistExpectedIdentity = written;
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				return;
 			}
@@ -19543,6 +19572,12 @@ export class SessionManager {
 						!pickerDiskIdentityMatchesManagedSnapshot(expectedDiskIdentity, snapshot.identity)
 					)
 						throw new Error("Selected session identity changed. Reopen the session picker.");
+					// The star adopts the transcript it writes as this manager's own. Bytes this manager
+					// never loaded (a writer it cannot see appended them) must not become its own, or its
+					// next full rewrite passes the identity fence and drops them.
+					const persisted = this.destination.kind === "managed" ? this.#managedPersistExpectedIdentity : undefined;
+					if (persisted && !sameManagedTranscript(snapshot.identity, persisted))
+						throw new ManagedAppendIdentityMismatchError(relativePath);
 					const content = snapshot.bytes.toString("utf8");
 					const newline = content.indexOf("\n");
 					const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));
@@ -20995,6 +21030,43 @@ export class SessionManager {
 			this.#sharedRewriteBarSessionIds.has(sessionId) ||
 			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0
 		);
+	}
+
+	/**
+	 * Whether this manager is the only writer of its current session, so a root interactive session
+	 * may write it on the legacy route instead of shared publication (single-owner step 9, design
+	 * §13 M3): a managed destination whose claim this manager holds under enforce, alone in this
+	 * process, before any shared publication of the id here (no bar latched, none in flight). Once
+	 * true for this manager and id it stays true; a claim in flight answers false without deciding.
+	 */
+	isSoleOwnerRoute(): boolean {
+		const sessionId = this.#sessionId;
+		if (this.#ownershipClaims.isSoleOwnerRoute(sessionId)) return true;
+		if (this.destination.kind !== "managed" || this.#publishedSharedSession(sessionId)) return false;
+		return this.#ownershipClaims.enterSoleOwnerRoute(sessionId);
+	}
+
+	/**
+	 * Refuse, with {@link ManagedAppendIdentityMismatchError}, a destructive control (`/drop`) on a
+	 * managed transcript that is no longer the one this manager last wrote or bound: a writer it
+	 * cannot see (ownership off, an older binary) changed it, and its entries would go with it.
+	 */
+	assertTranscriptUnchanged(): void {
+		if (this.#persistError instanceof ManagedAppendIdentityMismatchError) throw this.#persistError;
+		const expected = this.#managedPersistExpectedIdentity;
+		const sessionFile = this.#sessionFile;
+		if (this.destination.kind !== "managed" || !expected || !sessionFile) return;
+		const relativePath = path.basename(sessionFile);
+		const observed = this.#managedTranscriptStore(sessionFile).captureBoundedAppendExpectation(relativePath);
+		if (!observed) return;
+		if (
+			observed.dev !== expected.dev.toString() ||
+			observed.ino !== expected.ino.toString() ||
+			observed.nlink !== expected.nlink.toString() ||
+			observed.size !== String(expected.size) ||
+			(expected.sha256 !== undefined && observed.sha256 !== expected.sha256)
+		)
+			throw new ManagedAppendIdentityMismatchError(relativePath);
 	}
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */
@@ -24828,7 +24900,7 @@ export class SessionManager {
 		});
 		if (!header.ok) return undefined;
 		const sessionId = header.inspection.sessionId;
-		const attempt = await attemptSessionClaim(owner, sessionId);
+		const attempt = await attemptSessionClaim(owner, sessionId, undefined, { admission: true });
 		const refusal = claimRefusal(owner, sessionId, attempt);
 		if (refusal) throw refusal;
 		return attempt.status === "claimed" ? attempt.claim : undefined;
@@ -24842,9 +24914,11 @@ export class SessionManager {
 	/**
 	 * Enforce's admission of a switch target (design §1 rows 3 and 9): `open`'s pre-claim of the
 	 * target's header id, taken before the switch emits any event or begins its transition. It throws
-	 * {@link SessionHeldError} for a session another process holds; otherwise the caller keeps the
-	 * returned claim until the rotation's own claim of the target has landed, and then releases it.
-	 * `undefined`, with nothing awaited, outside enforce, so other modes keep their ordering.
+	 * {@link SessionHeldError} for a session another process holds. The returned claim is an
+	 * admission: the rotation's own claim of the target releases it when it lands, so the switched-to
+	 * session never has it as a second holder; the caller still releases it on every path (a no-op
+	 * by then), which covers a switch that ends before it claims. `undefined`, with nothing awaited,
+	 * outside enforce, so other modes keep their ordering.
 	 */
 	switchTargetAdmission(sessionFile: string): Promise<SessionOwnerClaim | undefined> | undefined {
 		const owner = this.#ownershipClaims.ownership;

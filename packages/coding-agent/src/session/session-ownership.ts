@@ -92,6 +92,8 @@ export interface SessionOwnerClaim {
 	/** True when this process already held the session and this claim shares it. */
 	readonly shared: boolean;
 	readonly released: boolean;
+	/** How many claims in this process share the session's lock now, this one included; 0 once released. */
+	readonly holders: number;
 	/** Drop this claim. Idempotent; the last claim of a session removes the record, then unlocks. */
 	release(): void;
 }
@@ -338,6 +340,11 @@ interface RegistryEntry {
 	readonly recordPath: string;
 	readonly lock: FileLock;
 	holders: number;
+	/**
+	 * Admission claims among the holders: an open's or a switch's cover, kept only until the opener's
+	 * own claim lands ({@link releaseSessionAdmissions}). Absent in a registry an older copy created.
+	 */
+	admissions?: Set<Claim>;
 }
 
 interface SessionOwnerRegistry {
@@ -493,10 +500,20 @@ class Claim implements SessionOwnerClaim {
 	readonly shared: boolean;
 	#released = false;
 
-	constructor(sidecar: string, entry: RegistryEntry, shared: boolean) {
+	constructor(sidecar: string, entry: RegistryEntry, shared: boolean, admission: boolean) {
 		this.#sidecar = sidecar;
 		this.#entry = entry;
 		this.shared = shared;
+		if (admission) {
+			entry.admissions ??= new Set();
+			entry.admissions.add(this);
+		}
+	}
+
+	/** Release every admission claim of this session except this claim, which keeps the lock. */
+	releaseAdmissions(): void {
+		if (this.#released) return;
+		for (const admission of [...(this.#entry.admissions ?? [])]) if (admission !== this) admission.release();
 	}
 
 	get sessionId(): string {
@@ -511,10 +528,15 @@ class Claim implements SessionOwnerClaim {
 		return this.#released;
 	}
 
+	get holders(): number {
+		return this.#released ? 0 : this.#entry.holders;
+	}
+
 	release(): void {
 		if (this.#released) return;
 		this.#released = true;
 		const entry = this.#entry;
+		entry.admissions?.delete(this);
 		entry.holders -= 1;
 		if (entry.holders > 0) return;
 		const entries = registry().entries;
@@ -534,6 +556,14 @@ class Claim implements SessionOwnerClaim {
 		}
 		entry.lock.release();
 	}
+}
+
+/**
+ * `claim`, an opener's own claim of its session, has landed: release the admission claims that
+ * covered the open. `claim` is held, so the lock never lapses between them (design §2.5).
+ */
+export function releaseSessionAdmissions(claim: SessionOwnerClaim): void {
+	if (claim instanceof Claim) claim.releaseAdmissions();
 }
 
 function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
@@ -561,11 +591,20 @@ function failOpen(
  * `repeat` names the outcome the caller's previous attempt of this id had (a turn-start
  * re-attempt): the same outcome again is neither counted nor logged again, so the counters count
  * episodes, not turns.
+ *
+ * `admission` marks a cover an open or a switch takes before it reads the session: the opener's own
+ * claim releases it when it lands ({@link releaseSessionAdmissions}), so it is never a second holder
+ * once the session is open.
  */
 export async function claimSessionOwner(
 	sessionId: string,
-	request: { readonly surface: SessionOwnerSurface; readonly repeat?: "held" | "timed_out" },
+	request: {
+		readonly surface: SessionOwnerSurface;
+		readonly repeat?: "held" | "timed_out";
+		readonly admission?: boolean;
+	},
 ): Promise<SessionOwnerClaimResult> {
+	const admission = request.admission === true;
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
 	if (current.unavailable !== undefined) return latchedFailOpen(current);
@@ -581,7 +620,7 @@ export async function claimSessionOwner(
 		const held = current.entries.get(sidecar);
 		if (held) {
 			held.holders += 1;
-			return { status: "claimed", claim: new Claim(sidecar, held, true) };
+			return { status: "claimed", claim: new Claim(sidecar, held, true, admission) };
 		}
 		const pending = current.pending.get(sidecar);
 		if (!pending) break;
@@ -640,7 +679,7 @@ export async function claimSessionOwner(
 				}
 				current.entries.set(sidecar, entry);
 				countSessionOwnershipEvent("claim_taken");
-				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
+				return { status: "claimed", claim: new Claim(sidecar, entry, false, admission) };
 			}
 			case FileLockAcquireStatus.Held:
 				if (request.repeat !== "held") countSessionOwnershipEvent("claim_conflict");

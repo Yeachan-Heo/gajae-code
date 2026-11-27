@@ -13,6 +13,9 @@ import { managedSessionTransactionLocksDirectory } from "../src/session/internal
 import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
+
+pinSharedPublicationMode();
 
 // A `!`/`$` result recorded while a turn streams is deferred and published through the
 // shared lease when the turn ends. A transition that leaves the session (`/new`,

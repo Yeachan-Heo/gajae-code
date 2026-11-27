@@ -250,7 +250,8 @@ async function claimHandedOver(
 	sessionId: string,
 	ownership: ResolvedSessionOwnership,
 ): Promise<SessionHandoverOutcome> {
-	const attempt = await attemptSessionClaim(ownership, sessionId);
+	// A cover for the open or switch that follows: that open's own claim releases it when it lands.
+	const attempt = await attemptSessionClaim(ownership, sessionId, undefined, { admission: true });
 	const refusal = claimRefusal(ownership, sessionId, attempt);
 	if (refusal) return { kind: "refused", message: refusal.operatorMessage };
 	return { kind: "closed", claim: attempt.status === "claimed" ? attempt.claim : undefined };

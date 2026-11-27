@@ -17,6 +17,9 @@ import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
+
+pinSharedPublicationMode();
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
