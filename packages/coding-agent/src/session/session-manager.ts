@@ -6521,17 +6521,56 @@ function rehydrateColdSpillEntry(
 	return cloneSessionEntry(entry);
 }
 
-async function truncateForPersistence(obj: FileEntry, blobStore: BlobStore, key?: string): Promise<FileEntry>;
-async function truncateForPersistence(obj: string, blobStore: BlobStore, key?: string): Promise<string>;
-async function truncateForPersistence(obj: unknown[], blobStore: BlobStore, key?: string): Promise<unknown[]>;
-async function truncateForPersistence(obj: object, blobStore: BlobStore, key?: string): Promise<object>;
-async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): Promise<unknown>;
+/**
+ * Check if a tool is a built-in render-only tool where displayContent can be stripped.
+ * Custom tools should preserve their details.displayContent.
+ */
+function isBuiltInRenderOnlyTool(toolName: string): boolean {
+	return toolName === "read" || toolName === "search" || toolName === "ast-grep" || toolName === "ast-edit";
+}
+
+async function truncateForPersistence(
+	obj: FileEntry,
+	blobStore: BlobStore,
+	key?: string,
+	toolName?: string,
+): Promise<FileEntry>;
+async function truncateForPersistence(
+	obj: string,
+	blobStore: BlobStore,
+	key?: string,
+	toolName?: string,
+): Promise<string>;
+async function truncateForPersistence(
+	obj: unknown[],
+	blobStore: BlobStore,
+	key?: string,
+	toolName?: string,
+): Promise<unknown[]>;
+async function truncateForPersistence(
+	obj: object,
+	blobStore: BlobStore,
+	key?: string,
+	toolName?: string,
+): Promise<object>;
+async function truncateForPersistence(
+	obj: unknown,
+	blobStore: BlobStore,
+	key?: string,
+	toolName?: string,
+): Promise<unknown>;
 async function truncateForPersistence(
 	obj: null | undefined,
 	blobStore: BlobStore,
 	key?: string,
+	toolName?: string,
 ): Promise<null | undefined>;
-async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): Promise<unknown> {
+async function truncateForPersistence(
+	obj: unknown,
+	blobStore: BlobStore,
+	key?: string,
+	toolName?: string,
+): Promise<unknown> {
 	if (obj === null || obj === undefined) return obj;
 
 	if (typeof obj === "string") {
@@ -6577,13 +6616,22 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 
 	if (typeof obj === "object") {
 		let changed = false;
+		// Extract toolName from this object if it's a tool result message
+		const objAsAny = obj as any;
+		const currentToolName = toolName ?? (objAsAny.toolName as string | undefined);
+
 		const entries: Array<readonly [string, unknown]> = await Promise.all(
 			Object.entries(obj).flatMap(([childKey, value]) => {
 				// Strip transient/redundant properties that shouldn't be persisted.
 				// - partialJson: streaming accumulator for tool call JSON parsing
 				// - jsonlEvents: raw subprocess streaming events (already saved to artifact files)
-				// - displayContent: TUI-only rendering detail, kept live for TUI but not needed in durable JSONL
-				if (childKey === "partialJson" || childKey === "jsonlEvents" || childKey === "displayContent") {
+				// - displayContent: TUI-only rendering detail for built-in render-only tools only.
+				//   Custom tools may use displayContent meaningfully and must preserve it.
+				if (childKey === "partialJson" || childKey === "jsonlEvents") {
+					changed = true;
+					return [];
+				}
+				if (childKey === "displayContent" && currentToolName && isBuiltInRenderOnlyTool(currentToolName)) {
 					changed = true;
 					return [];
 				}
@@ -6603,6 +6651,7 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 										imageUrlValue,
 										blobStore,
 										persistenceKey,
+										currentToolName,
 									);
 									if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
 									return [imageUrlKey, newImageUrlValue] as const;
@@ -6613,7 +6662,7 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 								return [childKey, Object.fromEntries(imageUrlEntries)] as const;
 							}
 						}
-						const newValue = await truncateForPersistence(value, blobStore, childKey);
+						const newValue = await truncateForPersistence(value, blobStore, childKey, currentToolName);
 						if (newValue !== value) changed = true;
 						return [childKey, newValue] as const;
 					})(),
@@ -6661,7 +6710,7 @@ async function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStore
  * blob bytes are in the kernel page cache before the JSONL line referencing them is
  * written.
  */
-function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: string): unknown {
+function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: string, toolName?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
 
 	if (typeof obj === "string") {
@@ -6700,9 +6749,17 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 
 	if (typeof obj === "object") {
 		let changed = false;
+		// Extract toolName from this object if it's a tool result message
+		const objAsAny = obj as any;
+		const currentToolName = toolName ?? (objAsAny.toolName as string | undefined);
+
 		const entries: Array<readonly [string, unknown]> = [];
 		for (const [childKey, value] of Object.entries(obj)) {
-			if (childKey === "partialJson" || childKey === "jsonlEvents" || childKey === "displayContent") {
+			if (childKey === "partialJson" || childKey === "jsonlEvents") {
+				changed = true;
+				continue;
+			}
+			if (childKey === "displayContent" && currentToolName && isBuiltInRenderOnlyTool(currentToolName)) {
 				changed = true;
 				continue;
 			}
@@ -6715,7 +6772,12 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 				let imageUrlChanged = false;
 				const imageUrlEntries = Object.entries(value).map(([imageUrlKey, imageUrlValue]) => {
 					const persistenceKey = imageUrlKey === "url" ? "image_url.url" : imageUrlKey;
-					const newImageUrlValue = truncateForPersistenceSync(imageUrlValue, blobStore, persistenceKey);
+					const newImageUrlValue = truncateForPersistenceSync(
+						imageUrlValue,
+						blobStore,
+						persistenceKey,
+						currentToolName,
+					);
 					if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
 					return [imageUrlKey, newImageUrlValue] as const;
 				});
@@ -6725,7 +6787,7 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 					continue;
 				}
 			}
-			const newValue = truncateForPersistenceSync(value, blobStore, childKey);
+			const newValue = truncateForPersistenceSync(value, blobStore, childKey, currentToolName);
 			if (newValue !== value) changed = true;
 			entries.push([childKey, newValue]);
 		}

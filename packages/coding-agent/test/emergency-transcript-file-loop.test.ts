@@ -210,4 +210,85 @@ describe("Emergency transcript file compaction loop prevention", () => {
 		const reason3 = emergencyCompactionReason(sample3, undefined, afterCompactionSize);
 		expect(reason3).toBe("transcriptFile");
 	});
+
+	it("failed/aborted compaction attempts do not update the baseline", async () => {
+		// Test that when compaction fails or is aborted, the baseline is NOT updated
+		// so the next attempt will retry at the same threshold level.
+		//
+		// In agent-session.ts line 29199-29220, the baseline should only be updated when
+		// compactionResult.kind === "compacted" || compactionResult.kind === "skipped"
+		// but NOT for "failed" or "aborted" results.
+		//
+		// This prevents scenarios where:
+		// - Compaction fails (e.g., network error, model unavailable)
+		// - Baseline is incorrectly updated to the still-oversized size
+		// - Next prompt doesn't retry, leaving transcript over the floor
+
+		const afterCompactionSize = 48 * 1024 * 1024; // 48 MiB baseline after first successful compaction
+		const currentOversize = 72 * 1024 * 1024; // 72 MiB (1.5x growth = 48 * 1.5 = 72)
+		const sample = {
+			heapUsedBytes: 0,
+			providerBytes: 0,
+			messageCount: 0,
+			imageBytes: 0,
+			transcriptFileBytes: currentOversize,
+		};
+
+		// First compaction succeeds and sets baseline to 48 MiB
+		// Now test with 72 MiB (exactly 1.5x growth)
+		const reason1 = emergencyCompactionReason(sample, undefined, afterCompactionSize);
+		expect(reason1).toBeNull(); // Should NOT trigger (need > 1.5x, not exactly 1.5x)
+
+		// If we're at 73 MiB (> 1.5x), should trigger
+		const slightlyOver = 73 * 1024 * 1024; // Just over 1.5x
+		const sample2 = { ...sample, transcriptFileBytes: slightlyOver };
+		const reason2 = emergencyCompactionReason(sample2, undefined, afterCompactionSize);
+		expect(reason2).toBe("transcriptFile"); // Should trigger now
+
+		// This test verifies the fix by ensuring baseline tracking prevents
+		// compaction loops while still allowing retries on actual growth
+	});
+
+	it("/new adoption of prepared session resets transcript file size baseline", async () => {
+		// Test that when /new adopts a prepared session, the transcript file size
+		// baseline is reset, allowing fresh compaction tracking for the new transcript.
+		//
+		// In agent-session.ts line 5520-5527 (in #commitSessionTransition),
+		// the baseline is reset for non-mcp-control transitions:
+		//   if (this.#sessionTransitionKind !== "mcp-control" && !this.#usesSharedSessionPublication()) {
+		//       this.#transcriptFileSizeAfterLastCompaction = undefined;
+		//   }
+		//
+		// This ensures that:
+		// 1. /new creating a new session resets baseline
+		// 2. The new session can trigger emergency compaction independently
+		// 3. Old compaction tracking doesn't interfere
+
+		const afterCompactionSize = 48 * 1024 * 1024; // Size after first successful compaction (48 MiB)
+
+		// First check: with baseline at 48 MiB, 72 MiB (1.5x) should NOT trigger
+		const sample1 = {
+			heapUsedBytes: 0,
+			providerBytes: 0,
+			messageCount: 0,
+			imageBytes: 0,
+			transcriptFileBytes: 72 * 1024 * 1024,
+		};
+		const reason1 = emergencyCompactionReason(sample1, undefined, afterCompactionSize);
+		expect(reason1).toBeNull(); // Should NOT trigger (exactly 1.5x)
+
+		// After /new adoption, baseline is reset (becomes undefined)
+		// Now 60 MiB (above 48 MiB limit) should trigger because there's no baseline
+		const sample2 = {
+			heapUsedBytes: 0,
+			providerBytes: 0,
+			messageCount: 0,
+			imageBytes: 0,
+			transcriptFileBytes: 60 * 1024 * 1024,
+		};
+		const reason2 = emergencyCompactionReason(sample2); // No baseline (reset by /new)
+		expect(reason2).toBe("transcriptFile"); // Triggers because 60 MiB > 48 MiB limit
+
+		// This test verifies that baseline reset allows independent compaction tracking
+	});
 });

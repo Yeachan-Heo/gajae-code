@@ -5519,6 +5519,11 @@ export class AgentSession {
 			this.#sessionTransitionGeneration += 1;
 			this.#discoveredToolActivationChain = Promise.resolve();
 			if (this.#sessionTransitionKind !== "mcp-control") this.#btwGeneration += 1;
+			// Reset transcript size baseline when the active transcript changes (new-session, switch-session, etc)
+			// but not for mcp-control which preserves the same transcript
+			if (this.#sessionTransitionKind !== "mcp-control" && !this.#usesSharedSessionPublication()) {
+				this.#transcriptFileSizeAfterLastCompaction = undefined;
+			}
 		}
 	}
 
@@ -29196,15 +29201,20 @@ export class AgentSession {
 		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
-			await this.#runAutoCompaction("overflow", false, false, {
+			const compactionResult = await this.#runAutoCompaction("overflow", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
 				force: true,
 				emergencyReason,
 			});
 			// Update tracking for transcriptFile compactions to prevent re-triggering on every
-			// prompt when the file cannot shrink further
-			if (emergencyReason === "transcriptFile" && !this.#usesSharedSessionPublication()) {
+			// prompt when the file cannot shrink further. Only update baseline on successful compaction
+			// or benign no-progress outcome (skipped); keep failed/aborted attempts eligible for retry.
+			if (
+				emergencyReason === "transcriptFile" &&
+				!this.#usesSharedSessionPublication() &&
+				(compactionResult.kind === "compacted" || compactionResult.kind === "skipped")
+			) {
 				try {
 					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
 				} catch {
