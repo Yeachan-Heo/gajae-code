@@ -504,7 +504,10 @@ class Claim implements SessionOwnerClaim {
 		this.#sidecar = sidecar;
 		this.#entry = entry;
 		this.shared = shared;
-		if (admission) (entry.admissions ??= new Set()).add(this);
+		if (admission) {
+			entry.admissions ??= new Set();
+			entry.admissions.add(this);
+		}
 	}
 
 	/** Release every admission claim of this session except this claim, which keeps the lock. */
