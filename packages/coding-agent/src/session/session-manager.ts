@@ -2007,6 +2007,20 @@ function isManagedReplaceIdentityMismatch(error: unknown): boolean {
 	return error instanceof Error && error.message === "managed_replace_identity_mismatch";
 }
 
+/**
+ * Whether `observed` is the transcript a manager last wrote or bound (`expected`): the same file
+ * object with the same bytes. Metadata-only drift (a touch) is not a change.
+ */
+function sameManagedTranscript(observed: ManagedFileSnapshot["identity"], expected: ManagedFileIdentity): boolean {
+	return (
+		observed.dev === expected.dev &&
+		observed.ino === expected.ino &&
+		observed.nlink === expected.nlink &&
+		observed.size === expected.size &&
+		(expected.sha256 === undefined || observed.sha256 === expected.sha256)
+	);
+}
+
 /** Title publication has patch evidence, not a conversation-graph entry ID. */
 export type SharedTitleOutcome =
 	| { readonly kind: "committed"; readonly title: string }
@@ -19543,6 +19557,12 @@ export class SessionManager {
 						!pickerDiskIdentityMatchesManagedSnapshot(expectedDiskIdentity, snapshot.identity)
 					)
 						throw new Error("Selected session identity changed. Reopen the session picker.");
+					// The star adopts the transcript it writes as this manager's own. Bytes this manager
+					// never loaded (a writer it cannot see appended them) must not become its own, or its
+					// next full rewrite passes the identity fence and drops them.
+					const persisted = this.destination.kind === "managed" ? this.#managedPersistExpectedIdentity : undefined;
+					if (persisted && !sameManagedTranscript(snapshot.identity, persisted))
+						throw new ManagedAppendIdentityMismatchError(relativePath);
 					const content = snapshot.bytes.toString("utf8");
 					const newline = content.indexOf("\n");
 					const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));

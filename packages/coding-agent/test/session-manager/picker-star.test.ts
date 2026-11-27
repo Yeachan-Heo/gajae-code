@@ -300,6 +300,44 @@ describe("picker star persistence", () => {
 		}
 	});
 
+	it("refuses a live picker star over a peer's append, so a later rewrite cannot drop it", async () => {
+		const manager = SessionManager.create(cwd);
+		try {
+			manager.appendMessage({ role: "user", content: "holder work", timestamp: 1 });
+			manager.appendMessage(makeAssistantMessage());
+			await manager.flush();
+			// A writer this manager cannot see (another process with ownership off, an older binary)
+			// appends to the transcript; this manager never loaded that entry.
+			const peer = await SessionManager.open(
+				manager.getSessionFile()!,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"exempt",
+			);
+			try {
+				peer.appendMessage({ role: "user", content: "peer work", timestamp: 2 });
+				await peer.flush();
+			} finally {
+				await peer.close();
+			}
+			const [candidate] = await manager.listForResumePickerReadOnly();
+			const before = await Bun.file(candidate!.path).text();
+
+			await expect(manager.setSessionStarredForPicker(candidate!, true)).rejects.toThrow(
+				"managed_append_identity_mismatch",
+			);
+			expect(await Bun.file(candidate!.path).text()).toBe(before);
+			expect(manager.isSessionStarred()).toBe(false);
+			// The rewrite a star used to unlock fails closed too; the peer's entry stays.
+			await expect(manager.rewriteEntries()).rejects.toThrow();
+			expect(await Bun.file(candidate!.path).text()).toContain("peer work");
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
+
 	it("fences a live picker toggle against a session lifecycle transition", async () => {
 		const manager = SessionManager.create(cwd);
 		try {
