@@ -9,19 +9,15 @@ import { BashTool } from "../src/tools/bash";
 
 const WINDOWS_HINT = "This host is Windows, but this tool runs a bash-compatible shell";
 
-const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 const tempDirs: string[] = [];
 
-function setPlatform(platform: NodeJS.Platform): void {
-	Object.defineProperty(process, "platform", { configurable: true, value: platform });
-}
-
-async function bashDescriptionOn(platform: NodeJS.Platform): Promise<string> {
+async function bashDescriptionOn(platform: NodeJS.Platform | undefined): Promise<string> {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bash-hint-"));
 	tempDirs.push(cwd);
 	const owner = SessionManager.create(cwd, SessionManager.explicitDestination(cwd));
 	const session: ToolSession = {
 		cwd,
+		platform,
 		hasUI: false,
 		getSessionId: () => owner.getSessionId(),
 		getSessionFile: () => owner.getSessionFile() ?? null,
@@ -31,16 +27,10 @@ async function bashDescriptionOn(platform: NodeJS.Platform): Promise<string> {
 		captureArtifactPublication: () => owner.captureArtifactPublication(),
 		settings: Settings.isolated(),
 	};
-	setPlatform(platform);
-	try {
-		return new BashTool(session).description;
-	} finally {
-		if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
-	}
+	return new BashTool(session).description;
 }
 
 afterEach(async () => {
-	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -56,5 +46,10 @@ describe("bash tool description shell hint", () => {
 			const description = await bashDescriptionOn(platform);
 			expect(description).not.toContain(WINDOWS_HINT);
 		}
+	});
+
+	it("defaults to the host platform when the session does not pin one", async () => {
+		const description = await bashDescriptionOn(undefined);
+		expect(description.includes(WINDOWS_HINT)).toBe(process.platform === "win32");
 	});
 });

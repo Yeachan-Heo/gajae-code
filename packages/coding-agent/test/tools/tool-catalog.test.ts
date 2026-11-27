@@ -12,6 +12,18 @@ describe("generated tool catalog", () => {
 		const regenerated = await generateToolCatalogData();
 		expect(regenerated).toEqual(TOOL_CATALOG);
 	});
+	test("bash description does not depend on the generating host's platform (#8072)", async () => {
+		// Load natives and descriptors under the real platform before simulating a Windows host.
+		await generateToolCatalogData();
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		try {
+			const regenerated = await generateToolCatalogData();
+			expect(regenerated.bash).toEqual(TOOL_CATALOG.bash);
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+		}
+	});
 	test("advertised descriptions contain no unrendered or undefined template values", () => {
 		// TOOL_CATALOG is exported, and deferred (discoverable) tools advertise its description
 		// until they materialize, so a template variable missing from the generator's
