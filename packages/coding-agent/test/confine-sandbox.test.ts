@@ -89,6 +89,24 @@ describe("--confine shell sandbox", () => {
 			await fs.rm(parent, { recursive: true, force: true });
 		}
 	});
+	it("runs ordinary shell plumbing without denials inside the sandboxed process", async () => {
+		if (process.platform !== "darwin") return;
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "confine-plumbing-")));
+		try {
+			// `/bin/sh` reads its selector link, `> /dev/null` writes a device, and
+			// `/etc` is the system configuration link git and TLS clients read.
+			const command = sandboxedShellCommand("echo hidden > /dev/null; cat /etc/hosts > /dev/null && echo ok", root);
+			const proc = Bun.spawn(["/bin/sh", "-c", command], { cwd: root, stdout: "pipe", stderr: "pipe" });
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect({ stdout, stderr, exitCode }).toEqual({ stdout: "ok\n", stderr: "", exitCode: 0 });
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 	it("pins the Seatbelt launcher to the trusted absolute executable", () => {
 		if (process.platform !== "darwin") return;
 		expect(sandboxedShellCommand("printf ok", os.tmpdir())).toContain("/usr/bin/sandbox-exec");

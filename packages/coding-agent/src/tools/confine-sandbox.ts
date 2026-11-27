@@ -26,9 +26,28 @@ export function confineSandboxProfile(root: string): string {
 		'(allow file-read* (subpath "/Library"))',
 		'(allow file-read* (subpath "/Applications"))',
 		'(allow file-read* (subpath "/dev"))',
+		'(allow file-read* (literal "/opt"))',
 		'(allow file-read* (subpath "/opt/homebrew"))',
+		// System configuration (git's /etc/gitconfig, TLS roots, resolver files), reached
+		// through the root-owned `/etc` link.
+		'(allow file-read* (literal "/etc"))',
+		'(allow file-read* (subpath "/private/etc"))',
+		// Root-owned selector links: `/bin/sh` reads `/private/var/select/sh` to pick its
+		// shell, and the `/usr/bin` developer-tool shims (git, cc, make) resolve
+		// `/var/select/developer_dir` through the `/var` link.
+		'(allow file-read* (literal "/var"))',
+		'(allow file-read* (subpath "/private/var/select"))',
+		'(allow file-read* (literal "/private/var/db/xcode_select_link"))',
 		"(deny file-write*)",
 		`(allow file-write* (subpath ${quote(confinedRoot)}))`,
+		// Character devices that hold no data: `> /dev/null`, git's stdio setup, and
+		// interactive prompts need them writable.
+		'(allow file-write* (literal "/dev/null"))',
+		'(allow file-write* (literal "/dev/zero"))',
+		'(allow file-write* (literal "/dev/tty"))',
+		'(allow file-write* (literal "/dev/stdout"))',
+		'(allow file-write* (literal "/dev/stderr"))',
+		'(allow file-write* (subpath "/dev/fd"))',
 	].join("\n");
 }
 
