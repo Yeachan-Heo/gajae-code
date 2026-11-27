@@ -11658,16 +11658,12 @@ export class SessionManager {
 					await this.#closePersistWriter();
 					await this.#storage.deleteSessionWithArtifacts(sessionPath);
 				};
-				// A transcript without a readable header names no session a claim could cover.
-				const header = inspectTranscriptHeaderBounded(
+				await SessionManager.#deleteUnderHeaderClaim(
 					sessionPath,
 					this.#storage,
-					BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
-					{ growing: true },
+					this.#scopedClaimOwnership(),
+					drop,
 				);
-				if (header.ok)
-					await withScopedSessionClaim(this.#scopedClaimOwnership(), header.inspection.sessionId, "delete", drop);
-				else await drop();
 			}
 		} catch (err) {
 			if (isEnoent(err)) return;
@@ -25490,12 +25486,43 @@ export class SessionManager {
 	/** Delete an authorized managed or project-local picker candidate, under a scoped claim of its id (design §1 row 17). */
 	static async deleteManagedCandidate(sessionPath: string, ownership?: SessionOwnershipDecision): Promise<void> {
 		const storage = new FileSessionStorage();
-		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		// `growing`: a holder may be appending; the header line never changes.
+		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, {
+			growing: true,
+		});
 		if (!inspected.ok || !inspected.inspection.cwd) throw new Error("Session has no valid workspace header.");
 		const headerCwd = inspected.inspection.cwd;
 		await withScopedSessionClaim(resolveSessionOwnership(ownership), inspected.inspection.sessionId, "delete", () =>
 			SessionManager.#deleteAuthorizedCandidate(sessionPath, headerCwd),
 		);
+	}
+
+	/**
+	 * Delete a picker candidate of an explicit `--session-dir` (transcript and artifacts), under a
+	 * scoped claim of the id its header names (design §1 row 17).
+	 */
+	static async deleteExplicitCandidate(sessionPath: string, ownership?: SessionOwnershipDecision): Promise<void> {
+		const storage = new FileSessionStorage();
+		await SessionManager.#deleteUnderHeaderClaim(sessionPath, storage, resolveSessionOwnership(ownership), () =>
+			storage.deleteSessionWithArtifacts(sessionPath),
+		);
+	}
+
+	/**
+	 * Run a delete under a scoped claim of the id `sessionPath`'s header names. A transcript without
+	 * a readable header names no session a claim could cover; a live holder always has a valid one.
+	 */
+	static async #deleteUnderHeaderClaim(
+		sessionPath: string,
+		storage: SessionStorage,
+		ownership: ResolvedSessionOwnership,
+		remove: () => Promise<void>,
+	): Promise<void> {
+		const header = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, {
+			growing: true,
+		});
+		if (header.ok) await withScopedSessionClaim(ownership, header.inspection.sessionId, "delete", remove);
+		else await remove();
 	}
 
 	static async #deleteAuthorizedCandidate(sessionPath: string, headerCwd: string): Promise<void> {

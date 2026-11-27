@@ -1107,13 +1107,13 @@ describe("CLI session picker deletion scope", () => {
 		await Bun.write(sessionFile, "session\n");
 		await Bun.write(path.join(artifactsDir, "artifact.txt"), "artifact");
 
-		await deleteSessionPickerCandidate({ id: "picked", path: sessionFile }, explicitDir);
+		await deleteSessionPickerCandidate(sessionFile, explicitDir);
 
 		expect(fs.existsSync(sessionFile)).toBe(false);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
-		await expect(
-			deleteSessionPickerCandidate({ id: "outside", path: path.join(root, "outside.jsonl") }, explicitDir),
-		).rejects.toThrow("escaped");
+		await expect(deleteSessionPickerCandidate(path.join(root, "outside.jsonl"), explicitDir)).rejects.toThrow(
+			"escaped",
+		);
 	});
 });
 

@@ -575,7 +575,11 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		await expect(
 			SessionManager.setSessionStarredForPicker(await row(), true, undefined, { surface: "terminal" }),
 		).rejects.toThrow(`Can't star this session: ${held}`);
-		await expect(deleteSessionPickerCandidate(await row())).rejects.toThrow(`Can't delete this session: ${held}`);
+		await expect(deleteSessionPickerCandidate(file)).rejects.toThrow(`Can't delete this session: ${held}`);
+		// The `--session-dir` delete claims the id its header names.
+		await expect(SessionManager.deleteExplicitCandidate(file, { surface: "terminal" })).rejects.toThrow(
+			`Can't delete this session: ${held}`,
+		);
 		await expect(tui.setSessionStarredForPicker(await row(), true)).rejects.toThrow(
 			`Can't star this session: ${held}`,
 		);

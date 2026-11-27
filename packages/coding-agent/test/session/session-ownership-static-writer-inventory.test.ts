@@ -399,6 +399,8 @@ const DEFERRED_WRITERS: Record<string, string> = {
 	setSessionStarredForPicker:
 		"picker write of any session, under a scoped claim of its id (4d; session-factory-claims.test.ts)",
 	deleteManagedCandidate: "deletes a session under a scoped claim of its id (4d; session-factory-claims.test.ts)",
+	deleteExplicitCandidate:
+		"deletes a --session-dir session under a scoped claim of its header's id (4d; session-factory-claims.test.ts)",
 	prepareManagedCandidateForWrite:
 		"migration of a legacy-directory candidate under a scoped claim, read in place for a held fork source (session-factory-claims.test.ts)",
 	openNestedManaged: "a subagent child: exempt until per-child claims (design §13 L2; session-factory-claims.test.ts)",
