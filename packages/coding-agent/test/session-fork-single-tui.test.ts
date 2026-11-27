@@ -307,6 +307,7 @@ async function forkFrom(tui: Tui, sessions: string, source: string, upPresses: n
 		},
 		30_000,
 		"fork successor transcript",
+		async () => `${screenSince(tui, mark)}\n--- transcripts ---\n${(await transcriptFiles(sessions)).join("\n")}`,
 	);
 	await waitFor(() => /Forked to a new session/.test(since(tui, mark)), 30_000, "fork confirmation");
 	expect(since(tui, mark)).not.toMatch(REFUSAL);
@@ -412,7 +413,12 @@ async function settledSnapshot(dir: string): Promise<Record<string, string> | nu
 	throw new Error(`${dir} did not settle`);
 }
 
-async function fixture() {
+/**
+ * An isolated root with the fake model. `ownership` writes `session.ownership.mode` into the
+ * operator's config (the setting is global-only; the env override can only lower it), and
+ * `branchSummaries` makes `/tree` ask whether to summarize the branch it leaves.
+ */
+async function fixture(options: { ownership?: "observe" | "enforce"; branchSummaries?: boolean } = {}) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-fork-single-tui-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -424,7 +430,12 @@ async function fixture() {
 	const model = startFakeModel();
 	await writeModelsConfig(agent, model.port);
 	// Keep almost nothing recent so a manual /compact of this short session has work to do.
-	await Bun.write(path.join(agent, "config.yml"), "compaction:\n  keepRecentTokens: 1\n");
+	await Bun.write(
+		path.join(agent, "config.yml"),
+		`compaction:\n  keepRecentTokens: 1\n${options.branchSummaries ? "branchSummary:\n  enabled: true\n" : ""}${
+			options.ownership ? `session:\n  ownership:\n    mode: ${options.ownership}\n` : ""
+		}`,
+	);
 	return { root, cwd, agent, sessions, cli, model };
 }
 
@@ -550,6 +561,199 @@ describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI
 			b.pty.write("fork-b2\r");
 			await replied(shared, "fork-b2");
 			expect(await transcriptFiles(sessions)).toEqual([shared]);
+		} finally {
+			await model.server.stop(true);
+		}
+	}, 240_000);
+});
+
+const DOWN = "\x1b[B";
+
+/**
+ * Drive `/tree`: move the cursor with `keys` until `cursorOn` shows it on the target, select it,
+ * and answer "Summarize branch?" (the fixture enables branch summaries). Returns the added entries.
+ */
+async function navigateTree(tui: Tui, file: string, keys: string[], cursorOn: RegExp, summarize: boolean) {
+	await quiet(tui);
+	const count = (await readTranscript(file)).entries.length;
+	const mark = tui.mark();
+	tui.pty.write("/tree\r");
+	await waitFor(
+		() => /Session Tree/.test(since(tui, mark)),
+		30_000,
+		"tree selector",
+		() => screenSince(tui, mark),
+	);
+	for (const key of keys) {
+		tui.pty.write(key);
+		await Bun.sleep(150);
+	}
+	await waitFor(
+		() => cursorOn.test(since(tui, mark)),
+		30_000,
+		"tree cursor on the target",
+		() => screenSince(tui, mark),
+	);
+	tui.pty.write("\r");
+	await waitFor(
+		() => /Summarize branch\?/.test(since(tui, mark)),
+		30_000,
+		"summary choice",
+		() => screenSince(tui, mark),
+	);
+	if (summarize) {
+		tui.pty.write(DOWN);
+		await Bun.sleep(150);
+	}
+	tui.pty.write("\r");
+	return { mark, count };
+}
+
+/** `command` is refused as a shared-session mutation naming `operation`, before any transcript write. */
+async function refusedBeforeEffect(tui: Tui, file: string, command: string, operation: string) {
+	await quiet(tui);
+	const bytes = Buffer.from(await Bun.file(file).arrayBuffer());
+	const mark = tui.mark();
+	tui.pty.write(`${command}\r`);
+	await waitFor(
+		() => since(tui, mark).includes(`Shared session mutation requires transaction admission: ${operation}`),
+		30_000,
+		`${command} refusal`,
+		() => screenSince(tui, mark),
+	);
+	await quiet(tui);
+	expect(Buffer.from(await Bun.file(file).arrayBuffer())).toEqual(bytes);
+}
+
+// Single-owner step 9 (design §7.2 #7): one TUI, no peer. Under enforce it holds its session's claim
+// alone, so after its first messages every control takes effect. Under observe it still publishes
+// through the shared layer, whose bars refuse the rewrite controls before any effect.
+describe.skipIf(process.platform === "win32")("single-TUI control matrix", () => {
+	it("enforce: star, rename, rewind, tree summary, compaction, move, /fork and /drop all take effect", async () => {
+		const { root, cwd, agent, sessions, cli, model } = await fixture({ ownership: "enforce", branchSummaries: true });
+		try {
+			const tui = startTui({ cli, cwd, root, agent });
+			await ready(tui);
+			tui.pty.write("fork-m1\r");
+			const source = await only(sessions);
+			await replied(source, "fork-m1");
+			tui.pty.write("fork-m2\r");
+			await replied(source, "fork-m2");
+			const sourceId = (await readTranscript(source)).header.id;
+
+			await sendCommand(tui, source, "/star", added =>
+				added.some(entry => entry.type === "header_patch" && JSON.stringify(entry).includes('"starred":true')),
+			);
+			await sendCommand(tui, source, "/rename matrix-renamed", added =>
+				added.some(entry => JSON.stringify(entry).includes('"title":"matrix-renamed"')),
+			);
+
+			// Rewind: back to the first reply without a summary, then a new prompt branches there.
+			const rewind = await navigateTree(tui, source, [UP, UP], /›\s*▸\s*assistant: fork-m1-reply/, false);
+			await waitFor(() => /Navigated to selected point/.test(since(tui, rewind.mark)), 30_000, "rewind");
+			expect(since(tui, rewind.mark)).not.toMatch(REFUSAL);
+			tui.pty.write("fork-m3\r");
+			await replied(source, "fork-m3");
+			const branched = (await readTranscript(source)).entries;
+			const m1Reply = messagesWith(branched, "fork-m1-reply")[0]!;
+			const m2 = messagesWith(branched, "fork-m2")[0]!;
+			const byId = new Map(branched.map(entry => [entry.id, entry]));
+			const ancestors: string[] = [];
+			for (let at = messagesWith(branched, "fork-m3")[0]?.parentId; at; at = byId.get(at)?.parentId)
+				ancestors.push(at);
+			expect(ancestors).toContain(m1Reply.id);
+			expect(ancestors).not.toContain(m2.id);
+
+			// Tree summary: back to the second reply, summarizing the branch it leaves.
+			const summary = await navigateTree(tui, source, [DOWN, DOWN], /›[\s│]*▸?\s*assistant: fork-m2-reply/, true);
+			await waitFor(
+				async () => (await addedSince(source, summary.count)).some(entry => entry.type === "branch_summary"),
+				60_000,
+				"branch summary entry",
+				() => screenSince(tui, summary.mark),
+			);
+			expect(since(tui, summary.mark)).not.toMatch(REFUSAL);
+
+			tui.pty.write("/compact\r");
+			await waitFor(
+				async () => (await readTranscript(source)).entries.some(entry => entry.type === "compaction"),
+				60_000,
+				"compaction entry",
+			);
+
+			// Move Session: the transcript leaves this workspace's session directory.
+			const movedCwd = path.join(root, "moved");
+			await fs.mkdir(movedCwd, { recursive: true });
+			const movedSessions = SessionManager.getDefaultSessionDirReadOnly(movedCwd, agent);
+			const moveMark = tui.mark();
+			tui.pty.write(`/move ${movedCwd}\r`);
+			let moved: string | undefined;
+			await waitFor(
+				async () => {
+					moved = await transcriptById(movedSessions, sourceId);
+					return moved !== undefined && !(await Bun.file(source).exists());
+				},
+				30_000,
+				"the moved transcript",
+				() => screenSince(tui, moveMark),
+			);
+			expect(since(tui, moveMark)).not.toMatch(REFUSAL);
+			tui.pty.write("fork-m4\r");
+			await replied(moved!, "fork-m4");
+			// The move kept the star and the title.
+			expect(await Bun.file(moved!).text()).toContain('"starred":true');
+			expect(await Bun.file(moved!).text()).toContain('"title":"matrix-renamed"');
+
+			// /fork from the second prompt, then /drop the fork: the source stays.
+			// The selector lists every user message, the rewound-from branch's fork-m3 included.
+			const fork = await forkFrom(tui, movedSessions, moved!, 2, "fork-m2");
+			expect(fork.header.parentSession).toBe(sourceId);
+			await submitRestored(tui, fork.file, "fork-m2");
+			await replied(fork.file, "fork-m2");
+			await quiet(tui);
+			const dropMark = tui.mark();
+			tui.pty.write("/drop\r");
+			await waitFor(
+				async () => !(await Bun.file(fork.file).exists()),
+				30_000,
+				"the dropped fork",
+				() => screenSince(tui, dropMark),
+			);
+			await waitFor(() => /Session dropped/.test(since(tui, dropMark)), 30_000, "drop confirmation");
+			expect(since(tui, dropMark)).not.toMatch(REFUSAL);
+			expect(Buffer.from(await Bun.file(moved!).arrayBuffer())).toEqual(fork.sourceBytes);
+		} finally {
+			await model.server.stop(true);
+		}
+	}, 240_000);
+
+	it("observe: star, tree summary, move and /drop refuse before any effect", async () => {
+		const { root, cwd, agent, sessions, cli, model } = await fixture({ ownership: "observe", branchSummaries: true });
+		try {
+			const tui = startTui({ cli, cwd, root, agent });
+			await ready(tui);
+			tui.pty.write("fork-o1\r");
+			const source = await only(sessions);
+			await replied(source, "fork-o1");
+			tui.pty.write("fork-o2\r");
+			await replied(source, "fork-o2");
+
+			await refusedBeforeEffect(tui, source, "/star", "set session starred");
+			const bytes = Buffer.from(await Bun.file(source).arrayBuffer());
+			const summary = await navigateTree(tui, source, [UP, UP], /›\s*▸\s*assistant: fork-o1-reply/, true);
+			await waitFor(
+				() => since(tui, summary.mark).includes("requires transaction admission: summarize branch"),
+				30_000,
+				"tree summary refusal",
+				() => screenSince(tui, summary.mark),
+			);
+			await quiet(tui);
+			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(bytes);
+			const movedCwd = path.join(root, "moved");
+			await fs.mkdir(movedCwd, { recursive: true });
+			await refusedBeforeEffect(tui, source, `/move ${movedCwd}`, "move session");
+			await refusedBeforeEffect(tui, source, "/drop", "drop session");
+			expect(await transcriptFiles(sessions)).toEqual([source]);
 		} finally {
 			await model.server.stop(true);
 		}

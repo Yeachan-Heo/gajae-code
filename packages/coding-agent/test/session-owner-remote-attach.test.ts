@@ -686,6 +686,34 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		// The claim is still the TUI's.
 		onlyTheTuiHolds(await sessionOwners(env, workspace));
 
+		// --- The owner's own rewrite controls after remote turns landed in it (single-owner step 9). Under
+		// enforce the TUI is the sole writer and writes on the legacy route: star and /drop take effect.
+		// Under observe it still publishes shared, so both refuse before any effect.
+		const controlsMark = tui.screen().length;
+		const refused = (operation: string) => () =>
+			tui
+				.screen()
+				.slice(controlsMark)
+				.includes(`Shared session mutation requires transaction admission: ${operation}`);
+		if (mode === "enforce") {
+			pty.write("/star\r");
+			await waitFor(
+				async () => (await Bun.file(transcript).text()).includes('"starred":true'),
+				30_000,
+				"the star in the owner's transcript",
+			);
+			pty.write("/drop\r");
+			await waitFor(async () => !(await Bun.file(transcript).exists()), 30_000, "the dropped transcript");
+			expect(tui.screen().slice(controlsMark)).not.toMatch(/requires transaction admission|Error:/);
+		} else {
+			const before = await Bun.file(transcript).text();
+			pty.write("/star\r");
+			await waitFor(refused("set session starred"), 30_000, "the star refusal");
+			pty.write("/drop\r");
+			await waitFor(refused("drop session"), 30_000, "the /drop refusal");
+			expect(await Bun.file(transcript).text()).toBe(before);
+		}
+
 		// --- The owner quits: nothing is held.
 		pty.write("/quit\r");
 		expect(await withTimeout(tuiDone, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
