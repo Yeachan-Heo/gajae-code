@@ -472,6 +472,30 @@ function isAcpUnavailableSlashCommand(text: string): boolean {
 	return /^\/import-session(?:\s|:|$)/u.test(text);
 }
 
+/**
+ * The broker returned no saved session for an exact lookup. The code stays `not_found`, which
+ * session/load callers retry on; `omissionReason` is the broker's `savedSessionOmission.reason`.
+ * Only `candidate_not_found` (or no reason) means the transcript is gone: a busy migration, a
+ * changed source or an unavailable scope clears up on its own.
+ */
+class SavedSessionUnavailableError extends AcpSdkAdapterError {
+	readonly omissionReason: string | undefined;
+	constructor(sessionId: string, omissionReason: string | undefined) {
+		super("not_found", `Saved ACP session does not exist: ${sessionId}`);
+		this.omissionReason = omissionReason;
+	}
+	get gone(): boolean {
+		return this.omissionReason === undefined || this.omissionReason === "candidate_not_found";
+	}
+}
+
+/** This connection's own cwd or scope authority disagrees with the broker's: a retry cannot fix it. */
+class AcpSessionScopeConflictError extends AcpSdkAdapterError {
+	constructor(message: string) {
+		super("conflict", message);
+	}
+}
+
 async function collectAcpSessionList(
 	request: (input: JsonObject) => Promise<unknown>,
 	input: JsonObject = {},
@@ -3741,7 +3765,7 @@ export class AcpAgent implements Agent {
 		const attached = this.#sessions.get(id);
 		if (attached) {
 			if (path.resolve(attached.cwd) !== path.resolve(cwd))
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+				throw new AcpSessionScopeConflictError(`ACP session ${id} has conflicting cwd authority.`);
 			// ACP clients replay their declared MCP servers when reconnecting. The live
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
@@ -3751,7 +3775,7 @@ export class AcpAgent implements Agent {
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
 		if (knownCwd && path.resolve(knownCwd) !== path.resolve(cwd))
-			throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			throw new AcpSessionScopeConflictError(`ACP session ${id} has conflicting cwd authority.`);
 		const resolving = this.#resolvingExisting.get(id);
 		if (resolving?.epoch === epoch) {
 			await resolving.task;
@@ -3759,7 +3783,7 @@ export class AcpAgent implements Agent {
 			const resolved = this.#sessions.get(id);
 			if (!resolved) throw new AcpSdkAdapterError("unavailable", `ACP session ${id} did not attach.`);
 			if (path.resolve(resolved.cwd) !== path.resolve(cwd))
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+				throw new AcpSessionScopeConflictError(`ACP session ${id} has conflicting cwd authority.`);
 			return;
 		}
 
@@ -3830,10 +3854,10 @@ export class AcpAgent implements Agent {
 			const session = object(item) as BrokerSession | undefined;
 			if (session?.sessionId !== id) continue;
 			if (typeof session.locator?.cwd !== "string" || session.locator.cwd !== canonicalCwd)
-				throw new AcpSdkAdapterError("conflict", `Broker returned conflicting session scope for ${id}.`);
+				throw new AcpSessionScopeConflictError(`Broker returned conflicting session scope for ${id}.`);
 			matches.push(session);
 		}
-		if (matches.length > 1) throw new AcpSdkAdapterError("conflict", `Broker returned duplicate session id: ${id}`);
+		if (matches.length > 1) throw new AcpSessionScopeConflictError(`Broker returned duplicate session id: ${id}`);
 		return matches[0];
 	}
 
@@ -3842,7 +3866,7 @@ export class AcpAgent implements Agent {
 		const existing = this.#sessions.get(id);
 		if (existing) {
 			if (path.resolve(existing.cwd) !== path.resolve(cwd))
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+				throw new AcpSessionScopeConflictError(`ACP session ${id} has conflicting cwd authority.`);
 			if (existing.primaryControlSurface === "sdk") await existing.adapter.ensureProviders();
 			return;
 		}
@@ -3853,7 +3877,7 @@ export class AcpAgent implements Agent {
 			const attached = this.#sessions.get(id);
 			if (!attached) throw new AcpSdkAdapterError("unavailable", `ACP session ${id} did not attach.`);
 			if (path.resolve(attached.cwd) !== path.resolve(cwd))
-				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+				throw new AcpSessionScopeConflictError(`ACP session ${id} has conflicting cwd authority.`);
 			return;
 		}
 
@@ -4963,10 +4987,13 @@ export class AcpAgent implements Agent {
 			}
 			// A close, delete or disposal that ran meanwhile owns the session now: never resurrect it.
 			const closing = this.#disposed || this.#tearingDown.has(id) || this.#sessionEpoch(id) !== epoch;
-			// The saved session is gone or out of this cwd's scope: retrying would only fail again, so
-			// it is reported closed with the session/load guidance, as after a lost transport.
+			// The saved session is gone (the broker found no candidate) or this connection's own cwd or
+			// scope authority conflicts: retrying would only fail again, so it is reported closed with
+			// the session/load guidance, as after a lost transport. A migration in progress, a changed
+			// source, an unavailable scope or a host's own conflict answer is transient.
 			const permanent =
-				error instanceof AcpSdkAdapterError && (error.code === "not_found" || error.code === "conflict");
+				(error instanceof SavedSessionUnavailableError && error.gone) ||
+				error instanceof AcpSessionScopeConflictError;
 			if (closing || permanent) {
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
@@ -5076,8 +5103,10 @@ export class AcpAgent implements Agent {
 			cwd,
 		});
 		const saved = object(result?.savedSession);
-		if (saved?.id !== id || typeof saved.path !== "string")
-			throw new AcpSdkAdapterError("not_found", `Saved ACP session does not exist: ${id}`);
+		if (saved?.id !== id || typeof saved.path !== "string") {
+			const reason = object(result?.savedSessionOmission)?.reason;
+			throw new SavedSessionUnavailableError(id, typeof reason === "string" ? reason : undefined);
+		}
 		return saved.path;
 	}
 
