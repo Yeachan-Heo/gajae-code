@@ -43,6 +43,10 @@ it.skipIf(process.platform === "win32")(
 			XDG_STATE_HOME: path.join(root, "state"),
 			XDG_CACHE_HOME: path.join(root, "cache"),
 			XDG_RUNTIME_DIR: path.join(root, "run"),
+			// Two cold owners of one session exist only below the default `enforce`, which refuses the
+			// second. This covers the shared-publication layer `observe` still runs (single-owner step 10
+			// retargets it), so the workers lower the mode.
+			GJC_SESSION_OWNERSHIP: "observe",
 			GJC_CODING_AGENT_DIR: agentDir,
 			PI_CODING_AGENT_DIR: agentDir,
 			NO_COLOR: "1",

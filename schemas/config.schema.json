@@ -105,8 +105,8 @@
 								"observe",
 								"enforce"
 							],
-							"description": "Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything, enforce refuses to open a session another process holds.",
-							"default": "observe"
+							"description": "Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything, enforce (the default) refuses to open a session another process holds.",
+							"default": "enforce"
 						}
 					},
 					"additionalProperties": false

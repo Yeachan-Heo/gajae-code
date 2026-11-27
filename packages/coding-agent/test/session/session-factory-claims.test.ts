@@ -960,10 +960,11 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			throw new Error("expected no config.yml in the isolated agent directory");
 		// A refusal's reread never changes the mode later factories read once.
 		resetSettingsForTest();
-		expect(sessionOwnershipMode()).toBe("observe");
+		// No config.yml: the default mode, which the factory then keeps.
+		expect(sessionOwnershipMode()).toBe("enforce");
 		await Bun.write(processConfig, "session:\n  ownership:\n    mode: off\n");
 		expect(liveSessionOwnershipMode()).toBe("off");
-		expect(sessionOwnershipMode()).toBe("observe");
+		expect(sessionOwnershipMode()).toBe("enforce");
 		expect(await decisions(processConfig)).toEqual(expected);
 		// With process settings (the TUI, -p): their agent directory's file, read again past their cache.
 		const agentDir = path.join(place.root, "agent");
