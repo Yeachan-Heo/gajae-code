@@ -358,9 +358,12 @@ export class SessionClaimSet {
 			status = result.status;
 			this.#record(sessionId, outcomeOf(result));
 			if (result.status === "claimed") {
-				// A re-attempt whose session the manager left while it was in flight is no staged target.
-				if (reattempt && sessionId !== this.#current && this.#transitions === 0) result.claim.release();
-				else this.add(result.claim);
+				// A re-attempt whose session the manager left while it was in flight is no staged target:
+				// released, so no `claimed` outcome stays recorded for it.
+				if (reattempt && sessionId !== this.#current && this.#transitions === 0) {
+					result.claim.release();
+					this.#outcomes.delete(sessionId);
+				} else this.add(result.claim);
 			}
 		} finally {
 			this.#pending.delete(sessionId);
