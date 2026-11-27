@@ -321,6 +321,8 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 		diagnostic = "lifecycle_legacy_history_ambiguous";
 	} else if (LIFECYCLE_INPUT_REFUSAL_CODES.has(outcome.error.code)) {
 		diagnostic = "lifecycle_input_refused";
+	} else if (outcome.operation === "session.resume" && outcome.error.code === "live_session") {
+		diagnostic = "lifecycle_session_held";
 	}
 	const diagnostics: readonly PublicCommandDiagnosticCode[] | undefined =
 		diagnostic === undefined ? undefined : [diagnostic];

@@ -39,6 +39,7 @@ import {
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { tagSdkLifecycleObserver } from "../../extensibility/extensions/function-hooks-internal";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
+import { trustedCoordinatorEnv } from "../../gjc-runtime/sidecar-bootstrap-env";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
@@ -5366,6 +5367,29 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 	return undefined;
 }
 
+const HOST_REGISTRATION_HOLD_DIR_ENV = "GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR";
+const HOST_REGISTRATION_HOLD_MAX_MS = 60_000;
+
+/**
+ * Test seam: while `<dir>/<sessionId>.hold` exists, defer this host's broker registration (at
+ * most 60 s), so a multi-process test can hold an interactive TUI in the window where it holds the
+ * session claim but has no endpoint in the index. A value that matches the project dotenv of the
+ * current directory is ignored, and an unset variable costs no read.
+ */
+async function awaitHostRegistrationTestHold(sessionId: string): Promise<void> {
+	if (!process.env[HOST_REGISTRATION_HOLD_DIR_ENV]) return;
+	const directory = trustedCoordinatorEnv(HOST_REGISTRATION_HOLD_DIR_ENV);
+	if (!directory) return;
+	const hold = path.join(directory, `${sessionId}.hold`);
+	const held = (): Promise<boolean> =>
+		fs.stat(hold).then(
+			() => true,
+			() => false,
+		);
+	const deadline = Date.now() + HOST_REGISTRATION_HOLD_MAX_MS;
+	while (Date.now() < deadline && (await held())) await Bun.sleep(50);
+}
+
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	const acceptedImages = new Map<
@@ -8277,6 +8301,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						pid: process.pid,
 						processIncarnation: effectiveIncarnation,
 					});
+					if (brokerRecoveryStopped) return;
+					await awaitHostRegistrationTestHold(sessionId);
 					if (brokerRecoveryStopped) return;
 					let brokerRegistrationEvent: SessionIndexEvent | undefined;
 					await runtime.registerWithBroker({

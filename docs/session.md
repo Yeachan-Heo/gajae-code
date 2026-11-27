@@ -593,12 +593,14 @@ Right before the final `fetch` hand-off (after transport transforms such as gzip
 
 A process that opens a persisted session for writing takes a claim on it: a kernel lock on a sidecar under `~/.gjc/runtime/session-owners/`, with a small holder record beside it. The lock ends when the holder exits, however it exits, so a crashed or killed `gjc` leaves no lock behind. The sidecar file itself stays: one `.session-owner` sidecar accumulates per session ever opened, until sidecar pruning lands. The sidecars are empty and harmless; do not delete them by hand while gjc runs, because a deleted sidecar lets a second process lock a new one for the same session. `gjc doctor` warns only above 100,000 of them. Remote clients (ACP editors, `gjc sdk`, the notification daemons) attach to the endpoint of the process that owns the session and never claim. When no process is running the session, the host the broker launches for it is that owner and claims it as `sdk-host`.
 
+The broker never launches a host for a session another process holds. A `session.resume` with no live endpoint to reuse first probes the claim (in `observe` and `enforce`; the probe takes nothing, and the broker rereads the mode for each resume, so `off` turns this off at once). If another process holds it, for example a TUI that is still starting or has just switched to the session, the broker waits up to 8 seconds, and never longer than the request's readiness timeout, for that process's endpoint, then returns it as `reused: true`. If no endpoint appears (a TUI started with `GJC_SDK_DISABLE=1`, an embedding), resume fails with `live_session`, a message naming the holder, and `holder: { surface, pid }`. If the holder lets go while the broker waits, resume launches a host as usual.
+
 The global setting `session.ownership.mode` decides what claims do:
 
 | Mode | Behaviour |
 | --- | --- |
 | `off` | No claims and no lock calls. The process is invisible to other processes' claims. |
-| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. |
+| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. The one exception is the broker: it does not launch a host over a held session (above). |
 | `enforce` | Claims as `observe` does, and a session another process holds is not opened for writing (below). Not the default yet. |
 
 Under `enforce`, a session open for writing in another process is refused before anything is written to it:
@@ -607,7 +609,7 @@ Under `enforce`, a session open for writing in another process is refused before
 - `gjc --continue` in the TUI, and `autoResume` (in the TUI and with `-p`), start a new session instead and say why: `Your most recent session is open in another terminal (pid N), so a new session was started.` A held candidate that could not have been continued anyway is skipped, as before.
 - The SDK session factories (`SessionManager.open`, `openExistingStrict`, `continueRecent`) and `createAgentSession` throw `SessionHeldError`, with `holder` naming the process (its surface and pid). A fork's source is never refused: `gjc --fork` reads a held source where it is.
 - An owners directory that fails its safety checks refuses the session too (`SessionOwnershipError`), as the append lock does.
-- Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. Only when no endpoint is live does the broker launch a host, and that host's open is refused; the broker reports it as `spawn_failed`.
+- Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. If a launched host's open is refused anyway (another process claimed the session after the broker checked), the broker reports the same `live_session` outcome as the resume wait below.
 
 A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. One lock timeout (a stalled network filesystem, for example) turns claims off for the rest of that process, so later opens never wait for the lock again.
 

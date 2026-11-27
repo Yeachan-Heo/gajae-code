@@ -74,6 +74,7 @@ import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validatio
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { findOperatorMessage } from "../../session/operator-error-message";
+import { sessionOwnerHolderSummary } from "../../session/session-ownership";
 import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
@@ -1691,6 +1692,13 @@ export function acpRequestFailure(error: unknown): unknown {
 	// terminals use (#5615). `code`/`details` and the JSON-RPC message are untouched.
 	const operatorMessage = findOperatorMessage(error);
 	if (operatorMessage !== undefined) Object.assign(data, { operatorMessage });
+	// A resume the broker refused because another process holds the session names that process
+	// (surface and pid) beside the code, as the broker reported it.
+	const holder =
+		code === "live_session" && error instanceof SdkClientError
+			? sessionOwnerHolderSummary(object(error.details)?.holder)
+			: undefined;
+	if (holder !== undefined) Object.assign(data, { holder });
 	switch (code) {
 		case "authentication_failed":
 			return RequestError.authRequired(data, message);

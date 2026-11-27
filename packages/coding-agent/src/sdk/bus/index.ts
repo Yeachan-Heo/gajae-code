@@ -476,6 +476,7 @@ export type LifecycleErrorReason =
 	| "dependency_preparation_timeout"
 	| "close_refused"
 	| "not_found"
+	| "live_session"
 	| "terminal_uncertain"
 	| "unsupported_platform";
 

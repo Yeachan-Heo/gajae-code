@@ -16,6 +16,7 @@ import type { ModelProfileErrorDetails } from "../../config/model-profile-contra
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
 import { SessionManager } from "../../session/session-manager";
+import type { SessionOwnerHolderSummary } from "../../session/session-ownership";
 import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
@@ -405,6 +406,8 @@ export type BrokerResponse =
 				code: BrokerErrorCode;
 				message: string;
 				details?: ModelProfileErrorDetails | SpawnSubstrateFailure;
+				/** `live_session` from `session.resume`: the process that holds the session (single-owner). */
+				holder?: SessionOwnerHolderSummary;
 				endpoint?: "unavailable";
 				cleanup?: BrokerCleanupEvidence;
 			};
