@@ -275,6 +275,8 @@ type AsyncResultEntry = {
 	durationMs: number | undefined;
 	/** Exact owned-completion origin when the job is registered left-running work of a terminal turn. */
 	ownedCompletion?: OwnedCompletionEnvelope;
+	/** The result carries a fold receipt for the wake turn that completes the folded task. */
+	foldReceipt?: boolean;
 };
 
 type AsyncResultJobDetails = {
@@ -2841,6 +2843,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								result: deliveredResult,
 								job,
 								durationMs,
+								...(foldDisposition.kind === "receipt" ? { foldReceipt: true } : {}),
 								...(ownedCompletion
 									? {
 											ownedCompletion: {
@@ -6128,6 +6131,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
+				// Ordinary completions reach a running turn at its next tool step.
+				// Owned completions need the resume classification and fresh lineage of
+				// the follow-up path, and fold receipts belong to the wake turn, so
+				// both stay on the before-yield/idle path.
+				deliverAtStepBoundary: entry => entry.ownedCompletion === undefined && entry.foldReceipt !== true,
 				build: entries => {
 					try {
 						return buildAsyncResultBatchMessage(entries);
@@ -6138,6 +6146,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
+			deliverAtStepBoundary: () => true,
 			build: buildMcpNotificationBatchMessage,
 		});
 
