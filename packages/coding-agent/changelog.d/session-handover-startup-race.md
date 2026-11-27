@@ -1,0 +1,3 @@
+### Fixed
+
+- Under `session.ownership.mode: enforce`, `gjc --resume`, the session picker and `/resume` now offer Continue here when a remote client's resume reached the broker first and the launched session host has claimed the session but not yet published its endpoint. This happens, for example, when Gajae Mobile opens `gjc --resume <id>` in a new tmux window and sends `session/load` at the same time. Before, the warning offered only Fork and Cancel. The warning now waits up to 8 seconds for that host to publish. It shows as soon as the host publishes or lets the session go. A session held by a terminal, the app or an embedding shows the warning at once, as before.
