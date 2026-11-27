@@ -1107,19 +1107,57 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		const { file, id } = await committed(place);
 		await holdInAnotherProcess(id);
 		const manager = keep(await SessionManager.open(file, place.destination));
-		expect(await sessionClaimSetOf(manager).settled()).toBe("held");
+		const claims = sessionClaimSetOf(manager);
+		expect(await claims.settled()).toBe("held");
+		const conflicts = sessionOwnershipCounters().claim_conflict;
 		const { session, turns } = await turnSession(manager);
 
+		// Past the open's backoff the turn re-attempts in the background; the same outcome again is not
+		// counted again, so the counters count the open, not the turns.
+		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
 		await session.prompt("while held");
-		expect([turns(), await ownedHere(id)]).toEqual([1, false]);
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([1, "held", false]);
+		expect(sessionOwnershipCounters().claim_conflict).toBe(conflicts);
 		await stopHolder();
 		// Within the backoff no lock call is made: the turn runs unclaimed, as observe never refuses.
 		await session.prompt("inside the backoff");
-		expect([turns(), await ownedHere(id)]).toEqual([2, false]);
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([2, "held", false]);
 		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
 		await session.prompt("after the holder exited");
-		expect([turns(), await ownedHere(id)]).toEqual([3, true]);
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([3, "claimed", true]);
 		expect(await fs.readFile(file, "utf8")).toContain("after the holder exited");
+	});
+
+	it("observe: a turn never waits on a stalled lock; the re-attempt runs beside it and claims once the lock recovers", async () => {
+		const place = await workspace();
+		const { id, file } = await committed(place);
+		const STALL_MS = 1_500;
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				if (!stall.on) return tryAcquireFileLock(sidecar, timeoutMs);
+				await Bun.sleep(STALL_MS);
+				return { status: FileLockAcquireStatus.TimedOut, code: "timed_out" };
+			},
+			probe: probeFileLock,
+		};
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const claims = sessionClaimSetOf(manager);
+		expect(await claims.settled()).toBe("none");
+		const failOpen = sessionOwnershipCounters().fail_open;
+		const { session, turns } = await turnSession(manager);
+
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		const started = performance.now();
+		await session.prompt("beside a stall");
+		expect(performance.now() - started).toBeLessThan(STALL_MS - 500);
+		expect(turns()).toBe(1);
+		expect(await claims.settled()).toBe("none");
+		expect(sessionOwnershipCounters().fail_open).toBe(failOpen);
+		stall.on = false;
+		setSystemTime(Date.now() + 2 * RECLAIM_BACKOFF_BASE_MS + 1);
+		await session.prompt("after the stall");
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([2, "claimed", true]);
 	});
 
 	it("enforce: a claim that timed out at open leaves claims on; the turn runs with a notice, and a later turn claims", async () => {
@@ -1132,20 +1170,27 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		expect(await sessionClaimSetOf(manager).settled()).toBe("none");
 		const { session, notices, turns } = await turnSession(manager);
 
+		const failOpen = sessionOwnershipCounters().fail_open;
+
+		// The open's own timeout seeds the backoff: the first turn does not stall on the lock again.
+		await session.prompt("right after the open");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([1, 0, false]);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
 		await session.prompt("while stalled");
-		expect([turns(), notices.length, await ownedHere(id)]).toEqual([1, 1, false]);
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([2, 1, false]);
+		expect(sessionOwnershipCounters().fail_open).toBe(failOpen);
 		stall.on = false;
 		await session.prompt("inside the backoff");
-		expect([turns(), notices.length, await ownedHere(id)]).toEqual([2, 1, false]);
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([3, 1, false]);
 		// A re-attempt that fails is refused as at open, at every turn: no backoff lets a turn through.
 		SessionOwnershipTestHooks.lockBackend = failingFor(id);
-		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		setSystemTime(Date.now() + 2 * RECLAIM_BACKOFF_BASE_MS + 1);
 		await expect(session.prompt("failed")).rejects.toBeInstanceOf(SessionOwnershipError);
 		await expect(session.prompt("failed again")).rejects.toBeInstanceOf(SessionOwnershipError);
-		expect(turns()).toBe(2);
+		expect(turns()).toBe(3);
 		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
 		await session.prompt("after the stall");
-		expect([turns(), notices.length, await ownedHere(id)]).toEqual([3, 1, true]);
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([4, 1, true]);
 	});
 
 	it("enforce: a turn on a session another process now holds is refused before it writes, and the TUI shows the held warning", async () => {
@@ -1161,13 +1206,24 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		const pid = await holdInAnotherProcess(id);
 		const before = await fs.readFile(file);
 
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
 		await expect(session.prompt("refused")).rejects.toMatchObject({
 			code: "session_held",
 			holder: { surface: "terminal", pid },
 		});
 		expect(turns()).toBe(0);
 		expect(await fs.readFile(file)).toEqual(before);
-		const warned: SessionHeldError[] = [];
+		// The turn gate found the holder; the write path enforces it for writers outside a turn.
+		let written: unknown;
+		try {
+			manager.appendCustomEntry("reclaim-test", { note: "outside a turn" });
+		} catch (error) {
+			written = error;
+		}
+		expect(written).toBeInstanceOf(SessionHeldError);
+		expect(await fs.readFile(file)).toEqual(before);
+		// A held session is checked at every turn (no backoff), and the TUI routes the refusal.
+		const refused: unknown[] = [];
 		const errors: string[] = [];
 		await submitInteractiveInput(
 			{
@@ -1176,15 +1232,18 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 				showError: message => errors.push(message),
 				checkShutdownRequested: async () => {},
 				waitForAgentEnd: () => ({ promise: Promise.withResolvers<void>().promise, dispose: () => {} }),
-				handleHeldSessionTurn: error => warned.push(error),
+				handleRefusedSessionTurn: error => refused.push(error),
 			},
 			session,
 			{ text: "refused again", cancelled: false, started: false },
 		);
-		expect([warned.map(error => error.sessionId), errors, turns()]).toEqual([[id], [], 0]);
-		// The TUI's warning is /resume's flow for the session's own file; Cancel keeps it here, unsent.
-		const titles: string[] = [];
+		expect([refused.length, refused[0] instanceof SessionHeldError, errors, turns()]).toEqual([1, true, [], 0]);
+
+		// The TUI's warning is /resume's flow for the session's own file, Fork and Cancel only. Cancel
+		// keeps the session here, unsent; Fork continues in a copy and leaves the original to its holder.
+		const offered: string[][] = [];
 		const statuses: string[] = [];
+		let choose = (options: string[]) => options.at(-1);
 		const ui = new TUI(new VirtualTerminal(80, 12));
 		try {
 			const controller = new SelectorController({
@@ -1196,23 +1255,28 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 				session,
 				sessionManager: manager,
 				settings: { get: () => undefined, getAgentDir },
-				showHookSelector: async (title: string, options: string[]) => {
-					titles.push(title);
-					return options.at(-1);
+				showHookSelector: async (_title: string, options: string[]) => {
+					offered.push(options);
+					return choose(options);
 				},
 				showStatus: (message: string) => statuses.push(message),
+				resetIrcSidebarSession: () => {},
+				resetAssistantTextPresentation: () => {},
+				updateEditorBorderColor: () => {},
+				rebuildInitialMessages: () => {},
+				reloadTodos: async () => undefined,
 			} as unknown as InteractiveModeContext);
-			await controller.handleResumeSession(file, { cancelledStatus: "Not sent" });
+			await controller.handleResumeSession(file, { cancelledStatus: "Not sent", continueHere: false });
+			expect([offered[0].length, statuses.at(-1), manager.getSessionId()]).toEqual([2, "Not sent", id]);
+			choose = options => options[0];
+			await controller.handleResumeSession(file, { continueHere: false });
 		} finally {
 			ui.stop();
 		}
-		expect([titles.length, statuses.at(-1), manager.getSessionId()]).toEqual([1, "Not sent", id]);
-		expect(titles[0]).toContain(`(pid ${pid})`);
+		const forkId = manager.getSessionId();
+		expect(forkId).not.toBe(id);
+		await session.prompt("in the fork");
+		expect([turns(), await ownedHere(forkId), await ownedHere(id)]).toEqual([1, true, false]);
 		expect(await fs.readFile(file)).toEqual(before);
-
-		// Enforce checks a held session at every turn, with no backoff: the holder gone, the next turn claims.
-		await stopHolder();
-		await session.prompt("after the holder exited");
-		expect([turns(), await ownedHere(id)]).toEqual([1, true]);
 	});
 });
