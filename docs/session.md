@@ -622,7 +622,7 @@ Under `enforce`, a session open for writing in another process is refused before
 - An owners directory that fails its safety checks refuses the session too (`SessionOwnershipError`), as the append lock does.
 - Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. If a launched host's open is refused anyway (another process claimed the session after the broker checked), the broker reports the same `live_session` outcome as the resume wait above.
 
-A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. One lock timeout (a stalled network filesystem, for example) turns claims off for the rest of that process, so later opens never wait for the lock again.
+A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. A lock timeout (a stalled network filesystem, for example) skips that one claim only: the next claim tries again.
 
 Operator notes:
 
