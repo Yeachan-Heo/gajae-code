@@ -3,12 +3,12 @@
 // Swift and Emacs Lisp tests on full-langs.
 //! Resolve the syntactic block that begins on a given source line.
 //!
-//! Parses the source with tree-sitter and returns the line span of the outermost
-//! named node that *begins* on that line (1-indexed, excluding the whole-file root).
-//! Brace languages anchor a construct's block to its opening line, so pointing at the
-//! line that opens an `if` / `function` / `struct` resolves to that construct's
-//! full span; pointing at a continuation line or a lone closing delimiter
-//! resolves to nothing.
+//! Parses the source with tree-sitter and returns the line span of the
+//! outermost named node that *begins* on that line (1-indexed, excluding the
+//! whole-file root). Brace languages anchor a construct's block to its opening
+//! line, so pointing at the line that opens an `if` / `function` / `struct`
+//! resolves to that construct's full span; pointing at a continuation line or a
+//! lone closing delimiter resolves to nothing.
 
 use std::collections::BTreeSet;
 

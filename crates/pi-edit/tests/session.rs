@@ -310,8 +310,6 @@ async fn update_after_delete_rejects_missing_file_without_writing() {
 	assert!(writer.requests.lock().is_empty());
 }
 
-
-
 #[tokio::test]
 async fn create_over_generated_file_still_rejected() {
 	let ws = Workspace::new(EditMode::Patch);

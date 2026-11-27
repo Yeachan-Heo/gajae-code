@@ -360,6 +360,8 @@
     "github",
     "goalTokenDelta",
     "goalToolRenderer",
+    "hashlineEditParamsSchema",
+    "hashlineParseText",
     "head",
     "highlightCode",
     "host",

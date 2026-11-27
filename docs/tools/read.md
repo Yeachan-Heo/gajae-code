@@ -256,7 +256,6 @@ Notes: ...
   - Uses `Bun.Archive` for tar/tgz and `fflate` for zip.
   - URL HTML rendering can delegate into site handlers and HTML-to-text backends from `packages/coding-agent/src/tools/fetch.ts`.
 - Session state
-  - Records local text lines into `session.fileReadCache` for later stale-anchor recovery.
   - Uses `session.internalRouter` for internal URLs.
   - Uses `session.allocateOutputArtifact()` for cached/truncated URL output.
 - Background work / cancellation

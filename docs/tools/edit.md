@@ -10,7 +10,6 @@
   - `packages/coding-agent/src/edit/modes/patch.ts` — structured JSON diff-hunk mode
   - `packages/coding-agent/src/edit/modes/apply-patch.ts` — freeform patch-envelope format
   - `packages/coding-agent/src/tools/vim.ts` — persistent modal editing buffer
-  - `packages/coding-agent/src/edit/file-read-cache.ts` — per-session read snapshot cache
   - `packages/coding-agent/src/edit/streaming.ts` — computes in-flight diff previews for the TUI
 
 ## Inputs
@@ -45,8 +44,7 @@
 3. The edited text is persisted via `serializeEditFileText()` in `packages/coding-agent/src/edit/read-file.ts`.
 4. The writethrough callback from `createLspWritethrough()` may format the file and fetch diagnostics.
 5. `invalidateFsScanAfterWrite()` calls `invalidateFsScanCache(path)` so filesystem-backed tools do not serve stale scan results.
-6. The session file-read cache is refreshed with the post-edit file text via `recordFull()`.
-7. The final response is built from a unified diff and any accumulated warnings.
+6. The final response is built from a unified diff and any accumulated warnings.
 
 ## Modes / Variants
 
@@ -80,7 +78,6 @@ Persistent modal editing buffer. The model issues vim commands to edit files int
 - Varies by mode. See the specific mode documentation for detailed error handling.
 
 ## Notes
-- File-read cache invalidation is conflict-based, not write-through invalidation. If `read` later records content for a line that disagrees with the cached snapshot, the entire snapshot for that path is replaced with the newly observed lines.
 - There is no resolve-style apply/discard phase for most edit modes. The primary exception is vim mode, which maintains an interactive buffer.
 - BOM and line ending styles are preserved from the original file.
 - For multi-file edits, each file is processed independently but failures in one may prevent others from applying depending on the mode.
