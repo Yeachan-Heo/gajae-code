@@ -864,11 +864,11 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	return subagent ? `a subagent of ${noun} (pid ${holder.pid})` : `${noun} (pid ${holder.pid})`;
 }
 
-/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`; `undefined` if unverified. */
+/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`, or `a gjc process on build-box, pid 4242` for a remote holder; `undefined` if unverified. */
 function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string | undefined {
 	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface)) return undefined;
 	if (holder.host === undefined) return `${holder.surface}, pid ${holder.pid}`;
-	return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host}, pid ${holder.pid}` : undefined;
+	return SAFE_HOST.test(holder.host) ? `a gjc process on ${holder.host}, pid ${holder.pid}` : undefined;
 }
 
 /**
