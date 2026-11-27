@@ -163,8 +163,8 @@ async function brokerWithSavedSession(
 			);
 		},
 		/** One delete as ACP sends it: every retry under the same per-session idempotency key. */
-		delete: (via: Broker = broker): Promise<BrokerResponse> =>
-			via.handleRequest("session.delete", { cwd: root, sessionId, sessionPath }, `acp:session.delete:${sessionId}`),
+		delete: (via: Broker = broker, key = `acp:session.delete:${sessionId}`): Promise<BrokerResponse> =>
+			via.handleRequest("session.delete", { cwd: root, sessionId, sessionPath }, key),
 	};
 }
 
@@ -370,7 +370,7 @@ describe.if(supported)("broker session.delete of a session another process holds
 		expect(await probeSessionOwner(fixture.sessionId)).toEqual({ state: "free" });
 	});
 
-	it("enforce: a claim that cannot be checked refuses with unavailable, and the same key deletes once it can", async () => {
+	it("enforce: a claim that cannot be checked refuses with unavailable, and another key deletes once it can", async () => {
 		SessionOwnershipTestHooks.mode = "enforce";
 		const fixture = await brokerWithSavedSession();
 		const bytes = await fs.readFile(fixture.sessionPath);
@@ -389,8 +389,12 @@ describe.if(supported)("broker session.delete of a session another process holds
 		});
 		expect(await fs.readFile(fixture.sessionPath)).toEqual(bytes);
 
+		// The refused key's retained binding does not fence another caller's key (`gjc sdk` picks its own).
 		delete SessionOwnershipTestHooks.lockBackend;
-		expect(await fixture.delete()).toEqual({ ok: true, result: { sessionId: fixture.sessionId } });
+		expect(await fixture.delete(fixture.broker, "sdk-cli-delete")).toEqual({
+			ok: true,
+			result: { sessionId: fixture.sessionId },
+		});
 		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
 	});
 
