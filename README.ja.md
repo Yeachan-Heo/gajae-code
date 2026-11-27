@@ -22,9 +22,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App を見る → デスクトップ＆セルフホスト Web GUI</strong></kbd></a>
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App（非推奨）</strong></kbd></a>
   <br/>
-  <sub>コミュニティ製の実験的なサードパーティープロジェクトであり、Gajae-Code 公式のファーストパーティーアプリではありません。</sub>
+  <sub>非推奨: このコミュニティ製サードパーティーアプリはメンテナンスされていません（最終リリース v2.0.0-beta.20、2026-09-25）。アプリ内アップデーターと同梱 SDK が古いため、新規インストールはしないでください。</sub>
 </p>
 
 <p align="center">
