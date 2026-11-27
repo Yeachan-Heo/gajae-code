@@ -1895,12 +1895,18 @@ export class InputController {
 		}
 		const claim = { draft, pendingImages };
 		this.#followUpClaim = claim;
+		// New Session aborts the run but not a pending input extension, and it reuses this
+		// AgentSession, so bind the submission to the session it was made in.
+		const submittedSessionId = this.ctx.sessionManager.getSessionId();
 		let extensionResult: InputExtensionResult;
 		try {
 			extensionResult = await this.#applyInputExtensions(draft, pendingImages);
 		} finally {
 			if (this.#followUpClaim === claim) this.#followUpClaim = undefined;
 		}
+		// The session changed during the wait. Sending now would deliver this session's text and
+		// images into its successor, and the composer already belongs to the new session.
+		if (this.ctx.sessionManager.getSessionId() !== submittedSessionId) return;
 		if (extensionResult.handled) {
 			if (extensionResult.handledText) {
 				this.ctx.addMessageToChat({

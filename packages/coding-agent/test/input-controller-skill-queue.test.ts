@@ -132,6 +132,7 @@ function createStubInputControllerContext(opts: {
 		},
 		sessionManager: {
 			getCwd: () => process.cwd(),
+			getSessionId: () => "test-session-id",
 		},
 		showError,
 		updatePendingMessagesDisplay,

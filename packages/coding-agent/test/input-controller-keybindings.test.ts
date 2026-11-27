@@ -282,6 +282,9 @@ async function createContext(options?: {
 			getSessionName() {
 				return "test-session";
 			},
+			getSessionId() {
+				return "test-session-id";
+			},
 		} as unknown as InteractiveModeContext["sessionManager"],
 		locallySubmittedUserSignatures: new Set<string>(),
 		isKnownSlashCommand: () => false,

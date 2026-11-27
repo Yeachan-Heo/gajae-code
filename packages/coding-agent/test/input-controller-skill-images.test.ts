@@ -37,6 +37,7 @@ function createContext(opts: {
 	const prompts: { text: string; options: { images?: PendingImages } | undefined }[] = [];
 	const followUps: { text: string; images: PendingImages | undefined }[] = [];
 	const showWarning = vi.fn();
+	const sessionId = { current: "session-a" };
 
 	// The real editor reports onChange("") when its buffer is emptied, which defers
 	// a pendingImages reset to a microtask. A controller that reads the images
@@ -81,7 +82,11 @@ function createContext(opts: {
 			}),
 		},
 		settings: { get: () => undefined },
-		sessionManager: { getCwd: () => process.cwd(), getSessionName: () => "named" },
+		sessionManager: {
+			getCwd: () => process.cwd(),
+			getSessionName: () => "named",
+			getSessionId: () => sessionId.current,
+		},
 		showError: vi.fn(),
 		showWarning,
 		showStatus: vi.fn(),
@@ -98,7 +103,7 @@ function createContext(opts: {
 		queueCompactionMessage: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor: editor as typeof stubEditor, customMessages, prompts, followUps, showWarning };
+	return { ctx, editor: editor as typeof stubEditor, customMessages, prompts, followUps, showWarning, sessionId };
 }
 
 function imageBlocks(content: unknown): unknown[] {
@@ -735,5 +740,75 @@ describe("InputController skill command images", () => {
 
 		expect(extensionRunner.emitInput).toHaveBeenCalledTimes(1);
 		expect(stub.prompts).toHaveLength(1);
+	});
+
+	it("does not deliver an Alt+Enter follow-up into the successor session after New Session", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("look at [image 1]");
+		const followUp = controller.handleFollowUp();
+		// Ctrl+N: the same AgentSession now identifies the successor, and the new session starts empty.
+		stub.sessionId.current = "session-b";
+		stub.ctx.editor.setText("");
+		stub.ctx.pendingImages = [];
+		release.resolve();
+		await followUp;
+
+		expect(stub.prompts).toHaveLength(0);
+		expect(stub.followUps).toHaveLength(0);
+		expect(stub.customMessages).toHaveLength(0);
+	});
+
+	it("does not dispatch a queued skill into the successor session after New Session", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		const followUp = controller.handleFollowUp();
+		stub.sessionId.current = "session-b";
+		release.resolve();
+		await followUp;
+
+		expect(stub.customMessages).toHaveLength(0);
+	});
+
+	it("does not clear the successor session's draft when a stale Alt+Enter follow-up finishes", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("old session draft");
+		const followUp = controller.handleFollowUp();
+		stub.sessionId.current = "session-b";
+		stub.ctx.editor.setText("old session draft");
+		release.resolve();
+		await followUp;
+
+		expect(stub.ctx.editor.getText()).toBe("old session draft");
+		expect(stub.prompts).toHaveLength(0);
 	});
 });
