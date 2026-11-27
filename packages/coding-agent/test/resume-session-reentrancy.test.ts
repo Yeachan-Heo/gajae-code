@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { Container, Text, TUI } from "@gajae-code/tui";
+import { getAgentDir } from "@gajae-code/utils";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { heldSessionWarningDialog } from "../src/modes/components/session-held-warning";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
@@ -50,7 +51,7 @@ function createContext(session: { switchSession: (path: string, options?: unknow
 		streamingMessage: undefined,
 		pendingTools: new Map(),
 		session,
-		settings: { get: () => undefined },
+		settings: { get: () => undefined, getAgentDir },
 		sessionManager: {
 			getSessionId: () => "before",
 			isManagedDestination: () => false,

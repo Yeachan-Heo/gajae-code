@@ -15,7 +15,7 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
-import { getAgentDbPath, getAgentDir, getProjectDir, logger, VERSION } from "@gajae-code/utils";
+import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
 import type { AutoroutingSetup } from "../../config/autorouting-contract";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
@@ -2721,7 +2721,8 @@ export class SelectorController {
 		| { readonly kind: "continued"; readonly admission: SessionOwnerClaim | undefined }
 		| undefined
 	> {
-		const agentDir = getAgentDir();
+		// The session's own agent dir and claim decision, as the launch and this switch's admission use.
+		const agentDir = this.ctx.settings.getAgentDir();
 		const handover = await findSessionHandoverTarget(error, agentDir);
 		let note: string | undefined;
 		for (;;) {
@@ -2732,7 +2733,9 @@ export class SelectorController {
 					break;
 				case "continue": {
 					if (!handover || this.ctx.isStopped?.()) return undefined;
-					const outcome = await handOverSession(error, agentDir, resolveSessionOwnership());
+					// Not cancellable: the selector is closed and the caller waits for the claim.
+					this.ctx.showStatus("Handing the session over…");
+					const outcome = await handOverSession(error, agentDir, this.ctx.sessionManager.ownershipDecision);
 					if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
 					note = outcome.message;
 					continue;

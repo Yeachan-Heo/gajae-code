@@ -636,7 +636,7 @@ describe.if(supported)("enforce refusals (5a)", () => {
 				pendingTools: new Map(),
 				session,
 				sessionManager: session.sessionManager,
-				settings: { get: () => undefined },
+				settings: { get: () => undefined, getAgentDir },
 				showHookSelector: async () => fork,
 				showStatus: (message: string) => statuses.push(message),
 				resetIrcSidebarSession: () => {},
