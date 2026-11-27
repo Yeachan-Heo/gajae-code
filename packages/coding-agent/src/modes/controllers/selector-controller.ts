@@ -2684,9 +2684,17 @@ export class SelectorController {
 		error: SessionHeldError,
 	): Promise<{ sessionPath: string; admission: SessionOwnerClaim | undefined } | undefined> {
 		const { title, options } = heldSessionWarningDialog(error);
-		if (heldSessionChoice(await this.ctx.showHookSelector(title, options)) !== "fork") {
-			this.ctx.showStatus("Resume cancelled");
-			return undefined;
+		const choice = heldSessionChoice(await this.ctx.showHookSelector(title, options));
+		switch (choice) {
+			case "fork":
+				break;
+			case "cancel":
+				this.ctx.showStatus("Resume cancelled");
+				return undefined;
+			default: {
+				const unknown: never = choice;
+				throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+			}
 		}
 		if (this.ctx.isStopped?.()) return undefined;
 		const migrationPolicy =

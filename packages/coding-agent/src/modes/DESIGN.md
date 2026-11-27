@@ -525,21 +525,23 @@ the viewport is captured once (`top`); an overflowing entry is captured at
 
 Source: `components/session-held-warning.ts` (the dialog), `components/session-selector.ts`
 (the marker), session single-owner design §3.1. This section extends the confirmation
-grammar above; it adds no tokens and no component.
+grammar above; it adds no tokens and no new component class (`session-held-warning.ts` is a
+factory over `HookSelectorComponent`).
 
 - **Anatomy:** a `HookSelectorComponent`, the same frame as "Resume this session?": border,
   a bold heading `This session is open in another process`, one line naming the session by
   its short id and the holder by its fixed phrase (`another terminal (pid N)`), one line
   `Only one process can write a session at a time.`, then the options `Fork into a new
   session — copy the conversation and continue there` (focused) and `Cancel`, the standard
-  dim key hint, border. `f` and `c` are accelerators.
+  dim key hint, border. At launch and in the picker, `f` and `c` are accelerators; the
+  `/resume` hook selector has none.
 - **Where it appears:** before the TUI starts (a one-shot TUI after one blank row, as the
   picker does), appended under the `--resume` picker like the resume confirmation, and as
   the TUI's hook selector for `/resume`. Escape is Cancel everywhere.
 - **States:** focused Fork (default); Cancel returns where the user was (exits at launch,
   back to the list in the picker, stays in the session for `/resume`); Fork opens the copy
-  idle and the status line says `Forked into a new session. The original stays with
-  <holder>.`
+  idle and a status message (at launch, a startup notice) says `Forked into a new session.
+  The original stays with <holder>.`
 - **Marker:** a session list row another process holds ends with
   `<format.bullet> in terminal` (or `in app`, `in gjc -p`, `in session host`, `in SDK app`,
   `in subagent`, `in use`) in `warning`. The title is truncated first so the marker stays

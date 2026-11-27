@@ -1535,12 +1535,30 @@ export async function createSessionManager(
 		// Under enforce, a session another process holds is never opened: the launch warns and offers
 		// Fork, which copies it here and also answers the different-folder question below (design §1
 		// row 1). A race past this probe still meets the open's own refusal.
-		const forkIfHeld = async (sourcePath: string): Promise<SessionManager | undefined> => {
+		// `undefined`, with nothing awaited, outside enforce or without a terminal to ask on.
+		const forkIfHeld = (sourcePath: string): Promise<SessionManager | undefined> | undefined => {
 			const held = startup.held;
 			const probe = held && SessionManager.probeHeldTranscript(sourcePath, ownership);
-			const refusal = probe ? await probe : undefined;
-			if (!held || !refusal) return undefined;
-			if ((await held.choose(refusal)) !== "fork") throw new SessionResumeCancelledError();
+			return held && probe ? forkWhenHeld(sourcePath, held, probe) : undefined;
+		};
+		const forkWhenHeld = async (
+			sourcePath: string,
+			held: NonNullable<SessionStartupNotices["held"]>,
+			probe: Promise<SessionHeldError | undefined>,
+		): Promise<SessionManager | undefined> => {
+			const refusal = await probe;
+			if (!refusal) return undefined;
+			const choice = await held.choose(refusal);
+			switch (choice) {
+				case "fork":
+					break;
+				case "cancel":
+					throw new SessionResumeCancelledError();
+				default: {
+					const unknown: never = choice;
+					throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+				}
+			}
 			const forked = await SessionManager.forkFrom(
 				sourcePath,
 				cwd,
@@ -1554,7 +1572,8 @@ export async function createSessionManager(
 			return forked;
 		};
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			const forked = await forkIfHeld(sessionArg);
+			const forking = forkIfHeld(sessionArg);
+			const forked = forking && (await forking);
 			if (forked) return forked;
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
@@ -1578,7 +1597,8 @@ export async function createSessionManager(
 		if (!match) {
 			throw new SessionNotFoundError(sessionArg);
 		}
-		const forked = await forkIfHeld(match.session.path);
+		const forking = forkIfHeld(match.session.path);
+		const forked = forking && (await forking);
 		if (forked) return forked;
 		if (match.scope === "global") {
 			const normalizedCwd = normalizePathForComparison(cwd);

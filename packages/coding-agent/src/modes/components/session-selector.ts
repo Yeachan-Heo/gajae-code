@@ -449,15 +449,22 @@ export class SessionSelectorComponent extends Container {
 		this.#state = { kind: "warning", session, token };
 		const dialog = createHeldSessionWarning(error, choice => {
 			if (this.#confirmationDialog !== dialog || this.#state.kind !== "warning") return;
-			if (choice === "fork") {
-				this.#settle({ kind: "fork", path: session.path, error });
-				return;
+			switch (choice) {
+				case "fork":
+					this.#settle({ kind: "fork", path: session.path, error });
+					return;
+				case "cancel":
+					this.removeChild(dialog);
+					this.#confirmationDialog = null;
+					this.#state = { kind: "browsing" };
+					this.#sessionList.setInputFrozen(false);
+					this.#requestRender();
+					return;
+				default: {
+					const unknown: never = choice;
+					throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+				}
 			}
-			this.removeChild(dialog);
-			this.#confirmationDialog = null;
-			this.#state = { kind: "browsing" };
-			this.#sessionList.setInputFrozen(false);
-			this.#requestRender();
 		});
 		this.#confirmationDialog = dialog;
 		this.addChild(dialog);

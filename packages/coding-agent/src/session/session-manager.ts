@@ -10702,14 +10702,7 @@ export class SessionManager {
 	 * another process holds is refused with {@link SessionHeldError} before anything changes.
 	 */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
-		const admission = this.switchTargetAdmission(sessionFile);
-		if (!admission) return this.#setSessionFileAdmitted(sessionFile, options);
-		const claim = await admission;
-		try {
-			return await this.#setSessionFileAdmitted(sessionFile, options);
-		} finally {
-			claim?.release();
-		}
+		return this.withSwitchTargetAdmission(sessionFile, () => this.#setSessionFileAdmitted(sessionFile, options));
 	}
 
 	async #setSessionFileAdmitted(
@@ -24686,6 +24679,24 @@ export class SessionManager {
 		const owner = this.#ownershipClaims.ownership;
 		if (owner === "exempt" || owner.mode !== "enforce") return undefined;
 		return SessionManager.#admitExistingTranscript(owner, sessionFile, this.#storage);
+	}
+
+	/**
+	 * Run `run` under {@link switchTargetAdmission}'s claim of `sessionFile`, released once `run`
+	 * settles. Outside enforce `run` is called at once, with nothing awaited before it.
+	 */
+	withSwitchTargetAdmission<T>(sessionFile: string, run: () => Promise<T>): Promise<T> {
+		const admission = this.switchTargetAdmission(sessionFile);
+		return admission ? SessionManager.#runAdmitted(admission, run) : run();
+	}
+
+	static async #runAdmitted<T>(admission: Promise<SessionOwnerClaim | undefined>, run: () => Promise<T>): Promise<T> {
+		const claim = await admission;
+		try {
+			return await run();
+		} finally {
+			claim?.release();
+		}
 	}
 
 	/**
