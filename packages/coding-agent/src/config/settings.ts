@@ -2504,7 +2504,9 @@ export class Settings implements NotificationSettingsReader {
 				}
 				merged = this.#deepMerge(merged, settings);
 			}
-			return this.#migrateRawSettings(merged);
+			const migrated = this.#migrateRawSettings(merged);
+			const reconciled = reconcileSettingsSchema(migrated);
+			return reconciled.settings;
 		} catch (error) {
 			// A malformed project file is tolerated (its layer is skipped), but a
 			// marker-read failure (EACCES/EISDIR/transient I/O - an fs error with

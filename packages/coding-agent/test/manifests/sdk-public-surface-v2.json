@@ -257,8 +257,6 @@
     "getThemeExportColors",
     "getUserMessageViewportAnchorIds",
     "github",
-    "hashlineEditParamsSchema",
-    "hashlineParseText",
     "head",
     "highlightCode",
     "host",

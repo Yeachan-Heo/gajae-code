@@ -408,6 +408,31 @@ describe("Settings", () => {
 			expect(settings.getEditVariantForModel("gpt-5.2")).toBe("apply_patch");
 		});
 
+		it("migrates project-scoped hashline edit mode settings to replace", async () => {
+			const projectConfigPath = path.join(getProjectAgentDir(projectDir), "config.yml");
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify(
+					{
+						edit: {
+							modelVariants: {
+								"claude-opus": "hashline",
+								"gpt-5": "apply_patch",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// Project-scoped hashline values should be migrated to replace
+			expect(settings.getEditVariantForModel("claude-opus-4-5")).toBe("replace");
+			expect(settings.getEditVariantForModel("gpt-5.2")).toBe("apply_patch");
+		});
+
 		it("maps legacy hindsight.dynamicBankId=true onto hindsight.scoping=per-project", async () => {
 			await writeSettings({
 				hindsight: { dynamicBankId: true },
