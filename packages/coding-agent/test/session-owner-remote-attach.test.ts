@@ -427,7 +427,12 @@ interface Tui {
 	pid(): Promise<number>;
 }
 
-function startTui(fixture: Fixture, args: readonly string[], extraEnv: Record<string, string> = {}): Tui {
+function startTui(
+	fixture: Fixture,
+	args: readonly string[],
+	extraEnv: Record<string, string> = {},
+	where: { readonly cwd?: string; readonly key?: string } = {},
+): Tui {
 	const tuiEnv: Record<string, string> = {
 		...fixture.env,
 		TERM: "xterm-256color",
@@ -441,7 +446,7 @@ function startTui(fixture: Fixture, args: readonly string[], extraEnv: Record<st
 		{
 			command: `printf 'gjc-tui-pid=%s\\n' $$; exec '${process.execPath}' '${cli}' --no-mcp --no-lsp --no-rules --no-title --model fake/fake-model ${args.join(" ")}`,
 			shell: "bash",
-			cwd: fixture.workspace,
+			cwd: where.cwd ?? fixture.workspace,
 			env: tuiEnv,
 			unsetEnv: Object.keys(process.env).filter(key => !(key in tuiEnv)),
 			cols: 120,
@@ -457,7 +462,7 @@ function startTui(fixture: Fixture, args: readonly string[], extraEnv: Record<st
 		exited = true;
 	});
 	registerFixtureRuntime(fixture.cleanup, {
-		key: "tui",
+		key: where.key ?? "tui",
 		requiredOwner: "runtime-and-broker",
 		shutdown: async () => {
 			// Quit first, so the TUI retires its broker row and a launched host's close is not
@@ -893,6 +898,17 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			const secondHost = await create(SECOND_PROMPT);
 			secondId = secondHost.id;
 			const transcript = await transcriptOf(sessionId);
+
+			// --- From another folder, `gjc --resume S` could only fork S here, so the warning offers Fork
+			// and Cancel, not Continue here. Cancel exits and leaves S with its host.
+			const elsewhere = path.join(fixture.root, "elsewhere");
+			await fs.mkdir(elsewhere, { recursive: true, mode: 0o700 });
+			const away = startTui(fixture, ["--resume", sessionId], {}, { cwd: elsewhere, key: "tui-elsewhere" });
+			await waitFor(() => away.screen().includes("Fork into a new session"), 60_000, "the warning elsewhere");
+			expect(away.screen()).not.toContain("Continue here");
+			away.pty.write("c");
+			expect(await withTimeout(away.done, 30_000, "the TUI elsewhere did not exit")).toMatchObject({ exitCode: 0 });
+			expect(await holderOf(sessionId)).toBe(hostPid);
 
 			// --- A turn is running in the host: the bridge's second prompt is held at the model.
 			const busy = acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: BUSY_PROMPT }] });

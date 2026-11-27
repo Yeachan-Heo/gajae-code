@@ -1545,20 +1545,24 @@ export async function createSessionManager(
 		// `undefined`, with nothing awaited, outside enforce or without a terminal to ask on.
 		// Continue here (design §13 L1) closes a broker-launched holder and resolves to the claim
 		// that covers the open below, released once the open has claimed or failed.
-		const forkIfHeld = (sourcePath: string): Promise<HeldStartupResolution | undefined> | undefined => {
+		const forkIfHeld = (
+			sourcePath: string,
+			continueHere: boolean,
+		): Promise<HeldStartupResolution | undefined> | undefined => {
 			const held = startup.held;
 			const probe = held && SessionManager.probeHeldTranscript(sourcePath, ownership);
-			return held && probe ? forkWhenHeld(sourcePath, held, probe) : undefined;
+			return held && probe ? forkWhenHeld(sourcePath, held, probe, continueHere) : undefined;
 		};
 		const forkWhenHeld = async (
 			sourcePath: string,
 			held: NonNullable<SessionStartupNotices["held"]>,
 			probe: Promise<SessionHeldError | undefined>,
+			continueHere: boolean,
 		): Promise<HeldStartupResolution | undefined> => {
 			const refusal = await probe;
 			if (!refusal) return undefined;
 			const agentDir = activeSettings.getAgentDir();
-			const handover = await findSessionHandoverTarget(refusal, agentDir);
+			const handover = continueHere ? await findSessionHandoverTarget(refusal, agentDir) : undefined;
 			let note: string | undefined;
 			for (;;) {
 				const choice = await held.choose(refusal, { continueHere: handover !== undefined, note });
@@ -1604,7 +1608,7 @@ export async function createSessionManager(
 			}
 		};
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			const forking = forkIfHeld(sessionArg);
+			const forking = forkIfHeld(sessionArg, true);
 			const held = forking && (await forking);
 			if (held?.kind === "forked") return held.manager;
 			const destination = parsed.sessionDir
@@ -1624,28 +1628,29 @@ export async function createSessionManager(
 		if (!match) {
 			throw new SessionNotFoundError(sessionArg);
 		}
-		const forking = forkIfHeld(match.session.path);
+		// A session from another folder is only ever forked here, so the held warning offers Fork
+		// (which answers this question too), not Continue here.
+		const otherFolder =
+			match.scope === "global" &&
+			normalizePathForComparison(cwd) !== normalizePathForComparison(match.session.cwd || cwd);
+		const forking = forkIfHeld(match.session.path, !otherFolder);
 		const held = forking && (await forking);
 		if (held?.kind === "forked") return held.manager;
 		return await openAfterHandover(held, async () => {
-			if (match.scope === "global") {
-				const normalizedCwd = normalizePathForComparison(cwd);
-				const normalizedMatchCwd = normalizePathForComparison(match.session.cwd || cwd);
-				if (normalizedCwd !== normalizedMatchCwd) {
-					const shouldFork = await promptForkSession(match.session);
-					if (!shouldFork) {
-						throw new SessionForkDeclinedError(sessionArg, match.session.cwd);
-					}
-					return await SessionManager.forkFrom(
-						match.session.path,
-						cwd,
-						sessionDestination(),
-						undefined,
-						migrationPolicy,
-						sessionMemoryMode,
-						ownership,
-					);
+			if (otherFolder) {
+				const shouldFork = await promptForkSession(match.session);
+				if (!shouldFork) {
+					throw new SessionForkDeclinedError(sessionArg, match.session.cwd);
 				}
+				return await SessionManager.forkFrom(
+					match.session.path,
+					cwd,
+					sessionDestination(),
+					undefined,
+					migrationPolicy,
+					sessionMemoryMode,
+					ownership,
+				);
 			}
 			return await SessionManager.open(
 				match.session.path,

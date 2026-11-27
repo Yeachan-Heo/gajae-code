@@ -1,6 +1,6 @@
 ### Added
 
-- With `session.ownership.mode: enforce` (not the default), the held-session warning now offers **Continue here** when the session is held by a host the broker launched, for example a session started from Gajae Mobile, Telegram or `gjc acp`. It closes that host between turns and opens the session in this terminal; attached clients re-attach to the terminal, and an ACP client's next prompt runs there without `session/load`. A host that is running a turn refuses with "The session is running a turn; try again when it finishes." and the warning shows again. Continue here is offered at `gjc --resume <id or path>`, in the `gjc --resume` picker and in `/resume`; never when the holder is another terminal or the app.
+- With `session.ownership.mode: enforce` (not the default), the held-session warning now offers **Continue here** when the session is held by a host the broker launched, for example a session started from Gajae Mobile, Telegram or `gjc acp`. It closes that host between turns and opens the session in this terminal; attached clients re-attach to the terminal, and an ACP client's next prompt runs there without `session/load`. A host that is running a turn refuses with "The session is running a turn; try again when it finishes." and the warning shows again. Continue here is offered at `gjc --resume <id or path>`, in the `gjc --resume` picker and in `/resume`; never when the holder is another terminal or the app, and not at `gjc --resume <id>` for a session from another folder, which can only be forked here.
 
 ### Fixed
 
