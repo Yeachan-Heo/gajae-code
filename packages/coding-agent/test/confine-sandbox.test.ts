@@ -107,6 +107,31 @@ describe("--confine shell sandbox", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+	it("runs git with the user's git config while other home files stay denied", async () => {
+		if (process.platform !== "darwin") return;
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "confine-git-")));
+		const outside = path.join(os.homedir(), `.gjc-confine-git-secret-${process.pid}`);
+		await fs.writeFile(outside, "hidden");
+		try {
+			const command = sandboxedShellCommand(
+				`git init -q . && git status --short && echo git-ok; cat ${JSON.stringify(outside)}`,
+				root,
+			);
+			const proc = Bun.spawn(["/bin/sh", "-c", command], { cwd: root, stdout: "pipe", stderr: "pipe" });
+			const [stdout, stderr] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			expect(stdout).toContain("git-ok");
+			expect(stdout).not.toContain("hidden");
+			expect(stderr).toContain("Operation not permitted");
+			expect(stderr).not.toContain("xcrun_db");
+		} finally {
+			await fs.rm(outside, { force: true });
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 	it("pins the Seatbelt launcher to the trusted absolute executable", () => {
 		if (process.platform !== "darwin") return;
 		expect(sandboxedShellCommand("printf ok", os.tmpdir())).toContain("/usr/bin/sandbox-exec");

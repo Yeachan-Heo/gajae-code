@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const UNSAFE_PROFILE_PATH = /[\u0000-\u001f"()#]/;
@@ -19,6 +20,9 @@ export function confineSandboxProfile(root: string): string {
 		'(deny file-read* (subpath "/"))',
 		'(deny file-read* (require-all (subpath "/") (vnode-type SYMLINK)))',
 		`(allow file-read* (subpath ${quote(confinedRoot)}))`,
+		// git and realpath(3) stat every ancestor of the working directory. Metadata
+		// only: listing or reading an ancestor stays denied.
+		...ancestorsOf(confinedRoot).map(dir => `(allow file-read-metadata (literal ${quote(dir)}))`),
 		'(allow file-read* (literal "/"))',
 		'(allow file-read* (subpath "/bin"))',
 		'(allow file-read* (subpath "/usr"))',
@@ -38,6 +42,7 @@ export function confineSandboxProfile(root: string): string {
 		'(allow file-read* (literal "/var"))',
 		'(allow file-read* (subpath "/private/var/select"))',
 		'(allow file-read* (literal "/private/var/db/xcode_select_link"))',
+		...userGitConfigReadRules(),
 		"(deny file-write*)",
 		`(allow file-write* (subpath ${quote(confinedRoot)}))`,
 		// Character devices that hold no data: `> /dev/null`, git's stdio setup, and
@@ -48,7 +53,42 @@ export function confineSandboxProfile(root: string): string {
 		'(allow file-write* (literal "/dev/stdout"))',
 		'(allow file-write* (literal "/dev/stderr"))',
 		'(allow file-write* (subpath "/dev/fd"))',
+		// The /usr/bin developer-tool shims (git, cc, make) cache their lookup in the
+		// per-user temp directory and print an error on every call when they cannot.
+		// Only that cache file is opened there.
+		'(allow file-read* file-write* (regex #"^/private/var/folders/[^/]+/[^/]+/T/xcrun_db"))',
 	].join("\n");
+}
+
+/**
+ * Read-only access to the user's git configuration. git aborts on an unreadable
+ * `~/.gitconfig` instead of skipping it, so without these rules no git command runs
+ * in a confined shell. Only the two config locations are opened, never the home
+ * directory itself; a home path the profile cannot express gets no rule.
+ */
+function userGitConfigReadRules(): string[] {
+	let home: string;
+	try {
+		home = fs.realpathSync(os.homedir());
+	} catch {
+		return [];
+	}
+	if (UNSAFE_PROFILE_PATH.test(home)) return [];
+	return [
+		...ancestorsOf(home).map(dir => `(allow file-read-metadata (literal ${quote(dir)}))`),
+		`(allow file-read-metadata (literal ${quote(home)}))`,
+		`(allow file-read* (literal ${quote(path.join(home, ".gitconfig"))}))`,
+		`(allow file-read* (subpath ${quote(path.join(home, ".config", "git"))}))`,
+	];
+}
+
+/** Every directory above `dir`, excluding `/` itself. */
+function ancestorsOf(dir: string): string[] {
+	const ancestors: string[] = [];
+	for (let parent = path.dirname(dir); parent !== path.dirname(parent); parent = path.dirname(parent)) {
+		ancestors.push(parent);
+	}
+	return ancestors;
 }
 
 const TRUSTED_SANDBOX_EXEC = "/usr/bin/sandbox-exec";
