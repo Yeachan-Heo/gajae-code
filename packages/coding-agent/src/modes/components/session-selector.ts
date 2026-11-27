@@ -16,8 +16,10 @@ import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import type { ResumeSessionIdentity } from "../../sdk/session-readonly/storage";
 import { prioritizeStarredSessions, type ResumeTailInspection, type SessionInfo } from "../../session/session-manager";
+import { type SessionHeldError, sessionOwnerHolderMarker } from "../../session/session-ownership";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
+import { createHeldSessionWarning } from "./session-held-warning";
 
 export interface SelectedSession {
 	kind: "selected";
@@ -30,7 +32,16 @@ export interface CancelledSessionSelection {
 	kind: "cancelled";
 }
 
-export type SessionSelectionResult = SelectedSession | CancelledSessionSelection;
+/** Fork chosen from the held-session warning: the session stays with its holder, a copy opens idle. */
+export interface ForkHeldSessionSelection {
+	kind: "fork";
+	path: string;
+	error: SessionHeldError;
+}
+
+export type SessionSelectionResult = SelectedSession | CancelledSessionSelection | ForkHeldSessionSelection;
+/** Whether another process holds a session, checked when it is chosen (enforce only). */
+export type HeldSessionCheck = (session: SessionInfo) => Promise<SessionHeldError | undefined>;
 export type SessionInspector = (sessionPath: string) => Promise<ResumeTailInspection>;
 
 /** One picker row. Keep each newline as its own space, then drop terminal controls. */
@@ -46,12 +57,14 @@ type SelectorState =
 	| { kind: "starring"; token: number }
 	| { kind: "checking"; session: SessionInfo; token: number }
 	| { kind: "confirming"; session: SessionInfo; token: number; identity: ResumeSessionIdentity }
+	| { kind: "warning"; session: SessionInfo; token: number }
 	| { kind: "settled" };
 
 class SessionList implements Component {
 	#filteredSessions: SessionInfo[] = [];
 	#selectedIndex = 0;
 	readonly #searchInput = new Input();
+	readonly #heldMarkers = new Map<string, string>();
 	#inputFrozen = false;
 	onSelect?: (session: SessionInfo) => void;
 	onCancel?: () => void;
@@ -72,6 +85,12 @@ class SessionList implements Component {
 
 	setInputFrozen(frozen: boolean): void {
 		this.#inputFrozen = frozen;
+	}
+
+	/** Mark (or unmark, with `undefined`) a session another process holds, by id: `in terminal`. */
+	setHeldMarker(sessionId: string, marker: string | undefined): void {
+		if (marker === undefined) this.#heldMarkers.delete(sessionId);
+		else this.#heldMarkers.set(sessionId, marker);
 	}
 
 	#clampSelectedIndex(): void {
@@ -157,11 +176,14 @@ class SessionList implements Component {
 			const prefix = selected ? theme.fg("accent", cursor) : padding(cursorWidth);
 			const message = sessionRowText(session.firstMessage).trim();
 			const star = session.starred ? theme.fg("warning", `${theme.icon.star} `) : "";
+			const heldMarker = this.#heldMarkers.get(session.id);
+			const held = heldMarker ? theme.fg("warning", `  ${theme.format.bullet} ${heldMarker}`) : "";
 			const title = truncateToWidth(
 				sessionRowText(session.title ?? message),
-				width - cursorWidth - visibleWidth(star),
+				width - cursorWidth - visibleWidth(star) - visibleWidth(held),
 			);
-			lines.push(prefix + star + (selected ? theme.bold(title) : title));
+			const row = prefix + star + (selected ? theme.bold(title) : title);
+			lines.push(held ? truncateToWidth(row + held, width) : row);
 			if (session.recap) {
 				// A model-written recap replaces the first-message description and is labelled as such,
 				// so it is never mistaken for the user's own words.
@@ -237,6 +259,7 @@ export class SessionSelectorComponent extends Container {
 	#onRequestRender?: () => void;
 	#state: SelectorState = { kind: "browsing" };
 	#nextToken = 0;
+	#heldCheck: HeldSessionCheck | undefined;
 
 	constructor(
 		sessions: SessionInfo[],
@@ -271,6 +294,16 @@ export class SessionSelectorComponent extends Container {
 
 	setOnRequestRender(callback: () => void): void {
 		this.#onRequestRender = callback;
+	}
+
+	/**
+	 * Under enforce (design §1 row 2): mark the rows other processes hold, and, with `check`, show the
+	 * held-session warning when one is chosen instead of resuming it. Cancel returns to the list.
+	 */
+	setHeldSessions(held: ReadonlyMap<string, SessionHeldError>, check?: HeldSessionCheck): void {
+		for (const [sessionId, error] of held)
+			this.#sessionList.setHeldMarker(sessionId, sessionOwnerHolderMarker(error.holder));
+		this.#heldCheck = check;
 	}
 	#clearError(): void {
 		this.#messageContainer.clear();
@@ -363,6 +396,15 @@ export class SessionSelectorComponent extends Container {
 		this.#clearError();
 		this.#requestRender();
 		try {
+			// Checked again when chosen: the list's markers are only as fresh as the listing.
+			const held = this.#heldCheck ? await this.#heldCheck(session) : undefined;
+			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
+			if (this.#heldCheck)
+				this.#sessionList.setHeldMarker(session.id, held && sessionOwnerHolderMarker(held.holder));
+			if (held) {
+				this.#showHeldWarning(session, token, held);
+				return;
+			}
 			const inspection = await inspector(session.path);
 			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
 			if (inspection.kind === "error") {
@@ -399,6 +441,24 @@ export class SessionSelectorComponent extends Container {
 			() => this.#settle({ kind: "cancelled" }),
 			{ acceleratorMap: { y: "Yes", n: "No" } },
 		);
+		this.#confirmationDialog = dialog;
+		this.addChild(dialog);
+		this.#requestRender();
+	}
+	#showHeldWarning(session: SessionInfo, token: number, error: SessionHeldError): void {
+		this.#state = { kind: "warning", session, token };
+		const dialog = createHeldSessionWarning(error, choice => {
+			if (this.#confirmationDialog !== dialog || this.#state.kind !== "warning") return;
+			if (choice === "fork") {
+				this.#settle({ kind: "fork", path: session.path, error });
+				return;
+			}
+			this.removeChild(dialog);
+			this.#confirmationDialog = null;
+			this.#state = { kind: "browsing" };
+			this.#sessionList.setInputFrozen(false);
+			this.#requestRender();
+		});
 		this.#confirmationDialog = dialog;
 		this.addChild(dialog);
 		this.#requestRender();

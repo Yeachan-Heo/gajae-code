@@ -35536,8 +35536,27 @@ export class AgentSession {
 	 * Aborts current operation, loads messages, restores model/thinking.
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
+	 * @throws SessionHeldError under enforce, before any event, for a target another process holds
 	 */
 	async switchSession(
+		sessionPath: string,
+		options?: {
+			transition?: SessionSwitchEvent["transition"];
+			onTransitionMutationStarted?: () => void;
+		},
+	): Promise<boolean> {
+		// The admission claim covers the target until the rotation's own claim lands (design §1 row 9).
+		const admission = this.sessionManager.switchTargetAdmission(sessionPath);
+		if (!admission) return this.#switchSessionAdmitted(sessionPath, options);
+		const claim = await admission;
+		try {
+			return await this.#switchSessionAdmitted(sessionPath, options);
+		} finally {
+			claim?.release();
+		}
+	}
+
+	async #switchSessionAdmitted(
 		sessionPath: string,
 		options?: {
 			transition?: SessionSwitchEvent["transition"];

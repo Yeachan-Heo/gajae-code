@@ -1,9 +1,12 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { Container, Text, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { heldSessionWarningDialog } from "../src/modes/components/session-held-warning";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { initTheme } from "../src/modes/theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext } from "../src/modes/types";
+import { SessionManager } from "../src/session/session-manager";
+import { SessionHeldError } from "../src/session/session-ownership";
 
 beforeAll(() => initTheme());
 
@@ -51,6 +54,7 @@ function createContext(session: { switchSession: (path: string, options?: unknow
 		sessionManager: {
 			getSessionId: () => "before",
 			isManagedDestination: () => false,
+			switchTargetAdmission: () => undefined,
 			getSessionName: () => undefined,
 			getCwd: () => "/tmp",
 		},
@@ -64,6 +68,49 @@ function createContext(session: { switchSession: (path: string, options?: unknow
 
 	return { context, statusContainer, pendingMessagesContainer, ui };
 }
+
+describe("resume of a session another process holds (design §1 row 3)", () => {
+	it("warns before anything else: Cancel stays here, Fork switches to a copy under the copy's claim", async () => {
+		const error = new SessionHeldError("01a21a7f-82ff-7332-bee3-31b605a15de0", { surface: "terminal", pid: 4242 });
+		const switchSession = vi.fn(async () => true);
+		const { context, ui } = createContext({ switchSession });
+		const released = vi.fn();
+		const forkClose = vi.fn(async () => undefined);
+		const forkFrom = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue({
+			getSessionFile: () => "/tmp/fork.jsonl",
+			close: forkClose,
+		} as unknown as SessionManager);
+		Object.assign(context.sessionManager, {
+			switchTargetAdmission: (file: string) =>
+				file === "/tmp/held.jsonl" ? Promise.reject(error) : Promise.resolve({ release: released }),
+			getDestinationForFork: () => ({ kind: "explicit", directory: "/tmp" }),
+		});
+		const { title, options } = heldSessionWarningDialog(error);
+		const answers = [options[1], options[0]];
+		const showHookSelector = vi.fn(async () => answers.shift());
+		Object.assign(context, { showHookSelector });
+		const controller = new SelectorController(context);
+		try {
+			await controller.handleResumeSession("/tmp/held.jsonl");
+			expect(showHookSelector).toHaveBeenCalledWith(title, options);
+			expect([switchSession.mock.calls.length, forkFrom.mock.calls.length]).toEqual([0, 0]);
+			expect(context.showStatus).toHaveBeenLastCalledWith("Resume cancelled");
+
+			await controller.handleResumeSession("/tmp/held.jsonl");
+			expect(forkFrom.mock.calls[0]?.[0]).toBe("/tmp/held.jsonl");
+			expect(switchSession).toHaveBeenCalledWith("/tmp/fork.jsonl", expect.any(Object));
+			// The forking manager closes before the switch; the copy's admission claim covers the gap.
+			expect(forkClose.mock.invocationCallOrder[0]).toBeLessThan(switchSession.mock.invocationCallOrder[0]!);
+			expect(released).toHaveBeenCalledTimes(1);
+			expect(context.showStatus).toHaveBeenLastCalledWith(
+				"Forked into a new session. The original stays with another terminal (pid 4242).",
+			);
+		} finally {
+			forkFrom.mockRestore();
+			ui.stop();
+		}
+	});
+});
 
 describe("resume session re-entrancy", () => {
 	it("ignores an overlapping resume instead of starting a second transition", async () => {

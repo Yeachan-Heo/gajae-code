@@ -82,10 +82,16 @@ import {
 	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { probeHeldSessions, resolveSessionOwnership } from "../../session/internal/session-claim-set";
 import { operatorErrorMessage } from "../../session/operator-error-message";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
-import { SessionHeldError, sessionHeldForkCommand } from "../../session/session-ownership";
+import {
+	SessionHeldError,
+	type SessionOwnerClaim,
+	sessionHeldForkCommand,
+	sessionHeldForkedNotice,
+} from "../../session/session-ownership";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -185,6 +191,7 @@ import {
 } from "../components/provider-onboarding-selector";
 import { ProviderOrderContext } from "../components/provider-order-context";
 import { ProviderOrderEditorComponent } from "../components/provider-order-editor";
+import { heldSessionChoice, heldSessionWarningDialog } from "../components/session-held-warning";
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
@@ -2405,6 +2412,13 @@ export class SelectorController {
 	async showSessionSelector(): Promise<void> {
 		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
 		if (this.ctx.isStopped?.()) return;
+		// Under enforce, rows other processes hold are marked; choosing one warns (design §1 row 3).
+		const heldProbe = probeHeldSessions(
+			resolveSessionOwnership(),
+			sessions.map(session => session.id),
+		);
+		const held = heldProbe ? await heldProbe : undefined;
+		if (this.ctx.isStopped?.()) return;
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
@@ -2417,7 +2431,15 @@ export class SelectorController {
 					void this.handleResumeSession(sessionPath).catch(error => {
 						// A refusal (a session open in another process, under enforce) carries operator text.
 						// `/fork` here would fork the current session, so name the command that copies this one.
-						const fork = error instanceof SessionHeldError ? sessionHeldForkCommand(error.sessionId) : undefined;
+						const fork =
+							error instanceof SessionHeldError
+								? sessionHeldForkCommand(
+										error.sessionId,
+										this.ctx.sessionManager.isManagedDestination()
+											? {}
+											: { sessionDir: this.ctx.sessionManager.getSessionDir() },
+									)
+								: undefined;
 						const message = operatorErrorMessage(error, String(error));
 						this.ctx.showError(fork ? `${message} To continue it in a copy, quit and run: ${fork}` : message);
 					});
@@ -2448,6 +2470,7 @@ export class SelectorController {
 				(session, starred) => this.ctx.sessionManager.setSessionStarredForPicker(session, starred),
 			);
 			selector.setOnRequestRender(() => this.ctx.ui.requestRender());
+			if (held) selector.setHeldSessions(held);
 			return { component: selector, focus: selector };
 		});
 	}
@@ -2534,7 +2557,25 @@ export class SelectorController {
 		// session-manager accessor, an unavailable status rail) can never strand the
 		// guard and silently disable every later resume.
 		let progressLease: ResumeProgressLease | undefined;
+		let admission: SessionOwnerClaim | undefined;
+		let resumedStatus = "Resumed session";
 		try {
+			// Under enforce the target is claimed first (design §1 row 3), before the spinner and before
+			// its preparation; the claim covers it until the switch's own claim lands. A session another
+			// process holds gets the warning instead: Cancel stays here, Fork switches to a copy.
+			const admitting = this.ctx.sessionManager.switchTargetAdmission(sessionPath);
+			if (admitting) {
+				try {
+					admission = await admitting;
+				} catch (error) {
+					if (!(error instanceof SessionHeldError)) throw error;
+					const forked = await this.#forkHeldSession(sessionPath, error);
+					if (!forked) return;
+					({ sessionPath, admission } = forked);
+					resumedStatus = sessionHeldForkedNotice(error);
+				}
+				if (this.ctx.isStopped?.()) return;
+			}
 			const previousSessionId = this.ctx.sessionManager.getSessionId();
 			progressLease = acquireResumeProgressLease(this.ctx);
 			await progressLease.committed;
@@ -2622,13 +2663,51 @@ export class SelectorController {
 			);
 			await this.ctx.reloadTodos();
 			if (this.ctx.isStopped?.()) return;
-			this.ctx.showStatus("Resumed session");
+			this.ctx.showStatus(resumedStatus);
 			this.#maybePromptResumeModelChoice();
 		} finally {
+			admission?.release();
 			progressLease?.clear();
 			this.#resumeInFlight = false;
 			releaseActivityIndicator();
 		}
+	}
+
+	/**
+	 * The held-session warning for `/resume` (design §3.1). On Fork, copy the held session into this
+	 * session's store, reading it in place, and return the copy to switch to, with an admission claim
+	 * that covers it once the forking manager closes. `undefined` on Cancel: the current session
+	 * stays as it was, still claimed.
+	 */
+	async #forkHeldSession(
+		sessionPath: string,
+		error: SessionHeldError,
+	): Promise<{ sessionPath: string; admission: SessionOwnerClaim | undefined } | undefined> {
+		const { title, options } = heldSessionWarningDialog(error);
+		if (heldSessionChoice(await this.ctx.showHookSelector(title, options)) !== "fork") {
+			this.ctx.showStatus("Resume cancelled");
+			return undefined;
+		}
+		if (this.ctx.isStopped?.()) return undefined;
+		const migrationPolicy =
+			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		const forked = await SessionManager.forkFrom(
+			sessionPath,
+			this.ctx.sessionManager.getCwd(),
+			this.ctx.sessionManager.getDestinationForFork(),
+			undefined,
+			migrationPolicy,
+			this.ctx.settings?.get("sessionMemory.mode"),
+		);
+		const forkPath = forked.getSessionFile();
+		let admission: SessionOwnerClaim | undefined;
+		try {
+			if (!forkPath) throw new Error("Fork created no session file");
+			admission = await this.ctx.sessionManager.switchTargetAdmission(forkPath);
+		} finally {
+			await forked.close();
+		}
+		return { sessionPath: forkPath, admission };
 	}
 
 	/**

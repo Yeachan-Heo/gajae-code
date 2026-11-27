@@ -878,10 +878,65 @@ function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string
  */
 export function sessionHeldForkCommand(
 	sessionId: string,
-	options: { readonly print?: boolean } = {},
+	options: {
+		readonly print?: boolean;
+		/** The transcript path the session was named by, repeated so the command reads the same file. */
+		readonly source?: string;
+		/** The `--session-dir` the session was found in; an id resolves only there. */
+		readonly sessionDir?: string;
+	} = {},
 ): string | undefined {
 	if (!SAFE_ID.test(sessionId)) return undefined;
-	return options.print ? `gjc -p --fork ${sessionId} "<message>"` : `gjc --fork ${sessionId}`;
+	const source = options.source === undefined ? sessionId : shellWord(options.source);
+	const sessionDir = options.sessionDir === undefined ? undefined : shellWord(options.sessionDir);
+	if (source === undefined || (options.sessionDir !== undefined && sessionDir === undefined)) return undefined;
+	const flags = sessionDir === undefined ? "" : `--session-dir ${sessionDir} `;
+	return options.print ? `gjc -p ${flags}--fork ${source} "<message>"` : `gjc ${flags}--fork ${source}`;
+}
+
+/** One shell word for a path in a printed command; `undefined` for text no terminal should print. */
+function shellWord(value: string): string | undefined {
+	if (value === "" || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)) return undefined;
+	return /^[A-Za-z0-9._/:@%+=,-]+$/.test(value) && !value.startsWith("-")
+		? value
+		: `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * The terminal warning for a session another process holds (design §3.1; Fork and Cancel only, the
+ * read-only view and Take over are deferred). Fixed vocabulary, the holder's §3.4 phrase and a safe
+ * short id only: nothing a session or another process wrote reaches the screen.
+ */
+export function sessionHeldWarning(error: SessionHeldError): { readonly heading: string; readonly lines: string[] } {
+	const subject = SAFE_ID.test(error.sessionId) ? `Session ${error.sessionId.slice(0, 8)}` : "This session";
+	return {
+		heading: "This session is open in another process",
+		lines: [
+			`${subject} is open for writing in ${sessionOwnerHolderPhrase(error.holder)}.`,
+			"Only one process can write a session at a time.",
+		],
+	};
+}
+
+/** What a launch or the TUI says after Fork (design §3.1). */
+export function sessionHeldForkedNotice(error: SessionHeldError): string {
+	return `Forked into a new session. The original stays with ${sessionOwnerHolderPhrase(error.holder)}.`;
+}
+
+const SURFACE_MARKERS: Record<SessionOwnerBaseSurface, string> = {
+	app: "in app",
+	terminal: "in terminal",
+	print: "in gjc -p",
+	"sdk-host": "in session host",
+	"acp-host": "in session host",
+	sdk: "in SDK app",
+};
+
+/** The short marker a session list shows on a row another process holds (design §1 row 2): `in terminal`. */
+export function sessionOwnerHolderMarker(holder: SessionOwnerHolder | undefined): string {
+	if (!holder || !isSurface(holder.surface) || holder.host !== undefined) return "in use";
+	if (holder.surface.endsWith(" (subagent)")) return "in subagent";
+	return SURFACE_MARKERS[holder.surface as SessionOwnerBaseSurface];
 }
 
 /**

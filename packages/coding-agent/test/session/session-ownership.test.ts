@@ -610,6 +610,19 @@ describe("SessionHeldError", () => {
 		expect(sessionOwnerHolderPhrase(undefined)).toBe("another gjc process");
 	});
 
+	it("prints a fork command that resolves where the session was found, quoted for the shell", () => {
+		const id = "01a21a7f-82ff-7332-bee3-31b605a15de0";
+		const fork = ownership.sessionHeldForkCommand;
+		expect(fork(id)).toBe(`gjc --fork ${id}`);
+		expect(fork(id, { sessionDir: "/work/sessions" })).toBe(`gjc --session-dir /work/sessions --fork ${id}`);
+		expect(fork(id, { print: true, source: "/work/a b/it's.jsonl" })).toBe(
+			`gjc -p --fork '/work/a b/it'\\''s.jsonl' "<message>"`,
+		);
+		// A path no terminal should print gets no command at all.
+		expect(fork(id, { source: "/work/\u001b[31mred.jsonl" })).toBeUndefined();
+		expect(fork(id, { sessionDir: "/work/‮sessions" })).toBeUndefined();
+	});
+
 	it("never renders a malformed holder a caller built", () => {
 		const malformed = [
 			{ surface: "terminal", pid: 7, host: "evil host/../x" },
