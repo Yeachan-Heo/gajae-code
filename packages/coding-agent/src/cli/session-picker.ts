@@ -1,7 +1,11 @@
 import * as path from "node:path";
 import { ProcessTerminal, Spacer, TUI } from "@gajae-code/tui";
 import { pathIsWithin } from "@gajae-code/utils";
-import { createHeldSessionWarning, type HeldSessionChoice } from "../modes/components/session-held-warning";
+import {
+	createHeldSessionWarning,
+	type HeldSessionChoice,
+	type HeldSessionWarningOptions,
+} from "../modes/components/session-held-warning";
 import {
 	type HeldSessionCheck,
 	type SessionSelectionResult,
@@ -25,21 +29,28 @@ export async function deleteSessionPickerCandidate(sessionPath: string, explicit
 
 /**
  * The held-session warning before the TUI starts (design §3.1), as a one-shot TUI like the picker:
- * resolves once Fork or Cancel is chosen and the terminal is handed back.
+ * resolves once Fork, Continue here or Cancel is chosen and the terminal is handed back.
  */
-export async function promptHeldSession(error: SessionHeldError): Promise<HeldSessionChoice> {
+export async function promptHeldSession(
+	error: SessionHeldError,
+	options: HeldSessionWarningOptions = {},
+): Promise<HeldSessionChoice> {
 	const { promise, resolve } = Promise.withResolvers<HeldSessionChoice>();
 	const ui = new TUI(new ProcessTerminal());
 	let settled = false;
-	const warning = createHeldSessionWarning(error, choice => {
-		if (settled) return;
-		settled = true;
-		// As in `selectSession`: finish the stdin dispatch before detaching, then resolve.
-		setImmediate(() => {
-			ui.stop();
-			resolve(choice);
-		});
-	});
+	const warning = createHeldSessionWarning(
+		error,
+		choice => {
+			if (settled) return;
+			settled = true;
+			// As in `selectSession`: finish the stdin dispatch before detaching, then resolve.
+			setImmediate(() => {
+				ui.stop();
+				resolve(choice);
+			});
+		},
+		options,
+	);
 	// As the picker does: one blank row first, so the frame starts below the launch's `> ` line.
 	ui.addChild(new Spacer(1));
 	ui.addChild(warning);

@@ -15,8 +15,13 @@ import { formatBytes, sanitizeDisplayLine, sanitizeText } from "@gajae-code/util
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import type { ResumeSessionIdentity } from "../../sdk/session-readonly/storage";
+import type { SessionHandoverOutcome } from "../../session/session-handover";
 import { prioritizeStarredSessions, type ResumeTailInspection, type SessionInfo } from "../../session/session-manager";
-import { type SessionHeldError, sessionOwnerHolderMarker } from "../../session/session-ownership";
+import {
+	type SessionHeldError,
+	type SessionOwnerClaim,
+	sessionOwnerHolderMarker,
+} from "../../session/session-ownership";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
 import { createHeldSessionWarning } from "./session-held-warning";
@@ -26,6 +31,8 @@ export interface SelectedSession {
 	path: string;
 	identity: ResumeSessionIdentity;
 	action: "continue-tail" | "open-idle";
+	/** Continue here's claim of the session: the caller releases it once its open has claimed. */
+	admission?: SessionOwnerClaim;
 }
 
 export interface CancelledSessionSelection {
@@ -40,8 +47,17 @@ export interface ForkHeldSessionSelection {
 }
 
 export type SessionSelectionResult = SelectedSession | CancelledSessionSelection | ForkHeldSessionSelection;
+/** A session another process holds, as checked when it is chosen. */
+export interface HeldSession {
+	readonly error: SessionHeldError;
+	/**
+	 * Continue here (design §13 L1), only when the holder is a broker-launched host: close it and
+	 * claim the session for the caller, which releases the claim once its open has claimed.
+	 */
+	readonly handOver?: () => Promise<SessionHandoverOutcome>;
+}
 /** Whether another process holds a session, checked when it is chosen (enforce only). */
-export type HeldSessionCheck = (session: SessionInfo) => Promise<SessionHeldError | undefined>;
+export type HeldSessionCheck = (session: SessionInfo) => Promise<HeldSession | undefined>;
 export type SessionInspector = (sessionPath: string) => Promise<ResumeTailInspection>;
 
 /** One picker row. Keep each newline as its own space, then drop terminal controls. */
@@ -58,6 +74,8 @@ type SelectorState =
 	| { kind: "checking"; session: SessionInfo; token: number }
 	| { kind: "confirming"; session: SessionInfo; token: number; identity: ResumeSessionIdentity }
 	| { kind: "warning"; session: SessionInfo; token: number }
+	/** Continue here is closing the holder: input is frozen and it cannot be cancelled. */
+	| { kind: "handing-over"; session: SessionInfo; token: number }
 	| { kind: "settled" };
 
 class SessionList implements Component {
@@ -354,11 +372,13 @@ export class SessionSelectorComponent extends Container {
 		else this.onCancel();
 	}
 	#cancel(): void {
-		if (this.#state.kind === "settled") return;
+		if (this.#state.kind === "settled" || this.#state.kind === "handing-over") return;
 		if (this.#state.kind === "checking") this.#nextToken++;
 		this.#settle({ kind: "cancelled" });
 	}
 	#exit(): void {
+		// A handover cannot be interrupted (it is bounded); Ctrl+C is ignored until it settles.
+		if (this.#state.kind === "handing-over") return;
 		if (this.#state.kind !== "settled") this.#nextToken++;
 		this.#state = { kind: "settled" };
 		this.#sessionList.setInputFrozen(true);
@@ -400,11 +420,20 @@ export class SessionSelectorComponent extends Container {
 			const held = this.#heldCheck ? await this.#heldCheck(session) : undefined;
 			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
 			if (this.#heldCheck)
-				this.#sessionList.setHeldMarker(session.id, held && sessionOwnerHolderMarker(held.holder));
+				this.#sessionList.setHeldMarker(session.id, held && sessionOwnerHolderMarker(held.error.holder));
 			if (held) {
 				this.#showHeldWarning(session, token, held);
 				return;
 			}
+		} catch (error) {
+			this.#failCheck(token, error);
+			return;
+		}
+		await this.#inspectChosen(session, token, inspector);
+	}
+	/** The inspection and resume confirmation of a chosen session nobody else holds. */
+	async #inspectChosen(session: SessionInfo, token: number, inspector: SessionInspector): Promise<void> {
+		try {
 			const inspection = await inspector(session.path);
 			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
 			if (inspection.kind === "error") {
@@ -420,21 +449,112 @@ export class SessionSelectorComponent extends Container {
 			}
 			this.#showResumeConfirmation(session, token, inspection.identity);
 		} catch (error) {
-			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
-			this.#state = { kind: "browsing" };
-			this.#sessionList.setInputFrozen(false);
-			this.#showError(error instanceof Error ? error.message : String(error));
-			this.#requestRender();
+			this.#failCheck(token, error);
 		}
 	}
-	#showResumeConfirmation(session: SessionInfo, token: number, identity: ResumeSessionIdentity): void {
+	#failCheck(token: number, error: unknown): void {
+		if (this.#state.kind !== "checking" || this.#state.token !== token) return;
+		this.#state = { kind: "browsing" };
+		this.#sessionList.setInputFrozen(false);
+		this.#showError(error instanceof Error ? error.message : String(error));
+		this.#requestRender();
+	}
+	/**
+	 * Continue here: the read-only inspection and the resume confirmation come first, so nothing is
+	 * closed before the user's final yes; then the handover, which cannot be cancelled.
+	 */
+	async #continueHere(session: SessionInfo, token: number, held: HeldSession): Promise<void> {
+		const inspector = this.inspector;
+		if (!held.handOver || !inspector) return;
+		this.#state = { kind: "checking", session, token };
+		this.#requestRender();
+		let inspection: ResumeTailInspection;
+		try {
+			inspection = await inspector(session.path);
+		} catch (error) {
+			this.#failCheck(token, error);
+			return;
+		}
+		if (this.#state.kind !== "checking" || this.#state.token !== token) return;
+		if (inspection.kind === "error") {
+			this.#failCheck(token, `Unable to inspect session (${inspection.reason}).`);
+			return;
+		}
+		if (inspection.kind === "terminal") {
+			await this.#handOverAndSettle(session, token, held, inspector, "open-idle");
+			return;
+		}
+		this.#showResumeConfirmation(session, token, inspection.identity, () =>
+			this.#handOverAndSettle(session, token, held, inspector, "continue-tail"),
+		);
+	}
+	async #handOverAndSettle(
+		session: SessionInfo,
+		token: number,
+		held: HeldSession,
+		inspector: SessionInspector,
+		action: SelectedSession["action"],
+	): Promise<void> {
+		if (!held.handOver) return;
+		const dialog = this.#confirmationDialog;
+		if (dialog) this.removeChild(dialog);
+		this.#confirmationDialog = null;
+		this.#state = { kind: "handing-over", session, token };
+		this.#sessionList.setInputFrozen(true);
+		this.#messageContainer.clear();
+		this.#messageContainer.addChild(new Text(theme.fg("muted", "Handing the session over…"), 1, 0));
+		this.#requestRender();
+		// Still this handover: nothing settled the picker meanwhile.
+		const current = () => this.#state.kind === "handing-over" && this.#state.token === token;
+		let claim: SessionOwnerClaim | undefined;
+		try {
+			const outcome = await held.handOver();
+			if (outcome.kind === "closed") claim = outcome.claim;
+			if (!current()) {
+				claim?.release();
+				return;
+			}
+			if (outcome.kind === "refused") {
+				this.#clearError();
+				this.#showHeldWarning(session, token, held, outcome.message);
+				return;
+			}
+			this.#sessionList.setHeldMarker(session.id, undefined);
+			// Read the tail again under the claim: the host may have finished a turn since the first read.
+			const inspection = await inspector(session.path);
+			if (!current()) {
+				claim?.release();
+				return;
+			}
+			if (inspection.kind === "error") throw new Error(`Unable to inspect session (${inspection.reason}).`);
+			const settled = { kind: "selected", path: session.path, identity: inspection.identity } as const;
+			this.#settle({
+				...settled,
+				action: inspection.kind === "terminal" ? "open-idle" : action,
+				...(claim ? { admission: claim } : {}),
+			});
+		} catch (error) {
+			// Never back to the list while holding the session, and never on a picker that closed.
+			claim?.release();
+			if (!current()) return;
+			this.#state = { kind: "checking", session, token };
+			this.#failCheck(token, error);
+		}
+	}
+	#showResumeConfirmation(
+		session: SessionInfo,
+		token: number,
+		identity: ResumeSessionIdentity,
+		onYes?: () => Promise<void>,
+	): void {
 		this.#state = { kind: "confirming", session, token, identity };
 		const dialog = new HookSelectorComponent(
 			"Resume this session?",
 			["Yes", "No"],
 			option => {
 				if (this.#confirmationDialog !== dialog || this.#state.kind !== "confirming") return;
-				if (option === "Yes")
+				if (option === "Yes" && onYes) void onYes();
+				else if (option === "Yes")
 					this.#settle({ kind: "selected", path: session.path, identity, action: "continue-tail" });
 				else this.#settle({ kind: "cancelled" });
 			},
@@ -445,27 +565,37 @@ export class SessionSelectorComponent extends Container {
 		this.addChild(dialog);
 		this.#requestRender();
 	}
-	#showHeldWarning(session: SessionInfo, token: number, error: SessionHeldError): void {
+	#showHeldWarning(session: SessionInfo, token: number, held: HeldSession, note?: string): void {
 		this.#state = { kind: "warning", session, token };
-		const dialog = createHeldSessionWarning(error, choice => {
-			if (this.#confirmationDialog !== dialog || this.#state.kind !== "warning") return;
-			switch (choice) {
-				case "fork":
-					this.#settle({ kind: "fork", path: session.path, error });
-					return;
-				case "cancel":
-					this.removeChild(dialog);
-					this.#confirmationDialog = null;
-					this.#state = { kind: "browsing" };
-					this.#sessionList.setInputFrozen(false);
-					this.#requestRender();
-					return;
-				default: {
-					const unknown: never = choice;
-					throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+		const { error } = held;
+		const dialog = createHeldSessionWarning(
+			error,
+			choice => {
+				if (this.#confirmationDialog !== dialog || this.#state.kind !== "warning") return;
+				switch (choice) {
+					case "fork":
+						this.#settle({ kind: "fork", path: session.path, error });
+						return;
+					case "continue":
+						this.removeChild(dialog);
+						this.#confirmationDialog = null;
+						void this.#continueHere(session, token, held);
+						return;
+					case "cancel":
+						this.removeChild(dialog);
+						this.#confirmationDialog = null;
+						this.#state = { kind: "browsing" };
+						this.#sessionList.setInputFrozen(false);
+						this.#requestRender();
+						return;
+					default: {
+						const unknown: never = choice;
+						throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+					}
 				}
-			}
-		});
+			},
+			{ continueHere: held.handOver !== undefined, note },
+		);
 		this.#confirmationDialog = dialog;
 		this.addChild(dialog);
 		this.#requestRender();

@@ -189,6 +189,48 @@ describe.if(supported)("broker session.resume of a session another process holds
 		expect(fixture.launchAttempts()).toBe(0);
 	});
 
+	// Continue here (design §13 L1): the terminal taking a session over fences the gap between the
+	// closed host's exit and its own claim with a live generation-0 row. A resume in that gap, with
+	// no claim held, waits for the terminal's endpoint instead of refusing the endpointless row.
+	it("enforce: a live generation-0 row with the claim free waits for the endpoint published after it", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		const terminal = await holdInAnotherProcess(fixture.sessionId);
+		await terminal.release();
+		const incarnation = processIncarnation(terminal.pid);
+		const registration = (endpointGeneration: number, stateRoot: string, endpointMtimeMs?: number) => ({
+			type: "host_registered" as const,
+			sessionId: fixture.sessionId,
+			locator: { cwd: fixture.root, worktreeRoot: null, stateRoot },
+			endpointGeneration,
+			pid: terminal.pid,
+			...(incarnation ? { processIncarnation: incarnation } : {}),
+			...(endpointMtimeMs === undefined ? {} : { endpointMtimeMs }),
+		});
+		await fixture.broker.index.append(registration(0, fixture.agentDir));
+
+		const resumed = fixture.resume();
+		await Bun.sleep(300);
+		const endpointPath = path.join(fixture.stateRoot, "sdk", `${fixture.sessionId}.json`);
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({
+				sessionId: fixture.sessionId,
+				pid: terminal.pid,
+				url: "ws://127.0.0.1:1",
+				token: "terminal",
+			}),
+		);
+		await fixture.broker.index.append(registration(1, fixture.stateRoot, (await fs.stat(endpointPath)).mtimeMs));
+
+		expect(await resumed).toMatchObject({
+			ok: true,
+			result: { sessionId: fixture.sessionId, pid: terminal.pid, reused: true, endpoint: { token: "terminal" } },
+		});
+		expect(fixture.launchAttempts()).toBe(0);
+	});
+
 	it("observe: when no endpoint appears it launches as before after a 2 s wait, and never refuses", async () => {
 		SessionOwnershipTestHooks.mode = "observe";
 		const fixture = await brokerWithSavedSession();

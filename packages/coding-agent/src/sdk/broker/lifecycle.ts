@@ -1544,6 +1544,21 @@ async function foreignSessionClaim(sessionId: string): Promise<{ holder: Session
 }
 
 /**
+ * Under `enforce`, a live generation-0 row of another process counts as a holder even while the
+ * claim is free: a terminal taking the session over with Continue here (design §13 L1) appends it
+ * before the broker closes the host, and claims only once the host has exited. A resume in that gap
+ * waits for the terminal's endpoint instead of refusing the endpointless row or launching a host.
+ */
+function handoverFence(authority: LiveResumeAuthority): { holder: SessionOwnerHolder | undefined } | undefined {
+	return resumeOwnershipMode() === "enforce" &&
+		authority.kind === "live" &&
+		authority.record.endpointGeneration === 0 &&
+		authority.record.pid !== process.pid
+		? { holder: undefined }
+		: undefined;
+}
+
+/**
  * The one outcome of a resume refused (under `enforce`) because another process holds the session
  * and has no endpoint to attach to: the resume wait ran out, or the launched host's claim was refused.
  * `live_session` is the code resume already uses for a live session it cannot attach to, and every
@@ -1605,7 +1620,7 @@ async function awaitHeldSessionEndpoint(
 		await broker.index.refreshIfChanged();
 		authority = liveResumeAuthority(broker.index.listSessions().sessions, sessionId);
 		if (authority.kind === "ambiguous" || hasResumableEndpoint(authority, sessionId)) break;
-		claim = await foreignSessionClaim(sessionId);
+		claim = (await foreignSessionClaim(sessionId)) ?? handoverFence(authority);
 	}
 	return { authority, waitedMs: timing.now() - startedAt };
 }
@@ -7292,7 +7307,7 @@ async function executeLifecycleResponse(
 				authority.kind !== "ambiguous" &&
 				!hasResumableEndpoint(authority, requestedSessionId)
 			) {
-				const claim = await foreignSessionClaim(requestedSessionId);
+				const claim = (await foreignSessionClaim(requestedSessionId)) ?? handoverFence(authority);
 				if (claim) {
 					const readiness = startupAdmittedInputs.has(input)
 						? 0

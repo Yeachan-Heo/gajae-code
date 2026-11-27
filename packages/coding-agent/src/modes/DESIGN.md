@@ -532,9 +532,13 @@ factory over `HookSelectorComponent`).
   a bold heading `This session is open in another process`, one line naming the session by
   its short id and the holder by its fixed phrase (`another terminal (pid N)`), one line
   `Only one process can write a session at a time.`, then the options `Fork into a new
-  session — copy the conversation and continue there` (focused) and `Cancel`, the standard
-  dim key hint, border. At launch and in the picker, `f` and `c` are accelerators; the
-  `/resume` hook selector has none.
+  session — copy the conversation and continue there` (focused), `Continue here — close the
+  session host and open it here` (only when the holder is a broker-launched host) and
+  `Cancel`, the standard dim key hint, border. At launch and in the picker, `f`, `h` and `c`
+  are accelerators; the `/resume` hook selector has none.
+- **Continue here refused:** when the host is running a turn, the same dialog shows again
+  with one blank line and `The session is running a turn; try again when it finishes.` under
+  the warning lines; any other refusal shows its fixed reason there.
 - **Where it appears:** before the TUI starts (a one-shot TUI after one blank row, as the
   picker does), appended under the `--resume` picker like the resume confirmation, and as
   the TUI's hook selector for `/resume`. Escape is Cancel everywhere.
