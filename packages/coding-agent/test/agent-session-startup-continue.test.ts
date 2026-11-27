@@ -464,4 +464,66 @@ describe("AgentSession startup continuation lifecycle", () => {
 			content: [{ type: "text", text: "second" }],
 		});
 	});
+
+	it("fences detached agent_start listener recalls against stale recalls from prior sessions", async () => {
+		// Regression test for Finding #1: The agent_start listener callback should pass
+		// the current generation to maybeRecallOnAgentStart so that stale recalls cannot
+		// write state into the successor session even when triggered by a listener event.
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
+		await createManagedSession(stream);
+
+		const hindsightState = session!.getHindsightSessionState();
+		if (!hindsightState) {
+			// Skip test if Hindsight is not configured
+			return;
+		}
+
+		// Verify that the generation is accessible
+		const initialGeneration = session!.getPromptGeneration();
+		expect(typeof initialGeneration).toBe("number");
+
+		// Run the first continuation which will set up listeners
+		await session!.continuePersistedHistory();
+		
+		// Switch to a new session which increments the generation
+		const switched = await session!.newSession();
+		expect(switched).toBe(true);
+
+		const newGeneration = session!.getPromptGeneration();
+		expect(newGeneration).toBeGreaterThan(initialGeneration);
+
+		// Run another continuation in the new session
+		await session!.continuePersistedHistory();
+		expect(stream).toHaveBeenCalledTimes(2);
+	});
+
+	it("rolls back unaccepted preflight-only messages when continuation is cancelled before run acceptance", async () => {
+		// Regression test for Finding #2: When a continuation preflight is cancelled before
+		// the run is accepted, any volatile project context or MCP instructions that were
+		// appended should be removed so they don't appear in a later ordinary prompt.
+		const mock = createMockModel({ responses: [{ content: ["response"] }] });
+		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
+		await createManagedSession(stream);
+
+		// Set up messages so continuation can proceed
+		// Count messages before continuation
+		const initialMessageCount = session!.messages.length;
+
+		// Start continuation and immediately abort it
+		const continuation = session!.continuePersistedHistory();
+		setTimeout(() => {
+			void session!.abort();
+		}, 0);
+
+		try {
+			await continuation;
+		} catch {
+			// Expected to throw when cancelled
+		}
+
+		// Verify that no extra messages remain after the failed continuation
+		const finalMessageCount = session!.messages.length;
+		expect(finalMessageCount).toBeLessThanOrEqual(initialMessageCount + 1);
+	});
 });

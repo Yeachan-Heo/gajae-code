@@ -7045,6 +7045,12 @@ export class AgentSession {
 	getAgentId(): string | undefined {
 		return this.#agentId;
 	}
+
+	/** Get the current prompt generation/attempt epoch. Used to fence state mutations across session transitions. */
+	getPromptGeneration(): number {
+		return this.#promptGeneration;
+	}
+
 	get isDisposed(): boolean {
 		return this.#isDisposed;
 	}
@@ -13294,6 +13300,9 @@ export class AgentSession {
 		await this.#awaitPromptPreflight(generation, preflightSignal, this.#awaitStartupTurnBarrier(preflightSignal));
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		const inFlightPrompt = this.#beginInFlight();
+		// Track message count before appending preflight-only messages; we'll roll them back
+		// if preflight is cancelled before the run is accepted.
+		const messageCountBeforePreflight = this.agent.state.messages.length;
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
 		try {
@@ -13354,6 +13363,12 @@ export class AgentSession {
 			});
 			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
 		} finally {
+			// Roll back any preflight-only messages if the continuation was cancelled
+			// before the run was accepted.
+			if (continuationSdkRunToken === undefined && this.agent.state.messages.length > messageCountBeforePreflight) {
+				const currentMessages = this.agent.state.messages;
+				this.agent.replaceMessages(currentMessages.slice(0, messageCountBeforePreflight));
+			}
 			await this.#settleEndedInFlight(
 				inFlightPrompt,
 				continuationSdkRunToken === undefined ? "full" : "publication",

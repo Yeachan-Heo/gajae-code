@@ -496,7 +496,8 @@ export class HindsightSessionState {
 		this.unsubscribe?.();
 		this.unsubscribe = this.session.subscribe(event => {
 			if (event.type === "agent_start") {
-				void this.maybeRecallOnAgentStart();
+				// Pass the current generation to fence against stale recalls from prior sessions.
+				void this.maybeRecallOnAgentStart(this.session.getPromptGeneration());
 			} else if (event.type === "agent_end") {
 				void this.maybeRetainOnAgentEnd();
 				// Drain any queued tool-initiated retain calls now that the turn
