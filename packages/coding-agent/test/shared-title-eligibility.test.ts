@@ -16,6 +16,9 @@ import {
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
+
+pinSharedPublicationMode();
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
