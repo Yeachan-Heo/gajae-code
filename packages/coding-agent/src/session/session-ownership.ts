@@ -92,6 +92,8 @@ export interface SessionOwnerClaim {
 	/** True when this process already held the session and this claim shares it. */
 	readonly shared: boolean;
 	readonly released: boolean;
+	/** How many claims in this process share the session's lock now, this one included; 0 once released. */
+	readonly holders: number;
 	/** Drop this claim. Idempotent; the last claim of a session removes the record, then unlocks. */
 	release(): void;
 }
@@ -509,6 +511,10 @@ class Claim implements SessionOwnerClaim {
 
 	get released(): boolean {
 		return this.#released;
+	}
+
+	get holders(): number {
+		return this.#released ? 0 : this.#entry.holders;
 	}
 
 	release(): void {

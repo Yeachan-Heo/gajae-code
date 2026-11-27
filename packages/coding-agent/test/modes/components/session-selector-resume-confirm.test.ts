@@ -208,6 +208,7 @@ describe("SessionSelectorComponent resume consent", () => {
 			surface: "terminal",
 			shared: false,
 			released: false,
+			holders: 1,
 			release: vi.fn(),
 		} as const;
 		const closing = Promise.withResolvers<SessionHandoverOutcome>();

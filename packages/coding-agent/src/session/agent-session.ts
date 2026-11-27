@@ -33816,13 +33816,17 @@ export class AgentSession {
 
 	/**
 	 * The single eligibility rule for admitted shared publication (#7824):
-	 * managed destination && (root shared mode || session already requires shared admission).
+	 * managed destination && ((root shared mode && not the session's sole owner) || session already
+	 * requires shared admission). A root session whose manager is the only writer of its session
+	 * (single-owner step 9) takes the legacy route; a latched bar still wins.
 	 * Every migrated control and canonical producer routes through this predicate.
 	 */
 	#usesSharedSessionPublication(): boolean {
+		const manager = this.sessionManager;
 		return (
-			this.sessionManager.isManagedDestination() &&
-			(this.#rootInteractiveSharedAppend || this.sessionManager.requiresSharedMutationAdmission())
+			manager.isManagedDestination() &&
+			((this.#rootInteractiveSharedAppend && !manager.isSoleOwnerRoute()) ||
+				manager.requiresSharedMutationAdmission())
 		);
 	}
 

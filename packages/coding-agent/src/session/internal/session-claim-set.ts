@@ -279,6 +279,8 @@ export class SessionClaimSet {
 	readonly #reclaims = new Map<string, { readonly attempts: number; readonly notBefore: number }>();
 	/** Ids a refused write queued a background re-attempt for. */
 	readonly #reclaimQueued = new Set<string>();
+	/** Ids {@link enterSoleOwnerRoute} admitted, until a new claim of the id is added. */
+	readonly #soleOwnerRoute = new Set<string>();
 
 	constructor(ownership: ResolvedSessionOwnership = resolveSessionOwnership()) {
 		this.#ownership = ownership;
@@ -310,6 +312,28 @@ export class SessionClaimSet {
 
 	has(sessionId: string): boolean {
 		return this.#claims.has(sessionId);
+	}
+
+	/** Whether {@link enterSoleOwnerRoute} admitted `sessionId` and no new claim of it was added since. */
+	isSoleOwnerRoute(sessionId: string): boolean {
+		return this.#soleOwnerRoute.has(sessionId);
+	}
+
+	/**
+	 * Admit `sessionId`, the current id, to the sole-owner route (single-owner step 9): this set holds
+	 * its claim under enforce, in the mode the factory read and in the live mode, and no other claim
+	 * in this process shares the lock. Once admitted it stays admitted until a new claim of the id is
+	 * added, so a later second holder, the release at close or a lowered live mode never switches a
+	 * running session's write path. Nothing is remembered for a refusal: a claim in flight, a
+	 * fail-open (`unavailable`, `timed_out`), observe and off.
+	 */
+	enterSoleOwnerRoute(sessionId: string): boolean {
+		if (this.#soleOwnerRoute.has(sessionId)) return true;
+		if (this.#mode !== "enforce" || this.#closed || sessionId !== this.#current) return false;
+		if (this.#claims.get(sessionId)?.holders !== 1) return false;
+		if (liveSessionOwnershipModeFor(this.#mode) !== "enforce") return false;
+		this.#soleOwnerRoute.add(sessionId);
+		return true;
 	}
 
 	/**
@@ -600,6 +624,8 @@ export class SessionClaimSet {
 			return;
 		}
 		this.#claims.set(claim.sessionId, claim);
+		// A new claim of the id is a new open of it: its route is decided again.
+		this.#soleOwnerRoute.delete(claim.sessionId);
 		// A target staged outside the transition that rotates to it is exposed to any unrelated
 		// transition's settle. Visible in observe; off stays inert.
 		if (
