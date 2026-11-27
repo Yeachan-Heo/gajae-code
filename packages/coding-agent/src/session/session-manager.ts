@@ -11609,6 +11609,15 @@ export class SessionManager {
 				: new AggregateError(errors, "Prepared session temporary-file cleanup failed.");
 	}
 
+	/**
+	 * The decision a scoped claim on another session is made under: this manager's, or, for an
+	 * exempt manager (an in-memory TUI's picker still writes other sessions' files), the process's.
+	 */
+	#scopedClaimOwnership(): ResolvedSessionOwnership {
+		const ownership = this.#ownershipClaims.ownership;
+		return ownership === "exempt" ? resolveSessionOwnership() : ownership;
+	}
+
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
 	async dropSession(sessionPath: string): Promise<void> {
 		// The own-session check below compares unresolved paths, so an aliased spelling of
@@ -11634,7 +11643,7 @@ export class SessionManager {
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
 				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
 				// Scoped claim (design §1 row 17): taken before the detach, so a held session is never touched.
-				await withScopedSessionClaim(this.#ownershipClaims.ownership, candidate.sessionId, "delete", async () => {
+				await withScopedSessionClaim(this.#scopedClaimOwnership(), candidate.sessionId, "delete", async () => {
 					if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
 					await this.#closePersistWriter();
 					this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
@@ -11657,12 +11666,7 @@ export class SessionManager {
 					{ growing: true },
 				);
 				if (header.ok)
-					await withScopedSessionClaim(
-						this.#ownershipClaims.ownership,
-						header.inspection.sessionId,
-						"delete",
-						drop,
-					);
+					await withScopedSessionClaim(this.#scopedClaimOwnership(), header.inspection.sessionId, "delete", drop);
 				else await drop();
 			}
 		} catch (err) {
@@ -19404,7 +19408,7 @@ export class SessionManager {
 			starred,
 			this.destination.kind === "explicit" ? this.destination.directory : undefined,
 			this.#publishedSharedSession(session.id),
-			this.#ownershipClaims.ownership,
+			this.#scopedClaimOwnership(),
 		);
 	}
 

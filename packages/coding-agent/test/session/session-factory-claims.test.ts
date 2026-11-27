@@ -580,6 +580,11 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			`Can't star this session: ${held}`,
 		);
 		await expect(tui.dropSession(file)).rejects.toThrow(`Can't delete this session: ${held}`);
+		// An in-memory TUI's manager claims nothing itself, but its picker still writes other sessions' files.
+		const memory = keep(SessionManager.inMemory(place.cwd));
+		await expect(memory.setSessionStarredForPicker(await row(), true)).rejects.toThrow(
+			`Can't star this session: ${held}`,
+		);
 		expect(await tree(place.root)).toEqual(before);
 		expect((await inspectSessionOwners()).held.filter(sidecar => sidecar.self && sidecar.sessionId === id)).toEqual(
 			[],
