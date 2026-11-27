@@ -16570,7 +16570,7 @@ export class AgentSession {
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		await this.#awaitPromptPreflight(generation, preflightSignal, this.#awaitStartupTurnBarrier(preflightSignal));
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
-		await this.#withSessionAdmission("prompt", async () => {});
+		await this.#withSessionAdmission("prompt", async () => {}, preflightSignal);
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
@@ -16646,6 +16646,12 @@ export class AgentSession {
 				},
 			});
 			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
+		} catch (error) {
+			if (isPromptPreflightCancelledError(error)) {
+				const hindsightState = this.getHindsightSessionState();
+				hindsightState?.invalidateOutstandingRecall();
+			}
+			throw error;
 		} finally {
 			await this.#settleEndedInFlight(
 				inFlightPrompt,

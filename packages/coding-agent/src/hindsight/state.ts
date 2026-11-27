@@ -221,6 +221,8 @@ export class HindsightSessionState {
 	#autoRetainPending = false;
 	/** Conversation epoch incremented on resetConversationTracking; fences concurrent recall operations. */
 	#conversationEpoch = 0;
+	/** Recall attempt generation incremented on invalidateOutstandingRecall; fences preflight cancellations. */
+	#recallAttemptGeneration = 0;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -249,6 +251,11 @@ export class HindsightSessionState {
 		this.lastRecallSnippet = undefined;
 		this.lastInjectedRecallSnippetHash = undefined;
 		this.#conversationEpoch++;
+	}
+
+	/** Invalidate any outstanding recall attempt, e.g. when a preflight is cancelled. */
+	invalidateOutstandingRecall(): void {
+		this.#recallAttemptGeneration++;
 	}
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
@@ -402,8 +409,10 @@ export class HindsightSessionState {
 
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
-		// Capture the conversation epoch to fence against concurrent session transitions.
+		// Capture the conversation epoch and recall attempt generation to fence against
+		// concurrent session transitions and preflight cancellations.
 		const epoch = this.#conversationEpoch;
+		const generation = this.#recallAttemptGeneration;
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(m => m.role === "user");
 		if (!lastUser) return;
@@ -413,10 +422,12 @@ export class HindsightSessionState {
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return;
 
-		// Fence: only write state if the conversation epoch hasn't changed.
+		// Fence: only write state if the conversation epoch and recall generation haven't changed.
 		// A session transition via resetConversationTracking increments the epoch,
 		// so stale recalls from a previous session will not pollute the current session's state.
-		if (this.#conversationEpoch !== epoch) return;
+		// A preflight cancellation via invalidateOutstandingRecall increments the generation,
+		// so cancelled recalls will not commit state into the next prompt.
+		if (this.#conversationEpoch !== epoch || this.#recallAttemptGeneration !== generation) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;
