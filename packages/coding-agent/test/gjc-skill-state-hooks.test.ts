@@ -469,6 +469,41 @@ describe("GJC native skill-state hooks", () => {
 			expect(modeState.threshold_source).toBe("default");
 		});
 
+		it("reads options only before the idea, so flag-like idea text never changes the target", async () => {
+			const root = await cwd();
+			const configPath = await writeProjectThreshold(root, 0.2);
+			const configured = await seedThreshold(root, "session-idea-threshold-text", {
+				args: "design a parser that accepts --threshold 0.8",
+			});
+			expect(configured.threshold).toBeCloseTo(0.2);
+			expect(await fs.realpath(configured.threshold_source)).toBe(await fs.realpath(configPath));
+
+			const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-hooks-idea-"));
+			try {
+				const unconfigured = await seedThreshold(otherRoot, "session-idea-mode-text", {
+					args: "explain when to pass --quick to a CLI",
+				});
+				expect(unconfigured.threshold).toBeCloseTo(0.05);
+				expect(unconfigured.threshold_source).toBe("default");
+			} finally {
+				await fs.rm(otherRoot, { recursive: true, force: true });
+			}
+		});
+
+		it("still seeds guarded workflow state when threshold settings cannot be read", async () => {
+			const root = await cwd();
+			// A retained legacy project settings.json plus an unreadable migration marker
+			// (a directory, so the read fails with a non-ENOENT error) makes the resolver throw.
+			await Bun.write(path.join(root, ".gjc", "settings.json"), "{}\n");
+			await fs.mkdir(path.join(root, ".gjc", "state", "settings.json.migrated-keys"), { recursive: true });
+			const modeState = await seedThreshold(root, "session-threshold-read-failure", { args: "--quick idea" });
+			expect(modeState).toMatchObject({ active: true, current_phase: "interviewing" });
+			expect(modeState.threshold).toBeCloseTo(0.05);
+			expect(modeState.threshold_source).toBe("default");
+			const active = await readVisibleSkillActiveState(root, "session-threshold-read-failure");
+			expect(active).toMatchObject({ active: true, skill: "deep-interview" });
+		});
+
 		it("keeps the seeded threshold when the skill is re-invoked with a new flag during an active interview", async () => {
 			const root = await cwd();
 			const first = await seedThreshold(root, "session-resume-keeps-threshold", { args: "--deep idea" });

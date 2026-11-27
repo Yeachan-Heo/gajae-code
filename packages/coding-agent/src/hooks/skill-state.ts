@@ -3,7 +3,11 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { resolveSkillScopeTrust, type SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
-import { resolveSkillActivationAmbiguityThreshold } from "../gjc-runtime/deep-interview-threshold";
+import {
+	DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD,
+	type ResolvedAmbiguityThreshold,
+	resolveSkillActivationAmbiguityThreshold,
+} from "../gjc-runtime/deep-interview-threshold";
 import { captureRepositoryBinding, publicRepositoryBinding } from "../gjc-runtime/repository-binding";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
@@ -446,10 +450,19 @@ async function seedSkillActivationState(
 		// Seed with the CLI seed's precedence (invocation flags, the session
 		// profile's config, then the default) because the skill's Phase 0 trusts
 		// pre-resolved state (#7316).
-		const resolved = await resolveSkillActivationAmbiguityThreshold(input.cwd, {
-			args: input.args,
-			agentDir: input.agentDir,
-		});
+		// A settings read failure must not skip the guarded mode/active writes
+		// below (the workflow mutation guard depends on them), so it falls back to
+		// the base default the seed used before threshold resolution existed.
+		let resolved: ResolvedAmbiguityThreshold;
+		try {
+			resolved = await resolveSkillActivationAmbiguityThreshold(input.cwd, {
+				args: input.args,
+				agentDir: input.agentDir,
+			});
+		} catch (error) {
+			logger.warn(`gjc skill-state: deep-interview threshold resolution failed; seeding the default: ${error}`);
+			resolved = { threshold: DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD, source: "default" };
+		}
 		modeState.threshold = resolved.threshold;
 		modeState.threshold_source = resolved.source;
 	}

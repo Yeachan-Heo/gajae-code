@@ -56,37 +56,55 @@ export async function resolveConfiguredAmbiguityThreshold(
  * or the `$deep-interview` keyword) with the same precedence as the CLI seed:
  * `--threshold` > configured value > `--quick`/`--standard`/`--deep` > default.
  *
- * Activation must not fail on a malformed request, so an invalid `--threshold`
- * value or conflicting resolution flags are ignored here and resolution falls
- * through to the next layer.
+ * Only the leading option segment is read (`[options] <idea>`): the first token
+ * that is not a recognized option starts the free-form idea, so flag-like text
+ * inside the idea never changes the target. Activation must not fail on a
+ * malformed request, so an invalid `--threshold` value or conflicting
+ * resolution flags are ignored and resolution falls through to the next layer.
  */
 export async function resolveSkillActivationAmbiguityThreshold(
 	cwd: string,
 	options: { args?: string; agentDir?: string } = {},
 ): Promise<ResolvedAmbiguityThreshold> {
-	const tokens = options.args?.trim().split(/\s+/).filter(Boolean) ?? [];
-	const explicit = explicitThresholdFlag(tokens);
-	if (explicit !== undefined) return { threshold: explicit, source: "flag:--threshold" };
+	const leading = parseLeadingThresholdOptions(options.args);
+	if (leading.threshold !== undefined) return { threshold: leading.threshold, source: "flag:--threshold" };
 	const configured = await resolveConfiguredAmbiguityThreshold(cwd, options.agentDir);
 	if (configured) return configured;
-	const resolutions = (Object.keys(RESOLUTION_THRESHOLDS) as DeepInterviewResolution[]).filter(name =>
-		tokens.includes(`--${name}`),
-	);
-	if (resolutions.length === 1) {
-		const [resolution] = resolutions;
+	if (leading.resolutions.length === 1) {
+		const [resolution] = leading.resolutions;
 		return { threshold: RESOLUTION_THRESHOLDS[resolution], source: `flag:--${resolution}` };
 	}
 	return { threshold: DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD, source: "default" };
 }
 
-function explicitThresholdFlag(tokens: readonly string[]): number | undefined {
+interface LeadingThresholdOptions {
+	threshold?: number;
+	resolutions: DeepInterviewResolution[];
+}
+
+/** Read threshold options from the leading `[options]` segment, stopping at the idea text. */
+export function parseLeadingThresholdOptions(args: string | undefined): LeadingThresholdOptions {
+	const tokens = args?.trim().split(/\s+/).filter(Boolean) ?? [];
+	const result: LeadingThresholdOptions = { resolutions: [] };
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
-		const raw =
-			token === "--threshold" ? tokens[index + 1] : token.startsWith("--threshold=") ? token.slice(12) : undefined;
-		if (raw === undefined) continue;
-		const parsed = Number(raw);
-		if (Number.isFinite(parsed) && parsed > 0 && parsed <= 1) return parsed;
+		if (token === "--quick" || token === "--standard" || token === "--deep") {
+			const resolution = token.slice(2) as DeepInterviewResolution;
+			if (!result.resolutions.includes(resolution)) result.resolutions.push(resolution);
+			continue;
+		}
+		if (token === "--trace") continue;
+		if (token === "--threshold-source") {
+			index++;
+			continue;
+		}
+		if (token === "--threshold" || token.startsWith("--threshold=")) {
+			const raw = token === "--threshold" ? tokens[++index] : token.slice("--threshold=".length);
+			const parsed = Number(raw);
+			if (raw !== undefined && Number.isFinite(parsed) && parsed > 0 && parsed <= 1) result.threshold = parsed;
+			continue;
+		}
+		break;
 	}
-	return undefined;
+	return result;
 }
