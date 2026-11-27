@@ -279,13 +279,8 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	const provider = resolveOAuthStorageProvider(providerArg);
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	try {
-		try {
-			store.deleteAuthCredentialsForProvider(provider, "logged out by user");
-		} catch (error) {
-			// Nothing was disabled, so the broker keeps serving these credentials.
-			writeCommandFailure("logout", flags, error);
-			return;
-		}
+		// A failed write throws before the success line; runAuthBrokerCommand reports it and sets exit code 1.
+		store.deleteAuthCredentialsForProvider(provider, "logged out by user");
 		process.stdout.write(`Logged out of ${provider}\n`);
 	} finally {
 		store.close();
@@ -813,7 +808,7 @@ export async function runAuthBrokerCommand(cmd: AuthBrokerCommandArgs): Promise<
 			}
 		}
 	} catch (error) {
-		if (cmd.action === "status" || cmd.action === "import" || cmd.action === "migrate") {
+		if (cmd.action === "status" || cmd.action === "import" || cmd.action === "migrate" || cmd.action === "logout") {
 			writeCommandFailure(cmd.action, cmd.flags, error);
 			return;
 		}

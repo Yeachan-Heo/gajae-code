@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AuthStorage, type CredentialDisabledEvent, SqliteAuthCredentialStore } from "../src/auth-storage";
+import { logger } from "@gajae-code/utils";
+import {
+	type AuthCredentialStore,
+	AuthStorage,
+	type CredentialDisabledEvent,
+	SqliteAuthCredentialStore,
+} from "../src/auth-storage";
 import * as oauthUtils from "../src/utils/oauth";
 import { withEnv } from "./helpers";
 
@@ -151,7 +157,7 @@ describe("credential delete failures (#8091)", () => {
 			expect(readRow(id).disabled_cause).toBeNull();
 		});
 
-		test("reload keeps a duplicate in memory when its delete fails", async () => {
+		async function seedDuplicateOAuth(): Promise<void> {
 			await authStorage.set("anthropic", {
 				type: "oauth",
 				access: "access",
@@ -166,6 +172,10 @@ describe("credential delete failures (#8091)", () => {
 				[originalId],
 			);
 			expect(store.listAuthCredentials("anthropic")).toHaveLength(2);
+		}
+
+		test("reload keeps a duplicate in memory when its delete fails", async () => {
+			await seedDuplicateOAuth();
 			makeReadOnly();
 
 			await authStorage.reload();
@@ -175,27 +185,92 @@ describe("credential delete failures (#8091)", () => {
 			expect(store.listAuthCredentials("anthropic")).toHaveLength(2);
 		});
 
+		test("reload with a remote store keeps duplicates without attempting the delete or warning", async () => {
+			await seedDuplicateOAuth();
+			// Mirror RemoteAuthCredentialStore: the synchronous delete always throws, and
+			// mutations go through disableAuthCredentialRemote.
+			const deleteAttempts: number[] = [];
+			store.deleteAuthCredential = id => {
+				deleteAttempts.push(id);
+				throw new Error("Remote auth-broker credentials can only be disabled on the broker host");
+			};
+			const remoteLike: AuthCredentialStore = store;
+			remoteLike.disableAuthCredentialRemote = async () => true;
+			const warnSpy = vi.spyOn(logger, "warn");
+
+			await authStorage.reload();
+
+			const cached = authStorage.getAll().anthropic;
+			expect(Array.isArray(cached) ? cached.length : 1).toBe(2);
+			expect(deleteAttempts).toEqual([]);
+			expect(warnSpy.mock.calls.map(call => call[0])).not.toContain(
+				"Could not retire a deduplicated credential; keeping it",
+			);
+		});
+
 		test("OAuth refresh failure rethrows the auth error when the CAS disable hits a database error", async () => {
-			await authStorage.set("anthropic", {
-				type: "oauth",
-				access: "expired-access",
-				refresh: "revoked-refresh",
-				expires: Date.now() - 60_000,
+			// Usage probes would hit the mocked network and wait on usage leases; this test
+			// is about credential selection only.
+			const storage = new AuthStorage(store, {
+				usageProviderResolver: () => undefined,
+				onCredentialDisabled: event => {
+					events.push(event);
+				},
 			});
-			const id = store.listAuthCredentials("anthropic")[0]!.id;
+			await storage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "revoked-refresh",
+					expires: Date.now() - 60_000,
+					email: "revoked@example.com",
+				},
+				{
+					type: "oauth",
+					access: "healthy-access",
+					refresh: "healthy-refresh",
+					expires: Date.now() + 3_600_000,
+					email: "healthy@example.com",
+				},
+			]);
+			const revokedId = store
+				.listAuthCredentials("anthropic")
+				.find(row => row.credential.type === "oauth" && row.credential.refresh === "revoked-refresh")!.id;
 			const authError = new Error('invalid_grant {"error":"invalid_grant"}');
-			vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
-				failDisables();
+			let revokedRefreshes = 0;
+			const refreshRevoked = (refresh: string | undefined): void => {
+				if (refresh !== "revoked-refresh") return;
+				if (revokedRefreshes++ === 0) failDisables();
 				throw authError;
+			};
+			vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+				refreshRevoked(credential.refresh);
+				return credential;
+			});
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+				const credential = credentials[provider];
+				if (!credential) return null;
+				if (credential.expires <= Date.now()) refreshRevoked(credential.refresh);
+				return { newCredentials: credential, apiKey: credential.access };
 			});
 			vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected OAuth network request"));
 
 			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
-				await expect(authStorage.getApiKey("anthropic", "session-cas-db-error")).rejects.toBe(authError);
+				await expect(
+					storage.getApiKey("anthropic", "session-cas-db-error", {
+						credentialSelector: { kind: "id", value: String(revokedId) },
+					}),
+				).rejects.toBe(authError);
+				// The revoked credential is blocked in this process, so another session lands on
+				// the healthy one instead of replaying the refresh that already failed definitively.
+				for (const sessionId of ["session-other-1", "session-other-2", "session-other-3"]) {
+					expect(await storage.getApiKey("anthropic", sessionId)).toBe("healthy-access");
+				}
 			});
+			expect(revokedRefreshes).toBe(1);
 			expect(events).toEqual([]);
-			expect(authStorage.has("anthropic")).toBe(true);
-			expect(readRow(id).disabled_cause).toBeNull();
+			expect(store.listAuthCredentials("anthropic").map(row => row.id)).toContain(revokedId);
+			expect(readRow(revokedId).disabled_cause).toBeNull();
 		});
 
 		test("OAuth refresh failure rethrows the auth error when the disable by id fails", async () => {

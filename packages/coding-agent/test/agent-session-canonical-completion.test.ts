@@ -11,7 +11,7 @@ import { initializeLocalRoot } from "@gajae-code/coding-agent/internal-urls/loca
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir, withTimeout } from "@gajae-code/utils";
+import { logger, TempDir, withTimeout } from "@gajae-code/utils";
 
 function assistant(): AssistantMessage {
 	return {
@@ -459,6 +459,10 @@ describe("AgentSession canonical completion", () => {
 
 	it("finishes post-turn handling and keeps the Copilot credential when its invalidation cannot be written", async () => {
 		const { agent, manager, session } = await setup();
+		const warnings: string[] = [];
+		vi.spyOn(logger, "warn").mockImplementation((message: string) => {
+			warnings.push(message);
+		});
 		await authStorage!.set("github-copilot", { type: "api_key", key: "stale-copilot-token" });
 		const admin = new Database(path.join(tempDir!.path(), "auth.db"));
 		try {
@@ -477,6 +481,10 @@ describe("AgentSession canonical completion", () => {
 		agent.emitExternalEvent({ type: "agent_end", messages: [terminal] });
 		await withTimeout(session.awaitSessionSettlement(), 5_000, "Failed Copilot invalidation blocked settlement");
 
+		// The failed invalidation is reported where it happens, and the agent_end handler
+		// continues past it instead of aborting the rest of post-turn handling.
+		expect(warnings).toContain("Failed to invalidate GitHub Copilot credentials after an auth failure");
+		expect(warnings).not.toContain("Agent event handler failed");
 		// The row is still active on disk, so memory keeps it as well.
 		expect(authStorage!.has("github-copilot")).toBe(true);
 		expect(

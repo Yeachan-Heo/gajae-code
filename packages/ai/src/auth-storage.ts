@@ -564,16 +564,22 @@ export interface AuthCredentialStore {
 		organizationId: string,
 		organizationName: string,
 	): AuthCredential | undefined;
-	/** Soft-deletes row `id`; a no-op for an already-disabled row. Throws when the write fails. */
+	/**
+	 * Soft-deletes row `id`; a no-op for an already-disabled row. Throws when the write fails. A remote store always
+	 * throws: it is read-only on the client.
+	 */
 	deleteAuthCredential(id: number, disabledCause: string): void;
-	/** Returns `false` only when no active row matched; throws when the write fails. */
+	/**
+	 * Local stores return `false` only when no active row matched and throw when the write fails. A remote store
+	 * cannot disable synchronously and always returns `false`; callers reach the broker via `disableAuthCredentialRemote`.
+	 */
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
-	/** Returns `false` only when no active row matched; throws when the write fails. */
+	/** Returns `false` only when no active row matched; throws when the write fails. Absent on remote stores. */
 	tryDisableAuthCredentialIfRevision?(id: number, expectedRevision: number, disabledCause: string): boolean;
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[];
 	upsertAuthCredentialForProvider(provider: string, credential: AuthCredential): StoredAuthCredential[];
 	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult;
-	/** Soft-deletes every active row of `provider`. Throws when the write fails. */
+	/** Soft-deletes every active row of `provider`. Throws when the write fails; a remote store always throws. */
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
@@ -3246,6 +3252,9 @@ export class AuthStorage {
 			else kept.push(entry);
 		}
 		if (removed.length === 0) return kept;
+		// A remote store's snapshot is the broker's truth and its synchronous delete can only throw: the broker owns
+		// deduplication, so this client keeps the rows as served instead of failing (and warning) on every reload.
+		if (this.#store.disableAuthCredentialRemote) return entries;
 		// A duplicate whose delete failed is still active on disk, so it stays in memory too: this process never
 		// publishes a pruned view that a reload would contradict.
 		const stillActive = new Set<number>();
@@ -7456,6 +7465,9 @@ export class AuthStorage {
 					if (sessionSelector && sessionId) {
 						this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
 					}
+					// Keep other sessions in this process off the revoked credential until a
+					// later disable succeeds.
+					this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
 					throw error;
 				}
 				if (sessionSelector && sessionId) {
@@ -7522,6 +7534,7 @@ export class AuthStorage {
 									credentialId: attemptedCredentialId,
 									error: String(disableError),
 								});
+								this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
 								throw error;
 							}
 						}

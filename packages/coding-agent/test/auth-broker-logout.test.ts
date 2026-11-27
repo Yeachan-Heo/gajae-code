@@ -94,4 +94,16 @@ describe("auth-broker logout", () => {
 		expect(process.exitCode).toBe(1);
 		expect(activeRows()).toBe(1);
 	});
+
+	test("reports a missing provider through the same failure path", async () => {
+		const stderr = capture(process.stderr);
+
+		await runAuthBrokerCommand({ action: "logout", flags: {} });
+		process.stderr.write = ORIGINAL_STDERR_WRITE;
+
+		expect(stderr.text()).toContain("FAILED");
+		expect(stderr.text()).toContain("Usage: gjc auth-broker logout <provider>");
+		expect(process.exitCode).toBe(1);
+		expect(activeRows()).toBe(1);
+	});
 });
