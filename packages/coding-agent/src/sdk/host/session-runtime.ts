@@ -575,6 +575,7 @@ export class SessionSdkSessionRuntime {
 	readonly #capabilitiesDisposer?: () => void;
 	#transportStarted = false;
 	#transportStartPromise?: Promise<{ url: string }>;
+	readonly #connectionStateListeners = new Set<() => void>();
 
 	constructor(options: SessionSdkRuntimeOptions) {
 		this.transport = options.transport;
@@ -634,6 +635,7 @@ export class SessionSdkSessionRuntime {
 			for (const controller of this.#btwControllers.get(connectionId) ?? []) controller.abort();
 			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
+			this.#notifyConnectionStateChanged();
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
 			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
@@ -642,6 +644,7 @@ export class SessionSdkSessionRuntime {
 				connectionId,
 				new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...negotiated]),
 			);
+			this.#notifyConnectionStateChanged();
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
 			this.host.handleMalformedFrame(connectionId, message);
@@ -702,6 +705,41 @@ export class SessionSdkSessionRuntime {
 				? [connectionId]
 				: [];
 		});
+	}
+
+	/**
+	 * Returns true if at least one connected client has the gate responder capability,
+	 * indicating it can handle and answer workflow gates.
+	 */
+	hasRemoteGateAnswerChannel(): boolean {
+		for (const connectionId of this.#connectionIds) {
+			const capabilities = this.#connectionCapabilitiesProvider(connectionId);
+			if (capabilities?.has("session_host_gate_responder_v1") === true) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Register a listener that is called whenever the connection state changes
+	 * (connections added/removed or capabilities changed). Returns a disposer function.
+	 */
+	onConnectionStateChanged(listener: () => void): () => void {
+		this.#connectionStateListeners.add(listener);
+		return () => {
+			this.#connectionStateListeners.delete(listener);
+		};
+	}
+
+	#notifyConnectionStateChanged(): void {
+		for (const listener of this.#connectionStateListeners) {
+			try {
+				listener();
+			} catch {
+				// Ignore listener errors to avoid affecting other listeners
+			}
+		}
 	}
 	/** Deliver a non-replayable frame to connections with an explicit capability intersection. */
 	sendFrameToCapabilities(

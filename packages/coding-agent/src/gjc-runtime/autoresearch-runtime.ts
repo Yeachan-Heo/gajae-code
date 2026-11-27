@@ -515,14 +515,19 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
+	// Check for a partial retirement in progress (interrupted previous clear)
+	const partialRetirementDir = await findPartialRetirementDirectory(paths);
 	// Close out the outgoing ledger first so the retired copy ends with its clear.
 	const ledgerEvent = await appendAutoresearchLedger(
 		cwd,
 		{ event: "mission_cleared", slug: existing?.slug ?? "" },
 		resolvedSessionId,
 	);
-	const retiredTo = existing ? await retireAutoresearchMissionArtifacts(paths, existing.slug) : undefined;
-	const deleted = existing !== null;
+	const retiredTo =
+		existing || partialRetirementDir
+			? await retireAutoresearchMissionArtifacts(paths, existing?.slug ?? "", partialRetirementDir)
+			: undefined;
+	const deleted = existing !== null || partialRetirementDir !== undefined;
 	await reconcileAutoresearchState(cwd, existing, resolvedSessionId, { active: false, phase: "complete" });
 	return {
 		ok: true,
@@ -565,24 +570,70 @@ export async function autoresearchRetireConclusiveMissionAfterHandoff(
 }
 
 /**
+ * Check if there's a partial retirement in progress and return the target directory path.
+ * This handles the case where a previous retirement was interrupted (e.g., mission.json
+ * was moved but ledger.jsonl failed). Returns undefined if no partial retirement is found.
+ */
+async function findPartialRetirementDirectory(paths: AutoresearchPaths): Promise<string | undefined> {
+	try {
+		const retiredEntries = await fs.readdir(paths.retiredRoot);
+		for (const entry of retiredEntries) {
+			const entryPath = path.join(paths.retiredRoot, entry);
+			const stat = await fs.stat(entryPath);
+			if (stat.isDirectory()) {
+				// Check if this directory has any mission artifacts
+				const artifacts = await fs.readdir(entryPath);
+				for (const artifactName of AUTORESEARCH_MISSION_ARTIFACTS) {
+					if (artifacts.includes(artifactName)) {
+						// Found a partial retirement in this directory
+						return entryPath;
+					}
+				}
+				// Also check for the runs subdirectory
+				if (artifacts.includes(AUTORESEARCH_RUNS_SUBDIR)) {
+					return entryPath;
+				}
+			}
+		}
+	} catch (error) {
+		// If retired directory doesn't exist or can't be read, no partial retirement
+		if (!isEnoent(error)) throw error;
+	}
+	return undefined;
+}
+
+/**
  * Move every durable mission artifact aside into a uniquely-reserved directory.
  *
  * A timestamp alone collides when two clears land in the same millisecond,
  * which would overwrite the earlier mission's evidence, so the directory is
  * reserved with an exclusive mkdir and disambiguated with a counter.
+ * If a partial retirement directory is provided, moves are completed into that
+ * directory (for resuming interrupted retirements).
  */
-async function retireAutoresearchMissionArtifacts(paths: AutoresearchPaths, slug: string): Promise<string> {
-	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-	await fs.mkdir(paths.retiredRoot, { recursive: true });
-	const base = path.join(paths.retiredRoot, `${slug}.${stamp}`);
-	let retiredTo = base;
-	for (let attempt = 1; ; attempt += 1) {
-		retiredTo = attempt === 1 ? base : `${base}-${attempt}`;
-		try {
-			await fs.mkdir(retiredTo);
-			break;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+async function retireAutoresearchMissionArtifacts(
+	paths: AutoresearchPaths,
+	slug: string,
+	partialRetirementDir?: string,
+): Promise<string> {
+	let retiredTo: string;
+	if (partialRetirementDir) {
+		// Resume an interrupted retirement: use the existing target directory
+		retiredTo = partialRetirementDir;
+	} else {
+		// Start a new retirement: create a new unique directory
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		await fs.mkdir(paths.retiredRoot, { recursive: true });
+		const base = path.join(paths.retiredRoot, `${slug}.${stamp}`);
+		retiredTo = base;
+		for (let attempt = 1; ; attempt += 1) {
+			retiredTo = attempt === 1 ? base : `${base}-${attempt}`;
+			try {
+				await fs.mkdir(retiredTo);
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
 		}
 	}
 	for (const name of AUTORESEARCH_MISSION_ARTIFACTS) {
@@ -592,11 +643,27 @@ async function retireAutoresearchMissionArtifacts(paths: AutoresearchPaths, slug
 	return retiredTo;
 }
 
+/**
+ * Move a file or directory, skipping if the target already exists (recovery case).
+ * This makes interrupted retirements resumable: if a previous attempt moved this
+ * file to the target directory but failed on a later file, we can skip the moved
+ * file and retry the remaining ones without re-moving.
+ */
 async function moveIfPresent(from: string, to: string): Promise<void> {
 	try {
+		// Check if target already exists (recovery from interrupted previous move)
+		try {
+			await fs.stat(to);
+			// Target already exists, so this file was already moved in a prior attempt
+			return;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			// Target doesn't exist, proceed with the move
+		}
 		await fs.rename(from, to);
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
+		// Source file doesn't exist, so it was already moved or never existed
 	}
 }
 

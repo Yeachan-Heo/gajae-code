@@ -137,6 +137,11 @@ export const TURN_STREAM_CAPABILITY = "turn_stream";
  */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 /**
+ * Capability for SDK clients that can handle and answer workflow gates.
+ * Passive SDK clients (e.g., `gjc sdk session send --wait`) must not declare this.
+ */
+export const SESSION_HOST_GATE_RESPONDER_CAPABILITY = "session_host_gate_responder_v1";
+/**
  * Opts notification adapters into positioned-only delivery for matching live
  * effects: the host excludes a negotiating connection from the raw native leg
  * of every frame its positioned envelope already reached.

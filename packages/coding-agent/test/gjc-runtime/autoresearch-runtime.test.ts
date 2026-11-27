@@ -477,6 +477,32 @@ describe("autoresearch ledger", () => {
 		expect(await Bun.file(path.join(second.retiredTo!, "mission.json")).exists()).toBe(true);
 	});
 
+	it("resumes interrupted retirement when mission.json was moved but other files failed", async () => {
+		const root = await tempDir();
+		const paths = getAutoresearchPaths(root, TEST_SESSION_ID);
+		await autoresearchWrite(baseMission(root));
+
+		// Simulate interrupted retirement by manually moving mission.json to retired dir
+		await fs.mkdir(paths.retiredRoot, { recursive: true });
+		const retiredDir = path.join(paths.retiredRoot, "test-mission.2026-11-27T00-00-00-000Z");
+		await fs.mkdir(retiredDir);
+		const missionContent = await Bun.file(paths.missionPath).text();
+		await fs.writeFile(path.join(retiredDir, "mission.json"), missionContent);
+		// Don't move ledger.jsonl or runs.jsonl to simulate an interrupted retirement
+
+		// Now retry the clear: it should detect the partial retirement and complete it
+		const clear = await autoresearchClear(root);
+		expect(clear.cleared).toBe(true);
+		expect(clear.retiredTo).toBe(retiredDir);
+
+		// Verify that the mission.json is still there (it was already moved)
+		expect(await Bun.file(path.join(retiredDir, "mission.json")).exists()).toBe(true);
+		// Verify that the ledger was moved on retry
+		expect(await Bun.file(path.join(retiredDir, "ledger.jsonl")).exists()).toBe(true);
+		// Verify mission.json is no longer in the live directory
+		expect(await Bun.file(paths.missionPath).exists()).toBe(false);
+	});
+
 	it("persists a declared primary metric contract and feeds it to the experiment config", async () => {
 		const root = await tempDir();
 		await autoresearchWrite({
