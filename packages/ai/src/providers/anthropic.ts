@@ -3856,8 +3856,16 @@ function hasNativeThinkingBlocks(messages: MessageParam[]): boolean {
  * back without it. Same for a `redactedThinking` block whose opaque payload is
  * gone. Only the latest assistant message is inspected because that is the turn
  * Anthropic validates against its own output.
+ *
+ * Signed thinking minted under another stored credential is unreplayable too:
+ * the signing endpoint rejects it under this request's credential, and the
+ * latest turn cannot lose the block either, so the whole replay degrades.
  */
-function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model<"anthropic-messages">): boolean {
+function latestAssistantThinkingIsUnreplayable(
+	messages: Message[],
+	model: Model<"anthropic-messages">,
+	targetCredentialId: number | undefined,
+): boolean {
 	const index = messages.findLastIndex(message => message.role === "assistant");
 	if (index < 0) return false;
 
@@ -3867,6 +3875,9 @@ function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model
 	if (assistant.api !== "anthropic-messages") return false;
 	// Endpoints that never sign thinking replay unsigned blocks verbatim.
 	const requiresSignature = !isNonSigningAnthropicEndpoint(model);
+	if (requiresSignature && latestThinkingIsBoundToAnotherCredential(assistant, model, targetCredentialId)) {
+		return true;
+	}
 
 	return assistant.content.some(block => {
 		if (block.type === "redactedThinking") return block.data.trim().length === 0;
@@ -3884,6 +3895,31 @@ function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model
 		if (isEmpty && requiresSignature) return true;
 		return false;
 	});
+}
+
+/**
+ * Whether the latest turn's private thinking is bound to a stored credential
+ * other than the one authenticating this request. Unknown provenance on either
+ * side keeps legacy replay. Following omp 4308d0156d, another provider's
+ * non-Claude turn wrote plain reasoning that no account binding governs, so it
+ * keeps the ordinary model-switch replay.
+ */
+function latestThinkingIsBoundToAnotherCredential(
+	assistant: AssistantMessage,
+	model: Model<"anthropic-messages">,
+	targetCredentialId: number | undefined,
+): boolean {
+	if (assistant.credentialId === undefined || targetCredentialId === undefined) return false;
+	if (assistant.credentialId === targetCredentialId) return false;
+	// Partial thinking of an aborted or errored turn is already dropped from the replay.
+	if (assistant.stopReason === "aborted" || assistant.stopReason === "error") return false;
+	if (assistant.provider !== model.provider && !isClaudeAssistantTurn(assistant)) return false;
+	return assistant.content.some(block => block.type === "thinking" || block.type === "redactedThinking");
+}
+
+/** Claude produced this turn (Anthropic itself or a Claude model behind another provider). */
+function isClaudeAssistantTurn(assistant: AssistantMessage): boolean {
+	return assistant.provider === "anthropic" || /(^|\/)claude[-.]/i.test(assistant.model);
 }
 
 function mapAnthropicToolChoice(
@@ -4148,7 +4184,10 @@ function buildParams(
 
 	const params: AnthropicSamplingParams = {
 		model: model.id,
-		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, thinkingRepair),
+		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, {
+			...thinkingRepair,
+			targetCredentialId: options?.credentialId,
+		}),
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
@@ -4277,6 +4316,7 @@ function buildParams(
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,
+			targetCredentialId: options?.credentialId,
 		});
 	}
 
@@ -4292,12 +4332,13 @@ function buildParams(
 	// build instead of paying for the 400 to discover it.
 	if (
 		!thinkingRepair?.repairAllAssistantThinking &&
-		latestAssistantThinkingIsUnreplayable(context.messages, model) &&
+		latestAssistantThinkingIsUnreplayable(context.messages, model, options?.credentialId) &&
 		hasNativeThinkingBlocks(params.messages)
 	) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,
+			targetCredentialId: options?.credentialId,
 		});
 	}
 
@@ -4429,11 +4470,21 @@ export function convertAnthropicMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
-	options?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
+	options?: {
+		repairLatestAssistantThinking?: boolean;
+		repairAllAssistantThinking?: boolean;
+		/** Stored credential row whose key authenticates this request; gates replay of bound thinking. */
+		targetCredentialId?: number;
+	},
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 
-	const transformedMessages = transformMessages(messages, model, normalizeToolCallId, options);
+	const transformedMessages = transformMessages(messages, model, normalizeToolCallId, {
+		repairLatestAssistantThinking: options?.repairLatestAssistantThinking,
+		repairAllAssistantThinking: options?.repairAllAssistantThinking,
+		signingAnthropicTarget: !isNonSigningAnthropicEndpoint(model),
+		targetCredentialId: options?.targetCredentialId,
+	});
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];

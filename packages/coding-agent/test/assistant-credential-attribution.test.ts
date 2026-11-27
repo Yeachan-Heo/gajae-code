@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import { gunzipSync } from "node:zlib";
 import { registerCustomApi, unregisterCustomApis } from "@gajae-code/ai/api-registry";
+import { Effort } from "@gajae-code/ai/model-thinking";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@gajae-code/ai/types";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -442,4 +444,129 @@ describe("assistant message credential attribution through a real session", () =
 		expect("credentialId" in (assistants[0] ?? {})).toBe(false);
 		expect(assistants[1]?.credentialId).toBe(rowIdForKey(authStorage, "stored-key-a"));
 	});
+
+	it("does not replay the previous account's signed thinking after an account move mid tool loop", async () => {
+		const dir = tempDirs.tempDirSync("@assistant-credential-attribution-anthropic-").path();
+		await Bun.write(path.join(dir, "notes.txt"), "tool output\n");
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		authStorages.push(authStorage);
+		const storedKeys = ["sk-ant-api03-attribution-row-a", "sk-ant-api03-attribution-row-b"];
+		await authStorage.set(
+			PROVIDER,
+			storedKeys.map(key => ({ type: "api_key" as const, key })),
+		);
+		const bundled = getBundledModel(PROVIDER, "claude-sonnet-4-5");
+		if (!bundled) throw new Error("Expected bundled anthropic model");
+		const model = bundled as Model<"anthropic-messages">;
+
+		const requests: Array<{ key: string; body: string }> = [];
+		let firstKey: string | undefined;
+		const sse = (events: Array<Record<string, unknown>>) =>
+			new Response(
+				events.map(event => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		const usageEvent = { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: string | URL | Request, init?: RequestInit) => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (!url.includes("/v1/messages")) throw new Error(`unexpected request to ${url}`);
+			const headers = new Headers(init?.headers);
+			const key = headers.get("x-api-key") ?? headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+			const raw = init?.body;
+			const bytes = typeof raw === "string" ? new TextEncoder().encode(raw) : (raw as Uint8Array);
+			const body = new TextDecoder().decode(bytes[0] === 0x1f && bytes[1] === 0x8b ? gunzipSync(bytes) : bytes);
+			requests.push({ key, body });
+			firstKey ??= key;
+			if (requests.length === 1) {
+				// Account A answers with signed thinking and a tool call.
+				return sse([
+					{ type: "message_start", message: { id: "msg_a", usage: { ...usageEvent, output_tokens: 0 } } },
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "thinking", thinking: "", signature: "" },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "thinking_delta", thinking: "row A reasoning" },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "signature_delta", signature: "sig_row_a_turn" },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: { type: "tool_use", id: "toolu_attr_1", name: "read", input: {} },
+					},
+					{
+						type: "content_block_delta",
+						index: 1,
+						delta: { type: "input_json_delta", partial_json: JSON.stringify({ path: "notes.txt" }) },
+					},
+					{ type: "content_block_stop", index: 1 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "tool_use" },
+						usage: { ...usageEvent, output_tokens: 5 },
+					},
+					{ type: "message_stop" },
+				]);
+			}
+			if (key === firstKey) {
+				// The tool-result continuation is rejected for account A; the session's
+				// auth retry moves the same request to account B.
+				return new Response(
+					JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid x-api-key" } }),
+					{ status: 401, headers: { "content-type": "application/json" } },
+				);
+			}
+			return sse([
+				{ type: "message_start", message: { id: "msg_b", usage: { ...usageEvent, output_tokens: 0 } } },
+				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } },
+				{ type: "content_block_stop", index: 0 },
+				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { ...usageEvent, output_tokens: 1 } },
+				{ type: "message_stop" },
+			]);
+		}) as typeof fetch);
+
+		const sessionManager = SessionManager.create(dir, dir);
+		const { session } = await createAgentSession({
+			cwd: dir,
+			agentDir: dir,
+			authStorage,
+			sessionManager,
+			model,
+			thinkingLevel: Effort.High,
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.baseDelayMs": 1 }),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		sessions.push(session);
+
+		await session.prompt("read notes.txt");
+		await session.waitForIdle();
+
+		const servedByB = requests.filter(request => request.key !== firstKey);
+		expect(servedByB.length).toBeGreaterThan(0);
+		expect(new Set(requests.map(request => request.key))).toEqual(new Set(storedKeys));
+		for (const request of servedByB) {
+			// The continuation still carries the tool loop, but not account A's signature.
+			expect(request.body).toContain("toolu_attr_1");
+			expect(request.body).not.toContain("sig_row_a_turn");
+		}
+		const assistants = await persistedAssistants(sessionManager);
+		const last = assistants.at(-1);
+		expect(last?.stopReason).toBe("stop");
+		expect(last?.credentialId).toBe(rowIdForKey(authStorage, servedByB[0]?.key ?? ""));
+	}, 30_000);
 });
