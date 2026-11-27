@@ -693,11 +693,13 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 
 	// Design §13 H3: a TUI holds the claim before its endpoint reaches the broker index. A resume in
 	// that window waits for the endpoint instead of launching a second writer. The test holds the
-	// TUI's registration open through its test seam, so the window lasts as long as the test needs.
-	it("observe: a broker resume and ACP session/load during the TUI's startup reuse its endpoint", async () => {
+	// TUI's registration open through its test seam for 3 s. It runs under `enforce`, whose 8 s wait
+	// leaves that hold a wide margin; `observe` waits only 2 s, and its reuse is pinned in
+	// sdk-broker-resume-held-session.test.ts.
+	it("enforce: a broker resume and ACP session/load during the TUI's startup reuse its endpoint", async () => {
 		const PRINT_PROMPT = "attach-print-zero";
 		const ACP_PROMPT = "attach-acp-late";
-		const fixture = await startFixture("observe", [ACP_PROMPT]);
+		const fixture = await startFixture("enforce", [ACP_PROMPT]);
 		const { env, agentDir, workspace, model, cleanup, started } = fixture;
 
 		// S exists before the TUI starts: one `gjc -p` turn, which claims S and releases it at exit.

@@ -5,12 +5,15 @@
  * launched. A launched host whose own claim was refused crosses to the broker as that same outcome.
  *
  * The broker runs in this process; the holder is a separate process claiming through the same
- * owners home, and the launch command is a counter, so no host process is ever started.
+ * owners home, and the launch command is a counter, except where a real session host is launched
+ * to show its refused claim crossing the broker.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getAgentDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
+import { resetSettingsForTest } from "../src/config/settings";
 import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
 import {
 	readSessionLifecycleFailureForTest,
@@ -21,7 +24,7 @@ import {
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
-import { SessionHeldError, SessionOwnershipTestHooks } from "../src/session/session-ownership";
+import { claimSessionOwner, SessionHeldError, SessionOwnershipTestHooks } from "../src/session/session-ownership";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const holderScript = path.join(import.meta.dir, "session", "session-ownership-holder-child.ts");
@@ -81,8 +84,31 @@ async function holdInAnotherProcess(sessionId: string): Promise<{ pid: number; r
 	};
 }
 
+const clocks = new WeakMap<Broker, { now: number }>();
+
+/** A virtual clock: each poll advances it, so the bound is observed without real waiting. */
+function virtualClock(broker: Broker): { now: number } {
+	const clock = { now: Date.now() };
+	clocks.set(broker, clock);
+	setLifecycleTimingForTest(broker, {
+		now: () => clock.now,
+		sleep: async ms => {
+			clock.now += ms;
+			await Bun.sleep(1);
+		},
+	});
+	return clock;
+}
+
+/** The broker's clock: its virtual clock when it has one. */
+function clockOf(broker: Broker): () => number {
+	return () => clocks.get(broker)?.now ?? Date.now();
+}
+
 /** A broker over a fresh agent dir with one saved session S that no process holds. */
-async function brokerWithSavedSession() {
+async function brokerWithSavedSession(
+	options: { launch?: (agentDir: string) => { file: string; args: string[] } } = {},
+) {
 	const root = await fs.realpath(await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-resume-held-")));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
@@ -96,9 +122,11 @@ async function brokerWithSavedSession() {
 	const broker = new Broker({ agentDir });
 	await broker.start();
 	let launchAttempts = 0;
+	let launchedAt: number | undefined;
 	setLifecycleCommandResolverForTest(broker, () => {
 		launchAttempts += 1;
-		return { file: "/bin/false", args: [] };
+		launchedAt ??= clockOf(broker)();
+		return options.launch?.(agentDir) ?? { file: "/bin/false", args: [] };
 	});
 	cleanups.push(async () => {
 		setLifecycleCommandResolverForTest(broker, undefined);
@@ -109,10 +137,13 @@ async function brokerWithSavedSession() {
 	let keys = 0;
 	return {
 		root,
+		agentDir,
 		stateRoot,
 		sessionId,
 		broker,
 		launchAttempts: () => launchAttempts,
+		/** The broker clock when the first launch was resolved. */
+		launchedAt: () => launchedAt,
 		/** One resume as ACP sends it, under a fresh idempotency key. */
 		resume: (extra: Record<string, unknown> = {}): Promise<BrokerResponse> => {
 			keys += 1;
@@ -158,20 +189,7 @@ describe.if(supported)("broker session.resume of a session another process holds
 		expect(fixture.launchAttempts()).toBe(0);
 	});
 
-	/** A virtual clock: each poll advances it, so the bound is observed without real waiting. */
-	function virtualClock(broker: Broker) {
-		const clock = { now: Date.now() };
-		setLifecycleTimingForTest(broker, {
-			now: () => clock.now,
-			sleep: async ms => {
-				clock.now += ms;
-				await Bun.sleep(1);
-			},
-		});
-		return clock;
-	}
-
-	it("observe: when no endpoint appears it launches as before, after the wait, and never refuses", async () => {
+	it("observe: when no endpoint appears it launches as before after a 2 s wait, and never refuses", async () => {
 		SessionOwnershipTestHooks.mode = "observe";
 		const fixture = await brokerWithSavedSession();
 		await holdInAnotherProcess(fixture.sessionId);
@@ -179,8 +197,45 @@ describe.if(supported)("broker session.resume of a session another process holds
 		const startedAt = clock.now;
 		const resumed = await fixture.resume();
 		expect(resumed.ok || resumed.error.code !== "live_session").toBe(true);
-		expect(clock.now - startedAt).toBeGreaterThanOrEqual(8_000);
 		expect(fixture.launchAttempts()).toBe(1);
+		expect(fixture.launchedAt()! - startedAt).toBe(2_000);
+	});
+
+	it("enforce: resumes queued on one session share the wait instead of stacking it", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		await holdInAnotherProcess(fixture.sessionId);
+		const clock = virtualClock(fixture.broker);
+		const startedAt = clock.now;
+		const outcomes = await Promise.all([fixture.resume(), fixture.resume(), fixture.resume()]);
+		for (const outcome of outcomes) expect(outcome).toMatchObject({ ok: false, error: { code: "live_session" } });
+		// The second and third queued behind the first for its whole wait, which used up theirs.
+		expect(clock.now - startedAt).toBe(8_000);
+		expect(fixture.launchAttempts()).toBe(0);
+	});
+
+	it("lowering the mode in config.yml reaches a running broker: the next resume neither waits nor refuses", async () => {
+		// The real setting source: the operator's config file in this process's agent directory.
+		const configFile = path.join(getAgentDir(), "config.yml");
+		await Bun.write(configFile, "session:\n  ownership:\n    mode: enforce\n");
+		resetSettingsForTest();
+		cleanups.push(async () => {
+			await fs.rm(configFile, { force: true });
+			resetSettingsForTest();
+		});
+		const fixture = await brokerWithSavedSession();
+		await holdInAnotherProcess(fixture.sessionId);
+		const clock = virtualClock(fixture.broker);
+		const startedAt = clock.now;
+		expect(await fixture.resume()).toMatchObject({ ok: false, error: { code: "live_session" } });
+		expect(clock.now - startedAt).toBe(8_000);
+
+		await Bun.write(configFile, "session:\n  ownership:\n    mode: off\n");
+		const loweredAt = clock.now;
+		const resumed = await fixture.resume();
+		expect(resumed.ok || resumed.error.code !== "live_session").toBe(true);
+		expect(fixture.launchAttempts()).toBe(1);
+		expect(fixture.launchedAt()! - loweredAt).toBe(0);
 	});
 
 	it("enforce: refuses with live_session naming the holder when no endpoint appears, and launches once it lets go", async () => {
@@ -219,6 +274,43 @@ describe.if(supported)("broker session.resume of a session another process holds
 });
 
 describe.if(supported)("a launched host whose claim was refused", () => {
+	it("crosses the broker as live_session naming the holder, with no endpoint", async () => {
+		const home = SessionOwnershipTestHooks.homeOverride;
+		if (!home) throw new Error("the test preload sets the owners home");
+		const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+		const cli = path.resolve(import.meta.dir, "../src/cli.ts");
+		// A real session host, with HOME at the owners home so it meets this process's claim.
+		const fixture = await brokerWithSavedSession({
+			launch: () => ({
+				file: "/bin/sh",
+				args: [
+					"-c",
+					`HOME=${quote(home)} exec ${quote(process.execPath)} run ${quote(cli)} sdk session-host-internal`,
+				],
+			}),
+		});
+		await Bun.write(path.join(fixture.agentDir, "config.yml"), "session:\n  ownership:\n    mode: enforce\n");
+		// This process holds S. The broker never counts its own process as another writer, so it
+		// launches; the host's claim under `enforce` is what refuses.
+		const claim = await claimSessionOwner(fixture.sessionId, { surface: "sdk" });
+		if (claim.status !== "claimed") throw new Error(`claim failed: ${claim.status}`);
+		cleanups.push(async () => claim.claim.release());
+
+		const refused = await fixture.resume({ readinessTimeoutMs: 30_000 });
+		expect(fixture.launchAttempts()).toBe(1);
+		expect(refused).toMatchObject({
+			ok: false,
+			error: {
+				code: "live_session",
+				message: expect.stringContaining(
+					`open for writing in an application using the gjc SDK (pid ${process.pid})`,
+				),
+				holder: { surface: "sdk", pid: process.pid },
+				endpoint: "unavailable",
+			},
+		});
+	}, 60_000);
+
 	it("reports the holder through its startup failure receipt", async () => {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-host-held-")));
 		cleanups.push(() => fs.rm(root, { recursive: true, force: true }));

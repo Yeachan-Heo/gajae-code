@@ -85,6 +85,7 @@ import {
 	hasSessionLifecycleStartupCommit,
 	isCanonicalSessionId,
 	type LifecycleFailureArtifact,
+	markLifecycleRequestReceived,
 	prepareSpawnChildHostLaunch,
 	processIncarnationForBroker,
 	readSessionLifecycleFailure,
@@ -6255,6 +6256,7 @@ export class Broker {
 			createHash("sha256")
 				.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
 				.digest("hex");
+		markLifecycleRequestReceived(this, input);
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));

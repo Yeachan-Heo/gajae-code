@@ -11,6 +11,8 @@ import {
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { AsyncJobManager } from "../../async";
 import {
 	getProxyRoutableProviders,
@@ -5371,14 +5373,30 @@ const HOST_REGISTRATION_HOLD_DIR_ENV = "GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR"
 const HOST_REGISTRATION_HOLD_MAX_MS = 60_000;
 
 /**
+ * The hold directory from the operator's environment only: a value the project dotenv supplied, in
+ * the current directory or in the one this process started in, is ignored and removed from this
+ * process's environment, so no child inherits it. An unset variable costs no read.
+ */
+function trustedHostRegistrationHoldDirectory(): string | undefined {
+	if (!process.env[HOST_REGISTRATION_HOLD_DIR_ENV]) return undefined;
+	let accepted: string | undefined;
+	for (const snapshot of [projectEnvSnapshot(process.cwd()), startupProjectEnvSnapshot()]) {
+		accepted = trustedCoordinatorEnv(HOST_REGISTRATION_HOLD_DIR_ENV, process.env, snapshot);
+		if (accepted === undefined) {
+			delete process.env[HOST_REGISTRATION_HOLD_DIR_ENV];
+			return undefined;
+		}
+	}
+	return accepted;
+}
+
+/**
  * Test seam: while `<dir>/<sessionId>.hold` exists, defer this host's broker registration (at
  * most 60 s), so a multi-process test can hold an interactive TUI in the window where it holds the
- * session claim but has no endpoint in the index. A value that matches the project dotenv of the
- * current directory is ignored, and an unset variable costs no read.
+ * session claim but has no endpoint in the index.
  */
 async function awaitHostRegistrationTestHold(sessionId: string): Promise<void> {
-	if (!process.env[HOST_REGISTRATION_HOLD_DIR_ENV]) return;
-	const directory = trustedCoordinatorEnv(HOST_REGISTRATION_HOLD_DIR_ENV);
+	const directory = trustedHostRegistrationHoldDirectory();
 	if (!directory) return;
 	const hold = path.join(directory, `${sessionId}.hold`);
 	const held = (): Promise<boolean> =>

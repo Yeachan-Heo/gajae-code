@@ -321,7 +321,13 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 		diagnostic = "lifecycle_legacy_history_ambiguous";
 	} else if (LIFECYCLE_INPUT_REFUSAL_CODES.has(outcome.error.code)) {
 		diagnostic = "lifecycle_input_refused";
-	} else if (outcome.operation === "session.resume" && outcome.error.code === "live_session") {
+	} else if (
+		outcome.operation === "session.resume" &&
+		outcome.error.code === "live_session" &&
+		outcome.error.holder !== undefined
+	) {
+		// Only the single-owner refusal names a holder; a live session whose endpoint authority is
+		// unavailable is a different `live_session` and keeps no diagnostic.
 		diagnostic = "lifecycle_session_held";
 	}
 	const diagnostics: readonly PublicCommandDiagnosticCode[] | undefined =

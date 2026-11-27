@@ -62,11 +62,7 @@ import {
 	sessionOwnerHolderPhrase,
 	sessionOwnerHolderSummary,
 } from "../../session/session-ownership";
-import {
-	liveSessionOwnershipMode,
-	type SessionOwnershipMode,
-	sessionOwnershipMode,
-} from "../../session/session-ownership-mode";
+import { liveSessionOwnershipModeFor, type SessionOwnershipMode } from "../../session/session-ownership-mode";
 import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
@@ -1480,30 +1476,54 @@ function hasResumableEndpoint(authority: LiveResumeAuthority, sessionId: string)
 }
 
 /**
- * Longest a `session.resume` waits for the process that holds the session's claim to publish its
- * SDK endpoint. An interactive TUI holds the claim before its endpoint reaches the index, while it
- * starts and right after it switches sessions; that gap is well under a second on an idle machine.
- * 8 s leaves 2 s of the SDK client's default 10 s request timeout for the broker's checks before
- * the wait and for the reply, so even a caller that never sized its deadline sees the refusal. The
- * wait is also capped by the request's readiness timeout: that is the share of the caller's budget
- * a launch may spend queued for admission, and a holder that lets go mid-wait leaves its launch
- * only the rest of that share.
+ * Longest a `session.resume` under `enforce` waits for the process that holds the session's claim to
+ * publish its SDK endpoint, before it refuses. An interactive TUI holds the claim before its endpoint
+ * reaches the index, while it starts and right after it switches sessions; that gap measured about
+ * 0.4 s on an idle machine. 8 s leaves 2 s of the SDK client's default 10 s request timeout for the
+ * reply, so a caller that never sized its deadline usually sees the refusal; index refreshes,
+ * heartbeats and a slow probe come before the wait, and resumes of one session queue behind each
+ * other, so it is not a guarantee. Callers that size their deadline with `lifecycleRequestTimeoutMs`
+ * (ACP, the lifecycle service and so the CLI, the SDK MCP server) are well inside it.
  */
-const HELD_SESSION_ENDPOINT_WAIT_MS = 8_000;
+const ENFORCE_HELD_ENDPOINT_WAIT_MS = 8_000;
+/**
+ * Longest a resume under the default `observe` waits. `observe` never refuses: after the wait it goes
+ * on as before ownership, so for a holder that never publishes an endpoint (an embedding such as the
+ * desktop app) the wait is pure latency added to every resume, and it shortens a later launch's
+ * admission window. 2 s covers the measured TUI startup gap several times over and keeps both small.
+ */
+const OBSERVE_HELD_ENDPOINT_WAIT_MS = 2_000;
 const HELD_SESSION_ENDPOINT_POLL_MS = 100;
 
-const OWNERSHIP_MODE_RANK: Record<SessionOwnershipMode, number> = { off: 0, observe: 1, enforce: 2 };
+/** When the broker received each lifecycle request, before it queued behind its session's chain. */
+const lifecycleRequestsReceivedAt = new WeakMap<Input, number>();
+
+/** Record a lifecycle request's arrival, so a resume's wait counts the time it spent queued. */
+export function markLifecycleRequestReceived(broker: Broker, input: Input): void {
+	lifecycleRequestsReceivedAt.set(input, lifecycleTiming(broker).now());
+}
 
 /**
- * The broker's ownership mode for one resume: its process mode (default `observe`), lowered by the
- * operator's config file read afresh, so `gjc config set session.ownership.mode off` (or `observe`)
- * reaches a running broker at once. Raising the mode still needs a restart, as everywhere else.
+ * The wait one resume may still spend: the mode's bound, never more than the request's readiness
+ * timeout (the share of the caller's budget a launch may spend queued for admission), less the time
+ * the request already spent queued, so concurrent resumes of one session never stack their waits.
+ */
+function heldEndpointWaitBudget(broker: Broker, input: Input, mode: SessionOwnershipMode, readiness: number): number {
+	const bound = Math.min(
+		mode === "enforce" ? ENFORCE_HELD_ENDPOINT_WAIT_MS : OBSERVE_HELD_ENDPOINT_WAIT_MS,
+		readiness,
+	);
+	const now = lifecycleTiming(broker).now();
+	return Math.max(0, bound - (now - (lifecycleRequestsReceivedAt.get(input) ?? now)));
+}
+
+/**
+ * The broker's ownership mode now: its process mode, lowered by an explicit lower value in the
+ * operator's config file, reread on each call. It is read at the probe and at every poll, so `off`
+ * set during a wait ends it, and `observe` set during a wait stops its refusal.
  */
 function resumeOwnershipMode(): SessionOwnershipMode {
-	const configured = sessionOwnershipMode();
-	if (configured === "off") return "off";
-	const live = liveSessionOwnershipMode();
-	return OWNERSHIP_MODE_RANK[live] < OWNERSHIP_MODE_RANK[configured] ? live : configured;
+	return liveSessionOwnershipModeFor();
 }
 
 /**
@@ -1545,9 +1565,16 @@ function heldSessionError(
 	};
 }
 
-/** The holder a launched host's refused claim named in its startup failure, already validated on read. */
-function startupFailureHolder(failure: SdkStartupFailure): SessionOwnerHolderSummary | undefined {
-	return sessionOwnerHolderSummary((failure.details as { holder?: unknown } | undefined)?.holder);
+/**
+ * The held outcome for a launched host whose own claim was refused, on the readiness path and the
+ * reconciled terminal path alike. The holder comes from the host's startup failure, validated on read.
+ */
+function hostHeldRefusalError(
+	sessionId: string,
+	failure: SdkStartupFailure,
+): { code: "live_session"; message: string; holder?: SessionOwnerHolderSummary; endpoint: "unavailable" } {
+	const holder = sessionOwnerHolderSummary((failure.details as { holder?: unknown } | undefined)?.holder);
+	return { ...heldSessionError(sessionId, holder), endpoint: "unavailable" };
 }
 
 /**
@@ -7275,7 +7302,7 @@ async function executeLifecycleResponse(
 						broker,
 						requestedSessionId,
 						claim.holder,
-						Math.min(HELD_SESSION_ENDPOINT_WAIT_MS, readiness),
+						heldEndpointWaitBudget(broker, input, resumeOwnershipMode(), readiness),
 						authority,
 					);
 					if ("ok" in waited) return waited;
@@ -7829,7 +7856,7 @@ async function executeLifecycleResponse(
 								`Session ${launch.id} did not become ready and its spawned process could not be verified dead. ${diagnostic ?? "stage=readiness waiting_for=session_ready child=uncertain exit=not_observed signal=not_observed stderr=none"}`,
 							);
 				if (readiness.kind === "startup_failed" && readiness.failure.code === SDK_STARTUP_SESSION_HELD_CODE)
-					return heldSessionResponse(launch.id, startupFailureHolder(readiness.failure));
+					return { ok: false, error: hostHeldRefusalError(launch.id, readiness.failure) };
 				return readiness.kind === "startup_failed"
 					? fail(
 							readiness.failure.code ?? "spawn_failed",
@@ -9595,13 +9622,7 @@ export async function executeLifecycle(
 									ok: false,
 									error:
 										startupFailure.code === SDK_STARTUP_SESSION_HELD_CODE
-											? {
-													...heldSessionError(
-														entry.intendedSessionId!,
-														startupFailureHolder(startupFailure),
-													),
-													endpoint: "unavailable" as const,
-												}
+											? hostHeldRefusalError(entry.intendedSessionId!, startupFailure)
 											: startupFailure.code
 												? {
 														code: startupFailure.code,
