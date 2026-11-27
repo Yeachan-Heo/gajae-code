@@ -15,6 +15,7 @@ import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { $which } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
 import { groupLeaderIdentityMatches } from "../../runtime/process-lifecycle";
 
@@ -222,7 +223,7 @@ export function runEngineSubprocess(
 
 		const child = spawnImpl("python3", ["-m", "engine", inv.url, "--json"], {
 			cwd: INSANE_VENDOR_DIR,
-			env: { ...process.env, PYTHONPATH: INSANE_VENDOR_DIR },
+			env: { ...projectSafeSpawnEnv(), PYTHONPATH: INSANE_VENDOR_DIR },
 			stdio: ["ignore", "pipe", "pipe"],
 			// Own process group on POSIX so killChild can signal the engine's
 			// whole tree (python3 -> node -> headless Chromium) in one shot.

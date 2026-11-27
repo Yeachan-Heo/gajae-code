@@ -39,7 +39,8 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
-import { $credentialEnv } from "@gajae-code/utils";
+import { $credentialEnv, startupProjectEnvSnapshot } from "@gajae-code/utils";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
@@ -480,8 +481,14 @@ function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	// A present higher rank cannot raise the pin.
 	const trusted = $credentialEnv(CONTENT_CAPTURE_ENV);
 	const live = Bun.env[CONTENT_CAPTURE_ENV];
+	const key = canonicalEnvKey(CONTENT_CAPTURE_ENV);
+	const project = startupProjectEnvSnapshot();
+	const projectDeclaration = project.values[key];
+	const liveIsProjectValue =
+		projectDeclaration !== undefined && (project.dynamic.has(key) || live === projectDeclaration);
 	let raw: string | undefined;
 	if (live === undefined) raw = undefined;
+	else if (liveIsProjectValue) raw = trusted;
 	else if (contentCaptureRank(live) < contentCaptureRank(trusted)) raw = live;
 	else raw = trusted;
 	if (!raw) {

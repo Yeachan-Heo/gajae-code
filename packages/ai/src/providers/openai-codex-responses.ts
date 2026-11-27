@@ -23,7 +23,7 @@ import type {
 } from "openai/resources/responses/responses";
 import packageJson from "../../package.json" with { type: "json" };
 import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
-import { calculateCost } from "../models";
+import { calculateCost, IMAGE_ONLY_CHAT_MESSAGE, isImageOnlyModel } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
 	type Api,
@@ -83,12 +83,19 @@ import {
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
 import { compactGrammarDefinition } from "./grammar";
-import { CODEX_BASE_URL, getCodexAccountId, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "./openai-codex/constants";
+import {
+	CODEX_BASE_URL,
+	codexRoutingHint,
+	getCodexAccountId,
+	OPENAI_HEADER_VALUES,
+	OPENAI_HEADERS,
+} from "./openai-codex/constants";
 import {
 	type CodexRequestOptions,
 	type InputItem,
 	type RequestBody,
 	transformRequestBody,
+	withCodexRoutingFieldsFirst,
 } from "./openai-codex/request-transformer";
 import { parseCodexError } from "./openai-codex/response-handler";
 import { normalizeOpenAIResponsesPromptCacheKey } from "./openai-responses";
@@ -122,6 +129,7 @@ const CODEX_MAX_RETRIES = 5;
 const CODEX_RETRY_DELAY_MS = 500;
 const CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS = 10000;
 const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
+const CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS = 30000;
 /** Longest delay setTimeout honors; larger delays fire after 1 ms, so waits are capped here. */
 const CODEX_MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
@@ -204,6 +212,9 @@ const CODEX_EXPLICIT_TERMINAL_VETO_CODES = new Set([
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE = /\bnot supported when using codex with a chatgpt account\b/i;
+// Codex has labelled the same account-specific rejection with both codes; the
+// provider-authored ChatGPT-account wording is what makes it credential-specific.
+const CODEX_ACCOUNT_MODEL_UNAVAILABLE_CODES = new Set(["invalid_request_error", "model_not_found"]);
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
 const providerSessionStateIdentities = new WeakMap<Map<string, ProviderSessionState>, number>();
 const disabledCodexPublicSessionKeys = new Set<string>();
@@ -393,6 +404,11 @@ export interface OpenAICodexWebSocketDebugStats {
 	lastInputItems: number;
 	lastDeltaInputItems?: number;
 	lastPreviousResponseId?: string;
+	lastTurn?: {
+		request: {
+			canAppendBeforeRequest: boolean;
+		};
+	};
 }
 
 type CodexWebSocketSessionState = {
@@ -983,16 +999,8 @@ async function buildTransformedCodexRequestBody(
 	if (options?.repetitionPenalty !== undefined) {
 		params.repetition_penalty = options.repetitionPenalty;
 	}
-	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
-	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
-		params.service_tier = resolvedServiceTier;
-	} else if (resolvedServiceTier === "ultrafast") {
-		// Gate ultrafast to models that explicitly support it
-		if (modelSupportsUltrafastTier(model)) {
-			params.service_tier = "ultrafast";
-		}
-		// else: silently omit ultrafast if model doesn't support it (fail-closed)
-	}
+	const requestServiceTier = resolveCodexRequestServiceTier(model, options?.serviceTier);
+	if (requestServiceTier) params.service_tier = requestServiceTier;
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
 		if (options?.toolChoice) {
@@ -1023,10 +1031,13 @@ async function buildTransformedCodexRequestBody(
 	}
 
 	// Neutralize leaked Harmony control tokens in the system prompt too:
-	// `params.instructions` and the developer messages prepended inside
-	// `transformRequestBody` bypass the `input` sanitizer above, so a poisoned
-	// system prompt rejects every turn with
-	// `Request blocked (code=invalid_prompt)`.
+	// System prompts are sent as developer messages (or as base instructions) so they are prompt-cached.
+	// The top-level `instructions` field is not cached by the Codex backend,
+	// so we pass the first system prompt as `instructions` for moveCodexInstructionsToInput to handle,
+	// and additional system prompts through developerMessages.
+	// Developer messages prepended inside `transformRequestBody` bypass the `input`
+	// sanitizer above, so neutralization is still required. A poisoned system
+	// prompt would reject every turn with `Request blocked (code=invalid_prompt)`.
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt).map(neutralizeReservedControlTokens);
 	if (systemPrompts.length > 0) {
 		params.instructions = systemPrompts[0];
@@ -1103,8 +1114,10 @@ async function openCodexWebSocketTransport(
 	transport: CodexTransport;
 	sentPreviousResponseId: boolean;
 }> {
-	const websocketRequest = buildCodexWebSocketRequest(requestContext.transformedBody, websocketState);
-	const sentPreviousResponseId = typeof websocketRequest.previous_response_id === "string";
+	// Record canAppend BEFORE building the request so we can detect reconnections.
+	let canAppendBeforeRequest = websocketState.canAppend === true;
+	// Build the request without stats initially, since we might rebuild it after reconnect detection.
+	let websocketRequest = buildCodexWebSocketRequestWithoutStats(requestContext.transformedBody, websocketState);
 	const websocketHeaders = createCodexHeaders(
 		requestContext.requestHeaders,
 		requestContext.accountId,
@@ -1112,6 +1125,7 @@ async function openCodexWebSocketTransport(
 		requestContext.transformedBody.prompt_cache_key,
 		"websocket",
 		websocketState,
+		{ model: requestContext.transformedBody.model, service_tier: requestContext.transformedBody.service_tier },
 	);
 	const requestBodyForState = structuredCloneJSON(requestContext.transformedBody);
 	logCodexDebug("codex websocket request", {
@@ -1122,18 +1136,35 @@ async function openCodexWebSocketTransport(
 		sentTurnStateHeader: websocketHeaders.has(X_CODEX_TURN_STATE_HEADER),
 		sentModelsEtagHeader: websocketHeaders.has(X_MODELS_ETAG_HEADER),
 		requestType: websocketRequest.type,
-		sentPreviousResponseId,
+		sentPreviousResponseId: typeof websocketRequest.previous_response_id === "string",
 		retry,
 		retryBudget: getCodexWebSocketRetryBudget(options),
 	});
-	const eventStream = await openCodexWebSocketEventStream(
+	// Get the WebSocket connection. If it reconnects (closed, idle eviction, token
+	// refresh, or routing-hint change), canAppend will be reset to false.
+	const connection = await getOrCreateCodexWebSocketConnection(
+		websocketState,
 		toWebSocketUrl(requestContext.url),
 		websocketHeaders,
-		websocketRequest,
-		websocketState,
 		requestSetup.requestSignal,
 		options,
+	);
+	// If the socket reconnected, discard any delta built against the old socket
+	// and replay the full transformed body instead.
+	if (canAppendBeforeRequest && !websocketState.canAppend) {
+		websocketRequest = buildCodexWebSocketRequestWithoutStats(requestContext.transformedBody, websocketState);
+		// A reconnect occurred, so the final request was NOT built with canAppend.
+		canAppendBeforeRequest = false;
+	}
+	// Record stats for the final request that will be sent, including whether a reconnect occurred.
+	recordCodexWebSocketRequestStats(websocketState, websocketRequest, canAppendBeforeRequest);
+	const sentPreviousResponseId = typeof websocketRequest.previous_response_id === "string";
+	const eventStream = await connection.streamRequest(
+		websocketRequest,
+		requestSetup.requestSignal,
 		requestSetup.firstEventTimeoutMs,
+		getCodexWebSocketIdleTimeoutMs(options?.streamIdleTimeoutMs),
+		options?.onStreamCreated,
 	);
 	return { eventStream, requestBodyForState, transport: "websocket", sentPreviousResponseId };
 }
@@ -2846,6 +2877,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 		let runtime: CodexStreamRuntime | undefined;
 
 		try {
+			if (isImageOnlyModel(model)) throw new Error(IMAGE_ONLY_CHAT_MESSAGE);
 			const requestContext = await buildCodexRequestContext(model, context, streamOptions, output);
 			let initialTransport: CodexInitialTransport;
 			try {
@@ -2922,11 +2954,25 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 	return stream;
 };
 
+/**
+ * The `service_tier` a Codex request carries for `serviceTier`, or undefined when none is sent.
+ * Ultrafast is sent only for models with `compat.supportsUltrafastTier` (fail-closed).
+ */
+export function resolveCodexRequestServiceTier(
+	model: Model<"openai-codex-responses">,
+	serviceTier: ServiceTier | undefined,
+): "flex" | "scale" | "priority" | "ultrafast" | undefined {
+	const resolved = resolveServiceTier(serviceTier, model.provider);
+	if (resolved === "flex" || resolved === "scale" || resolved === "priority") return resolved;
+	if (resolved === "ultrafast" && modelSupportsUltrafastTier(model)) return "ultrafast";
+	return undefined;
+}
+
 export async function prewarmOpenAICodexResponses(
 	model: Model<"openai-codex-responses">,
 	options?: Pick<
 		OpenAICodexResponsesOptions,
-		"apiKey" | "headers" | "sessionId" | "signal" | "preferWebsockets" | "providerSessionState"
+		"apiKey" | "headers" | "sessionId" | "signal" | "preferWebsockets" | "providerSessionState" | "serviceTier"
 	>,
 ): Promise<void> {
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
@@ -2956,6 +3002,7 @@ export async function prewarmOpenAICodexResponses(
 		promptCacheKey,
 		"websocket",
 		state,
+		{ model: model.id, service_tier: resolveCodexRequestServiceTier(model, options?.serviceTier) },
 	);
 	const connectionPromise = logger.time(
 		"prewarmCodex:establishWs",
@@ -3202,10 +3249,18 @@ function stripInputItemIds(items: Array<Record<string, unknown>>): InputItem[] {
 function recordCodexWebSocketRequestStats(
 	state: CodexWebSocketSessionState | undefined,
 	request: Record<string, unknown>,
+	canAppendBeforeRequest?: boolean,
 ): void {
 	if (!state) return;
 	const input = request.input;
 	state.stats.lastInputItems = Array.isArray(input) ? input.length : 0;
+	if (canAppendBeforeRequest !== undefined) {
+		state.stats.lastTurn = {
+			request: {
+				canAppendBeforeRequest,
+			},
+		};
+	}
 	if (typeof request.previous_response_id === "string" && request.previous_response_id.length > 0) {
 		state.stats.deltaRequests += 1;
 		state.stats.lastDeltaInputItems = state.stats.lastInputItems;
@@ -3217,7 +3272,7 @@ function recordCodexWebSocketRequestStats(
 	state.stats.lastPreviousResponseId = undefined;
 }
 
-function buildCodexWebSocketRequest(
+function buildCodexWebSocketRequestWithoutStats(
 	requestBody: RequestBody,
 	state: CodexWebSocketSessionState | undefined,
 ): Record<string, unknown> {
@@ -3231,7 +3286,6 @@ function buildCodexWebSocketRequest(
 			previous_response_id: state.lastResponseId,
 			input: appendInput,
 		};
-		recordCodexWebSocketRequestStats(state, request);
 		return request;
 	}
 	if (state?.canAppend) {
@@ -3246,6 +3300,14 @@ function buildCodexWebSocketRequest(
 		type: "response.create",
 		...requestBody,
 	};
+	return request;
+}
+
+function buildCodexWebSocketRequest(
+	requestBody: RequestBody,
+	state: CodexWebSocketSessionState | undefined,
+): Record<string, unknown> {
+	const request = buildCodexWebSocketRequestWithoutStats(requestBody, state);
 	recordCodexWebSocketRequestStats(state, request);
 	return request;
 }
@@ -3284,16 +3346,22 @@ class CodexWebSocketConnection {
 	#connectPromise?: Promise<void>;
 	#activeRequest = false;
 	#localCloseReason?: string;
+	#createdAt: number;
 
 	constructor(url: string, headers: Record<string, string>, options: CodexWebSocketConnectionOptions) {
 		this.#url = url;
 		this.#headers = headers;
 		this.#idleTimeoutMs = options.idleTimeoutMs;
 		this.#onHandshakeHeaders = options.onHandshakeHeaders;
+		this.#createdAt = Date.now();
 	}
 
 	isOpen(): boolean {
 		return this.#socket?.readyState === WebSocket.OPEN;
+	}
+
+	isStale(): boolean {
+		return Date.now() - this.#createdAt > CODEX_WEBSOCKET_MAX_IDLE_REUSE_MS;
 	}
 
 	wasClosedLocally(): boolean {
@@ -3302,6 +3370,10 @@ class CodexWebSocketConnection {
 
 	matchesAuth(headers: Record<string, string>): boolean {
 		return this.#headers.authorization === headers.authorization;
+	}
+
+	matchesRoutingHint(headers: Record<string, string>): boolean {
+		return this.#headers[OPENAI_HEADERS.ROUTING_HINT] === headers[OPENAI_HEADERS.ROUTING_HINT];
 	}
 
 	close(reason = "done"): void {
@@ -3453,7 +3525,7 @@ class CodexWebSocketConnection {
 
 		try {
 			onStreamCreated?.();
-			this.#socket.send(JSON.stringify(request));
+			this.#socket.send(JSON.stringify(withCodexRoutingFieldsFirst(request)));
 			let sawFirstProgress = false;
 			const startedAt = Date.now();
 			let lastProgressAt = startedAt;
@@ -3565,12 +3637,19 @@ async function getOrCreateCodexWebSocketConnection(
 ): Promise<CodexWebSocketConnection> {
 	const headerRecord = headersToRecord(headers);
 	if (state.connection?.isOpen()) {
-		if (state.connection.matchesAuth(headerRecord)) {
+		if (!state.connection.matchesAuth(headerRecord)) {
+			state.connection.close("token-refresh");
+			resetCodexWebSocketAppendState(state);
+		} else if (!state.connection.matchesRoutingHint(headerRecord)) {
+			state.connection.close("routing-change");
+			resetCodexWebSocketAppendState(state);
+		} else if (!state.connection.isStale()) {
 			logger.time("codexWs:reuseOpenSocket");
 			return state.connection;
+		} else {
+			state.connection.close("stale-reuse");
+			resetCodexWebSocketAppendState(state);
 		}
-		state.connection.close("token-refresh");
-		resetCodexWebSocketAppendState(state);
 	}
 	state.connection?.close("reconnect");
 	resetCodexWebSocketAppendState(state);
@@ -3599,7 +3678,10 @@ async function openCodexSseEventStream(
 	fetchOverride?: FetchImpl,
 	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries" | "onStreamCreated">,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
-	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state);
+	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state, {
+		model: body.model,
+		service_tier: body.service_tier,
+	});
 	logCodexDebug("codex request", {
 		url,
 		model: body.model,
@@ -3674,6 +3756,7 @@ function createCodexHeaders(
 	promptCacheKey?: string,
 	transport: CodexTransport = "sse",
 	state?: CodexWebSocketSessionState,
+	routedRequest?: Pick<RequestBody, "model" | "service_tier">,
 ): Headers {
 	const headers = new Headers(initHeaders ?? {});
 	headers.delete("x-api-key");
@@ -3692,12 +3775,18 @@ function createCodexHeaders(
 	headers.set(OPENAI_HEADERS.BETA, betaHeader);
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 	headers.set("User-Agent", getCodexUserAgent());
+	if (routedRequest?.model) {
+		headers.set(
+			OPENAI_HEADERS.ROUTING_HINT,
+			codexRoutingHint(routedRequest.model, routedRequest.service_tier as string | null | undefined),
+		);
+	} else {
+		headers.delete(OPENAI_HEADERS.ROUTING_HINT);
+	}
 	if (promptCacheKey) {
-		headers.set(OPENAI_HEADERS.CONVERSATION_ID, promptCacheKey);
 		headers.set(OPENAI_HEADERS.SESSION_ID, promptCacheKey);
 		headers.set("x-client-request-id", promptCacheKey);
 	} else {
-		headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
 		headers.delete(OPENAI_HEADERS.SESSION_ID);
 	}
 	if (state?.turnState) {
@@ -3717,6 +3806,9 @@ function createCodexHeaders(
 		headers.delete("accept");
 		headers.delete("content-type");
 	}
+	// Strip legacy conversation_id header unconditionally, regardless of caller input.
+	// Only session_id should be sent to Codex upstream.
+	headers.delete("conversation_id");
 	return headers;
 }
 
@@ -4066,7 +4158,8 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 
 function isCodexAccountModelUnavailable(message: string | undefined, code: string | undefined): boolean {
 	return (
-		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") && code?.toLowerCase() === "invalid_request_error"
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_MESSAGE.test(message ?? "") &&
+		CODEX_ACCOUNT_MODEL_UNAVAILABLE_CODES.has(code?.toLowerCase() ?? "")
 	);
 }
 

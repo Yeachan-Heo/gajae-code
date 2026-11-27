@@ -41,7 +41,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
-use crate::windows::configure_windows_path;
+use crate::windows::{capture_console_baseline, configure_windows_path, restore_console_baseline};
 use crate::{
 	cancel::{AbortReason, AbortToken, CancelToken},
 	minimizer,
@@ -1034,10 +1034,15 @@ async fn run_shell_command(
 		}
 	});
 	let source_info = SourceInfo::from("pi-natives:command");
+	#[cfg(windows)]
+	capture_console_baseline();
 	let result = session
 		.shell
 		.run_string(options.command.clone(), &source_info, &params)
 		.await;
+	// A child sharing the console may have switched its code page (#7760).
+	#[cfg(windows)]
+	restore_console_baseline();
 	pgid_probe.abort();
 	let _ = pgid_probe.await;
 
@@ -1236,10 +1241,15 @@ async fn run_shell_command_streams(
 		}
 	});
 	let source_info = SourceInfo::from("pi-shell:streams");
+	#[cfg(windows)]
+	capture_console_baseline();
 	let result = session
 		.shell
 		.run_string(options.command.clone(), &source_info, &params)
 		.await;
+	// A child sharing the console may have switched its code page (#7760).
+	#[cfg(windows)]
+	restore_console_baseline();
 	pgid_probe.abort();
 	let _ = pgid_probe.await;
 

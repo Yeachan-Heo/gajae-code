@@ -1,3 +1,4 @@
+import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
 	getMiniMaxThinkingMode,
@@ -68,11 +69,17 @@ import { getProviderAuthHealth } from "../../config/provider-auth-health";
 import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import type { RoutingSettingsPreview } from "../../sdk/routing-settings";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
-import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
+import {
+	formatClampedModelSelector,
+	getThinkingLevelMetadata,
+	modelSupportsThinkingOff,
+	parseThinkingLevel,
+} from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
-import type { SmartRoutingIntent, SmartRoutingPreview } from "./smart-routing-panel";
+import type { SmartRoutingIntent } from "./smart-routing-panel";
 import { SmartRoutingPanelComponent } from "./smart-routing-panel";
 
 function makeInvertedBadge(label: string, color: ThemeColor): string {
@@ -334,7 +341,10 @@ interface PendingThinkingChoice {
 	levels: ThinkingLevel[];
 }
 
-type RoleSelectCallback = (selection: ModelSelectorSelection) => void | Promise<void>;
+type RoleSelectCallback =
+	| ((selection: ModelSelectorSelection) => void)
+	| ((selection: ModelSelectorSelection) => Promise<void>)
+	| ((selection: ModelSelectorSelection) => Promise<RoutingSettingsPreview | undefined>);
 type CancelCallback = () => void;
 
 interface ProviderTabState {
@@ -590,7 +600,10 @@ export class ModelSelectorComponent extends Container {
 	#authSessionId?: string;
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
-	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	#smartRoutingStateUnknown = false;
+	#isSmartRoutingStateUnknown?: () => boolean;
+	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+	#smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
 	#isBillingDismissed?: (key: string) => boolean;
 	#markBillingDismissed?: (key: string) => void;
 	#pendingBillingNoticeKey?: string;
@@ -619,7 +632,9 @@ export class ModelSelectorComponent extends Container {
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
-			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+			smartRoutingPreview?: (draft: AutoroutingSetup) => RoutingSettingsPreview;
+			smartRoutingDiscardPreview?: (preview: RoutingSettingsPreview) => void;
+			smartRoutingStateUnknown?: () => boolean;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
 			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
@@ -640,6 +655,8 @@ export class ModelSelectorComponent extends Container {
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
+		this.#smartRoutingDiscardPreview = options?.smartRoutingDiscardPreview;
+		this.#isSmartRoutingStateUnknown = options?.smartRoutingStateUnknown;
 		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
 		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
@@ -1216,9 +1233,16 @@ export class ModelSelectorComponent extends Container {
 
 		// Start with all models or filter by provider/canonical view
 		let baseModels = this.#allModels;
-		const baseCanonicalModels = this.#canonicalModels;
+		let baseCanonicalModels = this.#canonicalModels;
 		if (this.#imageRoleFilter) {
 			baseModels = baseModels.filter(m => m.model.output?.includes("image") ?? false);
+			baseCanonicalModels = baseCanonicalModels.filter(m => m.model.output?.includes("image") ?? false);
+		} else {
+			// When not filtering for image role, exclude image-only models from chat selection.
+			// Image-only models have output: ["image"] and should not appear in ordinary chat.
+			// Models with undefined output default to text-only and are included.
+			baseModels = baseModels.filter(m => !m.model.output || m.model.output.includes("text"));
+			baseCanonicalModels = baseCanonicalModels.filter(m => !m.model.output || m.model.output.includes("text"));
 		}
 		if (activeProviderId) {
 			baseModels = baseModels.filter(m => m.provider === activeProviderId);
@@ -1234,7 +1258,9 @@ export class ModelSelectorComponent extends Container {
 					return;
 				}
 				this.#updateTabBar();
-				baseModels = this.#allModels;
+				baseModels = this.#imageRoleFilter
+					? this.#allModels.filter(m => m.model.output?.includes("image") ?? false)
+					: this.#allModels.filter(m => !m.model.output || m.model.output.includes("text"));
 			}
 
 			if (isCanonicalTab) {
@@ -1304,13 +1330,16 @@ export class ModelSelectorComponent extends Container {
 		return formatModelSelectorValue(`${this.#currentModel.provider}/${this.#currentModel.id}`, thinkingLevel);
 	}
 
-	#resolveProfileModelSelector(value: ModelSelectorValue | undefined): string | string[] | undefined {
+	#resolveProfileModelSelector(
+		value: ModelSelectorValue | undefined,
+		scopedCatalog: () => Model[],
+	): string | string[] | undefined {
 		const resolvedSelectors: string[] = [];
 		for (const configuredSelector of normalizeModelSelectorValue(value)) {
 			if (isInheritedRoleSelector(configuredSelector)) continue;
 			const selectors = resolveConfiguredModelPatterns(configuredSelector, this.#settings);
 			for (const selector of selectors.length > 0 ? selectors : [configuredSelector]) {
-				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
+				const resolved = resolveModelRoleValue(selector, scopedCatalog(), {
 					settings: this.#settings,
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
@@ -1342,6 +1371,7 @@ export class ModelSelectorComponent extends Container {
 
 	#buildCustomModelProfileSnapshot(): ModelProfileConfig {
 		const modelMapping: ModelProfileConfig["model_mapping"] = {};
+		const scopedCatalog = this.#scopedCatalogReader();
 		// Prefer the session's configured default chain so fallback tails are
 		// never dropped from the snapshot; the live model only replaces the head.
 		if (this.#configuredDefaultChain && this.#configuredDefaultChain.length > 0) {
@@ -1354,7 +1384,7 @@ export class ModelSelectorComponent extends Container {
 				modelMapping.default = currentModelSelector;
 			} else {
 				const defaultRole = this.#settings.getModelRole("default");
-				const defaultSelector = this.#resolveProfileModelSelector(defaultRole);
+				const defaultSelector = this.#resolveProfileModelSelector(defaultRole, scopedCatalog);
 				if (defaultSelector) modelMapping.default = defaultSelector;
 			}
 		}
@@ -1362,13 +1392,27 @@ export class ModelSelectorComponent extends Container {
 		const agentOverrides = this.#settings.get("task.agentModelOverrides");
 		for (const role of GJC_MODEL_ASSIGNMENT_TARGET_IDS) {
 			if (role === "default") continue;
-			const selector = this.#resolveProfileModelSelector(agentOverrides[role]);
+			const selector = this.#resolveProfileModelSelector(agentOverrides[role], scopedCatalog);
 			if (selector) modelMapping[role] = selector;
 		}
 
 		return {
 			required_providers: deriveRequiredProviders(modelMapping),
 			model_mapping: modelMapping,
+		};
+	}
+
+	/**
+	 * `getAll(sessionId)` re-merges and re-finalizes the credential-scoped catalog
+	 * on every call. A caller that resolves several selectors in one synchronous
+	 * pass reads it at most once through this reader; the copy belongs to that
+	 * pass alone and is never stored on the selector.
+	 */
+	#scopedCatalogReader(): () => Model[] {
+		let models: Model[] | undefined;
+		return () => {
+			models ??= this.#modelRegistry.getAll(this.#authSessionId);
+			return models;
 		};
 	}
 
@@ -1423,7 +1467,10 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#getProfileAvailableModels(): Model[] {
-		return this.#modelRegistry.getAvailable(this.#authSessionId);
+		// Exclude image-only models from profile availability since they should not
+		// be selectable as regular chat models. Image-only models have output: ["image"]
+		// and are only accessible through the image tool.
+		return this.#modelRegistry.getAvailable(this.#authSessionId).filter(m => !m.output || m.output.includes("text"));
 	}
 
 	#createProfileResolutionRegistry(availableModels: readonly Model[]) {
@@ -1943,18 +1990,24 @@ export class ModelSelectorComponent extends Container {
 		return autoroutingProviderOrderHint(declared, this.#modelRegistry.autoroutingProviderOrder());
 	}
 
-	#smartRoutingPreview(setup: AutoroutingSetup): SmartRoutingPreview {
+	#smartRoutingPreview(setup: AutoroutingSetup): RoutingSettingsPreview {
 		if (!this.#smartRoutingPreviewBuilder) {
 			throw new Error("Smart-routing preview is unavailable in this selector context.");
 		}
 		return this.#smartRoutingPreviewBuilder(setup);
 	}
 
-	#smartRoutingIsStale(): boolean {
+	#smartRoutingUnknown(): boolean {
+		return this.#smartRoutingStateUnknown || this.#isSmartRoutingStateUnknown?.() === true;
+	}
+
+	#smartRoutingIsStale(committedPreview?: RoutingSettingsPreview): boolean {
+		if (this.#smartRoutingUnknown()) return false;
 		const provenance = this.#settings.get("task.autorouting.provenance");
-		if (!provenance || validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+		if (!provenance) return false;
 		try {
-			const preview = this.#smartRoutingPreview(this.#smartRoutingSetup());
+			if (validateAutoroutingSetup(this.#smartRoutingSetup()).length > 0) return false;
+			const preview = committedPreview ?? this.#smartRoutingPreview(this.#smartRoutingSetup());
 			const state = evaluateAutoroutingProvenanceState(provenance, {
 				catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
 				mapFingerprint: preview.sourceIdentity.mapFingerprint,
@@ -1971,6 +2024,12 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#enterSmartRoutingMode(): void {
+		if (this.#smartRoutingUnknown()) {
+			this.#viewMode = "presets";
+			this.#presetLoginHint = "Smart-routing settings are unknown; reload Settings before continuing.";
+			this.#renderPresetLanding();
+			return;
+		}
 		if (!this.#smartRoutingPreviewBuilder) {
 			if (this.#smartRoutingOnly) {
 				this.#onCancelCallback();
@@ -2001,14 +2060,17 @@ export class ModelSelectorComponent extends Container {
 			tiers,
 			provenance,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
+			isStateUnknown: () => this.#smartRoutingUnknown(),
 			stale: this.#smartRoutingIsStale(),
 			preview,
 			generatePreview: draft => this.#smartRoutingPreview(draft),
+			discardPreview: preview => this.#smartRoutingDiscardPreview?.(preview),
 			onSelect: async intent => {
-				await this.#onSelectCallback({ kind: "smartRouting", intent });
-				return intent.kind === "apply" ? this.#smartRoutingPreview(intent.draft) : undefined;
+				const result = await this.#onSelectCallback({ kind: "smartRouting", intent });
+				return result || undefined;
 			},
 			onCancel: () => (this.#smartRoutingOnly ? this.#onCancelCallback() : this.#switchToPresetMode()),
 		});
@@ -2029,18 +2091,58 @@ export class ModelSelectorComponent extends Container {
 		this.#requestRender();
 	}
 
-	refreshSmartRoutingState(): void {
+	#hasEffectiveGeneratedSetup(): boolean {
+		return (
+			this.#settings.get("task.autorouting.setup") !== undefined ||
+			this.#settings.get("task.autorouting.provenance") !== undefined ||
+			Object.keys(this.#settings.get("task.autorouting.tiers") ?? {}).length > 0
+		);
+	}
+
+	/** The Settings snapshot cannot be trusted after an unresolved durable rollback. */
+	invalidateSmartRoutingState(): void {
+		this.#smartRoutingStateUnknown = true;
+	}
+
+	markSmartRoutingEffectiveStateUnknown(): void {
+		this.#smartRoutingPanel?.markEffectiveStateUnknown();
+	}
+
+	refreshSmartRoutingState(committedPreview?: RoutingSettingsPreview): void {
+		if (this.#smartRoutingUnknown()) return;
 		const panel = this.#smartRoutingPanel;
 		if (!panel || this.#viewMode !== "smart-routing") return;
-		const setup = this.#smartRoutingSetup();
-		const preview = this.#smartRoutingPreview(setup);
+		// Catalog and provider-order reads are advisory after publication. A failure must
+		// invalidate the preview, not turn an already committed write into a failure.
+		let setup = committedPreview?.setup ?? panel.getDraft();
+		let preview = committedPreview;
+		let providerOrderHint: AutoroutingProviderOrderHint | undefined;
+		try {
+			if (!committedPreview) {
+				setup = this.#smartRoutingSetup();
+				preview = this.#smartRoutingPreview(setup);
+			}
+			providerOrderHint = this.#providerOrderHintFor(setup.providers);
+		} catch {
+			if (!committedPreview) {
+				if (preview) this.#smartRoutingDiscardPreview?.(preview);
+				preview = undefined;
+			}
+		}
+		const effectiveDiffersFromSaved =
+			committedPreview !== undefined &&
+			(!util.isDeepStrictEqual(this.#settings.get("task.autorouting.setup"), committedPreview.setup) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.tiers"), committedPreview.tiers) ||
+				!util.isDeepStrictEqual(this.#settings.get("task.autorouting.provenance"), committedPreview.provenance));
 		panel.refreshState({
 			setup,
-			tiers: normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
-			provenance: this.#settings.get("task.autorouting.provenance"),
+			tiers: committedPreview?.tiers ?? normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
+			provenance: committedPreview?.provenance ?? this.#settings.get("task.autorouting.provenance"),
+			effectiveDiffersFromSaved,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
-			providerOrderHint: this.#providerOrderHintFor(setup.providers),
-			stale: this.#smartRoutingIsStale(),
+			effectiveGeneratedSetup: this.#hasEffectiveGeneratedSetup(),
+			providerOrderHint,
+			stale: committedPreview ? false : preview ? this.#smartRoutingIsStale(preview) : false,
 			preview,
 		});
 		this.#requestRender();
@@ -2067,7 +2169,11 @@ export class ModelSelectorComponent extends Container {
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			if (row.kind === "smartRouting") {
 				const stale = this.#smartRoutingIsStale();
-				const label = stale ? "Smart routing (stale)" : "Smart routing setup";
+				const label = this.#smartRoutingUnknown()
+					? "Smart routing (unknown)"
+					: stale
+						? "Smart routing (stale)"
+						: "Smart routing setup";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
@@ -2159,10 +2265,11 @@ export class ModelSelectorComponent extends Container {
 		this.#listContainer.addChild(
 			new Text(theme.fg("muted", `  Preset preview: ${getModelProfilePresentation(profile).displayName}`), 0, 0),
 		);
+		const scopedCatalog = this.#scopedCatalogReader();
 		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
 			const selector = profile.modelMapping[role];
 			if (!selector) continue;
-			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
+			const resolved = resolveModelRoleValue(selector, scopedCatalog(), {
 				settings: this.#settings,
 				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,
@@ -2486,6 +2593,15 @@ export class ModelSelectorComponent extends Container {
 		return this.#isCanonicalTab()
 			? this.#filteredCanonicalModels[this.#selectedIndex]
 			: this.#filteredModels[this.#selectedIndex];
+	}
+
+	render(width: number): string[] {
+		// The service does not notify the TUI: observe shared invalidation on the next render.
+		if (this.#viewMode === "presets" && this.#smartRoutingUnknown() && !this.#smartRoutingStateUnknown) {
+			this.#smartRoutingStateUnknown = true;
+			this.#renderPresetLanding();
+		}
+		return super.render(width);
 	}
 
 	handleInput(keyData: string): void {
@@ -3055,7 +3171,7 @@ export class ModelSelectorComponent extends Container {
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {
-	const levels: ThinkingLevel[] = [ThinkingLevel.Off];
+	const levels: ThinkingLevel[] = modelSupportsThinkingOff(model) ? [ThinkingLevel.Off] : [];
 	let efforts: readonly string[];
 	try {
 		efforts = getSupportedEfforts(model);

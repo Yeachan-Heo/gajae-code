@@ -4,7 +4,7 @@
  * bash-shell worker protocol) plus the unchanged ordinary routing order:
  * bash-shell workers -> darwin malloc re-exec -> internal smoke -> tmux owner
  * isolation -> managed-owner supervisor/admission/recovery -> broker hop ->
- * private sdk stderr drainer -> public family dispatch -> community app -> doctor worker /
+ * private sdk stderr drainer -> public family dispatch -> doctor worker /
  * probe / cli -> full registry. `cli.ts` imports it lazily, only after argv has
  * been proven not to be a `sdk diagnostics` observation. */
 
@@ -113,9 +113,9 @@ export async function runOrdinaryCli(argv: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (argv.length === 1 && argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(argv);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
@@ -148,22 +148,7 @@ export async function runOrdinaryCli(argv: string[]): Promise<void> {
 		await dispatchPublicFamily(argv);
 		return;
 	}
-	if (argv.length === 1 && argv[0] === "--supports-macos-community-app") {
-		process.stdout.write("macos-community-app-offer\n");
-		return;
-	}
-	if (argv.length === 1 && argv[0] === "--internal-macos-community-app-offer") {
-		try {
-			const { offerMacosCommunityApp } = await import("./cli/macos-community-app");
-			await offerMacosCommunityApp({ log: message => process.stderr.write(`${message}\n`) });
-		} catch {
-			const { COMMUNITY_APP_REPOSITORY } = await import("./cli/macos-community-app");
-			process.stderr.write(
-				`Optional community app offer failed; GJC remains installed. https://github.com/${COMMUNITY_APP_REPOSITORY}\n`,
-			);
-		}
-		return;
-	}
+
 	if (argv[0] === "--internal-doctor-worker") {
 		// Non-forgeable route: reachable only with the exact per-spawn token env var
 		// AND a non-TTY stdin (isRoutableDoctorWorkerInvocation), so a user's own
@@ -179,7 +164,7 @@ export async function runOrdinaryCli(argv: string[]): Promise<void> {
 		return;
 	}
 	if (argv[0] === "--internal-doctor-probe") {
-		if (argv.length !== 2 || (argv[1] !== "native" && argv[1] !== "projection")) {
+		if (argv.length !== 2 || (argv[1] !== "native" && argv[1] !== "projection" && argv[1] !== "session-owners")) {
 			process.stderr.write("gjc doctor: invalid internal probe invocation\n");
 			process.exitCode = 2;
 			return;

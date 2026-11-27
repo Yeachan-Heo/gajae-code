@@ -6,6 +6,7 @@ import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-
 import packageJson from "../package.json";
 import { parseArgs } from "../src/cli/args";
 import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli-main";
+import { prepareManagedDirectoryRoot } from "../src/session/internal/managed-session-storage";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -92,6 +93,9 @@ describe("GJC public CLI command surface", () => {
 		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
 		const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
+		// The launcher prepares each owner-only lifecycle root before the supervisor runs.
+		prepareManagedDirectoryRoot(lifecycle.root);
+		prepareManagedDirectoryRoot(lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked").root);
 		const managedOwnerEnv = {
 			...process.env,
 			GJC_TMUX_OWNER_STATE_DIR: stateDir,
@@ -101,15 +105,17 @@ describe("GJC public CLI command surface", () => {
 			GJC_MANAGED_OWNER_INCARNATION: "incarnation-cli-route",
 		};
 		try {
-			const admitted = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...managedOwnerEnv,
-					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, cliEntry, "--version"]),
+			const admitted = Bun.spawnSync(
+				["bun", cliEntry, "--internal-managed-owner-supervisor", "--", process.execPath, cliEntry, "--version"],
+				{
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...managedOwnerEnv,
+					},
 				},
-			});
+			);
 			const admittedOutput = `${admitted.stdout.toString()}\n${admitted.stderr.toString()}`;
 			expect(admitted.exitCode, admittedOutput).toBe(0);
 			expect(admitted.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
@@ -125,18 +131,20 @@ if (!binding) throw new Error("binding_missing");
 await writeFile(\`\${process.env.GJC_MANAGED_OWNER_BINDING_DIR}/\${binding}\`, "{}\\n");
 const child = Bun.spawn([${JSON.stringify(process.execPath)}, ${JSON.stringify(cliEntry)}, "--version"], { stdout: "inherit", stderr: "inherit" });
 process.exitCode = await child.exited;`;
-			const blocked = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...managedOwnerEnv,
-					GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
-					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, "-e", unboundChild]),
-					GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
-						.root,
+			const blocked = Bun.spawnSync(
+				["bun", cliEntry, "--internal-managed-owner-supervisor", "--", process.execPath, "-e", unboundChild],
+				{
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...managedOwnerEnv,
+						GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
+						GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
+							.root,
+					},
 				},
-			});
+			);
 			const blockedOutput = `${blocked.stdout.toString()}\n${blocked.stderr.toString()}`;
 			expect(blocked.exitCode, blockedOutput).toBe(75);
 			expect(blockedOutput).not.toContain("gjc/");

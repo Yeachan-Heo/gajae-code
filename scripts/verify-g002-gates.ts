@@ -491,9 +491,14 @@ function isExactMcpFallback(statement: Babel.Statement): boolean {
 	if (statement.type !== "IfStatement" || statement.alternate !== null) return false;
 	const condition = statement.test;
 	if (
-		condition.type !== "UnaryExpression" ||
-		condition.operator !== "!" ||
-		!hasMcpMemberAccessChain(condition.argument, "runtime", ["ctx", "session", "hasExactMcpControls"])
+		condition.type !== "LogicalExpression" ||
+		condition.operator !== "&&" ||
+		condition.left.type !== "UnaryExpression" ||
+		condition.left.operator !== "!" ||
+		!hasMcpMemberAccessChain(condition.left.argument, "runtime", ["ctx", "session", "hasExactMcpControls"]) ||
+		condition.right.type !== "UnaryExpression" ||
+		condition.right.operator !== "!" ||
+		!hasMcpMemberAccessChain(condition.right.argument, "runtime", ["ctx", "session", "hasSessionMcpControls"])
 	) {
 		return false;
 	}
@@ -511,6 +516,27 @@ function isExactMcpFallback(statement: Babel.Statement): boolean {
 		prompt.value.object.name === "command" &&
 		prompt.value.property.type === "Identifier" &&
 		prompt.value.property.name === "text"
+	);
+}
+
+function isSessionMcpTuiHandler(statement: Babel.Statement): boolean {
+	if (statement.type !== "IfStatement" || statement.alternate !== null) return false;
+	const condition = statement.test;
+	const fallback = statement.consequent;
+	return (
+		condition.type === "UnaryExpression" &&
+		condition.operator === "!" &&
+		hasMcpMemberAccessChain(condition.argument, "runtime", ["ctx", "session", "hasExactMcpControls"]) &&
+		fallback.type === "ReturnStatement" &&
+		fallback.argument?.type === "CallExpression" &&
+		!fallback.argument.optional &&
+		fallback.argument.callee.type === "Identifier" &&
+		fallback.argument.callee.name === "handleSessionMcpTui" &&
+		fallback.argument.arguments.length === 2 &&
+		fallback.argument.arguments[0]?.type === "Identifier" &&
+		fallback.argument.arguments[0].name === "command" &&
+		fallback.argument.arguments[1]?.type === "Identifier" &&
+		fallback.argument.arguments[1].name === "runtime"
 	);
 }
 
@@ -1097,7 +1123,13 @@ export function findMcpBuiltinQuarantineFindings(builtinRegistry: string): strin
 			continue;
 		}
 		const handlerBody = getMcpHandlerBody(tuiHandlers[0]!);
-		if (!handlerBody || !handlerBody.body[0] || !isExactMcpFallback(handlerBody.body[0])) {
+		if (
+			!handlerBody ||
+			!handlerBody.body[0] ||
+			!handlerBody.body[1] ||
+			!isExactMcpFallback(handlerBody.body[0]) ||
+			!isSessionMcpTuiHandler(handlerBody.body[1])
+		) {
 			findings.push("root /mcp TUI handler must fall through without exact MCP controls");
 		}
 	}
@@ -1113,20 +1145,39 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				return false;
 			}
 			const declaration = statement.declaration;
-			const [capabilityBranch, filteredReturn] = declaration.body.body;
+			const [exactCapabilityBranch, sessionCapabilityBranch, filteredReturn] = declaration.body.body;
 			if (
 				declaration.id?.name !== "getBuiltinSlashCommandsForSession" ||
-				declaration.params.length !== 1 ||
+				declaration.params.length !== 2 ||
 				declaration.params[0]?.type !== "Identifier" ||
 				declaration.params[0].name !== "hasExactMcpControls" ||
-				declaration.body.body.length !== 2 ||
-				capabilityBranch?.type !== "IfStatement" ||
-				capabilityBranch.test.type !== "Identifier" ||
-				capabilityBranch.test.name !== "hasExactMcpControls" ||
-				capabilityBranch.alternate !== null ||
-				capabilityBranch.consequent.type !== "ReturnStatement" ||
-				capabilityBranch.consequent.argument?.type !== "Identifier" ||
-				capabilityBranch.consequent.argument.name !== "BUILTIN_SLASH_COMMANDS" ||
+				declaration.params[1]?.type !== "Identifier" ||
+				declaration.params[1].name !== "session" ||
+				declaration.body.body.length !== 3 ||
+				exactCapabilityBranch?.type !== "IfStatement" ||
+				exactCapabilityBranch.test.type !== "Identifier" ||
+				exactCapabilityBranch.test.name !== "hasExactMcpControls" ||
+				exactCapabilityBranch.alternate !== null ||
+				exactCapabilityBranch.consequent.type !== "ReturnStatement" ||
+				exactCapabilityBranch.consequent.argument?.type !== "Identifier" ||
+				exactCapabilityBranch.consequent.argument.name !== "BUILTIN_SLASH_COMMANDS" ||
+				sessionCapabilityBranch?.type !== "IfStatement" ||
+				sessionCapabilityBranch.alternate !== null ||
+				sessionCapabilityBranch.test.type !== "OptionalMemberExpression" ||
+				!sessionCapabilityBranch.test.optional ||
+				sessionCapabilityBranch.test.computed ||
+				sessionCapabilityBranch.test.object.type !== "Identifier" ||
+				sessionCapabilityBranch.test.object.name !== "session" ||
+				sessionCapabilityBranch.test.property.type !== "Identifier" ||
+				sessionCapabilityBranch.test.property.name !== "hasSessionMcpControls" ||
+				sessionCapabilityBranch.consequent.type !== "ReturnStatement" ||
+				sessionCapabilityBranch.consequent.argument?.type !== "CallExpression" ||
+				sessionCapabilityBranch.consequent.argument.optional ||
+				sessionCapabilityBranch.consequent.argument.callee.type !== "Identifier" ||
+				sessionCapabilityBranch.consequent.argument.callee.name !== "getSessionMcpSlashCommands" ||
+				sessionCapabilityBranch.consequent.argument.arguments.length !== 1 ||
+				sessionCapabilityBranch.consequent.argument.arguments[0]?.type !== "Identifier" ||
+				sessionCapabilityBranch.consequent.argument.arguments[0].name !== "session" ||
 				filteredReturn?.type !== "ReturnStatement" ||
 				filteredReturn.argument?.type !== "CallExpression" ||
 				filteredReturn.argument.optional ||
@@ -1315,7 +1366,8 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 		const constructor = method("constructor");
 		const refreshCommands = method("refreshSlashCommandState");
 		const constructorBody = constructor?.body.body ?? [];
-		const constructorCapabilityAssignments: Babel.AssignmentExpression[] = [];
+		const constructorExactCapabilityAssignments: Babel.AssignmentExpression[] = [];
+		const constructorSessionCapabilityAssignments: Babel.AssignmentExpression[] = [];
 		if (constructor) {
 			traverse(interactiveMode, {
 				AssignmentExpression(assignmentPath) {
@@ -1323,11 +1375,28 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 						assignmentPath.findParent(parentPath => parentPath.node === constructor) &&
 						thisPrivate(assignmentPath.node.left, "sessionBuiltinMcpVisible")
 					) {
-						constructorCapabilityAssignments.push(assignmentPath.node);
+						constructorExactCapabilityAssignments.push(assignmentPath.node);
+					}
+					if (
+						assignmentPath.findParent(parentPath => parentPath.node === constructor) &&
+						thisPrivate(assignmentPath.node.left, "sessionBuiltinSessionMcpVisible")
+					) {
+						constructorSessionCapabilityAssignments.push(assignmentPath.node);
 					}
 				},
 			});
 		}
+		const isSessionArgument = (node: Babel.Node | null | undefined, capability: string): boolean =>
+			node?.type === "ConditionalExpression" &&
+			((node.test.type === "MemberExpression" && thisPrivate(node.test, capability)) ||
+				(node.test.type === "Identifier" && node.test.name === capability)) &&
+			node.consequent.type === "MemberExpression" &&
+			!node.consequent.computed &&
+			node.consequent.object.type === "ThisExpression" &&
+			node.consequent.property.type === "Identifier" &&
+			node.consequent.property.name === "session" &&
+			node.alternate.type === "Identifier" &&
+			node.alternate.name === "undefined";
 		const initSlashCommandsIndex = constructorBody.findIndex(
 			statement =>
 				statement.type === "VariableDeclaration" &&
@@ -1339,15 +1408,17 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 						declaration.init?.type === "CallExpression" &&
 						declaration.init.callee.type === "Identifier" &&
 						declaration.init.callee.name === "getBuiltinSlashCommandsForSession" &&
+						declaration.init.arguments.length === 2 &&
 						declaration.init.arguments[0]?.type === "MemberExpression" &&
-						thisPrivate(declaration.init.arguments[0], "sessionBuiltinMcpVisible"),
+						thisPrivate(declaration.init.arguments[0], "sessionBuiltinMcpVisible") &&
+						isSessionArgument(declaration.init.arguments[1], "sessionBuiltinSessionMcpVisible"),
 				),
 		);
-		const initializationAssignmentIndex = constructorBody.findIndex(
+		const exactInitializationAssignmentIndex = constructorBody.findIndex(
 			statement =>
 				statement.type === "ExpressionStatement" &&
 				statement.expression.type === "AssignmentExpression" &&
-				constructorCapabilityAssignments.includes(statement.expression) &&
+				constructorExactCapabilityAssignments.includes(statement.expression) &&
 				statement.expression.operator === "=" &&
 				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
 				statement.expression.right.type === "MemberExpression" &&
@@ -1360,10 +1431,30 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				statement.expression.right.property.type === "Identifier" &&
 				statement.expression.right.property.name === "hasExactMcpControls",
 		);
+		const sessionInitializationAssignmentIndex = constructorBody.findIndex(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				constructorSessionCapabilityAssignments.includes(statement.expression) &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinSessionMcpVisible") &&
+				statement.expression.right.type === "MemberExpression" &&
+				!statement.expression.right.computed &&
+				statement.expression.right.object.type === "MemberExpression" &&
+				!statement.expression.right.object.computed &&
+				statement.expression.right.object.object.type === "ThisExpression" &&
+				statement.expression.right.object.property.type === "Identifier" &&
+				statement.expression.right.object.property.name === "session" &&
+				statement.expression.right.property.type === "Identifier" &&
+				statement.expression.right.property.name === "hasSessionMcpControls",
+		);
 		const initialization =
-			constructorCapabilityAssignments.length === 1 &&
-			initializationAssignmentIndex >= 0 &&
-			initializationAssignmentIndex < initSlashCommandsIndex;
+			constructorExactCapabilityAssignments.length === 1 &&
+			constructorSessionCapabilityAssignments.length === 1 &&
+			exactInitializationAssignmentIndex >= 0 &&
+			sessionInitializationAssignmentIndex >= 0 &&
+			exactInitializationAssignmentIndex < sessionInitializationAssignmentIndex &&
+			sessionInitializationAssignmentIndex < initSlashCommandsIndex;
 		const baseSlashCommandsAssignments = constructorBody.filter(
 			statement =>
 				statement.type === "ExpressionStatement" &&
@@ -1396,31 +1487,39 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 			);
 		});
 		const initSlashCommands = initSlashCommandsIndex >= 0 && initSlashCommandsIndex < baseSlashCommandsIndex;
-		const capabilitySnapshot = refreshBody[0];
-		const capabilitySnapshotIsExact =
-			capabilitySnapshot?.type === "VariableDeclaration" &&
-			capabilitySnapshot.kind === "const" &&
-			capabilitySnapshot.declarations.length === 1 &&
-			capabilitySnapshot.declarations[0]?.id.type === "Identifier" &&
-			capabilitySnapshot.declarations[0].id.name === "hasExactMcpControls" &&
-			capabilitySnapshot.declarations[0].init?.type === "MemberExpression" &&
-			!capabilitySnapshot.declarations[0].init.computed &&
-			capabilitySnapshot.declarations[0].init.object.type === "MemberExpression" &&
-			!capabilitySnapshot.declarations[0].init.object.computed &&
-			capabilitySnapshot.declarations[0].init.object.object.type === "ThisExpression" &&
-			capabilitySnapshot.declarations[0].init.object.property.type === "Identifier" &&
-			capabilitySnapshot.declarations[0].init.object.property.name === "session" &&
-			capabilitySnapshot.declarations[0].init.property.type === "Identifier" &&
-			capabilitySnapshot.declarations[0].init.property.name === "hasExactMcpControls";
-		const capabilityNoopGuard = refreshBody[1];
+		const isCapabilitySnapshot = (statement: Babel.Statement | undefined, name: string): boolean =>
+			statement?.type === "VariableDeclaration" &&
+			statement.kind === "const" &&
+			statement.declarations.length === 1 &&
+			statement.declarations[0]?.id.type === "Identifier" &&
+			statement.declarations[0].id.name === name &&
+			statement.declarations[0].init?.type === "MemberExpression" &&
+			!statement.declarations[0].init.computed &&
+			statement.declarations[0].init.object.type === "MemberExpression" &&
+			!statement.declarations[0].init.object.computed &&
+			statement.declarations[0].init.object.object.type === "ThisExpression" &&
+			statement.declarations[0].init.object.property.type === "Identifier" &&
+			statement.declarations[0].init.object.property.name === "session" &&
+			statement.declarations[0].init.property.type === "Identifier" &&
+			statement.declarations[0].init.property.name === name;
+		const capabilitySnapshotIsExact = isCapabilitySnapshot(refreshBody[0], "hasExactMcpControls");
+		const capabilitySnapshotIsSession = isCapabilitySnapshot(refreshBody[1], "hasSessionMcpControls");
+		const capabilityNoopGuard = refreshBody[2];
 		const capabilityNoopReturn =
 			capabilityNoopGuard?.type === "IfStatement" &&
 			capabilityNoopGuard.alternate === null &&
-			capabilityNoopGuard.test.type === "BinaryExpression" &&
-			capabilityNoopGuard.test.operator === "===" &&
-			capabilityNoopGuard.test.left.type === "Identifier" &&
-			capabilityNoopGuard.test.left.name === "hasExactMcpControls" &&
-			thisPrivate(capabilityNoopGuard.test.right, "sessionBuiltinMcpVisible") &&
+			capabilityNoopGuard.test.type === "LogicalExpression" &&
+			capabilityNoopGuard.test.operator === "&&" &&
+			capabilityNoopGuard.test.left.type === "BinaryExpression" &&
+			capabilityNoopGuard.test.left.operator === "===" &&
+			capabilityNoopGuard.test.left.left.type === "Identifier" &&
+			capabilityNoopGuard.test.left.left.name === "hasExactMcpControls" &&
+			thisPrivate(capabilityNoopGuard.test.left.right, "sessionBuiltinMcpVisible") &&
+			capabilityNoopGuard.test.right.type === "BinaryExpression" &&
+			capabilityNoopGuard.test.right.operator === "===" &&
+			capabilityNoopGuard.test.right.left.type === "Identifier" &&
+			capabilityNoopGuard.test.right.left.name === "hasSessionMcpControls" &&
+			thisPrivate(capabilityNoopGuard.test.right.right, "sessionBuiltinSessionMcpVisible") &&
 			capabilityNoopGuard.consequent.type === "ReturnStatement" &&
 			capabilityNoopGuard.consequent.argument === null
 				? capabilityNoopGuard.consequent
@@ -1433,6 +1532,15 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 				thisPrivate(statement.expression.left, "sessionBuiltinMcpVisible") &&
 				statement.expression.right.type === "Identifier" &&
 				statement.expression.right.name === "hasExactMcpControls",
+		);
+		const refreshSessionCapabilityFlagIndex = refreshBody.findIndex(
+			statement =>
+				statement.type === "ExpressionStatement" &&
+				statement.expression.type === "AssignmentExpression" &&
+				statement.expression.operator === "=" &&
+				thisPrivate(statement.expression.left, "sessionBuiltinSessionMcpVisible") &&
+				statement.expression.right.type === "Identifier" &&
+				statement.expression.right.name === "hasSessionMcpControls",
 		);
 		const rebuildSlashCommandsIndex = refreshBody.findIndex(
 			statement => {
@@ -1457,9 +1565,10 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 					sessionBuiltins.argument.type === "CallExpression" &&
 					sessionBuiltins.argument.callee.type === "Identifier" &&
 					sessionBuiltins.argument.callee.name === "getBuiltinSlashCommandsForSession" &&
-					sessionBuiltins.argument.arguments.length === 1 &&
+					sessionBuiltins.argument.arguments.length === 2 &&
 					sessionBuiltins.argument.arguments[0]?.type === "Identifier" &&
 					sessionBuiltins.argument.arguments[0].name === "hasExactMcpControls" &&
+					isSessionArgument(sessionBuiltins.argument.arguments[1], "hasSessionMcpControls") &&
 					isExpectedBuiltinCommandNamesTail(elements[1])
 				);
 			},
@@ -1522,18 +1631,20 @@ export function findMcpTuiMetadataFindings(slashCommandsSource: string, interact
 			});
 		}
 		const refreshActionsAreReachable =
-			refreshBody.length === 8 &&
+			refreshBody.length === 10 &&
 			capabilitySnapshotIsExact &&
+			capabilitySnapshotIsSession &&
 			capabilityNoopReturn !== undefined &&
 			!hasUnexpectedRefreshExit &&
 			previousSlashCommandTailIndices.length === 1 &&
-			previousSlashCommandTailIndices[0] === 2 &&
+			previousSlashCommandTailIndices[0] === 3 &&
 			builtinCommandNamesDeclarationIndices.length === 1 &&
-			builtinCommandNamesDeclarationIndices[0] === 3 &&
-			rebuildSlashCommandsIndex === 4 &&
-			refreshCapabilityFlagIndex === 5 &&
-			rebuildResolvedSlashCommandsIndex === 6 &&
-			updateAutocompleteIndex === 7;
+			builtinCommandNamesDeclarationIndices[0] === 4 &&
+			rebuildSlashCommandsIndex === 5 &&
+			refreshCapabilityFlagIndex === 6 &&
+			refreshSessionCapabilityFlagIndex === 7 &&
+			rebuildResolvedSlashCommandsIndex === 8 &&
+			updateAutocompleteIndex === 9;
 		const refreshBodyStatements = refreshCommands?.body.body ?? [];
 		const loadIndex = refreshBodyStatements.findIndex(
 			statement =>

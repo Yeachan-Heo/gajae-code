@@ -1,5 +1,7 @@
+import { dlopen, ptr } from "bun:ffi";
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -242,6 +244,87 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(result.ok).toBe(true);
 		expect(await fs.readFile(destination, "utf8")).toBe("new-binary");
 		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
+	});
+
+	async function retainedReplaceFixture(root: string) {
+		const source = path.join(root, "staged.exe");
+		const destination = path.join(root, "gjc.exe");
+		await fs.writeFile(source, "new-binary");
+		await fs.writeFile(destination, "old-binary");
+		const parent = await parentIdentity(source);
+		const identity = async (pathname: string, contents: string) => {
+			const stat = await fs.stat(pathname, { bigint: true });
+			return {
+				...parent,
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256(contents),
+			};
+		};
+		return {
+			source,
+			destination,
+			replace: async () =>
+				exactReplaceRetained(
+					source,
+					destination,
+					"gjc.exe.backup",
+					await identity(source, "new-binary"),
+					await identity(destination, "old-binary"),
+				),
+		};
+	}
+
+	// What a default %LOCALAPPDATA%\gjc install inherits (#6096, #6916).
+	async function applyDefaultProfileDacl(pathname: string, user: string): Promise<void> {
+		await runIcacls(pathname, "/inheritance:r", "/grant:r", `${user}:F`, "*S-1-5-18:F", "*S-1-5-32-544:F");
+	}
+
+	it("publishes over an executable carrying the default profile DACL and an Administrators owner", async () => {
+		// An elevated token's default owner is BUILTIN\Administrators, and the
+		// profile DACL grants SYSTEM and Administrators full control. Both are
+		// trusted principals, so a stock elevated install must update.
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const root = await temporaryDirectory();
+		const fixture = await retainedReplaceFixture(root);
+		for (const pathname of [fixture.source, fixture.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			await runIcacls(pathname, "/setowner", "*S-1-5-32-544");
+		}
+
+		const result = await fixture.replace();
+
+		expect(result.code).toBeUndefined();
+		expect(result.ok).toBe(true);
+		expect(await fs.readFile(fixture.destination, "utf8")).toBe("new-binary");
+		expect(await fs.readFile(path.join(root, "gjc.exe.backup"), "utf8")).toBe("old-binary");
+	});
+
+	it("accepts a read/execute grant for another principal but refuses a shared write grant", async () => {
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const readOnlyRoot = await temporaryDirectory();
+		const readOnly = await retainedReplaceFixture(readOnlyRoot);
+		for (const pathname of [readOnly.source, readOnly.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			// (RX) carries SYNCHRONIZE; it must not count as a write grant (#6096).
+			await runIcacls(pathname, "/grant", "*S-1-5-32-545:RX");
+		}
+		expect(await readOnly.replace()).toMatchObject({ ok: true });
+
+		const sharedRoot = await temporaryDirectory();
+		const shared = await retainedReplaceFixture(sharedRoot);
+		for (const pathname of [shared.source, shared.destination]) {
+			await applyDefaultProfileDacl(pathname, user);
+			await runIcacls(pathname, "/grant", "*S-1-5-32-545:M");
+		}
+		expect(await shared.replace()).toMatchObject({ ok: false, code: "acl_present" });
+		expect(await fs.readFile(shared.destination, "utf8")).toBe("old-binary");
+		expect(await fs.readFile(shared.source, "utf8")).toBe("new-binary");
 	});
 
 	it("retries a transient destination sharing violation and succeeds after the holder releases", async () => {
@@ -526,6 +609,39 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		await expect(fs.stat(original)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("refuses a directory restore before mutation while a peer holds a child open, then completes", async () => {
+		// NTFS refuses to rename a directory while any handle is open on a file inside it,
+		// even one opened with FILE_SHARE_DELETE. A lock waiter reading `<lock>/info` holds
+		// exactly such a handle, which is why file-lock publication rollback retries this
+		// pre-mutation refusal instead of failing on the first attempt.
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-lock-pending");
+		const original = path.join(root, "session.lock");
+		await fs.mkdir(detached);
+		await fs.writeFile(path.join(detached, "info"), "owner");
+		const stat = await fs.stat(detached, { bigint: true });
+		const identity = {
+			...(await parentIdentity(detached)),
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			directory: true,
+		};
+
+		const reader = await fs.open(path.join(detached, "info"), "r");
+		try {
+			expect(exactRestore(detached, original, identity)).toEqual({ ok: false, code: "access_denied" });
+			expect(await fs.readFile(path.join(detached, "info"), "utf8")).toBe("owner");
+			await expect(fs.stat(original)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await reader.close();
+		}
+
+		expect(exactRestore(detached, original, identity)).toEqual({ ok: true });
+		expect(await fs.readFile(path.join(original, "info"), "utf8")).toBe("owner");
+	});
+
 	it("rejects exact tree removal when a child gains a foreign hard link", async () => {
 		const root = await temporaryDirectory();
 		const tree = path.join(root, "tree");
@@ -609,6 +725,38 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 			await writer.close();
 		}
 	});
+	it("reports a lock detach blocked by an open child handle as access_denied and succeeds after close", async () => {
+		// NTFS refuses to rename a directory with STATUS_ACCESS_DENIED while any
+		// handle is open on a child, even one that shares read, write, and delete.
+		// File-lock release detaches `<lock>` this way while waiters read
+		// `<lock>/info`; the denial is contention, not an owner mismatch.
+		const root = await temporaryDirectory();
+		const lock = path.join(root, "state.lock");
+		const info = path.join(lock, "info");
+		await fs.mkdir(lock);
+		await fs.writeFile(info, "owner record");
+		const snapshot = snapshotDirectoryTree(lock);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+		const parent = await fs.stat(root, { bigint: true });
+		const parentIdentity = { dev: parent.dev, ino: parent.ino };
+
+		const reader = await fs.open(info, "r");
+		try {
+			const blocked = exactRemoveDirectoryTree(lock, snapshot.snapshot, parentIdentity, true);
+			expect(blocked).toMatchObject({ ok: false, code: "access_denied" });
+			expect(blocked.detachedPath).toBeUndefined();
+			expect(await fs.readFile(info, "utf8")).toBe("owner record");
+		} finally {
+			await reader.close();
+		}
+
+		const detachedPath = `${lock}.removing`;
+		expect(exactRemoveDirectoryTree(lock, snapshot.snapshot, parentIdentity, true)).toEqual({
+			ok: true,
+			detachedPath,
+		});
+		expect(await fs.readFile(path.join(detachedPath, "info"), "utf8")).toBe("owner record");
+	});
 	it("rejects a replaced ancestor junction during exact restore and retains detached content", async () => {
 		const root = await temporaryDirectory();
 		const managed = path.join(root, "managed");
@@ -685,6 +833,28 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		} finally {
 			await runIcacls(directory, "/setowner", user);
 		}
+	});
+	it("keeps owner_mismatch for a denied owner-only open while other operations report access_denied", async () => {
+		// Another user's owner-only directory denies this user's traversal and
+		// READ_CONTROL opens. Managed-session repair routing and the tmux
+		// foreign-owner skip read that denial as `owner_mismatch`; every other
+		// path-identity operation reports the same NTSTATUS as `access_denied`.
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		const root = await temporaryDirectory();
+		const guarded = path.join(root, "guarded");
+		const target = path.join(guarded, "managed");
+		await fs.mkdir(target, { recursive: true });
+
+		await runIcacls(guarded, "/deny", `${user}:(X)`);
+		try {
+			expect(verifyOwnerOnlyPathSecurity(target, "directory")).toEqual({ ok: false, code: "owner_mismatch" });
+			expect(applyOwnerOnlyPathSecurity(target, "directory")).toEqual({ ok: false, code: "owner_mismatch" });
+			expect(snapshotDirectoryTree(target)).toEqual({ ok: false, code: "access_denied" });
+		} finally {
+			await runIcacls(guarded, "/remove:d", user);
+		}
+		expect(snapshotDirectoryTree(target).ok).toBe(true);
 	});
 	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
 		const root = await temporaryDirectory();
@@ -1185,6 +1355,105 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 			if (resolved.ok) expect(resolved.canonicalPath).toStartWith("\\\\?\\Volume{");
 		},
 	);
+	it("drops the child handle when an external holder blocks exact removal so the retry can finish", async () => {
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-detached");
+		const info = path.join(detached, "info");
+		await fs.mkdir(detached);
+		await fs.writeFile(info, "info");
+		const snapshot = snapshotDirectoryTree(detached);
+		expect(snapshot.ok).toBe(true);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+
+		const held = fsSync.openSync(info, "r");
+		try {
+			// The holder keeps the directory non-empty, so this attempt cannot finish.
+			expect(exactRemoveDirectoryTree(detached, snapshot.snapshot).ok).toBe(false);
+		} finally {
+			fsSync.closeSync(held);
+		}
+
+		// The failed attempt must not keep its own child handle. A leaked handle
+		// makes this process the remaining holder, so the caller's retry with the
+		// same snapshot would fail with sharing_violation forever.
+		expect(exactRemoveDirectoryTree(detached, snapshot.snapshot)).toEqual({ ok: true });
+		expect(fsSync.existsSync(detached)).toBe(false);
+	});
+
+	it("drops the child handle when quarantine of a staged lock info fails", async () => {
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-detached");
+		const info = path.join(detached, "info");
+		await fs.mkdir(detached);
+		await fs.writeFile(info, "info");
+		const snapshot = snapshotDirectoryTree(detached);
+		expect(snapshot.ok).toBe(true);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+		const infoEntry = snapshot.snapshot.entries.find(entry => entry.relativePath === "info");
+		if (!infoEntry) throw new Error("missing info entry");
+		// The quarantine rename opens `detached` as its target with
+		// FILE_ADD_FILE. Windows 11 and Windows Server 2022 and earlier share
+		// only READ|WRITE on that open, and Windows Server 2025 adds DELETE, so
+		// a holder that lists `detached` while denying write sharing blocks it
+		// on every version with a sharing violation. The tree itself is
+		// unchanged and no earlier open requests write data on `detached`, so
+		// validation passes and `info` is already open with FILE_SHARE_READ
+		// and DELETE when the rename fails.
+		const kernel32 = dlopen("kernel32.dll", {
+			CreateFileW: { args: ["ptr", "u32", "u32", "ptr", "u32", "u32", "i64"], returns: "i64" },
+			CloseHandle: { args: ["i64"], returns: "u32" },
+		});
+		const widePath = Buffer.from(`${detached}\0`, "utf16le");
+		const FILE_LIST_DIRECTORY = 0x0001;
+		const FILE_SHARE_READ_DELETE = 0x1 | 0x4;
+		const OPEN_EXISTING = 3;
+		const FILE_FLAG_BACKUP_SEMANTICS = 0x0200_0000;
+		const holder = kernel32.symbols.CreateFileW(
+			ptr(widePath),
+			FILE_LIST_DIRECTORY,
+			FILE_SHARE_READ_DELETE,
+			null,
+			OPEN_EXISTING,
+			FILE_FLAG_BACKUP_SEMANTICS,
+			0n,
+		);
+		expect(holder).not.toBe(-1n);
+		try {
+			const first = exactRemoveDirectoryTree(detached, snapshot.snapshot);
+			expect(first).toMatchObject({ ok: false, code: "sharing_violation" });
+			expect(fsSync.existsSync(path.join(detached, treeQuarantineName(infoEntry)))).toBe(false);
+
+			// Before the handle guard, the failed rename returned without
+			// CloseHandle and this process kept `info` open with FILE_SHARE_READ,
+			// so the delete below failed with EBUSY.
+			expect(() => fsSync.rmSync(info)).not.toThrow();
+		} finally {
+			expect(kernel32.symbols.CloseHandle(holder)).not.toBe(0);
+			kernel32.close();
+		}
+	});
+
+	it("does not leave a hard-link snapshot failure holding the directory against rename", async () => {
+		const root = await temporaryDirectory();
+		const detached = path.join(root, ".gjc-detached");
+		const info = path.join(detached, "info");
+		await fs.mkdir(detached);
+		await fs.writeFile(info, "info");
+		await fs.link(info, `${info}-link`);
+
+		const snapshot = snapshotDirectoryTree(detached);
+		expect(snapshot).toEqual({ ok: false, code: "hard_link_unsupported" });
+		const published = path.join(root, "published");
+		const renamed = renameNoReplacePath(detached, published);
+		expect(renamed.ok).toBe(true);
+		expect(
+			await fs.stat(published).then(
+				() => true,
+				() => false,
+			),
+		).toBe(true);
+	});
+
 	it("snapshots and removes nested files and empty directories through retained NT handles", async () => {
 		const root = await temporaryDirectory();
 		const detached = path.join(root, ".gjc-detached");
@@ -1209,6 +1478,24 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 				() => false,
 			),
 		).toBe(false);
+	});
+
+	it("removes a staged lock tree with an info file on every attempt without an external holder", async () => {
+		// Quarantining a child renames it inside its parent directory, and the
+		// I/O manager opens that parent as the rename target without
+		// FILE_SHARE_DELETE. Holding the parent with DELETE at that point made
+		// every non-empty removal fail with sharing_violation, which wedged the
+		// SDK broker's index lock cleanup after the first lock contention.
+		const root = await temporaryDirectory();
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const staged = path.join(root, `index.jsonl.lock.pending.${attempt}`);
+			await fs.mkdir(staged);
+			await fs.writeFile(path.join(staged, "info"), "x".repeat(296));
+			const snapshot = snapshotDirectoryTree(staged);
+			if (!snapshot.ok || !snapshot.snapshot) throw new Error(`snapshot failed: ${snapshot.code}`);
+			expect(exactRemoveDirectoryTree(staged, snapshot.snapshot)).toEqual({ ok: true });
+			expect(fsSync.existsSync(staged)).toBe(false);
+		}
 	});
 
 	it("rejects a descendant substitution after snapshot without deleting the replacement", async () => {

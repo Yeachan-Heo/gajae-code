@@ -10,6 +10,7 @@ import type { AssistantMessage, Usage } from "@gajae-code/ai/types";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { hookFetch } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { lcg32 } from "../../utils/test/helpers/prng";
 import type { SessionEntry, SessionMessageEntry } from "../src/session/session-manager";
 
 const OPERATOR_URL = "http://127.0.0.1:18081";
@@ -26,14 +27,6 @@ afterEach(async () => {
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-		return state;
-	};
-}
 
 async function loadLayers(options: {
 	globalCompaction?: Record<string, unknown>;
@@ -273,7 +266,7 @@ describe("project compaction remote endpoint", () => {
 	});
 
 	it(`property: project endpoint strings stay operator-owned, seed ${SEED}, ${PROPERTY_INPUTS} inputs`, async () => {
-		const next = mulberry32(SEED);
+		const next = lcg32(SEED);
 		for (let i = 0; i < PROPERTY_INPUTS; i++) {
 			const port = 19000 + (next() % 10000);
 			const endpoint = `http://127.0.0.1:${port}/p${i}`;

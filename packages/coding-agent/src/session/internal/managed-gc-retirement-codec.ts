@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import type { SessionStorageFileIdentity } from "../session-storage";
 import {
 	assertSessionRoot,
@@ -34,10 +35,6 @@ export interface ManagedGcSessionRetirementReceipt extends ManagedGcSessionRetir
 	readonly taskArtifactOwnerPayloadRetired?: true;
 	readonly taskArtifactOwnerNamespaceRetained?: true;
 	readonly taskArtifactOwnerRetired?: true;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function managedGcRetirementIdentityRecord(identity: SessionStorageFileIdentity): Record<string, unknown> {

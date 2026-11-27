@@ -10,7 +10,7 @@ import {
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import type { ModelSelectorValue } from "../src/config/model-selector-value";
 import { Settings } from "../src/config/settings";
-import type { DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import type { DefaultFallbackRuntimeState, PreparedProfileModelSelection } from "../src/session/agent-session";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -66,6 +66,37 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
+		committedModelSelections: [] as PreparedProfileModelSelection[],
+		async prepareModelSelectionForProfileActivation(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			signal?: AbortSignal,
+		): Promise<PreparedProfileModelSelection> {
+			signal?.throwIfAborted();
+			return {
+				sessionId: this.sessionId,
+				model: next,
+				thinkingLevel,
+				committedThinkingLevel: thinkingLevel,
+				previousModel: this.model,
+				previousThinkingLevel: this.thinkingLevel,
+				previousThinkingLevelMutationRevision: 0,
+				previousEditMode: "hashline",
+				signal,
+			};
+		},
+		commitPreparedProfileModelSelection(selection: PreparedProfileModelSelection): void {
+			selection.signal?.throwIfAborted();
+			if (
+				this.sessionId !== selection.sessionId ||
+				this.model !== selection.previousModel ||
+				this.thinkingLevel !== selection.previousThinkingLevel
+			)
+				throw new Error("Session changed while publishing profile");
+			this.model = selection.model;
+			this.thinkingLevel = selection.committedThinkingLevel;
+			this.committedModelSelections.push(selection);
+		},
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		configuredModelChains: new Map<string, readonly string[]>(),
 		setConfiguredModelChainCalls: [] as Array<{ role: string; entries: readonly string[] }>,
@@ -334,6 +365,7 @@ describe("model profile activation red-team", () => {
 		expect(session.model?.id).toBe("initial");
 		expect(session.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.committedModelSelections).toEqual([]);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
@@ -480,7 +512,11 @@ describe("model profile activation red-team", () => {
 		});
 
 		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "session-only" });
-		expect(session.setModelTemporaryCalls).toHaveLength(1);
+		expect(session.committedModelSelections).toHaveLength(1);
+		expect(session.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(session.thinkingLevel).toBeUndefined();
+		expect(session.configuredModelChains.get("default")).toEqual(["provider-a/default"]);
+		expect(session.getActiveModelProfile()).toBe("session-only");
 		expect(settings.get("modelRoles")).toEqual({ default: "provider-a/original-default" });
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			critic: "provider-a/original-critic",
@@ -542,6 +578,7 @@ describe("model profile activation red-team", () => {
 		expect(settings.get("modelRoles")).toEqual({ planner: "provider-a/architect" });
 		expect(session.model?.id).toBe("alternate");
 		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(session.committedModelSelections).toEqual([]);
 		expect(session.configuredModelChains.get("default")).toEqual(defaultChain);
 		expect(session.setConfiguredModelChainCalls).toHaveLength(1);
 		expect(session.defaultFallbackRuntimeState).toBe(fallbackRuntimeState);
@@ -622,10 +659,9 @@ describe("model profile activation red-team", () => {
 			executor: "explicit/executor",
 		});
 
-		expect(session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}`)).toEqual([
-			"provider-a/default",
-			"provider-a/alternate",
-		]);
+		expect(
+			session.committedModelSelections.map(selection => `${selection.model.provider}/${selection.model.id}`),
+		).toEqual(["provider-a/default", "provider-a/alternate"]);
 		expect(session.model?.id).toBe("alternate");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			executor: "explicit/executor",

@@ -252,7 +252,9 @@ describe("submitInteractiveInput", () => {
 
 		await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
 
-		expect(mode.showError).toHaveBeenCalledWith(new ManagedAppendIdentityMismatchError("session.jsonl").message);
+		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
+		expect(mode.showError).toHaveBeenCalledWith(mismatch.operatorMessage);
+		expect(mode.showError).not.toHaveBeenCalledWith(mismatch.message);
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
 	});

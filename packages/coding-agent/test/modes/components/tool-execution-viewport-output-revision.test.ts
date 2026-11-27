@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { ImageProtocol, setTerminalImageProtocol, TERMINAL, type TUI } from "@gajae-code/tui";
+import { waitForMicrotasks } from "../../../../utils/test/helpers/wait-for";
 import { resetSettingsForTest, Settings } from "../../../src/config/settings";
 import { EDIT_MODE_STRATEGIES, type PerFileDiffPreview } from "../../../src/edit";
 import { AssistantMessageComponent } from "../../../src/modes/components/assistant-message";
@@ -29,13 +30,8 @@ const preview: PerFileDiffPreview[] = [
 	{ path: "preview.ts", diff: "@@ -1 +1 @@\n-const value = 1;\n+const value = 2;" },
 ];
 
-async function waitFor(condition: () => boolean): Promise<void> {
-	for (let attempts = 0; attempts < 50; attempts++) {
-		if (condition()) return;
-		await Promise.resolve();
-	}
-	throw new Error("Preview computation did not reach the expected state");
-}
+const waitFor = (condition: () => boolean): Promise<void> =>
+	waitForMicrotasks(condition, 50, "Preview computation did not reach the expected state");
 
 function deferredPreview(): PromiseWithResolvers<PerFileDiffPreview[] | null> {
 	return Promise.withResolvers<PerFileDiffPreview[] | null>();

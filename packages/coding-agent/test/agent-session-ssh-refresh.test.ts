@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
 import { getSSHConfigPath, TempDir } from "@gajae-code/utils";
 import { reset as resetCapabilities } from "../src/capability";
 import { type SSHHost, sshCapability } from "../src/capability/ssh";
@@ -12,21 +11,7 @@ import { addSSHHost, removeSSHHost, updateSSHHost } from "../src/ssh/config-writ
 import * as connectionManager from "../src/ssh/connection-manager";
 import type { ToolSession } from "../src/tools";
 import { loadSshTool } from "../src/tools/implementations";
-
-function createModel(): Model<"openai-responses"> {
-	return {
-		id: "mock",
-		name: "mock",
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: "https://example.invalid",
-		reasoning: false,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 8192,
-		maxTokens: 2048,
-	};
-}
+import { createModel } from "./helpers/mock-model";
 
 describe("AgentSession SSH tool refresh", () => {
 	const tempDirs: TempDir[] = [];

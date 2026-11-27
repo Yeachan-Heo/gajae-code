@@ -39,7 +39,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent, isRecord } from "@gajae-code/utils";
 import { type ChatDaemonKind, chatDaemonPaths } from "./chat-daemon-control";
 
 export const CHAT_DAEMON_COMMAND_VERSION = 1;
@@ -156,10 +156,6 @@ function requestEntry(requestId: string): string {
 
 function responseEntry(requestId: string): string {
 	return `${requestId}${RESPONSE_SUFFIX}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function boundedString(value: unknown): value is string {

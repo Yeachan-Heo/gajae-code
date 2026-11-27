@@ -1229,10 +1229,11 @@ pub mod capabilities {
 	pub const THREADED: &str = "threaded";
 	/// Streamed dynamic context updates.
 	pub const CONTEXT: &str = "context";
-	/// Live + finalized turn streaming.
+	/// Live + finalized turn streaming, including turns owned by another
+	/// submission or typed in the host's terminal.
 	pub const TURN_STREAM: &str = "turn_stream";
-	/// Observe live turn content without owning the submission (requires
-	/// `TURN_STREAM`).
+	/// Non-demanding observer: the connection does not keep a detached host
+	/// alive. Content delivery is gated on `TURN_STREAM` alone.
 	pub const SESSION_HOST_OBSERVER_V1: &str = "session_host_observer_v1";
 	/// Image attachments.
 	pub const IMAGES: &str = "images";

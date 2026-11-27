@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { JobsObserver } from "../src/modes/jobs-observer";
@@ -91,14 +92,8 @@ function foldVia(adapter: FoldAdapter): void {
 	});
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 5_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 5 });
 
 afterEach(() => {
 	mock.restore();

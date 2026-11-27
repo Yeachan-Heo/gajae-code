@@ -358,6 +358,17 @@ pub fn apply_bash_fixups(command: String) -> BashFixupResult {
 	core_apply_bash_fixups(&command).into()
 }
 
+/// Re-assert the console code pages recorded before the first shell command.
+///
+/// The Windows TUI calls this before each frame, because a background shell
+/// child sharing the console may have switched them (#7760). No-op elsewhere.
+#[napi]
+#[cfg_attr(not(windows), allow(clippy::missing_const_for_fn, reason = "const only off Windows"))]
+pub fn restore_console_code_pages_for_render() {
+	#[cfg(windows)]
+	pi_shell::windows::restore_console_baseline();
+}
+
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;

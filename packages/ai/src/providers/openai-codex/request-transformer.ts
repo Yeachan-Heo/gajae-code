@@ -2,6 +2,7 @@ import type { Effort } from "../../model-thinking";
 import { requireSupportedEffort } from "../../model-thinking";
 import type { Api, Model } from "../../types";
 import { sanitizeJsonStrings } from "../../utils";
+import { formatOrphanToolResultNote } from "../openai-responses-shared";
 
 export interface ReasoningConfig {
 	effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -25,6 +26,7 @@ export interface InputItem {
 	output?: unknown;
 	arguments?: unknown;
 	encrypted_content?: unknown;
+	internal_chat_message_metadata_passthrough?: { content_item_kinds?: string[] };
 }
 
 export interface RequestBody {
@@ -133,6 +135,39 @@ function filterInput(input: InputItem[] | undefined): InputItem[] | undefined {
 		});
 }
 
+/** Content-item kind codex-rs tags its base-instructions developer message with. */
+const CODEX_BASE_INSTRUCTIONS_KIND = "model.base_instructions";
+
+/**
+ * Moves top-level `instructions` into a leading developer message in place, as
+ * codex-rs has done for every Responses and `/responses/compact` request since
+ * 0.162 (openai/codex#51156): `BaseInstructionsFragment`, tagged
+ * `model.base_instructions`, with id `msg_<uuidv5(uuidv5(prompt_cache_key, 'oid'), text)>`.
+ * The prompt cache key is the thread, so the id stays stable across retries and
+ * resumed sessions; without one the id is omitted. Empty instructions are
+ * dropped, matching codex-rs.
+ */
+export interface CodexInstructionsCarrier {
+	instructions?: unknown;
+	prompt_cache_key?: unknown;
+	input?: unknown;
+}
+
+export function moveCodexInstructionsToInput(body: CodexInstructionsCarrier): void {
+	const text = body.instructions;
+	delete body.instructions;
+	if (typeof text !== "string" || text.length === 0) return;
+	const thread = typeof body.prompt_cache_key === "string" ? body.prompt_cache_key : "";
+	const item: InputItem = {
+		...(thread ? { id: `msg_${Bun.randomUUIDv5(text, Bun.randomUUIDv5(thread, "oid"))}` } : {}),
+		type: "message",
+		role: "developer",
+		content: [{ type: "input_text", text }],
+		internal_chat_message_metadata_passthrough: { content_item_kinds: [CODEX_BASE_INSTRUCTIONS_KIND] },
+	};
+	body.input = [item, ...(Array.isArray(body.input) ? body.input : [])];
+}
+
 export async function transformRequestBody(
 	body: RequestBody,
 	model: Model<Api>,
@@ -165,13 +200,10 @@ export async function transformRequestBody(
 						} catch {
 							text = String(itemRecord.output ?? "");
 						}
-						if (text.length > 16000) {
-							text = `${text.slice(0, 16000)}\n...[truncated]`;
-						}
 						return {
 							type: "message",
-							role: "assistant",
-							content: `[Previous ${toolName} result; call_id=${callId}]: ${text}`,
+							role: "user",
+							content: formatOrphanToolResultNote(toolName, callId, text),
 						} as InputItem;
 					}
 				}
@@ -192,6 +224,12 @@ export async function transformRequestBody(
 		);
 		body.input = [...developerMessages, ...body.input];
 	}
+
+	// Move top-level instructions to a leading developer message for prompt caching.
+	// codex-rs has done this for Responses and /responses/compact since v0.162.
+	// This must happen after prepending developerMessages to ensure instructions
+	// (the base instructions) ends up first in the input array.
+	moveCodexInstructionsToInput(body);
 
 	if (options.reasoningEffort !== undefined) {
 		const reasoningConfig = getReasoningConfig(model, options);
@@ -216,4 +254,22 @@ export async function transformRequestBody(
 	delete body.max_completion_tokens;
 
 	return body;
+}
+
+/** Request fields codex-rs serializes ahead of `input` (`ResponsesApiRequest`, `ResponseCreateWsRequest`). */
+const CODEX_ROUTING_FIELDS = ["type", "model", "stream", "service_tier", "previous_response_id"] as const;
+
+/**
+ * Returns a shallow copy whose routing fields lead in codex-rs order; every
+ * other field trails. This is a no-op when no routing fields are present.
+ */
+export function withCodexRoutingFieldsFirst<T extends object>(body: T): T {
+	const ordered: Record<string, unknown> = {};
+	for (const key of CODEX_ROUTING_FIELDS) {
+		if (Object.hasOwn(body, key)) ordered[key] = (body as Record<string, unknown>)[key];
+	}
+	for (const [key, value] of Object.entries(body)) {
+		if (!Object.hasOwn(ordered, key)) ordered[key] = value;
+	}
+	return ordered as T;
 }

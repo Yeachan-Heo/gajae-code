@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
+import { isRecord } from "@gajae-code/utils";
 import type { ManagedDirectoryRoot, ManagedSessionSecurityPolicy } from "./internal/managed-session-storage";
 import type { NativeDirectoryTreeSnapshot } from "./session-storage";
 
@@ -122,10 +123,6 @@ export type TaskArtifactOwnerRetirementOutcome =
 			readonly reason: string;
 			readonly nativeOutcome?: NativeExactUnlinkResult;
 	  };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /** True only for canonical unsigned decimal strings within the native u64 range. */
 export function isCanonicalDecimal(value: unknown): value is string {

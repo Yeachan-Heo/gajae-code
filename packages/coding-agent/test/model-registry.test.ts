@@ -4872,42 +4872,248 @@ describe("ModelRegistry", () => {
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {
-			await Settings.init({
-				inMemory: true,
-				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
+			// Rapid-MLX discovery leaves through the direct loopback transport, so the
+			// global fetch hook cannot see it. Watch the endpoint itself; the positive
+			// control below proves the observation channel is live when the provider is
+			// enabled, so an empty probe list is the disabled guard and not a blind spot.
+			const rapidMlxProbes: string[] = [];
+			const rapidMlxAuthorizations: (string | null)[] = [];
+			const rapidMlxServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					rapidMlxProbes.push(pathname);
+					if (pathname === "/v1/models") {
+						rapidMlxAuthorizations.push(request.headers.get("authorization"));
+						return Response.json({ data: [{ id: "rapid-mlx-probe-model", context_window: 131_072 }] });
+					}
+					return new Response("not found", { status: 404 });
 				},
 			});
-			const requestedUrls: string[] = [];
-			using _hook = hookFetch(input => {
-				requestedUrls.push(String(input));
-				throw new Error(`Unexpected URL: ${String(input)}`);
+			const rapidMlxBaseUrl = `http://127.0.0.1:${rapidMlxServer.port}/v1`;
+			const shadowProbes: string[] = [];
+			const shadowServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					shadowProbes.push(request.url);
+					return Response.json({ data: [{ id: "shadow-endpoint-model" }] });
+				},
 			});
+			// Synthetic conflicting ambient values for the provider under test: these
+			// are exactly what credential resolution reads in this process, and the
+			// explicit keyless fixture entry must outrank both for the probe.
+			const restoreRapidMlxBaseUrl = setEnvForTest("RAPID_MLX_BASE_URL", `http://127.0.0.1:${shadowServer.port}/v1`);
+			const restoreRapidMlxApiKey = setEnvForTest("RAPID_MLX_API_KEY", "ambient-rapid-mlx-probe-key");
+			try {
+				expect($credentialEnv("RAPID_MLX_BASE_URL")).toBe(`http://127.0.0.1:${shadowServer.port}/v1`);
+				expect($credentialEnv("RAPID_MLX_API_KEY")).toBe("ambient-rapid-mlx-probe-key");
+				// The endpoint is fixture-owned: an explicit keyless provider entry pins
+				// the base URL and selects no credentials, so neither an ambient
+				// RAPID_MLX_BASE_URL (which credential resolution would otherwise prefer
+				// over the environment assignment) nor an ambient RAPID_MLX_API_KEY can
+				// redirect or authenticate this probe.
+				writeRawModelsJson({
+					"rapid-mlx": {
+						baseUrl: rapidMlxBaseUrl,
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "rapid-mlx" },
+					},
+				});
+				await Settings.init({
+					inMemory: true,
+					overrides: {
+						disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
+					},
+				});
+				const requestedUrls: string[] = [];
+				using _hook = hookFetch(input => {
+					requestedUrls.push(String(input));
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				});
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refresh("online");
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh("online");
 
-			const disabledProbeUrls = requestedUrls.filter(
-				url => url.includes("127.0.0.1:11434") || url.includes("127.0.0.1:8080") || url.includes("127.0.0.1:1234"),
-			);
-			expect(disabledProbeUrls).toEqual([]);
+				const disabledProbeUrls = requestedUrls.filter(
+					url =>
+						url.includes("127.0.0.1:11434") || url.includes("127.0.0.1:8080") || url.includes("127.0.0.1:1234"),
+				);
+				expect(disabledProbeUrls).toEqual([]);
+				expect(rapidMlxProbes).toEqual([]);
+
+				settings.override("disabledProviders", ["llama.cpp", "lm-studio", "ollama", "omlx"]);
+				// Provider-scoped online refresh: only Rapid-MLX is re-enabled, so the
+				// fixture listener is the only endpoint this phase can reach.
+				await registry.refreshProvider("rapid-mlx", "online");
+				expect(rapidMlxProbes).toEqual(["/v1/models"]);
+				// The conflicting ambient endpoint was never contacted, and the ambient
+				// key never authenticated the probe.
+				expect(shadowProbes).toEqual([]);
+				// The configured entry is keyless, so no ambient credential may be
+				// attached to the probe, and the discovered row must keep the fixture
+				// endpoint rather than an inherited environment one.
+				expect(rapidMlxAuthorizations).toEqual([null]);
+				expect(registry.find("rapid-mlx", "rapid-mlx-probe-model")?.baseUrl).toBe(rapidMlxBaseUrl);
+			} finally {
+				restoreRapidMlxApiKey();
+				restoreRapidMlxBaseUrl();
+				rapidMlxServer.stop(true);
+				shadowServer.stop(true);
+			}
+		});
+		test("routes a Rapid-MLX discovery probe to the loopback endpoint directly", async () => {
+			// The transport exemption follows provider identity, not the absence of a
+			// credential: a Rapid-MLX entry that carries a secret header still probes
+			// over the direct socket, so no proxy can read the header or inject a
+			// catalog. A fetch hook throws if the probe regresses to the shared path.
+			const probes: { pathname: string; apiKey: string | null }[] = [];
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					const pathname = new URL(request.url).pathname;
+					if (pathname !== "/v1/models") return new Response(null, { status: 404 });
+					probes.push({ pathname, apiKey: request.headers.get("x-api-key") });
+					return Response.json({ data: [{ id: "rapid-mlx-credentialed-model", context_window: 131_072 }] });
+				},
+			});
+			const baseUrl = `http://127.0.0.1:${server.port}/v1`;
+			try {
+				writeRawModelsJson({
+					"rapid-mlx": {
+						baseUrl,
+						api: "openai-completions",
+						auth: "none",
+						headers: { "X-API-Key": "rapid-mlx-header-key" },
+						discovery: { type: "rapid-mlx" },
+					},
+				});
+				const fetched: string[] = [];
+				using _hook = hookFetch(input => {
+					fetched.push(String(input));
+					throw new Error(`Rapid-MLX discovery must not use fetch: ${String(input)}`);
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("rapid-mlx", "online");
+
+				expect(probes).toEqual([{ pathname: "/v1/models", apiKey: "rapid-mlx-header-key" }]);
+				expect(fetched).toEqual([]);
+				expect(registry.find("rapid-mlx", "rapid-mlx-credentialed-model")?.baseUrl).toBe(baseUrl);
+			} finally {
+				server.stop(true);
+			}
+		});
+		test("routes a non-Rapid-MLX implicit probe to the configured proxy target, not the loopback endpoint", async () => {
+			// The destination is the criterion: only a loopback Rapid-MLX probe is
+			// direct, so an oMLX probe must address the configured proxy target and
+			// never the implicit endpoint. Bun resolves and caches the proxy decision
+			// at startup, so the probe runs in a fresh process with the variables
+			// planted.
+			const endpointProbes: string[] = [];
+			const endpointServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					endpointProbes.push(new URL(request.url).pathname);
+					return Response.json({ data: [{ id: "omlx-proxy-probe-model" }] });
+				},
+			});
+			const proxiedRequests: { url: string; authorization: string | null }[] = [];
+			const proxyServer = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch(request) {
+					proxiedRequests.push({
+						url: request.url,
+						authorization: request.headers.get("authorization"),
+					});
+					return new Response("forwarded through the proxy", { status: 502 });
+				},
+			});
+			const endpointBaseUrl = `http://127.0.0.1:${endpointServer.port}/v1`;
+			try {
+				const projectDir = path.join(tempDir, "omlx-proxy-project");
+				const agentDir = path.join(tempDir, "omlx-proxy-agent");
+				const scratchDir = path.join(tempDir, "omlx-proxy-scratch");
+				fs.mkdirSync(projectDir, { recursive: true });
+				fs.mkdirSync(agentDir, { recursive: true });
+				fs.mkdirSync(scratchDir, { recursive: true });
+				const inheritedEnv: Record<string, string> = {};
+				for (const [name, value] of Object.entries(process.env)) {
+					if (value === undefined) continue;
+					const normalized = name.toLowerCase();
+					if (
+						normalized === "http_proxy" ||
+						normalized === "https_proxy" ||
+						normalized === "all_proxy" ||
+						normalized === "no_proxy"
+					) {
+						continue;
+					}
+					inheritedEnv[name] = value;
+				}
+				const proxyUrl = `http://127.0.0.1:${proxyServer.port}`;
+				const child = Bun.spawn(
+					[process.execPath, path.join(import.meta.dir, "fixtures", "omlx-proxy-probe.ts"), scratchDir],
+					{
+						cwd: projectDir,
+						env: {
+							...inheritedEnv,
+							GJC_CODING_AGENT_DIR: agentDir,
+							HTTP_PROXY: proxyUrl,
+							http_proxy: proxyUrl,
+							HTTPS_PROXY: proxyUrl,
+							https_proxy: proxyUrl,
+							ALL_PROXY: proxyUrl,
+							all_proxy: proxyUrl,
+							OMLX_BASE_URL: endpointBaseUrl,
+							OMLX_API_KEY: "omlx-proxy-probe-key",
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+					},
+				);
+				const [stdout, stderr, exitCode] = await Promise.all([
+					new Response(child.stdout).text(),
+					new Response(child.stderr).text(),
+					child.exited,
+				]);
+				expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+				// The credentialed probe reached the configured proxy...
+				expect(proxiedRequests.filter(request => request.url === `${endpointBaseUrl}/models`)).toEqual([
+					{ url: `${endpointBaseUrl}/models`, authorization: "Bearer omlx-proxy-probe-key" },
+				]);
+				// ...and no direct socket was opened to the implicit endpoint.
+				expect(endpointProbes).toEqual([]);
+				// The proxy refused the request, so no direct-socket catalog may slip in.
+				expect(JSON.parse(stdout)).toEqual({ modelIds: [] });
+			} finally {
+				endpointServer.stop(true);
+				proxyServer.stop(true);
+			}
 		});
 		test("rebuilds implicit discovery when disabled providers change without models.json", async () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx", "rapid-mlx"],
 				},
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
 			expect(registry.getDiscoverableProviders()).not.toContain("omlx");
+			expect(registry.getDiscoverableProviders()).not.toContain("rapid-mlx");
 
 			settings.override("disabledProviders", []);
 			await registry.refresh("offline");
 
 			expect(registry.getDiscoverableProviders()).toContain("ollama");
 			expect(registry.getDiscoverableProviders()).toContain("omlx");
+			expect(registry.getDiscoverableProviders()).toContain("rapid-mlx");
 		});
 		test("rebuilds implicit discovery when endpoint environment changes without models.json", async () => {
 			const firstBaseUrl = "http://127.0.0.1:21334";
@@ -10100,6 +10306,314 @@ describe("ModelRegistry", () => {
 					"https://anthropic.example.com/v1",
 				);
 				expect(JSON.stringify(cached)).not.toContain("models-dev-secret");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("keeps discovered Anthropic models across refreshes with two OAuth accounts", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			const account = (name: string) => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${name}`,
+				refresh: `refresh-${name}`,
+				expires: Date.now() + 60 * 60_000,
+				email: `${name}@example.test`,
+			});
+			await authStorage.set("anthropic", [account("first"), account("second")]);
+			const listedWith: string[] = [];
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models") {
+					listedWith.push(new Headers(init?.headers).get("authorization") ?? "");
+					return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("Not found", { status: 404 });
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+			try {
+				// Startup background refresh, then each /model open reloads offline.
+				await registry.refresh("online-if-uncached");
+				expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+				for (let open = 0; open < 3; open++) {
+					await registry.refresh("offline");
+					expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+				}
+				// Offline reloads send nothing; only the one online refresh listed models.
+				expect(listedWith).toHaveLength(1);
+			} finally {
+				await registry.dispose();
+				restoreBaseUrl();
+			}
+		});
+		describe("offline reloads after Anthropic discovery", () => {
+			const account = (name: string) => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${name}`,
+				refresh: `refresh-${name}`,
+				expires: Date.now() + 60 * 60_000,
+				email: `${name}@example.test`,
+			});
+			const listing = (listedWith: string[]) =>
+				hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "https://models.dev/api.json") {
+						return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+					}
+					if (url === "https://api.anthropic.com/v1/models") {
+						listedWith.push(new Headers(init?.headers).get("authorization") ?? "");
+						return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response("Not found", { status: 404 });
+				});
+
+			test("online refreshes still rotate accounts", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				const listedWith: string[] = [];
+				using _hook = listing(listedWith);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refresh("online");
+					await registry.refresh("offline");
+					await registry.refresh("online");
+					expect(new Set(listedWith)).toEqual(
+						new Set(["Bearer sk-ant-oat01-first", "Bearer sk-ant-oat01-second"]),
+					);
+				} finally {
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("installs an apiKeyEnv that became set instead of reusing the published account", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const apiKeyEnv = `GJC_TEST_OFFLINE_REUSE_KEY_${Snowflake.next()}`;
+				const restoreKey = unsetEnvForTest(apiKeyEnv);
+				writeRawModelsJson({ anthropic: { apiKeyEnv } });
+				await authStorage.set("anthropic", [account("first")]);
+				using _hook = listing([]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refreshProvider("anthropic", "online");
+					expect(authStorage.hasConfigApiKey("anthropic", registry.getAuthStorageOwner())).toBe(false);
+					Bun.env[apiKeyEnv] = "sk-ant-api-late-env";
+					await registry.refreshProvider("anthropic", "offline");
+					// Checked before any other credential lookup that would sync the override on its own.
+					expect(authStorage.hasConfigApiKey("anthropic", registry.getAuthStorageOwner())).toBe(true);
+				} finally {
+					await registry.dispose();
+					restoreKey();
+					restoreBaseUrl();
+				}
+			});
+
+			test("does not reuse a published account that was removed", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				const listedWith: string[] = [];
+				using _hook = listing(listedWith);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				try {
+					await registry.refresh("online");
+					const published = listedWith.at(-1)?.replace("Bearer ", "");
+					const remaining = published === "sk-ant-oat01-first" ? "second" : "first";
+					await authStorage.set("anthropic", [account(remaining)]);
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline");
+					const anthropicPeeks = peek.mock.calls.flatMap(([provider], index) =>
+						provider === "anthropic" ? [peek.mock.results[index]?.value] : [],
+					);
+					expect(anthropicPeeks.length).toBeGreaterThan(0);
+					expect(await anthropicPeeks.at(-1)).toBe(`sk-ant-oat01-${remaining}`);
+				} finally {
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("an AUTO session does not inherit evidence published under a runtime selector", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const sessionId = "offline-reuse-auto-mask";
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				// Account-specific catalogs: each account lists a model only it can use.
+				using _hook = hookFetch((input, init) => {
+					const url = String(input);
+					if (url === "https://models.dev/api.json") {
+						return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+					}
+					if (url === "https://api.anthropic.com/v1/models") {
+						const owner = new Headers(init?.headers).get("authorization")?.endsWith("first") ? "first" : "second";
+						return new Response(JSON.stringify({ data: [{ id: `claude-${owner}-only` }] }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					return new Response("Not found", { status: 404 });
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				authStorage.setRuntimeCredentialSelector("anthropic", { kind: "email", value: "first@example.test" });
+				authStorage.acquireCredentialScope(sessionId);
+				authStorage.setSessionCredentialAuto("anthropic", sessionId);
+				try {
+					await registry.refresh("online");
+					expect(registry.find("anthropic", "claude-first-only")).toBeDefined();
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline", sessionId);
+					// The AUTO session resolves its own account instead of reusing the selector's evidence.
+					expect(
+						peek.mock.calls.some(
+							([provider, options]) => provider === "anthropic" && options?.sessionId === sessionId,
+						),
+					).toBe(true);
+				} finally {
+					authStorage.releaseCredentialScope(sessionId);
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+
+			test("a session whose pin became unavailable takes the normal fail-closed peek", async () => {
+				const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+				const sessionId = "offline-reuse-unavailable-pin";
+				await authStorage.set("anthropic", [account("first"), account("second")]);
+				using _hook = listing([]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+				authStorage.acquireCredentialScope(sessionId);
+				try {
+					await registry.refresh("online", sessionId);
+					expect(registry.find("anthropic", "claude-live-only")).toBeDefined();
+					authStorage.markSessionCredentialUnavailable(sessionId, "anthropic", {
+						kind: "email",
+						value: "second@example.test",
+					});
+					const peek = vi.spyOn(authStorage, "peekApiKey");
+					await registry.refresh("offline", sessionId);
+					const sessionPeeks = peek.mock.calls.flatMap(([provider, options], index) =>
+						provider === "anthropic" && options?.sessionId === sessionId ? [peek.mock.results[index]?.value] : [],
+					);
+					expect(sessionPeeks.length).toBeGreaterThan(0);
+					// The unavailable pin fails closed instead of falling back to another stored account.
+					for (const result of sessionPeeks) expect(await result).toBeUndefined();
+				} finally {
+					authStorage.releaseCredentialScope(sessionId);
+					await registry.dispose();
+					restoreBaseUrl();
+				}
+			});
+		});
+
+		test("discovers Anthropic models from /v1/models on the default transport origin", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			const requested: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				requested.push(url);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models") {
+					return new Response(
+						JSON.stringify({
+							data: [
+								{ id: "claude-sonnet-4-5", display_name: "Claude Sonnet 4.5" },
+								{ id: "claude-live-only", display_name: "Claude Live Only" },
+							],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("Not found", { status: 404 });
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				expect(requested).toContain("https://api.anthropic.com/v1/models");
+				expect(requested).not.toContain("https://api.anthropic.com/models");
+				// Discovered rows keep the transport origin: the Messages client appends /v1/messages.
+				expect(registry.find("anthropic", "claude-live-only")?.baseUrl).toBe("https://api.anthropic.com");
+				expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+				const cached = readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				expect(cached?.authoritative).toBe(true);
+				expect(cached?.dynamicModelIds).toContain("claude-live-only");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("falls back to the bundled Anthropic catalog when the first /v1/models listing fails", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			const requested: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				requested.push(url);
+				return new Response("upstream unavailable", { status: 503 });
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("anthropic", "online");
+
+				expect(requested).toEqual(["https://api.anthropic.com/v1/models"]);
+				expect(registry.find("anthropic", "claude-live-only")).toBeUndefined();
+				expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+				expect(
+					readModelCache<Api>("anthropic", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.authoritative,
+				).not.toBe(true);
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("keeps the last discovered Anthropic catalog when a later /v1/models listing fails", async () => {
+			const restoreBaseUrl = unsetEnvForTest("ANTHROPIC_BASE_URL");
+			authStorage.setRuntimeApiKey("anthropic", "fresh-anthropic-key");
+			let listingUp = true;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://api.anthropic.com/v1/models" && listingUp) {
+					return new Response(JSON.stringify({ data: [{ id: "claude-live-only" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("upstream unavailable", { status: 503 });
+			});
+			try {
+				const first = new ModelRegistry(authStorage, modelsJsonPath);
+				await first.refreshProvider("anthropic", "online");
+				expect(first.find("anthropic", "claude-live-only")).toBeDefined();
+
+				listingUp = false;
+				await first.refreshProvider("anthropic", "online");
+
+				expect(first.find("anthropic", "claude-live-only")?.baseUrl).toBe("https://api.anthropic.com");
 			} finally {
 				restoreBaseUrl();
 			}

@@ -3,7 +3,7 @@ import { closeSync } from "node:fs";
 import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { openHtmlExportDestination } from "../../src/export/html/html-export-destination";
+import { createHtmlExportTempFile, openHtmlExportDestination } from "../../src/export/html/html-export-destination";
 
 describe("HTML export file mode", () => {
 	it("creates an owner-only file and removes other users' access from an existing one", async () => {
@@ -20,6 +20,19 @@ describe("HTML export file mode", () => {
 			closeSync(openHtmlExportDestination(existing));
 			expect((await stat(existing)).mode & 0o777).toBe(0o600);
 			expect(await Bun.file(existing).text()).toBe("transcript");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("writes a bounded snapshot's export into an owner-only temp file beside the output", async () => {
+		if (process.platform === "win32") return;
+		const dir = await mkdtemp(path.join(tmpdir(), "html-export-mode-"));
+		try {
+			const temp = createHtmlExportTempFile(path.join(dir, "new.html"));
+			closeSync(temp.fd);
+			expect(path.dirname(temp.path)).toBe(dir);
+			expect((await stat(temp.path)).mode & 0o777).toBe(0o600);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

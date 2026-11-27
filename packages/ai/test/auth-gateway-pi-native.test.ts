@@ -848,6 +848,111 @@ describe("pi-native managed gateway credential failure marking", () => {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	});
+	it("does not mark concurrency-limited failures as rate-limited (Issue 7796)", async () => {
+		// When a credential receives a concurrency-limited (too_many_concurrent_requests) 429,
+		// it should NOT be marked as rate-limited because the credential is healthy.
+		// Only the managed fallback controller's same-credential wait should apply.
+		let upstreamRequests = 0;
+		const credentials: string[] = [];
+		const upstream = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: req => {
+				upstreamRequests++;
+				credentials.push(req.headers.get("authorization") ?? "");
+				if (upstreamRequests === 1) {
+					// First request: concurrency-limited 429 from OpenAI
+					return new Response(
+						JSON.stringify({
+							error: {
+								code: "rate_limit_exceeded",
+								message: "Request rate limited due to too_many_concurrent_requests",
+							},
+						}),
+						{
+							status: 429,
+							headers: { "Content-Type": "application/json", "Retry-After": "1" },
+						},
+					);
+				} else {
+					// Second request: should use the SAME credential (not rotated), indicating it was not marked as rate-limited
+					return new Response(
+						JSON.stringify({
+							choices: [{ delta: { content: "ok" }, finish_reason: null }],
+							usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
+				}
+			},
+		});
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-concurrency-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
+		const storage = new AuthStorage(store);
+		const provider = "gateway-concurrency-test";
+		const model: Model<Api> = {
+			id: "gateway-concurrency-model",
+			name: "Gateway concurrency test model",
+			api: "openai-completions",
+			provider,
+			baseUrl: upstream.url.toString(),
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		await storage.set(provider, [{ type: "api_key", key: "gateway-concurrency-key" }]);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: ["gateway-test-token"],
+			version: "test",
+			storage,
+			...testAuthority(storage, provider),
+			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
+		});
+		const request = () =>
+			fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({
+					modelId: model.id,
+					context: baseContext,
+					stream: true,
+					options: { fallbackManaged: true },
+				}),
+			});
+		try {
+			// First request hits concurrency limit and returns 429
+			const first = await request();
+			expect(first.status).toBe(200);
+			await first.text();
+			expect(upstreamRequests).toBe(1);
+			expect(credentials).toEqual(["Bearer gateway-concurrency-key"]);
+
+			// Second request should retry the SAME credential (not rotate), because
+			// concurrency-limited failures do not mark the credential as rate-limited.
+			// If the credential was incorrectly marked as rate-limited, the gateway would
+			// reject it or use a different one; since we only have one, this proves
+			// the credential was NOT marked as rate-limited.
+			const second = await request();
+			expect(second.status).toBe(200);
+			await second.text();
+			expect(upstreamRequests).toBe(2);
+			// Both requests should use the same credential
+			expect(credentials).toEqual(["Bearer gateway-concurrency-key", "Bearer gateway-concurrency-key"]);
+		} finally {
+			await gateway.close();
+			upstream.stop(true);
+			store.close();
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("pi-native client wire context", () => {

@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, isRecord } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import {
 	normalizePublicCommandFailure,
@@ -243,10 +243,6 @@ type BrokerSessionRow = {
 	locator?: BrokerSessionLocator;
 	savedSession?: BrokerSavedSession;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /** Extracts the broker `result` envelope, converting an explicit error frame into a typed throw. */
 function brokerResult(value: unknown): Record<string, unknown> {

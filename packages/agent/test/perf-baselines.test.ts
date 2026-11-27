@@ -1,13 +1,9 @@
 // Advisory perf baselines: recording only; hard gating deferred to perf-gates.test.ts.
 import { describe, expect, it } from "bun:test";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message, Model } from "@gajae-code/ai";
+import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
+import type { AssistantMessage, Model } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
-import { createAssistantMessage, createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createAssistantMessage, createUserMessage, identityConverter } from "./helpers";
 
 const model: Model = {
 	id: "perf-baseline-model",

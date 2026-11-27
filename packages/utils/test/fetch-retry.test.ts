@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
-import { type FetchWithRetryOptions, fetchWithRetry } from "../src/fetch-retry";
+import { extractRetryHint, type FetchWithRetryOptions, fetchWithRetry } from "../src/fetch-retry";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -46,6 +46,96 @@ describe("fetchWithRetry", () => {
 		expect(response.status).toBe(200);
 		expect(await response.text()).toBe("done");
 		expect(attempt).toBe(2);
+	});
+
+	it.each([
+		["retry-after", "0"],
+		["x-ratelimit-reset", "4102444800"],
+		["x-ratelimit-reset-after", "0.001"],
+	])("uses %s without waiting for an unfinished error body", async (header, value) => {
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("not finished"));
+			},
+		});
+		const retryResponse = new Response(body, { status: 503, headers: { [header]: value } });
+		const cloneSpy = vi.spyOn(retryResponse, "clone").mockImplementation(() => {
+			throw new Error("header hint must not inspect the body");
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let calls = 0;
+		const response = await fetchWithRetry("https://example.invalid/header-hint", {
+			fetch: async () => (++calls === 1 ? retryResponse : new Response("done")),
+			maxAttempts: 2,
+			maxDelayMs: Number.POSITIVE_INFINITY,
+		});
+		expect(await response.text()).toBe("done");
+		expect(calls).toBe(2);
+		expect(cloneSpy).not.toHaveBeenCalled();
+		expect(waitSpy).toHaveBeenCalledTimes(1);
+		expect(retryResponse.bodyUsed).toBe(true);
+	});
+
+	it("retries from a header before the real error stream closes", async () => {
+		let closeBody = () => {};
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("partial error"));
+				closeBody = () => controller.close();
+			},
+		});
+		let calls = 0;
+		const request = fetchWithRetry("https://example.invalid/open-body", {
+			fetch: async () =>
+				++calls === 1 ? new Response(body, { status: 503, headers: { "Retry-After": "0" } }) : new Response("done"),
+			maxAttempts: 2,
+		});
+		try {
+			const outcome = await Promise.race([
+				request.then(response => response.status),
+				Bun.sleep(100).then(() => "timed-out"),
+			]);
+			expect(outcome).toBe(200);
+			expect(calls).toBe(2);
+		} finally {
+			// Closing releases the old implementation's pending clone read on failure.
+			try {
+				closeBody();
+			} catch {
+				// The fixed implementation may already have cancelled the stream.
+			}
+			await request;
+		}
+	});
+
+	it("returns an over-cap header response without inspecting or cancelling its body", async () => {
+		const response = new Response("still readable", { status: 429, headers: { "Retry-After": "2" } });
+		const cloneSpy = vi.spyOn(response, "clone").mockImplementation(() => {
+			throw new Error("over-cap header must not inspect the body");
+		});
+		const result = await fetchWithRetry("https://example.invalid/header-cap", {
+			fetch: async () => response,
+			maxAttempts: 2,
+			maxDelayMs: 1,
+		});
+		expect(result).toBe(response);
+		expect(cloneSpy).not.toHaveBeenCalled();
+		expect(response.bodyUsed).toBe(false);
+		expect(await response.text()).toBe("still readable");
+	});
+
+	it("falls back to a body hint when headers have no usable hint", async () => {
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		let calls = 0;
+		await fetchWithRetry("https://example.invalid/body-hint", {
+			fetch: async () =>
+				++calls === 1
+					? new Response("Please retry in 7ms", { status: 503, headers: { "Retry-After": "invalid" } })
+					: new Response("done"),
+			maxAttempts: 2,
+		});
+		expect(calls).toBe(2);
+		expect(waitSpy).toHaveBeenCalledWith(7, { signal: undefined });
 	});
 
 	it("cancels response bodies that are discarded before a retry", async () => {
@@ -345,5 +435,22 @@ describe("fetchWithRetry", () => {
 		expect(response.status).toBe(200);
 		expect(waitSpy).toHaveBeenCalledTimes(1);
 		expect(waitSpy).toHaveBeenCalledWith(maxTimerDelayMs, { signal: undefined });
+	});
+});
+
+describe("extractRetryHint", () => {
+	it("honors a millisecond quotaResetDelay", () => {
+		// Floor Google's fractional metadata to whole milliseconds.
+		expect(extractRetryHint(undefined, '{"metadata":{"quotaResetDelay":"835.150299ms"}}')).toBe(835);
+	});
+
+	it.each([
+		["30m", 1_800_000],
+		["1h", 3_600_000],
+		["1.5h", 5_400_000],
+		["1h30m", 5_400_000],
+	])("prefers structured quotaResetDelay %s to earlier display text", (quotaResetDelay, expected) => {
+		const body = `Cloud Code Assist API error (429): {"error":{"status":"RESOURCE_EXHAUSTED","message":"Resource exhausted"},"metadata":{"quotaResetDelay":"${quotaResetDelay}"}}`;
+		expect(extractRetryHint(undefined, body)).toBe(expected);
 	});
 });

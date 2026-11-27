@@ -66,7 +66,7 @@ describe("LSP diagnostics freshness", () => {
 		const filePath = path.join(tempDir.path(), "example.ts");
 		const uri = fileToUri(filePath);
 		const client = createClient(tempDir.path(), TEST_SERVER);
-		client.openFiles.set(uri, { version: 1, languageId: "typescript" });
+		client.openFiles.set(uri, { version: 1, languageId: "typescript", lastUsedAt: Date.now() });
 
 		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
 		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["test-lsp", TEST_SERVER]]);
@@ -78,7 +78,7 @@ describe("LSP diagnostics freshness", () => {
 			if (openFile) {
 				openFile.version += 1;
 			} else {
-				mockClient.openFiles.set(syncedUri, { version: 1, languageId: "typescript" });
+				mockClient.openFiles.set(syncedUri, { version: 1, languageId: "typescript", lastUsedAt: Date.now() });
 			}
 		});
 		vi.spyOn(lspClient, "notifySaved").mockImplementation(async (mockClient, savedFilePath) => {

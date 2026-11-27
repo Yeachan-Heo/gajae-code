@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import { YAML } from "bun";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
@@ -121,10 +122,6 @@ const DEFAULT_TIMEOUT = 180;
 const DEFAULT_CONNECT_TIMEOUT = 60;
 const MIN_TIMEOUT_SECONDS = 1;
 const MAX_TIMEOUT_SECONDS = 3600;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function optionalTrim(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();

@@ -102,30 +102,36 @@ describe("ModelRegistry oMLX Discovery", () => {
 
 	test("forwards configured oMLX auth during discovery when configured", async () => {
 		authStorage.setRuntimeApiKey("omlx", "test-omlx-key");
-
+		const endpoint = "http://127.0.0.1:18117/v1";
+		Bun.env.OMLX_BASE_URL = endpoint;
+		const requestedUrls: string[] = [];
+		const authorizations: (string | null)[] = [];
+		// Observe the discovery request through the fetch hook: a credentialed oMLX
+		// probe is not a transport exemption, so it takes the ordinary `fetch` path
+		// that an ambient proxy can redirect. The hook keeps this assertion about the
+		// bearer independent of that configuration; the fresh-child inverse test in
+		// model-registry.test.ts remains the wire-level proof that the request target
+		// is the configured proxy. `bun test` strips proxy variables in its preload, but
+		// preload-free and E2E invocations do not, so those must control
+		// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY explicitly.
 		using _hook = hookFetch((input, init) => {
 			const url = String(input);
-			if (url.includes(":8080/v1/models")) {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authHeader).toBe("Bearer test-omlx-key");
-				return new Response(
-					JSON.stringify({
-						object: "list",
-						data: [{ id: "authenticated-omlx-model", max_model_len: 131072 }],
-					}),
-					{
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					},
-				);
-			}
-			return new Response(null, { status: 404 });
+			requestedUrls.push(url);
+			if (url !== `${endpoint}/models`) return new Response(null, { status: 404 });
+			authorizations.push(new Headers(init?.headers).get("authorization"));
+			return Response.json({
+				object: "list",
+				data: [{ id: "authenticated-omlx-model", max_model_len: 131072 }],
+			});
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		await registry.refresh();
+		// Provider-scoped so this case cannot probe Ollama, llama.cpp, LM Studio, or
+		// the implicit Rapid-MLX hook (whose direct socket bypasses the fetch hook).
+		await registry.refreshProvider("omlx", "online");
 
+		expect(requestedUrls).toEqual([`${endpoint}/models`]);
+		expect(authorizations).toEqual(["Bearer test-omlx-key"]);
 		const model = registry.find("omlx", "authenticated-omlx-model");
 		expect(model?.provider).toBe("omlx");
 		expect(await registry.getApiKey(model!)).toBe("test-omlx-key");
@@ -134,24 +140,27 @@ describe("ModelRegistry oMLX Discovery", () => {
 	test("rejects a remote implicit endpoint so its provider credential cannot be exfiltrated", async () => {
 		Bun.env.OMLX_BASE_URL = "https://untrusted.example/v1";
 		authStorage.setRuntimeApiKey("omlx", "test-omlx-key");
+		const authorizations: (string | null)[] = [];
 		const requestedUrls: string[] = [];
-
+		// The remote endpoint is rewritten to the loopback default before the probe.
+		// A credential does not change the transport, so the ordinary discovery
+		// `fetch` is observable here: serve the loopback catalog through the hook and
+		// record where the bearer would have gone.
 		using _hook = hookFetch((input, init) => {
 			const url = String(input);
 			requestedUrls.push(url);
-			if (url.includes(":8080/v1/models")) {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authorization = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authorization).toBe("Bearer test-omlx-key");
-				return new Response(JSON.stringify({ data: [{ id: "loopback-omlx-model" }] }), { status: 200 });
-			}
-			return new Response(null, { status: 404 });
+			if (!url.includes(":8080/v1/models")) return new Response(null, { status: 404 });
+			authorizations.push(new Headers(init?.headers).get("authorization"));
+			return Response.json({ data: [{ id: "loopback-omlx-model" }] });
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		await registry.refresh();
+		// Provider-scoped refresh: the oMLX probe is the only one this case observes.
+		await registry.refreshProvider("omlx", "online");
 
 		expect(registry.find("omlx", "loopback-omlx-model")).toBeDefined();
+		expect(requestedUrls).toContain("http://127.0.0.1:8080/v1/models");
+		expect(authorizations).toEqual(["Bearer test-omlx-key"]);
 		expect(requestedUrls.some(url => url.includes("untrusted.example"))).toBe(false);
 	});
 

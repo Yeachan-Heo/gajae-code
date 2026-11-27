@@ -4,7 +4,14 @@ import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrokerWorkflowGateEmitter, FileGateStore } from "../src/modes/shared/agent-wire/workflow-gate-broker";
-import { CURSOR_TTL_MS, CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
+import {
+	CURSOR_TTL_MS,
+	CursorRegistry,
+	cursorMac,
+	QueryHandlers,
+	RevisionStore,
+	SNAPSHOT_TTL_MS,
+} from "../src/sdk/host/query/index.js";
 import { Q10ThinkingMetadataError } from "../src/sdk/models.js";
 import type { ActiveProviderDescriptor } from "../src/sdk/providers.js";
 
@@ -388,6 +395,51 @@ describe("SDK query pagination", () => {
 			expect((await stat(snapshotDir)).mode & 0o777).toBe(0o700);
 			expect((await stat(join(objects, files[0]!))).mode & 0o777).toBe(0o600);
 		}
+		await store.close();
+	});
+
+	it("keeps spill files that a snapshot in progress shares with a revision swept meanwhile", async () => {
+		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
+		const snapshotDir = join(stateRoot, "sdk", "snapshots", "s1");
+		let now = 1_000_000;
+		const store = new RevisionStore("s1", () => now, { storageDir: stateRoot });
+		// The first element fills one 4 MiB chunk, so that chunk is on disk before the
+		// second element is encoded. Its toJSON stands in for another query's sweep.
+		let duringEncode = () => {};
+		const marker = {
+			toJSON: () => {
+				duringEncode();
+				return 1;
+			},
+		};
+		const value = ["x".repeat(4 * 1024 * 1024), marker];
+		expect(await store.createRevision("skills", "default", value)).toBe("1");
+		const files = async () => ({
+			objects: (await readdir(join(snapshotDir, "objects"))).sort(),
+			manifests: await readdir(join(snapshotDir, "manifests")),
+		});
+		const written = await files();
+		expect(written.objects).toHaveLength(2);
+		expect(written.manifests).toHaveLength(1);
+
+		now += SNAPSHOT_TTL_MS + 1;
+		let swept = 0;
+		duringEncode = () => {
+			swept++;
+			store.sweep();
+		};
+		const revision = await store.createRevision("skills", "default", value);
+		expect(swept).toBe(1);
+		duringEncode = () => {};
+		await Bun.sleep(50);
+		expect(await files()).toEqual(written);
+		expect(JSON.stringify(await store.readRevision("skills", "default", revision))).toBe(JSON.stringify(value));
+
+		// Once nothing refers to them, the files still go away.
+		now += SNAPSHOT_TTL_MS + 1;
+		store.sweep();
+		await Bun.sleep(50);
+		expect(await files()).toEqual({ objects: [], manifests: [] });
 		await store.close();
 	});
 

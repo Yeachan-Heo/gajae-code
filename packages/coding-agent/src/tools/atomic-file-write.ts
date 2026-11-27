@@ -168,8 +168,35 @@ async function resolvePublishPath(dest: string, depth = 0): Promise<ResolvedPubl
 	}
 }
 
-function pathIsWithin(target: string, root: string): boolean {
-	return target === root || target.startsWith(`${root}${path.sep}`);
+function relativeStaysWithin(target: string, root: string): boolean {
+	// A prefix check treats the filesystem root as `//`, so a normal child is
+	// rejected. Compare the relative path instead. Callers pass real paths.
+	const relative = path.relative(root, target);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+/**
+ * Case-sensitive containment for canonical Windows paths. `path.win32.relative`
+ * folds directory case, but a volume can keep `local` and `Local` as different
+ * directories. Drive letters stay case-insensitive.
+ */
+export function canonicalWindowsPathWithin(root: string, candidate: string): boolean {
+	if (!path.win32.isAbsolute(root) || !path.win32.isAbsolute(candidate)) return false;
+	const canonicalRoot = path.win32.resolve(root);
+	const canonicalCandidate = path.win32.resolve(candidate);
+	const rootParts = path.win32.parse(canonicalRoot);
+	const candidateParts = path.win32.parse(canonicalCandidate);
+	if (rootParts.root.toLowerCase() !== candidateParts.root.toLowerCase()) return false;
+	const rootSegments = canonicalRoot.slice(rootParts.root.length).split(path.win32.sep).filter(Boolean);
+	const candidateSegments = canonicalCandidate.slice(candidateParts.root.length).split(path.win32.sep).filter(Boolean);
+	if (candidateSegments.length < rootSegments.length) return false;
+	return rootSegments.every((segment, index) => segment === candidateSegments[index]);
+}
+
+export function pathIsWithin(target: string, root: string): boolean {
+	if (!relativeStaysWithin(target, root)) return false;
+	if (process.platform !== "win32") return true;
+	return canonicalWindowsPathWithin(root, target);
 }
 
 async function realpathOrSelf(p: string): Promise<string> {
@@ -198,7 +225,7 @@ async function realpathOrSelf(p: string): Promise<string> {
 function sessionLocalRootFor(lexicalDest: string): string | undefined {
 	const resolvedDest = path.resolve(lexicalDest);
 	const localParent = path.join(os.tmpdir(), "gjc-local");
-	if (!pathIsWithin(resolvedDest, localParent)) return undefined;
+	if (!relativeStaysWithin(resolvedDest, localParent)) return undefined;
 	const rest = resolvedDest.slice(localParent.length + path.sep.length);
 	const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
 	if (sessionSegment.length === 0) return undefined;
@@ -216,7 +243,7 @@ function explicitLocalRootFor(lexicalDest: string): string | undefined {
 	const artifactsDir = options.getArtifactsDir?.();
 	if (!artifactsDir) return undefined;
 	const root = path.resolve(artifactsDir, "local");
-	if (!pathIsWithin(path.resolve(lexicalDest), root)) return undefined;
+	if (!relativeStaysWithin(path.resolve(lexicalDest), root)) return undefined;
 	return root;
 }
 

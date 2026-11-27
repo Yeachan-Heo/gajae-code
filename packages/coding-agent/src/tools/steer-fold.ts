@@ -1,5 +1,4 @@
 import { logger } from "@gajae-code/utils";
-import type { FoldReason } from "../async/job-manager";
 import type { ToolSession } from ".";
 
 /** A short foreground wait stays in the foreground even when a steer is admitted. */
@@ -8,31 +7,6 @@ export const STEER_FOLD_GRACE_MS = 2_000;
 /** Model-facing line appended to a steer-folded background-start result. */
 export function steerFoldReasonLine(jobId: string): string {
 	return `Folded into background job ${jobId} because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.`;
-}
-
-/** Model-facing cause clause for a fold, keyed by the recorded {@link FoldReason}. */
-export function foldReasonClause(reason: FoldReason): string {
-	switch (reason) {
-		case "steer":
-			return "because a user steer arrived";
-		case "chord":
-			return "because the user pressed the fold chord";
-		case "sdk_control":
-			return "because an SDK client requested it";
-		case "timer":
-			return "because the auto-background threshold elapsed";
-	}
-}
-
-/** Model-facing line used when the `job` tool's own wait is folded; states the real trigger. */
-export function foldAwaitReasonLine(folded: ReadonlyMap<string, FoldReason>): string {
-	const jobIds = [...folded.keys()];
-	const names = jobIds.map(id => `\`${id}\``).join(", ");
-	const reasons = [...new Set(folded.values())];
-	const single = reasons.length === 1 ? reasons[0] : undefined;
-	const cause = single ? foldReasonClause(single) : "because the waits were folded";
-	const plural = jobIds.length !== 1;
-	return `Folded the job await for ${names} ${cause}; the job${plural ? "s keep" : " keeps"} running with ${plural ? "their original deadlines" : "its original deadline"}, and ${plural ? "their results" : "its result"} will wake a later turn.`;
 }
 
 type SteerFoldSession = Pick<ToolSession, "settings" | "waitForUserSteering" | "requestForegroundBashBackground">;

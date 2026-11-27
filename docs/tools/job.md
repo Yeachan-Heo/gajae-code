@@ -87,6 +87,7 @@ Foreground fold contract:
 - A steer fold appends `Folded into background job <id> because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.` to the background-start result. Every fold records `metadata.foldReason` (`steer` | `chord` | `timer` | `sdk_control`); `list: true` snapshots expose it as `foldReason`, and the SDK `runtime.jobs.list` payload carries it beside `backgrounded`. The manager emits one `onFold` notification per fold, which the SDK host publishes as a replayable `bash_folded` frame.
 - Chord/timer/SDK-control folds wake a fresh turn on completion with a receipt containing bounded output, the original request, and a `job` retrieval handle. A steer fold keeps the current turn running so the steer is consumed immediately; the job's completion still wakes a later turn. The original command deadline remains active and `job tail` is available while the job runs.
 - PTY overlay disposal is non-owning; explicit Escape and `job cancel` stop the PTY through its lifecycle hook. `task` and `subagent` waits are not foldable.
+- A `job` `poll` wait is never folded, because its jobs are already in the background. A user steer that arrives during the wait ends it immediately — no grace window and no `busyPromptMode` check, matching `subagent` await — and the result appends `Job await interrupted by a new user message; …`. This applies to `bash` and `task` jobs alike; every watched job keeps running, records no `foldReason`, and delivers its completion through the ordinary automatic delivery.
 
 Spawn paths that produce jobs:
 - `packages/coding-agent/src/tools/bash.ts`
@@ -148,5 +149,9 @@ Lifecycle and exact state names:
   - snapshots (`job` calls with `poll` or `list: true`) read current manager state;
   - follow-up delivery comes from `AsyncJobManager.#enqueueDelivery(...)` and `sdk.ts` `onJobComplete`;
   - watched or acknowledged ids are suppressed via `isDeliverySuppressed(...)`.
+- Delivery timing of automatic completions (`AgentSession` yield queue):
+  - while the agent is working, an ordinary completion is added to the running turn at its next tool step (after the tool results, before the next model call), so the agent sees it within the same turn;
+  - a completion that arrives during the final answer, an owned completion of a terminal-aborted turn, and a folded job's receipt are delivered when the turn is about to end (one follow-up iteration) or, when idle, as a new turn;
+  - an aborted, folding, or transitioning turn never receives a completion at a tool step.
 - `manager.cancel(id)` sets `status = "cancelled"` before the underlying promise settles. The job function may later populate `resultText` or `errorText`; `job-manager.ts` preserves that text but does not transition the status away from `cancelled`.
 - Retention eviction removes the job record, suppression flags, and watch flag together. After eviction, both `job` calls and `list: true` snapshots behave as if the id never existed.

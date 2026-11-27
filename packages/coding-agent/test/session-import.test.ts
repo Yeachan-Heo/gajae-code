@@ -11,7 +11,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { canContinuePersistedHistory } from "@gajae-code/agent-core";
+import { FileLockAcquireStatus, FileLockProbeState } from "@gajae-code/natives";
 import { SessionManager } from "../src/session/session-manager";
+import { inspectSessionOwners, SessionOwnershipTestHooks } from "../src/session/session-ownership";
 import { parseImportSessionArgs } from "../src/session-import/command";
 import { detectSessionImportFormat } from "../src/session-import/detect";
 import {
@@ -659,6 +661,31 @@ describe("session import materialization", () => {
 
 		// The source transcript is untouched.
 		expect(createHash("sha256").update(fs.readFileSync(source)).digest("hex")).toBe(sourceShaBefore);
+	});
+
+	it("under enforce, an owners-directory failure refuses the import before it writes or claims anything", async () => {
+		const dir = makeTempDir();
+		const destination = path.join(dir, "sessions");
+		const source = writeSource(dir, "rollout.jsonl", CODEX_ROLLOUT);
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => ({ status: FileLockAcquireStatus.Failed, code: "EACCES" }),
+			probe: async () => ({ state: FileLockProbeState.Free }),
+		};
+		try {
+			const error = await importProviderSessionFile({ sourcePath: source, cwd: dir, destination }).catch(
+				(caught: unknown) => caught,
+			);
+			expect(expectImportError(error, "io_failed").message).toContain("could not check safely");
+			const written = (fs.existsSync(destination) ? fs.readdirSync(destination, { recursive: true }) : []).filter(
+				name => String(name).endsWith(".jsonl"),
+			);
+			expect(written).toEqual([]);
+			expect((await inspectSessionOwners()).held).toEqual([]);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.lockBackend;
+		}
 	});
 
 	it("creates distinct sessions for repeated imports of the same source", async () => {

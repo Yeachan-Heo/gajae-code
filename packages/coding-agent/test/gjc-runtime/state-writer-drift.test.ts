@@ -11,6 +11,7 @@ import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/stat
 import { RequiredOnWriteEnvelopeSchema } from "@gajae-code/coding-agent/gjc-runtime/state-schema";
 import { writeWorkflowEnvelopeAtomic } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "@gajae-code/coding-agent/skill-state/workflow-state-contract";
+import { readJson } from "../helpers/read-json";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -33,10 +34,6 @@ afterAll(async () => {
 	else delete process.env.GJC_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
-
-async function readJson(filePath: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await fs.readFile(filePath, "utf-8")) as Record<string, unknown>;
-}
 
 async function readAuditEntries(root: string): Promise<Array<Record<string, unknown>>> {
 	try {

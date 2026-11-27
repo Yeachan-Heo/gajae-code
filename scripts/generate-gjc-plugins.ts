@@ -210,6 +210,9 @@ never prints. \`--agent-dir\` selects the broker state directory.
   through the broker without attaching. The default idempotency key includes the
   endpoint generation and incarnation, so retries for one host replay while a
   resumed host with the same session id gets a new lifecycle identity.
+  \`--if-idle\` closes only an idle host: a busy host refuses with \`busy\`, is
+  left running and usable, and the same close can be retried once it is idle.
+  It never falls back to signals and never forces the close.
 
 - \`gjc sdk session tail <sessionId>\` — retained transcript replay from the
   durable checkpoint followed by live event-ring frames. \`--strict\` fails

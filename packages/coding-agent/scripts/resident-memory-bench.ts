@@ -51,8 +51,8 @@ import * as fs from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
+import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/sdk/session-readonly/inspection";
 import { EphemeralBlobStore, MemoryBlobStore, openVerifiedResidentCacheInstanceDir } from "../src/session/blob-store";
-import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/session/internal/managed-session-storage";
 import type {
 	SessionManagerObservabilityStats,
 	SessionManager as SessionManagerType,

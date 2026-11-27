@@ -27,7 +27,7 @@ import { getEmbeddedDefaultGjcSkills } from "@gajae-code/coding-agent/defaults/g
 import { resolveSkillSlashCommands, type Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
@@ -36,6 +36,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "@gajae-code/
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
+import { loadTestTheme } from "./helpers/test-theme";
 
 // ============================================================================
 // Shared helpers
@@ -747,7 +748,7 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		// No `afterEach` restore is required by that convention; the theme
 		// module exposes no reset API, and `dark` is the suite-wide assumed
 		// post-state.
-		const themeInstance = await getThemeByName("red-claw");
+		const themeInstance = await loadTestTheme();
 		expect(themeInstance).toBeDefined();
 		setThemeInstance(themeInstance!);
 	});

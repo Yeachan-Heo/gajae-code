@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
 import { buildMCPPoolKeyIdentity, canonicalizeMCPEndpoint, computeMCPPoolKey, MCPPoolConfigError } from "./pool-key";
 import type { MCPHttpServerConfig, MCPServerConfig, MCPStdioServerConfig } from "./types";
 
@@ -132,7 +133,7 @@ describe("MCP C5 pool identity", () => {
 	});
 
 	test("plain credential-free env/header rotation remains partitioning per C5", () => {
-		// This is contract-conformant behavior, not a defect: only Authorization rotates out of identity.
+		// Non-authorization values stay in the identity. A shared API-key Authorization value does too.
 		expect(key(stdio(), { effectiveEnv: { PATH: "one" } })).not.toBe(key(stdio(), { effectiveEnv: { PATH: "two" } }));
 		expect(key(http("https://h/mcp"), { effectiveHeaders: { "X-Test": "one" } })).not.toBe(
 			key(http("https://h/mcp"), { effectiveHeaders: { "X-Test": "two" } }),
@@ -165,6 +166,113 @@ describe("MCP C5 pool identity", () => {
 		} catch (error) {
 			expect(error).toMatchObject({ code: "MCP_DUPLICATE_HEADER", name: "MCPPoolConfigError" });
 		}
+	});
+
+	test("shared apikey authorization values partition the pool key", () => {
+		const label = http("https://h/mcp", {
+			sharing: "shared",
+			auth: { type: "apikey", credentialId: "tenant-scope" },
+			headers: { Authorization: "Bearer unresolved" },
+		});
+		const first = key(label, {
+			sharingMode: "shared",
+			keyConfig: label,
+			effectiveHeaders: { Authorization: "Bearer tenant-one" },
+		});
+		const second = key(label, {
+			sharingMode: "shared",
+			keyConfig: label,
+			effectiveHeaders: { Authorization: "Bearer tenant-two" },
+		});
+		expect(first).not.toBe(second);
+	});
+
+	test("shared apikey leases keep one pool key when the authorization token matches", () => {
+		const label = http("https://h/mcp", {
+			sharing: "shared",
+			auth: { type: "apikey", credentialId: "tenant-scope" },
+		});
+		const token = "Bearer tenant-one";
+		expect(key(label, { sharingMode: "shared", effectiveHeaders: { Authorization: token } })).toBe(
+			key(label, { sharingMode: "shared", effectiveHeaders: { Authorization: token } }),
+		);
+	});
+
+	test("shared apikey keeps one pool key when only the authorization header name case differs", () => {
+		const label = http("https://h/mcp", {
+			sharing: "shared",
+			auth: { type: "apikey", credentialId: "tenant-scope" },
+		});
+		expect(key(label, { sharingMode: "shared", effectiveHeaders: { authorization: "Bearer tenant-one" } })).toBe(
+			key(label, { sharingMode: "shared", effectiveHeaders: { Authorization: "Bearer tenant-one" } }),
+		);
+	});
+
+	test("shared oauth rotation keeps one pool key across authorization tokens", () => {
+		const label = http("https://h/mcp", {
+			sharing: "shared",
+			auth: { type: "oauth", credentialId: "credential-a" },
+		});
+		expect(
+			key(label, {
+				sharingMode: "shared",
+				effectiveHeaders: { Authorization: "Bearer old-token" },
+			}),
+		).toBe(
+			key(label, {
+				sharingMode: "shared",
+				effectiveHeaders: { Authorization: "Bearer new-token" },
+			}),
+		);
+	});
+
+	test("per-session apikey token rotation keeps the pool key", () => {
+		const label = http("https://h/mcp", { auth: { type: "apikey", credentialId: "tenant-scope" } });
+		expect(
+			key(label, {
+				sharingMode: "per-session",
+				effectiveHeaders: { Authorization: "Bearer old-token" },
+			}),
+		).toBe(
+			key(label, {
+				sharingMode: "per-session",
+				effectiveHeaders: { Authorization: "Bearer new-token" },
+			}),
+		);
+	});
+
+	test("property: shared apikey values partition and oauth rotation does not, fc.property seed 43317, numRuns 64", () => {
+		const token = fc.string({ minLength: 1, maxLength: 40 });
+		fc.assert(
+			fc.property(token, token, fc.string({ minLength: 1, maxLength: 24 }), (left, right, scope) => {
+				const apikey = (value: string) =>
+					key(
+						http("https://h/mcp", {
+							sharing: "shared",
+							auth: { type: "apikey", credentialId: scope },
+						}),
+						{ sharingMode: "shared", effectiveHeaders: { Authorization: value } },
+					);
+				const oauth = (value: string) =>
+					key(
+						http("https://h/mcp", {
+							sharing: "shared",
+							auth: { type: "oauth", credentialId: scope },
+						}),
+						{ sharingMode: "shared", effectiveHeaders: { Authorization: value } },
+					);
+				const apikeyLeft = apikey(left);
+				const apikeyAgain = apikey(left);
+				const oauthLeft = oauth(left);
+				const oauthRight = oauth(right);
+				return (
+					apikeyLeft === apikeyAgain &&
+					(left === right || apikeyLeft !== apikey(right)) &&
+					oauthLeft === oauthRight
+				);
+			}),
+			{ seed: 43317, numRuns: 64 },
+		);
 	});
 
 	test("rejects URL userinfo with a typed config error", () => {

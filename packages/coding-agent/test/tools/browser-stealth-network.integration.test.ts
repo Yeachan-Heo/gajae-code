@@ -30,13 +30,22 @@ async function withStealthPage<T>(
 	fn: (page: import("puppeteer-core").Page, browser: Browser) => Promise<T>,
 	geo?: { timezone?: string; locale?: string },
 ): Promise<T> {
-	const browser = await launchHeadlessBrowser({ headless: true, ...(geo ? { geo } : {}) });
+	const launchResult = await launchHeadlessBrowser({ headless: true, ...(geo ? { geo } : {}) });
+	const browser = launchResult.browser;
 	try {
 		const page = await browser.newPage();
 		await applyStealthPatches(browser, page, { browserSession: null as CDPSession | null, override: null }, geo);
 		return await fn(page, browser);
 	} finally {
 		await browser.close();
+		// Clean up the created userDataDir if any
+		if (launchResult.createdUserDataDir) {
+			try {
+				fs.rmSync(launchResult.createdUserDataDir, { recursive: true, force: true });
+			} catch {
+				// Ignore cleanup errors in test
+			}
+		}
 	}
 }
 
@@ -181,7 +190,8 @@ describe("stealth network posture (integration)", () => {
 			expect(true).toBe(true);
 			return;
 		}
-		const browser = await launchHeadlessBrowser({ headless: true });
+		const launchResult = await launchHeadlessBrowser({ headless: true });
+		const browser = launchResult.browser;
 		try {
 			const page = await browser.newPage();
 			const readLocale = () =>
@@ -197,6 +207,14 @@ describe("stealth network posture (integration)", () => {
 			expect(await readLocale()).toEqual(before);
 		} finally {
 			await browser.close();
+			// Clean up the created userDataDir if any
+			if (launchResult.createdUserDataDir) {
+				try {
+					fs.rmSync(launchResult.createdUserDataDir, { recursive: true, force: true });
+				} catch {
+					// Ignore cleanup errors in test
+				}
+			}
 		}
 	}, 120_000);
 

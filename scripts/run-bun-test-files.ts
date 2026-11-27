@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createIsolatedHomeDirectories, isolatedHomeEnv } from "./test-home-isolation";
 
 export const DEFAULT_TEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_FILE_TIMEOUT_MS = 5 * 60_000;
@@ -169,7 +170,6 @@ export function buildTestProcessSpec(
 	base: string = repoRoot,
 	parentEnv: NodeJS.ProcessEnv = process.env,
 ): TestProcessSpec {
-	const home = path.join(sandbox, "home");
 	const env: NodeJS.ProcessEnv = { ...parentEnv };
 	const e2eEnabled = /^(1|true|yes|on)$/iu.test(parentEnv.E2E?.trim() ?? "");
 	if (!e2eEnabled) {
@@ -192,13 +192,7 @@ export function buildTestProcessSpec(
 		sandbox,
 		env: {
 			...env,
-			HOME: home,
-			USERPROFILE: home,
-			XDG_CONFIG_HOME: path.join(sandbox, "xdg", "config"),
-			XDG_DATA_HOME: path.join(sandbox, "xdg", "data"),
-			XDG_STATE_HOME: path.join(sandbox, "xdg", "state"),
-			XDG_CACHE_HOME: path.join(sandbox, "xdg", "cache"),
-			XDG_RUNTIME_DIR: path.join(sandbox, "xdg", "runtime"),
+			...isolatedHomeEnv(sandbox),
 			TMPDIR: path.join(sandbox, "tmp"),
 			TMP: path.join(sandbox, "tmp"),
 			TEMP: path.join(sandbox, "tmp"),
@@ -402,13 +396,8 @@ export async function runHarness(
 			if (!file) return;
 			const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-test-file-"));
 			const spec = buildTestProcessSpec(file, sandbox, options.testTimeoutMs, base);
+			createIsolatedHomeDirectories(isolatedHomeEnv(sandbox));
 			await Promise.all([
-				fs.mkdir(spec.env.HOME!, { recursive: true }),
-				fs.mkdir(spec.env.XDG_CONFIG_HOME!, { recursive: true }),
-				fs.mkdir(spec.env.XDG_DATA_HOME!, { recursive: true }),
-				fs.mkdir(spec.env.XDG_STATE_HOME!, { recursive: true }),
-				fs.mkdir(spec.env.XDG_CACHE_HOME!, { recursive: true }),
-				fs.mkdir(spec.env.XDG_RUNTIME_DIR!, { recursive: true, mode: 0o700 }),
 				fs.mkdir(spec.env.TMPDIR!, { recursive: true }),
 				fs.mkdir(spec.env.GJC_HOME!, { recursive: true }),
 			]);

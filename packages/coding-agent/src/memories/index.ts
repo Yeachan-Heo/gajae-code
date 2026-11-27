@@ -22,6 +22,7 @@ import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with 
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import unavailableTemplate from "../prompts/memories/unavailable.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { escapePromptMetadata, wrapUntrustedContent } from "../session/messages";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -166,6 +167,40 @@ export function startMemoryStartupTask(options: {
 	});
 }
 
+const SUMMARY_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
+
+/**
+ * Keep an already-encoded summary inside the injection budget. Encoding can expand
+ * `&`, quotes, and tags, so this cut runs after encoding and before the fence.
+ * Head and tail both stay so a closer that survived the first cut is still fenced.
+ */
+function boundEncodedMemorySummary(encoded: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (encoded.length <= maxChars) return encoded;
+	if (maxChars <= SUMMARY_TRUNCATION_MARKER.length) return encoded.slice(0, maxChars);
+	const room = maxChars - SUMMARY_TRUNCATION_MARKER.length;
+	const head = Math.floor(room * 0.6);
+	const tail = room - head;
+	return `${encoded.slice(0, head)}${SUMMARY_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
+}
+
+/** Break project-block markers, including case and spaces inside the brackets. */
+function neutralizeProjectMarkers(value: string): string {
+	return value.replace(/\[\s*(?:(\/)\s*)?project\s*\]/gi, (_match, slash: string | undefined) =>
+		(slash ?? "") ? "[ /PRO JECT]" : "[ PRO JECT]",
+	);
+}
+
+/**
+ * Frame a stored summary after the token cut. Encoding runs before the fence so a
+ * tail that keeps only a closer still opens with `<untrusted-content>`.
+ * Brackets survive encoding, so project-block markers are broken too.
+ */
+function frameInjectedMemorySummary(summary: string, maxChars: number): string {
+	const encoded = neutralizeProjectMarkers(escapePromptMetadata(summary, { preserveNewlines: true }));
+	return wrapUntrustedContent(boundEncodedMemorySummary(encoded, maxChars));
+}
+
 /**
  * Build memory usage instructions for prompt injection.
  */
@@ -192,12 +227,18 @@ export async function buildMemoryToolDeveloperInstructions(
 	if (!truncated.trim()) return unavailableTemplate;
 
 	return prompt.render(readPathTemplate, {
-		memory_summary: truncated,
+		memory_summary: frameInjectedMemorySummary(truncated, cfg.summaryInjectionTokenLimit * 4),
 	});
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Delete every memory row and memory job in the shared local database, then remove
+ * only the current project's memory directory.
+ *
+ * Database deletion is not scoped to `cwd`. Filesystem cleanup removes the
+ * directory that `getMemoryRoot(agentDir, cwd)` returns. Project paths that
+ * differ only in `/`, `\`, or `:` versus `-` map to the same directory, so that
+ * shared directory is removed too.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -206,6 +247,7 @@ export async function clearMemoryData(agentDir: string, cwd: string): Promise<vo
 	} finally {
 		closeMemoryDb(db);
 	}
+	// Filesystem cleanup is the current project directory only.
 	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
 }
 
@@ -681,23 +723,27 @@ async function runStage1Job(options: {
 async function syncPhase2Artifacts(memoryRoot: string, outputs: Stage1OutputRow[]): Promise<void> {
 	const summariesDir = path.join(memoryRoot, "rollout_summaries");
 	await fs.mkdir(summariesDir, { recursive: true });
+	const summariesRoot = path.resolve(summariesDir);
 
 	const keepFiles = new Set<string>();
 	for (const row of outputs) {
-		const stem = formatRolloutFilename(row.threadId, row.rolloutSlug);
-		const filename = `${stem}.md`;
+		const target = rolloutSummaryDestination(summariesRoot, row.threadId, row.rolloutSlug);
+		if (!target) continue;
+		const filename = path.basename(target);
 		keepFiles.add(filename);
 		const body = [`thread_id: ${row.threadId}`, `updated_at: ${row.sourceUpdatedAt}`, "", row.rolloutSummary].join(
 			"\n",
 		);
-		await Bun.write(path.join(summariesDir, filename), `${body.trim()}\n`);
+		await Bun.write(target, `${body.trim()}\n`);
 	}
 
 	const currentFiles = await fs.readdir(summariesDir).catch(() => [] as string[]);
 	for (const file of currentFiles) {
 		if (!file.endsWith(".md")) continue;
 		if (keepFiles.has(file)) continue;
-		await fs.rm(path.join(summariesDir, file), { force: true });
+		const target = containedExistingSummary(summariesRoot, file);
+		if (!target) continue;
+		await fs.rm(target, { force: true });
 	}
 
 	const rawBody = buildRawMemoriesMarkdown(outputs);
@@ -923,6 +969,55 @@ function formatRolloutFilename(threadId: string, rolloutSlug: string | null): st
 		.slice(0, 20);
 	if (!normalized) return threadId;
 	return `${threadId}-${normalized}`;
+}
+
+/** Lexical containment for one summary file name. A backslash is a separator only when the platform says so. */
+function lexicalSummaryTarget(summariesRoot: string, filename: string): string | undefined {
+	if (filename.length === 0 || filename.includes("\0") || filename.includes("/")) return undefined;
+	if (filename === "." || filename === "..") return undefined;
+	if (path.basename(filename) !== filename) return undefined;
+	const target = path.resolve(summariesRoot, filename);
+	const relative = path.relative(summariesRoot, target);
+	if (
+		relative.length === 0 ||
+		relative === ".." ||
+		relative.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relative) ||
+		relative !== filename
+	) {
+		return undefined;
+	}
+	return target;
+}
+
+/** New summary names stay portable: reject separators, including backslash. */
+function containedSummaryFilename(summariesRoot: string, filename: string): string | undefined {
+	if (filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+/** Existing directory entries may contain a backslash on POSIX. Still refuse a name that leaves the directory. */
+function containedExistingSummary(summariesRoot: string, filename: string): string | undefined {
+	if (!filename.endsWith(".md")) return undefined;
+	if (path.sep === "\\" && filename.includes("\\")) return undefined;
+	return lexicalSummaryTarget(summariesRoot, filename);
+}
+
+function rolloutSummaryDestination(
+	summariesRoot: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return containedSummaryFilename(summariesRoot, `${formatRolloutFilename(threadId, rolloutSlug)}.md`);
+}
+
+/** Test seam for the rollout summary path gate. */
+export function rolloutSummaryDestinationForTesting(
+	summariesDir: string,
+	threadId: string,
+	rolloutSlug: string | null,
+): string | undefined {
+	return rolloutSummaryDestination(path.resolve(summariesDir), threadId, rolloutSlug);
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | undefined {

@@ -210,14 +210,14 @@ describe("maintenance call transport forwarding (#736)", () => {
 });
 
 describe("split-turn compaction sequencing (#736)", () => {
-	/** Mock completeSimple with a slow body that records peak concurrency. */
+	/** Yield completeSimple once so synchronous parallel launches overlap. */
 	function spyTrackingConcurrency(): { peak: () => number } {
 		let active = 0;
 		let maxActive = 0;
 		vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
 			active++;
 			maxActive = Math.max(maxActive, active);
-			await new Promise(resolve => setTimeout(resolve, 10));
+			await Promise.resolve();
 			active--;
 			return makeAssistantMessage("ok");
 		});
