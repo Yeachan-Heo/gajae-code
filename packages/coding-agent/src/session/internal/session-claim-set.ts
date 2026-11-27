@@ -24,7 +24,7 @@ import {
 	sessionOwnerSurface,
 } from "../session-ownership";
 import {
-	liveSessionOwnershipMode,
+	liveSessionOwnershipModeFor,
 	type SessionOwnershipMode,
 	sessionOwnershipMode,
 	sessionOwnershipTestHookSlot,
@@ -129,7 +129,7 @@ export function claimRefusal(
 ): SessionHeldError | SessionOwnershipError | undefined {
 	if (ownership === "exempt" || ownership.mode !== "enforce") return undefined;
 	if (outcome?.status !== "held" && outcome?.status !== "failed") return undefined;
-	if (liveSessionOwnershipMode() !== "enforce") return undefined;
+	if (liveSessionOwnershipModeFor(ownership.mode) !== "enforce") return undefined;
 	return outcome.status === "held" ? new SessionHeldError(sessionId, outcome.holder) : outcome.error;
 }
 

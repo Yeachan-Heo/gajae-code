@@ -32,6 +32,7 @@ import type { PtyRunResult } from "@gajae-code/natives";
 import { PtySession } from "@gajae-code/natives";
 import { withTimeout } from "@gajae-code/utils";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClient, type SdkRequestOptions } from "../src/sdk/client";
 import { SessionManager } from "../src/session/session-manager";
 import { buildChildEnv } from "./helpers/acp-child-env";
@@ -83,12 +84,20 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs: numbe
 
 type ChatBody = { messages?: { role?: string; content?: unknown }[] };
 
+interface FakeModel {
+	port: number;
+	prompts: string[];
+	reached(prompt: string): Promise<void>;
+	release(prompt: string): void;
+	releaseAll(): void;
+}
+
 /**
  * Replies `<prompt>-reply` to the latest `attach-*` user prompt. A prompt listed in `holds` is
  * answered only after the test releases it, so the test can probe ownership while that turn is
  * in flight and its client process is still alive.
  */
-function startFakeModel(holds: readonly string[]) {
+function startFakeModel(holds: readonly string[]): FakeModel {
 	const prompts: string[] = [];
 	const gates = new Map(holds.map(prompt => [prompt, Promise.withResolvers<void>()]));
 	const reached = new Map(holds.map(prompt => [prompt, Promise.withResolvers<void>()]));
@@ -334,44 +343,49 @@ function subprocessInput(proc: Bun.Subprocess<"pipe", "pipe", "pipe">): Writable
 	});
 }
 
-// The harness drives a real PTY and POSIX process groups; Windows keeps its own suites.
-// Under `enforce` too: a refusal never blocks remote control, because attach and reuse never claim.
-describe.skipIf(process.platform === "win32")("remote clients attach to the TUI that owns the session", () => {
-	it.each([
-		"observe",
-		"enforce",
-	] as const)("%s: ACP session/load and an SDK send run in the owner's transcript and never claim", async mode => {
-		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-attach-")));
-		const env = buildChildEnv(root);
-		const agentDir = env.GJC_CODING_AGENT_DIR!;
-		const workspace = path.join(root, "workspace");
-		const stubs = path.join(root, "stub-bin");
-		for (const dir of [
-			env.TMPDIR,
-			env.XDG_DATA_HOME,
-			env.XDG_CONFIG_HOME,
-			env.XDG_STATE_HOME,
-			env.XDG_CACHE_HOME,
-			env.XDG_RUNTIME_DIR,
-			agentDir,
-			workspace,
-			stubs,
-		])
-			await fs.mkdir(dir!, { recursive: true, mode: 0o700 });
-		// No child may open a browser: `open`/`xdg-open` resolve to no-op stubs first on PATH.
-		for (const name of ["open", "xdg-open"]) {
-			await Bun.write(path.join(stubs, name), "#!/bin/sh\nexit 0\n");
-			await fs.chmod(path.join(stubs, name), 0o755);
-		}
-		env.PATH = `${stubs}:${env.PATH}`;
+interface Fixture {
+	root: string;
+	env: Record<string, string>;
+	agentDir: string;
+	workspace: string;
+	model: FakeModel;
+	cleanup: FixtureRootCleanup;
+	started: { discovery: { url: string; token: string } };
+}
 
-		const TUI_PROMPT = "attach-tui-one";
-		const ACP_PROMPT = "attach-acp-two";
-		const SDK_PROMPT = "attach-sdk-three";
-		const model = startFakeModel([ACP_PROMPT, SDK_PROMPT]);
-		await Bun.write(
-			path.join(agentDir, "models.yml"),
-			`providers:
+/**
+ * An owned root with an isolated environment, the fake model in `models.yml`, the ownership mode
+ * in the operator's global config, and a fixture broker. Shutdown runs in registration order:
+ * release held turns, stop the TUI, ACP and any CLI command, then close the broker lease.
+ */
+async function startFixture(mode: "observe" | "enforce", holds: readonly string[]): Promise<Fixture> {
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-attach-")));
+	const env = buildChildEnv(root);
+	const agentDir = env.GJC_CODING_AGENT_DIR!;
+	const workspace = path.join(root, "workspace");
+	const stubs = path.join(root, "stub-bin");
+	for (const dir of [
+		env.TMPDIR,
+		env.XDG_DATA_HOME,
+		env.XDG_CONFIG_HOME,
+		env.XDG_STATE_HOME,
+		env.XDG_CACHE_HOME,
+		env.XDG_RUNTIME_DIR,
+		agentDir,
+		workspace,
+		stubs,
+	])
+		await fs.mkdir(dir!, { recursive: true, mode: 0o700 });
+	// No child may open a browser: `open`/`xdg-open` resolve to no-op stubs first on PATH.
+	for (const name of ["open", "xdg-open"]) {
+		await Bun.write(path.join(stubs, name), "#!/bin/sh\nexit 0\n");
+		await fs.chmod(path.join(stubs, name), 0o755);
+	}
+	env.PATH = `${stubs}:${env.PATH}`;
+	const model = startFakeModel(holds);
+	await Bun.write(
+		path.join(agentDir, "models.yml"),
+		`providers:
   fake:
     baseUrl: http://127.0.0.1:${model.port}/v1
     apiKey: test-key
@@ -384,72 +398,140 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
         input: [text]
         output: [text]
 `,
-		);
-		// The operator's global config (ownership settings are global-only).
-		await Bun.write(path.join(agentDir, "config.yml"), `session:\n  ownership:\n    mode: ${mode}\n`);
+	);
+	// The operator's global config (ownership settings are global-only).
+	await Bun.write(path.join(agentDir, "config.yml"), `session:\n  ownership:\n    mode: ${mode}\n`);
 
-		const started = await withFixtureBrokerEnvironment(() =>
-			startFixtureBrokerWithLeaseForTest({ agentDir, env }),
-		).catch(async error => {
-			await fs.rm(root, { recursive: true, force: true });
-			throw error;
-		});
-		const cleanup = createFixtureRootCleanup(root, agentDir, started.lease);
-		cleanupRoots.push(cleanup);
-		// Shutdown runs in registration order: release held turns, then stop the TUI, ACP and any CLI
-		// command, and only then close the broker lease and remove the root.
-		registerFixtureRuntime(cleanup, {
-			key: "fake-model",
-			requiredOwner: "runtime",
-			shutdown: async () => model.releaseAll(),
-		});
-		registerFixtureRuntime(cleanup, { key: "cli-commands", requiredOwner: "runtime", shutdown: killCliChildren });
+	const started = await withFixtureBrokerEnvironment(() =>
+		startFixtureBrokerWithLeaseForTest({ agentDir, env }),
+	).catch(async error => {
+		await fs.rm(root, { recursive: true, force: true });
+		throw error;
+	});
+	const cleanup = createFixtureRootCleanup(root, agentDir, started.lease);
+	cleanupRoots.push(cleanup);
+	registerFixtureRuntime(cleanup, {
+		key: "fake-model",
+		requiredOwner: "runtime",
+		shutdown: async () => model.releaseAll(),
+	});
+	registerFixtureRuntime(cleanup, { key: "cli-commands", requiredOwner: "runtime", shutdown: killCliChildren });
+	return { root, env, agentDir, workspace, model, cleanup, started };
+}
 
-		// --- The owner: a real interactive TUI in a PTY. `exec` keeps the printed pid the TUI's own.
-		const tuiEnv: Record<string, string> = { ...env, TERM: "xterm-256color", GJC_AUTOMATION: "1", GJC_NOTIFY: "off" };
-		const pty = new PtySession();
-		let raw = "";
-		const tuiDone: Promise<PtyRunResult> = pty.start(
-			{
-				command: `printf 'gjc-tui-pid=%s\\n' $$; exec '${process.execPath}' '${cli}' --no-mcp --no-lsp --no-rules --no-title --model fake/fake-model`,
-				shell: "bash",
-				cwd: workspace,
-				env: tuiEnv,
-				unsetEnv: Object.keys(process.env).filter(key => !(key in tuiEnv)),
-				cols: 120,
-				rows: 36,
-				timeoutMs: 240_000,
-			},
-			(_error, chunk) => {
-				if (chunk) raw += chunk;
-			},
-		);
-		let tuiExited = false;
-		void tuiDone.finally(() => {
-			tuiExited = true;
-		});
-		registerFixtureRuntime(cleanup, {
-			key: "tui",
-			requiredOwner: "runtime-and-broker",
-			shutdown: async () => {
-				// Quit first, so the TUI retires its broker row and a launched host's close is not
-				// refused as ambiguous; kill only if it does not exit.
-				if (!tuiExited) {
-					pty.write("/quit\r");
-					await Promise.race([tuiDone.catch(() => undefined), Bun.sleep(10_000)]);
-				}
-				if (!tuiExited) pty.kill();
-				await withTimeout(
-					tuiDone.catch(() => undefined),
-					20_000,
-					"TUI PTY did not settle",
-				);
-			},
-		});
-		const screen = () => strip(raw);
-		await waitFor(() => /v\d+\.\d+\.\d+/.test(screen()), 60_000, "TUI footer");
-		const tuiPid = Number(/gjc-tui-pid=(\d+)/.exec(raw)?.[1]);
-		expect(tuiPid).toBeGreaterThan(0);
+/** A real interactive TUI in a PTY. `exec` keeps the printed pid the TUI's own. */
+function startTui(fixture: Fixture, args: readonly string[], extraEnv: Record<string, string> = {}) {
+	const tuiEnv: Record<string, string> = {
+		...fixture.env,
+		TERM: "xterm-256color",
+		GJC_AUTOMATION: "1",
+		GJC_NOTIFY: "off",
+		...extraEnv,
+	};
+	const pty = new PtySession();
+	let raw = "";
+	const done: Promise<PtyRunResult> = pty.start(
+		{
+			command: `printf 'gjc-tui-pid=%s\\n' $$; exec '${process.execPath}' '${cli}' --no-mcp --no-lsp --no-rules --no-title --model fake/fake-model ${args.join(" ")}`,
+			shell: "bash",
+			cwd: fixture.workspace,
+			env: tuiEnv,
+			unsetEnv: Object.keys(process.env).filter(key => !(key in tuiEnv)),
+			cols: 120,
+			rows: 36,
+			timeoutMs: 240_000,
+		},
+		(_error, chunk) => {
+			if (chunk) raw += chunk;
+		},
+	);
+	let exited = false;
+	void done.finally(() => {
+		exited = true;
+	});
+	registerFixtureRuntime(fixture.cleanup, {
+		key: "tui",
+		requiredOwner: "runtime-and-broker",
+		shutdown: async () => {
+			// Quit first, so the TUI retires its broker row and a launched host's close is not
+			// refused as ambiguous; kill only if it does not exit.
+			if (!exited) {
+				pty.write("/quit\r");
+				await Promise.race([done.catch(() => undefined), Bun.sleep(10_000)]);
+			}
+			if (!exited) pty.kill();
+			await withTimeout(
+				done.catch(() => undefined),
+				20_000,
+				"TUI PTY did not settle",
+			);
+		},
+	});
+	return {
+		pty,
+		done,
+		screen: () => strip(raw),
+		pid: async (): Promise<number> => {
+			await waitFor(() => /gjc-tui-pid=\d+/.test(raw), 30_000, "the TUI pid");
+			const pid = Number(/gjc-tui-pid=(\d+)/.exec(raw)?.[1]);
+			expect(pid).toBeGreaterThan(0);
+			return pid;
+		},
+	};
+}
+
+/** `gjc acp` with a recording ACP client on its stdio; stopped by the fixture cleanup. */
+function startAcp(fixture: Fixture) {
+	const acp = Bun.spawn([process.execPath, cli, "acp"], {
+		cwd: fixture.workspace,
+		env: fixture.env,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	let stderr = "";
+	const stderrDrain = (async () => {
+		const decoder = new TextDecoder();
+		for await (const chunk of acp.stderr)
+			stderr = `${stderr}${decoder.decode(chunk, { stream: true })}`.slice(-STDERR_CAP);
+	})();
+	registerFixtureRuntime(fixture.cleanup, {
+		key: "acp",
+		requiredOwner: "runtime-and-broker",
+		shutdown: async () => {
+			if (acp.exitCode !== null) return;
+			try {
+				acp.stdin.end();
+			} catch {}
+			const graceful = await Promise.race([acp.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
+			if (!graceful) acp.kill("SIGKILL");
+			await withTimeout(acp.exited, 5_000, "ACP did not exit after SIGKILL");
+		},
+		dispose: () => stderrDrain,
+	});
+	const client = new RecordingClient();
+	const connection = new ClientSideConnection(() => client, ndJsonStream(subprocessInput(acp), acp.stdout));
+	return { acp, client, connection, stderr: () => stderr };
+}
+
+// The harness drives a real PTY and POSIX process groups; Windows keeps its own suites.
+// Under `enforce` too: a refusal never blocks remote control, because attach and reuse never claim.
+describe.skipIf(process.platform === "win32")("remote clients attach to the TUI that owns the session", () => {
+	it.each([
+		"observe",
+		"enforce",
+	] as const)("%s: ACP session/load and an SDK send run in the owner's transcript and never claim", async mode => {
+		const TUI_PROMPT = "attach-tui-one";
+		const ACP_PROMPT = "attach-acp-two";
+		const SDK_PROMPT = "attach-sdk-three";
+		const fixture = await startFixture(mode, [ACP_PROMPT, SDK_PROMPT]);
+		const { root, env, agentDir, workspace, model, cleanup, started } = fixture;
+
+		// --- The owner: a real interactive TUI in a PTY.
+		const tui = startTui(fixture, []);
+		const { pty, done: tuiDone } = tui;
+		await waitFor(() => /v\d+\.\d+\.\d+/.test(tui.screen()), 60_000, "TUI footer");
+		const tuiPid = await tui.pid();
 
 		// The TUI's own first prompt creates S on disk.
 		const sessions = SessionManager.getDefaultSessionDirReadOnly(workspace, agentDir);
@@ -468,8 +550,8 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		const sessionId = (await readTranscript(transcript)).header.id!;
 		expect(sessionId).toBeTruthy();
 
-		// Attach only once the owner's endpoint is live in the broker index with a positive generation.
-		// The generation-0 startup window is a separate, known gap (design §13 H3).
+		// Attach only once the owner's endpoint is live in the broker index with a positive generation;
+		// the startup window before it is the case below.
 		let ownerRow: BrokerRow | undefined;
 		await waitFor(
 			async () => {
@@ -502,35 +584,7 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		});
 
 		// --- ACP client: `gjc acp`, initialize, session/load S, one prompt.
-		const acp = Bun.spawn([process.execPath, cli, "acp"], {
-			cwd: workspace,
-			env,
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		let acpStderr = "";
-		const acpStderrDrain = (async () => {
-			const decoder = new TextDecoder();
-			for await (const chunk of acp.stderr)
-				acpStderr = `${acpStderr}${decoder.decode(chunk, { stream: true })}`.slice(-STDERR_CAP);
-		})();
-		registerFixtureRuntime(cleanup, {
-			key: "acp",
-			requiredOwner: "runtime-and-broker",
-			shutdown: async () => {
-				if (acp.exitCode !== null) return;
-				try {
-					acp.stdin.end();
-				} catch {}
-				const graceful = await Promise.race([acp.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
-				if (!graceful) acp.kill("SIGKILL");
-				await withTimeout(acp.exited, 5_000, "ACP did not exit after SIGKILL");
-			},
-			dispose: () => acpStderrDrain,
-		});
-		const acpClient = new RecordingClient();
-		const connection = new ClientSideConnection(() => acpClient, ndJsonStream(subprocessInput(acp), acp.stdout));
+		const { acp, client: acpClient, connection, stderr: acpStderr } = startAcp(fixture);
 		try {
 			await withTimeout(
 				connection.initialize({ protocolVersion: 1, clientCapabilities: {} }),
@@ -552,7 +606,7 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			expect(response.stopReason).toBe("end_turn");
 			expect(acpClient.assistantText()).toContain(`${ACP_PROMPT}-reply`);
 		} catch (error) {
-			throw new Error(`${error instanceof Error ? error.message : String(error)}\n[acp stderr]\n${acpStderr}`);
+			throw new Error(`${error instanceof Error ? error.message : String(error)}\n[acp stderr]\n${acpStderr()}`);
 		}
 		acp.stdin.end();
 		expect(await withTimeout(acp.exited, 20_000, "ACP did not exit after stdin closed")).toBe(0);
@@ -635,5 +689,127 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		} finally {
 			db.close();
 		}
+	}, 300_000);
+
+	// Design §13 H3: a TUI holds the claim before its endpoint reaches the broker index. A resume in
+	// that window waits for the endpoint instead of launching a second writer. The test holds the
+	// TUI's registration open through its test seam for 3 s. It runs under `enforce`, whose 8 s wait
+	// leaves that hold a wide margin; `observe` waits only 2 s, and its reuse is pinned in
+	// sdk-broker-resume-held-session.test.ts.
+	it("enforce: a broker resume and ACP session/load during the TUI's startup reuse its endpoint", async () => {
+		const PRINT_PROMPT = "attach-print-zero";
+		const ACP_PROMPT = "attach-acp-late";
+		const fixture = await startFixture("enforce", [ACP_PROMPT]);
+		const { env, agentDir, workspace, model, cleanup, started } = fixture;
+
+		// S exists before the TUI starts: one `gjc -p` turn, which claims S and releases it at exit.
+		const printed = await runGjc(env, workspace, [
+			"-p",
+			"--no-mcp",
+			"--no-lsp",
+			"--no-rules",
+			"--model",
+			"fake/fake-model",
+			PRINT_PROMPT,
+		]);
+		expect(printed.exitCode).toBe(0);
+		const sessions = SessionManager.getDefaultSessionDirReadOnly(workspace, agentDir);
+		const files = await transcriptFiles(sessions);
+		expect(files).toHaveLength(1);
+		const transcript = files[0]!;
+		const sessionId = (await readTranscript(transcript)).header.id!;
+		expect(await sessionOwners(env, workspace)).toEqual([]);
+
+		// `gjc --resume S`, with its endpoint registration held.
+		const holdDir = path.join(fixture.root, "registration-hold");
+		await fs.mkdir(holdDir, { recursive: true, mode: 0o700 });
+		const hold = path.join(holdDir, `${sessionId}.hold`);
+		await Bun.write(hold, "");
+		const tui = startTui(fixture, ["--resume", sessionId], { GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR: holdDir });
+		const tuiPid = await tui.pid();
+		const launchedHosts: LaunchedHost[] = [];
+		registerFixtureRuntime(cleanup, {
+			key: "launched-hosts",
+			requiredOwner: "runtime-and-broker",
+			shutdown: () => closeLaunchedHosts(started.discovery, sessionId, tuiPid, launchedHosts),
+		});
+		await waitFor(
+			async () =>
+				(await sessionOwners(env, workspace)).some(
+					owner => owner.sessionId === sessionId && owner.holder?.pid === tuiPid,
+				),
+			60_000,
+			"the TUI's claim on S",
+		);
+		const rowsForS = async () => (await brokerRows(started.discovery)).filter(row => row.sessionId === sessionId);
+		const endpointPublished = async () => (await rowsForS()).some(row => Number(row.endpointGeneration ?? 0) > 0);
+		expect(await endpointPublished()).toBe(false);
+
+		const acp = startAcp(fixture);
+		// Requests still waiting in the broker when a step fails. They settle while the TUI still
+		// holds S: once cleanup quits it, a waiting resume would launch a host after cleanup ran.
+		const inFlight: Promise<unknown>[] = [];
+		try {
+			await withTimeout(
+				acp.connection.initialize({ protocolVersion: 1, clientCapabilities: {} }),
+				60_000,
+				"ACP initialize",
+			);
+			// Inside the window: a broker resume, as Telegram and Hermes send it, and ACP session/load.
+			const resumeInput = { sessionId, cwd: workspace, sessionPath: transcript, target: { path: workspace } };
+			const resumed = brokerGlobal(started.discovery, "session.resume", resumeInput, {
+				idempotencyKey: `startup-window-resume-${sessionId}`,
+				// The deadline every lifecycle client sizes for a resume.
+				timeoutMs: lifecycleRequestTimeoutMs("session.resume", resumeInput),
+			});
+			const loaded = acp.connection.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+			inFlight.push(resumed, loaded);
+			// Awaited below; this only keeps an early failure from also reporting an unhandled rejection.
+			resumed.catch(() => undefined);
+			loaded.catch(() => undefined);
+			await Bun.sleep(3_000);
+			// Both are waiting: the endpoint is still held back, and no host was launched for S.
+			expect(await endpointPublished()).toBe(false);
+			expect((await rowsForS()).every(row => row.pid === tuiPid)).toBe(true);
+
+			await fs.rm(hold);
+			const resume = await withTimeout(resumed, 30_000, "broker session.resume");
+			if (typeof resume.pid === "number" && resume.pid !== tuiPid)
+				launchedHosts.push({
+					pid: resume.pid,
+					endpointGeneration: resume.endpointGeneration,
+					endpointIncarnation: resume.endpointIncarnation,
+				});
+			expect(resume).toMatchObject({ sessionId, reused: true, pid: tuiPid });
+			await withTimeout(loaded, 60_000, "ACP session/load");
+
+			const prompt = acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: ACP_PROMPT }] });
+			await withTimeout(model.reached(ACP_PROMPT), 60_000, "the ACP prompt at the model");
+			model.release(ACP_PROMPT);
+			expect((await withTimeout(prompt, 60_000, "ACP session/prompt")).stopReason).toBe("end_turn");
+			expect(acp.client.assistantText()).toContain(`${ACP_PROMPT}-reply`);
+		} catch (error) {
+			await fs.rm(hold, { force: true });
+			await Promise.allSettled(inFlight.map(request => withTimeout(request, 30_000, "a request in flight")));
+			const rows = JSON.stringify(await rowsForS().catch(() => "unavailable"));
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)}\n[rows]\n${rows}\n[tui]\n${tui.screen().slice(-3000)}\n[acp stderr]\n${acp.stderr()}`,
+			);
+		}
+		acp.acp.stdin.end();
+		expect(await withTimeout(acp.acp.exited, 20_000, "ACP did not exit after stdin closed")).toBe(0);
+
+		// The ACP turn ran in the TUI's transcript, S, and the broker still routes S to the TUI alone.
+		expect(await transcriptFiles(sessions)).toEqual([transcript]);
+		const merged = await readTranscript(transcript);
+		expect(merged.header.id).toBe(sessionId);
+		expect(messageEntries(merged.entries, `${ACP_PROMPT}-reply`)).toHaveLength(1);
+		expect((await rowsForS()).map(row => row.pid)).toEqual([tuiPid]);
+		expect(
+			(await sessionOwners(env, workspace)).map(owner => ({ sessionId: owner.sessionId, pid: owner.holder?.pid })),
+		).toEqual([{ sessionId, pid: tuiPid }]);
+
+		tui.pty.write("/quit\r");
+		expect(await withTimeout(tui.done, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
 	}, 300_000);
 });

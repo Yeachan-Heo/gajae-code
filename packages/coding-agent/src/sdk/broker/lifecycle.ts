@@ -56,6 +56,14 @@ import {
 	taskArtifactOwnerLocatorFromTranscriptBytes,
 } from "../../session/internal/task-artifact-owner-transcript";
 import {
+	probeSessionOwner,
+	type SessionOwnerHolder,
+	type SessionOwnerHolderSummary,
+	sessionOwnerHolderPhrase,
+	sessionOwnerHolderSummary,
+} from "../../session/session-ownership";
+import { liveSessionOwnershipModeFor, type SessionOwnershipMode } from "../../session/session-ownership-mode";
+import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorageFileIdentity,
@@ -90,6 +98,7 @@ import type { SessionStorageSnapshot } from "../session-readonly/storage";
 import {
 	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,
+	SDK_STARTUP_SESSION_HELD_CODE,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
 	sanitizeSdkStartupMessage,
@@ -1450,16 +1459,162 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 	);
 }
 
-function liveResumeAuthority(
-	sessions: readonly LiveResumeRecord[],
-	sessionId: string,
-): { kind: "none" } | { kind: "ambiguous" } | { kind: "live"; record: LiveResumeRecord } {
+type LiveResumeAuthority = { kind: "none" } | { kind: "ambiguous" } | { kind: "live"; record: LiveResumeRecord };
+
+function liveResumeAuthority(sessions: readonly LiveResumeRecord[], sessionId: string): LiveResumeAuthority {
 	const indexedCandidates = sessions.filter(session => session.sessionId === sessionId);
 	if (indexedCandidates.some(session => !isSessionAuthorityEligible(session))) return { kind: "ambiguous" };
 	const liveCandidates = indexedCandidates.filter(session => session.live);
 	if (liveCandidates.length > 1) return { kind: "ambiguous" };
 	const record = liveCandidates[0];
 	return record ? { kind: "live", record } : { kind: "none" };
+}
+
+/** A live row with an endpoint resume can hand out; a generation-0 direct-session row has none. */
+function hasResumableEndpoint(authority: LiveResumeAuthority, sessionId: string): boolean {
+	return authority.kind === "live" && endpointIncarnation(authority.record, sessionId) !== undefined;
+}
+
+/**
+ * Longest a `session.resume` under `enforce` waits for the process that holds the session's claim to
+ * publish its SDK endpoint, before it refuses. An interactive TUI holds the claim before its endpoint
+ * reaches the index, while it starts and right after it switches sessions; that gap measured about
+ * 0.4 s on an idle machine. 8 s leaves 2 s of the SDK client's default 10 s request timeout for the
+ * reply, so a caller that never sized its deadline usually sees the refusal; index refreshes,
+ * heartbeats and a slow probe come before the wait, and resumes of one session queue behind each
+ * other, so it is not a guarantee. Callers that size their deadline with `lifecycleRequestTimeoutMs`
+ * (ACP, the lifecycle service and so the CLI, the SDK MCP server) are well inside it.
+ */
+const ENFORCE_HELD_ENDPOINT_WAIT_MS = 8_000;
+/**
+ * Longest a resume under the default `observe` waits. `observe` never refuses: after the wait it goes
+ * on as before ownership, so for a holder that never publishes an endpoint (an embedding such as the
+ * desktop app) the wait is pure latency added to every resume, and it shortens a later launch's
+ * admission window. 2 s covers the measured TUI startup gap several times over and keeps both small.
+ */
+const OBSERVE_HELD_ENDPOINT_WAIT_MS = 2_000;
+const HELD_SESSION_ENDPOINT_POLL_MS = 100;
+
+/** When the broker received each lifecycle request, before it queued behind its session's chain. */
+const lifecycleRequestsReceivedAt = new WeakMap<Input, number>();
+
+/** Record a lifecycle request's arrival, so a resume's wait counts the time it spent queued. */
+export function markLifecycleRequestReceived(broker: Broker, input: Input): void {
+	lifecycleRequestsReceivedAt.set(input, lifecycleTiming(broker).now());
+}
+
+/**
+ * The wait one resume may still spend: the mode's bound, never more than the request's readiness
+ * timeout (the share of the caller's budget a launch may spend queued for admission), less the time
+ * the request already spent queued, so concurrent resumes of one session never stack their waits.
+ */
+function heldEndpointWaitBudget(broker: Broker, input: Input, mode: SessionOwnershipMode, readiness: number): number {
+	const bound = Math.min(
+		mode === "enforce" ? ENFORCE_HELD_ENDPOINT_WAIT_MS : OBSERVE_HELD_ENDPOINT_WAIT_MS,
+		readiness,
+	);
+	const now = lifecycleTiming(broker).now();
+	return Math.max(0, bound - (now - (lifecycleRequestsReceivedAt.get(input) ?? now)));
+}
+
+/**
+ * The broker's ownership mode now: its process mode, lowered by an explicit lower value in the
+ * operator's config file, reread on each call. It is read at the probe and at every poll, so `off`
+ * set during a wait ends it, and `observe` set during a wait stops its refusal.
+ */
+function resumeOwnershipMode(): SessionOwnershipMode {
+	return liveSessionOwnershipModeFor();
+}
+
+/**
+ * Another live process holds the session's claim. Probes, never claims. This process's own claim
+ * (an in-process host or test) is not a writer a launched host would race, and `free` or `unknown`
+ * (an unsupported platform, a stalled probe) keep resume's behaviour from before ownership, as does
+ * `off`.
+ */
+async function foreignSessionClaim(sessionId: string): Promise<{ holder: SessionOwnerHolder | undefined } | undefined> {
+	if (resumeOwnershipMode() === "off") return undefined;
+	try {
+		const probe = await probeSessionOwner(sessionId);
+		return probe.state === "held" && !probe.self ? { holder: probe.holder } : undefined;
+	} catch (error) {
+		logger.warn("sdk broker: session owner probe failed; resume continues as unheld", { error: String(error) });
+		return undefined;
+	}
+}
+
+/**
+ * The one outcome of a resume refused (under `enforce`) because another process holds the session
+ * and has no endpoint to attach to: the resume wait ran out, or the launched host's claim was refused.
+ * `live_session` is the code resume already uses for a live session it cannot attach to, and every
+ * client already treats it as terminal; `holder` names it by surface and pid only (design §3.4).
+ */
+function heldSessionResponse(sessionId: string, holder: SessionOwnerHolder | undefined): BrokerResponse {
+	return { ok: false, error: heldSessionError(sessionId, holder) };
+}
+
+function heldSessionError(
+	sessionId: string,
+	holder: SessionOwnerHolder | undefined,
+): { code: "live_session"; message: string; holder?: SessionOwnerHolderSummary } {
+	const summary = sessionOwnerHolderSummary(holder);
+	return {
+		code: "live_session",
+		message: `Session ${sessionId} is open for writing in ${sessionOwnerHolderPhrase(holder)}, which has not published an SDK endpoint to attach to. Only one process can write a session at a time; try again once it is ready, or fork the session.`,
+		...(summary ? { holder: summary } : {}),
+	};
+}
+
+/**
+ * The held outcome for a launched host whose own claim was refused, on the readiness path and the
+ * reconciled terminal path alike. The holder comes from the host's startup failure, validated on read.
+ */
+function hostHeldRefusalError(
+	sessionId: string,
+	failure: SdkStartupFailure,
+): { code: "live_session"; message: string; holder?: SessionOwnerHolderSummary; endpoint: "unavailable" } {
+	const holder = sessionOwnerHolderSummary((failure.details as { holder?: unknown } | undefined)?.holder);
+	return { ...heldSessionError(sessionId, holder), endpoint: "unavailable" };
+}
+
+/**
+ * Resume's attach-or-wait (design §13 H3). Poll the index for up to `waitMs` until the holder's
+ * endpoint is live, the holder lets go, or the authority turns ambiguous, and return the authority
+ * to continue with. When the wait runs out with the holder still there, only `enforce` refuses
+ * with the held outcome; `observe` never refuses, so resume goes on as before ownership (a launch,
+ * whose host counts the conflict).
+ */
+async function awaitHeldSessionEndpoint(
+	broker: Broker,
+	sessionId: string,
+	holder: SessionOwnerHolder | undefined,
+	waitMs: number,
+	initial: LiveResumeAuthority,
+): Promise<{ authority: LiveResumeAuthority; waitedMs: number } | BrokerResponse> {
+	const timing = lifecycleTiming(broker);
+	const startedAt = timing.now();
+	let claim: { holder: SessionOwnerHolder | undefined } | undefined = { holder };
+	let authority = initial;
+	while (claim) {
+		const remaining = startedAt + waitMs - timing.now();
+		if (remaining <= 0) {
+			if (resumeOwnershipMode() === "enforce") return heldSessionResponse(sessionId, claim.holder);
+			break;
+		}
+		await timing.sleep(Math.min(HELD_SESSION_ENDPOINT_POLL_MS, remaining));
+		await broker.index.refreshIfChanged();
+		authority = liveResumeAuthority(broker.index.listSessions().sessions, sessionId);
+		if (authority.kind === "ambiguous" || hasResumableEndpoint(authority, sessionId)) break;
+		claim = await foreignSessionClaim(sessionId);
+	}
+	return { authority, waitedMs: timing.now() - startedAt };
+}
+
+/** The readiness timeout a startup request asked for, from its deadline tuple or `readinessTimeoutMs`. */
+function requestedReadinessTimeout(input: Input, now: number): number | BrokerResponse {
+	if (!deadlineFieldsPresent(input)) return readinessTimeout(input);
+	const supplied = lifecycleDeadlines(input, now);
+	return "ok" in supplied ? supplied : supplied.requestedReadinessTimeoutMs;
 }
 
 type ValidatedTranscript = {
@@ -2594,7 +2749,25 @@ function isSdkStartupFailure(value: unknown): value is SdkStartupFailure {
 	)
 		return false;
 	if (failure.code === undefined && failure.details === undefined) return keys.length === 3;
-	return keys.length === 5 && isModelProfileError(failure);
+	return keys.length === 5 && (isModelProfileError(failure) || isSessionHeldStartupFailure(failure));
+}
+
+/** A host's refused claim: `details` is `{}` or `{ holder }` with exactly a valid surface and pid. */
+function isSessionHeldStartupFailure(failure: Record<string, unknown>): boolean {
+	if (failure.code !== SDK_STARTUP_SESSION_HELD_CODE) return false;
+	const details = failure.details;
+	if (typeof details !== "object" || details === null || Array.isArray(details)) return false;
+	const keys = Object.keys(details);
+	if (keys.length === 0) return true;
+	const holder = (details as { holder?: unknown }).holder;
+	return (
+		keys.length === 1 &&
+		keys[0] === "holder" &&
+		typeof holder === "object" &&
+		holder !== null &&
+		Object.keys(holder).length === 2 &&
+		sessionOwnerHolderSummary(holder) !== undefined
+	);
 }
 
 function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureArtifact {
@@ -7096,6 +7269,9 @@ async function executeLifecycleResponse(
 			// authority before validating the source session below.
 			await broker.index.refresh();
 		}
+		// Time a resume already spent waiting for a holder's endpoint comes out of its startup
+		// queue wait, so a launch after the holder let go still ends inside the caller's budget.
+		let heldEndpointWaitedMs = 0;
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
 			if (
@@ -7104,9 +7280,36 @@ async function executeLifecycleResponse(
 					.sessions.some(session => session.sessionId === requestedSessionId && session.ephemeral)
 			)
 				return fail("ephemeral_unsupported", "Temporary sessions cannot be resumed.");
-			const authority = requestedSessionId
+			let authority: LiveResumeAuthority = requestedSessionId
 				? liveResumeAuthority(broker.index.listSessions().sessions, requestedSessionId)
-				: { kind: "none" as const };
+				: { kind: "none" };
+			// No endpoint to reuse, and another process holds the session: wait for its endpoint
+			// rather than launch a second writer. The admitted pass of a launch re-probes without
+			// waiting, so under `enforce` a holder that claimed while the launch was queued refuses
+			// it at once; `observe` launches.
+			if (
+				requestedSessionId &&
+				authority.kind !== "ambiguous" &&
+				!hasResumableEndpoint(authority, requestedSessionId)
+			) {
+				const claim = await foreignSessionClaim(requestedSessionId);
+				if (claim) {
+					const readiness = startupAdmittedInputs.has(input)
+						? 0
+						: requestedReadinessTimeout(input, lifecycleTiming(broker).now());
+					if (typeof readiness !== "number") return readiness;
+					const waited = await awaitHeldSessionEndpoint(
+						broker,
+						requestedSessionId,
+						claim.holder,
+						heldEndpointWaitBudget(broker, input, resumeOwnershipMode(), readiness),
+						authority,
+					);
+					if ("ok" in waited) return waited;
+					authority = waited.authority;
+					heldEndpointWaitedMs = waited.waitedMs;
+				}
+			}
 			if (authority.kind === "ambiguous")
 				return fail("endpoint_stale", "Session authority is ambiguous and cannot be resumed safely.");
 			const existing = authority.kind === "live" ? authority.record : undefined;
@@ -7160,24 +7363,10 @@ async function executeLifecycleResponse(
 		const admissionGranted = startupAdmittedInputs.has(input);
 		if (!admissionGranted) {
 			const startupReceivedAt = timing.now();
-			const suppliedDeadlineFields = [
-				input.receivedAt,
-				input.requestedReadinessTimeoutMs,
-				input.semanticReadyDeadlineAt,
-				input.terminationStartDeadlineAt,
-				input.lifecycleCleanupDeadlineAt,
-			];
-			let requestedReadinessTimeoutMs: number;
-			if (suppliedDeadlineFields.some(value => value !== undefined)) {
-				const supplied = lifecycleDeadlines(input, timing.now());
-				if ("ok" in supplied) return supplied;
-				requestedReadinessTimeoutMs = supplied.requestedReadinessTimeoutMs;
-			} else {
-				const timeout = readinessTimeout(input);
-				if (typeof timeout !== "number") return timeout;
-				requestedReadinessTimeoutMs = timeout;
-			}
-			const queueWaitMs = startupQueueWaitMs(requestedReadinessTimeoutMs);
+			const callerSuppliedDeadlines = deadlineFieldsPresent(input);
+			const requestedReadinessTimeoutMs = requestedReadinessTimeout(input, timing.now());
+			if (typeof requestedReadinessTimeoutMs !== "number") return requestedReadinessTimeoutMs;
+			const queueWaitMs = Math.max(0, startupQueueWaitMs(requestedReadinessTimeoutMs) - heldEndpointWaitedMs);
 			const launch = await launchInput(broker, operation, input);
 			if ("ok" in launch) return launch;
 			if (launch.worktreePlan && deadlineFieldsPresent(input)) {
@@ -7187,7 +7376,6 @@ async function executeLifecycleResponse(
 				);
 			}
 			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
-				const callerSuppliedDeadlines = suppliedDeadlineFields.some(value => value !== undefined);
 				let admittedInput: Input;
 				if (launch.worktreePlan) admittedInput = { ...input, admittedAt, requestedReadinessTimeoutMs };
 				else if (callerSuppliedDeadlines) admittedInput = { ...input };
@@ -7667,6 +7855,8 @@ async function executeLifecycleResponse(
 								"terminal_uncertain",
 								`Session ${launch.id} did not become ready and its spawned process could not be verified dead. ${diagnostic ?? "stage=readiness waiting_for=session_ready child=uncertain exit=not_observed signal=not_observed stderr=none"}`,
 							);
+				if (readiness.kind === "startup_failed" && readiness.failure.code === SDK_STARTUP_SESSION_HELD_CODE)
+					return { ok: false, error: hostHeldRefusalError(launch.id, readiness.failure) };
 				return readiness.kind === "startup_failed"
 					? fail(
 							readiness.failure.code ?? "spawn_failed",
@@ -7675,7 +7865,8 @@ async function executeLifecycleResponse(
 							// leaves the broker.
 							`${sanitizeSdkStartupMessage(readiness.failure.message, knownSecrets)} ${diagnostic ?? "stage=startup waiting_for=startup completion child=uncertain exit=not_observed signal=not_observed stderr=none"}`,
 							undefined,
-							readiness.failure.details,
+							// Only a model-profile failure carries details here; a held one returned above.
+							readiness.failure.details as ModelProfileErrorDetails | undefined,
 						)
 					: readiness.kind === "ready_then_exited"
 						? readyThenExitedResponse(launch.id, child)
@@ -9429,18 +9620,21 @@ export async function executeLifecycle(
 						: startupFailure && cleanupProof
 							? {
 									ok: false,
-									error: startupFailure.code
-										? {
-												code: startupFailure.code,
-												message: startupFailure.message,
-												details: startupFailure.details!,
-												endpoint: "unavailable" as const,
-											}
-										: {
-												code: "spawn_failed",
-												message: startupFailure.message,
-												endpoint: "unavailable" as const,
-											},
+									error:
+										startupFailure.code === SDK_STARTUP_SESSION_HELD_CODE
+											? hostHeldRefusalError(entry.intendedSessionId!, startupFailure)
+											: startupFailure.code
+												? {
+														code: startupFailure.code,
+														message: startupFailure.message,
+														details: startupFailure.details as ModelProfileErrorDetails,
+														endpoint: "unavailable" as const,
+													}
+												: {
+														code: "spawn_failed",
+														message: startupFailure.message,
+														endpoint: "unavailable" as const,
+													},
 									...(durableEffects ? { durableEffects } : {}),
 									startupFailure,
 								}
