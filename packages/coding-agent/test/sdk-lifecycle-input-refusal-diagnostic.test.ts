@@ -206,3 +206,36 @@ describe("raw global session.delete refusal output", () => {
 		expect(envelope.diagnostics).toBeUndefined();
 	}, 20_000);
 });
+
+describe("resume refused because another process holds the session", () => {
+	async function resumeDiagnostics(error: Record<string, unknown>): Promise<string[]> {
+		const service = new SessionLifecycleService(new FakeLifecycleClient({ ok: false, error }));
+		const outcome = failureOutcome(
+			await service.resume({
+				actor,
+				capability: "session.resume",
+				requestKey: "resume-request",
+				target: { sessionId: "session-1", cwd: "/repo" },
+			}),
+		);
+		const result = await renderPublicCommandFailure(lifecyclePublicFailure(outcome), {
+			command: [...DELETE_COMMAND],
+			json: true,
+		});
+		return diagnosticCodes(JSON.parse(result.stdout) as PublicCommandErrorEnvelope);
+	}
+
+	it("names the class only when the broker names a holder", async () => {
+		const held = { code: "live_session", message: "Session session-1 is open for writing in another terminal." };
+		expect(await resumeDiagnostics({ ...held, holder: { surface: "terminal", pid: 4242 } })).toEqual([
+			"lifecycle_session_held",
+		]);
+		// The live session whose endpoint authority is unavailable is a different `live_session`.
+		expect(
+			await resumeDiagnostics({
+				code: "live_session",
+				message: "Session is already live but its incarnation-bound endpoint is unavailable.",
+			}),
+		).toEqual([]);
+	}, 20_000);
+});

@@ -16,6 +16,7 @@ import type { ModelProfileErrorDetails } from "../../config/model-profile-contra
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
 import { SessionManager } from "../../session/session-manager";
+import type { SessionOwnerHolderSummary } from "../../session/session-ownership";
 import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
@@ -84,6 +85,7 @@ import {
 	hasSessionLifecycleStartupCommit,
 	isCanonicalSessionId,
 	type LifecycleFailureArtifact,
+	markLifecycleRequestReceived,
 	prepareSpawnChildHostLaunch,
 	processIncarnationForBroker,
 	readSessionLifecycleFailure,
@@ -405,6 +407,8 @@ export type BrokerResponse =
 				code: BrokerErrorCode;
 				message: string;
 				details?: ModelProfileErrorDetails | SpawnSubstrateFailure;
+				/** `live_session` from `session.resume`: the process that holds the session (single-owner). */
+				holder?: SessionOwnerHolderSummary;
 				endpoint?: "unavailable";
 				cleanup?: BrokerCleanupEvidence;
 			};
@@ -6252,6 +6256,7 @@ export class Broker {
 			createHash("sha256")
 				.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
 				.digest("hex");
+		markLifecycleRequestReceived(this, input);
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));

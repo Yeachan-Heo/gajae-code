@@ -847,6 +847,25 @@ const SURFACE_NOUNS: Record<SessionOwnerBaseSurface, string> = {
 	sdk: "an application using the gjc SDK",
 };
 
+/** The holder as a remote client is told it, in a broker lifecycle error: surface and pid only. */
+export interface SessionOwnerHolderSummary {
+	readonly surface: SessionOwnerSurface;
+	readonly pid: number;
+}
+
+/**
+ * {@link SessionOwnerHolderSummary} of `holder`, checked field by field because it may come from
+ * a file another process wrote; `undefined` when it does not name a surface and a positive pid.
+ * A holder on another host keeps its surface and pid; its host name stays out.
+ */
+export function sessionOwnerHolderSummary(holder: unknown): SessionOwnerHolderSummary | undefined {
+	if (typeof holder !== "object" || holder === null) return undefined;
+	const { surface, pid } = holder as { surface?: unknown; pid?: unknown };
+	return isSurface(surface) && typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
+		? { surface, pid }
+		: undefined;
+}
+
 /**
  * How a holder is named to a person (design §3.4). The holder is checked again here, because a
  * caller may build one: anything malformed reads as "another gjc process", never as raw text.
@@ -864,11 +883,11 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	return subagent ? `a subagent of ${noun} (pid ${holder.pid})` : `${noun} (pid ${holder.pid})`;
 }
 
-/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`; `undefined` if unverified. */
+/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`, or `a gjc process on build-box, pid 4242` for a remote holder; `undefined` if unverified. */
 function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string | undefined {
 	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface)) return undefined;
 	if (holder.host === undefined) return `${holder.surface}, pid ${holder.pid}`;
-	return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host}, pid ${holder.pid}` : undefined;
+	return SAFE_HOST.test(holder.host) ? `a gjc process on ${holder.host}, pid ${holder.pid}` : undefined;
 }
 
 /**

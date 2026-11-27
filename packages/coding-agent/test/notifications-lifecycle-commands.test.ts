@@ -212,6 +212,7 @@ describe("lifecycle command parser (G009)", () => {
 			"dependency_preparation_timeout",
 			"close_refused",
 			"not_found",
+			"live_session",
 			"terminal_uncertain",
 			"unsupported_platform",
 		] as const;
@@ -225,6 +226,21 @@ describe("lifecycle command parser (G009)", () => {
 			});
 			expect(out.length).toBeGreaterThan(0);
 		}
+
+		// A resume refused because another process holds the session shows the broker's message,
+		// which names the holder.
+		expect(
+			formatLifecycleOutcome(
+				{
+					type: "session_lifecycle_error",
+					requestId: "r",
+					status: "error",
+					reason: "live_session",
+					message: "Session s is open for writing in another terminal (pid 4242).",
+				},
+				"session_resume",
+			),
+		).toContain("another terminal (pid 4242)");
 
 		// "in progress" terminal_uncertain is surfaced distinctly (pending).
 		expect(
