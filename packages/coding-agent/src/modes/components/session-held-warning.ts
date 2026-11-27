@@ -17,6 +17,9 @@ export interface HeldSessionWarningOptions {
 	readonly note?: string;
 }
 
+/** Shown while the warning waits for a launched session host to publish (design §13 H3). */
+export const SESSION_HOST_WAITING_MESSAGE = "Waiting for the session host…";
+
 const FORK_OPTION = "Fork into a new session — copy the conversation and continue there";
 const CONTINUE_OPTION = "Continue here — close the session host and open it here";
 const CANCEL_OPTION = "Cancel";

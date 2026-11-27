@@ -10,6 +10,7 @@ import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import {
 	DIRECT_SESSION_REGISTRATION_ATTEMPTS,
+	type IndexedSession,
 	isTransientSessionIndexLockError,
 	resolveSessionLocator,
 	SessionIndex,
@@ -19,9 +20,9 @@ import { createBrokerSessionLifecycleService } from "../sdk/lifecycle/broker-cli
 import { attemptSessionClaim, claimRefusal, type ResolvedSessionOwnership } from "./internal/session-claim-set";
 import {
 	probeSessionOwner,
-	type SessionHeldError,
+	SessionHeldError,
 	type SessionOwnerClaim,
-	type SessionOwnerHolder,
+	type SessionOwnerProbe,
 	type SessionOwnerSurface,
 } from "./session-ownership";
 
@@ -61,78 +62,122 @@ const HANDOVER_CLOSE_TIMEOUT_MS = 30_000;
  */
 const BROKER_HOST_SURFACES: ReadonlySet<SessionOwnerSurface> = new Set(["sdk-host", "acp-host"]);
 /**
- * Longest the warning waits for a host that holds the claim to publish its row: the bound a broker
- * resume under `enforce` waits for a holder's endpoint (design §13 H3), for the same gap.
+ * Longest the warning waits for a host that holds the claim to publish its row. A UX cap below the
+ * host readiness budget (`DEFAULT_READINESS_TIMEOUT_MS`, 10 s); a host slower than this gets
+ * Fork/Cancel.
  */
 const HOST_PUBLICATION_WAIT_MS = 8_000;
 const HOST_PUBLICATION_POLL_MS = 100;
 
+export interface SessionHandoverWaitOptions {
+	/** Ends the wait at the next poll: the caller was cancelled or is exiting. */
+	readonly signal?: AbortSignal;
+	/** Called once, when the warning starts waiting for the host to publish. */
+	readonly onWaiting?: () => void;
+}
+
+/** The held-session warning's input for a refusal, as it stands after any wait. */
+export interface SessionHandoverCheck {
+	/** Who to warn about now; `undefined` once nothing holds the session, so it opens as unheld. */
+	readonly error: SessionHeldError | undefined;
+	/** The host Continue here closes, when it is offered for `error`. */
+	readonly target: SessionHandoverTarget | undefined;
+}
+
+type HandoverLookup =
+	| { readonly kind: "found"; readonly target: SessionHandoverTarget }
+	| { readonly kind: "none" }
+	/** The holder let go during the wait; the probe says who holds the session now. */
+	| { readonly kind: "let-go"; readonly probe: SessionOwnerProbe };
+
+const NO_TARGET: HandoverLookup = { kind: "none" };
+
 /**
- * The host Continue here can close for `error`, or `undefined` when it is not offered: the holder
- * must be the live, broker-launched host in the session index (its row carries a
- * `lifecycleRequestId`, design §13 L1), not a terminal, the app or an embedding. The surface label
- * in the holder record does not decide it.
+ * Whether Continue here is offered for `error`, and for which host: the holder must be the live,
+ * broker-launched host in the session index (its row carries a `lifecycleRequestId`, design §13
+ * L1), not a terminal, the app or an embedding. The surface label in the holder record does not
+ * decide it.
  *
  * A host claims before it publishes (a remote resume that reached the broker first, design §13
  * H3), so when the holder claimed as a host and its row is not there yet, this waits for the row,
- * at most {@link HOST_PUBLICATION_WAIT_MS}, while that host still holds the session.
+ * at most {@link HOST_PUBLICATION_WAIT_MS}, while that host still holds the session and has not
+ * published an endpoint. A holder that let go meanwhile is not warned about: a free session opens
+ * as unheld, and a new holder is looked up once, without waiting.
  */
-export function findSessionHandoverTarget(
+export async function checkSessionHandover(
 	error: SessionHeldError,
 	agentDir: string,
-): Promise<SessionHandoverTarget | undefined> {
+	options: SessionHandoverWaitOptions = {},
+): Promise<SessionHandoverCheck> {
 	const waitMs = error.holder && BROKER_HOST_SURFACES.has(error.holder.surface) ? HOST_PUBLICATION_WAIT_MS : 0;
-	return lookUpHandoverTarget(error, agentDir, waitMs);
+	const looked = await lookUpHandoverTarget(error, agentDir, waitMs, options);
+	if (looked.kind === "found") return { error, target: looked.target };
+	if (looked.kind === "none") return { error, target: undefined };
+	const { probe } = looked;
+	if (probe.state === "free" || (probe.state === "held" && probe.self)) return { error: undefined, target: undefined };
+	if (probe.state !== "held") return { error, target: undefined };
+	const current = new SessionHeldError(error.sessionId, probe.holder);
+	const next = await lookUpHandoverTarget(current, agentDir, 0);
+	return { error: current, target: next.kind === "found" ? next.target : undefined };
 }
 
 async function lookUpHandoverTarget(
 	error: SessionHeldError,
 	agentDir: string,
 	waitMs: number,
-): Promise<SessionHandoverTarget | undefined> {
+	options: SessionHandoverWaitOptions = {},
+): Promise<HandoverLookup> {
 	const holder = error.holder;
-	if (!holder || holder.host !== undefined) return undefined;
+	if (!holder || holder.host !== undefined) return NO_TARGET;
 	const deadline = Date.now() + waitMs;
 	try {
 		const index = new SessionIndex(agentDir);
 		await index.refresh();
+		let waiting = false;
 		for (;;) {
-			const target = handoverTargetIn(index, error.sessionId, holder, agentDir);
-			if (target || Date.now() >= deadline || !(await stillHeldBy(error.sessionId, holder))) return target;
+			const rows = index
+				.listSessions(undefined, new Set([error.sessionId]))
+				.sessions.filter(row => row.sessionId === error.sessionId && row.live && row.pid === holder.pid);
+			const target = handoverTargetIn(rows, error.sessionId, agentDir);
+			if (target) return { kind: "found", target };
+			// A published endpoint without a lifecycle identity is not a launched host: nothing to wait for.
+			if (Date.now() >= deadline || options.signal?.aborted || rows.some(row => row.endpointGeneration > 0))
+				return NO_TARGET;
+			const probe = await probeSessionOwner(error.sessionId);
+			if (!(probe.state === "held" && !probe.self && probe.holder?.pid === holder.pid))
+				return { kind: "let-go", probe };
+			if (!waiting) {
+				waiting = true;
+				options.onWaiting?.();
+			}
 			await Bun.sleep(HOST_PUBLICATION_POLL_MS);
+			if (options.signal?.aborted) return NO_TARGET;
 			await index.refreshIfChanged();
 		}
 	} catch (failure) {
 		logger.warn("Could not read the session index for Continue here", { error: String(failure) });
-		return undefined;
+		return NO_TARGET;
 	}
 }
 
 function handoverTargetIn(
-	index: SessionIndex,
+	rows: readonly IndexedSession[],
 	sessionId: string,
-	holder: SessionOwnerHolder,
 	agentDir: string,
 ): SessionHandoverTarget | undefined {
-	const row = index
-		.listSessions(undefined, new Set([sessionId]))
-		.sessions.find(session => session.sessionId === sessionId);
-	if (!row?.live || row.lifecycleRequestId === undefined || row.pid !== holder.pid) return undefined;
-	const incarnation = endpointIncarnation(row, sessionId);
-	if (!incarnation) return undefined;
-	return {
-		sessionId,
-		agentDir,
-		cwd: row.locator.cwd,
-		endpointGeneration: row.endpointGeneration,
-		endpointIncarnation: incarnation,
-	};
-}
-
-/** The same process still holds the session's claim: a host that exited or let go ends the wait. */
-async function stillHeldBy(sessionId: string, holder: SessionOwnerHolder): Promise<boolean> {
-	const probe = await probeSessionOwner(sessionId);
-	return probe.state === "held" && !probe.self && probe.holder?.pid === holder.pid;
+	for (const row of rows) {
+		if (row.lifecycleRequestId === undefined) continue;
+		const incarnation = endpointIncarnation(row, sessionId);
+		if (!incarnation) continue;
+		return {
+			sessionId,
+			agentDir,
+			cwd: row.locator.cwd,
+			endpointGeneration: row.endpointGeneration,
+			endpointIncarnation: incarnation,
+		};
+	}
+	return undefined;
 }
 
 /**
@@ -153,8 +198,9 @@ export async function handOverSession(
 	agentDir: string,
 	ownership: ResolvedSessionOwnership,
 ): Promise<SessionHandoverOutcome> {
-	const target = await lookUpHandoverTarget(error, agentDir, 0);
-	if (!target) return await claimHandedOver(error.sessionId, ownership);
+	const looked = await lookUpHandoverTarget(error, agentDir, 0);
+	if (looked.kind !== "found") return await claimHandedOver(error.sessionId, ownership);
+	const { target } = looked;
 	const index = new SessionIndex(agentDir);
 	const incarnation = processIncarnation(process.pid);
 	// Set before the append: an append can reject after its row is durable, so a row that was only
