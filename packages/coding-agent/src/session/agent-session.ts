@@ -31409,7 +31409,7 @@ export class AgentSession {
 		model: Model,
 		credentialKind: string,
 		rowId?: number,
-	): Promise<ResolvedApiKey | undefined> {
+	): Promise<ResolvedApiKey | string | undefined> {
 		const authStorage = this.#modelRegistry.authStorage;
 		const storageProvider = resolveOAuthStorageProvider(model.provider);
 		const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
@@ -31424,10 +31424,13 @@ export class AgentSession {
 			)
 				continue;
 			let apiKey: string | undefined;
+			let credentialRowId: number | undefined;
 			try {
-				apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
-					credentialSelector: { kind: "id", value: String(credential.id) },
-				});
+				({ apiKey, credentialRowId } = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+					model,
+					this.credentialSessionId,
+					{ credentialSelector: { kind: "id", value: String(credential.id) } },
+				));
 			} catch (error) {
 				const currentCredential = inventory.find(row => row.id === credential.id);
 				if (!currentCredential?.disabled) throw error;
@@ -31441,7 +31444,9 @@ export class AgentSession {
 				currentCredential &&
 				!currentCredential.disabled
 			)
-				return { apiKey, credentialId: credential.id };
+				// Attribute only when the row itself supplied the key; a runtime or
+				// config override returns early without moving the sticky pointer.
+				return credentialRowId === credential.id ? { apiKey, credentialId: credential.id } : apiKey;
 		}
 		return undefined;
 	}

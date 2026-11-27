@@ -37,6 +37,8 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"signal",
 	"apiKey",
+	// Local stored-row id; the gateway authenticates upstream with its own rows.
+	"credentialId",
 	"onStreamCreated",
 	"fetch",
 	"onPayload",

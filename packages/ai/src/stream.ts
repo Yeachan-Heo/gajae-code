@@ -881,10 +881,19 @@ function attributableCredentialId(model: Model<Api>, options: SimpleStreamOption
 	return Number.isSafeInteger(credentialId) ? credentialId : undefined;
 }
 
+/** Best-effort: attribution must never fail a request whose message object rejects writes. */
+function setCredentialId(message: AssistantMessage, credentialId: number): void {
+	try {
+		Reflect.set(message, "credentialId", credentialId);
+	} catch {
+		// Frozen or hostile provider object; leave it unattributed.
+	}
+}
+
 function stampCredentialId(event: AssistantMessageEvent, credentialId: number): void {
-	if (event.type === "done") event.message.credentialId = credentialId;
-	else if (event.type === "error") event.error.credentialId = credentialId;
-	else if ("partial" in event) event.partial.credentialId = credentialId;
+	if (event.type === "done") setCredentialId(event.message, credentialId);
+	else if (event.type === "error") setCredentialId(event.error, credentialId);
+	else if ("partial" in event) setCredentialId(event.partial, credentialId);
 }
 
 /**
@@ -913,7 +922,7 @@ function streamWithCredentialAttribution<TApi extends Api>(
 			}
 			if (outer.done) return;
 			const result = await inner.result();
-			result.credentialId = credentialId;
+			setCredentialId(result, credentialId);
 			outer.end(result);
 		} catch (error) {
 			outer.fail(error);

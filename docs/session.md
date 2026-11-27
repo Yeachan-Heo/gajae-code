@@ -210,7 +210,7 @@ Stores an `AgentMessage` directly.
 }
 ```
 
-Assistant messages may also carry `credentialId`, the opaque row id of the stored credential whose key authenticated the request that produced the message (success, error, or the partial snapshots seen while streaming). When a usage limit or auth retry moves a turn to another stored account, each persisted message names the row that actually served it. The field is absent when the request used a runtime `--api-key`, a models.yml key, an environment variable, a fallback resolver, or a pi-native gateway bearer, and in session files written before the field existed. It is a non-secret number only; account identity (email, account id) is never written to history.
+Assistant messages may also carry `credentialId`, the opaque row id of the stored credential whose key authenticated the request that produced the message (success, provider error, an abort after the response started, or the partial snapshots seen while streaming). When a usage limit or auth retry moves a turn to another stored account, each persisted message names the row that actually served it. The field is absent when the request used a runtime `--api-key`, a models.yml key, an environment variable, a fallback resolver, or a pi-native gateway bearer, and in session files written before the field existed. Failures raised before or instead of a provider response (a transport exception, an abort before the first event, a local run failure) produce a synthetic error message that is also unattributed. It is a non-secret number only; account identity (email, account id) is never written to history.
 
 ### `model_change`
 

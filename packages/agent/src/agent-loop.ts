@@ -5459,6 +5459,9 @@ function emitAbortedAssistantMessage(
 		errorMessage,
 		timestamp: now,
 	};
+	// A partial proves the request reached the provider with that credential;
+	// without one the request may never have been sent, so stay unattributed.
+	if (partialMessage?.credentialId !== undefined) abortedMessage.credentialId = partialMessage.credentialId;
 	if (addedPartial) {
 		context.messages.pop();
 	} else {

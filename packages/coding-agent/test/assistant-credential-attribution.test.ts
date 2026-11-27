@@ -313,9 +313,45 @@ describe("assistant message credential attribution through a real session", () =
 		if (!served) throw new Error("Expected a served request");
 		expect(succeeded[0]?.model).toBe(served.model);
 		expect(succeeded[0]?.credentialId).toBe(rowFor(served.key));
-		for (const failed of assistants.filter(message => message.stopReason === "error")) {
-			expect(failed.credentialId).toBe(rowFor(firstKey ?? ""));
-		}
+		// The failed attempt is discarded by the managed transaction, so the only
+		// persisted turn is the one served by the rotated row.
+		expect(assistants.filter(message => message.stopReason === "error")).toHaveLength(0);
+		expect(succeeded[0]?.credentialId).not.toBe(rowFor(firstKey ?? ""));
+	});
+
+	it("keeps the serving credential on a turn aborted mid-stream", async () => {
+		const started = Promise.withResolvers<void>();
+		registerCustomApi(
+			API,
+			(model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				const stream = new AssistantMessageEventStream();
+				const message = providerMessage(model, "ok");
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "text_start", contentIndex: 0, partial: message });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "partial", partial: message });
+					started.resolve();
+				});
+				options?.signal?.addEventListener("abort", () => stream.fail(new Error("Request was aborted")), {
+					once: true,
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+		const { authStorage, sessionManager, session } = await setup(["stored-key-a"]);
+
+		const prompt = session.prompt("hello");
+		await started.promise;
+		await Bun.sleep(10);
+		await session.abort();
+		await prompt.catch(() => undefined);
+		await session.waitForIdle();
+
+		const assistants = await persistedAssistants(sessionManager);
+		const aborted = assistants.find(message => message.stopReason === "aborted");
+		expect(aborted).toBeDefined();
+		expect(aborted?.credentialId).toBe(rowIdForKey(authStorage, "stored-key-a"));
 	});
 
 	it("loads a pre-attribution session file and attributes only new turns", async () => {

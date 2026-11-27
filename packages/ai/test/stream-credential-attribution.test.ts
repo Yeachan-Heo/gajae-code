@@ -212,6 +212,28 @@ describe("streamSimple credential attribution", () => {
 		expect(result.credentialId).toBeUndefined();
 	});
 
+	it("does not fail a request whose provider message rejects the attribution write", async () => {
+		registerCustomApi(
+			API,
+			() => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = Object.freeze(assistant(["ok"]));
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const { result } = await collect(streamSimple(model(), context, { apiKey: "stored-key", credentialId: 4 }));
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "ok" }]);
+		expect(result.credentialId).toBeUndefined();
+	});
+
 	it("aborts the provider request when the consumer stops early", async () => {
 		let providerSignal: AbortSignal | undefined;
 		registerCustomApi(
