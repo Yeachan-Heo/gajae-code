@@ -7,20 +7,29 @@ import {
 	type SessionSelectionResult,
 	SessionSelectorComponent,
 } from "../modes/components/session-selector";
+import { resolveSessionOwnership, withScopedSessionClaim } from "../session/internal/session-claim-set";
 import { type SessionInfo, SessionManager } from "../session/session-manager";
 import type { SessionHeldError } from "../session/session-ownership";
 import { FileSessionStorage } from "../session/session-storage";
 
-export async function deleteSessionPickerCandidate(sessionPath: string, explicitSessionDir?: string): Promise<void> {
+/** The bare picker runs before the process surface is set: its scoped claims name the terminal. */
+const PICKER_OWNERSHIP = { surface: "terminal" } as const;
+
+export async function deleteSessionPickerCandidate(
+	session: Pick<SessionInfo, "id" | "path">,
+	explicitSessionDir?: string,
+): Promise<void> {
 	if (!explicitSessionDir) {
-		await SessionManager.deleteManagedCandidate(sessionPath);
+		await SessionManager.deleteManagedCandidate(session.path, PICKER_OWNERSHIP);
 		return;
 	}
 	const root = path.resolve(explicitSessionDir);
-	const target = path.resolve(sessionPath);
+	const target = path.resolve(session.path);
 	if (!pathIsWithin(root, target))
 		throw new Error("Explicit session deletion escaped the configured session directory.");
-	await new FileSessionStorage().deleteSessionWithArtifacts(target);
+	await withScopedSessionClaim(resolveSessionOwnership(PICKER_OWNERSHIP), session.id, "delete", () =>
+		new FileSessionStorage().deleteSessionWithArtifacts(target),
+	);
 }
 
 /**
@@ -79,12 +88,13 @@ export async function selectSession(
 		() => settle({ kind: "cancelled" }),
 		() => settle({ kind: "cancelled" }),
 		async session => {
-			await deleteSessionPickerCandidate(session.path, explicitSessionDir);
+			await deleteSessionPickerCandidate(session, explicitSessionDir);
 			return true;
 		},
 		SessionManager.inspectSessionTailReadOnly,
 		settle,
-		(session, starred) => SessionManager.setSessionStarredForPicker(session, starred, explicitSessionDir),
+		(session, starred) =>
+			SessionManager.setSessionStarredForPicker(session, starred, explicitSessionDir, PICKER_OWNERSHIP),
 	);
 	selector.setOnRequestRender(() => ui.requestRender());
 	if (held) selector.setHeldSessions(held.sessions, held.check);

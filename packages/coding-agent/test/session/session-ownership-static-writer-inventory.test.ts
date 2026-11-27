@@ -396,8 +396,9 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Run> = {
 
 /** Writers not run here: a later step covers them, or the test named in the reason does. */
 const DEFERRED_WRITERS: Record<string, string> = {
-	setSessionStarredForPicker: "picker write of any session; scoped claims cover picker writes (4d)",
-	deleteManagedCandidate: "deletes a session; delete ownership is the scoped-claim step (4d)",
+	setSessionStarredForPicker:
+		"picker write of any session, under a scoped claim of its id (4d; session-factory-claims.test.ts)",
+	deleteManagedCandidate: "deletes a session under a scoped claim of its id (4d; session-factory-claims.test.ts)",
 	prepareManagedCandidateForWrite:
 		"migration of a legacy-directory candidate under a scoped claim, read in place for a held fork source (session-factory-claims.test.ts)",
 	openNestedManaged: "a subagent child: exempt until per-child claims (design §13 L2; session-factory-claims.test.ts)",
