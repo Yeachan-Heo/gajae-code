@@ -219,8 +219,8 @@ export class HindsightSessionState {
 	/** One auto-retain may run at a time; one later agent_end is coalesced. */
 	#autoRetainInFlight?: Promise<void>;
 	#autoRetainPending = false;
-	/** Generation when the current recall operation was launched; used to fence writes across session transitions. */
-	#recallGeneration?: number;
+	/** Conversation epoch incremented on resetConversationTracking; fences concurrent recall operations. */
+	#conversationEpoch = 0;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -248,7 +248,7 @@ export class HindsightSessionState {
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 		this.lastInjectedRecallSnippetHash = undefined;
-		this.#recallGeneration = undefined;
+		this.#conversationEpoch++;
 	}
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
@@ -400,10 +400,10 @@ export class HindsightSessionState {
 		}
 	}
 
-	async maybeRecallOnAgentStart(generation?: number): Promise<void> {
+	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
-		// Capture the generation when recall is launched; used to fence against session transitions.
-		this.#recallGeneration = generation;
+		// Capture the conversation epoch to fence against concurrent session transitions.
+		const epoch = this.#conversationEpoch;
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(m => m.role === "user");
 		if (!lastUser) return;
@@ -413,10 +413,10 @@ export class HindsightSessionState {
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return;
 
-		// Fence: only write state if the session/generation hasn't changed.
-		// A session transition resets #recallGeneration, so stale recalls from a previous session
-		// will not pollute the current session's state.
-		if (generation !== undefined && this.#recallGeneration !== generation) return;
+		// Fence: only write state if the conversation epoch hasn't changed.
+		// A session transition via resetConversationTracking increments the epoch,
+		// so stale recalls from a previous session will not pollute the current session's state.
+		if (this.#conversationEpoch !== epoch) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;
@@ -496,8 +496,7 @@ export class HindsightSessionState {
 		this.unsubscribe?.();
 		this.unsubscribe = this.session.subscribe(event => {
 			if (event.type === "agent_start") {
-				// Pass the current generation to fence against stale recalls from prior sessions.
-				void this.maybeRecallOnAgentStart(this.session.getPromptGeneration());
+				void this.maybeRecallOnAgentStart();
 			} else if (event.type === "agent_end") {
 				void this.maybeRetainOnAgentEnd();
 				// Drain any queued tool-initiated retain calls now that the turn

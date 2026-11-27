@@ -491,7 +491,7 @@ describe("AgentSession startup continuation lifecycle", () => {
 
 		// Run the first continuation which will set up listeners
 		await session!.continuePersistedHistory();
-		
+
 		// Switch to a new session which increments the generation
 		const switched = await session!.newSession();
 		expect(switched).toBe(true);

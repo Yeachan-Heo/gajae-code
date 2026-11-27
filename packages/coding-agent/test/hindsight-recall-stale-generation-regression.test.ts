@@ -6,19 +6,19 @@ describe("Hindsight recall stale generation regression", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("fences stale recall writes after session reset - generation mismatch prevents state write", async () => {
+	it("fences stale recall writes after session reset - epoch mismatch prevents state write", async () => {
 		// Regression test for PR #7048 Finding #1:
-		// A pending Hindsight recall from generation N must not write state
-		// if the session/generation changes to M before the recall completes.
+		// A pending Hindsight recall from epoch N must not write state
+		// if resetConversationTracking is called (incrementing the epoch) before the recall completes.
 		//
 		// The fence works by:
-		// 1. Capturing the generation when recall starts: this.#recallGeneration = generation
-		// 2. When recall completes, checking: if (generation !== undefined && this.#recallGeneration !== generation) return;
-		// 3. When session resets, clearing the fence: this.#recallGeneration = undefined;
+		// 1. Capturing the epoch when recall starts: const epoch = this.#conversationEpoch
+		// 2. When recall completes, checking: if (this.#conversationEpoch !== epoch) return;
+		// 3. When session resets, incrementing the fence: this.#conversationEpoch++
 
 		// Create a minimal HindsightSessionState for testing
 		const state = new HindsightSessionState({
-			sessionId: "test-gen-fence",
+			sessionId: "test-epoch-fence",
 			client: {} as any,
 			bankId: "test-bank",
 			config: {
@@ -44,7 +44,7 @@ describe("Hindsight recall stale generation regression", () => {
 					],
 					getCwd: () => "/tmp",
 					getSessionFile: () => null,
-					getSessionId: () => "test-gen-fence",
+					getSessionId: () => "test-epoch-fence",
 				},
 			} as any,
 			missionsSet: new Set(),
@@ -60,25 +60,24 @@ describe("Hindsight recall stale generation regression", () => {
 		// Spy on recallForContext to return our deferred promise
 		vi.spyOn(state, "recallForContext" as any).mockReturnValue(recallPromise.promise);
 
-		// Step 1: Start recall with generation 1
-		// This sets this.#recallGeneration = 1
-		const generation1 = 1;
-		const recall1Promise = state.maybeRecallOnAgentStart(generation1);
+		// Step 1: Start recall at epoch 0
+		// This captures: const epoch = this.#conversationEpoch (epoch = 0)
+		const recall1Promise = state.maybeRecallOnAgentStart();
 
-		// Give the recall a moment to capture the generation
+		// Give the recall a moment to capture the epoch
 		await Bun.sleep(10);
 
 		// Step 2: Reset the conversation tracking
-		// This clears the generation fence: this.#recallGeneration = undefined
+		// This increments the epoch: this.#conversationEpoch++ (now 1)
 		state.resetConversationTracking();
 
 		// Step 3: Resolve the stale recall
 		// When the promise resolves, maybeRecallOnAgentStart will:
 		// - Extract context: { context: "STALE", ok: true }
-		// - Check the fence: if (generation !== undefined && this.#recallGeneration !== generation)
-		//   - generation = 1 (not undefined)
-		//   - this.#recallGeneration = undefined (was cleared)
-		//   - undefined !== 1 is true, so we RETURN early without writing state
+		// - Check the fence: if (this.#conversationEpoch !== epoch)
+		//   - this.#conversationEpoch = 1 (was incremented)
+		//   - epoch = 0 (captured at start)
+		//   - 1 !== 0 is true, so we RETURN early without writing state
 		recallPromise.resolve({ context: "STALE_CONTEXT", ok: true });
 
 		// Wait for the recall to complete
@@ -90,12 +89,12 @@ describe("Hindsight recall stale generation regression", () => {
 		expect(state.getRecallSnippet()).toBeUndefined();
 	});
 
-	it("allows legitimate recalls to write state when generation matches", async () => {
+	it("allows legitimate recalls to write state when epoch is stable", async () => {
 		// Verify that the fence doesn't prevent legitimate recalls
-		// i.e., when the session/generation doesn't change
+		// i.e., when resetConversationTracking is not called
 
 		const state = new HindsightSessionState({
-			sessionId: "test-gen-match",
+			sessionId: "test-epoch-match",
 			client: {} as any,
 			bankId: "test-bank",
 			config: {
@@ -121,7 +120,7 @@ describe("Hindsight recall stale generation regression", () => {
 					],
 					getCwd: () => "/tmp",
 					getSessionFile: () => null,
-					getSessionId: () => "test-gen-match",
+					getSessionId: () => "test-epoch-match",
 				},
 			} as any,
 			missionsSet: new Set(),
@@ -131,46 +130,29 @@ describe("Hindsight recall stale generation regression", () => {
 		const recallPromise = Promise.withResolvers<{ context: string; ok: boolean }>();
 		vi.spyOn(state, "recallForContext" as any).mockReturnValue(recallPromise.promise);
 
-		// Call with generation 1, and keep it unchanged (no reset)
-		const generation1 = 1;
-		const recall1Promise = state.maybeRecallOnAgentStart(generation1);
+		// Call maybeRecallOnAgentStart at epoch 0
+		const recall1Promise = state.maybeRecallOnAgentStart();
 
 		await Bun.sleep(10);
 
-		// Resolve with legitimate data WITHOUT changing the generation
+		// Resolve with legitimate data WITHOUT changing the epoch
 		recallPromise.resolve({ context: "LEGITIMATE_CONTEXT", ok: true });
 
 		// Wait for completion
 		await recall1Promise;
 
-		// Verify state WAS written (generation didn't change)
+		// Verify state WAS written (epoch didn't change)
 		expect(state.hasRecalledForFirstTurn).toBe(true);
 		expect(state.getRecallSnippet()).toBe("LEGITIMATE_CONTEXT");
 	});
 
-	it("prevents stale recalls in old code: demonstrates the old code would have a bug", async () => {
-		// This test documents what would happen with the old code (87fda1075d)
-		// where maybeRecallOnAgentStart had NO generation parameter and NO fence check.
-		//
-		// In the old code:
-		// - async maybeRecallOnAgentStart(): Promise<void> { ... }
-		// - No #recallGeneration field
-		// - No fence check: just writes state after recall completes
-		//
-		// The old code would ALWAYS write state when recall succeeds, even if
-		// the session has changed. This is the bug.
-		//
-		// With the new code:
-		// - async maybeRecallOnAgentStart(generation?: number): Promise<void> { ... }
-		// - #recallGeneration captures the generation
-		// - Fence check prevents writes: if (generation !== undefined && this.#recallGeneration !== generation) return;
-		//
-		// This test verifies the fence works by showing that:
-		// 1. When generation matches: state is written ✓
-		// 2. When generation changes (reset): state is NOT written ✓ (the fix)
+	it("prevents stale recalls by using epoch-based fencing", async () => {
+		// This test verifies the new epoch-based fence implementation.
+		// It demonstrates that stale recalls from an old epoch are blocked
+		// while new recalls after a reset can proceed normally.
 
 		const state = new HindsightSessionState({
-			sessionId: "test-gen-old-code",
+			sessionId: "test-epoch-transition",
 			client: {} as any,
 			bankId: "test-bank",
 			config: {
@@ -196,13 +178,13 @@ describe("Hindsight recall stale generation regression", () => {
 					],
 					getCwd: () => "/tmp",
 					getSessionFile: () => null,
-					getSessionId: () => "test-gen-old-code",
+					getSessionId: () => "test-epoch-transition",
 				},
 			} as any,
 			missionsSet: new Set(),
 		});
 
-		// Deferred recall promise
+		// Deferred recall promises
 		const recallPromise1 = Promise.withResolvers<{ context: string; ok: boolean }>();
 		const recallPromise2 = Promise.withResolvers<{ context: string; ok: boolean }>();
 
@@ -213,31 +195,31 @@ describe("Hindsight recall stale generation regression", () => {
 			return recallPromise2.promise;
 		});
 
-		// Scenario: Generation 1 starts a recall
-		const gen1Promise = state.maybeRecallOnAgentStart(1);
+		// Scenario: Epoch 0 starts a recall
+		const epoch0Promise = state.maybeRecallOnAgentStart();
 		await Bun.sleep(10);
 
-		// Session reset happens (generation fence cleared)
+		// Session reset happens (epoch incremented to 1)
 		state.resetConversationTracking();
 
-		// Stale recall from gen 1 completes
-		recallPromise1.resolve({ context: "STALE_FROM_GEN_1", ok: true });
-		await gen1Promise;
+		// Stale recall from epoch 0 completes
+		recallPromise1.resolve({ context: "STALE_FROM_EPOCH_0", ok: true });
+		await epoch0Promise;
 
 		// Stale recall should NOT have written state
 		expect(state.hasRecalledForFirstTurn).toBe(false);
 		expect(state.getRecallSnippet()).toBeUndefined();
 
-		// Now generation 2 starts (after the session change)
-		const gen2Promise = state.maybeRecallOnAgentStart(2);
+		// Now epoch 1 starts (after the reset)
+		const epoch1Promise = state.maybeRecallOnAgentStart();
 		await Bun.sleep(10);
 
-		// Gen 2's recall completes with legitimate data
-		recallPromise2.resolve({ context: "LEGITIMATE_FROM_GEN_2", ok: true });
-		await gen2Promise;
+		// Epoch 1's recall completes with legitimate data
+		recallPromise2.resolve({ context: "LEGITIMATE_FROM_EPOCH_1", ok: true });
+		await epoch1Promise;
 
-		// Gen 2's recall SHOULD have written state
+		// Epoch 1's recall SHOULD have written state
 		expect(state.hasRecalledForFirstTurn).toBe(true);
-		expect(state.getRecallSnippet()).toBe("LEGITIMATE_FROM_GEN_2");
+		expect(state.getRecallSnippet()).toBe("LEGITIMATE_FROM_EPOCH_1");
 	});
 });
