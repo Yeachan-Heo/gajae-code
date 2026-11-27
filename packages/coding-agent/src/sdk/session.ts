@@ -206,6 +206,7 @@ import {
 	startupAuthConfigError,
 } from "../session/startup-auth-config";
 import {
+	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	type OwnedCompletionEnvelope,
@@ -275,6 +276,8 @@ type AsyncResultEntry = {
 	durationMs: number | undefined;
 	/** Exact owned-completion origin when the job is registered left-running work of a terminal turn. */
 	ownedCompletion?: OwnedCompletionEnvelope;
+	/** The result carries a fold receipt for the wake turn that completes the folded task. */
+	foldReceipt?: boolean;
 };
 
 type AsyncResultJobDetails = {
@@ -2862,6 +2865,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								result: deliveredResult,
 								job,
 								durationMs,
+								...(foldDisposition.kind === "receipt" ? { foldReceipt: true } : {}),
 								...(ownedCompletion
 									? {
 											ownedCompletion: {
@@ -6149,6 +6153,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
+				// Completions that classify "ordinary" reach a running turn at its next
+				// tool step. That includes jobs launched by a tool call of a turn that
+				// was never terminal-aborted: they carry an ownership envelope whose
+				// terminal scope does not exist. A "fresh" envelope needs the follow-up
+				// path's resume admission (new lineage), a "drop" envelope must never
+				// reach the agent, and a fold receipt belongs to the wake turn, so
+				// those stay on the before-yield/idle path. The classification is
+				// read in the same synchronous tick in which the loop commits the
+				// built message, so it cannot change before delivery.
+				deliverAtStepBoundary: entry =>
+					entry.foldReceipt !== true &&
+					(entry.ownedCompletion === undefined || classifyOwnedEnvelope(entry.ownedCompletion) === "ordinary"),
 				build: entries => {
 					try {
 						return buildAsyncResultBatchMessage(entries);
@@ -6159,6 +6175,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
+			deliverAtStepBoundary: () => true,
 			build: buildMcpNotificationBatchMessage,
 		});
 

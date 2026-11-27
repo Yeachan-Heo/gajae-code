@@ -426,6 +426,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	onBeforeYield?: () => Promise<void> | void;
 
 	/**
+	 * Returns queued asynchronous messages (for example background job results)
+	 * to deliver at a step boundary of the current turn.
+	 *
+	 * Polled once after a completed tool step that continues the loop anyway, after
+	 * steering, abort and {@link shouldPause} have been checked, so it never adds
+	 * a model call, never interrupts running tools and never bypasses a pause.
+	 * Returned messages are added to the context before the next LLM call. Not
+	 * polled after a final answer: entries still queued then are left for
+	 * {@link onBeforeYield}.
+	 */
+	getStepBoundaryMessages?: () => AgentMessage[];
+
+	/**
 	 * Provides tool execution context, resolved per tool call.
 	 * Use for late-bound UI or session state access.
 	 */

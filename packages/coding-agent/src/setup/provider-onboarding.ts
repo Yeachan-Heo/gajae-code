@@ -299,11 +299,11 @@ function providerCredentialRecoveryHint(providerId: string): string {
  * old literal key. OAuth rows are never touched, and rows are soft-disabled
  * (`gjc accounts list` shows them as `disabled`) rather than deleted.
  *
- * Only a confirmed disable (`disableCredentialById` returning `true`) counts:
- * the store can swallow errors, and this count is what the user reasons about
- * in a path that cannot restore the rows. Persistence is verified by
- * re-reading the store, because remote (broker-owned) stores reject disables
- * outright and a reload is the only proof the rows no longer resolve.
+ * Only a confirmed disable (`disableCredentialById` returning `true`) counts,
+ * and this count is what the user reasons about in a path that cannot restore
+ * the rows. A failed store write throws and is reported as a refused disable.
+ * Persistence is still verified by re-reading the store, because a reload is
+ * the only proof the rows no longer resolve.
  */
 async function removeStoredApiKeyCredentials(store: ProviderSetupCredentialStore, providerId: string): Promise<number> {
 	const selectApiKeyRows = () =>

@@ -4591,6 +4591,7 @@ export class AgentSession {
 							job,
 							durationMs: undefined,
 							ownedCompletion,
+							foldReceipt: true,
 						});
 					} finally {
 						manager?.clearParkedDelivery(job.generation);
@@ -7111,6 +7112,26 @@ export class AgentSession {
 			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Step-boundary delivery: eligible entries (ordinary async results, MCP
+		// notifications) reach the running turn at its next tool step instead of
+		// waiting for before-yield, which would force an extra iteration after the
+		// final answer. Entries whose ownership classifies "fresh" or "drop" and
+		// fold receipts are ineligible by their dispatcher and keep the
+		// before-yield/idle path above. Transitions, abort unwinds and disposal
+		// leave the queue untouched.
+		this.agent.setStepBoundaryMessageProvider(() => {
+			if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return [];
+			if (this.#abortUnwind !== undefined || this.#isDisposed || this.#sessionAdmissionClosing) return [];
+			const messages = this.yieldQueue.drainStepBoundary();
+			// This is the delivery boundary for these messages (the loop commits
+			// them synchronously), so settle their terminal owned registrations as
+			// onFollowUpConsumed does; unsettled tuples would fill the bounded
+			// registry until later owned aborts fail closed. No SDK run token or
+			// fresh lineage applies: these entries were never queued as SDK input
+			// and "fresh" entries are not eligible here.
+			this.#settleDeliveredOwnedRegistrations(messages);
+			return messages;
+		});
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
 		// to the folded turn instead of pausing everything that follows. The
@@ -9964,7 +9985,15 @@ export class AgentSession {
 				msg.provider === "github-copilot" &&
 				msg.errorMessage?.includes("GitHub Copilot authentication failed")
 			) {
-				await this.#modelRegistry.authStorage.remove("github-copilot");
+				try {
+					await this.#modelRegistry.authStorage.remove("github-copilot");
+				} catch (error) {
+					// The credential is still stored; the next authentication failure retries the
+					// invalidation. Post-turn handling must still run.
+					logger.warn("Failed to invalidate GitHub Copilot credentials after an auth failure", {
+						error: String(error),
+					});
+				}
 			}
 
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
@@ -13435,6 +13464,7 @@ export class AgentSession {
 		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
+		this.agent.setStepBoundaryMessageProvider(undefined);
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await awaitDisposeStep(

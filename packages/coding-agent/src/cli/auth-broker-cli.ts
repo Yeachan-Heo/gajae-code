@@ -70,6 +70,7 @@ type AuthBrokerCliErrorCode =
 	| "broker_unavailable"
 	| "credential_import_failed"
 	| "credential_migration_failed"
+	| "credential_logout_failed"
 	| "auth_broker_command_failed";
 
 function stableErrorForAction(action: AuthBrokerAction): { code: AuthBrokerCliErrorCode; message: string } {
@@ -80,6 +81,8 @@ function stableErrorForAction(action: AuthBrokerAction): { code: AuthBrokerCliEr
 			return { code: "credential_import_failed", message: "Credential import failed." };
 		case "migrate":
 			return { code: "credential_migration_failed", message: "Credential migration failed." };
+		case "logout":
+			return { code: "credential_logout_failed", message: "Credential logout failed." };
 		default:
 			return { code: "auth_broker_command_failed", message: "Auth broker command failed." };
 	}
@@ -276,6 +279,7 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	const provider = resolveOAuthStorageProvider(providerArg);
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	try {
+		// A failed write throws before the success line; runAuthBrokerCommand reports it and sets exit code 1.
 		store.deleteAuthCredentialsForProvider(provider, "logged out by user");
 		process.stdout.write(`Logged out of ${provider}\n`);
 	} finally {
@@ -804,7 +808,7 @@ export async function runAuthBrokerCommand(cmd: AuthBrokerCommandArgs): Promise<
 			}
 		}
 	} catch (error) {
-		if (cmd.action === "status" || cmd.action === "import" || cmd.action === "migrate") {
+		if (cmd.action === "status" || cmd.action === "import" || cmd.action === "migrate" || cmd.action === "logout") {
 			writeCommandFailure(cmd.action, cmd.flags, error);
 			return;
 		}

@@ -149,5 +149,9 @@ Lifecycle and exact state names:
   - snapshots (`job` calls with `poll` or `list: true`) read current manager state;
   - follow-up delivery comes from `AsyncJobManager.#enqueueDelivery(...)` and `sdk.ts` `onJobComplete`;
   - watched or acknowledged ids are suppressed via `isDeliverySuppressed(...)`.
+- Delivery timing of automatic completions (`AgentSession` yield queue):
+  - while the agent is working, an ordinary completion is added to the running turn at its next tool step (after the tool results, before the next model call), so the agent sees it within the same turn;
+  - a completion that arrives during the final answer, an owned completion of a terminal-aborted turn, and a folded job's receipt are delivered when the turn is about to end (one follow-up iteration) or, when idle, as a new turn;
+  - an aborted, folding, or transitioning turn never receives a completion at a tool step.
 - `manager.cancel(id)` sets `status = "cancelled"` before the underlying promise settles. The job function may later populate `resultText` or `errorText`; `job-manager.ts` preserves that text but does not transition the status away from `cancelled`.
 - Retention eviction removes the job record, suppression flags, and watch flag together. After eviction, both `job` calls and `list: true` snapshots behave as if the id never existed.
