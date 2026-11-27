@@ -302,6 +302,10 @@ export function sanitizePromptFailure(error: unknown): { code: string; message: 
 	} catch {
 		// Untrusted error records may expose throwing accessors.
 	}
+	// A turn refused because another process holds the session (`SessionHeldError`, code
+	// `session_held`) is published as the broker's `live_session`, the code every remote client
+	// already reads for a held session, so a prompt record never carries a second spelling of it.
+	if (rawCode === "session_held") return { code: "live_session", message: "Prompt submission failed." };
 	const code = rawCode.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(rawCode) ? rawCode : "internal";
 	return { code, message: "Prompt submission failed." };
 }
