@@ -7077,10 +7077,19 @@ export class AgentSession {
 						if (settleIfDisposing()) return;
 					}
 					// An idle delivery starts a turn without #promptWithMessage: the same ownership gate. A
-					// refusal rejects to the yield queue, which logs it; the delivery is dropped.
+					// refused delivery is dropped (the yield queue logs the rejection), so say so.
 					const ownershipGate = this.#sessionOwnershipTurnGate();
 					if (ownershipGate) {
-						await ownershipGate;
+						try {
+							await ownershipGate;
+						} catch (error) {
+							this.emitNotice(
+								"warning",
+								`A background result was not delivered: ${operatorErrorMessage(error)}`,
+								"session-ownership",
+							);
+							throw error;
+						}
 						if (settleIfDisposing()) return;
 					}
 					if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
@@ -16588,9 +16597,10 @@ export class AgentSession {
 		}
 		await this.#awaitStartupTurnBarrier();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
-		await this.#withSessionAdmission("prompt", async () => {});
-		const ownershipGate = this.#sessionOwnershipTurnGate();
-		if (ownershipGate) await ownershipGate;
+		await this.#withSessionAdmission("prompt", async () => {
+			const ownershipGate = this.#sessionOwnershipTurnGate();
+			if (ownershipGate) await ownershipGate;
+		});
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;

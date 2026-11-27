@@ -13322,6 +13322,9 @@ export class SessionManager {
 	}
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
+		// Enforce's write gate refused the write before it wrote anything: not a persistence failure,
+		// so nothing latches and the next write is judged on its own.
+		if (normalized instanceof SessionHeldError) return normalized;
 		if (!this.#persistError) this.#persistError = normalized;
 		if (!this.#persistErrorReported) {
 			this.#persistErrorReported = true;
@@ -13412,6 +13415,8 @@ export class SessionManager {
 			return undefined;
 		}
 		if (this.#persistWriter && this.#persistWriterPath === this.#sessionFile) {
+			// Every append through an open writer, not only its open, passes enforce's write gate.
+			this.#ownershipClaims.refuseWriteIfHeld();
 			if (this.#persistWriter.isOpen()) return this.#persistWriter;
 			// Cached writer for the current file is mid-close (queued
 			// `#closePersistWriterInternal` has flipped `#closing` but not yet
@@ -20450,6 +20455,8 @@ export class SessionManager {
 			// append. Preserve its type after rolling back the rejected entry.
 			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
 			if (error instanceof SharedAppendRewriteRequiredError) throw error;
+			// So is enforce's write gate: another process holds the session (nothing was written).
+			if (error instanceof SessionHeldError) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,

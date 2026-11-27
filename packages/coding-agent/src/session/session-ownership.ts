@@ -544,8 +544,12 @@ function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
 // Claim and probe
 // =============================================================================
 
-function failOpen(reason: "unavailable" | "timed_out", code: string | undefined): SessionOwnerClaimResult {
-	countSessionOwnershipEvent("fail_open");
+function failOpen(
+	reason: "unavailable" | "timed_out",
+	code: string | undefined,
+	counted = true,
+): SessionOwnerClaimResult {
+	if (counted) countSessionOwnershipEvent("fail_open");
 	return { status: "skipped", reason, code };
 }
 
@@ -553,10 +557,14 @@ function failOpen(reason: "unavailable" | "timed_out", code: string | undefined)
  * Claim `sessionId` for this process. A session this process already holds is shared (design D10).
  * Throws `SessionOwnershipError` when the owners directory or the lock fails in a way that must
  * refuse the session; only `unavailable` and `timed_out` fail open (design §2.7).
+ *
+ * `repeat` names the outcome the caller's previous attempt of this id had (a turn-start
+ * re-attempt): the same outcome again is neither counted nor logged again, so the counters count
+ * episodes, not turns.
  */
 export async function claimSessionOwner(
 	sessionId: string,
-	request: { readonly surface: SessionOwnerSurface },
+	request: { readonly surface: SessionOwnerSurface; readonly repeat?: "held" | "timed_out" },
 ): Promise<SessionOwnerClaimResult> {
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
@@ -635,7 +643,7 @@ export async function claimSessionOwner(
 				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
 			}
 			case FileLockAcquireStatus.Held:
-				countSessionOwnershipEvent("claim_conflict");
+				if (request.repeat !== "held") countSessionOwnershipEvent("claim_conflict");
 				return {
 					status: "held",
 					holder: verifiedHolder(readRecord(path.join(owners, `${key}${RECORD_SUFFIX}`)), sessionId),
@@ -646,8 +654,9 @@ export async function claimSessionOwner(
 				// A stall skips this call only (design §2.7): latching it would leave a long-lived writer
 				// unclaimed, and so invisible to other processes, for the rest of its life. Turn start
 				// re-attempts the current session, with backoff (`SessionClaimSet.reclaimCurrent`).
-				logger.warn("Session ownership claim timed out; this claim was skipped", { code: result.code });
-				return failOpen("timed_out", result.code ?? "timed_out");
+				if (request.repeat !== "timed_out")
+					logger.warn("Session ownership claim timed out; this claim was skipped", { code: result.code });
+				return failOpen("timed_out", result.code ?? "timed_out", request.repeat !== "timed_out");
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}
