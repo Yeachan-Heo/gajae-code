@@ -836,6 +836,7 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		const FIRST_PROMPT = "attach-acp-one";
 		const BUSY_PROMPT = "attach-acp-busy";
 		const AFTER_PROMPT = "attach-acp-after";
+		const EARLY_PROMPT = "attach-acp-early";
 		const SECOND_PROMPT = "attach-acp-second";
 		const LATER_PROMPT = "attach-acp-later";
 		const fixture = await startFixture("enforce", [BUSY_PROMPT]);
@@ -916,7 +917,13 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			await withTimeout(model.reached(BUSY_PROMPT), 60_000, "the busy prompt at the model");
 
 			// --- `gjc --resume S` in a terminal: the warning offers Continue here beside Fork and Cancel.
-			tui = startTui(fixture, ["--resume", sessionId]);
+			// The TUI's endpoint publication is held after it takes S over, so the bridge's first prompt
+			// meets a TUI that is still starting.
+			const holdDir = path.join(fixture.root, "registration-hold");
+			await fs.mkdir(holdDir, { recursive: true, mode: 0o700 });
+			const hold = path.join(holdDir, `${sessionId}.hold`);
+			await Bun.write(hold, "");
+			tui = startTui(fixture, ["--resume", sessionId], { GJC_SDK_TEST_HOST_REGISTRATION_HOLD_DIR: holdDir });
 			const view = tui;
 			tuiPid = await view.pid();
 			await waitFor(() => view.screen().includes("Continue here"), 60_000, "the held-session warning");
@@ -950,7 +957,12 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			);
 			await waitFor(() => !processAlive(hostPid), 30_000, "the session host to exit");
 
-			// --- The bridge sends its next prompt with no session/load: it runs in the TUI.
+			// --- A prompt while the TUI has no endpoint yet fails as before, undelivered, and the bridge
+			// keeps S: once the endpoint is published, its next prompt, with no session/load, runs in
+			// the TUI.
+			const early = acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: EARLY_PROMPT }] });
+			await expect(withTimeout(early, 60_000, "the ACP prompt while the TUI starts")).rejects.toThrow();
+			await fs.rm(hold);
 			const after = await withTimeout(
 				acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: AFTER_PROMPT }] }),
 				90_000,
@@ -966,6 +978,7 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 				expect(messageEntries(merged.entries, text)).toHaveLength(1);
 				expect(messageEntries(merged.entries, `${text}-reply`)).toHaveLength(1);
 			}
+			expect(messageEntries(merged.entries, EARLY_PROMPT)).toHaveLength(0);
 			expect((await rowsForS()).map(row => row.pid)).toEqual([tuiPid]);
 			expect(await holderOf(sessionId)).toBe(tuiPid);
 
@@ -1016,6 +1029,7 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			]);
 		} catch (error) {
 			model.releaseAll();
+			await fs.rm(path.join(fixture.root, "registration-hold"), { recursive: true, force: true });
 			const rows = JSON.stringify(await rowsForS().catch(() => "unavailable"));
 			const data = JSON.stringify((error as { data?: unknown }).data ?? null);
 			const events = (

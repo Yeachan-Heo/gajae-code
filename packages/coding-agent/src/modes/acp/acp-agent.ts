@@ -1918,15 +1918,7 @@ export class AcpAgent implements Agent {
 						// session over with Continue here (session single-owner design §13 H1). The
 						// record's provenance (lifecycle ownership, reverse providers) belongs to the
 						// old host, so re-establish the session through the broker instead of rebinding.
-						void this.#failAndReattachSession(
-							attachment.sessionId,
-							record.adapter,
-							record.cwd,
-							new AcpSdkAdapterError(
-								"session_closed",
-								`ACP session ${attachment.sessionId} changed its SDK host.`,
-							),
-						);
+						void this.#reattachInPlace(attachment.sessionId, record);
 						return;
 					}
 					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
@@ -2414,18 +2406,14 @@ export class AcpAgent implements Agent {
 		// The host may have closed between turns, as Continue here closes a broker-launched host for
 		// the terminal taking the session over (session single-owner design §13 H1). Reconcile first,
 		// so the Router learns of it before anything is dispatched; with no successor attached yet,
-		// reattach the session to its current owner through the broker, which waits for that owner's
-		// endpoint, then submit there.
-		if (!rebound && !record.activePrompt && !record.pendingPromptAdmission) {
+		// re-attach the session to its current owner through the broker, which waits for that owner's
+		// endpoint, then submit there. If that fails the session keeps its record, and this prompt
+		// fails as it did before; a later prompt or attachment recovers it.
+		if (!rebound && this.#idleForReattach(params.sessionId, record)) {
 			await this.#router.reconcile({ waitForReplay: false }).catch(() => undefined);
 			if (this.#sessions.get(params.sessionId) !== record) return await this.#prompt(params, true);
-			if (!record.activePrompt && !record.pendingPromptAdmission && !record.attachment.isCurrent()) {
-				await this.#failAndReattachSession(
-					params.sessionId,
-					record.adapter,
-					record.cwd,
-					new AcpSdkAdapterError("session_closed", `ACP session ${params.sessionId} lost its SDK session host.`),
-				);
+			if (this.#idleForReattach(params.sessionId, record) && !record.attachment.isCurrent()) {
+				await this.#reattachInPlace(params.sessionId, record);
 				return await this.#prompt(params, true);
 			}
 		}
@@ -4904,11 +4892,80 @@ export class AcpAgent implements Agent {
 	 */
 	#ownerEndpointChanged(record: SessionRecord, attachment: SessionAttachment): boolean {
 		return (
-			attachment.generation !== record.attachment.generation &&
+			attachment.generation !== record.attachment.generation && this.#idleForReattach(attachment.sessionId, record)
+		);
+	}
+
+	/**
+	 * Whether an idle session may be re-attached in place. Temporary sessions keep their own
+	 * recovery (`ephemeral_session_unrecoverable`); a prompt in flight, an admission waiting for one,
+	 * or a first-turn retry in its backoff (#5574) keep the session busy.
+	 */
+	#idleForReattach(id: string, record: SessionRecord): boolean {
+		return (
+			!this.#ephemeralSessionIds.has(id) &&
 			!record.activePrompt &&
 			!record.pendingPromptAdmission &&
-			!this.#reattachingSessions.has(attachment.sessionId)
+			!record.pendingFirstPromptRetry &&
+			!this.#reattachingSessions.has(id)
 		);
+	}
+
+	/**
+	 * Re-attach an idle session to its current owner through the broker without giving it up first
+	 * (session single-owner design §13 H1). The record leaves the session table only while the new
+	 * attachment is built, and comes back unchanged when that fails (the owner is still starting, for
+	 * example), so the next prompt or attachment can recover it. `true` once the session runs on the
+	 * new attachment. A prompt arriving meanwhile waits for the outcome.
+	 */
+	async #reattachInPlace(id: string, record: SessionRecord): Promise<boolean> {
+		if (this.#disposed || this.#sessions.get(id) !== record || !this.#idleForReattach(id, record)) return false;
+		const cwd = record.cwd;
+		const mcpServers = this.#knownSessionMcpServers.get(id);
+		const owned = this.#ownedSessionIds.has(id);
+		const epoch = this.#sessionEpoch(id);
+		const done = Promise.withResolvers<void>();
+		this.#reattachingSessions.set(id, done.promise);
+		this.#sessions.delete(id);
+		try {
+			await this.#attachExisting(id, cwd, mcpServers ?? []);
+			const current = this.#sessions.get(id);
+			if (!current) throw new AcpSdkAdapterError("unavailable", `ACP session ${id} did not attach.`);
+			if (record.firstPromptDone) current.firstPromptDone = true;
+			await this.#retireReplacedRecord(record, current);
+			return true;
+		} catch (error) {
+			logger.warn(`ACP session ${id} could not re-attach to its new owner yet: ${String(error)}`);
+			const current = this.#sessions.get(id);
+			if (current) {
+				await this.#retireReplacedRecord(record, current);
+				return true;
+			}
+			// A close, delete or disposal that ran meanwhile owns the session now: never resurrect it.
+			if (this.#disposed || this.#tearingDown.has(id) || this.#sessionEpoch(id) !== epoch) {
+				record.unsubscribe();
+				record.reconnectUnsubscribe();
+				await record.adapter.close().catch(() => undefined);
+				return false;
+			}
+			this.#sessions.set(id, record);
+			this.#knownSessionCwds.set(id, cwd);
+			if (mcpServers) this.#knownSessionMcpServers.set(id, mcpServers);
+			if (owned) this.#ownedSessionIds.add(id);
+			return false;
+		} finally {
+			if (this.#reattachingSessions.get(id) === done.promise) this.#reattachingSessions.delete(id);
+			done.resolve();
+		}
+	}
+
+	/** Releases an idle record that a re-attachment replaced; its prompts are already settled. */
+	async #retireReplacedRecord(record: SessionRecord, replacement: SessionRecord): Promise<void> {
+		record.unsubscribe();
+		record.reconnectUnsubscribe();
+		if (record.adapter !== replacement.adapter) await record.adapter.close().catch(() => undefined);
+		if (record.attachment !== replacement.attachment)
+			await Promise.resolve(record.attachment.retire?.()).catch(() => undefined);
 	}
 
 	async #brokerAdapter(): Promise<AcpSdkAdapter> {
