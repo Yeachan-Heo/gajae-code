@@ -1873,7 +1873,7 @@ test.each([
 	["image-only input", true, true, "", [], undefined],
 	["automatic resume continuation", true, true, undefined, [], "continue-tail"],
 ] as const)("root startup keeps %s credential failures fatal", async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction) => {
-		const session = fakeSession();
+	const session = fakeSession();
 	const settings = Settings.isolated({ "modelProfile.default": "codex-medium" });
 	const registry = {
 		...fakeRegistry([
@@ -1909,8 +1909,8 @@ test.each([
 		).rejects.toBe(exit);
 	} finally {
 		stderrSpy.mockRestore();
-			exitSpy.mockRestore();
-		}
+		exitSpy.mockRestore();
+	}
 });
 
 test("recoverable blocked default still applies healthy --mpreset and explicit CLI override", async () => {
