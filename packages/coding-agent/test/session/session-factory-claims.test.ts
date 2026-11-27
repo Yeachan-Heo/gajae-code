@@ -15,6 +15,7 @@ import { getAgentDir, getTerminalSessionsDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 import type { Args } from "../../src/cli/args";
+import { deleteSessionPickerCandidate } from "../../src/cli/session-picker";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { createSessionManager, operatorFacingSessionOpenMessage, SessionResumeCancelledError } from "../../src/main";
 import { type HeldSessionChoice, heldSessionWarningDialog } from "../../src/modes/components/session-held-warning";
@@ -551,6 +552,66 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			await session.dispose();
 		}
 		expect((await probeSessionOwners([freeTarget.id])).get(freeTarget.id)).toEqual({ state: "free" });
+	});
+
+	it("picker star and delete of a session another process holds are refused; observe writes as before (design §1 row 17)", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		const agentDir = path.join(place.root, "agent");
+		const row = async () => {
+			const found = (await SessionManager.listManagedForResumePickerReadOnly(place.cwd, agentDir)).find(
+				session => session.id === id,
+			);
+			if (!found) throw new Error("the session is not listed");
+			return found;
+		};
+		const starred = async () => (await row()).starred === true;
+		SessionOwnershipTestHooks.mode = "enforce";
+		const tui = keep(SessionManager.create(place.cwd, place.destination));
+		const pid = await holdInAnotherProcess(id);
+		const before = await tree(place.root);
+		const held = `it is open in another terminal (pid ${pid}).`;
+		// The bare `--resume` picker and the in-TUI `/resume` picker.
+		await expect(
+			SessionManager.setSessionStarredForPicker(await row(), true, undefined, { surface: "terminal" }),
+		).rejects.toThrow(`Can't star this session: ${held}`);
+		await expect(deleteSessionPickerCandidate(file)).rejects.toThrow(`Can't delete this session: ${held}`);
+		// The `--session-dir` delete claims the id its header names.
+		await expect(SessionManager.deleteExplicitCandidate(file, { surface: "terminal" })).rejects.toThrow(
+			`Can't delete this session: ${held}`,
+		);
+		await expect(tui.setSessionStarredForPicker(await row(), true)).rejects.toThrow(
+			`Can't star this session: ${held}`,
+		);
+		await expect(tui.dropSession(file)).rejects.toThrow(`Can't delete this session: ${held}`);
+		// An in-memory TUI's manager claims nothing itself, but its picker still writes other sessions' files.
+		const memory = keep(SessionManager.inMemory(place.cwd));
+		await expect(memory.setSessionStarredForPicker(await row(), true)).rejects.toThrow(
+			`Can't star this session: ${held}`,
+		);
+		expect(await tree(place.root)).toEqual(before);
+		expect((await inspectSessionOwners()).held.filter(sidecar => sidecar.self && sidecar.sessionId === id)).toEqual(
+			[],
+		);
+		// Observe: the write goes ahead as on dev, and the conflict is counted.
+		SessionOwnershipTestHooks.mode = "observe";
+		const conflicts = sessionOwnershipCounters().claim_conflict;
+		await SessionManager.setSessionStarredForPicker(await row(), true, undefined, { surface: "terminal" });
+		expect(await starred()).toBe(true);
+		expect(sessionOwnershipCounters().claim_conflict).toBe(conflicts + 1);
+		// The holder quits: a session this process holds is its own, so its picker writes go ahead.
+		for (const child of holders.splice(0)) {
+			child.kill("SIGKILL");
+			await child.exited;
+		}
+		SessionOwnershipTestHooks.mode = "enforce";
+		const own = keep(await SessionManager.open(file, place.destination));
+		await own.setSessionStarredForPicker(await row(), false);
+		expect(await starred()).toBe(false);
+		await own.dropSession(file);
+		expect(await Bun.file(file).exists()).toBe(false);
+		expect(own.getSessionId()).not.toBe(id);
+		expect(await state(id)).toBe("free");
 	});
 
 	it("observe adds no await: the switch admission and the held probes return undefined at once, even for a held session", async () => {

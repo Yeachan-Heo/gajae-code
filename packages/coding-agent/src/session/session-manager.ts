@@ -195,6 +195,7 @@ import {
 	SessionClaimSet,
 	type SessionOwnershipDecision,
 	sessionClaimSetCapability,
+	withScopedSessionClaim,
 } from "./internal/session-claim-set";
 import {
 	applyReducerDelta,
@@ -11608,6 +11609,15 @@ export class SessionManager {
 				: new AggregateError(errors, "Prepared session temporary-file cleanup failed.");
 	}
 
+	/**
+	 * The decision a scoped claim on another session is made under: this manager's, or, for an
+	 * exempt manager (an in-memory TUI's picker still writes other sessions' files), the process's.
+	 */
+	#scopedClaimOwnership(): ResolvedSessionOwnership {
+		const ownership = this.#ownershipClaims.ownership;
+		return ownership === "exempt" ? resolveSessionOwnership() : ownership;
+	}
+
 	/** Tombstone and exact-delete managed transcripts, detaching the active transcript first. */
 	async dropSession(sessionPath: string): Promise<void> {
 		// The own-session check below compares unresolved paths, so an aliased spelling of
@@ -11632,17 +11642,28 @@ export class SessionManager {
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
 				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
-				if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
-				await this.#closePersistWriter();
-				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
-				const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
-				if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
-				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
-					throw new Error(`Could not delete managed session: ${deleted.message}`);
+				// Scoped claim (design §1 row 17): taken before the detach, so a held session is never touched.
+				await withScopedSessionClaim(this.#scopedClaimOwnership(), candidate.sessionId, "delete", async () => {
+					if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
+					await this.#closePersistWriter();
+					this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
+					const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
+					if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
+					if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
+						throw new Error(`Could not delete managed session: ${deleted.message}`);
+				});
 			} else {
-				if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
-				await this.#closePersistWriter();
-				await this.#storage.deleteSessionWithArtifacts(sessionPath);
+				const drop = async (): Promise<void> => {
+					if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
+					await this.#closePersistWriter();
+					await this.#storage.deleteSessionWithArtifacts(sessionPath);
+				};
+				await SessionManager.#deleteUnderHeaderClaim(
+					sessionPath,
+					this.#storage,
+					this.#scopedClaimOwnership(),
+					drop,
+				);
 			}
 		} catch (err) {
 			if (isEnoent(err)) return;
@@ -19383,6 +19404,7 @@ export class SessionManager {
 			starred,
 			this.destination.kind === "explicit" ? this.destination.directory : undefined,
 			this.#publishedSharedSession(session.id),
+			this.#scopedClaimOwnership(),
 		);
 	}
 
@@ -19509,12 +19531,20 @@ export class SessionManager {
 		session: SessionInfo,
 		starred: boolean,
 		explicitSessionDir?: string,
+		ownership?: SessionOwnershipDecision,
 	): Promise<void> {
-		await SessionManager.#setPickerCandidateStar(session, starred, explicitSessionDir, false);
+		await SessionManager.#setPickerCandidateStar(
+			session,
+			starred,
+			explicitSessionDir,
+			false,
+			resolveSessionOwnership(ownership),
+		);
 	}
 
 	/**
-	 * Star a non-live picker candidate. A `shared` candidate (a predecessor this manager
+	 * Star a non-live picker candidate, under a scoped claim of its id (design §1 row 17).
+	 * A `shared` candidate (a predecessor this manager
 	 * published through shared admission) is patched only by an append under its managed
 	 * session transaction lease, like a shared title; a whole-transcript header upgrade
 	 * is refused because it would move a live peer's transcript identity.
@@ -19524,6 +19554,7 @@ export class SessionManager {
 		starred: boolean,
 		explicitSessionDir: string | undefined,
 		shared: boolean,
+		ownership: ResolvedSessionOwnership,
 	): Promise<void> {
 		if (isStagedSessionPath(session.path)) throw new Error("Staged session paths are not resumable");
 		const directory = await fs.promises.realpath(path.dirname(session.path));
@@ -19544,15 +19575,17 @@ export class SessionManager {
 			)
 				throw new Error("Session is not an authorized managed candidate.");
 		}
-		if (!shared) {
-			SessionManager.#writePickerCandidateStar(session, starred, directory);
-			return;
-		}
-		const locksDirectory = managedSessionTransactionLocksDirectory(directory);
-		fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-		await withManagedSessionTransaction({ locksDirectory, sessionId: session.id }, scope =>
-			SessionManager.#writePickerCandidateStar(session, starred, directory, scope),
-		);
+		await withScopedSessionClaim(ownership, session.id, starred ? "star" : "unstar", async () => {
+			if (!shared) {
+				SessionManager.#writePickerCandidateStar(session, starred, directory);
+				return;
+			}
+			const locksDirectory = managedSessionTransactionLocksDirectory(directory);
+			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
+			await withManagedSessionTransaction({ locksDirectory, sessionId: session.id }, scope =>
+				SessionManager.#writePickerCandidateStar(session, starred, directory, scope),
+			);
+		});
 	}
 
 	static #writePickerCandidateStar(
@@ -25455,12 +25488,49 @@ export class SessionManager {
 		}
 	}
 
-	/** Delete an authorized managed or project-local picker candidate. */
-	static async deleteManagedCandidate(sessionPath: string): Promise<void> {
+	/** Delete an authorized managed or project-local picker candidate, under a scoped claim of its id (design §1 row 17). */
+	static async deleteManagedCandidate(sessionPath: string, ownership?: SessionOwnershipDecision): Promise<void> {
 		const storage = new FileSessionStorage();
-		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		// `growing`: a holder may be appending; the header line never changes.
+		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, {
+			growing: true,
+		});
 		if (!inspected.ok || !inspected.inspection.cwd) throw new Error("Session has no valid workspace header.");
 		const headerCwd = inspected.inspection.cwd;
+		await withScopedSessionClaim(resolveSessionOwnership(ownership), inspected.inspection.sessionId, "delete", () =>
+			SessionManager.#deleteAuthorizedCandidate(sessionPath, headerCwd),
+		);
+	}
+
+	/**
+	 * Delete a picker candidate of an explicit `--session-dir` (transcript and artifacts), under a
+	 * scoped claim of the id its header names (design §1 row 17).
+	 */
+	static async deleteExplicitCandidate(sessionPath: string, ownership?: SessionOwnershipDecision): Promise<void> {
+		const storage = new FileSessionStorage();
+		await SessionManager.#deleteUnderHeaderClaim(sessionPath, storage, resolveSessionOwnership(ownership), () =>
+			storage.deleteSessionWithArtifacts(sessionPath),
+		);
+	}
+
+	/**
+	 * Run a delete under a scoped claim of the id `sessionPath`'s header names. A transcript without
+	 * a readable header names no session a claim could cover; a live holder always has a valid one.
+	 */
+	static async #deleteUnderHeaderClaim(
+		sessionPath: string,
+		storage: SessionStorage,
+		ownership: ResolvedSessionOwnership,
+		remove: () => Promise<void>,
+	): Promise<void> {
+		const header = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, {
+			growing: true,
+		});
+		if (header.ok) await withScopedSessionClaim(ownership, header.inspection.sessionId, "delete", remove);
+		else await remove();
+	}
+
+	static async #deleteAuthorizedCandidate(sessionPath: string, headerCwd: string): Promise<void> {
 		const projectGjcDir = path.join(path.resolve(headerCwd), ".gjc");
 		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
 			const relativePath = path.relative(projectGjcDir, path.resolve(sessionPath)).split(path.sep).join("/");

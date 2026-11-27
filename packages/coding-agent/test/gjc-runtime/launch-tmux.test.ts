@@ -44,6 +44,11 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
 import { observeProcessIncarnation } from "../../src/sdk/broker/process-incarnation";
+import {
+	probeSessionOwner,
+	SessionOwnershipTestHooks,
+	sessionOwnershipCounters,
+} from "../../src/session/session-ownership";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -1398,6 +1403,42 @@ describe("default GJC tmux launch", () => {
 			false,
 		);
 		expect(calls.find(call => call.args[0] === "new-session")?.args.at(-1)).toContain("--resume");
+	});
+
+	it("targeted resume under enforce leaves every claim to the inner process: the launcher claims nothing (design §1 row 21)", async () => {
+		// The owners directory lives under this test's own home, never the operator's.
+		const previousHome = SessionOwnershipTestHooks.homeOverride;
+		SessionOwnershipTestHooks.homeOverride = fs.realpathSync(
+			fs.mkdtempSync(path.join(launchTestRoot, "owners-home-")),
+		);
+		SessionOwnershipTestHooks.mode = "enforce";
+		try {
+			const before = sessionOwnershipCounters();
+			const calls: string[][] = [];
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ tmux: true, resume: "abc123" }),
+				rawArgs: ["--tmux", "--resume", "abc123"],
+				cwd: "/repo",
+				env: {},
+				argv: ["bun", "packages/coding-agent/src/cli.ts"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(handled).toBe(true);
+			expect(calls.find(call => call[0] === "new-session")?.at(-1)).toContain("abc123");
+			expect(sessionOwnershipCounters()).toEqual(before);
+			expect(await probeSessionOwner("abc123")).toEqual({ state: "free" });
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			if (previousHome === undefined) delete SessionOwnershipTestHooks.homeOverride;
+			else SessionOwnershipTestHooks.homeOverride = previousHome;
+		}
 	});
 
 	it("targeted resume launches inner session resolver instead of branch tmux attach", () => {
