@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
-import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpPromptPayload, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
