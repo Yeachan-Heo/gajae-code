@@ -638,7 +638,7 @@ Operator notes:
 - **What the default `enforce` changes for users:**
   - A second terminal that resumes a session another terminal has open (`gjc --resume <id>`, the `--resume` picker, `/resume`) shows the held-session warning naming the holder, with **Fork into a new session** and **Cancel**.
   - Picking up on a PC a session started from a phone or a bot (Gajae Mobile, Telegram, `gjc acp`, `gjc sdk`) while the host the broker launched for it is still running shows the same warning with **Continue here**, which moves the session to this terminal between turns. Once that host has exited, the session opens with no warning.
-  - `gjc -p --resume <id>` of a held session exits 1 and names the holder on stderr, before any model call.
+  - `gjc -p --resume <id>` of a held session exits 1 and names the holder on stderr, before any model call. So does `gjc -p --continue` when the most recent session is held (a script run while a TUI has it open); in a terminal, `gjc --continue` and `autoResume` start a new session instead and say why.
   - Starring, unstarring or deleting a held session in the picker is refused with a message naming the holder, and a broker `session.delete` of a held session answers `live_session`.
   - Remote clients (ACP `session/load`, `gjc sdk session send`, the notification daemons) still attach to the process that holds the session; their prompts run there.
 - **Opting out:** `gjc config set session.ownership.mode observe` (claims and counts, never refuses) or `off` (no claims at all) in the global config; restart running gjc processes afterwards (below). Hosts the broker launches follow that file too.
