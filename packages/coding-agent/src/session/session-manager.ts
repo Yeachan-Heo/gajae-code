@@ -187,6 +187,7 @@ import {
 	attemptSessionClaim,
 	claimRefusal,
 	claimsUnder,
+	probeHeldSessions,
 	type ResolvedSessionOwnership,
 	resolveSessionOwnership,
 	type SessionClaimAttempt,
@@ -8219,6 +8220,8 @@ export class SessionManager {
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
 	#commitGen = 0;
+	/** Set only while `forkFrom` builds a fork whose caller switches to it next: no breadcrumb yet. */
+	#deferForkBreadcrumb = false;
 	/** Failed staged persistence retains its exact writer and temporary pathname for retryable cleanup. */
 	/** Candidate-owned session publication state; set only by staged factories. */
 	#stagedPublication:
@@ -10649,6 +10652,7 @@ export class SessionManager {
 
 	#writeTerminalBreadcrumb(sessionFile: string): void {
 		if (this.#stagedPublication && !this.#stagedPublication.committed) return;
+		if (this.#deferForkBreadcrumb) return;
 		writeTerminalBreadcrumb(this.cwd, sessionFile);
 	}
 
@@ -10696,8 +10700,18 @@ export class SessionManager {
 		this.#newSessionSync();
 	}
 
-	/** Switch to a different session file (used for resume and branching). */
+	/**
+	 * Switch to a different session file (used for resume and branching). Under enforce, a target
+	 * another process holds is refused with {@link SessionHeldError} before anything changes.
+	 */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
+		return this.withSwitchTargetAdmission(sessionFile, () => this.#setSessionFileAdmitted(sessionFile, options));
+	}
+
+	async #setSessionFileAdmitted(
+		sessionFile: string,
+		options?: { deferEphemeralArtifactRetirement?: boolean },
+	): Promise<void> {
 		using _rotation = this.#ownershipClaims.transition();
 		this.#assertArtifactOpen();
 		this.#assertRecoveryHydrationWritable();
@@ -23857,7 +23871,7 @@ export class SessionManager {
 				}
 			}
 			await this.#initSessionFile(fresh.sessionFile);
-			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			if (!this.#deferForkBreadcrumb) writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
 		} catch (error) {
 			try {
@@ -24065,12 +24079,20 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		ownership?: SessionOwnershipDecision,
+		options: {
+			/**
+			 * `false` when the caller switches to the fork next: the switch moves the terminal
+			 * breadcrumb once it lands, so an abandoned fork never becomes `--continue`'s target.
+			 */
+			readonly writeBreadcrumb?: boolean;
+		} = {},
 	): Promise<SessionManager> {
 		const owner = resolveSessionOwnership(ownership);
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, owner, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
+		manager.#deferForkBreadcrumb = options.writeBreadcrumb === false;
 		let managedSourcePath = sourcePath;
 		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
 			const resolvedSource = path.resolve(sourcePath);
@@ -24130,8 +24152,10 @@ export class SessionManager {
 				if (
 					inspected.ok &&
 					(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
-				)
+				) {
+					manager.#deferForkBreadcrumb = false;
 					return manager;
+				}
 			}
 			if (manager.#boundedManagedSource && sourceSize <= eagerHydrationMaxBytes()) {
 				const boundedSource = manager.#boundedManagedSource;
@@ -24180,7 +24204,7 @@ export class SessionManager {
 		manager.#applyFreshSessionMetadata(fresh);
 		manager.#commitResidentTextStoreTransition(transition);
 		manager.#retireEphemeralArtifacts();
-		if (fresh.sessionFile) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
+		if (fresh.sessionFile && !manager.#deferForkBreadcrumb) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (manager.#ownershipClaims.claiming) await manager.#ownershipClaims.claim(fresh.sessionId);
 		try {
@@ -24190,6 +24214,7 @@ export class SessionManager {
 			manager.#ownershipClaims.releaseAll();
 			throw error;
 		}
+		manager.#deferForkBreadcrumb = false;
 		return manager;
 	}
 
@@ -24655,6 +24680,59 @@ export class SessionManager {
 		const refusal = claimRefusal(owner, sessionId, attempt);
 		if (refusal) throw refusal;
 		return attempt.status === "claimed" ? attempt.claim : undefined;
+	}
+
+	/**
+	 * Enforce's admission of a switch target (design §1 rows 3 and 9): `open`'s pre-claim of the
+	 * target's header id, taken before the switch emits any event or begins its transition. It throws
+	 * {@link SessionHeldError} for a session another process holds; otherwise the caller keeps the
+	 * returned claim until the rotation's own claim of the target has landed, and then releases it.
+	 * `undefined`, with nothing awaited, outside enforce, so other modes keep their ordering.
+	 */
+	switchTargetAdmission(sessionFile: string): Promise<SessionOwnerClaim | undefined> | undefined {
+		const owner = this.#ownershipClaims.ownership;
+		if (owner === "exempt" || owner.mode !== "enforce") return undefined;
+		return SessionManager.#admitExistingTranscript(owner, sessionFile, this.#storage);
+	}
+
+	/**
+	 * Run `run` under {@link switchTargetAdmission}'s claim of `sessionFile`, released once `run`
+	 * settles. Outside enforce `run` is called at once, with nothing awaited before it.
+	 */
+	withSwitchTargetAdmission<T>(sessionFile: string, run: () => Promise<T>): Promise<T> {
+		const admission = this.switchTargetAdmission(sessionFile);
+		return admission ? SessionManager.#runAdmitted(admission, run) : run();
+	}
+
+	static async #runAdmitted<T>(admission: Promise<SessionOwnerClaim | undefined>, run: () => Promise<T>): Promise<T> {
+		const claim = await admission;
+		try {
+			return await run();
+		} finally {
+			claim?.release();
+		}
+	}
+
+	/**
+	 * Enforce's refusal for the session in an existing transcript that another process holds, from a
+	 * probe of its header id: what an interactive launch warns about before it opens or forks
+	 * (design §3.1). `undefined`, with nothing awaited, outside enforce.
+	 */
+	static probeHeldTranscript(
+		filePath: string,
+		ownership?: SessionOwnershipDecision,
+	): Promise<SessionHeldError | undefined> | undefined {
+		const owner = resolveSessionOwnership(ownership);
+		if (owner === "exempt" || owner.mode !== "enforce") return undefined;
+		const header = inspectTranscriptHeaderBounded(
+			filePath,
+			new FileSessionStorage(),
+			BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+			{ growing: true },
+		);
+		if (!header.ok) return undefined;
+		const sessionId = header.inspection.sessionId;
+		return probeHeldSessions(owner, [sessionId])?.then(held => held.get(sessionId));
 	}
 
 	static async #openAdmitted(
