@@ -577,12 +577,21 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		// A terminal id, whatever runs the test: tmux and a stdin TTY take precedence over kitty's id,
 		// so clear tmux's and read the breadcrumb path back from the same resolver gjc uses.
 		const terminalEnv = ["TMUX", "TMUX_PANE", "KITTY_WINDOW_ID"].map(key => [key, process.env[key]] as const);
+		const restoreTerminalEnv = () => {
+			for (const [key, value] of terminalEnv) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		};
 		delete process.env.TMUX;
 		delete process.env.TMUX_PANE;
 		process.env.KITTY_WINDOW_ID = "held-fork-test";
 		const terminal = getTerminalId();
-		if (!terminal) throw new Error("expected a terminal id");
-		const breadcrumb = path.join(getTerminalSessionsDir(), terminal);
+		const breadcrumb = terminal && path.join(getTerminalSessionsDir(), terminal);
+		if (!breadcrumb) {
+			restoreTerminalEnv();
+			throw new Error("expected a terminal id");
+		}
 		const previousBreadcrumb = (await Bun.file(breadcrumb).exists()) ? await Bun.file(breadcrumb).text() : undefined;
 		const { session } = await createAgentSession({
 			cwd: place.cwd,
@@ -602,6 +611,9 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			enableMCP: false,
 			enableLsp: false,
 			toolNames: ["__none__"],
+		}).catch(error => {
+			restoreTerminalEnv();
+			throw error;
 		});
 		const ui = new TUI(new VirtualTerminal(80, 12));
 		try {
@@ -647,10 +659,7 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			expect(await transcripts()).toEqual(before);
 		} finally {
 			ui.stop();
-			for (const [key, value] of terminalEnv) {
-				if (value === undefined) delete process.env[key];
-				else process.env[key] = value;
-			}
+			restoreTerminalEnv();
 			if (previousBreadcrumb === undefined) await fs.rm(breadcrumb, { force: true });
 			else await Bun.write(breadcrumb, previousBreadcrumb);
 			await session.dispose();
