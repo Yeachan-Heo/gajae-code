@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
-import { classifyFallbackTrigger, isForbiddenAuthFailure } from "../src/utils/fallback-transport";
+import {
+	classifyFallbackTrigger,
+	isForbiddenAuthFailure,
+	isRejectedAccessTokenFailure,
+} from "../src/utils/fallback-transport";
 
 /**
  * The transport collapses 401 and 403 into a single `auth` class. These cases
@@ -134,5 +138,23 @@ describe("fallback transport — auth disposition", () => {
 		expect(trigger.class).toBe("auth");
 		expect(trigger.authDisposition).toBe("credential");
 		expect(trigger.retryAfterMs).toBe(2000);
+	});
+
+	it("recognizes a rejected bearer token from a 401 or a typed token code", () => {
+		expect(isRejectedAccessTokenFailure(facts(401, "token_expired"))).toBe(true);
+		expect(isRejectedAccessTokenFailure(facts(401))).toBe(true);
+		expect(isRejectedAccessTokenFailure(facts(undefined, "invalid_token"))).toBe(true);
+		expect(
+			isRejectedAccessTokenFailure({ kind: "transport", status: 401, anthropicErrorType: "authentication_error" }),
+		).toBe(true);
+	});
+
+	it("does not treat forbidden, quota, or non-auth failures as a rejected token", () => {
+		expect(isRejectedAccessTokenFailure(facts(403))).toBe(false);
+		expect(isRejectedAccessTokenFailure(facts(401, "forbidden"))).toBe(false);
+		expect(isRejectedAccessTokenFailure(facts(403, "invalid_api_key"))).toBe(false);
+		expect(isRejectedAccessTokenFailure(facts(429))).toBe(false);
+		expect(isRejectedAccessTokenFailure(facts(401, "insufficient_quota"))).toBe(false);
+		expect(isRejectedAccessTokenFailure(undefined)).toBe(false);
 	});
 });

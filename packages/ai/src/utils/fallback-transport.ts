@@ -450,3 +450,25 @@ export function isForbiddenAuthFailure(errorOrFacts: TransportFailureFacts | Fal
 	const trigger = classifyFallbackTrigger(errorOrFacts);
 	return trigger.class === "auth" && trigger.authDisposition === "forbidden";
 }
+
+/**
+ * True when the provider rejected the bearer token itself: a typed
+ * `token_expired` / `invalid_token` code, or an HTTP 401 whose codes name a
+ * credential fault rather than `forbidden`. For an OAuth credential this means
+ * the access token is dead even if its recorded expiry is still in the future
+ * (providers can revoke or shorten access tokens server-side), so the caller
+ * should refresh it instead of resending it until local expiry.
+ */
+export function isRejectedAccessTokenFailure(
+	errorOrFacts: TransportFailureFacts | FallbackTriggerInput | unknown,
+): boolean {
+	const facts = transportFailureFacts(errorOrFacts);
+	if (!facts) return false;
+	const trigger = classifyFallbackTrigger(facts);
+	if (trigger.class !== "auth" || trigger.authDisposition !== "credential") return false;
+	if (facts.status === 401) return true;
+	return [facts.openaiErrorCode, facts.anthropicErrorType, facts.providerCode].some(code => {
+		const normalized = code?.toLowerCase();
+		return normalized === "token_expired" || normalized === "invalid_token";
+	});
+}

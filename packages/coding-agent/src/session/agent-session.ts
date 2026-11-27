@@ -128,6 +128,7 @@ import {
 	isContextOverflow,
 	isFastModeEffectiveForProvider,
 	isImageOnlyModel,
+	isSqliteError,
 	isUsageLimitError,
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
@@ -146,6 +147,7 @@ import {
 	type FallbackAttemptToken,
 	type FallbackTrigger,
 	type FallbackTriggerClass,
+	isRejectedAccessTokenFailure,
 	PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE,
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
@@ -4399,6 +4401,7 @@ export class AgentSession {
 		this.#managedFallbackNextCredentialOverride = undefined;
 		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 		this.#codexCredentialModelUnavailableRetried = false;
+		this.#rejectedOAuthRefreshTriedRows.clear();
 	}
 
 	#markRetryReplayUnsafe(): void {
@@ -4456,6 +4459,12 @@ export class AgentSession {
 	#managedFallbackQuotaCeilingModels = new Set<string>();
 	/** One content-free retry is allowed after Codex says the active account lacks the model. */
 	#codexCredentialModelUnavailableRetried = false;
+	/**
+	 * OAuth rows already force-refreshed this prompt after the provider rejected
+	 * their unexpired access token. One refresh per row per prompt: a second
+	 * rejection of the fresh token is a real auth failure, not a stale token.
+	 */
+	#rejectedOAuthRefreshTriedRows = new Set<number>();
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
@@ -4485,7 +4494,11 @@ export class AgentSession {
 	/** Credential rows tried by managed fallback for each canonical model and credential kind. */
 	#managedFallbackActiveCredentialRows = new Map<string, Map<string, Set<number>>>();
 	/** Currently captured credential after a managed request resolves its API key for tracking same-turn rows. */
-	#managedFallbackCapturedCredential = new Map<string, { credentialKind: string; rowId: number }>();
+	#managedFallbackCapturedCredential = new Map<string, { credentialKind: string; rowId: number; access?: string }>();
+	/** Access token that was actually used for a failed OAuth request, captured to detect peer rotation during recovery. */
+	#rejectedOAuthAccessTokenSnapshot: string | undefined;
+	/** Row ID of the OAuth credential actually used for the failed request, captured to detect peer rotation. */
+	#rejectedOAuthCredentialRowId: number | undefined;
 	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
 	#managedFallbackNextCredentialOverride:
 		| { modelKey: string; storageProvider: string; rowId: number; credentialKind: string }
@@ -6941,18 +6954,21 @@ export class AgentSession {
 					});
 					if (isAuthenticated(apiKey)) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+						this.#captureRejectedOAuthCredentialSnapshot(model);
 						return apiKey;
 					}
 					// The preselected credential is no longer available; try to resolve another one of the same kind.
 					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(model, override.credentialKind);
 					if (fallbackApiKey !== undefined) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+						this.#captureRejectedOAuthCredentialSnapshot(model);
 						return fallbackApiKey;
 					}
 					throw new Error("Selected managed fallback credential is no longer available");
 				}
 				const apiKey = await invokeOriginalGetApiKey(provider);
 				if (shouldCapture && model && isAuthenticated(apiKey)) this.#captureManagedFallbackActiveCredential(model);
+				this.#captureRejectedOAuthCredentialSnapshot(model);
 				return apiKey;
 			};
 			this.agent.getApiKey = managedGetApiKey;
@@ -31443,6 +31459,106 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * Whether a content-free 401 on the session's OAuth row should force one
+	 * refresh of that row before anything else. Expiry-driven refresh only fires
+	 * near the token's recorded expiry, so a token the provider revoked or expired
+	 * early would otherwise be resent, and rejected, until that expiry passes.
+	 * Pinned credentials (`--api-key`, `--credential`, config keys) and API-key
+	 * rows are never touched.
+	 */
+	#canRefreshRejectedOAuthCredential(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error" || assistantMessageHasVisibleOrToolContent(message)) return false;
+		if (!isRejectedAccessTokenFailure(message.transportFailure)) return false;
+		const model = this.model;
+		if (!model || model.provider !== message.provider) return false;
+		const authStorage = this.#modelRegistry.authStorage;
+		const provider = model.provider;
+		if (
+			this.#modelRegistry.getSessionCredentialType(provider, this.credentialSessionId) !== "oauth" ||
+			this.#hasManagedFallbackCredentialPin(provider) ||
+			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+		) {
+			return false;
+		}
+		const rowId = authStorage.getSessionCredentialRowId(provider, this.credentialSessionId);
+		return rowId !== undefined && !this.#rejectedOAuthRefreshTriedRows.has(rowId);
+	}
+
+	/**
+	 * Force one refresh of the session's OAuth row after the provider rejected its
+	 * access token. Returns true only when the session now resolves a different
+	 * key, so the caller can replay the content-free request on the fresh token.
+	 * A definitive refresh failure disables the row inside AuthStorage, which
+	 * surfaces as a missing-credentials error on the next request.
+	 */
+	async #refreshRejectedOAuthCredential(): Promise<boolean> {
+		const model = this.model;
+		if (!model) return false;
+		const authStorage = this.#modelRegistry.authStorage;
+		const credentialSessionId = this.credentialSessionId;
+		const rowId = authStorage.getSessionCredentialRowId(model.provider, credentialSessionId);
+		if (rowId === undefined) return false;
+		this.#rejectedOAuthRefreshTriedRows.add(rowId);
+
+		// Capture the current credential snapshot to avoid refreshing if another
+		// request has already rotated the row to a different access token.
+		const credentialSnapshot = authStorage.getOAuthCredentialByRowId(model.provider, rowId);
+		if (!credentialSnapshot) return false;
+
+		// Fail closed if the credential identity could not be established at dispatch time.
+		// Without knowing which credential was actually used for the failed request, we cannot
+		// safely detect if another session has rotated the credential.
+		if (this.#rejectedOAuthAccessTokenSnapshot === undefined || this.#rejectedOAuthCredentialRowId === undefined) {
+			return false;
+		}
+
+		// Check if the row ID has changed, indicating the credential was rotated to a different row.
+		if (this.#rejectedOAuthCredentialRowId !== rowId) {
+			return false;
+		}
+
+		// Check if the access token within the same row has been rotated by another session.
+		// If the snapshot differs from the current row's access token, another session has rotated
+		// the row, so we should not refresh a token that was not the one that was rejected.
+		if (this.#rejectedOAuthAccessTokenSnapshot !== credentialSnapshot.access) {
+			// The credential was rotated by another session; do not refresh the replacement.
+			return false;
+		}
+
+		let rejectedApiKey: string | undefined;
+		try {
+			rejectedApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
+		} catch (error) {
+			if (isSqliteError(error)) throw error;
+			return false;
+		}
+		if (!isAuthenticated(rejectedApiKey)) return false;
+
+		try {
+			const refreshed = await authStorage.refreshRejectedOAuthCredential(model.provider, rejectedApiKey, {
+				sessionId: credentialSessionId,
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				owner: this.#modelRegistry.getAuthStorageOwner(),
+				rejectedCredentialId: { id: rowId, access: credentialSnapshot.access },
+			});
+			if (!refreshed) return false;
+			let freshApiKey: string | undefined;
+			try {
+				freshApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
+			} catch (error) {
+				if (isSqliteError(error)) throw error;
+				return false;
+			}
+			return isAuthenticated(freshApiKey) && freshApiKey !== rejectedApiKey;
+		} finally {
+			// Clear the snapshots so they don't affect subsequent refresh attempts
+			this.#rejectedOAuthAccessTokenSnapshot = undefined;
+			this.#rejectedOAuthCredentialRowId = undefined;
+		}
+	}
+
 	#canRotateCodexCredential(message: AssistantMessage): boolean {
 		if (!this.#isCodexCredentialModelUnavailable(message)) return false;
 		if (this.#codexCredentialModelUnavailableRetried || assistantMessageHasVisibleOrToolContent(message))
@@ -31522,6 +31638,9 @@ export class AgentSession {
 			this.settings.get("retry.enabled") !== false
 		)
 			return true;
+		// A rejected OAuth access token gets one forced refresh and a same-turn
+		// replay even when auth errors are otherwise terminal for this session.
+		if (this.#canRefreshRejectedOAuthCredential(message)) return true;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		// An account-specific model rejection that cannot rotate to another
 		// credential stays terminal only on the session's own retry path; managed
@@ -32839,9 +32958,31 @@ export class AgentSession {
 		const rowId = authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId);
 		const credentialKind = authStorage.getSessionCredentialType(model.provider, this.credentialSessionId);
 		if (rowId !== undefined && credentialKind !== undefined) {
-			this.#managedFallbackCapturedCredential.set(modelKey, { credentialKind, rowId });
+			// Also capture the OAuth access token at the time of the request to detect
+			// if another session has rotated the credential by the time rejection recovery runs.
+			const access =
+				credentialKind === "oauth"
+					? authStorage.getOAuthCredentialByRowId(model.provider, rowId)?.access
+					: undefined;
+			this.#managedFallbackCapturedCredential.set(modelKey, { credentialKind, rowId, access });
 			const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
 			triedRows.add(rowId);
+		}
+	}
+
+	#captureRejectedOAuthCredentialSnapshot(model: Model | undefined): void {
+		if (!model) return;
+		const authStorage = this.#modelRegistry.authStorage;
+		const rowId = authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId);
+		const credentialKind = authStorage.getSessionCredentialType(model.provider, this.credentialSessionId);
+		// Only capture for OAuth credentials. For bare defaults, only capture if not already captured
+		// by managed fallback (which is indicated by the absence of a dispatched credential snapshot).
+		if (rowId !== undefined && credentialKind === "oauth" && this.#rejectedOAuthAccessTokenSnapshot === undefined) {
+			const access = authStorage.getOAuthCredentialByRowId(model.provider, rowId)?.access;
+			if (access !== undefined) {
+				this.#rejectedOAuthAccessTokenSnapshot = access;
+				this.#rejectedOAuthCredentialRowId = rowId;
+			}
 		}
 	}
 
@@ -33089,6 +33230,7 @@ export class AgentSession {
 				: false;
 		}
 		const canRotateCodexCredential = this.#canRotateCodexCredential(message);
+		const canRefreshRejectedOAuthCredential = this.#canRefreshRejectedOAuthCredential(message);
 		if (this.#isCodexCredentialModelUnavailable(message) && !canRotateCodexCredential && !managedFallback) {
 			return managedOutcome
 				? {
@@ -33100,7 +33242,12 @@ export class AgentSession {
 		// retry.enabled=false always surfaces immediately, matching the explicit
 		// user opt-out. The managed provider-fallback chain keeps its own
 		// availability policy.
-		if (!retrySettings.enabled && !managedFallback && !canRotateCodexCredential) {
+		if (
+			!retrySettings.enabled &&
+			!managedFallback &&
+			!canRotateCodexCredential &&
+			!canRefreshRejectedOAuthCredential
+		) {
 			return managedOutcome
 				? {
 						type: "terminal",
@@ -33202,6 +33349,36 @@ export class AgentSession {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
 			credentialRotated = mark === "rotated" || (managedFallback && mark === "alternate");
+			if (!credentialRotated && !managedFallback) {
+				return managedOutcome
+					? {
+							type: "terminal",
+							terminal: { stopReason: "error", messages: [message] },
+						}
+					: false;
+			}
+		}
+		// The provider rejected an OAuth access token the store still considers
+		// fresh. Refresh that row once and replay on the new token; when the
+		// refresh fails, fall through to the existing auth-failure handling.
+		if (canRefreshRejectedOAuthCredential && trigger.class === "auth" && !providerRetryCeilingReached) {
+			// Capture the access token that was actually used for the failed request from the
+			// managed fallback capture if available, as it was recorded when the request was made.
+			// This allows us to detect if another session has rotated the credential between the
+			// failed request and the refresh attempt.
+			if (this.model) {
+				const modelKey = this.#managedFallbackCanonicalModelKey(this.model);
+				const managedCapture = this.#managedFallbackCapturedCredential.get(modelKey);
+				if (managedCapture?.access !== undefined) {
+					// Use the credential identity that was captured when the request was made
+					this.#rejectedOAuthAccessTokenSnapshot = managedCapture.access;
+					this.#rejectedOAuthCredentialRowId = managedCapture.rowId;
+				}
+				// For ordinary (non-managed-fallback) requests, the credential identity cannot be
+				// reliably established after the 401. The recovery path will fail closed if credentials
+				// are undefined, preventing refresh of a potentially rotated credential.
+			}
+			credentialRotated = await this.#refreshRejectedOAuthCredential();
 			if (!credentialRotated && !managedFallback) {
 				return managedOutcome
 					? {
