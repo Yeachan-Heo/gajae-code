@@ -6521,41 +6521,17 @@ function rehydrateColdSpillEntry(
 	return cloneSessionEntry(entry);
 }
 
-async function truncateForPersistence(
-	obj: FileEntry,
-	blobStore: BlobStore,
-	key?: string,
-): Promise<FileEntry>;
-async function truncateForPersistence(
-	obj: string,
-	blobStore: BlobStore,
-	key?: string,
-): Promise<string>;
-async function truncateForPersistence(
-	obj: unknown[],
-	blobStore: BlobStore,
-	key?: string,
-): Promise<unknown[]>;
-async function truncateForPersistence(
-	obj: object,
-	blobStore: BlobStore,
-	key?: string,
-): Promise<object>;
-async function truncateForPersistence(
-	obj: unknown,
-	blobStore: BlobStore,
-	key?: string,
-): Promise<unknown>;
+async function truncateForPersistence(obj: FileEntry, blobStore: BlobStore, key?: string): Promise<FileEntry>;
+async function truncateForPersistence(obj: string, blobStore: BlobStore, key?: string): Promise<string>;
+async function truncateForPersistence(obj: unknown[], blobStore: BlobStore, key?: string): Promise<unknown[]>;
+async function truncateForPersistence(obj: object, blobStore: BlobStore, key?: string): Promise<object>;
+async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): Promise<unknown>;
 async function truncateForPersistence(
 	obj: null | undefined,
 	blobStore: BlobStore,
 	key?: string,
 ): Promise<null | undefined>;
-async function truncateForPersistence(
-	obj: unknown,
-	blobStore: BlobStore,
-	key?: string,
-): Promise<unknown> {
+async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): Promise<unknown> {
 	if (obj === null || obj === undefined) return obj;
 
 	if (typeof obj === "string") {
@@ -6601,7 +6577,6 @@ async function truncateForPersistence(
 
 	if (typeof obj === "object") {
 		let changed = false;
-
 		const entries: Array<readonly [string, unknown]> = await Promise.all(
 			Object.entries(obj).flatMap(([childKey, value]) => {
 				// Strip transient/redundant properties that shouldn't be persisted.
@@ -6622,22 +6597,22 @@ async function truncateForPersistence(
 							let imageUrlChanged = false;
 							const imageUrlEntries = await Promise.all(
 								Object.entries(value).map(async ([imageUrlKey, imageUrlValue]) => {
-						const persistenceKey = imageUrlKey === "url" ? "image_url.url" : imageUrlKey;
-						const newImageUrlValue = await truncateForPersistence(
-							imageUrlValue,
-							blobStore,
-							persistenceKey,
-						);
-						if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
-						return [imageUrlKey, newImageUrlValue] as const;
-					}),
-				);
-					if (imageUrlChanged) {
-						changed = true;
-						return [childKey, Object.fromEntries(imageUrlEntries)] as const;
-					}
-				}
-				const newValue = await truncateForPersistence(value, blobStore, childKey);
+									const persistenceKey = imageUrlKey === "url" ? "image_url.url" : imageUrlKey;
+									const newImageUrlValue = await truncateForPersistence(
+										imageUrlValue,
+										blobStore,
+										persistenceKey,
+									);
+									if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
+									return [imageUrlKey, newImageUrlValue] as const;
+								}),
+							);
+							if (imageUrlChanged) {
+								changed = true;
+								return [childKey, Object.fromEntries(imageUrlEntries)] as const;
+							}
+						}
+						const newValue = await truncateForPersistence(value, blobStore, childKey);
 						if (newValue !== value) changed = true;
 						return [childKey, newValue] as const;
 					})(),
@@ -6724,7 +6699,6 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 
 	if (typeof obj === "object") {
 		let changed = false;
-
 		const entries: Array<readonly [string, unknown]> = [];
 		for (const [childKey, value] of Object.entries(obj)) {
 			if (childKey === "partialJson" || childKey === "jsonlEvents") {
@@ -6740,11 +6714,7 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 				let imageUrlChanged = false;
 				const imageUrlEntries = Object.entries(value).map(([imageUrlKey, imageUrlValue]) => {
 					const persistenceKey = imageUrlKey === "url" ? "image_url.url" : imageUrlKey;
-					const newImageUrlValue = truncateForPersistenceSync(
-						imageUrlValue,
-						blobStore,
-						persistenceKey,
-					);
+					const newImageUrlValue = truncateForPersistenceSync(imageUrlValue, blobStore, persistenceKey);
 					if (newImageUrlValue !== imageUrlValue) imageUrlChanged = true;
 					return [imageUrlKey, newImageUrlValue] as const;
 				});
