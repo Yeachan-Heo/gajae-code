@@ -474,7 +474,8 @@ describe("GJC native skill-state hooks", () => {
 				["--json --quick idea", 0.6, "flag:--quick"],
 				["--trace --json --deep idea", 0.35, "flag:--deep"],
 				["--session-id abc --threshold=0.4 idea", 0.4, "flag:--threshold"],
-				["--threshold-source note --json --threshold 0.25 idea", 0.25, "flag:--threshold"],
+				["--threshold-source note --json --threshold 0.25 idea", 0.25, "note"],
+				["--json --threshold 0.25 idea", 0.25, "flag:--threshold"],
 			];
 			for (const [index, [args, threshold, source]] of cases.entries()) {
 				const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-hooks-order-"));

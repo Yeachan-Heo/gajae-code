@@ -33,6 +33,15 @@ const DEEP_INTERVIEW_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
 	"--deep",
 ]);
 
+/**
+ * Every leading `gjc deep-interview` option name. A deep-interview plugin
+ * sub-skill must not claim one as its `activation_arg`: the sub-skill
+ * preprocessor would consume the token before threshold resolution sees it.
+ */
+export const DEEP_INTERVIEW_RESERVED_OPTIONS: ReadonlySet<string> = new Set(
+	[...DEEP_INTERVIEW_BOOLEAN_FLAGS, ...DEEP_INTERVIEW_VALUE_FLAGS].map(flag => flag.slice(2)),
+);
+
 export interface ResolvedAmbiguityThreshold {
 	threshold: number;
 	source: string;
@@ -87,7 +96,8 @@ export async function resolveSkillActivationAmbiguityThreshold(
 	options: { args?: string; agentDir?: string } = {},
 ): Promise<ResolvedAmbiguityThreshold> {
 	const leading = parseLeadingThresholdOptions(options.args);
-	if (leading.threshold !== undefined) return { threshold: leading.threshold, source: "flag:--threshold" };
+	if (leading.threshold !== undefined)
+		return { threshold: leading.threshold, source: leading.thresholdSource || "flag:--threshold" };
 	const configured = await resolveConfiguredAmbiguityThreshold(cwd, options.agentDir);
 	if (configured) return configured;
 	if (leading.resolutions.length === 1) {
@@ -99,6 +109,8 @@ export async function resolveSkillActivationAmbiguityThreshold(
 
 interface LeadingThresholdOptions {
 	threshold?: number;
+	/** `--threshold-source <s>`, recorded as the source of an explicit `--threshold` (CLI parity). */
+	thresholdSource?: string;
 	resolutions: DeepInterviewResolution[];
 }
 
@@ -125,6 +137,7 @@ export function parseLeadingThresholdOptions(args: string | undefined): LeadingT
 		const name = equals > 0 ? token.slice(0, equals) : token;
 		if (!DEEP_INTERVIEW_VALUE_FLAGS.has(name)) break;
 		const value = equals > 0 ? token.slice(equals + 1) : tokens[++index];
+		if (name === "--threshold-source" && value?.trim()) result.thresholdSource = value.trim();
 		if (name === "--threshold") {
 			const parsed = Number(value);
 			if (value !== undefined && Number.isFinite(parsed) && parsed > 0 && parsed <= 1) result.threshold = parsed;

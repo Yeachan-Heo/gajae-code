@@ -5,6 +5,7 @@ import {
 	type GjcPluginRegistryEntry,
 	type NormalizedGjcPluginBundle,
 	type NormalizedGjcPluginSurfaces,
+	validateBinding,
 	validateInstallPlan,
 } from "../src/extensibility/gjc-plugins";
 
@@ -87,5 +88,40 @@ describe("GJC plugin install-time collision validation", () => {
 		expect(() =>
 			validateInstallPlan(bundle("same", { tools: [toolSurface] }), [entry("same", { tools: [toolSurface] })]),
 		).not.toThrow();
+	});
+});
+
+describe("deep-interview sub-skill activation_arg vs built-in options (#7316)", () => {
+	const frontmatter = (binds_to: string, activation_arg: string) => ({
+		name: "probe",
+		binds_to,
+		phase: "interviewing",
+		activation_arg,
+		description: "probe",
+	});
+
+	test.each([
+		"threshold",
+		"quick",
+		"standard",
+		"deep",
+		"json",
+		"trace",
+		"threshold-source",
+		"session-id",
+	])("rejects a deep-interview sub-skill that claims --%s", arg => {
+		let caught: unknown;
+		try {
+			validateBinding(frontmatter("deep-interview", arg));
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(GjcPluginLoadError);
+		expect((caught as GjcPluginLoadError).code).toBe("duplicate_arg");
+		expect((caught as GjcPluginLoadError).message).toContain(`built-in --${arg} option`);
+	});
+
+	test("still accepts a deep-interview sub-skill with a non-reserved activation_arg", () => {
+		expect(() => validateBinding(frontmatter("deep-interview", "design"))).not.toThrow();
 	});
 });
