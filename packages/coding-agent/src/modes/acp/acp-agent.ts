@@ -4717,6 +4717,7 @@ export class AcpAgent implements Agent {
 
 	async #reattachSession(id: string, cwd: string): Promise<void> {
 		if (this.#disposed || this.#knownSessionCwds.get(id) !== cwd) return;
+		const epoch = this.#sessionEpoch(id);
 		const mcpServers = this.#knownSessionMcpServers.get(id) ?? [];
 		try {
 			await this.#attachExisting(id, cwd, mcpServers);
@@ -4724,6 +4725,8 @@ export class AcpAgent implements Agent {
 			if (current) void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		} catch (attachError) {
 			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${String(attachError)}`);
+			// A close that ran meanwhile now owns the session: it is not a recovery failure.
+			if (this.#sessionEpoch(id) !== epoch) return;
 			await this.#reportReattachFailed(id, cwd, attachError);
 		}
 	}
