@@ -74,7 +74,7 @@ import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validatio
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { findOperatorMessage } from "../../session/operator-error-message";
-import { sessionOwnerHolderSummary } from "../../session/session-ownership";
+import { sessionOwnerHolderSummary } from "../../session/session-owner-holder";
 import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
