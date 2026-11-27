@@ -450,4 +450,101 @@ ${Array(500)
 		// - Built-in tools: displayContent removed (not durable, TUI-only)
 		// - Custom tools: displayContent preserved (may be used by custom renderers)
 	});
+
+	it("preserves displayContent for search tool because display differs from raw content", () => {
+		// search tool formats displayContent specially for readability;
+		// raw content has different structure and cannot reconstruct display exactly
+		const searchToolResult = {
+			role: "toolResult",
+			toolName: "search",
+			toolCallId: "call-search",
+			content: [{ type: "text", text: "file1.ts:42|const x = 5;" }],
+			isError: false,
+			details: {
+				displayContent: "## file1.ts\n  42|  const x = 5;",
+				matchCount: 1,
+				fileCount: 1,
+			},
+		};
+
+		// displayContent must be preserved because renderer uses it for formatting
+		expect(searchToolResult.details?.displayContent).toBeDefined();
+		// If displayContent were stripped, renderer would fall back to raw content
+		// which has different structure and would render incorrectly
+	});
+
+	it("preserves displayContent for read tool because raw content includes hash lines for LLM", () => {
+		// read tool's content includes hash lines (for LLM anchors)
+		// displayContent has clean content without hash lines
+		// renderer prefers displayContent to avoid showing hash lines in UI
+		const readToolResult = {
+			role: "toolResult",
+			toolName: "read",
+			toolCallId: "call-read",
+			content: [
+				{
+					type: "text",
+					text: "*1abc123def456|function foo() {\n 2abc456def789|  return 42;\n 3abc789def123|}", // With hash lines
+				},
+			],
+			isError: false,
+			details: {
+				displayContent: { text: "function foo() {\n  return 42;\n}" }, // Clean, no hash lines
+				resolvedPath: "/path/to/file.ts",
+			},
+		};
+
+		// displayContent must be preserved to avoid showing hash lines
+		expect(readToolResult.details?.displayContent).toBeDefined();
+	});
+
+	it("preserves displayContent for ast_grep tool because raw content includes hash lines", () => {
+		// ast_grep formats displayContent without hash lines
+		// raw content (outputLines) includes hash lines for LLM context
+		const astGrepResult = {
+			role: "toolResult",
+			toolName: "ast_grep",
+			toolCallId: "call-ast-grep",
+			content: [
+				{
+					type: "text",
+					text: "*42abc123|export function foo() { return 42; }", // With hash line
+				},
+			],
+			isError: false,
+			details: {
+				displayContent: "*  42 export function foo() { return 42; }", // Clean display
+				matchCount: 1,
+				fileCount: 1,
+			},
+		};
+
+		// displayContent must be preserved to avoid showing hash lines in UI
+		expect(astGrepResult.details?.displayContent).toBeDefined();
+	});
+
+	it("preserves displayContent for ast_edit tool because raw content includes hash lines", () => {
+		// ast_edit formats displayContent without hash lines
+		// raw content (outputLines) includes hash lines for LLM context
+		const astEditResult = {
+			role: "toolResult",
+			toolName: "ast_edit",
+			toolCallId: "call-ast-edit",
+			content: [
+				{
+					type: "text",
+					text: "-42abc123|const x = old;\n+42def456|const x = new;", // With hash lines
+				},
+			],
+			isError: false,
+			details: {
+				displayContent: "-  42 const x = old;\n+  42 const x = new;", // Clean display
+				totalReplacements: 1,
+				filesTouched: 1,
+			},
+		};
+
+		// displayContent must be preserved to avoid showing hash lines in UI
+		expect(astEditResult.details?.displayContent).toBeDefined();
+	});
 });

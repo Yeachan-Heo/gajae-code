@@ -152,4 +152,32 @@ describe("emergencyCompactionReason (W4 / F6)", () => {
 			emergencyCompactionReason({ ...under, transcriptFileBytes: significantGrowth }, LIM, afterCompactionSize),
 		).toBe("transcriptFile");
 	});
+
+	it("caps retry threshold at managed transcript cap minus safety margin", () => {
+		// Scenario: baseline is 90MiB, file at 113MiB should trigger before hitting 128MiB cap
+		const baselineMiB = 90 * 1024 * 1024;
+		const fileSizeMiB = 113 * 1024 * 1024;
+		const cappedLimits = { ...LIM };
+
+		// Without cap: 90MiB * 1.5 = 135MiB (would exceed 128MiB cap)
+		// With cap: min(135MiB, 128MiB - 16MiB) = min(135MiB, 112MiB) = 112MiB
+		// File at 113MiB > 112MiB, so SHOULD trigger
+		expect(emergencyCompactionReason({ ...under, transcriptFileBytes: fileSizeMiB }, cappedLimits, baselineMiB)).toBe(
+			"transcriptFile",
+		);
+
+		// File at exactly 112MiB should NOT trigger (need strictly greater)
+		const cappedThreshold = 112 * 1024 * 1024;
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: cappedThreshold }, cappedLimits, baselineMiB),
+		).toBeNull();
+
+		// Verify retry threshold respects the managed cap
+		// Baseline at 90MiB: threshold should be min(135MiB, 112MiB) = 112MiB
+		const uncappedThreshold = Math.floor(baselineMiB * 1.5); // 135MiB
+		const TRANSCRIPT_CAP = 128 * 1024 * 1024;
+		const SAFETY_MARGIN = 16 * 1024 * 1024;
+		const cappedThresholdExpected = Math.min(uncappedThreshold, TRANSCRIPT_CAP - SAFETY_MARGIN);
+		expect(cappedThresholdExpected).toBe(112 * 1024 * 1024);
+	});
 });

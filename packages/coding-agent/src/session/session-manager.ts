@@ -6524,9 +6524,15 @@ function rehydrateColdSpillEntry(
 /**
  * Check if a tool is a built-in render-only tool where displayContent can be stripped.
  * Custom tools should preserve their details.displayContent.
+ * Note: displayContent serves distinct purpose for all built-in tools and cannot be safely stripped:
+ * - search: display is custom-formatted for readability and cannot be reconstructed from raw LLM output
+ * - read: content includes hash lines (for LLM anchors) but displayContent doesn't; renderer would show hash lines
+ * - ast_grep: same hash-line pattern — displayContent has clean output, raw has hash lines
+ * - ast_edit: same hash-line pattern — displayContent has clean output, raw has hash lines
  */
-function isBuiltInRenderOnlyTool(toolName: string): boolean {
-	return toolName === "read" || toolName === "search" || toolName === "ast-grep" || toolName === "ast-edit";
+function isBuiltInRenderOnlyTool(_toolName: string): boolean {
+	// displayContent is not safe to strip for any of these tools; renderers would display hash lines
+	return false;
 }
 
 async function truncateForPersistence(
