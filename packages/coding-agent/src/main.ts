@@ -2368,7 +2368,13 @@ export async function runRootCommand(
 		}
 		// Continue here's claim (design §13 L1) covers the open below until the open's own claim lands.
 		const handoverAdmission = selection.kind === "selected" ? selection.admission : undefined;
-		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
+		// Released in the `finally` below once loaded; a failed load must release it here.
+		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd }).catch(
+			(error: unknown) => {
+				handoverAdmission?.release();
+				throw error;
+			},
+		);
 		try {
 			const resumeMigrationPolicy =
 				scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
