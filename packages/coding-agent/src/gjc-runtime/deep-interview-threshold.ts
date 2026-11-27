@@ -13,6 +13,26 @@ export const RESOLUTION_THRESHOLDS = {
 
 export type DeepInterviewResolution = keyof typeof RESOLUTION_THRESHOLDS;
 
+/** `gjc deep-interview` options that take a value (shared with the CLI argument parser). */
+export const DEEP_INTERVIEW_VALUE_FLAGS: ReadonlySet<string> = new Set([
+	"--session-id",
+	"--threshold",
+	"--threshold-source",
+	"--stage",
+	"--slug",
+	"--spec",
+	"--handoff",
+]);
+
+/** Valueless `gjc deep-interview` options that may precede the idea. */
+const DEEP_INTERVIEW_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
+	"--trace",
+	"--json",
+	"--quick",
+	"--standard",
+	"--deep",
+]);
+
 export interface ResolvedAmbiguityThreshold {
 	threshold: number;
 	source: string;
@@ -82,29 +102,33 @@ interface LeadingThresholdOptions {
 	resolutions: DeepInterviewResolution[];
 }
 
-/** Read threshold options from the leading `[options]` segment, stopping at the idea text. */
+/**
+ * Read threshold options from the leading `[options]` segment, stopping at the
+ * idea text. Every documented `gjc deep-interview` kickoff option is consumed
+ * (`--trace`, `--json`, `--quick`/`--standard`/`--deep`, and value options such
+ * as `--threshold <n>`, `--threshold=<n>`, or `--session-id <id>`), so their
+ * order does not matter; the first token that is not one of them starts the idea.
+ */
 export function parseLeadingThresholdOptions(args: string | undefined): LeadingThresholdOptions {
 	const tokens = args?.trim().split(/\s+/).filter(Boolean) ?? [];
 	const result: LeadingThresholdOptions = { resolutions: [] };
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
-		if (token === "--quick" || token === "--standard" || token === "--deep") {
-			const resolution = token.slice(2) as DeepInterviewResolution;
-			if (!result.resolutions.includes(resolution)) result.resolutions.push(resolution);
+		if (DEEP_INTERVIEW_BOOLEAN_FLAGS.has(token)) {
+			if (token === "--quick" || token === "--standard" || token === "--deep") {
+				const resolution = token.slice(2) as DeepInterviewResolution;
+				if (!result.resolutions.includes(resolution)) result.resolutions.push(resolution);
+			}
 			continue;
 		}
-		if (token === "--trace") continue;
-		if (token === "--threshold-source") {
-			index++;
-			continue;
+		const equals = token.indexOf("=");
+		const name = equals > 0 ? token.slice(0, equals) : token;
+		if (!DEEP_INTERVIEW_VALUE_FLAGS.has(name)) break;
+		const value = equals > 0 ? token.slice(equals + 1) : tokens[++index];
+		if (name === "--threshold") {
+			const parsed = Number(value);
+			if (value !== undefined && Number.isFinite(parsed) && parsed > 0 && parsed <= 1) result.threshold = parsed;
 		}
-		if (token === "--threshold" || token.startsWith("--threshold=")) {
-			const raw = token === "--threshold" ? tokens[++index] : token.slice("--threshold=".length);
-			const parsed = Number(raw);
-			if (raw !== undefined && Number.isFinite(parsed) && parsed > 0 && parsed <= 1) result.threshold = parsed;
-			continue;
-		}
-		break;
 	}
 	return result;
 }

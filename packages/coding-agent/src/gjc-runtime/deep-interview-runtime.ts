@@ -37,6 +37,7 @@ import {
 	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
 import {
+	DEEP_INTERVIEW_VALUE_FLAGS,
 	DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD,
 	RESOLUTION_THRESHOLDS,
 	resolveConfiguredAmbiguityThreshold,
@@ -172,15 +173,7 @@ class DeepInterviewCommandError extends CommandError {
 	}
 }
 
-const VALUE_FLAGS = new Set([
-	"--session-id",
-	"--threshold",
-	"--threshold-source",
-	"--stage",
-	"--slug",
-	"--spec",
-	"--handoff",
-]);
+const VALUE_FLAGS: ReadonlySet<string> = DEEP_INTERVIEW_VALUE_FLAGS;
 
 // Keep the runtime's transcript and publication bounds aligned with the pure
 // Crystal validator.  These are byte bounds for recovery reads; normal input

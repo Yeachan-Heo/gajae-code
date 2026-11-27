@@ -469,6 +469,28 @@ describe("GJC native skill-state hooks", () => {
 			expect(modeState.threshold_source).toBe("default");
 		});
 
+		it("reads threshold flags after any other documented leading option", async () => {
+			const cases: Array<[string, number, string]> = [
+				["--json --quick idea", 0.6, "flag:--quick"],
+				["--trace --json --deep idea", 0.35, "flag:--deep"],
+				["--session-id abc --threshold=0.4 idea", 0.4, "flag:--threshold"],
+				["--threshold-source note --json --threshold 0.25 idea", 0.25, "flag:--threshold"],
+			];
+			for (const [index, [args, threshold, source]] of cases.entries()) {
+				const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-hooks-order-"));
+				try {
+					const modeState = await seedThreshold(root, `session-option-order-${index}`, { args });
+					expect({ args, threshold: modeState.threshold, source: modeState.threshold_source }).toEqual({
+						args,
+						threshold,
+						source,
+					});
+				} finally {
+					await fs.rm(root, { recursive: true, force: true });
+				}
+			}
+		});
+
 		it("reads options only before the idea, so flag-like idea text never changes the target", async () => {
 			const root = await cwd();
 			const configPath = await writeProjectThreshold(root, 0.2);
