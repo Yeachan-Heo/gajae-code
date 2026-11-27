@@ -1717,8 +1717,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const selectedContent = windowSegments(window)
 			.map(segment => segment.content)
 			.join("\n");
-		// Store displayContent for TUI rendering (will be stripped during JSONL persistence)
-		const displayContentText = selectedContent;
 
 		let usedLegacyHeadTruncation = false;
 		let outputText = partialTailWarning
@@ -1859,6 +1857,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			});
 		}
 		// Add displayContent for TUI rendering (clean content without model-only formatting)
+		// Use selectedContent if available (clean window segments), fall back to stripped outputText
+		const displayContentText =
+			selectedContent.length > 0 ? selectedContent : stripOutputNotice(outputText, details?.meta);
 		if (displayContentText.length > 0) {
 			details.displayContent = { text: displayContentText, startLine: startLineDisplay };
 		}

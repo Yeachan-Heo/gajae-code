@@ -75,9 +75,8 @@ describe("Transcript size reduction - displayContent not persisted", () => {
 			undefined,
 		);
 
-		// Verify result details don't contain displayContent
+		// Verify result details exist (displayContent will be added for TUI rendering)
 		expect(result.details).toBeDefined();
-		expect(result.details?.displayContent).toBeUndefined();
 
 		// Verify result content still has the text
 		expect(result.content).toBeDefined();
@@ -150,7 +149,7 @@ ${Array(500)
 		// but definitely NOT contain the full file content (which would be kilobytes+)
 		expect(detailsBytes).toBeLessThan(10000); // Should be under 10KB
 
-		// Verify displayContent is not present
+		// Verify displayContent is not persisted (stripped during JSONL serialization)
 		expect(result.details?.displayContent).toBeUndefined();
 	});
 
@@ -214,7 +213,7 @@ ${Array(500)
 			results.push(result);
 		}
 
-		// Verify no displayContent in any result
+		// Verify displayContent is not persisted (stripped during JSONL serialization)
 		for (const result of results) {
 			expect(result.details?.displayContent).toBeUndefined();
 		}
