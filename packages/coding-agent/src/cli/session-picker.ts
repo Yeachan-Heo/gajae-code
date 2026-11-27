@@ -13,18 +13,20 @@ import {
 } from "../modes/components/session-selector";
 import { type SessionInfo, SessionManager } from "../session/session-manager";
 import type { SessionHeldError } from "../session/session-ownership";
-import { FileSessionStorage } from "../session/session-storage";
+
+/** The bare picker runs before the process surface is set: its scoped claims name the terminal. */
+const PICKER_OWNERSHIP = { surface: "terminal" } as const;
 
 export async function deleteSessionPickerCandidate(sessionPath: string, explicitSessionDir?: string): Promise<void> {
 	if (!explicitSessionDir) {
-		await SessionManager.deleteManagedCandidate(sessionPath);
+		await SessionManager.deleteManagedCandidate(sessionPath, PICKER_OWNERSHIP);
 		return;
 	}
 	const root = path.resolve(explicitSessionDir);
 	const target = path.resolve(sessionPath);
 	if (!pathIsWithin(root, target))
 		throw new Error("Explicit session deletion escaped the configured session directory.");
-	await new FileSessionStorage().deleteSessionWithArtifacts(target);
+	await SessionManager.deleteExplicitCandidate(target, PICKER_OWNERSHIP);
 }
 
 /**
@@ -95,7 +97,8 @@ export async function selectSession(
 		},
 		SessionManager.inspectSessionTailReadOnly,
 		settle,
-		(session, starred) => SessionManager.setSessionStarredForPicker(session, starred, explicitSessionDir),
+		(session, starred) =>
+			SessionManager.setSessionStarredForPicker(session, starred, explicitSessionDir, PICKER_OWNERSHIP),
 	);
 	selector.setOnRequestRender(() => ui.requestRender());
 	if (held) selector.setHeldSessions(held.sessions, held.check);

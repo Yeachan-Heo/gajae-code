@@ -134,6 +134,36 @@ export function claimRefusal(
 }
 
 /**
+ * Run `write`, a short write to a session that is not the caller's own (a picker star or delete,
+ * design §1 row 17), under a scoped claim: claim, write, release. Enforce refuses a session another
+ * process holds, and a claim that failed, with `Can't <action> this session: …` (the refusal is the
+ * `cause`), so the holder keeps its transcript; observe logs and counts the conflict and writes as
+ * before; off and exempt make no lock call. A session this process holds shares its claim (D10).
+ */
+export async function withScopedSessionClaim<T>(
+	ownership: ResolvedSessionOwnership,
+	sessionId: string,
+	action: string,
+	write: () => Promise<T>,
+): Promise<T> {
+	if (!claimsUnder(ownership)) return await write();
+	const attempt = await attemptSessionClaim(ownership, sessionId);
+	try {
+		const refusal = claimRefusal(ownership, sessionId, attempt);
+		if (refusal) {
+			const reason =
+				refusal instanceof SessionHeldError
+					? `it is open in ${sessionOwnerHolderPhrase(refusal.holder)}`
+					: "gjc could not check whether another process has it open";
+			throw new Error(`Can't ${action} this session: ${reason}.`, { cause: refusal });
+		}
+		return await write();
+	} finally {
+		if (attempt.status === "claimed") attempt.claim.release();
+	}
+}
+
+/**
  * The sessions enforce would refuse because another process holds them, each with the refusal that
  * names its holder: what the held-session warning and the session list's markers show (design §1
  * rows 1-3). A probe, never a claim: the claim stays the authority, and a race falls back to its
