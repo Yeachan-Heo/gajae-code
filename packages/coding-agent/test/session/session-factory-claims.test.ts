@@ -1195,6 +1195,46 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		expect([turns(), notices.length, await ownedHere(id)]).toEqual([4, 1, true]);
 	});
 
+	it("enforce: a turn that starts while a re-attempt is in flight waits for it, then refuses the held outcome", async () => {
+		const place = await workspace();
+		const { file } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = stallingLocks({ on: true });
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const { session, turns } = await turnSession(manager);
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let attempts = 0;
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => {
+				attempts += 1;
+				entered.resolve();
+				await gate.promise;
+				return { status: FileLockAcquireStatus.Held };
+			},
+			probe: probeFileLock,
+		};
+		try {
+			// Another re-attempt, started before the turn: the turn must join it, not start its own.
+			setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+			const inFlight = sessionClaimSetOf(manager).reclaimCurrent();
+			await entered.promise;
+			let settled = false;
+			const turn = session.prompt("joins the re-attempt").finally(() => {
+				settled = true;
+			});
+			turn.catch(() => undefined);
+			await Bun.sleep(50);
+			expect([settled, turns(), attempts]).toEqual([false, 0, 1]);
+			gate.resolve();
+			await expect(turn).rejects.toBeInstanceOf(SessionHeldError);
+			expect((await inFlight)?.refusal).toBeInstanceOf(SessionHeldError);
+			expect([turns(), attempts]).toEqual([0, 1]);
+		} finally {
+			gate.resolve();
+		}
+	});
+
 	it("enforce: a turn on a session another process now holds is refused before it writes, and the TUI shows the held warning", async () => {
 		const place = await workspace();
 		const { file, id } = await committed(place);
