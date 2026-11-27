@@ -351,10 +351,12 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		expect(sessionManager.getLeafId()).toBe(secondParent ?? null);
 		// /fork from the first prompt: a new session whose parent is this one.
 		const sourceId = sessionManager.getSessionId();
+		const sourceFile = sessionManager.getSessionFile()!;
 		const forked = await session.branch(users[0]!.entryId);
 		expect(forked.cancelled).toBe(false);
 		expect(sessionManager.getSessionId()).not.toBe(sourceId);
-		expect(sessionManager.getHeader()?.parentSession).toBe(sourceId);
+		// The direct route names the parent by its transcript path, as dev's legacy branch does.
+		expect(sessionManager.getHeader()?.parentSession).toBe(sourceFile);
 		await sessionClaimSetOf(sessionManager).settled();
 		expect(sessionManager.isSoleOwnerRoute()).toBe(true);
 		expect(session.usesSharedControlPublication()).toBe(false);

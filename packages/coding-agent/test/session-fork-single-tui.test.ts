@@ -267,6 +267,17 @@ const operatorEffort = (added: Added[]) =>
  * successor's transcript once it is on disk. The selected prompt is restored into the
  * editor and must not be submitted.
  */
+/**
+ * `parentSession` is an opaque lineage string (docs/session.md): the shared route records the
+ * source id, the direct route the source's transcript path. Either names the source.
+ */
+function namesParent(parentSession: string | undefined, sourceId: string, sourceFile: string): boolean {
+	return (
+		parentSession === sourceId ||
+		(parentSession !== undefined && path.resolve(parentSession) === path.resolve(sourceFile))
+	);
+}
+
 async function forkFrom(tui: Tui, sessions: string, source: string, upPresses: number, selected: string) {
 	const sourceBytes = Buffer.from(await Bun.file(source).arrayBuffer());
 	const sourceHeader = (await readTranscript(source)).header;
@@ -301,7 +312,8 @@ async function forkFrom(tui: Tui, sessions: string, source: string, upPresses: n
 				);
 			for (const file of await transcriptFiles(sessions)) {
 				if (before.has(file)) continue;
-				if ((await readTranscript(file)).header.parentSession === sourceHeader.id) successor = file;
+				if (namesParent((await readTranscript(file)).header.parentSession, sourceHeader.id, source))
+					successor = file;
 			}
 			return successor !== undefined;
 		},
@@ -314,7 +326,7 @@ async function forkFrom(tui: Tui, sessions: string, source: string, upPresses: n
 	const fork = await readTranscript(successor!);
 	expect(fork.header.id).not.toBe(sourceHeader.id);
 	expect(path.basename(successor!)).not.toBe(path.basename(source));
-	expect(fork.header.parentSession).toBe(sourceHeader.id);
+	expect(namesParent(fork.header.parentSession, sourceHeader.id, source)).toBe(true);
 	// The selected prompt is restored for editing, not submitted: still absent once the
 	// post-fork redraw has settled and the editor shows it.
 	await waitFor(() => new RegExp(`>\\s*${selected}\\b`).test(since(tui, mark)), 30_000, "restored prompt in editor");
@@ -472,7 +484,7 @@ describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI
 			const sourceWorkflow = sessionRoot(cwd, sourceId);
 			const sourceWorkflowBefore = await settledSnapshot(sourceWorkflow);
 			const first = await forkFrom(tui, sessions, source, 0, "fork-p2");
-			expect(first.header.parentSession).toBe(sourceId);
+			expect(namesParent(first.header.parentSession, sourceId, source)).toBe(true);
 			expect(messagesWith(first.entries, "fork-p1")).toHaveLength(1);
 			expect(messagesWith(first.entries, "fork-p1-reply")).toHaveLength(1);
 			expect(first.entries.some(entry => entry.type === "model_change")).toBe(true);
@@ -707,7 +719,7 @@ describe.skipIf(process.platform === "win32")("single-TUI control matrix", () =>
 			// /fork from the second prompt, then /drop the fork: the source stays.
 			// The selector lists every user message, the rewound-from branch's fork-m3 included.
 			const fork = await forkFrom(tui, movedSessions, moved!, 2, "fork-m2");
-			expect(fork.header.parentSession).toBe(sourceId);
+			expect(namesParent(fork.header.parentSession, sourceId, moved!)).toBe(true);
 			await submitRestored(tui, fork.file, "fork-m2");
 			await replied(fork.file, "fork-m2");
 			await quiet(tui);

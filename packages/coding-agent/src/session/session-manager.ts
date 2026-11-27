@@ -11417,14 +11417,8 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
-			// A managed source is named by its id (design decision 4), on either route: a root TUI that
-			// owns its session alone branches on the legacy route. An explicit source keeps its path.
-			parentSession:
-				route === "committed" || (this.persist && this.destination.kind === "managed")
-					? sourceId
-					: this.persist
-						? this.#sessionFile
-						: undefined,
+			// The committed route records the source id; the legacy route keeps the path.
+			parentSession: route === "committed" ? sourceId : this.persist ? this.#sessionFile : undefined,
 		};
 		const pathWithoutLabels = branchPath.filter(entry => entry.type !== "label");
 		const pathEntryIds = new Set(pathWithoutLabels.map(entry => entry.id));
