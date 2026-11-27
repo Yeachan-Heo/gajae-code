@@ -6684,7 +6684,7 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 		let changed = false;
 		const entries: Array<readonly [string, unknown]> = [];
 		for (const [childKey, value] of Object.entries(obj)) {
-			if (childKey === "partialJson" || childKey === "jsonlEvents") {
+			if (childKey === "partialJson" || childKey === "jsonlEvents" || childKey === "displayContent") {
 				changed = true;
 				continue;
 			}

@@ -1717,7 +1717,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const selectedContent = windowSegments(window)
 			.map(segment => segment.content)
 			.join("\n");
-		// displayContent intentionally not persisted to reduce session size
+		// Store displayContent for TUI rendering (will be stripped during JSONL persistence)
+		const displayContentText = selectedContent;
 
 		let usedLegacyHeadTruncation = false;
 		let outputText = partialTailWarning
@@ -1856,6 +1857,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				startLine: startLineDisplay,
 				totalFileLines: totalLines,
 			});
+		}
+		// Add displayContent for TUI rendering (clean content without model-only formatting)
+		if (displayContentText.length > 0) {
+			details.displayContent = { text: displayContentText, startLine: startLineDisplay };
 		}
 		return resultBuilder.done();
 	}

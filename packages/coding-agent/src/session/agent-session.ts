@@ -65,7 +65,6 @@ import {
 	type CompactionPreparation,
 	type CompactionResult,
 	type CompactionSettings,
-	type CompactionTriggerReason,
 	calculateContextTokens,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
@@ -12920,10 +12919,13 @@ export class AgentSession {
 				if (isNonDispatchedToolEvent(event)) markNonDispatchedToolEvent(extensionEvent);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "auto_compaction_start") {
+				// Map emergency reasons to 'overflow' for the extension event contract
+				const extensionEventReason =
+					event.reason === "threshold" || event.reason === "idle" ? event.reason : "overflow";
 				await this.#extensionRunner.emit(
 					{
 						type: "auto_compaction_start",
-						reason: event.reason as "threshold" | "overflow" | "idle",
+						reason: extensionEventReason,
 						action: event.action,
 					},
 					undefined,
@@ -29133,29 +29135,19 @@ export class AgentSession {
 		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
-			await this.#runAutoCompaction(
-				emergencyReason as Extract<
-					CompactionTriggerReason,
-					"heap" | "retainedMemory" | "transcriptFile" | "providerBytes" | "imageBytes" | "messageCount"
-				>,
-				false,
-				false,
-				{
-					continueAfterMaintenance: false,
-					deferHandoffMaintenance: false,
-					force: true,
-				},
-			);
+			await this.#runAutoCompaction("overflow", false, false, {
+				continueAfterMaintenance: false,
+				deferHandoffMaintenance: false,
+				force: true,
+				emergencyReason,
+			});
 			// Update tracking for transcriptFile compactions to prevent re-triggering on every
 			// prompt when the file cannot shrink further
-			if (emergencyReason === "transcriptFile" && this.sessionManager.getSessionFile()) {
-				const sessionFile = this.sessionManager.getSessionFile();
-				if (sessionFile && !this.#usesSharedSessionPublication()) {
-					try {
-						this.#transcriptFileSizeAfterLastCompaction = fs.statSync(sessionFile).size;
-					} catch {
-						// Best effort; if we can't stat the file, don't update the tracking
-					}
+			if (emergencyReason === "transcriptFile" && !this.#usesSharedSessionPublication()) {
+				try {
+					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
+				} catch {
+					// Best effort; if we can't stat the file, don't update the tracking
 				}
 			}
 			return;
@@ -30581,6 +30573,7 @@ export class AgentSession {
 			beforeTerminalOverflowNoop?: () => void;
 			resourceRunId?: string;
 			sdkOwnership?: SdkContinuationOwnership;
+			emergencyReason?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		if (this.#isDisposed || this.#sessionAdmissionClosing) return Promise.resolve({ kind: "skipped" });
@@ -30611,6 +30604,7 @@ export class AgentSession {
 			beforeTerminalOverflowNoop?: () => void;
 			resourceRunId?: string;
 			sdkOwnership?: SdkContinuationOwnership;
+			emergencyReason?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -35711,6 +35705,8 @@ export class AgentSession {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				// Reset transcript size baseline when session file changes
+				this.#transcriptFileSizeAfterLastCompaction = undefined;
 				if (preflightSessionId !== undefined && this.sessionManager.getSessionId() !== preflightSessionId)
 					throw new Error("Session MCP reload identity changed after preflight");
 				const loadedSessionFile = this.sessionManager.getSessionFile();

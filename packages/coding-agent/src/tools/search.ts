@@ -695,6 +695,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				};
 				if (truncation.truncated) details.truncation = truncation;
 				if (linesTruncated) details.linesTruncated = true;
+				// Add displayContent for TUI rendering (clean search output)
+				if (output.length > 0) {
+					details.displayContent = output;
+				}
 				const resultBuilder = toolResult(details)
 					.text(wrapUntrustedContent(output))
 					.limits({ columnMax: linesTruncated ? DEFAULT_MAX_COLUMN : undefined });

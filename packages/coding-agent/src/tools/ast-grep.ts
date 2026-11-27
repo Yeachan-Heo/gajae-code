@@ -293,17 +293,21 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 					count: fileMatchCounts.get(filePath) ?? 0,
 				})),
 			};
-			// displayContent intentionally not persisted
+			// Store displayContent for TUI rendering (will be stripped during JSONL persistence)
+			let displayText = outputLines.join("\n");
 			if (result.limitReached) {
 				outputLines.push("", "Result limit reached; narrow paths or increase limit.");
 			}
 			if (cappedParseErrors.length) {
 				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
+			displayText = outputLines.join("\n");
+			// Add displayContent for TUI rendering
+			if (displayText.length > 0) {
+				details.displayContent = displayText;
+			}
 
-			return toolResult(details)
-				.text(wrapUntrustedContent(outputLines.join("\n")))
-				.done();
+			return toolResult(details).text(wrapUntrustedContent(displayText)).done();
 		});
 	}
 }

@@ -454,11 +454,14 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				...baseDetails,
 				fileReplacements,
 			};
-			// displayContent intentionally not persisted
+			// Store displayContent for TUI rendering (will be stripped during JSONL persistence)
+			const displayText = outputLines.join("\n");
+			// Add displayContent for TUI rendering
+			if (displayText.length > 0) {
+				details.displayContent = displayText;
+			}
 			// Line clips (120 chars) are already applied. Frame the joined preview once.
-			return toolResult(details)
-				.text(wrapUntrustedContent(outputLines.join("\n")))
-				.done();
+			return toolResult(details).text(wrapUntrustedContent(displayText)).done();
 		});
 	}
 }
