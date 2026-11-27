@@ -887,7 +887,7 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				// Rewrite the frontmatter to reflect the new name
 				const { frontmatter, body } = parseFrontmatter(agentContent);
 				frontmatter.name = name;
-				agentContent = `---\n${YAML.stringify(frontmatter, null, 2)}---\n${body}`;
+				agentContent = `---\n${YAML.stringify(frontmatter, null, 2).trimEnd()}\n---\n${body}`;
 			}
 			if (!validAgentName.test(name)) {
 				actions.push({

@@ -820,8 +820,6 @@ describe("executeActions — mcp destination safety", () => {
 	});
 });
 
-<<<<<<< HEAD
-=======
 describe("planMigration — hook destination safety during planning", () => {
 	test("hook root is not safe (symlink): skip without force, fail with force", async () => {
 		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-hook-planner-outside-"));
@@ -906,4 +904,3 @@ describe("executeActions — hook destination safety", () => {
 		}
 	});
 });
->>>>>>> dev-remote

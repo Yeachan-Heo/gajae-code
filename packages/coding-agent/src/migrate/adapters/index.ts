@@ -451,9 +451,9 @@ export async function collectMarkdownAgents(
 		if (tools && typeof tools === "object" && "unsupportedOnly" in tools) {
 			diagnostics.push({
 				source,
-				name: rawName,
-				code: "agent_unsupported_tools_only",
-				message: `Agent tool restriction "${JSON.stringify(frontmatter.tools)}" maps to no supported GJC tools; agent skipped`,
+				type: "agent",
+				status: "skipped_absent_source",
+				message: `Agent "${rawName}" tool restriction "${JSON.stringify(frontmatter.tools)}" maps to no supported GJC tools; agent skipped`,
 			});
 			continue;
 		}
