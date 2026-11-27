@@ -477,6 +477,30 @@ describe("autoresearch ledger", () => {
 		expect(await Bun.file(path.join(second.retiredTo!, "mission.json")).exists()).toBe(true);
 	});
 
+	it("recovers from partially-interrupted retirement when mission.json is already moved", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+		const paths = getAutoresearchPaths(root, TEST_SESSION_ID);
+
+		// Manually simulate a partial retirement: move mission.json and ledger.jsonl,
+		// but leave runs.jsonl behind (simulating an interrupted move).
+		await fs.mkdir(paths.retiredRoot, { recursive: true });
+		const recoveryDir = path.join(paths.retiredRoot, "partial.recovery");
+		await fs.mkdir(recoveryDir);
+		await fs.rename(path.join(paths.dir, "mission.json"), path.join(recoveryDir, "mission.json"));
+		await fs.rename(path.join(paths.dir, "ledger.jsonl"), path.join(recoveryDir, "ledger.jsonl"));
+		// runs.jsonl remains in the live directory, simulating interruption.
+
+		// Now call clear again. It should detect remaining artifacts and retire them.
+		const recovery = await autoresearchClear(root);
+		expect(recovery.cleared).toBe(true); // Should succeed despite mission.json being missing
+		expect(recovery.retiredTo).toBeDefined();
+		// runs.jsonl should now be in a recovery directory
+		expect(await Bun.file(path.join(recovery.retiredTo!, "runs.jsonl")).exists()).toBe(true);
+		// Live directory should be clean
+		expect(await Bun.file(path.join(paths.dir, "runs.jsonl")).exists()).toBe(false);
+	});
+
 	it("persists a declared primary metric contract and feeds it to the experiment config", async () => {
 		const root = await tempDir();
 		await autoresearchWrite({

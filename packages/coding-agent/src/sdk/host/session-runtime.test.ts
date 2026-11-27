@@ -1971,10 +1971,12 @@ describe("SessionSdkSessionRuntime", () => {
 			negotiateCapabilities("passive-observer", [SESSION_HOST_OBSERVER_CAPABILITY]);
 			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false);
 			negotiateCapabilities("polling-client", []);
+			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false); // empty capabilities = passive client
+			negotiateCapabilities("gate-responder", ["gate_responder_v1"]);
 			expect(runtime.hasRemoteGateAnswerChannel()).toBe(true);
-			closeConnection("polling-client");
+			closeConnection("gate-responder");
 			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false);
-			expect(availability).toEqual([false, false, true, false]);
+			expect(availability).toEqual([false, false, false, true, false]);
 		} finally {
 			disposeListener();
 			await runtime.stop();
