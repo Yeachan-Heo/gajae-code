@@ -234,6 +234,26 @@ describe.skipIf(!supported)("isSoleOwnerRoute", () => {
 		await sessionClaimSetOf(sessionManager).settled();
 		expect(sessionManager.isSoleOwnerRoute()).toBe(true);
 	});
+
+	it("enforce: a return to an id whose claim left is decided again; a timed-out reclaim is shared", async () => {
+		const place = await workspace();
+		SessionOwnershipTestHooks.mode = "enforce";
+		const sessionManager = await manager(place.cwd, place.managed, "enforce");
+		sessionManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
+		sessionManager.appendMessage({ ...createAssistantMessage("ok"), timestamp: Date.now() });
+		await sessionManager.flush();
+		const first = sessionManager.getSessionFile()!;
+		const firstId = sessionManager.getSessionId();
+		expect(sessionManager.isSoleOwnerRoute()).toBe(true);
+		await sessionManager.newSession();
+		await sessionClaimSetOf(sessionManager).settled();
+		expect(sessionClaimSetOf(sessionManager).has(firstId)).toBe(false);
+		failOpenLocks(FileLockAcquireStatus.TimedOut);
+		await sessionManager.setSessionFile(first);
+		expect(sessionManager.getSessionId()).toBe(firstId);
+		expect(sessionClaimSetOf(sessionManager).has(firstId)).toBe(false);
+		expect(sessionManager.isSoleOwnerRoute()).toBe(false);
+	});
 });
 
 describe.skipIf(!supported)("a root session's controls after its first messages", () => {
@@ -306,6 +326,18 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		const [row] = await sessionManager.listForResumePickerReadOnly();
 		await expect(sessionManager.setSessionStarredForPicker(row!, true)).rejects.toThrow(/identity_mismatch/);
 		await expect(sessionManager.rewriteEntries()).rejects.toThrow(/identity_mismatch/);
+		expect(await Bun.file(file).text()).toBe(before);
+		expect(before).toContain("peer entry");
+	});
+
+	it("enforce, sole owner: Move Session refuses a transcript a peer appended to; nothing moves", async () => {
+		const { sessionManager, file } = await prompted("enforce");
+		await peerAppends(file, "peer entry");
+		const before = await Bun.file(file).text();
+		const target = path.join(path.dirname(sessionManager.getCwd()), "moved");
+		await fs.mkdir(target, { recursive: true });
+		await expect(sessionManager.moveTo(target)).rejects.toThrow("managed_append_identity_mismatch");
+		expect(sessionManager.getCwd()).not.toBe(target);
 		expect(await Bun.file(file).text()).toBe(before);
 		expect(before).toContain("peer entry");
 	});

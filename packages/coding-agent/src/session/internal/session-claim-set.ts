@@ -279,7 +279,10 @@ export class SessionClaimSet {
 	readonly #reclaims = new Map<string, { readonly attempts: number; readonly notBefore: number }>();
 	/** Ids a refused write queued a background re-attempt for. */
 	readonly #reclaimQueued = new Set<string>();
-	/** Ids {@link enterSoleOwnerRoute} admitted, until a new claim of the id is added. */
+	/**
+	 * Ids {@link enterSoleOwnerRoute} admitted, until the id's claim leaves the set while the manager
+	 * stays open, or a new claim of it is added. The release at close keeps them.
+	 */
 	readonly #soleOwnerRoute = new Set<string>();
 
 	constructor(ownership: ResolvedSessionOwnership = resolveSessionOwnership()) {
@@ -322,9 +325,9 @@ export class SessionClaimSet {
 	/**
 	 * Admit `sessionId`, the current id, to the sole-owner route (single-owner step 9): this set holds
 	 * its claim under enforce, in the mode the factory read and in the live mode, and no other claim
-	 * in this process shares the lock. Once admitted it stays admitted until a new claim of the id is
-	 * added, so a later second holder, the release at close or a lowered live mode never switches a
-	 * running session's write path. Nothing is remembered for a refusal: a claim in flight, a
+	 * in this process shares the lock. Once admitted it stays admitted while this set keeps that claim
+	 * (and through the release at close), so a later second holder or a lowered live mode never
+	 * switches a running session's write path; a return to the id after its claim left is decided again. Nothing is remembered for a refusal: a claim in flight, a
 	 * fail-open (`unavailable`, `timed_out`), observe and off.
 	 */
 	enterSoleOwnerRoute(sessionId: string): boolean {
@@ -665,6 +668,8 @@ export class SessionClaimSet {
 		for (const [sessionId, claim] of [...this.#claims]) {
 			if (sessionId === this.#current || this.#holds.has(sessionId)) continue;
 			this.#claims.delete(sessionId);
+			// A later return to the id is a new open, decided again even if its claim does not land.
+			this.#soleOwnerRoute.delete(sessionId);
 			claim.release();
 		}
 	}
@@ -685,7 +690,10 @@ export class SessionClaimSet {
 			if (this.#closed) this.#releaseOne(sessionId);
 			// Only the held id: any other non-current claim (a target staged before its rotation)
 			// waits for the transition that commits or abandons it.
-			else if (this.#transitions === 0 && this.#current !== sessionId) this.#releaseOne(sessionId);
+			else if (this.#transitions === 0 && this.#current !== sessionId) {
+				this.#releaseOne(sessionId);
+				this.#soleOwnerRoute.delete(sessionId);
+			}
 		};
 		hold.timer = setTimeout(() => end(true), capMs);
 		hold.timer.unref();

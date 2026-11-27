@@ -12960,6 +12960,11 @@ export class SessionManager {
 					};
 					managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
 					hadSessionFile = managedTranscript !== null;
+					// The move adopts the copied transcript and rewrites it from resident entries: bytes
+					// this manager never loaded (a writer it cannot see appended them) would be dropped.
+					const persisted = this.#managedPersistExpectedIdentity;
+					if (managedTranscript && persisted && !sameManagedTranscript(managedTranscript.identity, persisted))
+						throw new ManagedAppendIdentityMismatchError(path.basename(oldSessionFile));
 					if (managedTranscript) {
 						await managedDestinationStore.publishNoReplace(
 							path.basename(newSessionFile),
