@@ -148,9 +148,11 @@ export async function runAcpConformance(options: RunAcpConformanceOptions): Prom
 	// A failing run still writes its report. Preserve that matrix as CI evidence before
 	// surfacing the failure, so the uploaded artifact explains what actually broke.
 	let runnerFailure: unknown;
-	const callerHome = process.env[AGENT_HOME_ENV]?.trim();
+	const callerHomeSetting = process.env[AGENT_HOME_ENV]?.trim();
+	// Resolved here: the runner's child runs in the acpx checkout, not the caller's cwd.
+	const callerHome = callerHomeSetting ? path.resolve(callerHomeSetting) : undefined;
 	const home =
-		callerHome || (await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-conformance-home-"))));
+		callerHome ?? (await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-conformance-home-"))));
 	try {
 		await (options.runRunner ?? runRunner)({
 			command,
@@ -161,7 +163,11 @@ export async function runAcpConformance(options: RunAcpConformanceOptions): Prom
 	} catch (error) {
 		runnerFailure = error;
 	} finally {
-		if (!callerHome) await fs.rm(home, { recursive: true, force: true });
+		// Cleanup must never fail the run: lingering session hosts may still be writing logs here.
+		if (!callerHome)
+			await fs.rm(home, { recursive: true, force: true, maxRetries: 3 }).catch(error => {
+				process.stderr.write(`acp conformance: could not remove the agent HOME ${home}: ${String(error)}\n`);
+			});
 	}
 	const upstream = await (options.readReport ?? readReport)(upstreamReportPath).catch(() => undefined);
 	if (runnerFailure !== undefined) {
