@@ -1,34 +1,52 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash, createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker, spawnRegistrationMatches } from "../src/sdk/broker/broker";
+import { withFileLock } from "../src/config/file-lock";
+import {
+	awaitSpawnHostRegistration,
+	Broker,
+	type SpawnRegistrationRequest,
+	spawnRegistrationMatches,
+} from "../src/sdk/broker/broker";
+import { canonicalJson } from "../src/sdk/broker/canonical-json";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import {
+	setLifecycleCommandResolverForTest,
+	setProcessIncarnationForTest,
+	writeSessionLifecycleFailure,
+	writeSessionLifecycleReady,
+	writeSessionLifecycleStartupCommit,
+} from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
-import type { IndexedSession } from "../src/sdk/broker/session-index";
+import * as incarnationModule from "../src/sdk/broker/process-incarnation";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
+import {
+	type IndexedSession,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionIndexEvent,
+	sessionIndexChecksum,
+} from "../src/sdk/broker/session-index";
 import {
 	isSpawnClaimV2,
 	type SeedDeliveryV2,
 	SpawnAuthorityStore,
 	type SpawnClaimV2,
+	type SpawnLifecycleOwnerResolution,
+	type SpawnSubstrateProof,
 } from "../src/sdk/broker/spawn-authority";
 import { createSpawnSubstrateProvider } from "../src/sdk/broker/spawn-substrate";
+import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
-const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
+const temp = () => trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
 async function writeSpawnModelFixtures(agentDir: string): Promise<void> {
 	await fs.writeFile(
 		path.join(agentDir, "models.yml"),
@@ -55,6 +73,12 @@ async function writeSpawnModelFixtures(agentDir: string): Promise<void> {
 	await fs.writeFile(path.join(agentDir, "config.yml"), "modelProviderOrder:\n  - fixture-b\n");
 }
 
+async function resolveFakeLifecycleOwner(proof: SpawnSubstrateProof): Promise<SpawnLifecycleOwnerResolution> {
+	if (!Number.isSafeInteger(proof.pid) || !proof.pid || proof.pid <= 0 || !proof.processIncarnation)
+		return { ok: false, code: "owner_proof_failed" };
+	return { ok: true, owner: { pid: proof.pid, incarnation: proof.processIncarnation } };
+}
+
 const spawnSubstrateFake = {
 	launch: async () => ({
 		ok: true as const,
@@ -66,13 +90,15 @@ const spawnSubstrateFake = {
 		},
 	}),
 	verify: async () => "verified" as const,
+	resolveLifecycleOwner: resolveFakeLifecycleOwner,
 	close: async () => ({ ok: true }),
 };
 const spawnPromptLayerFake = {
-	awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+	awaitRegistration: async (input: SpawnRegistrationRequest) => ({
 		ok: true as const,
 		registration: {
 			sessionId: input.childId,
+			lifecycleRequestId: input.effectMarker,
 			endpointGeneration: 1,
 			pid: 4242,
 			processIncarnation: "inc-4242",
@@ -512,10 +538,13 @@ describe("Broker spawn flow driver", () => {
 		const lexical = path.join(agentDir, "var", "folders", "workspace");
 		await fs.mkdir(path.join(physical, ".gjc", "state"), { recursive: true });
 		await fs.symlink(path.join(agentDir, "private", "var"), path.join(agentDir, "var"), "dir");
+		const owner = { pid: process.pid, incarnation: "host-macos" };
 		const candidate = {
 			sessionId: "child-macos",
 			endpointGeneration: 1,
 			pid: process.pid,
+			processIncarnation: owner.incarnation,
+			lifecycleRequestId: "marker-macos",
 			live: true,
 			terminal: false,
 			terminalUncertain: false,
@@ -531,6 +560,8 @@ describe("Broker spawn flow driver", () => {
 					childId: "child-macos",
 					cwd: lexical,
 					stateRoot: path.join(lexical, ".gjc", "state"),
+					owner,
+					effectMarker: "marker-macos",
 				}),
 			).toBe(true);
 			expect(
@@ -538,9 +569,272 @@ describe("Broker spawn flow driver", () => {
 					childId: "child-macos",
 					cwd: lexical,
 					stateRoot: path.join(agentDir, "other", ".gjc", "state"),
+					owner,
+					effectMarker: "marker-macos",
 				}),
 			).toBe(false);
+			for (const expected of [
+				{ owner: { ...owner, pid: owner.pid + 1 }, effectMarker: "marker-macos" },
+				{ owner: { ...owner, incarnation: "supervisor-incarnation" }, effectMarker: "marker-macos" },
+				{ owner, effectMarker: "other-marker" },
+			]) {
+				expect(
+					spawnRegistrationMatches(candidate, {
+						childId: "child-macos",
+						cwd: lexical,
+						stateRoot: path.join(lexical, ".gjc", "state"),
+						...expected,
+					}),
+				).toBe(false);
+			}
 		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+	for (const mismatch of ["pid", "incarnation", "effectMarker"] as const) {
+		it(`rejects a registration with the wrong host ${mismatch} and cleans up the original substrate`, async () => {
+			const agentDir = await temp();
+			const proof: SpawnSubstrateProof = {
+				substrateKind: "tmux",
+				providerIdentity: "readiness-provider",
+				nativeSessionId: "$23",
+				pid: 980,
+				processIncarnation: "shell-980",
+				ownerGeneration: 4,
+				stateFileProof: { socket: "fixture-socket" },
+			};
+			const owner = { pid: 981, incarnation: "host-981" };
+			const closed: SpawnSubstrateProof[] = [];
+			let registrationInput: SpawnRegistrationRequest | undefined;
+			let writtenMarker: unknown;
+			let registrations = 0;
+			let dispatches = 0;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({ ok: true, proof }),
+					resolveLifecycleOwner: async (observed, deadlineAt) => {
+						expect(observed).toEqual(proof);
+						expect(deadlineAt).toBeGreaterThan(Date.now());
+						return { ok: true, owner };
+					},
+					verify: async observed => {
+						expect(observed).toEqual(proof);
+						return "verified";
+					},
+					close: async observed => {
+						closed.push(observed);
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					...spawnPromptLayerFake,
+					awaitRegistration: async input => {
+						registrations += 1;
+						registrationInput = input;
+						writtenMarker = await Bun.file(
+							path.join(input.stateRoot, "sdk", `${input.childId}.lifecycle.json`),
+						).json();
+						return {
+							ok: true,
+							registration: {
+								sessionId: input.childId,
+								endpointGeneration: 1,
+								pid: mismatch === "pid" ? 980 : owner.pid,
+								processIncarnation: mismatch === "incarnation" ? "shell-980" : owner.incarnation,
+								lifecycleRequestId: mismatch === "effectMarker" ? "wrong-effect-marker" : input.effectMarker,
+								cwd: input.cwd,
+								stateRoot: input.stateRoot,
+							},
+						};
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return { kind: "pre_send_rejected" };
+					},
+				},
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`wrong-${mismatch}`,
+				);
+				// The mismatched host is never adopted; the proven release makes the
+				// failure an ordinary pre-send rejection with no seed.
+				expect(response).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+				expect(registrations).toBe(1);
+				expect(registrationInput?.owner).toEqual(owner);
+				expect(writtenMarker).toMatchObject({ ...owner, effectMarker: registrationInput?.effectMarker });
+				expect(dispatches).toBe(0);
+				expect(closed).toEqual([proof]);
+				const claim = await latestClaim(agentDir);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.failure?.code).toBe("child_registration_timeout");
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await broker.stop();
+				await fs.rm(agentDir, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const failure of [
+		"owner_deadline",
+		"owner_unsupported",
+		"owner_proof_failed",
+		"owner_ambiguous",
+		"throw",
+		"missing_pid",
+		"missing_incarnation",
+	] as const) {
+		it(`writes no marker or seed when owner proof or resolution fails: ${failure}`, async () => {
+			const agentDir = await temp();
+			const missingProof = failure === "missing_pid" || failure === "missing_incarnation";
+			const proof: SpawnSubstrateProof = {
+				substrateKind: "headless",
+				providerIdentity: "owner-failure-provider",
+				...(failure === "missing_pid" ? {} : { pid: 982 }),
+				...(failure === "missing_incarnation" ? {} : { processIncarnation: "inc-982" }),
+			};
+			let markerPath: string | undefined;
+			let resolutions = 0;
+			let registrations = 0;
+			let dispatches = 0;
+			const closed: SpawnSubstrateProof[] = [];
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async spec => {
+						const request = JSON.parse(spec.env?.GJC_SDK_LIFECYCLE_REQUEST ?? "{}") as { stateRoot: string };
+						markerPath = path.join(request.stateRoot, "sdk", `${spec.childSessionId}.lifecycle.json`);
+						return { ok: true, proof };
+					},
+					resolveLifecycleOwner: async observed => {
+						resolutions += 1;
+						expect(observed).toEqual(proof);
+						if (failure === "throw") throw new Error("owner observation failed");
+						if (failure === "missing_pid" || failure === "missing_incarnation")
+							return resolveFakeLifecycleOwner(observed);
+						return { ok: false, code: failure };
+					},
+					verify: async () => "verified",
+					close: async observed => {
+						closed.push(observed);
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					...spawnPromptLayerFake,
+					awaitRegistration: async input => {
+						registrations += 1;
+						return spawnPromptLayerFake.awaitRegistration(input);
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return { kind: "pre_send_rejected" };
+					},
+				},
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`owner-${failure}`,
+				);
+				expect(response).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+				expect(resolutions).toBe(missingProof ? 0 : 1);
+				expect(registrations).toBe(0);
+				expect(dispatches).toBe(0);
+				expect(closed).toEqual([proof]);
+				if (!markerPath) throw new Error("launch did not capture marker path");
+				expect(await Bun.file(markerPath).exists()).toBe(false);
+				const claim = await latestClaim(agentDir);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.failure?.code).toBe(
+					missingProof
+						? "substrate_proof_failed"
+						: failure === "throw"
+							? "child_registration_failed"
+							: "lifecycle_owner_unresolved",
+				);
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await broker.stop();
+				await fs.rm(agentDir, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it.each([
+		["fails, then its substrate is gone", "fail", "gone", true],
+		["throws, then its substrate is gone", "throw", "gone", true],
+		["refuses an already gone substrate", "refuse_gone", "gone", true],
+		["fails while its substrate stays live", "fail", "verified", false],
+		["fails and its substrate is replaced", "fail", "mismatch", false],
+	] as const)("releases an unowned managed substrate whose close %s only on proven absence", async (_case, close, after, released) => {
+		const agentDir = await temp();
+		let verdict: "verified" | "mismatch" | "gone" = "verified";
+		let closes = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "tmux" as const,
+						providerIdentity: "unowned-release-provider",
+						nativeSessionId: "$8",
+						pid: 996,
+						processIncarnation: "inc-996",
+						ownerGeneration: 3,
+					},
+				}),
+				// The host gives up at its readiness cutoff while its owner stays unresolved.
+				resolveLifecycleOwner: async () => ({ ok: false, code: "owner_deadline" }),
+				verify: async () => verdict,
+				close: async () => {
+					closes += 1;
+					// The supervisor exits on its own while the exact close runs.
+					verdict = after;
+					if (close === "throw") throw new Error("gjc_tmux_owner_unverifiable:child");
+					return { ok: false, code: close === "refuse_gone" ? "substrate_gone" : "substrate_close_failed" };
+				},
+			},
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				`unowned-release-${close}-${after}`,
+			);
+			expect(closes).toBe(1);
+			const claim = await latestClaim(agentDir);
+			if (released) {
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
+				});
+				expect(claim).toMatchObject({
+					state: "pre_send_rejected",
+					failure: { code: "lifecycle_owner_unresolved" },
+				});
+			} else {
+				expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(claim).toMatchObject({
+					state: "uncertain",
+					failure: { code: "child_registration_release_unproven" },
+				});
+			}
+		} finally {
+			await broker.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
@@ -575,13 +869,15 @@ describe("Broker spawn flow driver", () => {
 					};
 				},
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+				awaitRegistration: async (input: SpawnRegistrationRequest) => ({
 					ok: true as const,
 					registration: {
 						sessionId: input.childId,
+						lifecycleRequestId: input.effectMarker,
 						endpointGeneration: 1,
 						pid: 999,
 						processIncarnation: "inc-999",
@@ -652,13 +948,15 @@ describe("Broker spawn flow driver", () => {
 					},
 				}),
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+				awaitRegistration: async (input: SpawnRegistrationRequest) => ({
 					ok: true as const,
 					registration: {
 						sessionId: input.childId,
+						lifecycleRequestId: input.effectMarker,
 						endpointGeneration: 1,
 						pid: 998,
 						processIncarnation: "inc-998",
@@ -709,16 +1007,18 @@ describe("Broker spawn flow driver", () => {
 					},
 				}),
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => {
 					closes += 1;
 					return { ok: true };
 				},
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+				awaitRegistration: async (input: SpawnRegistrationRequest) => ({
 					ok: true as const,
 					registration: {
 						sessionId: input.childId,
+						lifecycleRequestId: input.effectMarker,
 						endpointGeneration: 1,
 						pid: 997,
 						processIncarnation: "inc-997",
@@ -761,6 +1061,7 @@ describe("Broker spawn flow driver", () => {
 					},
 				}),
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => {
 					closes += 1;
 					return { ok: true };
@@ -794,6 +1095,766 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	for (const host of [
+		"ready",
+		"ready-stalled",
+		"ready-uncommitted",
+		"failed",
+		"silent",
+		"ready-then-failed",
+		"failed-late",
+		"revoked",
+	] as const) {
+		it(`settles a registration observed after the deadline on the host's own verdict: ${host}`, async () => {
+			// The registration layer may return a read that began in time after the
+			// clock passed the deadline (the macOS child_registration_timeout report:
+			// host registered at +1.9 s of 8 s). The flow driver must not discard that
+			// host on the clock alone, but past the deadline the host may already be
+			// rolling back, so admission needs its startup commit.
+			const agentDir = await temp();
+			const incarnation = processIncarnation(process.pid);
+			if (!incarnation) throw new Error("test process incarnation is unavailable");
+			let closes = 0;
+			let dispatches = 0;
+			let deadlineAt = 0;
+			// A synchronous broker stall (the tmux probing named in the incident)
+			// lands inside the late verdict, after its first readiness read began.
+			let stallArmed = false;
+			const realIncarnation = incarnationModule.processIncarnation;
+			const incarnationSpy = spyOn(incarnationModule, "processIncarnation").mockImplementation((pid, options) => {
+				if (stallArmed) {
+					stallArmed = false;
+					Bun.sleepSync(250);
+				}
+				return realIncarnation(pid, options);
+			});
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "late-observer-provider",
+							pid: process.pid,
+							processIncarnation: incarnation,
+						},
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async (input: SpawnRegistrationRequest) => {
+						deadlineAt = input.deadlineAt;
+						const writeFailure = () =>
+							writeSessionLifecycleFailure(
+								input.stateRoot,
+								input.childId,
+								input.effectMarker,
+								{ phase: "startup", reason: "pending", message: "readiness cutoff" },
+								{
+									endpointGeneration: null,
+									fenced: true,
+									runtimeRemoved: true,
+									hostStopped: true,
+									brokerRegistrationReleased: true,
+								},
+								undefined,
+								incarnation,
+								process.pid,
+							);
+						const commitStartup = () =>
+							writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+						if (host === "ready-stalled") {
+							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+							await commitStartup();
+							stallArmed = true;
+						}
+						if (host === "ready" || host === "ready-uncommitted" || host === "ready-then-failed")
+							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+						if (host === "ready") await commitStartup();
+						if (host === "failed" || host === "ready-then-failed") await writeFailure();
+						if (host === "revoked") {
+							// The host published readiness, then revoked it at its cutoff.
+							let revoke: (() => Promise<boolean>) | undefined;
+							await writeSessionLifecycleReady(
+								input.stateRoot,
+								input.childId,
+								input.effectMarker,
+								() => true,
+								captured => {
+									revoke = captured;
+								},
+							);
+							expect(await revoke?.()).toBe(true);
+						}
+						if (host === "failed-late")
+							// The host's failure receipt lands only after the late path started polling.
+							setTimeout(() => void writeFailure(), Math.max(0, input.deadlineAt - Date.now()) + 200);
+						// The stalled case returns past termination start, so only an
+						// unconditional confirming read can still admit it.
+						await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + (host === "ready-stalled" ? 1_500 : 50));
+						return {
+							ok: true as const,
+							registration: {
+								sessionId: input.childId,
+								lifecycleRequestId: input.effectMarker,
+								endpointGeneration: 1,
+								pid: process.pid,
+								processIncarnation: incarnation,
+								cwd: input.cwd,
+								stateRoot: input.stateRoot,
+							},
+						};
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return {
+							kind: "accepted" as const,
+							commandId: "cmd-late",
+							turnId: "turn-late",
+							acceptedAt: Date.now(),
+						};
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`late-observer-${host}`,
+				);
+				expect(Date.now()).toBeGreaterThan(deadlineAt);
+				const claim = await latestClaim(agentDir);
+				if (host === "ready" || host === "ready-stalled") {
+					expect(response).toMatchObject({ ok: true });
+					expect(dispatches).toBe(1);
+					expect(closes).toBe(0);
+					expect(claim?.state).toBe("accepted");
+					return;
+				}
+				expect(response).toMatchObject({
+					ok: false,
+					error: {
+						code: "spawn_failed",
+						details: {
+							code:
+								host === "silent" || host === "revoked" || host === "ready-uncommitted"
+									? "child_registration_timeout"
+									: "child_registration_failed",
+						},
+					},
+				});
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.seed).toBeUndefined();
+				if (host === "silent" || host === "revoked" || host === "ready-uncommitted")
+					expect(claim?.failure?.message).toContain("did not confirm readiness");
+			} finally {
+				incarnationSpy.mockRestore();
+				await broker.stop();
+			}
+		}, 20_000);
+	}
+
+	// Incident magnitude: in the latest macOS report the host registered at +5.9 s
+	// of the 8 s budget (2.1 s left) and the broker rejected it about 3.7 s past
+	// the deadline; earlier reports came back 4 s and 8.7 s late.
+	for (const path_ of ["late-read", "recheck"] as const) {
+		for (const readiness of [true, false] as const) {
+			it(`${readiness ? "admits" : "refuses"} a host registered 2.1 s before and observed 3.7 s past the deadline (${path_}, readiness and startup commit ${readiness ? "published" : "absent"})`, async () => {
+				const agentDir = await temp();
+				const incarnation = processIncarnation(process.pid);
+				if (!incarnation) throw new Error("test process incarnation is unavailable");
+				let closes = 0;
+				let dispatches = 0;
+				let calls = 0;
+				let deadlineAt = 0;
+				let brokerRef: Broker | undefined;
+				const broker = new Broker({
+					agentDir,
+					masterCapabilityVerifier: verifier,
+					spawnSubstrateProvider: {
+						launch: async () => ({
+							ok: true as const,
+							proof: {
+								substrateKind: "headless" as const,
+								providerIdentity: "incident-provider",
+								pid: process.pid,
+								processIncarnation: incarnation,
+							},
+						}),
+						verify: async () => "verified" as const,
+						resolveLifecycleOwner: resolveFakeLifecycleOwner,
+						close: async () => {
+							closes += 1;
+							return { ok: true };
+						},
+					},
+					spawnPromptLayer: {
+						awaitRegistration: async (input: SpawnRegistrationRequest) => {
+							calls += 1;
+							if (calls > 1) {
+								// The post-deadline recheck runs the real registration reader
+								// against the broker's own index, where the host row now exists.
+								if (!brokerRef) throw new Error("broker not set");
+								return await awaitSpawnHostRegistration(brokerRef.index, input);
+							}
+							deadlineAt = input.deadlineAt;
+							// The host registers 2.1 s before the deadline, then publishes readiness.
+							await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+							expect(Date.now()).toBeLessThan(input.deadlineAt - 1_500);
+							const host = await new SessionIndex(agentDir).open();
+							await host.append({
+								type: "host_registered",
+								sessionId: input.childId,
+								locator: await resolveSessionLocator(input.cwd, input.stateRoot),
+								endpointGeneration: 1,
+								pid: process.pid,
+								processIncarnation: incarnation,
+								hostIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
+							});
+							if (readiness) {
+								await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+								await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+							}
+							// The observer only comes back 3.7 s past the deadline.
+							await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + 3_700);
+							if (path_ === "recheck") return { ok: false as const, reason: "inconclusive" as const };
+							return {
+								ok: true as const,
+								registration: {
+									sessionId: input.childId,
+									lifecycleRequestId: input.effectMarker,
+									endpointGeneration: 1,
+									pid: process.pid,
+									processIncarnation: incarnation,
+									cwd: input.cwd,
+									stateRoot: input.stateRoot,
+								},
+							};
+						},
+						dispatch: async () => {
+							dispatches += 1;
+							return {
+								kind: "accepted" as const,
+								commandId: "cmd-incident",
+								turnId: "turn-incident",
+								acceptedAt: Date.now(),
+							};
+						},
+						reconcile: async () => ({ status: "unknown" as const }),
+					},
+				});
+				brokerRef = broker;
+				await broker.start();
+				try {
+					const response = await broker.handleRequest(
+						"session.spawn",
+						{ ...spawnInput(), cwd: agentDir },
+						`incident-${path_}-${readiness}`,
+					);
+					expect(Date.now()).toBeGreaterThan(deadlineAt + 3_700);
+					const claim = await latestClaim(agentDir);
+					// Without published readiness there is no post-deadline recheck.
+					expect(calls).toBe(path_ === "recheck" && readiness ? 2 : 1);
+					if (readiness) {
+						expect(response).toMatchObject({ ok: true });
+						expect(dispatches).toBe(1);
+						expect(closes).toBe(0);
+						expect(claim?.state).toBe("accepted");
+						return;
+					}
+					expect(response).toMatchObject({
+						ok: false,
+						error: { code: "spawn_failed", details: { code: "child_registration_timeout" } },
+					});
+					expect(dispatches).toBe(0);
+					expect(closes).toBe(1);
+					expect(claim?.state).toBe("pre_send_rejected");
+					expect(claim?.seed).toBeUndefined();
+				} finally {
+					await broker.stop();
+				}
+			}, 40_000);
+		}
+	}
+
+	// 8.7 s is the largest reported overrun (incident 6dc4dc3b): the global index
+	// lock was released only then, after an 8 s recheck window had already closed.
+	for (const { overrunMs, readiness } of [
+		{ overrunMs: 3_700, readiness: true },
+		{ overrunMs: 3_700, readiness: false },
+		{ overrunMs: 8_700, readiness: true },
+	] as const) {
+		it(`${readiness ? "admits" : "refuses"} a timely host when the index lock is held until ${overrunMs / 1_000} s past the deadline (real reader, readiness and startup commit ${readiness ? "published" : "absent"})`, async () => {
+			const agentDir = await temp();
+			const incarnation = processIncarnation(process.pid);
+			if (!incarnation) throw new Error("test process incarnation is unavailable");
+			let closes = 0;
+			let dispatches = 0;
+			let calls = 0;
+			let deadlineAt = 0;
+			let holder: Promise<void> | undefined;
+			let brokerRef: Broker | undefined;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "lock-incident-provider",
+							pid: process.pid,
+							processIncarnation: incarnation,
+						},
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async (input: SpawnRegistrationRequest) => {
+						calls += 1;
+						if (!brokerRef) throw new Error("broker not set");
+						if (calls === 1) {
+							deadlineAt = input.deadlineAt;
+							await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+							const host = await new SessionIndex(agentDir).open();
+							await host.append({
+								type: "host_registered",
+								sessionId: input.childId,
+								locator: await resolveSessionLocator(input.cwd, input.stateRoot),
+								endpointGeneration: 1,
+								pid: process.pid,
+								processIncarnation: incarnation,
+								hostIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
+							});
+							if (readiness) {
+								await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+								await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+							}
+							// Another process holds the machine-global index lock from before
+							// the broker can read the row until the overrun past the deadline.
+							const acquired = Promise.withResolvers<void>();
+							holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+								acquired.resolve();
+								await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + overrunMs);
+							});
+							await acquired.promise;
+						}
+						return await awaitSpawnHostRegistration(brokerRef.index, input);
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return {
+							kind: "accepted" as const,
+							commandId: "cmd-lock",
+							turnId: "turn-lock",
+							acceptedAt: Date.now(),
+						};
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			brokerRef = broker;
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`lock-incident-${overrunMs}-${readiness}`,
+				);
+				const answeredAt = Date.now();
+				await holder;
+				const claim = await latestClaim(agentDir);
+				if (readiness) {
+					// Admission must come from the read after the lock was released.
+					expect(answeredAt).toBeGreaterThanOrEqual(deadlineAt + overrunMs);
+					expect(calls).toBe(2);
+					expect(response).toMatchObject({ ok: true });
+					expect(dispatches).toBe(1);
+					expect(closes).toBe(0);
+					expect(claim?.state).toBe("accepted");
+					return;
+				}
+				expect(calls).toBe(1);
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "child_registration_timeout" } },
+				});
+				expect(claim?.failure?.message).toContain("could not be observed");
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await holder;
+				await broker.stop();
+			}
+		}, 40_000);
+	}
+
+	// The recheck may last 20 s, but only a live, ready host behind a held lock
+	// should wait for it. `dead-owner` and `failure-receipt` decide the refusal
+	// mid-recheck while the lock is still held; the broker must answer within a
+	// few polls, not at lock release or the recheck bound.
+	// `unregistered-then-receipt` is a host rolling back in its real order
+	// (unregister, then the failure receipt): the lock is released at +1 s, the
+	// first recheck read sees the unregistered row before the receipt exists
+	// (+1.8 s), and the refusal must wait for and report the receipt, not a timeout.
+	for (const outcome of ["dead-owner", "failure-receipt", "unregistered-then-receipt"] as const) {
+		it(`ends the post-deadline recheck early on a ${outcome}`, async () => {
+			const agentDir = await temp();
+			const incarnation = processIncarnation(process.pid);
+			if (!incarnation) throw new Error("test process incarnation is unavailable");
+			const unregistered = outcome === "unregistered-then-receipt";
+			const lockHeldPastDeadlineMs = unregistered ? 1_000 : 10_000;
+			const decidedPastDeadlineMs = unregistered ? 1_800 : 1_000;
+			let closes = 0;
+			let dispatches = 0;
+			let calls = 0;
+			let deadlineAt = 0;
+			let ownerDead = false;
+			let holder: Promise<void> | undefined;
+			let decision: Promise<void> | undefined;
+			let brokerRef: Broker | undefined;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "early-exit-provider",
+							pid: process.pid,
+							processIncarnation: incarnation,
+						},
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async (input: SpawnRegistrationRequest) => {
+						calls += 1;
+						if (!brokerRef) throw new Error("broker not set");
+						if (calls === 1) {
+							deadlineAt = input.deadlineAt;
+							await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+							const host = await new SessionIndex(agentDir).open();
+							const registration = {
+								type: "host_registered" as const,
+								sessionId: input.childId,
+								locator: await resolveSessionLocator(input.cwd, input.stateRoot),
+								endpointGeneration: 1,
+								pid: process.pid,
+								processIncarnation: incarnation,
+								hostIncarnation: incarnation,
+								lifecycleRequestId: input.effectMarker,
+							};
+							await host.append(registration);
+							await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+							await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+							// The host's row no longer matches once it unregisters.
+							if (unregistered) await host.append({ ...registration, type: "host_unregistered" });
+							const acquired = Promise.withResolvers<void>();
+							holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+								acquired.resolve();
+								await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + lockHeldPastDeadlineMs);
+							});
+							await acquired.promise;
+							const { stateRoot, childId, effectMarker } = input;
+							decision = (async () => {
+								await Bun.sleep(Math.max(0, deadlineAt - Date.now()) + decidedPastDeadlineMs);
+								if (outcome === "dead-owner") {
+									ownerDead = true;
+									return;
+								}
+								await writeSessionLifecycleFailure(
+									stateRoot,
+									childId,
+									effectMarker,
+									{ phase: "startup", reason: "failed", message: "host failed after readiness" },
+									{
+										endpointGeneration: 1,
+										fenced: true,
+										runtimeRemoved: true,
+										hostStopped: true,
+										brokerRegistrationReleased: true,
+									},
+									undefined,
+									incarnation,
+									process.pid,
+								);
+							})();
+						}
+						return await awaitSpawnHostRegistration(brokerRef.index, input);
+					},
+					dispatch: async () => {
+						dispatches += 1;
+						return {
+							kind: "accepted" as const,
+							commandId: "cmd-early-exit",
+							turnId: "turn-early-exit",
+							acceptedAt: Date.now(),
+						};
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			brokerRef = broker;
+			// The owner process provably exits: its pid now names a different, readable
+			// incarnation (pid reuse), both through the broker's incarnation seam and
+			// through the tri-state OS observer the recheck decides on. The index's own
+			// liveness probe still sees this live test process.
+			setProcessIncarnationForTest(broker, pid =>
+				ownerDead && pid === process.pid ? "replaced-incarnation" : processIncarnation(pid),
+			);
+			const realObserve = incarnationModule.observeProcessIncarnation;
+			const observeSpy = spyOn(incarnationModule, "observeProcessIncarnation").mockImplementation((pid, options) =>
+				ownerDead && pid === process.pid
+					? { status: "present", incarnation: "replaced-incarnation" }
+					: realObserve(pid, options),
+			);
+			await broker.start();
+			try {
+				const response = await broker.handleRequest(
+					"session.spawn",
+					{ ...spawnInput(), cwd: agentDir },
+					`early-exit-${outcome}`,
+				);
+				const answeredAt = Date.now();
+				await decision;
+				await holder;
+				const claim = await latestClaim(agentDir);
+				expect(calls).toBe(2);
+				// Decided at +1 s, before the lock release (+10 s) and the recheck bound
+				// (+21 s). For an unregistered row the decision is the receipt at +1.8 s,
+				// after the lock release (+1 s): the row alone must not settle the refusal.
+				expect(answeredAt).toBeGreaterThan(deadlineAt + decidedPastDeadlineMs);
+				expect(answeredAt).toBeLessThan(deadlineAt + decidedPastDeadlineMs + 3_000);
+				expect(response).toMatchObject({
+					ok: false,
+					error: {
+						code: "spawn_failed",
+						details: {
+							code: outcome === "dead-owner" ? "child_registration_timeout" : "child_registration_failed",
+						},
+					},
+				});
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await decision;
+				await holder;
+				setProcessIncarnationForTest(broker, undefined);
+				observeSpy.mockRestore();
+				await broker.stop();
+			}
+		}, 40_000);
+	}
+
+	// An unreadable incarnation is uncertain, not death: probes that cannot read
+	// the owner while the lock is held must not end the recheck, and the host is
+	// admitted once the lock is released.
+	it("keeps the post-deadline recheck open while the owner incarnation is transiently unreadable", async () => {
+		const agentDir = await temp();
+		const incarnation = processIncarnation(process.pid);
+		if (!incarnation) throw new Error("test process incarnation is unavailable");
+		const lockHeldPastDeadlineMs = 3_000;
+		let closes = 0;
+		let dispatches = 0;
+		let calls = 0;
+		let deadlineAt = 0;
+		let unreadableProbes = 0;
+		let holder: Promise<void> | undefined;
+		let brokerRef: Broker | undefined;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "uncertain-owner-provider",
+						pid: process.pid,
+						processIncarnation: incarnation,
+					},
+				}),
+				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
+				close: async () => {
+					closes += 1;
+					return { ok: true };
+				},
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async (input: SpawnRegistrationRequest) => {
+					calls += 1;
+					if (!brokerRef) throw new Error("broker not set");
+					if (calls === 1) {
+						deadlineAt = input.deadlineAt;
+						await Bun.sleep(Math.max(0, input.deadlineAt - 2_100 - Date.now()));
+						const host = await new SessionIndex(agentDir).open();
+						await host.append({
+							type: "host_registered",
+							sessionId: input.childId,
+							locator: await resolveSessionLocator(input.cwd, input.stateRoot),
+							endpointGeneration: 1,
+							pid: process.pid,
+							processIncarnation: incarnation,
+							hostIncarnation: incarnation,
+							lifecycleRequestId: input.effectMarker,
+						});
+						await writeSessionLifecycleReady(input.stateRoot, input.childId, input.effectMarker);
+						await writeSessionLifecycleStartupCommit(input.stateRoot, input.childId, input.effectMarker);
+						const acquired = Promise.withResolvers<void>();
+						holder = withFileLock(path.join(agentDir, "sdk", "sessions", "index.jsonl"), async () => {
+							acquired.resolve();
+							await Bun.sleep(Math.max(0, input.deadlineAt - Date.now()) + lockHeldPastDeadlineMs);
+						});
+						await acquired.promise;
+					}
+					return await awaitSpawnHostRegistration(brokerRef.index, input);
+				},
+				dispatch: async () => {
+					dispatches += 1;
+					return {
+						kind: "accepted" as const,
+						commandId: "cmd-uncertain-owner",
+						turnId: "turn-uncertain-owner",
+						acceptedAt: Date.now(),
+					};
+				},
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		brokerRef = broker;
+		// The OS observer cannot query the owner from 0.5 s to 2.5 s past the
+		// deadline, inside the recheck and the lock hold (a Windows PID that fails
+		// to open looks like this); it reads the owner again before the lock is
+		// released. The broker's incarnation seam goes unreadable in the same window.
+		const unreadable = (pid: number): boolean => {
+			const sinceDeadline = Date.now() - deadlineAt;
+			return pid === process.pid && deadlineAt > 0 && sinceDeadline > 500 && sinceDeadline < 2_500;
+		};
+		setProcessIncarnationForTest(broker, pid => (unreadable(pid) ? undefined : processIncarnation(pid)));
+		const realObserve = incarnationModule.observeProcessIncarnation;
+		const observeSpy = spyOn(incarnationModule, "observeProcessIncarnation").mockImplementation((pid, options) => {
+			if (!unreadable(pid)) return realObserve(pid, options);
+			unreadableProbes += 1;
+			return { status: "unknown", reasonCode: "open_failed" };
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				"uncertain-owner",
+			);
+			const answeredAt = Date.now();
+			await holder;
+			const claim = await latestClaim(agentDir);
+			expect(unreadableProbes).toBeGreaterThan(0);
+			// Admitted by the read after the lock was released, not before.
+			expect(answeredAt).toBeGreaterThanOrEqual(deadlineAt + lockHeldPastDeadlineMs);
+			expect(calls).toBe(2);
+			expect(response).toMatchObject({ ok: true });
+			expect(dispatches).toBe(1);
+			expect(closes).toBe(0);
+			expect(claim?.state).toBe("accepted");
+		} finally {
+			await holder;
+			setProcessIncarnationForTest(broker, undefined);
+			observeSpy.mockRestore();
+			await broker.stop();
+		}
+	}, 40_000);
+
+	for (const scenario of [
+		{ reason: "absent", message: "no registration row was observed" },
+		{ reason: "mismatch", message: "did not match the launched host" },
+		{ reason: "inconclusive", message: "could not be observed" },
+		{ reason: undefined, message: "did not register before the bounded admission deadline" },
+	] as const) {
+		it(`reports a ${scenario.reason ?? "legacy"} registration miss distinctly and releases the child once`, async () => {
+			const agentDir = await temp();
+			let closes = 0;
+			let dispatches = 0;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "miss-provider",
+							pid: 995,
+							processIncarnation: "inc-995",
+						},
+					}),
+					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async () =>
+						scenario.reason === undefined
+							? { ok: false as const }
+							: { ok: false as const, reason: scenario.reason },
+					dispatch: async () => {
+						dispatches += 1;
+						return { kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 };
+					},
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest("session.spawn", spawnInput(), `miss-${scenario.reason}`);
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "child_registration_timeout" } },
+				});
+				expect(dispatches).toBe(0);
+				expect(closes).toBe(1);
+				const claim = await latestClaim(agentDir);
+				expect(claim?.state).toBe("pre_send_rejected");
+				expect(claim?.failure?.code).toBe("child_registration_timeout");
+				expect(claim?.failure?.message).toContain(scenario.message);
+				expect(claim?.seed).toBeUndefined();
+			} finally {
+				await broker.stop();
+			}
+		});
+	}
+
 	it("re-drives an uncertain registration to a deterministic failure on retry", async () => {
 		const agentDir = await temp();
 		let verifyCalls = 0;
@@ -811,9 +1872,11 @@ describe("Broker spawn flow driver", () => {
 						processIncarnation: "inc-992",
 					},
 				}),
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
+				// Live through the failed close and its absence re-check; gone by the retry.
 				verify: async () => {
 					verifyCalls += 1;
-					return verifyCalls === 1 ? ("verified" as const) : ("gone" as const);
+					return verifyCalls <= 2 ? ("verified" as const) : ("gone" as const);
 				},
 				close: async () => {
 					closeCalls += 1;
@@ -830,7 +1893,7 @@ describe("Broker spawn flow driver", () => {
 		try {
 			const first = await broker.handleRequest("session.spawn", spawnInput(), "retry-registration-key");
 			expect(first).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-			expect(verifyCalls).toBe(1);
+			expect(verifyCalls).toBe(2);
 			expect(closeCalls).toBe(1);
 			expect(await latestClaim(agentDir)).toMatchObject({
 				state: "uncertain",
@@ -842,7 +1905,7 @@ describe("Broker spawn flow driver", () => {
 				ok: false,
 				error: { code: "spawn_failed", details: { code: "child_registration_reconciled_failed" } },
 			});
-			expect(verifyCalls).toBe(2);
+			expect(verifyCalls).toBe(3);
 			expect(closeCalls).toBe(1);
 		} finally {
 			await broker.stop();
@@ -898,6 +1961,7 @@ describe("Broker spawn flow driver", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				launch: async () => ({
 					ok: false as const,
 					code: "substrate_unavailable" as const,
@@ -1044,6 +2108,7 @@ describe("Broker spawn flow driver", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				launch: async () => ({
 					ok: false as const,
 					code: "substrate_unavailable" as const,
@@ -1138,6 +2203,7 @@ describe("Broker spawn flow driver", () => {
 					message: "no relaunch",
 				}),
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
@@ -1217,6 +2283,7 @@ describe("Broker spawn flow driver", () => {
 					verifyCalls += 1;
 					return "mismatch" as const;
 				},
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
@@ -1325,6 +2392,7 @@ describe("Broker spawn flow driver", () => {
 					};
 				},
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
@@ -1388,6 +2456,7 @@ describe("Broker spawn close and orphan reaper", () => {
 				},
 			}),
 			verify: async () => probe.verdict,
+			resolveLifecycleOwner: resolveFakeLifecycleOwner,
 			close: async () => {
 				probe.closes += 1;
 				if (probe.closePending) return { ok: false, code: "substrate_close_pending" };
@@ -1397,13 +2466,14 @@ describe("Broker spawn close and orphan reaper", () => {
 		};
 	}
 	const promptLayer = {
-		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+		awaitRegistration: async (input: SpawnRegistrationRequest) => ({
 			ok: true as const,
 			registration: {
 				sessionId: input.childId,
+				lifecycleRequestId: input.effectMarker,
 				endpointGeneration: 1,
-				pid: 995,
-				processIncarnation: "inc-995",
+				pid: input.owner.pid,
+				processIncarnation: input.owner.incarnation,
 				cwd: input.cwd,
 				stateRoot: input.stateRoot,
 			},
@@ -1443,6 +2513,16 @@ describe("Broker spawn close and orphan reaper", () => {
 					return { pid: 996, terminate() {} };
 				},
 				processIncarnation: pid => (pid === 996 ? "inc-996" : undefined),
+				openLifecycleProcess: pid =>
+					pid === 996
+						? {
+								pid,
+								incarnation: "inc-996",
+								ppid: process.pid,
+								status: () => "running",
+								children: () => [],
+							}
+						: null,
 				isProcessGone: () => false,
 				onInheritedEnvironmentDrop: names => drops.push([...names]),
 			}),
@@ -1562,6 +2642,7 @@ describe("Broker spawn close and orphan reaper", () => {
 						},
 					}),
 					verify: async () => "verified" as const,
+					resolveLifecycleOwner: resolveFakeLifecycleOwner,
 					close: async () => {
 						closes += 1;
 						return { ok: true };
@@ -1643,6 +2724,7 @@ describe("Broker spawn close and orphan reaper", () => {
 					verifyCalls += 1;
 					throw new Error("verify transport failed");
 				},
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
@@ -1683,6 +2765,7 @@ describe("Broker spawn close and orphan reaper", () => {
 					};
 				},
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: promptLayer,
@@ -1729,6 +2812,7 @@ describe("Broker spawn close and orphan reaper", () => {
 					};
 				},
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: async () => ({ ok: true as const, owner: { pid: 990, incarnation: "inc-990" } }),
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
@@ -1789,13 +2873,15 @@ describe("Broker spawn close and orphan reaper", () => {
 					};
 				},
 				verify: async () => "verified" as const,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+				awaitRegistration: async (input: SpawnRegistrationRequest) => ({
 					ok: true as const,
 					registration: {
 						sessionId: input.childId,
+						lifecycleRequestId: input.effectMarker,
 						endpointGeneration: 1,
 						pid: 989,
 						processIncarnation: "inc-989",
@@ -1841,16 +2927,81 @@ describe("Broker spawn close and orphan reaper", () => {
 		}
 	});
 
+	it.each([
+		["win32", true],
+		["darwin", false],
+	] as const)("%s Broker spawn persists its authority claim when the journal directory cannot be flushed: launches=%p", async (platform, launches) => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const base = provider(probe);
+		let launched = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				...base,
+				launch: async () => {
+					launched += 1;
+					return await base.launch();
+				},
+			},
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		const journalDirectory = path.join(agentDir, "sdk");
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		const realOpen = fs.open;
+		// Windows refuses a read-only handle on a directory; every other open is real.
+		const open = spyOn(fs, "open").mockImplementation((async (
+			file: Parameters<typeof fs.open>[0],
+			...rest: unknown[]
+		) => {
+			if (path.resolve(String(file)) === journalDirectory)
+				throw Object.assign(new Error(`EPERM: operation not permitted, open '${journalDirectory}'`), {
+					code: "EPERM",
+				});
+			return await (realOpen as (...args: unknown[]) => ReturnType<typeof fs.open>)(file, ...rest);
+		}) as typeof fs.open);
+		try {
+			Object.defineProperty(process, "platform", { configurable: true, value: platform });
+			const response = (await broker.handleRequest("session.spawn", spawnInput(), `journal-${platform}`)) as {
+				ok: boolean;
+			};
+			Object.defineProperty(process, "platform", platformDescriptor!);
+			expect(response.ok).toBe(launches);
+			expect(launched).toBe(launches ? 1 : 0);
+			if (launches) {
+				// The claim is durable: a fresh store reopening the journal sees it.
+				const reopened = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+				await reopened.open();
+				expect(reopened.claims()).toHaveLength(1);
+			}
+		} finally {
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+			open.mockRestore();
+			await broker.stop();
+		}
+	});
+
 	it("pins child registration to the launch locator and the dispatch endpoint", async () => {
 		const agentDir = await temp();
 		const seen: { pinned?: { endpointGeneration: number; pid: number } } = {};
 		const registrations: { childId: string; cwd: string; stateRoot: string }[] = [];
+		const closedProofs: SpawnSubstrateProof[] = [];
+		const substrate = provider({ verdict: "verified", closes: 0 });
 		const broker = new Broker({
 			agentDir,
 			masterCapabilityVerifier: verifier,
-			spawnSubstrateProvider: provider({ verdict: "verified", closes: 0 }),
+			spawnSubstrateProvider: {
+				...substrate,
+				resolveLifecycleOwner: async () => ({ ok: true, owner: { pid: 4242, incarnation: "inc-4242" } }),
+				close: async proof => {
+					closedProofs.push(proof);
+					return substrate.close();
+				},
+			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+				awaitRegistration: async (input: SpawnRegistrationRequest) => {
 					// The launch locator must reach the matcher; a same-id row from an
 					// unrelated workspace must not satisfy this spawn.
 					registrations.push(input);
@@ -1858,6 +3009,7 @@ describe("Broker spawn close and orphan reaper", () => {
 						ok: true as const,
 						registration: {
 							sessionId: input.childId,
+							lifecycleRequestId: input.effectMarker,
 							endpointGeneration: 7,
 							pid: 4242,
 							processIncarnation: "inc-4242",
@@ -1882,6 +3034,25 @@ describe("Broker spawn close and orphan reaper", () => {
 			expect(registrations[0]!.stateRoot.length).toBeGreaterThan(0);
 			// The proven endpoint identity is carried into the seed dispatch.
 			expect(seen.pinned).toMatchObject({ endpointGeneration: 7, pid: 4242 });
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			const claim = store.claims()[0];
+			expect(store.authority(claim?.lifecycleIdentity ?? "")).toMatchObject({
+				pid: 995,
+				processIncarnation: "inc-995",
+				endpointPid: 4242,
+				endpointIncarnation: "inc-4242",
+			});
+			const closed = await broker.handleRequest("session.close", { sessionId: claim?.childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+			expect(closedProofs).toEqual([
+				{
+					substrateKind: "headless",
+					providerIdentity: "close-provider",
+					pid: 995,
+					processIncarnation: "inc-995",
+				},
+			]);
 		} finally {
 			await broker.stop();
 		}
@@ -1913,9 +3084,507 @@ describe("Broker spawn close and orphan reaper", () => {
 		}
 	});
 
+	const hostCloseLayer = (
+		probe: ProviderProbe,
+		outcome: "accepted-exits" | "accepted-stays" | "accepted-mismatch" | "unavailable" | "throws",
+		calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[],
+	) => ({
+		...promptLayer,
+		close: async (input: { sessionId: string; pinned: { pid: number; endpointGeneration: number } }) => {
+			calls.push({
+				pid: input.pinned.pid,
+				endpointGeneration: input.pinned.endpointGeneration,
+				substrateClosesBefore: probe.closes,
+			});
+			if (outcome === "throws") throw new Error("endpoint exploded");
+			if (outcome === "accepted-exits") probe.verdict = "gone";
+			// A reused pid after the acknowledgement is not proof that this host exited.
+			if (outcome === "accepted-mismatch") probe.verdict = "mismatch";
+			return outcome === "unavailable" ? ("unavailable" as const) : ("accepted" as const);
+		},
+	});
+
+	it("closes a headless host through its own endpoint before any substrate signal", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, "accepted-exits", calls),
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "graceful-key");
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			// Only the registration-pinned endpoint is asked, and no substrate signal follows.
+			expect(calls).toEqual([{ pid: 995, endpointGeneration: 1, substrateClosesBefore: 0 }]);
+			expect(probe.closes).toBe(0);
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			const claim = store.claims().find(row => row.childId === childId);
+			expect(claim?.state).toBe("closed");
+			expect(store.authority(claim?.lifecycleIdentity ?? "")?.closeState).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it.each([
+		"accepted-stays",
+		"unavailable",
+		"throws",
+	] as const)("escalates through the exact substrate close when the host close is %s", async outcome => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, outcome, calls),
+			spawnHostCloseGraceMs: 150,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `escalate-${outcome}`);
+			const started = Date.now();
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			expect(calls).toEqual([{ pid: 995, endpointGeneration: 1, substrateClosesBefore: 0 }]);
+			expect(probe.closes).toBe(1);
+			// Only an acknowledged close earns the exit grace before escalation.
+			if (outcome === "accepted-stays") expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("retains a host whose identity stops re-proving after it acknowledged close, without any signal", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, "accepted-mismatch", calls),
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "accepted-mismatch-key");
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: false, error: { code: "close_refused" } });
+			expect(calls).toHaveLength(1);
+			// A reused pid is not this host: it is neither proven gone nor signaled.
+			expect(probe.closes).toBe(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	type HeadlessHost = { alive: boolean; signals: string[]; dieAfterReads?: number };
+	function exactHeadlessProvider(host: HeadlessHost) {
+		const exact = createSpawnSubstrateProvider({
+			platform: "darwin",
+			selectMultiplexer: () => "none",
+			startHeadless: () => ({ pid: 996, terminate() {} }),
+			processIncarnation: pid => {
+				if (pid !== 996) return undefined;
+				if (host.dieAfterReads !== undefined && --host.dieAfterReads < 0) host.alive = false;
+				return host.alive ? "inc-996" : undefined;
+			},
+			isProcessGone: pid => pid === 996 && !host.alive,
+			signalHeadless: (_pid, _incarnation, _platform, signal) => {
+				host.signals.push(signal);
+				host.alive = false;
+				return true;
+			},
+			sleep: async () => {},
+		});
+		// Registration binding is covered by the substrate suite; resolving the owner
+		// here would consume the scripted incarnation reads these close tests count.
+		return { ...exact, resolveLifecycleOwner: resolveFakeLifecycleOwner };
+	}
+	async function closeExactHeadless(
+		key: string,
+		host: HeadlessHost,
+		close: (host: HeadlessHost) => Promise<"accepted" | "unavailable">,
+		graceMs = 5_000,
+	): Promise<{ first: unknown; second?: unknown }> {
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: exactHeadlessProvider(host),
+			spawnPromptLayer: { ...promptLayer, close: async () => await close(host) },
+			spawnHostCloseGraceMs: graceMs,
+		});
+		setLifecycleCommandResolverForTest(broker, () => ({
+			kind: "compiled",
+			file: "child-command",
+			args: [],
+			env: {},
+		}));
+		await broker.start();
+		try {
+			const response = (await broker.handleRequest("session.spawn", { ...spawnInput(), cwd: agentDir }, key)) as {
+				ok: boolean;
+				result?: { sessionId?: string };
+			};
+			expect(response.ok).toBe(true);
+			const childId = response.result!.sessionId!;
+			const first = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			const second = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			return { first, second };
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	}
+
+	it.each([
+		"unavailable",
+		"throws",
+	] as const)("closes a host that exits although its close acknowledgement was %s, without any signal", async outcome => {
+		const host: HeadlessHost = { alive: true, signals: [] };
+		const { first, second } = await closeExactHeadless(`lost-ack-${outcome}`, host, async current => {
+			// The host ran session.close, but the acknowledgement never arrived.
+			current.alive = false;
+			if (outcome === "throws") throw new Error("socket closed before the response");
+			return "unavailable";
+		});
+		expect(first).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+		expect(second).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+		expect(host.signals).toEqual([]);
+	});
+
+	it("closes a host that exits right after the grace expired, without any signal", async () => {
+		const host: HeadlessHost = { alive: true, signals: [] };
+		const { first } = await closeExactHeadless(
+			"grace-boundary",
+			host,
+			async current => {
+				// Still alive for the grace check, gone when the escalation re-verifies.
+				current.dieAfterReads = 1;
+				return "accepted";
+			},
+			0,
+		);
+		expect(first).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+		expect(host.signals).toEqual([]);
+	});
+
+	it("closes a host that already exited before close was requested, without any signal", async () => {
+		const host: HeadlessHost = { alive: true, signals: [] };
+		const closeCalls: string[] = [];
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: exactHeadlessProvider(host),
+			spawnPromptLayer: {
+				...promptLayer,
+				close: async () => {
+					closeCalls.push("close");
+					return "accepted" as const;
+				},
+			},
+		});
+		setLifecycleCommandResolverForTest(broker, () => ({
+			kind: "compiled",
+			file: "child-command",
+			args: [],
+			env: {},
+		}));
+		await broker.start();
+		try {
+			const response = (await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				"already-gone-key",
+			)) as { ok: boolean; result?: { sessionId?: string } };
+			expect(response.ok).toBe(true);
+			host.alive = false;
+			const closed = await broker.handleRequest(
+				"session.close",
+				{ sessionId: response.result!.sessionId! },
+				undefined,
+			);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+			expect(closeCalls).toEqual([]);
+			expect(host.signals).toEqual([]);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["forward", 3_600_000],
+		["backward", -3_600_000],
+	] as const)("measures the close grace on monotonic time when the wall clock steps %s", async (_direction, step) => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		let armed = false;
+		let stepped = false;
+		const exact = provider(probe);
+		// The wall clock steps once the grace has started: at the first re-verification.
+		const base = {
+			...exact,
+			verify: async () => {
+				if (armed) stepped = true;
+				return await exact.verify();
+			},
+		};
+		const wallNow = Date.now.bind(Date);
+		const clock = spyOn(Date, "now");
+		clock.mockImplementation(() => wallNow() + (stepped ? step : 0));
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: base,
+			spawnPromptLayer: {
+				...promptLayer,
+				close: async () => {
+					armed = true;
+					if (step > 0) setTimeout(() => (probe.verdict = "gone"), 200);
+					return "accepted" as const;
+				},
+			},
+			spawnHostCloseGraceMs: step > 0 ? 2_000 : 300,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `clock-${step}`);
+			const started = performance.now();
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			const elapsed = performance.now() - started;
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+			if (step > 0) {
+				// A forward step must not cut the host's cleanup short.
+				expect(probe.closes).toBe(0);
+			} else {
+				// A backward step must not stretch the grace beyond its bound.
+				expect(probe.closes).toBe(1);
+				expect(elapsed).toBeLessThan(2_000);
+			}
+		} finally {
+			clock.mockRestore();
+			await broker.stop();
+		}
+	});
+
+	it.each([
+		"gone after its failed close",
+		"gone before close",
+	] as const)("keeps a managed close that failed retained when its substrate is %s", async phase => {
+		const agentDir = await temp();
+		let verdict: "verified" | "gone" = "verified";
+		const closes: string[] = [];
+		const hostCloses: string[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "tmux" as const,
+						providerIdentity: "managed-close-provider",
+						nativeSessionId: "$7",
+						pid: 995,
+						processIncarnation: "inc-995",
+						ownerGeneration: 3,
+					},
+				}),
+				verify: async () => verdict,
+				resolveLifecycleOwner: resolveFakeLifecycleOwner,
+				close: async () => {
+					// The cooperative close failed (no matching verdict), but the session went away.
+					closes.push("close");
+					verdict = "gone";
+					return { ok: false, code: "substrate_close_failed" };
+				},
+			},
+			spawnPromptLayer: {
+				...promptLayer,
+				close: async () => {
+					hostCloses.push("close");
+					return "accepted" as const;
+				},
+			},
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `managed-failed-close-${phase}`);
+			// Managed close keeps its pre-existing contract for an already-gone session too.
+			if (phase === "gone before close") verdict = "gone";
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			// Only the matching terminal verdict closes a managed owner; absence is not enough.
+			expect(closed).toMatchObject({ ok: false, error: { code: "close_refused" } });
+			expect(closes).toEqual(["close"]);
+			// A managed owner is never asked to close through the host endpoint.
+			expect(hostCloses).toEqual([]);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it.each([
+		["the Broker lifecycle marker", "lifecycle-marker-close"],
+		["no lifecycle marker", undefined],
+	] as const)("sends the production host close over the pinned endpoint with %s", async (_label, marker) => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const hostIncarnation = processIncarnation(process.pid);
+		const registrations: SpawnRegistrationRequest[] = [];
+		const received: Record<string, unknown>[] = [];
+		const token = "spawn-close-token";
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, instance) {
+				if (new URL(request.url).searchParams.get("token") !== token)
+					return new Response("Unauthorized", { status: 401 });
+				if (instance.upgrade(request, { data: undefined })) return undefined;
+				return new Response("WebSocket upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(socket) {
+					socket.send(JSON.stringify({ type: "hello" }));
+				},
+				message(socket, message) {
+					const frame = JSON.parse(String(message)) as Record<string, unknown>;
+					received.push(frame);
+					const input = frame.input as Record<string, unknown> | undefined;
+					const authorized =
+						frame.type === "control_request" &&
+						frame.operation === "session.close" &&
+						input?.[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD] === marker;
+					if (authorized) probe.verdict = "gone";
+					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: authorized }));
+				},
+			},
+		});
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			// The resolved SDK host is this test process, which serves the pinned endpoint.
+			spawnSubstrateProvider: {
+				...provider(probe),
+				resolveLifecycleOwner: async () => ({
+					ok: true as const,
+					owner: { pid: process.pid, incarnation: hostIncarnation ?? "missing-incarnation" },
+				}),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async (input: SpawnRegistrationRequest) => {
+					registrations.push(input);
+					return {
+						ok: true as const,
+						registration: {
+							sessionId: input.childId,
+							lifecycleRequestId: input.effectMarker,
+							endpointGeneration: 1,
+							pid: input.owner.pid,
+							processIncarnation: input.owner.incarnation,
+							cwd: input.cwd,
+							stateRoot: input.stateRoot,
+						},
+					};
+				},
+				dispatch: promptLayer.dispatch,
+				reconcile: promptLayer.reconcile,
+			},
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `endpoint-close-${marker ?? "none"}`);
+			const { cwd, stateRoot } = registrations[0]!;
+			const endpointPath = path.join(stateRoot, "sdk", `${childId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			const url = new URL(server.url);
+			url.protocol = "ws:";
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({ version: 1, sessionId: childId, pid: process.pid, url: url.toString(), token }),
+			);
+			const stat = await fs.stat(endpointPath, { bigint: true });
+			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+				type: "host_registered",
+				sessionId: childId,
+				locator: { cwd, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				hostIncarnation,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				endpointFileId: `${stat.dev}:${stat.ino}`,
+				...(marker ? { lifecycleRequestId: marker } : {}),
+				version: SESSION_INDEX_EVENT_VERSION,
+				indexSeq: 1,
+				ts: Date.now(),
+			};
+			const indexFile = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+			await fs.mkdir(path.dirname(indexFile), { recursive: true });
+			await Bun.write(
+				indexFile,
+				`${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) } as SessionIndexEvent)}\n`,
+			);
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			if (marker) {
+				// The host saw exactly one close carrying its own launch marker, and no
+				// substrate signal was needed.
+				expect(received).toHaveLength(1);
+				expect(received[0]).toMatchObject({
+					type: "control_request",
+					operation: "session.close",
+					input: { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: marker },
+				});
+				expect(probe.closes).toBe(0);
+			} else {
+				// Without the marker the host could not authorize a close, so nothing is
+				// sent and the exact substrate close remains the path.
+				expect(received).toEqual([]);
+				expect(probe.closes).toBe(1);
+			}
+		} finally {
+			await broker.stop();
+			server.stop(true);
+		}
+	});
+
+	it("never asks a host to close when its substrate identity is not re-proven", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, "accepted-exits", calls),
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "mismatch-graceful-key");
+			probe.verdict = "mismatch";
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(calls).toEqual([]);
+			expect(probe.closes).toBe(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("retains uncertainty for a mismatched substrate identity and never closes it", async () => {
 		const agentDir = await temp();
-		const probe: ProviderProbe = { verdict: "mismatch", closes: 0 };
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
 		const broker = new Broker({
 			agentDir,
 			masterCapabilityVerifier: verifier,
@@ -1925,6 +3594,7 @@ describe("Broker spawn close and orphan reaper", () => {
 		await broker.start();
 		try {
 			const childId = await acceptedChild(broker, "mismatch-key");
+			probe.verdict = "mismatch";
 			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
 			expect(closed).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
 			expect(probe.closes).toBe(0);

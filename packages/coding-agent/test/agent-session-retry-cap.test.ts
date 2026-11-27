@@ -7,6 +7,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { PROVIDER_PROTOCOL_MISMATCH_ERROR_CODE } from "@gajae-code/ai/utils/fallback-transport";
 import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
+import { GEMINI_HEADER_RUNAWAY_ERROR_CODE } from "@gajae-code/ai/utils/thinking-loop";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
@@ -51,6 +52,48 @@ describe("AgentSession retry delay cap", () => {
 		authStorage.close();
 		tempDir.removeSync();
 		vi.restoreAllMocks();
+	});
+
+	it.each([
+		["https://rapid.example/v1", true],
+		["http://127.0.0.1:8477/v1", false],
+		["http://localhost:8000/v1", false],
+		["http://192.168.1.20:8000/v1", false],
+	] as const)("Rapid-MLX endpoint %s keeps the appropriate retry path", async (baseUrl, shouldRetry) => {
+		const model: Model = {
+			...createMockModel(),
+			provider: "rapid-mlx",
+			api: "openai-completions",
+			baseUrl,
+		};
+		const mock = createMockModel({
+			responses: [{ throw: "503 service unavailable" }, { content: ["recovered"] }],
+		});
+		let attempts = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				attempts++;
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 5,
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const retries: AutoRetryStartEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retries.push(event);
+		});
+		await session.prompt("Exercise Rapid-MLX availability handling");
+		await session.waitForIdle();
+		expect(attempts).toBe(shouldRetry ? 2 : 1);
+		expect(retries).toHaveLength(shouldRetry ? 1 : 0);
+		if (shouldRetry) expect(retries[0].unbounded).toBe(true);
+		expect(lastAssistant(session).stopReason).toBe(shouldRetry ? "stop" : "error");
 	});
 
 	it("caps legacy retry-after delays at retry.maxDelayMs", async () => {
@@ -365,6 +408,17 @@ describe("AgentSession retry admission: repetition guard", () => {
 		const last = lastAssistant(session!);
 		expect(last.stopReason).toBe("error");
 		expect(last.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+	});
+
+	// Finding 2: Gemini header runaway should be classified as terminal
+	it("does not retry a turn the Gemini header runaway detector stopped", async () => {
+		const runawayMessage = `Gemini reasoning-summary header runaway detected at 64 consecutive headers. Interrupted to prevent budget exhaustion.`;
+		const retryStartEvents = await runTurn(GEMINI_HEADER_RUNAWAY_ERROR_CODE, runawayMessage);
+
+		expect(retryStartEvents).toEqual([]);
+		const last = lastAssistant(session!);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorCode).toBe(GEMINI_HEADER_RUNAWAY_ERROR_CODE);
 	});
 
 	// Pins the delta rather than just the new branch: the identical message

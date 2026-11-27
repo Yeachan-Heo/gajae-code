@@ -93,13 +93,20 @@ function collapseCarriageReturns(line: string): string {
 	const idx = line.lastIndexOf("\r");
 	return idx < 0 ? line : line.slice(idx + 1);
 }
+
+// Source bytes are untrusted. Collapse CR first: sanitizeText drops CR, which
+// would concatenate both sides of a progress-bar overwrite. Strip before the
+// line cap and the highlighter so a clipped line cannot keep a control.
+function sanitizeCodeLines(text: string): string[] {
+	return sanitizeTerminalLines(text).map(line => sanitizeText(line));
+}
 export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[] {
 	const { code, language, output, expanded = false, outputMaxLines = 6, codeMaxLines = 12, width } = options;
 	const { title, meta } = formatHeader(options, theme);
 	const state = getState(options.status);
 
 	const normalizedCode = replaceTabs(code ?? "");
-	const rawCodeLines = sanitizeTerminalLines(normalizedCode);
+	const rawCodeLines = sanitizeCodeLines(normalizedCode);
 	const maxCodeLines = expanded ? rawCodeLines.length : Math.min(rawCodeLines.length, codeMaxLines);
 	const visibleCode = rawCodeLines.slice(0, maxCodeLines).join("\n");
 	const codeLines = highlightCode(visibleCode, language);

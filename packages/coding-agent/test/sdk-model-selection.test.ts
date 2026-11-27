@@ -1410,6 +1410,88 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+	async function resumeWithSavedChain(entries: string[]): Promise<SessionManager> {
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries,
+			origin: "model_selection",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+		return SessionManager.open(sessionFile, tempDir);
+	}
+
+	function registerPaygProvider(): void {
+		modelRegistry.registerProvider("payg-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "PAYG_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "payg-model",
+					name: "PAYG Model",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 10, output: 30, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("payg-provider", "test-key");
+	}
+
+	test("a removed saved model falls back within its own provider, not to another credentialed provider", async () => {
+		// runtime-provider is credentialed and first in automatic order, so the
+		// generic fallback would pick it; the saved provider must win instead.
+		registerPaygProvider();
+		const resumedManager = await resumeWithSavedChain(["payg-provider/removed-preview"]);
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+		try {
+			expect(session.model).toMatchObject({ provider: "payg-provider", id: "payg-model" });
+			expect(modelFallbackMessage).toBeDefined();
+			expect(modelFallbackMessage!).toContain("payg-provider/removed-preview");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a removed saved model never switches to a different provider when its own has nothing callable", async () => {
+		const resumedManager = await resumeWithSavedChain(["gone-provider/removed-preview"]);
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+		try {
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toBeDefined();
+			expect(modelFallbackMessage!).toContain("gone-provider/removed-preview");
+			expect(modelFallbackMessage!).toContain("/model");
+			expect(modelFallbackMessage!).not.toContain("runtime-provider");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a fresh session with no saved model still uses the generic credentialed fallback", async () => {
+		const { session } = await createAgentSession({ ...buildSessionOptions(""), modelPattern: undefined });
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("resumes a bare profile alias through preset-equivalent resolution when a startup profile is configured", async () => {
 		// Slash-prefixed catalog id keeps the alias out of the exact canonical-id
 		// path, so resolution must pass through the final-segment alias stage.
@@ -1523,6 +1605,160 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(lookupAliasSpy).not.toHaveBeenCalled();
 			expect(resolveAliasSpy).not.toHaveBeenCalled();
 			expect(session.getActiveModelProfile()).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("[P2] honors explicit preferred provider during resume fallback when saved model is rejected by preference", async () => {
+		// Setup: save payg-provider model, but set preference to anthropic (a bundled provider with OAuth support).
+		// This tests that fallback respects the credential preference and selects from the preferred provider.
+		registerPaygProvider();
+		authStorage.setRuntimeApiKey("payg-provider", "payg-key");
+
+		// Setup: anthropic credentials for the preferred provider
+		const anthropicModel = getBundledModel("anthropic", DEFAULT_MODEL_PER_PROVIDER.anthropic);
+		if (!anthropicModel) throw new Error("Expected a bundled anthropic model");
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "token-test-preferred",
+				refresh: "refresh-test-preferred",
+				expires: Date.now() + 60 * 60_000,
+				email: "preferred@example.test",
+			},
+		]);
+
+		// Get the anthropic credential row to create a preference selector
+		const anthropicCredential = authStorage
+			.exportSnapshot()
+			.credentials.find(entry => entry.provider === "anthropic");
+		if (!anthropicCredential) throw new Error("Expected an anthropic credential row");
+
+		// This test verifies that when a saved model is rejected due to credential preference,
+		// fallback selects a model from the preferred provider, not from the saved provider.
+		// Regression test: ensures preferredCredentialSelector is honored during fallback.
+		const resumedManager = await resumeWithSavedChain(["payg-provider/payg-model"]);
+		const { session } = await createAgentSession({
+			...buildSessionOptions("", resumedManager),
+			preferredCredentialSelector: {
+				selector: { kind: "id", value: String(anthropicCredential.id) },
+				raw: `id:${anthropicCredential.id}`,
+			},
+		});
+		try {
+			// The saved payg-model should be rejected by the preference (credential mismatch),
+			// and fallback should select an anthropic model instead.
+			expect(session.model).toBeDefined();
+			expect(session.model?.provider).toBe("anthropic");
+			expect(authStorage.hasRuntimePreferredCredentialSelector("anthropic")).toBe(true);
+			expect(authStorage.hasRuntimePreferredCredentialSelector("payg-provider")).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("[P2] matches saved provider identity case-insensitively when filtering fallback candidates", async () => {
+		// Setup: simulated case-mismatch scenario
+		modelRegistry.registerProvider("openai", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "OPENAI_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "gpt-4-turbo",
+					name: "GPT-4 Turbo",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 4096,
+				},
+				{
+					id: "gpt-4-fallback",
+					name: "GPT-4 Fallback",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 4096,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("openai", "openai-key");
+
+		// Create a session manager with saved chain using uppercase provider name (for a removed model)
+		const resumedManager = await resumeWithSavedChain(["OPENAI/gpt-4-turbo-removed"]); // removed model with uppercase provider
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, resumedManager),
+		});
+		try {
+			// Should match case-insensitively and select an openai model (not undefined)
+			// even though the persisted selector uses uppercase OPENAI
+			expect(session.model?.provider).toBe("openai");
+			expect(session.model).toBeDefined();
+			expect(["gpt-4-turbo", "gpt-4-fallback"]).toContain(session.model!.id);
+			expect(modelFallbackMessage).toBeDefined();
+			expect(modelFallbackMessage!).toContain("OPENAI/gpt-4-turbo-removed");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("[P2] fail closed when saved model provider cannot be identified but model is unavailable", async () => {
+		// Regression test: when a saved model is unavailable but we can't identify the provider,
+		// we should NOT fall through to an arbitrary provider. Must fail closed.
+		modelRegistry.registerProvider("payg-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "PAYG_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "payg-model-1",
+					name: "PAYG Model 1",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 4096,
+				},
+			],
+		});
+		modelRegistry.registerProvider("anthropic", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "ANTHROPIC_KEY",
+			api: "anthropic",
+			models: [
+				{
+					id: "claude-3.5",
+					name: "Claude 3.5",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 200000,
+					maxTokens: 16384,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("payg-provider", "payg-key");
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-key");
+
+		// Create a session with a saved model chain that uses a provider that no longer exists
+		// The saved selector would have been "unknown-provider/removed-model" but provider is gone
+		const resumedManager = await resumeWithSavedChain(["unknown-provider/removed-model"]);
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, resumedManager),
+		});
+		try {
+			// Critical: session.model should be undefined because we can't identify the saved provider.
+			// We should NOT fall back to payg-provider or anthropic (arbitrary providers).
+			// This is the fail-closed behavior.
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toBeDefined();
+			// Message should indicate that a model needs to be selected
+			expect(modelFallbackMessage!).toContain("/model");
 		} finally {
 			await session.dispose();
 		}

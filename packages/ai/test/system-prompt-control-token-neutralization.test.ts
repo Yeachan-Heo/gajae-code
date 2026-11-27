@@ -47,7 +47,7 @@ function completedSse(modelId: string): Response {
 }
 
 describe("system prompt control-token neutralization (Request blocked regression)", () => {
-	it("codex: neutralizes `instructions` and developer messages in the wire body", async () => {
+	it("codex: neutralizes all system prompts as developer messages in the wire body", async () => {
 		let body: Record<string, unknown> | undefined;
 		const model: Model<"openai-codex-responses"> = {
 			...createBaseModel("openai-codex-responses"),
@@ -69,11 +69,16 @@ describe("system prompt control-token neutralization (Request blocked regression
 		const serialized = JSON.stringify(body);
 		expect(serialized).not.toContain(RAW_MARKER);
 		expect(serialized).not.toContain("<|assistant to=");
-		expect(String(body?.instructions)).toContain(NEUTRALIZED_MARKER);
-		// The developer message travels inside `input` (prepended by
-		// transformRequestBody) and must be neutralized there too.
-		const inputJson = JSON.stringify(body?.input);
-		expect(inputJson).toContain("<\u200b|assistant to=functions.bash|>");
+		// System prompts are now sent as developer messages (for prompt caching)
+		// rather than the top-level `instructions` field which is not cached.
+		expect(body?.instructions).toBeUndefined();
+		const input = body?.input as Array<{ role?: string; content?: string | unknown[] }> | undefined;
+		expect(Array.isArray(input)).toBe(true);
+		const developerMessages = input?.filter(item => item.role === "developer") ?? [];
+		expect(developerMessages.length).toBeGreaterThan(0);
+		const inputJson = JSON.stringify(developerMessages);
+		expect(inputJson).toContain(NEUTRALIZED_MARKER); // First prompt neutralized
+		expect(inputJson).toContain("<\u200b|assistant to=functions.bash|>"); // Second prompt neutralized
 	});
 
 	it("openai-responses: neutralizes the top-level `instructions` field", async () => {

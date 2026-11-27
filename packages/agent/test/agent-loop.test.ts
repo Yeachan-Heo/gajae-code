@@ -20,12 +20,7 @@ import type { AssistantMessage, Context, Message, Model, ToolResultMessage } fro
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
-import { createAssistantMessage, createUserMessage } from "./helpers";
-
-// Simple identity converter for tests - just passes through standard messages
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createAssistantMessage, createUserMessage, identityConverter } from "./helpers";
 
 describe("agentLoop with AgentMessage", () => {
 	it("forwards provider conversation authority separately from generic session affinity", async () => {
@@ -2030,6 +2025,146 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(hookCalls).toBe(2);
 		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "user", "assistant"]);
 		expect(messages[2]).toMatchObject({ role: "user", content: "follow-up" });
+	});
+});
+
+describe("agentLoop - step boundary messages", () => {
+	const echoTool: AgentTool<z.ZodObject<{ value: z.ZodString }>, { value: string }> = {
+		name: "echo",
+		label: "Echo",
+		description: "Echo tool",
+		parameters: z.object({ value: z.string() }),
+		async execute(_toolCallId, params) {
+			return { content: [{ type: "text", text: `ok: ${params.value}` }], details: { value: params.value } };
+		},
+	};
+	const toolTurn = (id: string) => ({
+		content: [{ type: "toolCall" as const, id, name: "echo", arguments: { value: id } }],
+	});
+
+	it("adds boundary messages before the next model call without an extra iteration after the final answer", async () => {
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [echoTool] };
+		const mock = createMockModel({ responses: [toolTurn("t1"), toolTurn("t2"), { content: ["done"] }] });
+		let polls = 0;
+		let beforeYieldCalls = 0;
+		const config: AgentLoopConfig = {
+			model: mock,
+			convertToLlm: identityConverter,
+			getStepBoundaryMessages: () => {
+				polls += 1;
+				return polls === 1 ? [createUserMessage("background result")] : [];
+			},
+			onBeforeYield: () => {
+				beforeYieldCalls += 1;
+			},
+			getFollowUpMessages: async () => [],
+		};
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, mock.stream);
+		for await (const _ of stream) {
+			// drain
+		}
+		const messages = await stream.result();
+
+		// Polled once per completed tool step, never after the final answer.
+		expect(polls).toBe(2);
+		expect(beforeYieldCalls).toBe(1);
+		expect(mock.calls).toHaveLength(3);
+		expect(messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
+		expect(messages[3]).toMatchObject({ role: "user", content: "background result" });
+		expect(JSON.stringify(mock.calls[1]?.context.messages)).toContain("background result");
+	});
+
+	it("is not polled when the turn answers without tools", async () => {
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [echoTool] };
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		let polls = 0;
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{
+				model: mock,
+				convertToLlm: identityConverter,
+				getStepBoundaryMessages: () => {
+					polls += 1;
+					return [createUserMessage("background result")];
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+		expect(polls).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("is not polled past a pause checkpoint", async () => {
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [echoTool] };
+		const mock = createMockModel({ responses: [toolTurn("t1"), { content: ["done"] }] });
+		let polls = 0;
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{
+				model: mock,
+				convertToLlm: identityConverter,
+				shouldPause: () => true,
+				getStepBoundaryMessages: () => {
+					polls += 1;
+					return [createUserMessage("background result")];
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+		expect(polls).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "paused" });
+	});
+
+	it("is not polled when the run is aborted during a tool step", async () => {
+		const controller = new AbortController();
+		const abortingTool: AgentTool = {
+			...echoTool,
+			async execute() {
+				controller.abort();
+				return { content: [{ type: "text", text: "aborted" }] };
+			},
+		} as AgentTool;
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [abortingTool] };
+		const mock = createMockModel({ responses: [toolTurn("t1"), { content: ["done"] }] });
+		let polls = 0;
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{
+				model: mock,
+				convertToLlm: identityConverter,
+				getStepBoundaryMessages: () => {
+					polls += 1;
+					return [createUserMessage("background result")];
+				},
+			},
+			controller.signal,
+			mock.stream,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+		expect(polls).toBe(0);
+		expect(mock.calls).toHaveLength(1);
 	});
 });
 

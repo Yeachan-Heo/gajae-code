@@ -31,7 +31,7 @@ export interface StartupAuthConfigSnapshot {
 	credentialPinStoreIdentity?: string;
 	credentialRankingMode: CredentialRankingMode;
 	credentialPins: Readonly<Record<string, string>>;
-	/** Ordered soft per-provider preferences; only portable email/`account:` selectors are accepted. */
+	/** Ordered soft per-provider preferences; only portable email, `account:`, and `org:<organization-id>` selectors are accepted. */
 	credentialPreferences: Readonly<Record<string, readonly ConfiguredCredentialPreference[]>>;
 }
 
@@ -109,17 +109,19 @@ export function isValidPersistedCredentialSelector(value: string): boolean {
 }
 
 /** JSON-schema pattern for a preference account; shared with {@link parsePreferenceAccount}. */
-export const PREFERENCE_ACCOUNT_PATTERN = "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$";
+export const PREFERENCE_ACCOUNT_PATTERN = "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$";
 
 /**
- * Parse one `auth.credentialPreferences` account: a bare email, `email:<address>`, or `account:<id>`. Numeric row ids
- * are excluded: they are bound to one credential store, and a preference has no store-identity binding to detect a
- * retargeted row.
+ * Parse one `auth.credentialPreferences` account: a bare email, `email:<address>`, `account:<id>`, or
+ * `org:<organization id>` (one login can hold a row per organization, sharing email and account id; display names are
+ * not accepted because they are neither unique nor stable). Numeric row ids are excluded: they are bound to one credential store, and a preference has no store-identity binding to
+ * detect a retargeted row.
  */
 export function parsePreferenceAccount(value: string): AuthCredentialSelector | undefined {
 	const trimmed = value.trim();
 	const selector = parsePersistedCredentialSelector(trimmed);
 	if (selector) return selector.kind === "id" ? undefined : selector;
+	if (/^org:\S+$/.test(trimmed)) return { kind: "org", value: trimmed.slice(4) };
 	return /^[^@\s:]+@[^@\s]+$/.test(trimmed) ? { kind: "email", value: trimmed } : undefined;
 }
 
@@ -146,7 +148,8 @@ function parseCredentialPreferenceEntry(value: unknown): ConfiguredCredentialPre
 }
 
 function preferenceSelectorKey(selector: AuthCredentialSelector): string {
-	return `${selector.kind}:${selector.kind === "email" ? selector.value.toLowerCase() : selector.value}`;
+	const caseInsensitive = selector.kind === "email" || selector.kind === "org";
+	return `${selector.kind}:${caseInsensitive ? selector.value.toLowerCase() : selector.value}`;
 }
 
 /**

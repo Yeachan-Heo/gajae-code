@@ -328,11 +328,11 @@ export class TtsrManager {
 		return false;
 	}
 
-	#matchesCondition(entry: TtsrEntry, streamBuffer: string): boolean {
+	#matchesCondition(entry: TtsrEntry, streamBuffer: string, complete = false): boolean {
 		for (let i = 0; i < entry.conditions.length; i++) {
 			const condition = entry.conditions[i];
 			const window = entry.conditionWindows[i];
-			const target = window === undefined ? streamBuffer : streamBuffer.slice(-window);
+			const target = complete || window === undefined ? streamBuffer : streamBuffer.slice(-window);
 			condition.lastIndex = 0;
 			if (condition.test(target)) {
 				return true;
@@ -406,7 +406,24 @@ export class TtsrManager {
 		const bufferKey = this.#bufferKey(context);
 		const nextBuffer = `${this.#buffers.get(bufferKey) ?? ""}${delta}`;
 		this.#buffers.set(bufferKey, nextBuffer);
+		return this.#collectMatches(nextBuffer, context, false);
+	}
 
+	/**
+	 * Match a complete snapshot (for example final tool arguments) against every
+	 * rule. Unlike {@link checkDelta}, conditions are scanned over the whole
+	 * snapshot rather than the tail window used for incremental stream chunks, so
+	 * a short match in an early field cannot be hidden by a long trailing field.
+	 * Does not read or write any stream buffer.
+	 */
+	checkSnapshot(snapshot: string, context: TtsrMatchContext): Rule[] {
+		if (this.#isDisabled()) {
+			return [];
+		}
+		return this.#collectMatches(snapshot, context, true);
+	}
+
+	#collectMatches(buffer: string, context: TtsrMatchContext, complete: boolean): Rule[] {
 		const matches: Rule[] = [];
 		for (const [name, entry] of this.#rules) {
 			if (!this.#canTrigger(name)) {
@@ -418,7 +435,7 @@ export class TtsrManager {
 			if (!this.#matchesGlobalPaths(entry, context)) {
 				continue;
 			}
-			if (!this.#matchesCondition(entry, nextBuffer)) {
+			if (!this.#matchesCondition(entry, buffer, complete)) {
 				continue;
 			}
 
@@ -442,6 +459,11 @@ export class TtsrManager {
 
 	/** Mark rule names as injected (won't trigger again until conditions allow). */
 	markInjectedByNames(ruleNames: string[]): void {
+		this.markInjectedByNamesAt(ruleNames, this.#messageCount);
+	}
+
+	/** Mark rule names as injected at a specific message count (for reconciliation). */
+	markInjectedByNamesAt(ruleNames: string[], messageCount: number): void {
 		for (const rawName of ruleNames) {
 			const ruleName = rawName.trim();
 			if (ruleName.length === 0) {
@@ -449,7 +471,7 @@ export class TtsrManager {
 			}
 			const entry = this.#rules.get(ruleName);
 			const nextRecord: InjectionRecord = {
-				lastInjectedAt: this.#messageCount,
+				lastInjectedAt: messageCount,
 				repeatMode: entry?.rule.repeatMode ?? this.#settings.repeatMode,
 				repeatGap: entry?.rule.repeatGap ?? this.#settings.repeatGap,
 			};
@@ -457,7 +479,7 @@ export class TtsrManager {
 
 			logger.debug("TTSR rule marked as injected", {
 				ruleName,
-				messageCount: this.#messageCount,
+				messageCount,
 				repeatMode: nextRecord.repeatMode,
 			});
 		}

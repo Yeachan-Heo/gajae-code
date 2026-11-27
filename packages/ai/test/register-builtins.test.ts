@@ -390,7 +390,7 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		expect(result.errorMessage).toBeUndefined();
 	});
 
-	it("alibaba-token-plan times out at 600s when the source never emits", async () => {
+	it("alibaba-token-plan times out at 900s when the source never emits", async () => {
 		vi.useFakeTimers();
 		const source = createHangingSource();
 		setBedrockProviderModule({ streamBedrock: () => source });
@@ -398,8 +398,8 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const stream = streamBedrock(createAlibabaModel(), baseContext, {});
 		await flush();
 
-		// 599s — still alive.
-		vi.advanceTimersByTime(599_000);
+		// 899s — still alive.
+		vi.advanceTimersByTime(899_000);
 		await flush();
 		let settled = false;
 		void stream.result().then(() => {
@@ -408,7 +408,7 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		await flush();
 		expect(settled).toBe(false);
 
-		// 600s — watchdog fires.
+		// 900s — watchdog fires.
 		vi.advanceTimersByTime(1_000);
 		await flush();
 		const result = await stream.result();
@@ -420,16 +420,16 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		});
 	});
 
-	it("unrelated providers still time out at the 120s shared default", async () => {
+	it("unrelated providers still time out at the 900s shared default", async () => {
 		vi.useFakeTimers();
-		// Source would emit at 150s, but the generic 120s watchdog fires first.
-		const source = createDelayedSource(150_000);
+		// Source would emit at 950s, but the generic 900s watchdog fires first.
+		const source = createDelayedSource(950_000);
 		setBedrockProviderModule({ streamBedrock: () => source });
 
 		const stream = streamBedrock(createModel(), baseContext, {});
 		await flush();
 
-		vi.advanceTimersByTime(120_000);
+		vi.advanceTimersByTime(900_000);
 		await flush();
 		const result = await stream.result();
 		expect(result.stopReason).toBe("error");

@@ -25,6 +25,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
+import type { SessionStorageSnapshot } from "@gajae-code/coding-agent/sdk/session-readonly/storage";
 import {
 	SessionManager,
 	type SessionManagerCloseOutcome,
@@ -33,7 +34,6 @@ import {
 import {
 	MemorySessionStorage,
 	type SessionStorage,
-	type SessionStorageSnapshot,
 	type SessionStorageWriter,
 	type SessionStorageWriterCloseState,
 	type SessionStorageWriterOpenOptions,

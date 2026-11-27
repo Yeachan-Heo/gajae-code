@@ -1,4 +1,5 @@
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
+import { isRecord } from "@gajae-code/utils";
 import {
 	assertSessionRoot,
 	parseTaskArtifactOwnerDeletionEvidence,
@@ -45,10 +46,6 @@ export interface BrokerTaskArtifactOwnerCleanupValidation {
 	readonly retired?: true;
 	readonly transcriptDeleted?: true;
 	readonly cleanupDiagnostic?: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {

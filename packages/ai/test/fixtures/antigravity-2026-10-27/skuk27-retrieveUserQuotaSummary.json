@@ -1,0 +1,61 @@
+{
+  "description": "Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens. Thus, limits will last longer with shorter tasks or using more cost-effective models. The 5-hour limit smooths out aggregate demand to fairly distribute global capacity across all users, while your weekly limit is tied directly to your individual tier.",
+  "groups": [
+    {
+      "buckets": [
+        {
+          "bucketId": "gemini-weekly",
+          "description": "You have used some of your weekly limit, it will fully refresh in 4 days, 10 hours.",
+          "displayName": "Weekly Limit Remaining",
+          "remainingFraction": 0.99973905,
+          "resetTime": "2026-11-01T04:52:49Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "gemini-5h",
+          "displayName": "Five Hour Limit Remaining",
+          "remainingFraction": 1,
+          "resetTime": "2026-10-27T23:39:53Z",
+          "window": "5h"
+        }
+      ],
+      "description": "Models within this group: Gemini Flash, Gemini Pro",
+      "displayName": "Gemini Models"
+    },
+    {
+      "buckets": [
+        {
+          "bucketId": "3p-weekly",
+          "description": "You have used some of your weekly limit, it will fully refresh in 10 hours, 13 minutes.",
+          "displayName": "Weekly Limit Remaining",
+          "remainingFraction": 0.4184348,
+          "resetTime": "2026-10-28T04:53:18Z",
+          "window": "weekly"
+        },
+        {
+          "bucketId": "3p-5h",
+          "displayName": "Five Hour Limit Remaining",
+          "remainingFraction": 1,
+          "resetTime": "2026-10-27T23:39:53Z",
+          "window": "5h"
+        }
+      ],
+      "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+      "displayName": "Claude and GPT models"
+    },
+    {
+      "buckets": [
+        {
+          "bucketId": "gemini-argon-wtu-weekly",
+          "description": "You have hit your weekly limit, it refreshes in 3 days, 9 hours. If on a supported paid plan, you can use AI credits in the interim or upgrade to a higher tier.",
+          "displayName": "Gemini 4 Argon Weekly Limit",
+          "remainingFraction": 0,
+          "resetTime": "2026-10-31T04:06:51Z",
+          "window": "weekly"
+        }
+      ],
+      "description": "For paid Pro plans, Argon quota is separate. Higher Argon quota (included as part of the larger Gemini quota bucket) is available on Ultra plans.",
+      "displayName": "Gemini 4 Argon"
+    }
+  ]
+}

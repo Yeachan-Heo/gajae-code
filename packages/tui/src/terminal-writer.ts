@@ -1,7 +1,7 @@
 import { isBunTestRuntime } from "@gajae-code/utils";
 
 type NativeTtyWriter = InstanceType<typeof import("@gajae-code/natives").TtyWriter>;
-type NativeBindings = Pick<typeof import("@gajae-code/natives"), "TtyWriter">;
+type NativeBindings = Pick<typeof import("@gajae-code/natives"), "TtyWriter" | "restoreConsoleCodePagesForRender">;
 
 let nativeWriter: NativeTtyWriter | undefined;
 
@@ -27,6 +27,19 @@ function getNativeWriter(): NativeTtyWriter {
 	return nativeWriter;
 }
 
+let restoreCodePages: (() => void) | undefined;
+
+/**
+ * Re-assert the console code pages GJC recorded before its first shell command.
+ * A background child of a bash-tool command shares this console and may switch
+ * its code page at any time (#7760); checking before each frame keeps every
+ * frame decoded as UTF-8. When nothing drifted this is two console queries.
+ */
+function restoreConsoleCodePages(): void {
+	restoreCodePages ??= (require("@gajae-code/natives") as NativeBindings).restoreConsoleCodePagesForRender;
+	restoreCodePages();
+}
+
 /**
  * Write terminal bytes in FIFO order. Windows intentionally retains Bun's
  * ConPTY-aware stdout writer; Unix uses the lazily-created native pump. Bun's
@@ -34,6 +47,7 @@ function getNativeWriter(): NativeTtyWriter {
  */
 export function writeTerminalOutput(data: string): void {
 	if (process.platform === "win32" || isBunTestRuntime()) {
+		if (process.platform === "win32") restoreConsoleCodePages();
 		process.stdout.write(data);
 		return;
 	}

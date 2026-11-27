@@ -12,6 +12,9 @@ const STORE_HEADINGS: Record<GcStore, string> = {
 	tmux_sessions: "Tmux sessions",
 	registry_entries: "Harness-root registry entries",
 	local_roots: "Session local roots",
+	shell_snapshots: "Shell snapshot roots",
+	sdk_snapshots: "SDK snapshot spill roots",
+	python_runners: "Python runner roots",
 };
 
 function actionLabel(record: GcRecord): string {

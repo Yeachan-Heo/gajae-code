@@ -114,6 +114,21 @@ describe("YieldTool", () => {
 		expect(dataSchema.additionalProperties).toBe(false);
 	});
 
+	it("preserves own __proto__ properties in emitted output schemas", () => {
+		const outputSchema = JSON.parse(
+			'{"type":"object","properties":{"__proto__":{"type":"string"}},"required":["__proto__"],"additionalProperties":false}',
+		);
+		const tool = new YieldTool(createSession({ outputSchema }));
+		const dataSchema = getSuccessDataSchema(enforceStrictSchema(toolWireSchema(tool as unknown as Tool)));
+		const properties = toRecord(dataSchema.properties);
+
+		expect(tool.strict).toBe(true);
+		expect(Object.hasOwn(properties, "__proto__")).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(properties, "__proto__")?.value).toEqual({ type: "string" });
+		expect(dataSchema.required).toEqual(["__proto__"]);
+		expect(dataSchema.additionalProperties).toBe(false);
+	});
+
 	it("normalizes object/null type arrays into strict-compatible data variants", () => {
 		const tool = new YieldTool(
 			createSession({

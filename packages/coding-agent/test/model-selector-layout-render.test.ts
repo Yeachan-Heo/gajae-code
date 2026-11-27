@@ -4,9 +4,10 @@ import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/mod
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { type Component, Container, Text, TUI, type ViewportAnchorRender } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { loadTestTheme } from "./helpers/test-theme";
 
 class CountingTranscript extends Container {
 	renders = 0;
@@ -270,8 +271,7 @@ async function replayPresetLanding(renderScope?: "layout"): Promise<Capture[]> {
 
 test("default preset landing reuses history across catalog and auth refreshes with identical pinned terminal output", async () => {
 	const previousTheme = theme;
-	const testTheme = await getThemeByName("red-claw");
-	if (!testTheme) throw new Error("Missing test theme");
+	const testTheme = await loadTestTheme();
 	setThemeInstance(testTheme);
 	try {
 		const full = await replayPresetLanding();
@@ -298,8 +298,7 @@ test("default preset landing reuses history across catalog and auth refreshes wi
 
 test("composer model refreshes reuse the transcript with identical terminal output and conservative invalidation", async () => {
 	const previousTheme = theme;
-	const testTheme = await getThemeByName("red-claw");
-	if (!testTheme) throw new Error("Missing test theme");
+	const testTheme = await loadTestTheme();
 	setThemeInstance(testTheme);
 	try {
 		const full = await replay();

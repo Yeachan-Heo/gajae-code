@@ -1,14 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 
 import { HookInputComponent } from "@gajae-code/coding-agent/modes/components/hook-input";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 beforeAll(async () => {
-	const theme = await getThemeByName("red-claw");
-	if (!theme) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const theme = await loadTestTheme();
 	setThemeInstance(theme);
 });
 describe("HookInputComponent timeout", () => {

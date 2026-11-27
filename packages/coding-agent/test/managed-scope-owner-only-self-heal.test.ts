@@ -4,9 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { NativeOwnerOnlySecurityResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
+import { resolveManagedScope } from "../src/sdk/session-readonly/scope";
 import {
 	prepareManagedSessionScopeForWriteSync,
-	resolveManagedScope,
 	resolveManagedScopeForWrite,
 } from "../src/session/internal/managed-session-scope";
 

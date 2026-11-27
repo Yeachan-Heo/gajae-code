@@ -382,12 +382,18 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
 		// DeepSeek-style / o-series reasoning channel.
 		responseMessage.reasoning_content = reasoning;
 	}
+	let hasExecutableToolCalls = false;
 	if (toolCalls.length > 0) {
-		responseMessage.tool_calls = toolCalls.map(tc => ({
-			id: wireToolCallId(tc.id),
-			type: "function",
-			function: { name: tc.name, arguments: stringifyArgs(tc.arguments) },
-		}));
+		// Filter out incomplete tool calls: they must not be forwarded as executable.
+		const executableCalls = toolCalls.filter(tc => !tc.incompleteArguments);
+		if (executableCalls.length > 0) {
+			hasExecutableToolCalls = true;
+			responseMessage.tool_calls = executableCalls.map(tc => ({
+				id: wireToolCallId(tc.id),
+				type: "function",
+				function: { name: tc.name, arguments: stringifyArgs(tc.arguments) },
+			}));
+		}
 	}
 
 	return {
@@ -402,7 +408,7 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
 			{
 				index: 0,
 				message: responseMessage,
-				finish_reason: mapFinishReason(message.stopReason, toolCalls.length > 0),
+				finish_reason: mapFinishReason(message.stopReason, hasExecutableToolCalls),
 				logprobs: null,
 			},
 		],
@@ -497,7 +503,7 @@ function stringifyArgs(args: Record<string, unknown>): string {
 }
 
 function mapFinishReason(reason: StopReason, hasToolCalls: boolean): string {
-	if (reason === "toolUse" || (hasToolCalls && reason === "stop")) return "tool_calls";
+	if ((reason === "toolUse" || reason === "stop") && hasToolCalls) return "tool_calls";
 	if (reason === "length") return "length";
 	// pi-ai's StopReason does not currently carry a content-filter signal;
 	// when it does, map it to "content_filter" here.
@@ -553,6 +559,14 @@ export function encodeStream(
 		async start(controller) {
 			// contentIndex (from pi-ai events) -> tool_calls index on the wire.
 			const toolIndexByContentIndex = new Map<number, number>();
+			// Buffer for tool call events before we know if the call is complete.
+			const pendingToolCallBuffers = new Map<
+				number,
+				{
+					toolCall: { id: string; name: string };
+					deltas: string[];
+				}
+			>();
 			let nextToolIndex = 0;
 			let hasToolCalls = false;
 			let finishReason: string = "stop";
@@ -636,44 +650,68 @@ export function encodeStream(
 							break;
 
 						case "toolcall_start": {
-							hasToolCalls = true;
-							const idx = nextToolIndex++;
-							toolIndexByContentIndex.set(event.contentIndex, idx);
+							// Buffer tool call events until we know if the call is complete (toolcall_end).
+							// Don't allocate tool_calls index yet; it's allocated only on successful emission at toolcall_end.
 							const partial = event.partial.content[event.contentIndex];
 							const call = partial && partial.type === "toolCall" ? partial : undefined;
-							writeSse(
-								controller,
-								baseChunk(
-									{
-										tool_calls: [
-											{
-												index: idx,
-												id: call ? wireToolCallId(call.id) : "",
-												type: "function",
-												function: { name: call?.name ?? "", arguments: "" },
-											},
-										],
-									},
-									null,
-								),
-							);
+							pendingToolCallBuffers.set(event.contentIndex, {
+								toolCall: { id: call ? wireToolCallId(call.id) : "", name: call?.name ?? "" },
+								deltas: [],
+							});
 							break;
 						}
 
 						case "toolcall_delta": {
-							const idx = toolIndexByContentIndex.get(event.contentIndex);
-							if (idx === undefined) break;
-							writeSse(
-								controller,
-								baseChunk({ tool_calls: [{ index: idx, function: { arguments: event.delta } }] }, null),
-							);
+							// Buffer delta events until toolcall_end confirms the call is complete.
+							const buffer = pendingToolCallBuffers.get(event.contentIndex);
+							if (buffer) {
+								buffer.deltas.push(event.delta);
+							}
+							break;
+						}
+
+						case "toolcall_end": {
+							const buffer = pendingToolCallBuffers.get(event.contentIndex);
+							if (!buffer) break;
+							pendingToolCallBuffers.delete(event.contentIndex);
+
+							// Skip incomplete tool calls: they must not be forwarded as executable.
+							if (event.toolCall.incompleteArguments) {
+								break;
+							}
+
+							// Allocate tool_calls index only now that we know the call is complete.
+							hasToolCalls = true;
+							const idx = nextToolIndex++;
+							toolIndexByContentIndex.set(event.contentIndex, idx);
+							const startChunk = {
+								tool_calls: [
+									{
+										index: idx,
+										id: buffer.toolCall.id,
+										type: "function",
+										function: { name: buffer.toolCall.name, arguments: "" },
+									},
+								],
+							};
+							writeSse(controller, baseChunk(startChunk, null));
+							// Emit all buffered deltas
+							for (const delta of buffer.deltas) {
+								writeSse(
+									controller,
+									baseChunk({ tool_calls: [{ index: idx, function: { arguments: delta } }] }, null),
+								);
+							}
 							break;
 						}
 
 						case "done":
 							pendingThinkingDeltas.clear();
+							// Only use tool_calls finish_reason if at least one tool call was actually emitted.
+							// If event.reason is "toolUse" but all tool calls were dropped (incomplete),
+							// use "stop" instead of "tool_calls".
 							finishReason =
-								event.reason === "toolUse"
+								event.reason === "toolUse" && hasToolCalls
 									? "tool_calls"
 									: event.reason === "length"
 										? "length"

@@ -13,6 +13,62 @@ describe("kind-aware reconciliation", () => {
 		expect(() => rec.admit("prompt", "same-ref")).toThrow(/clientRef/);
 	});
 
+	test("an admitted submission is observable during preflight and its rejection is definite (#7867)", async () => {
+		const rec = createKindAwareReconciliation({ now: () => 5_000 });
+		const correlation = { commandId: "preflight-command", turnId: "preflight-turn" };
+		rec.admit("prompt", "compacting-ref");
+		rec.bindAdmission("prompt", "compacting-ref", correlation);
+		const admitted = {
+			status: "admitted",
+			kind: "prompt",
+			clientRef: "compacting-ref",
+			...correlation,
+			receiptState: "absent",
+		} as const;
+		expect(rec.lookupResult("prompt", { clientRef: "compacting-ref" })).toEqual(admitted);
+		expect(rec.lookupResult("prompt", correlation)).toEqual(admitted);
+		// The same ref under another kind is a different submission.
+		expect(rec.lookupResult("skill", { clientRef: "compacting-ref" })).toMatchObject({ status: "unknown" });
+
+		// The requester connection closed during preflight: the host cancelled the submission.
+		rec.releaseAdmission("prompt", "compacting-ref", {
+			cause: Object.assign(new Error("requester connection closed"), { code: "cancelled" }),
+		});
+		const rejected = rec.lookupResult("prompt", { clientRef: "compacting-ref" });
+		expect(rejected).toMatchObject({
+			status: "failed",
+			kind: "prompt",
+			clientRef: "compacting-ref",
+			...correlation,
+			terminalAt: 5_000,
+			receiptState: "missing",
+			error: { code: expect.any(String), message: expect.stringContaining("never ran") },
+		});
+		expect(rejected).not.toHaveProperty("outcome");
+		// The rejected ref is free again, and a fresh admission replaces the rejection.
+		expect(() => rec.admit("prompt", "compacting-ref")).not.toThrow();
+		rec.bindAdmission("prompt", "compacting-ref", { commandId: "retry-command", turnId: "retry-turn" });
+		expect(rec.lookupResult("prompt", { clientRef: "compacting-ref" })).toMatchObject({
+			status: "admitted",
+			commandId: "retry-command",
+		});
+
+		// Acceptance hands the submission to its durable record.
+		await rec.noteAccepted("prompt", { commandId: "retry-command", turnId: "retry-turn" }, "compacting-ref");
+		expect(rec.lookupResult("prompt", { clientRef: "compacting-ref" })).toMatchObject({ status: "accepted" });
+	});
+
+	test("an admission released without a rejection is no longer reported", () => {
+		const rec = createKindAwareReconciliation();
+		rec.admit("prompt", "released-ref");
+		rec.bindAdmission("prompt", "released-ref", { commandId: "c", turnId: "t" });
+		rec.releaseAdmission("prompt", "released-ref");
+		expect(rec.lookupResult("prompt", { clientRef: "released-ref" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
+	});
+
 	test("a steer-only writer preserves prompt records owned by another reconciler", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-owned-recon-"));
 		try {

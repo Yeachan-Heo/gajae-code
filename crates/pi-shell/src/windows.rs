@@ -13,6 +13,8 @@ use brush_core::{
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
 
+use crate::console_code_page::{ConsoleCodePages, restore_code_pages};
+
 pub fn configure_windows_path(shell: &mut BrushShell) -> Result<()> {
 	let install_roots = find_git_install_roots();
 	let git_paths = find_git_paths();
@@ -291,6 +293,47 @@ fn is_windows_style_path(value: &str) -> bool {
 		return true;
 	}
 	value.starts_with("\\\\")
+}
+
+/// The host's console code pages, captured once before the first shell command
+/// runs. Every command restores this baseline rather than its own entry
+/// snapshot: with overlapping commands, a later command's entry snapshot can
+/// already hold a code page an earlier command's child left behind.
+static CONSOLE_BASELINE: std::sync::OnceLock<Option<ConsoleCodePages>> = std::sync::OnceLock::new();
+
+fn current_code_pages() -> Option<ConsoleCodePages> {
+	use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+	// SAFETY: pure queries of this process's attached console; 0 means none.
+	let (input, output) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
+	(input != 0 && output != 0).then_some(ConsoleCodePages { input, output })
+}
+
+/// Record the host's console code pages if they are not recorded yet. Call
+/// before a shell command starts.
+pub fn capture_console_baseline() {
+	CONSOLE_BASELINE.get_or_init(current_code_pages);
+}
+
+/// Restore the recorded console code pages after a shell command ends.
+pub fn restore_console_baseline() {
+	use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+	let (Some(Some(baseline)), Some(current)) =
+		(CONSOLE_BASELINE.get().copied(), current_code_pages())
+	else {
+		return;
+	};
+	// SAFETY: setting this process's console code pages to values the console
+	// itself reported earlier.
+	restore_code_pages(
+		baseline,
+		current,
+		|page| unsafe {
+			SetConsoleCP(page);
+		},
+		|page| unsafe {
+			SetConsoleOutputCP(page);
+		},
+	);
 }
 
 #[cfg(test)]

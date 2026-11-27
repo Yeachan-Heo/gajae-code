@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
@@ -25,9 +25,12 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { safeRm } from "../../../../scripts/safe-cleanup";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 async function makeSkill(name: string, content: string): Promise<Skill> {
-	const dir = await mkdtemp(path.join(os.tmpdir(), `skill-tool-${name}-`));
+	const dir = await trackedTemp.mkdtemp(path.join(os.tmpdir(), `skill-tool-${name}-`));
 	const filePath = path.join(dir, "SKILL.md");
 	await writeFile(filePath, content, "utf8");
 	return {
@@ -46,7 +49,7 @@ interface CapturedSend {
 }
 
 async function makeTempCwd(): Promise<string> {
-	return mkdtemp(path.join(os.tmpdir(), "skill-tool-cwd-"));
+	return trackedTemp.mkdtemp(path.join(os.tmpdir(), "skill-tool-cwd-"));
 }
 
 async function makeRuntimeSkill(root: string, name: string, description: string, body: string): Promise<string> {
@@ -248,7 +251,7 @@ describe("SkillTool", () => {
 
 	it("uses runtime fallback through createIf while session skills retain name precedence", async () => {
 		const cwd = await makeTempCwd();
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-home-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-home-"));
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		let unrelated: Skill | undefined;
@@ -298,7 +301,7 @@ describe("SkillTool", () => {
 
 	it("uses exact runtime fallback precedence across project, canonical, configured, and historical roots", async () => {
 		const cwd = await makeTempCwd();
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -1115,7 +1118,7 @@ describe("SkillTool", () => {
 
 	it("enumerates and invokes registered marketplace skills by their namespaced name", async () => {
 		const cwd = await makeTempCwd();
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-marketplace-home-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "skill-tool-marketplace-home-"));
 		const craftRoot = path.join(home, "plugin-cache", "craft-skills");
 		const bstackRoot = path.join(home, "plugin-cache", "bstack");
 		const registryPath = path.join(home, ".gjc", "plugins", "installed_plugins.json");

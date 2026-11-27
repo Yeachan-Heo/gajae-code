@@ -119,7 +119,7 @@ async function readBoundedBytes(file: string, maxBytes: number): Promise<Uint8Ar
 	}
 }
 
-function parseFatalUtf8Json(bytes: Uint8Array): unknown {
+export function parseFatalUtf8Json(bytes: Uint8Array): unknown {
 	return JSON.parse(guideUtf8Decoder.decode(bytes));
 }
 

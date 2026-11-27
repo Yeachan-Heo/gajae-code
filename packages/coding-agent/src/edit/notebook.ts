@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent, isRecord } from "@gajae-code/utils";
 
 export type NotebookCellType = "code" | "markdown" | "raw";
 
@@ -24,10 +24,6 @@ const CELL_MARKER_RE = /^# %% \[(code|markdown|raw)\](?: cell:(\d+))?$/;
 
 export function isNotebookPath(filePath: string): boolean {
 	return path.extname(filePath).toLowerCase() === ".ipynb";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isCellType(value: unknown): value is NotebookCellType {

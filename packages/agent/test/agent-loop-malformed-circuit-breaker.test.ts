@@ -4,7 +4,7 @@ import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool
 import type { Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 // Bounded termination for argument-validation loops.
 //
@@ -19,10 +19,6 @@ const toolSchema = z.object({ value: z.string() });
 const RECOVERY_MARKER = "Do not call any tools";
 /** Well above the production bound; only guards the test runner. */
 const RUNAWAY_CAP = 60;
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 function throwingTool(onExecute?: () => void): AgentTool<typeof toolSchema, Record<string, never>> {
 	return {

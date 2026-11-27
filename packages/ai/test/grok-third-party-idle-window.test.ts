@@ -30,11 +30,11 @@ describe("Grok idle window on third-party OpenAI-compatible hosts", () => {
 			expect(getOpenAIStreamIdleTimeoutMs("venice", "grok-build-0-1")).toBe(300_000);
 		});
 
-		it("keeps non-Grok models on the 120s default", () => {
-			expect(getOpenAIStreamIdleTimeoutMs("openrouter", "anthropic/claude-sonnet-4")).toBe(120_000);
-			expect(getOpenAIStreamIdleTimeoutMs("kilo", "moonshotai/kimi-k2.5")).toBe(120_000);
-			expect(getOpenAIStreamIdleTimeoutMs("openai", "gpt-4o-mini")).toBe(120_000);
-			expect(getOpenAIStreamIdleTimeoutMs("openrouter")).toBe(120_000);
+		it("keeps non-Grok models on the 900s default", () => {
+			expect(getOpenAIStreamIdleTimeoutMs("openrouter", "anthropic/claude-sonnet-4")).toBe(900_000);
+			expect(getOpenAIStreamIdleTimeoutMs("kilo", "moonshotai/kimi-k2.5")).toBe(900_000);
+			expect(getOpenAIStreamIdleTimeoutMs("openai", "gpt-4o-mini")).toBe(900_000);
+			expect(getOpenAIStreamIdleTimeoutMs("openrouter")).toBe(900_000);
 		});
 
 		it("preserves the provider floor and env precedence", () => {

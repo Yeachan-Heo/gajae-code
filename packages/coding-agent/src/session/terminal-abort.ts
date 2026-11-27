@@ -15,6 +15,10 @@
  * must not be reinstated under any name.
  */
 import { createHash, randomUUID } from "node:crypto";
+import {
+	MAX_DURABLE_TERMINAL_RESERVATIONS,
+	MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
+} from "../sdk/protocol/terminal-abort-contract";
 
 /** Origin class assigned to every causal callback/queue entry before escape. */
 export type DeliveryOrigin =
@@ -1225,14 +1229,6 @@ export function collectEvictedTerminalKeys<T extends DurableScopeRetentionRow>(
 	}
 	return evicted;
 }
-
-/** Durable terminal-scope reservation cap. Idle/already-terminal aborts write
- *  durable no-effect reservations, so a client sending idle aborts with unique
- *  keys must not grow the reconciliation document indefinitely: only the OLDEST
- *  COMPLETED rows beyond this cap are evicted (review thread P2). */
-export const MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
-/** Retained evicted-key tombstone cap; see {@link boundEvictedTerminalKeys}. */
-export const MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
 
 /**
  * Apply the durable terminal-scope retention bound to a pending

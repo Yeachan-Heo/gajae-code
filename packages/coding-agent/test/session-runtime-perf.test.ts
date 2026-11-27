@@ -375,11 +375,17 @@ describe("session runtime cache hot paths", () => {
 		const mapSpy = spyOn(WeakMap.prototype, "set");
 		try {
 			const session = createSession(dir.path(), "ok", [tool]);
+			// An ACP permission bridge and an SDK permission provider are mutually
+			// exclusive, so each generation hands the lease from one to the other.
 			for (let index = 0; index < 40; index++) {
+				session.setSdkPermissionProvider(undefined);
 				session.setClientBridge({
 					capabilities: { requestPermission: true },
 					requestPermission: async () => ({ outcome: "cancelled" }),
 				});
+				const bridged = session.getToolForExecution("bash");
+				expect(session.getToolForExecution("bash")).toBe(bridged);
+				session.setClientBridge(undefined);
 				session.setSdkPermissionProvider(async () => ({ outcome: "cancelled" }));
 				const wrapped = session.getToolForExecution("bash");
 				expect(session.getToolForExecution("bash")).toBe(wrapped);

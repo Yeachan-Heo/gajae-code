@@ -2,6 +2,64 @@
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-25
+
+### Added
+
+- `tryAcquireFileLock(path, timeoutMs?)`, `probeFileLock(path, timeoutMs?)` and the `FileLock` handle: a non-blocking, kernel-backed exclusive lock on a sidecar file, using an open-file-description lock on Linux and `flock` on macOS. The kernel releases the lock when its holder exits or is killed, and the descriptor is close-on-exec, so spawned children never keep it. The probe reports `free`, `held` or `unknown` with a read-lock query and never takes the lock. Acquire and probe run off the JS thread, and a time budget (default 2 s, clamped to 1-60000 ms) bounds how long the caller waits; past it they answer `timed_out`, while a call stuck in a stalled filesystem keeps its thread until the filesystem answers. `release()` and garbage collection close the descriptor synchronously, with no budget. Only `ENOLCK`, `ENOTSUP`/`EOPNOTSUPP` and an unsupported platform report `unavailable`. A symlinked, non-regular, foreign-owned, group- or other-accessible or multiply-linked sidecar, and every other error, reports `failed`. Every target other than Linux and macOS, Windows included, reports `unavailable` for now. Nothing uses the lock yet.
+
+## [0.22.1] - 2026-11-24
+
+### Fixed
+
+- Keep a live native-build temporary file, and keep the existing index when a rename fails for a reason other than a Windows file-in-use error. A missing or regular `index.js` or `index.d.ts` is written in place without a temporary file or rename: an existing file keeps its inode, mode, owner, and ACL, and a missing one is created with mode 0644 (subject to umask). Temp and rename are used only for a symlink or another non-regular destination. An existing index is truncated only after the opened file is confirmed to be the one that was checked. A symlinked `index.js` or declaration is not read, so a linked private file is never copied into a new index.
+
+- When installing generated native bindings, replace a destination symlink instead of following it. An existing regular index file is updated in place.
+
+- Report Windows `STATUS_ACCESS_DENIED` (`0xC0000022`) as `access_denied` instead of `owner_mismatch` from tree snapshots, exact tree removal and detach, exact unlink and restore, and the exact-replace rename. NTFS refuses to rename a directory while another process holds a handle on one of its children, so a lock directory whose `info` file is being read returned a permanent-looking owner failure for what is transient contention. Callers of `exactReplacePath` and `exactRestore` that matched `owner_mismatch` for a denied open or rename now receive `access_denied`. The owner-only security APIs still report a denied open as `owner_mismatch`, so managed-session repair routing and the skip for foreign-owner tmux state keep their behavior.
+- A tree snapshot whose child open fails reports that first failure (for example `sharing_violation` or `access_denied`) instead of the directory reopen's `io_error`.
+
+- On Windows, `Process.observe` reports a process that has exited as `absent` even while a handle to it is still open, by checking the handle's exit state with a zero-timeout wait. It previously reported such a process as `present`, so `gjc sdk` commands failed to clean up a broker that had already exited on a lock failure and hid the lock failure behind a cleanup error.
+- On Windows, `Process.observe` no longer needs termination rights to report `present`; a live process that denies termination access but allows query and synchronize access is now `present` with its incarnation instead of `unknown`.
+
+## [0.22.0] - 2026-11-19
+
+## [0.21.1] - 2026-11-17
+
+## [0.21.0] - 2026-11-16
+
+### Fixed
+
+- Windows `exactRemoveDirectoryTree` no longer fails every non-empty removal with `sharing_violation` by holding the directory it quarantines children into with DELETE, and no longer leaks child handles on failed removals. This stops the SDK broker from wedging its session index after the first lock contention on Windows 10.
+
+- Windows process-tree walks (`Process.children()`, `killTree()`, `terminate()` and the bash tool's timeout/cancel cleanup) no longer adopt unrelated processes through a recycled parent PID. Windows keeps a dead parent's PID number on its orphans and reuses that number, so a cleanup walk from a command process that received such a number treated the orphan (for example the SDK broker, which is started through a short-lived hop) and its whole subtree as the command's descendants and terminated them. A process is now walked only when its own handle confirms the parent number and it was created strictly after that parent; the current process and its provable ancestors are never selected; PID 0/4, unreadable processes, equal creation times and processes whose handle reports a different parent number than the snapshot are skipped together with their subtrees.
+
+## [0.20.0] - 2026-11-08
+
+### Fixed
+
+- Isolation git commands drop `GIT_CONFIG_*` from the child environment, so a repository `.env` cannot set `core.hooksPath` while a task worktree is created.
+
+## [0.19.3] - 2026-11-03
+
+### Added
+
+- Added Unix-only `reassertRawTty(fd)`. It applies the `setRawMode(true)` raw transform (libuv `UV_TTY_MODE_RAW`) to the live termios with `TCSANOW`, so the tty never enters an echoing state. It returns `true` when it had to restore raw mode, returns `false` without calling `tcsetattr` when the tty is already raw, and throws when `fd` is not a tty.
+
+- `readOwnerOnlyFile(path, maxBytes)` reads a private regular file (`0600`, single link, owned by the effective user, no extended ACL) under a private `0700` directory on macOS and Linux with a bounded, descriptor-retaining double read. Failures return only a bounded code, never paths or partial bytes. The loader and the addon embedder reject a candidate addon without it, so a retained same-version variant built before the reader is skipped in favor of a compatible one.
+
+### Fixes
+
+- Windows `gjc update` failures on `acl_present` now return structured diagnostic details: the offending principal (account name when resolvable, SID string otherwise) and whether the ACE is inherited. JavaScript layer formats these into actionable error messages that explain the security issue and how to remediate it (e.g. disable inheritance on `%LOCALAPPDATA%\gjc` and remove the offending principal's ACE). The stable error code `acl_present` remains unchanged for compatibility with existing callers and tests (issue #7469).
+
+## [0.19.2] - 2026-10-29
+
+## [0.19.1] - 2026-10-28
+
+### Fixed
+
+- Accept a Windows executable owned by `BUILTIN\Administrators` and carrying the default profile DACL (`SYSTEM`/`Administrators` full control, read/execute for others) during exact replacement, so `gjc update` no longer fails with `owner_mismatch` or `acl_present` on elevated or stock `%LOCALAPPDATA%` installs. Write grants to any other principal are still refused (issues #6096, #6916).
+
 ## [0.19.0] - 2026-10-22
 
 ### Added

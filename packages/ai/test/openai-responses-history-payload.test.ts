@@ -13,12 +13,7 @@ import type { AssistantMessage, Context, Model, ProviderSessionState, ToolResult
 import type OpenAI from "openai";
 import type { ResponseInput } from "openai/resources/responses/responses";
 import { createOpenAIResponsesHistoryPayload, truncateResponseItemId } from "../src/utils";
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
+import { createAbortedSignal } from "./helpers";
 
 function createCodexToken(accountId: string): string {
 	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");

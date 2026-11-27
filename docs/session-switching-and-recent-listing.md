@@ -57,6 +57,20 @@ For `SessionInfo` list entries:
 - `starred` defaults to `false` for sessions without star metadata
 - `firstMessage` is first user message text or `"(no messages)"`
 
+### Optional AI recap
+
+With `recap.enabled: true`, a normally completed user turn produces one short summary from its request and final answer. The default is `false`. The input is at most 8192 UTF-8 bytes including its frame, bounded after registered secrets are masked. The model follows the `default` role setting. This is an extra model call; it does not guarantee a cache hit or any cost saving.
+
+A recap is a single line of at most 120 code points and 720 UTF-8 bytes. An empty answer, a tool call, an abnormal stop, or an over-limit result yields no recap; nothing is clipped or regenerated. A result that arrives after a new request, cancellation, settings/model change, or session switch is not stored.
+
+It is stored as a `session_recap` custom entry linking the original request (`requestEntryId`) and the final answer (`sourceEntryId`). Read results are marked `source: "model"`. `SessionInfo.recap` exists only while those entries are ancestors of the current leaf and the final answer is still the latest conversation entry. Metadata-only appends keep it; a new conversation turn or a move to another branch stops showing the old recap as current. A recap never replaces the title, the transcript, or a compaction summary.
+
+The `/resume` picker shows the latest recap as `[AI recap]` and searches its text; without one, the existing title/first-message display is unchanged. Listing or resuming a session never generates a recap. The read-only listing walks only the needed ancestor range from the end of the file, and omits the recap when a needed record is corrupt or a single line exceeds 8 MiB. The walk covers at most 100,000 lines and keeps at most 256 recap candidates. Only the current session format (v5) is read; the single-line limit does not cap the total session size.
+
+The generation input is the accepted original user text plus the final answer. Steering and follow-up messages are not merged in, so a recap is not a full execution report of changed requirements or tool details. Image-only requests and skill/custom prompts get no recap.
+
+An exact SDK `session.list` lookup (with `cwd` and `resolveSessionId`) exposes the same record as a validated `savedSession.recap`. Plain broker index rows, ACP listings, and the lightweight `RecentSessionInfo` welcome list do not include it.
+
 ## `--continue` resolution and terminal breadcrumb preference
 
 `SessionManager.continueRecent(cwd, sessionDir?)` resolves the target in this order:
@@ -105,6 +119,7 @@ Handled after initial session-manager construction:
 4. inspect the selected transcript read-only and confirm resumable tail state when required
 5. strictly open the approved identity, rechecking ownership before any replay-sanitization persistence
 6. publish the terminal breadcrumb only after strict-open sanitation succeeds, then continue startup from the opened manager
+
 ### `--continue`
 
 Uses `SessionManager.continueRecent(...)` directly (breadcrumb-first behavior above).

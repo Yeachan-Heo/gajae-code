@@ -5,14 +5,9 @@ import type { GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/codi
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { ThinkingSelectorComponent } from "@gajae-code/coding-agent/modes/components/thinking-selector";
-import {
-	getThemeByName,
-	setSymbolPreset,
-	setTheme,
-	setThemeInstance,
-	theme,
-} from "@gajae-code/coding-agent/modes/theme/theme";
+import { setSymbolPreset, setTheme, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 function normalizeRenderedText(text: string): string {
 	return (
@@ -169,25 +164,15 @@ function createOllamaCloudModel(id: string): Model {
 		maxTokens: 8192,
 	};
 }
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) {
-		throw new Error("Failed to load dark theme for ModelSelector tests");
-	}
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 describe("ModelSelector canonical model selection", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		if (!testTheme) {
-			throw new Error("Failed to load dark theme for ModelSelector tests");
-		}
+		testTheme = await loadTestTheme();
 	});
 
 	test("uses canonical GJC assignment actions while hiding legacy roles", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
@@ -211,7 +196,7 @@ describe("ModelSelector canonical model selection", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("DEFAULT (low)");
@@ -220,7 +205,7 @@ describe("ModelSelector canonical model selection", () => {
 		expect(rendered).not.toContain("SMOL");
 
 		selector.handleInput("\n");
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const actionRendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(actionRendered).toContain("Action for:");
 		expect(actionRendered).toContain("Set as DEFAULT (Default)");
@@ -251,7 +236,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("selects role-agent assignment without using stale task role", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
@@ -269,7 +254,7 @@ describe("ModelSelector canonical model selection", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
@@ -290,7 +275,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("role assignment updates live runtime override for next selector render", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-live-override-test");
 		const settings = Settings.isolated();
 		settings.set("task.agentModelOverrides", {
@@ -306,7 +291,7 @@ describe("ModelSelector canonical model selection", () => {
 			}
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
@@ -322,7 +307,7 @@ describe("ModelSelector canonical model selection", () => {
 
 		const nextSelector = createSelector(model, settings);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const rendered = normalizeRenderedText(nextSelector.render(220).join("\n"));
 
 		expect(rendered).toContain("PLANNER (high)");
@@ -335,7 +320,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("selects batch role-agent assignment action", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
@@ -344,7 +329,7 @@ describe("ModelSelector canonical model selection", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		for (let i = 0; i < 6; i++) selector.handleInput("\x1b[B");
@@ -364,7 +349,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("selects batch all-targets assignment action", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
@@ -373,7 +358,7 @@ describe("ModelSelector canonical model selection", () => {
 			if (selection.kind === "assignment") selected = selection;
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		for (let i = 0; i < 7; i++) selector.handleInput("\x1b[B");
@@ -393,7 +378,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("temporary scoped model selection carries selected reasoning", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
@@ -413,7 +398,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ temporaryOnly: true, thinkingLevel: ThinkingLevel.Low },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 
@@ -425,7 +410,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("canonical scoped model assignment preserves selected reasoning", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
@@ -469,7 +454,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ modelRegistry, thinkingLevel: ThinkingLevel.Medium },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\t");
 		selector.handleInput("\n");
@@ -485,7 +470,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("refreshes Ollama Cloud by provider id with the credential session", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const settings = Settings.isolated({});
 		const discoveredModel = createOllamaCloudModel("deepseek-v4-pro");
 		let availableModels: Model[] = [];
@@ -528,7 +513,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ sessionId: "selector-refresh-session" },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const initialRendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(initialRendered).toContain("OLLAMA CLOUD");
@@ -536,7 +521,7 @@ describe("ModelSelector canonical model selection", () => {
 		selector.handleInput("\t");
 		selector.handleInput("\t");
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud", "online-if-uncached", "selector-refresh-session");
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
@@ -545,7 +530,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("prompts for reasoning before assigning OpenAI reasoning default models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-reasoning-test");
 		const settings = Settings.isolated({});
 
@@ -559,7 +544,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -588,7 +573,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("prompts and carries the selected effort for an explicitly eligible custom OpenAI-compatible model", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createCustomOpenAIReasoningModel("eligible-reasoner", true);
 		let selected: SelectionCapture | undefined;
 		const selector = createSelector(
@@ -600,7 +585,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -617,7 +602,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("keeps custom OpenAI-compatible reasoning controls unavailable when transport support is disabled", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createCustomOpenAIReasoningModel("unsupported-reasoner", false);
 		let selected: SelectionCapture | undefined;
 		const selector = createSelector(
@@ -629,7 +614,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -646,7 +631,7 @@ describe("ModelSelector canonical model selection", () => {
 		["google", "gemini-reasoning-test"],
 		["ollama-cloud", "deepseek-reasoning-test"],
 	] as const)("prompts for reasoning before assigning %s reasoning default models", async (provider, id) => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = { ...createAnthropicReasoningModel(id), provider } as Model;
 		const settings = Settings.isolated({});
 
@@ -660,7 +645,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -686,7 +671,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("cancelling DEFAULT reasoning returns to the action menu without assignment", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createAnthropicReasoningModel("claude-fable-cancel");
 		let selected: SelectionCapture | undefined;
 		const selector = createSelector(
@@ -698,7 +683,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -713,7 +698,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("does not prompt when assigning Anthropic non-reasoning models to default", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const reasoningModel = createAnthropicReasoningModel("claude-plain-base");
 		const model = {
 			...reasoningModel,
@@ -734,7 +719,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -746,7 +731,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("can explicitly choose off for OpenAI reasoning default models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-reasoning-off-test");
 		const settings = Settings.isolated({});
 
@@ -760,7 +745,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -774,7 +759,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("prompts for reasoning before assigning OpenAI Codex role-agent models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai-codex", "gpt-codex-reasoning-test");
 		const settings = Settings.isolated({});
 
@@ -788,7 +773,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\x1b[B");
@@ -811,7 +796,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("shows only role assignment actions for OpenAI Codex reasoning models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai-codex", "gpt-codex-actions-test");
 		model.thinking = {
 			minLevel: Effort.Low,
@@ -823,7 +808,7 @@ describe("ModelSelector canonical model selection", () => {
 
 		const selector = createSelector(model, settings, undefined, { thinkingLevel: null });
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		const actionRendered = normalizeRenderedText(selector.render(260).join("\n"));
@@ -840,7 +825,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("prompts for reasoning when scoped OpenAI thinking came from defaults", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-defaulted-scope-test");
 		const settings = Settings.isolated({});
 
@@ -854,7 +839,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: ThinkingLevel.High, explicitThinkingLevel: false },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -873,7 +858,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("does not prompt when scoped OpenAI thinking was explicit", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-explicit-scope-test");
 		const settings = Settings.isolated({});
 
@@ -887,7 +872,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: ThinkingLevel.High, explicitThinkingLevel: true },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -900,14 +885,14 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("limits missing OpenAI thinking metadata to off choice", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-missing-thinking-metadata");
 		model.thinking = undefined;
 		const settings = Settings.isolated({});
 
 		const selector = createSelector(model, settings, () => {}, { thinkingLevel: null });
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -920,7 +905,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("does not prompt for non-reasoning OpenAI models", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = createOpenAIModel("openai", "gpt-non-reasoning-test", false);
 		const settings = Settings.isolated({});
 
@@ -934,7 +919,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		selector.handleInput("\n");
 		selector.handleInput("\n");
@@ -947,7 +932,7 @@ describe("ModelSelector canonical model selection", () => {
 	});
 
 	test("seeds reasoning cursor from multi-effort role badge and keeps limited-effort catalog surface", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		// Multi-effort Luna-class model (xhigh assigned on executor).
 		const multiEffort = createOpenAIModel("openai-codex", "gpt-5.6-luna");
 		multiEffort.thinking = {
@@ -990,7 +975,7 @@ describe("ModelSelector canonical model selection", () => {
 			{ modelRegistry, thinkingLevel: null },
 		);
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 
 		const badgeRendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(badgeRendered).toContain("EXECUTOR (xhigh)");
@@ -1020,7 +1005,7 @@ describe("ModelSelector canonical model selection", () => {
 			thinkingLevel: null,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		limitedSelector.handleInput("\n");
 		limitedSelector.handleInput("\n");
 		const limitedRendered = normalizeRenderedText(limitedSelector.render(220).join("\n"));
@@ -1079,14 +1064,11 @@ function createFastSelector(args: {
 
 describe("ModelSelector fast-mode indicator", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		if (!testTheme) {
-			throw new Error("Failed to load theme for fast-mode indicator tests");
-		}
+		testTheme = await loadTestTheme();
 	});
 
 	test("AC-1: renders fast glyph after DEFAULT and EXECUTOR badges for priority tier", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 		const settings = Settings.isolated({
@@ -1100,7 +1082,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			currentModel: model,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain(`DEFAULT (low) ${iconFast}`);
@@ -1120,7 +1102,7 @@ describe("ModelSelector fast-mode indicator", () => {
 		// task.serviceTier=none. DEFAULT (modelRoles) runs in the main session and is
 		// fast; EXECUTOR (task.agentModelOverrides) runs under the subagent tier and
 		// must show no glyph even with the same anthropic model.
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 		const settings = Settings.isolated({
@@ -1135,7 +1117,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			currentModel: model,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain(`DEFAULT (low) ${iconFast}`);
@@ -1145,7 +1127,7 @@ describe("ModelSelector fast-mode indicator", () => {
 		expect(countOccurrences(rendered, iconFast)).toBe(1);
 	});
 	test("AC-2: claude-only renders fast glyph only on anthropic rows in mixed-provider selector", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const anthropic = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!anthropic) throw new Error("Expected anthropic model");
 		const openai = createOpenAIModel("openai", "gpt-5-fast-mixed");
@@ -1159,7 +1141,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			isFastForProvider: provider => provider === "anthropic",
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain(`DEFAULT (low) ${iconFast}`);
@@ -1169,7 +1151,7 @@ describe("ModelSelector fast-mode indicator", () => {
 	});
 
 	test("AC-3: none tier renders no fast glyph but keeps badges", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected model");
 		const settings = Settings.isolated({
@@ -1183,7 +1165,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			currentModel: model,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("DEFAULT (low)");
@@ -1192,7 +1174,7 @@ describe("ModelSelector fast-mode indicator", () => {
 	});
 
 	test("AC-4: active non-role current model row shows fast glyph via currentModel", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected model");
 		const settings = Settings.isolated({});
@@ -1203,7 +1185,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			currentModel: model,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).not.toContain("DEFAULT");
@@ -1235,12 +1217,12 @@ describe("ModelSelector fast-mode indicator", () => {
 			expect(rendered).not.toContain("\u26a1");
 		} finally {
 			await setSymbolPreset("unicode");
-			installTestTheme();
+			setThemeInstance(testTheme);
 		}
 	});
 
 	test("AC-8: unset service tier renders no fast glyph", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected model");
 		const settings = Settings.isolated({
@@ -1254,7 +1236,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			currentModel: model,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("DEFAULT (low)");
@@ -1262,7 +1244,7 @@ describe("ModelSelector fast-mode indicator", () => {
 	});
 
 	test("current model's DEFAULT badge uses EFFECTIVE state: no glyph after auto-disable, subagent still on", async () => {
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 		const settings = Settings.isolated({
@@ -1281,7 +1263,7 @@ describe("ModelSelector fast-mode indicator", () => {
 			currentModel: model,
 		});
 		await Bun.sleep(0);
-		installTestTheme();
+		setThemeInstance(testTheme);
 		const iconFast = theme.icon.fast;
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		// Current-model DEFAULT badge: no glyph (effective off).
@@ -1296,7 +1278,7 @@ describe("MiniMax reasoning menus", () => {
 	for (const provider of ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const) {
 		for (const temporaryOnly of [false, true]) {
 			test(`${provider}: M3 offers on/off for ${temporaryOnly ? "temporary" : "default"} selection`, async () => {
-				installTestTheme();
+				setThemeInstance(testTheme);
 				const model = getBundledModel(provider, "MiniMax-M3");
 				let selected: SelectionCapture | undefined;
 				const selector = createSelector(
@@ -1308,7 +1290,7 @@ describe("MiniMax reasoning menus", () => {
 					{ temporaryOnly },
 				);
 				await Bun.sleep(0);
-				installTestTheme();
+				setThemeInstance(testTheme);
 				selector.handleInput("\n");
 				if (!temporaryOnly) selector.handleInput("\n");
 				expect(selected).toBeUndefined();
@@ -1325,14 +1307,14 @@ describe("MiniMax reasoning menus", () => {
 		}
 
 		test(`${provider}: M2.x explains always-on reasoning and skips effort selection`, async () => {
-			installTestTheme();
+			setThemeInstance(testTheme);
 			const model = getBundledModel(provider, "MiniMax-M2.7");
 			let selected: SelectionCapture | undefined;
 			const selector = createSelector(model, Settings.isolated({}), selection => {
 				selected = selection;
 			});
 			await Bun.sleep(0);
-			installTestTheme();
+			setThemeInstance(testTheme);
 			selector.handleInput("\n");
 			expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain(
 				"Reasoning: always on; effort control is unsupported",
@@ -1342,7 +1324,7 @@ describe("MiniMax reasoning menus", () => {
 		});
 
 		test(`${provider}: reasoning selector labels the enabled state on, including scope confirmation`, () => {
-			installTestTheme();
+			setThemeInstance(testTheme);
 			const selector = new ThinkingSelectorComponent(
 				ThinkingLevel.High,
 				[ThinkingLevel.Off, ThinkingLevel.High],

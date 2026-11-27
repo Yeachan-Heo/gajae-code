@@ -14,6 +14,7 @@ import { type Component, Container, Editor, Text, TUI } from "@gajae-code/tui";
 import { renderMetrics } from "../../../../tui/src/metrics";
 import { defaultEditorTheme } from "../../../../tui/test/test-themes";
 import { VirtualTerminal } from "../../../../tui/test/virtual-terminal";
+import { waitForMicrotasks } from "../../../../utils/test/helpers/wait-for";
 
 function createContext(handle: ToolExecutionHandle): {
 	ctx: InteractiveModeContext;
@@ -59,13 +60,8 @@ function createContext(handle: ToolExecutionHandle): {
 	};
 }
 
-async function waitFor(condition: () => boolean): Promise<void> {
-	for (let attempts = 0; attempts < 50; attempts++) {
-		if (condition()) return;
-		await Promise.resolve();
-	}
-	throw new Error("Preview computation did not reach the expected state");
-}
+const waitFor = (condition: () => boolean): Promise<void> =>
+	waitForMicrotasks(condition, 50, "Preview computation did not reach the expected state");
 
 const applyPatch = [
 	"*** Begin Patch",

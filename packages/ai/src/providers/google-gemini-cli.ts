@@ -33,6 +33,7 @@ import { resolveRetryBudget } from "../utils/retry-budget";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
+import { GeminiHeaderRunawayError, GeminiHeaderRunDetector, isGeminiModel } from "../utils/thinking-loop";
 import {
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
@@ -519,6 +520,10 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				let currentBlock: TextContent | ThinkingContent | null = null;
 				const blocks = output.content;
 				const blockIndex = () => blocks.length - 1;
+				// Gate detector to Gemini models only.
+				const isGemini = isGeminiModel(model.id);
+				const geminiHeaderRunDetector = isGemini ? new GeminiHeaderRunDetector() : null;
+				let geminiHeaderRunawayError: Error | null = null;
 
 				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
 					activeResponse.body!,
@@ -570,7 +575,18 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 										delta: part.text,
 										partial: output,
 									});
+									// Feed thinking to Gemini header runaway detector (Gemini models only).
+									if (geminiHeaderRunDetector?.push(part.text)) {
+										// Defer error until after tool calls in this frame are processed.
+										// Error will be caught by caller and classified by error code in retry policy.
+										geminiHeaderRunawayError = new GeminiHeaderRunawayError(
+											`Gemini reasoning-summary header runaway detected at ${geminiHeaderRunDetector.count} consecutive headers. Interrupted to prevent budget exhaustion.`,
+											geminiHeaderRunDetector.count,
+										);
+									}
 								} else {
+									// Reset Gemini header runaway detector when transitioning to visible text.
+									geminiHeaderRunDetector?.reset();
 									currentBlock.text += part.text;
 									currentBlock.textSignature = retainThoughtSignature(
 										currentBlock.textSignature,
@@ -588,6 +604,8 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							if (part.functionCall) {
 								chunkKind = "functionCall";
 								hasContent = true;
+								// Reset Gemini header runaway detector when transitioning to tool calls.
+								geminiHeaderRunDetector?.reset();
 								if (currentBlock) {
 									pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
 									currentBlock = null;
@@ -609,6 +627,8 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								output.content.push(toolCall);
 								ensureStarted();
 								pushToolCallEvents(toolCall, blockIndex(), output, stream);
+								// Throw deferred Gemini runaway error after tool call is processed.
+								if (geminiHeaderRunawayError) throw geminiHeaderRunawayError;
 							}
 						}
 					}
@@ -683,6 +703,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				if (currentBlock) {
 					pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
 				}
+
+				// Throw deferred Gemini runaway error if no tool calls followed in this chunk.
+				if (geminiHeaderRunawayError) throw geminiHeaderRunawayError;
 
 				return hasContent;
 			};
@@ -762,6 +785,10 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			// Detect Gemini header runaway error and set error code for terminal classification.
+			if (error instanceof GeminiHeaderRunawayError) {
+				output.errorCode = error.errorCode;
+			}
 			output.errorStatus = extractHttpStatusFromError(error);
 			output.transportFailure = transportFailureFacts(error);
 			output.googleGeminiCliDiagnostics = googleGeminiCliDiagnostics;

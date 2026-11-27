@@ -121,7 +121,15 @@ export class AuthBrokerRefresher {
 					id,
 					error: errorMsg,
 				});
-				this.#storage.disableCredentialById(id, `auth-broker refresh failed: ${errorMsg}`);
+				try {
+					this.#storage.disableCredentialById(id, `auth-broker refresh failed: ${errorMsg}`);
+				} catch (disableError) {
+					// The row is still active on disk; the next sweep retries the refresh and the disable.
+					logger.warn("auth-broker could not disable a definitively failed credential", {
+						id,
+						error: cleanReason(disableError) ?? "Unknown disable failure",
+					});
+				}
 			} else {
 				logger.debug("auth-broker refresh failed (transient)", { id, error: errorMsg });
 			}

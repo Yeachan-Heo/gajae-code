@@ -435,7 +435,11 @@ function mapAssistantMessageUpdate(
 				progress.textEmitted = true;
 			}
 			break;
+		// Providers that stream summarized reasoning (Anthropic summarized thinking,
+		// OpenAI Responses and Codex reasoning summaries) emit it as
+		// `reasoning_summary_delta` instead of `thinking_delta`.
 		case "thinking_delta":
+		case "reasoning_summary_delta":
 			sessionUpdate = "agent_thought_chunk";
 			text = event.assistantMessageEvent.delta;
 			if (text.length > 0 && progress) {

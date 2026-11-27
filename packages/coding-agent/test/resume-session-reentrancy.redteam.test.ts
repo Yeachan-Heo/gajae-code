@@ -110,6 +110,7 @@ function createResumeHarness(options: ResumeHarnessOptions = {}): {
 		sessionManager: {
 			getSessionId: options.getSessionId ?? (() => "before"),
 			isManagedDestination: options.isManagedDestination ?? (() => false),
+			switchTargetAdmission: () => undefined,
 			prepareManagedCandidateForStrictAdoption:
 				options.prepareManagedCandidateForStrictAdoption ?? (async (path: string) => path),
 			getSessionName: () => undefined,

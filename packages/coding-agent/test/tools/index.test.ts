@@ -247,6 +247,19 @@ describe("createTools", () => {
 		expect(names).toContain("yield");
 	});
 
+	it("gives report_metric to subagents only, including a requested tool subset", async () => {
+		const subagent = (await createTools(createTestSession({ requireYieldTool: true }))).map(t => t.name);
+		const subset = (await createTools(createTestSession({ requireYieldTool: true }), ["read"])).map(t => t.name);
+		const main = (await createTools(createTestSession())).map(t => t.name);
+
+		expect(subagent).toContain("report_metric");
+		expect(subset).toEqual(["read", "goal", "yield", "report_metric", "resolve"]);
+		expect(main).not.toContain("report_metric");
+		expect((await createTools(createTestSession(), ["report_metric"])).map(t => t.name)).not.toContain(
+			"report_metric",
+		);
+	});
+
 	it("excludes ask tool when hasUI is false", async () => {
 		const session = createTestSession({ hasUI: false });
 		const tools = await createTools(session);
@@ -360,7 +373,7 @@ describe("createTools", () => {
 	});
 
 	it("exposes only the unified goal tool as a builtin goal surface", () => {
-		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["report_finding", "resolve", "yield"]);
+		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["report_finding", "report_metric", "resolve", "yield"]);
 		expect(Object.keys(BUILTIN_TOOLS)).toContain("goal");
 		expect(Object.keys(BUILTIN_TOOLS)).not.toEqual(
 			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),

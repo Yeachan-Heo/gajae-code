@@ -143,6 +143,91 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 		).toEqual((parameters as { properties: { lines: unknown } }).properties.lines);
 	});
 
+	it("collapses mixed-type anyOf with string first (issue #7808)", () => {
+		// Test case from issue #7808: string variant first with minLength,
+		// followed by array variant with items. Result should only have
+		// keys valid for the chosen type (string in this case).
+		const parameters = {
+			type: "object",
+			properties: {
+				tags: {
+					anyOf: [
+						{ type: "string", minLength: 1 },
+						{ type: "array", items: { type: "string" } },
+						{ type: "null" },
+					],
+				},
+			},
+			required: ["tags"],
+		} as TJsonSchema;
+		const tools: Tool[] = [{ name: "test_tool", description: "Test tool", parameters }];
+		const claudeModel = createModel("claude-sonnet-4-5");
+
+		const declaration = convertTools(tools, claudeModel)?.[0]?.functionDeclarations[0] as Record<string, unknown>;
+		const tagsSchema = ((declaration.parameters as { properties?: Record<string, unknown> })?.properties?.tags ??
+			null) as Record<string, unknown> | null;
+
+		// Should collapse to first non-null type (string) without invalid keys
+		expect(tagsSchema?.type).toBe("string");
+		// minLength is stripped by normalization and moved to description
+		// MUST NOT contain 'items' (valid only for array type)
+		expect(tagsSchema?.items).toBeUndefined();
+		expect(JSON.stringify(declaration.parameters)).not.toContain('"anyOf"');
+	});
+
+	it("collapses mixed-type anyOf with string first and no null (issue #7808)", () => {
+		// Same as above but without null variant
+		const parameters = {
+			type: "object",
+			properties: {
+				tags: {
+					anyOf: [
+						{ type: "string", minLength: 1 },
+						{ type: "array", items: { type: "string" } },
+					],
+				},
+			},
+			required: ["tags"],
+		} as TJsonSchema;
+		const tools: Tool[] = [{ name: "test_tool", description: "Test tool", parameters }];
+		const claudeModel = createModel("claude-sonnet-4-5");
+
+		const declaration = convertTools(tools, claudeModel)?.[0]?.functionDeclarations[0] as Record<string, unknown>;
+		const tagsSchema = ((declaration.parameters as { properties?: Record<string, unknown> })?.properties?.tags ??
+			null) as Record<string, unknown> | null;
+
+		// Should collapse to first non-null type (string) without invalid keys
+		expect(tagsSchema?.type).toBe("string");
+		// minLength is stripped by normalization and moved to description
+		// MUST NOT contain 'items' (valid only for array type)
+		expect(tagsSchema?.items).toBeUndefined();
+	});
+
+	it("falls back when parent has sibling type-specific keys conflicting with collapsed type (issue #7808 regression)", () => {
+		// Edge case: parent has items (array-only key) + anyOf with string first
+		// Without regression fix, collapsing to string would create {type: "string", items: {...}}
+		// Conservative bailout detects the conflict and returns schema unchanged → residual checks catch it → fallback
+		const parameters = {
+			type: "object",
+			properties: {
+				tags: {
+					items: { type: "string" },
+					anyOf: [{ type: "string" }, { type: "array", items: { type: "string", description: "tag" } }],
+				},
+			},
+		} as TJsonSchema;
+		const tools: Tool[] = [{ name: "test_tool", description: "Test tool", parameters }];
+		const claudeModel = createModel("claude-sonnet-4-5");
+
+		// Should fall back to safe schema with empty properties due to conflict
+		const declaration = convertTools(tools, claudeModel)?.[0]?.functionDeclarations[0] as Record<string, unknown>;
+		const result = declaration.parameters as Record<string, unknown>;
+
+		// Fallback schema has object type with empty properties
+		expect(result.type).toBe("object");
+		expect(Object.keys((result.properties as Record<string, unknown>) ?? {})).toEqual([]);
+	});
+
 	it("collapses mixed anyOf with shared metadata for edit-style lines fields", () => {
 		const parameters = {
 			type: "object",

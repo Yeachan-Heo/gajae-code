@@ -22,6 +22,7 @@ import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with 
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import unavailableTemplate from "../prompts/memories/unavailable.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { escapePromptMetadata, wrapUntrustedContent } from "../session/messages";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -166,6 +167,40 @@ export function startMemoryStartupTask(options: {
 	});
 }
 
+const SUMMARY_TRUNCATION_MARKER = "\n\n...[truncated]...\n\n";
+
+/**
+ * Keep an already-encoded summary inside the injection budget. Encoding can expand
+ * `&`, quotes, and tags, so this cut runs after encoding and before the fence.
+ * Head and tail both stay so a closer that survived the first cut is still fenced.
+ */
+function boundEncodedMemorySummary(encoded: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (encoded.length <= maxChars) return encoded;
+	if (maxChars <= SUMMARY_TRUNCATION_MARKER.length) return encoded.slice(0, maxChars);
+	const room = maxChars - SUMMARY_TRUNCATION_MARKER.length;
+	const head = Math.floor(room * 0.6);
+	const tail = room - head;
+	return `${encoded.slice(0, head)}${SUMMARY_TRUNCATION_MARKER}${encoded.slice(-tail)}`;
+}
+
+/** Break project-block markers, including case and spaces inside the brackets. */
+function neutralizeProjectMarkers(value: string): string {
+	return value.replace(/\[\s*(?:(\/)\s*)?project\s*\]/gi, (_match, slash: string | undefined) =>
+		(slash ?? "") ? "[ /PRO JECT]" : "[ PRO JECT]",
+	);
+}
+
+/**
+ * Frame a stored summary after the token cut. Encoding runs before the fence so a
+ * tail that keeps only a closer still opens with `<untrusted-content>`.
+ * Brackets survive encoding, so project-block markers are broken too.
+ */
+function frameInjectedMemorySummary(summary: string, maxChars: number): string {
+	const encoded = neutralizeProjectMarkers(escapePromptMetadata(summary, { preserveNewlines: true }));
+	return wrapUntrustedContent(boundEncodedMemorySummary(encoded, maxChars));
+}
+
 /**
  * Build memory usage instructions for prompt injection.
  */
@@ -192,12 +227,18 @@ export async function buildMemoryToolDeveloperInstructions(
 	if (!truncated.trim()) return unavailableTemplate;
 
 	return prompt.render(readPathTemplate, {
-		memory_summary: truncated,
+		memory_summary: frameInjectedMemorySummary(truncated, cfg.summaryInjectionTokenLimit * 4),
 	});
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Delete every memory row and memory job in the shared local database, then remove
+ * only the current project's memory directory.
+ *
+ * Database deletion is not scoped to `cwd`. Filesystem cleanup removes the
+ * directory that `getMemoryRoot(agentDir, cwd)` returns. Project paths that
+ * differ only in `/`, `\`, or `:` versus `-` map to the same directory, so that
+ * shared directory is removed too.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -206,6 +247,7 @@ export async function clearMemoryData(agentDir: string, cwd: string): Promise<vo
 	} finally {
 		closeMemoryDb(db);
 	}
+	// Filesystem cleanup is the current project directory only.
 	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
 }
 

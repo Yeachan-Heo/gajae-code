@@ -94,6 +94,31 @@ export function setShellFactoryForTests(factory: ShellFactory | undefined): void
 	shellFactoryForTests = factory;
 }
 
+const LIFECYCLE_REQUEST_ENV = "GJC_LIFECYCLE_REQUEST_ID";
+
+/**
+ * Drop an inherited lifecycle request id from the shell session and from the
+ * host environment the native shell imports. An explicit `options.env` value
+ * is the caller's own marker and is kept. Without this, a nested gjc sees the
+ * marker plus GJC_SESSION_ID and adopts the parent header id.
+ */
+function scrubInheritedLifecycleRequest(
+	shellEnv: Record<string, string>,
+	explicitEnv: Record<string, string> | undefined,
+	unsetEnv: string[] | undefined,
+): string[] | undefined {
+	// Never copy the value into shellEnv. That value is part of the persistent
+	// shell identity, so a per-command override would switch shells and drop
+	// functions defined by earlier commands. The explicit value travels only
+	// on commandEnv; leaving it out of unsetEnv lets that override win.
+	delete shellEnv[LIFECYCLE_REQUEST_ENV];
+	if (explicitEnv && Object.hasOwn(explicitEnv, LIFECYCLE_REQUEST_ENV)) {
+		return unsetEnv?.filter(name => name !== LIFECYCLE_REQUEST_ENV);
+	}
+	if (unsetEnv?.includes(LIFECYCLE_REQUEST_ENV)) return unsetEnv;
+	return [...(unsetEnv ?? []), LIFECYCLE_REQUEST_ENV];
+}
+
 function projectHookUnsetEnv(
 	unsetEnv: string[] | undefined,
 	env: Record<string, string> | undefined,
@@ -503,6 +528,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// their own documented allowlist). Only the bash tool's shell must not see
 	// project hook variables such as BASH_ENV or GIT_CONFIG_*.
 	const shellEnv = stripProjectSpawnHooks({ ...configEnv });
+	const lifecycleUnsetEnv = scrubInheritedLifecycleRequest(shellEnv, options?.env, options?.unsetEnv);
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =
 		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
@@ -657,7 +683,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			// `sessionEnv`, and where it runs in-process (Windows) that environment
 			// holds the autoloaded project `.env`. Shadow project hook variables per
 			// run unless this call sets them explicitly.
-			unsetEnv: projectHookUnsetEnv(options?.unsetEnv, options?.env, shellEnv),
+			unsetEnv: projectHookUnsetEnv(lifecycleUnsetEnv, options?.env, shellEnv),
 			timeoutMs: executionTimeoutMs,
 			signal: runAbortController.signal,
 		};

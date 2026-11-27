@@ -4,6 +4,7 @@ import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-complet
 import { isJsonSchemaValueValid, toolWireSchema } from "@gajae-code/ai/utils/schema";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
+import { createAbortedSignal } from "../../../ai/test/helpers";
 
 type JsonObject = Record<string, unknown>;
 
@@ -97,12 +98,6 @@ function positiveRoundIntentReviewArguments(): JsonObject {
 	};
 }
 
-function abortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
-
 async function askTool(stage?: "topology" | "post-topology") {
 	const tool = (await createTools(createTestSession(stage), ["ask"])).find(candidate => candidate.name === "ask");
 	if (!tool) throw new Error("Expected AskTool to be registered");
@@ -118,7 +113,7 @@ async function capturePayload(stage?: "topology" | "post-topology"): Promise<Jso
 	};
 	streamOpenAICompletions(model, context, {
 		apiKey: "test-key",
-		signal: abortedSignal(),
+		signal: createAbortedSignal(),
 		onPayload: payload => resolve(payload),
 	});
 	return (await promise) as JsonObject;

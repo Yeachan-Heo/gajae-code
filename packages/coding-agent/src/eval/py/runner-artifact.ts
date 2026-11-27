@@ -1,12 +1,11 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { ownedTempRootTemplate, resolveTempRoot } from "../../gjc-runtime/owned-temp-root";
 import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
 
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
-const DIRECTORY_PREFIX = "gjc-python-runner-";
 
 interface RunnerScriptArtifact {
 	directory: string;
@@ -14,7 +13,7 @@ interface RunnerScriptArtifact {
 }
 
 async function initializeRunnerScript(tempRoot: string): Promise<RunnerScriptArtifact> {
-	const directory = await fs.mkdtemp(path.join(tempRoot, DIRECTORY_PREFIX));
+	const directory = await fs.mkdtemp(ownedTempRootTemplate(tempRoot, "python_runners"));
 	try {
 		if (process.platform !== "win32") await fs.chmod(directory, DIRECTORY_MODE);
 		const scriptPath = path.join(directory, "runner.py");
@@ -77,7 +76,7 @@ export function createRunnerScriptInitializer(tempRoot: string): () => Promise<s
 	return createRunnerScriptCache(tempRoot).ensureRunnerScript;
 }
 
-const processRunnerScriptCache = createRunnerScriptCache(os.tmpdir());
+const processRunnerScriptCache = createRunnerScriptCache(resolveTempRoot(process.env));
 
 export const ensureRunnerScript = () => processRunnerScriptCache.ensureRunnerScript();
 

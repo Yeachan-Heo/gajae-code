@@ -4,7 +4,10 @@
  * Handles `gjc plugin <command>` subcommands for plugin lifecycle management.
  */
 
-import { APP_NAME, getProjectDir } from "@gajae-code/utils";
+import * as os from "node:os";
+import { homedir } from "node:os";
+import * as path from "node:path";
+import { APP_NAME, getProjectDir, safeStderrWrite, sanitizeDisplayLine } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
 import {
@@ -20,6 +23,7 @@ import {
 	isGjcPluginSourceShape,
 	listGjcBundles,
 	migrationDoctorCheckMessage,
+	previewGjcBundleInstall,
 	previewGjcBundleUninstall,
 	previewGjcBundleUpdate,
 	runGjcPluginMigrationPreflight,
@@ -488,6 +492,68 @@ function describeInstallFailure(error: unknown): string {
 	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
 }
 
+/** Longest loader detail kept for the bundle-path branch; the code stays intact. */
+export const MAX_INSTALL_FAILURE_CHARS = 400;
+
+/**
+ * A path the loader embedded that no known root covered. Every loader message puts a path
+ * after a fixed lead-in (`at `, `in `, `file at `, `lock at `, `(`) and ends it at `:`, `;`, `)`
+ * or the end of the text, so the path is recognised by that frame rather than by the absence
+ * of whitespace, which a path containing a space (`/tmp/customer private/...`) defeats.
+ * It covers POSIX, drive-rooted (`C:\a`, `C:/a`) and UNC (`\\srv\share`) forms. The trailing
+ * component is kept: it names the file the loader read, not where it lives.
+ *
+ * Group 1 is the lead-in, group 2 the directory part (replaced), group 3 the final component.
+ */
+const FRAMED_LOADER_PATH =
+	/((?:\b(?:at|in)\s|\()\s*)(?:[A-Za-z]:[\\/]|\\\\|\/(?!\/))((?:[^:;()"'\r\n]|:(?=[\\/]))*?)(?:[\\/]([^\\/:;()"'\r\n]+))?(?=\s*(?:[:;)]|$)|\s+(?:supported|expected|got)\b)/gu;
+
+/**
+ * Reduce the paths a loader message carries until none of them name a location.
+ *
+ * The parser inserts the manifest path, and a relative spec is resolved before it
+ * reaches the loader, so replacing the caller's own spec alone is not enough. Known roots
+ * are replaced by exact string match first, which is correct for paths containing spaces:
+ * the caller's bundle (`<bundle>`), the platform temp root the installer extracts tarballs
+ * and git sources under (`<tmp>`), and the home prefix (`~`). Whatever absolute path the
+ * loader resolved on its own is then masked by its frame as `<path>/<file>`.
+ */
+function redactLoaderPaths(text: string, bundlePath: string): string {
+	const resolved = path.resolve(bundlePath);
+	const trimmed = (value: string): string => value.replace(/[\\/]+$/u, "");
+	let out = text;
+	// The directory only: the file name after it is what tells the caller which file the loader read.
+	for (const candidate of [resolved, trimmed(bundlePath), bundlePath]) {
+		if (candidate.length > 1) out = out.split(candidate).join("<bundle>");
+	}
+	const tmp = trimmed(os.tmpdir());
+	if (tmp.length > 1) out = out.split(tmp).join("<tmp>");
+	const home = trimmed(homedir());
+	if (home.length > 1) out = out.split(home).join("~");
+	return out.replace(FRAMED_LOADER_PATH, (_match, lead: string, _dirs: string, file: string | undefined) =>
+		file ? `${lead}<path>/${file}` : `${lead}<path>`,
+	);
+}
+
+/**
+ * Loader detail for a bundle install, reduced until it names no identity.
+ *
+ * The manifest parser explains exactly which field is unsupported, and dropping
+ * that explanation leaves a caller with an opaque code and no way to find the
+ * offending line. That explanation is untrusted — a bundle can put a control
+ * sequence in the key it names — so it is sanitized for display before styling,
+ * its paths are reduced, and the result is whitespace-collapsed and clamped so a
+ * huge manifest cannot flood the terminal.
+ */
+export function describeBundleInstallFailure(error: unknown, bundlePath: string): string {
+	if (!(error instanceof GjcPluginLoadError)) return "install_failed";
+	const detail = redactLoaderPaths(sanitizeDisplayLine(error.message), bundlePath).replace(/\s+/g, " ").trim();
+	if (!detail) return error.code;
+	const clamped =
+		detail.length > MAX_INSTALL_FAILURE_CHARS ? `${detail.slice(0, MAX_INSTALL_FAILURE_CHARS)}…` : detail;
+	return `${error.code}: ${clamped}`;
+}
+
 function isGjcRegistryShapeFailure(error: unknown): boolean {
 	return (
 		(error instanceof GjcPluginLoadError && error.code === "invalid_manifest") ||
@@ -596,7 +662,9 @@ async function handleInstall(
 			}
 			const scope: "user" | "project" = flags.user ? "user" : "project";
 			try {
-				const res = await installGjcBundle({ cwd: getProjectDir() }, scope, spec);
+				const res = flags.dryRun
+					? await previewGjcBundleInstall({ cwd: getProjectDir() }, scope, spec)
+					: await installGjcBundle({ cwd: getProjectDir() }, scope, spec);
 				if (!res.ok) {
 					const doc = {
 						error: { code: res.error.code, message: res.error.message, recovery: res.error.recovery },
@@ -609,20 +677,35 @@ async function handleInstall(
 					process.exit(3);
 				}
 				const { summary } = res.value;
-				if (flags.json) {
-					console.log(JSON.stringify({ status: res.value.status, bundle: summary }, null, 2));
+				if (flags.dryRun) {
+					if (flags.json) {
+						process.stdout.write(`${JSON.stringify({ dryRun: true, wouldInstall: summary }, null, 2)}\n`);
+					} else {
+						process.stdout.write(
+							`${chalk.dim(`[dry-run] Would install ${summary.identity.name}@${summary.version} (${scope})`)}\n`,
+						);
+					}
+				} else if (flags.json) {
+					process.stdout.write(`${JSON.stringify({ status: "installed", bundle: summary }, null, 2)}\n`);
 				} else {
-					console.log(
-						chalk.green(
+					process.stdout.write(
+						`${chalk.green(
 							`${theme.status.success} installed GJC plugin ${summary.identity.name}@${summary.version} (${scope})`,
-						),
+						)}\n`,
 					);
 				}
 			} catch (err) {
 				// Never echo the raw spec or the underlying cause: either can carry
-				// credentials, a query string, or an absolute home path.
-				const reason = err instanceof GjcPluginLoadError ? err.code : "install_failed";
-				console.error(chalk.red(`${theme.status.error} Failed to install GJC bundle (${reason})`));
+				// credentials, a query string, or an absolute home path. The loader's
+				// explanation is still what tells the caller which field to fix, so it is
+				// reduced (relative path, `~`, clamped) instead of dropped.
+				// stderr, not console.error: coding-agent must not touch the console
+				// (it corrupts TUI rendering), and safeStderrWrite survives a closed pipe.
+				safeStderrWrite(
+					`${chalk.red(
+						`${theme.status.error} Failed to install GJC bundle (${describeBundleInstallFailure(err, spec)})`,
+					)}\n`,
+				);
 				process.exit(1);
 			}
 			continue;

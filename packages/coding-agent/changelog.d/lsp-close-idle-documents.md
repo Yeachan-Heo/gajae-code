@@ -1,0 +1,2 @@
+### Fixed
+- Language servers no longer keep every document a session ever touched open. Before gjc opens another document it sends `didClose` for documents no gjc operation has used for 5 minutes, and a document whose file was deleted is closed when it is next refreshed. tsserver then unloads the projects of packages the session stopped working in; working across six packages of this repository ended at 2684 MB instead of 3341 MB.

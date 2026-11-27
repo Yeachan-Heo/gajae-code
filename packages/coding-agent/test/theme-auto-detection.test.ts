@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import * as nativesModule from "@gajae-code/natives";
 import { MacOSAppearance } from "@gajae-code/natives";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const originalPlatform = process.platform;
 const originalColorfgbg = Bun.env.COLORFGBG;
@@ -46,10 +47,7 @@ const withThemeTestGlobals = (globals: ThemeTestGlobals = {}) => {
 describe("theme auto-detection", () => {
 	beforeEach(async () => {
 		themeModule.stopThemeWatcher();
-		const darkTheme = await themeModule.getThemeByName("red-claw");
-		if (!darkTheme) {
-			throw new Error("Failed to load dark theme for tests");
-		}
+		const darkTheme = await loadTestTheme();
 		themeModule.setThemeInstance(darkTheme);
 		vi.restoreAllMocks();
 	});
@@ -211,6 +209,41 @@ describe("theme auto-detection", () => {
 
 		expect(themeModule.getCurrentThemeName()).toBe("blue-crab");
 		expect(detectSpy).not.toHaveBeenCalled();
+	});
+
+	it("requests OSC 11 polling only while terminal appearance can change the theme", async () => {
+		using _globals = withThemeTestGlobals();
+		const demand: boolean[] = [];
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "red-claw");
+		const unsubscribe = themeModule.onTerminalAppearanceDemandChange(needed => demand.push(needed));
+		try {
+			expect(demand).toEqual([false]);
+
+			themeModule.setAutoThemeMapping("light", "blue-crab");
+			expect(demand).toEqual([false, true]);
+
+			const explicit = await loadTestTheme();
+			themeModule.setThemeInstance(explicit);
+			expect(demand).toEqual([false, true, false]);
+
+			themeModule.enableAutoTheme();
+			expect(demand).toEqual([false, true, false, true]);
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("does not request OSC 11 polling under the macOS Zellij fallback", async () => {
+		using _globals = withThemeTestGlobals({ zellij: "1" });
+		vi.spyOn(nativesModule, "detectMacOSAppearance").mockReturnValue(MacOSAppearance.Dark);
+		const demand: boolean[] = [];
+		await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+		const unsubscribe = themeModule.onTerminalAppearanceDemandChange(needed => demand.push(needed));
+		try {
+			expect(demand).toEqual([false]);
+		} finally {
+			unsubscribe();
+		}
 	});
 
 	it("does not apply a theme after the owning UI stops", async () => {

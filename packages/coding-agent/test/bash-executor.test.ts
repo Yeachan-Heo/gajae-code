@@ -32,7 +32,9 @@ import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-ou
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
+import { $ } from "bun";
 import { safeRmSync } from "../../../scripts/safe-cleanup";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 
 const BACKGROUND_COMPLETION_RACE_MS = 750;
 // Direct executor callers retain the shared 20 KiB head alongside the 50 KiB tail.
@@ -771,7 +773,11 @@ describe("executeBash", () => {
 		if (process.platform === "win32") return;
 		const pidFile = path.join(tempDir, "timeout-grandchild.pid");
 		const sessionKey = "contained-timeout-grandchild";
-		const command = `timeout 0.1 python3 -c 'import os,signal,time; pid=os.fork(); (open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid())), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30)) if pid == 0 else time.sleep(30)'`;
+		// Resolve launcher shims before the 100 ms child deadline; pyenv startup
+		// can exceed that deadline before the descendant fixture even starts.
+		const python = (await $`python3 -c "import sys; print(sys.executable)"`.quiet().text()).trim();
+		expect(path.isAbsolute(python)).toBe(true);
+		const command = `timeout 0.1 ${$.escape(python)} -c 'import os,signal,time; pid=os.fork(); (open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid())), signal.signal(signal.SIGTERM, signal.SIG_IGN), time.sleep(30)) if pid == 0 else time.sleep(30)'`;
 		const startedAt = Date.now();
 		const result = await executeBash(command, { cwd: tempDir, timeout: 5_000, sessionKey });
 		expect(result).toMatchObject({ exitCode: 124, cancelled: false });
@@ -1208,6 +1214,148 @@ describe("executeBash", () => {
 		}
 	});
 
+	it("spares the published SDK broker and its session hosts but reaps other detached descendants (#7998)", async () => {
+		if (process.platform !== "darwin") return;
+		const agentDir = path.join(tempDir, "agent");
+		const brokerFile = path.join(tempDir, "broker.pid");
+		const hostFile = path.join(tempDir, "host.pid");
+		const strayFile = path.join(tempDir, "stray.pid");
+		const discoveryFile = path.join(agentDir, "sdk", "broker.json");
+		fs.mkdirSync(path.dirname(discoveryFile), { recursive: true });
+		// Detaches like the real broker launch (fork, setsid, reparent to launchd) and
+		// forks a long-lived child standing in for a session host.
+		const daemon = (pidFile: string, childFile?: string) =>
+			`import os,time\nif os.fork(): os._exit(0)\nos.setsid()\nos.closerange(3, 256)\n` +
+			(childFile
+				? `if os.fork() == 0:\n  open(${JSON.stringify(childFile)}, "w").write(str(os.getpid())); time.sleep(60); os._exit(0)\n`
+				: "") +
+			`open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))\ntime.sleep(60)\n`;
+		const brokerArgs = `sdk broker-internal --agent-dir ${$.escape(agentDir)}`;
+		const command = [
+			`python3 -c ${$.escape(daemon(brokerFile, hostFile))} ${brokerArgs} </dev/null >/dev/null 2>&1 &`,
+			`python3 -c ${$.escape(daemon(strayFile))} </dev/null >/dev/null 2>&1 &`,
+			`while [ ! -s ${$.escape(discoveryFile)} ] || [ ! -s ${$.escape(hostFile)} ] || [ ! -s ${$.escape(strayFile)} ]; do sleep 0.01; done`,
+		].join("\n");
+		const readPid = async (file: string): Promise<number> => {
+			for (let attempt = 0; attempt < 500; attempt++) {
+				const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+				if (text) return Number.parseInt(text, 10);
+				await Bun.sleep(10);
+			}
+			throw new Error(`no pid in ${file}`);
+		};
+		const isAlive = (pid: number): boolean => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		const shell = new IsolatedShell();
+		const survivors: number[] = [];
+		try {
+			const run = shell.run({ command, cwd: tempDir, timeoutMs: 10_000 });
+			const brokerPid = await readPid(brokerFile);
+			survivors.push(brokerPid);
+			const incarnation = processIncarnation(brokerPid);
+			expect(incarnation).toBeDefined();
+			fs.writeFileSync(
+				discoveryFile,
+				JSON.stringify({
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					host: "127.0.0.1",
+					port: 45_678,
+					url: "ws://127.0.0.1:45678",
+					token: "test-token",
+					pid: brokerPid,
+					incarnation,
+					heartbeatAt: Date.now(),
+				}),
+			);
+			expect(await run).toMatchObject({ exitCode: 0, cancelled: false });
+			const hostPid = await readPid(hostFile);
+			survivors.push(hostPid);
+			const strayPid = await readPid(strayFile);
+			await shell.close();
+			let strayAlive = true;
+			for (let attempt = 0; attempt < 100 && strayAlive; attempt++) {
+				strayAlive = isAlive(strayPid);
+				if (strayAlive) await Bun.sleep(20);
+			}
+			expect(strayAlive).toBe(false);
+			expect(isAlive(brokerPid)).toBe(true);
+			expect(processIncarnation(brokerPid)).toBe(incarnation);
+			expect(isAlive(hostPid)).toBe(true);
+		} finally {
+			await shell.close();
+			for (const file of [hostFile, strayFile]) {
+				const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+				if (text) survivors.push(Number.parseInt(text, 10));
+			}
+			for (const pid of survivors) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+		}
+	});
+
+	it("reaps a broker-shaped descendant that is not the published broker (#7998)", async () => {
+		if (process.platform !== "darwin") return;
+		const agentDir = path.join(tempDir, "agent");
+		const brokerFile = path.join(tempDir, "impostor.pid");
+		fs.mkdirSync(path.join(agentDir, "sdk"), { recursive: true });
+		// Discovery names a different (live) process: this shell's test runner.
+		fs.writeFileSync(
+			path.join(agentDir, "sdk", "broker.json"),
+			JSON.stringify({
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				host: "127.0.0.1",
+				port: 45_678,
+				url: "ws://127.0.0.1:45678",
+				token: "test-token",
+				pid: process.pid,
+				incarnation: processIncarnation(process.pid),
+				heartbeatAt: Date.now(),
+			}),
+		);
+		const code = `import os,time\nif os.fork(): os._exit(0)\nos.setsid()\nos.closerange(3, 256)\nopen(${JSON.stringify(brokerFile)}, "w").write(str(os.getpid()))\ntime.sleep(60)\n`;
+		const shell = new IsolatedShell();
+		let impostorPid: number | undefined;
+		try {
+			const result = await shell.run({
+				command: `python3 -c ${$.escape(code)} sdk broker-internal --agent-dir ${$.escape(agentDir)} </dev/null >/dev/null 2>&1 &\nwhile [ ! -s ${$.escape(brokerFile)} ]; do sleep 0.01; done`,
+				cwd: tempDir,
+				timeoutMs: 10_000,
+			});
+			expect(result).toMatchObject({ exitCode: 0, cancelled: false });
+			impostorPid = Number.parseInt(fs.readFileSync(brokerFile, "utf8"), 10);
+			await shell.close();
+			let alive = true;
+			for (let attempt = 0; attempt < 100 && alive; attempt++) {
+				try {
+					process.kill(impostorPid, 0);
+					await Bun.sleep(20);
+				} catch {
+					alive = false;
+				}
+			}
+			expect(alive).toBe(false);
+		} finally {
+			await shell.close();
+			if (impostorPid) {
+				try {
+					process.kill(impostorPid, "SIGKILL");
+				} catch {}
+			}
+		}
+	});
+
 	it("scrubs inherited managed transcript paths from shell sessions", async () => {
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		const previousOwnerPath = process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
@@ -1256,7 +1404,6 @@ describe("executeBash", () => {
 			// Explicitly unset managed-owner vars like the bash tool does
 			const unsetEnv = [
 				"GJC_MANAGED_OWNER_CHILD_TOKEN",
-				"GJC_MANAGED_OWNER_COMMAND_JSON",
 				"GJC_COORDINATOR_SESSION_ID",
 				"GJC_TMUX_OWNER_GENERATION",
 				"GJC_TMUX_OWNER_STATE_DIR",

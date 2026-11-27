@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentLoopConfig, AgentMessage } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 // DeepSeek-family reasoning-content replay rejection. The proxy strips the
 // encrypted reasoning blob to `""`; replaying it 400s deterministically, so the
@@ -12,10 +12,6 @@ import { createUserMessage } from "./helpers";
 
 const REASONING_REPLAY_ERROR =
 	"400 Error from provider (Console): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API.";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
 
 async function drain(stream: AsyncIterable<unknown> & { result(): Promise<AgentMessage[]> }): Promise<AgentMessage[]> {
 	for await (const _ of stream) {

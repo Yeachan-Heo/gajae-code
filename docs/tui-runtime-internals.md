@@ -46,7 +46,7 @@ A forced render (`requestRender(true)`) resets previous-line caches and cursor b
 2. Attaches resize handler.
 3. Creates a `StdinBuffer` to split partial escape chunks into complete sequences.
 4. Queries Kitty keyboard protocol support (`CSI ? u`), then enables protocol flags if supported; otherwise enables the modifyOtherKeys fallback after a short timeout, except on Windows and Apple Terminal where that fallback breaks CJK/Hangul IME composition.
-5. Queries OSC 11 background color and enables Mode 2031 appearance notifications for dark/light theme detection.
+5. Queries OSC 11 background color and enables Mode 2031 appearance notifications for dark/light theme detection. Without Mode 2031 it re-queries every 2 seconds while the app keeps `setAppearancePolling(true)` (the default) and `GJC_TUI_DISABLE_OSC11_POLL` is unset.
 6. On Windows, attempts VT input enablement via `kernel32` mode flags.
    `StdinBuffer` behavior:
 

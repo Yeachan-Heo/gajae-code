@@ -293,6 +293,9 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		}
 
 		await assertPublicOAuthUrl(this.config.tokenUrl, { signal: this.ctrl.signal });
+		if (new URL(this.config.tokenUrl).protocol !== "https:") {
+			throw new Error("OAuth token endpoint must use HTTPS");
+		}
 		const response = await fetchPinnedOAuthEndpoint(this.config.tokenUrl, {
 			method: "POST",
 			headers: {

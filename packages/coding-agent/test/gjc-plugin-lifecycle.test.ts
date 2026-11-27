@@ -10,6 +10,7 @@ import {
 	getGjcBundle,
 	installGjcBundle,
 	listGjcBundles,
+	previewGjcBundleInstall,
 	previewGjcBundleUninstall,
 	previewGjcBundleUpdate,
 	readRegistry,
@@ -484,5 +485,22 @@ describe("GJC bundle lifecycle", () => {
 		expect(redacted).not.toContain("user:");
 		expect(redacted).not.toContain("?x=1");
 		expect(redacted).not.toContain("#frag");
+	});
+
+	test("dry-run preview refuses already-installed bundle before resolving source", async () => {
+		const cwd = await mkProjectCwd();
+		await installFixture(cwd, "project");
+		// Preview installing the same source again should refuse with already_installed,
+		// matching the real install behavior. Regression test for issue #7601: the preflight
+		// check must happen before resolution/compilation so that a readable manifest with
+		// missing declared file returns already_installed, not missing_file.
+		const preview = await previewGjcBundleInstall({ cwd }, "project", sixSurface);
+		expect(preview).toMatchObject({
+			ok: false,
+			error: { code: "already_installed_use_upgrade" },
+		});
+		if (!preview.ok) {
+			expect(preview.error.recovery).toContain("upgrade");
+		}
 	});
 });

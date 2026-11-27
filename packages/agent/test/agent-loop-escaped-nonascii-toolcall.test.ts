@@ -5,21 +5,16 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
-	AgentMessage,
 	AgentTool,
 	ManagedAttemptOutcome,
 } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message, ToolCall } from "@gajae-code/ai";
+import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { createMockModel, type MockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { captureUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import * as logger from "@gajae-code/utils/logger";
 import * as z from "zod/v4";
-import { createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
-}
+import { createUserMessage, identityConverter } from "./helpers";
 
 const askSchema = z.object({ question: z.string() });
 

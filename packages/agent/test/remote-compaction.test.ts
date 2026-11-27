@@ -5,7 +5,7 @@ import {
 	requestRemoteCompaction,
 } from "@gajae-code/agent-core/compaction/openai";
 import type { AssistantMessage, Model, ToolResultMessage } from "@gajae-code/ai/types";
-import { hookFetch } from "@gajae-code/utils";
+import { captureEndpointConfiguration, type EndpointConfiguration, hookFetch } from "@gajae-code/utils";
 
 function setEnvForTest(key: string, value: string): () => void {
 	const previous = Bun.env[key];
@@ -216,6 +216,27 @@ describe("remote compaction input trimming", () => {
 });
 
 describe("remote compaction endpoint", () => {
+	test("rejects copied and proxied handles before OAuth and Codex endpoint shortcuts", async () => {
+		const captured = captureEndpointConfiguration();
+		const forgedHandles = [Object.freeze({ ...captured }) as EndpointConfiguration, new Proxy(captured, {})];
+		let fetchCalls = 0;
+		using _hook = hookFetch(async () => {
+			fetchCalls++;
+			return Response.json({ output: [{ type: "compaction_summary", summary: "unexpected" }] });
+		});
+		for (const endpointConfiguration of forgedHandles) {
+			for (const provider of ["openai", "openai-codex"] as const) {
+				await expect(
+					requestOpenAiRemoteCompaction(makeOpenAiModel({ provider }), "unused-key", [], "compact", undefined, {
+						authCredentialType: "oauth",
+						endpointConfiguration,
+					}),
+				).rejects.toThrow("Invalid endpoint configuration handle");
+			}
+		}
+		expect(fetchCalls).toBe(0);
+	});
+
 	test("uses OPENAI_BASE_URL for OpenAI compaction when bundled metadata has the default OpenAI URL", async () => {
 		const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
 		let requestUrl: string | undefined;
@@ -326,5 +347,42 @@ describe("remote compaction invalid_prompt termination (issue #2282)", () => {
 		expect(sentBody).not.toContain("<|channel|>");
 		expect(sentBody).not.toContain("<|message|>");
 		expect(sentBody).toContain("<\u200b|channel|>");
+	});
+});
+
+describe("remote compaction base instructions placement", () => {
+	async function captureCompactionBody(provider: "openai" | "openai-codex"): Promise<Record<string, unknown>> {
+		let body: Record<string, unknown> | undefined;
+		using _hook = hookFetch(async (_input, init) => {
+			body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return Response.json({ output: [{ type: "compaction_summary", summary: "compact" }] });
+		});
+		await requestOpenAiRemoteCompaction(
+			makeOpenAiModel({ provider }),
+			"test-key",
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+			"Base instructions.",
+		);
+		if (!body) throw new Error("compaction request was not sent");
+		return body;
+	}
+
+	test("openai-codex sends instructions as a leading model.base_instructions developer message", async () => {
+		const body = await captureCompactionBody("openai-codex");
+		expect(body.instructions).toBeUndefined();
+		const [first] = body.input as Array<Record<string, unknown>>;
+		expect(first).toMatchObject({
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: "Base instructions." }],
+			internal_chat_message_metadata_passthrough: { content_item_kinds: ["model.base_instructions"] },
+		});
+	});
+
+	test("public openai keeps the top-level instructions field", async () => {
+		const body = await captureCompactionBody("openai");
+		expect(body.instructions).toBe("Base instructions.");
+		const input = body.input as Array<Record<string, unknown>>;
+		expect(input.some(item => item.role === "developer")).toBe(false);
 	});
 });

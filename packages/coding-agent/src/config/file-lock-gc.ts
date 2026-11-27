@@ -20,6 +20,7 @@ import { resolveReceiptSpoolDir } from "../harness-control-plane/receipt-spool";
 import {
 	fileLockStagingOwnerPid,
 	inspectFileLockStagingDir,
+	isFileLockRemovalTransitionName,
 	readFileLockObservationForGc,
 	removeFileLockDirForGc,
 } from "./file-lock";
@@ -182,7 +183,25 @@ async function walkForLockDirs(
 			await walkForLockDirs(path.join(dir, entry), MAX_WALK_DEPTH - 1, state, lockDirs, errors, maxWalkEntries);
 			continue;
 		}
+		// Windows refuses to list a transition while its owner deletes it (EPERM scandir).
 		if (PRUNED_DIR_NAMES.has(entry)) continue;
+		// Skip only verified removal transitions (those with a sibling .owner record),
+		// not ordinary directories that happen to match the transition suffix pattern.
+		if (isFileLockRemovalTransitionName(entry)) {
+			const fullPath = path.join(dir, entry);
+			const ownerRecordPath = `${fullPath}.owner`;
+			try {
+				// Check for positive transition evidence: .owner record exists.
+				await fs.lstat(ownerRecordPath);
+				continue; // It's a verified transition; skip it.
+			} catch (error) {
+				if (!isEnoent(error)) {
+					// Real error (not missing); report it.
+					errors.push({ store: "file_locks", scope: fullPath, message: errorMessage(error) });
+				}
+				// Either missing or error: treat as not a verified transition; continue walking.
+			}
+		}
 		await walkForLockDirs(path.join(dir, entry), depth + 1, state, lockDirs, errors, maxWalkEntries);
 	}
 }

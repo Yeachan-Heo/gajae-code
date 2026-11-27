@@ -3,7 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
+import { getAgentDir, isRecord, logger, sanitizeDisplayLine } from "@gajae-code/utils";
 import {
 	PUBLIC_COMMAND_DIAGNOSTICS,
 	type PublicCommandDiagnosticCode,
@@ -14,16 +14,20 @@ import {
 import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
+import { normalizeBrokerLockRefusalError } from "../broker/lock-refusal";
 import { resolveSessionLocator } from "../broker/session-index";
 import {
+	MASTER_OWNER_SESSION_ENV,
 	resolveScopeRequest,
 	type ScopeNameV1,
 	type ScopeRequestV1,
 	type SdkSearchResultV1,
 	type SdkSearchRowV1,
+	withSpawnOwnerSelf,
 } from "../broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
+import { BrokerStartupError } from "../broker/startup-failure";
+import { bounded, readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
 	SessionLifecycleLookupOutcome,
@@ -35,13 +39,16 @@ import type {
 	SessionLifecycleService,
 	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
+import { isSessionLifecycleMutationOperation } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import {
+	containsSecretConfigKey,
 	validateAdapterControl,
 	validateAdapterSecretFields,
 	validateRequiredPromptText,
 } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
+import { normalizeSdkRevisionInput } from "../protocol/revision-contracts";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
@@ -95,6 +102,7 @@ export interface SdkSessionCliArgs {
 	timeoutMs?: number;
 	strict?: boolean;
 	untilIdle?: boolean;
+	ifIdle?: boolean;
 	allEvents?: boolean;
 	/** tail --cursor: transcript row id the caller has already processed; rows up to and including it are omitted. */
 	afterTranscriptId?: string;
@@ -120,7 +128,6 @@ export interface RetainedTranscriptTailReader {
 	readRange(start: number, end: number): Promise<Uint8Array>;
 }
 
-const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const SDK_SESSION_CLI_LIFECYCLE_ACTOR = { id: "gjc-sdk-session-cli", namespace: "sdk:session-cli" } as const;
 const ROUTER_START_TIMEOUT_MS = 10_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
@@ -180,6 +187,7 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		wait_timeout: "wait_timeout",
 		uncertain_after_send: "uncertain_after_send",
 		busy: "busy",
+		not_found: "not_found",
 		authorization_denied: "authorization_denied",
 		unauthorized: "authorization_denied",
 		forbidden: "authorization_denied",
@@ -223,6 +231,25 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	});
 }
 
+/**
+ * `broker_unavailable` with the fixed `lock_refused` diagnostic when a detached
+ * broker refused an existing `broker.lock`; `undefined` for any other error.
+ * Neither the lock path nor the broker's message is exposed.
+ * Unwraps AggregateError to handle cleanup failures alongside primary refusal.
+ */
+export function brokerLockRefusalFailure(error: unknown, details?: unknown): PublicCommandFailure | undefined {
+	const normalized = normalizeBrokerLockRefusalError(error);
+	if (normalized.refusalCode === undefined) {
+		// Also check BrokerStartupError with lockRefused (when refusal code info was lost)
+		if (!(normalized.primaryError instanceof BrokerStartupError) || !normalized.primaryError.lockRefused)
+			return undefined;
+	}
+	return new PublicCommandFailure({
+		...sdkPublicFailure("broker_unavailable", details, "pre-send").input,
+		diagnostics: normalized.cleanupUnverified ? ["lock_refused", "broker_cleanup_unverified"] : ["lock_refused"],
+	});
+}
+
 function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): PublicCommandFailure {
 	if (error instanceof PublicCommandFailure)
 		return new PublicCommandFailure({
@@ -237,6 +264,8 @@ function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): Publi
 			],
 		});
 	const context = { sessionId: args.sessionId, operationRef: args.opRef, idempotencyKey: args.idempotencyKey };
+	const lockFailure = brokerLockRefusalFailure(error, context);
+	if (lockFailure) return lockFailure;
 	if (error instanceof SdkSessionCliError)
 		return sdkPublicFailure(
 			error.exitCode === 2 && error.code !== "invalid_json" ? "usage" : error.code,
@@ -276,7 +305,11 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 	const failure = sdkPublicFailure(outcome.error.code);
 	// The service emits retryable protocol_error only when requestSent is explicitly false.
 	const proof: PublicEffectProof =
-		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
+		outcome.error.code === "busy"
+			? "pre-effect"
+			: outcome.certainty === "retryable" && outcome.error.code === "protocol_error"
+				? "pre-send"
+				: "unknown";
 	// `operation_failed` cannot distinguish a conflict or an input refusal from any other failed
 	// operation, so each survives as one fixed diagnostic. The broker message itself is never
 	// rendered: it may carry request keys, paths, or credentials, and its cause is not decidable
@@ -288,6 +321,14 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 		diagnostic = "lifecycle_legacy_history_ambiguous";
 	} else if (LIFECYCLE_INPUT_REFUSAL_CODES.has(outcome.error.code)) {
 		diagnostic = "lifecycle_input_refused";
+	} else if (
+		outcome.operation === "session.resume" &&
+		outcome.error.code === "live_session" &&
+		outcome.error.holder !== undefined
+	) {
+		// Only the single-owner refusal names a holder; a live session whose endpoint authority is
+		// unavailable is a different `live_session` and keeps no diagnostic.
+		diagnostic = "lifecycle_session_held";
 	}
 	const diagnostics: readonly PublicCommandDiagnosticCode[] | undefined =
 		diagnostic === undefined ? undefined : [diagnostic];
@@ -316,10 +357,6 @@ class RetainedTranscriptTailError extends Error {
 
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function object(value: unknown): JsonRecord | undefined {
@@ -469,12 +506,6 @@ export async function readSecureJsonInputFile(filePath: string): Promise<string>
 	}
 }
 
-function containsSecretField(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsSecretField);
-	if (!isRecord(value)) return false;
-	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
-}
-
 async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	const sources = [
 		args.jsonInput !== undefined,
@@ -484,7 +515,7 @@ async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
 	if (sources > 1) throw new SdkSessionCliError("usage", "Use only one JSON input source.", 2);
 	if (args.jsonInput !== undefined) {
 		const input = parseInput(args.jsonInput, "--json-input");
-		if (containsSecretField(input))
+		if (containsSecretConfigKey(input))
 			throw new SdkSessionCliError(
 				"secret_field_forbidden",
 				"Secret values must use --json-input-file or --json-input-stdin.",
@@ -517,14 +548,8 @@ function isRawSpawnOperation(kind: OperationKind, operation: string): boolean {
 }
 
 function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
-	return (
-		operation === "session.create" ||
-		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete" ||
-		operation === "session.reconcile_uncertain"
-	);
+	// The local daemon CLI additionally exposes same-session revision (G11).
+	return operation === "session.revise" || isSessionLifecycleMutationOperation(operation);
 }
 
 function cliOperationError(kind: OperationKind, operation: string): { code: string; message: string } | undefined {
@@ -537,17 +562,6 @@ function cliOperationError(kind: OperationKind, operation: string): { code: stri
 			message: `${operation} is unavailable through the SDK session CLI.`,
 		};
 	return error;
-}
-
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: NodeJS.Timeout | undefined;
-	const timeout = Promise.withResolvers<never>();
-	try {
-		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
-		return await Promise.race([promise, timeout.promise]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
 }
 
 function reportRouterCleanupFailure(): void {
@@ -717,7 +731,8 @@ async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<Se
 		const result = resultObject(response) ?? {};
 		let sessions: SdkSessionRowV1[];
 		try {
-			sessions = arrayOf(result.sessions).map(toSessionRowV1);
+			const viewer = viewingMasterSessionId();
+			sessions = arrayOf(result.sessions).map(row => withSpawnOwnerSelf(toSessionRowV1(row), viewer));
 		} catch {
 			throw new SdkClientError("protocol_error", "session.list returned a malformed session row.");
 		}
@@ -731,6 +746,12 @@ async function sessionRows(agentDir: string, input: JsonRecord = {}): Promise<Se
 
 function searchScopeRequest(scope: ScopeNameV1, locator: { cwd: string; worktreeRoot: string | null }): ScopeRequestV1 {
 	return { version: 1, requested: scope, requestAnchor: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot } };
+}
+
+/** The master identity a master session's Bash tool exports; undefined outside master sessions. */
+function viewingMasterSessionId(): string | undefined {
+	const value = process.env[MASTER_OWNER_SESSION_ENV];
+	return value === undefined || value.length === 0 ? undefined : value;
 }
 
 function searchProbe(row: SdkSearchRowV1, router: SessionRouter): Promise<SdkSearchRowV1> {
@@ -806,7 +827,9 @@ export async function runSdkSearch(
 				if (outcome.result.status === "not-in-git-worktree") return { result: outcome.result, exitCode: 0 };
 				if (outcome.result.status === "unavailable")
 					throw sdkPublicFailure(outcome.result.error?.code ?? "unavailable");
-				return { result: await probe(agentDir, outcome.result), exitCode: 0 };
+				const viewer = viewingMasterSessionId();
+				const owned = { ...outcome.result, rows: outcome.result.rows.map(row => withSpawnOwnerSelf(row, viewer)) };
+				return { result: await probe(agentDir, owned), exitCode: 0 };
 			}
 			throw sdkPublicFailure("operation_failed");
 		}
@@ -841,12 +864,26 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 		...(result.cursor === undefined ? [] : [`Continuation cursor: ${safeSearchText(result.cursor)}`]),
 	];
 	if (result.rows.length === 0) return lines.join("\n");
-	lines.push("ID  PROBE        LIVE  CWD");
+	lines.push("ID  PROBE        LIVE  OWNER         CWD");
 	for (const row of result.rows)
 		lines.push(
-			`${safeSearchText(row.id).padEnd(20)}  ${safeSearchText(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
+			`${safeSearchText(row.id).padEnd(20)}  ${safeSearchText(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${searchOwnerLabel(row).padEnd(12)}  ${safeSearchText(row.locator.cwd)}`,
 		);
 	return lines.join("\n");
+}
+
+/** `master` for master sessions, `self`/`other` for spawned children, `-` when ownership is unrecorded. */
+function searchOwnerLabel(row: SdkSearchRowV1): string {
+	const spawned =
+		row.spawnedBy === undefined
+			? undefined
+			: row.spawnedBy.self === true
+				? "self"
+				: row.spawnedBy.self === false
+					? "other"
+					: "spawned";
+	if (row.role === "master") return spawned === undefined ? "master" : `master/${spawned}`;
+	return spawned ?? "-";
 }
 
 const SESSION_LIST_SCOPES: readonly SdkSessionListScope[] = ["repo", "cwd", "worktree", "all"];
@@ -2269,6 +2306,12 @@ function lifecycleMutationRequest(
 		requestKey,
 		...(timeoutMs === undefined ? {} : { timeoutMs }),
 	};
+	if (operation === "session.revise") {
+		const revision = normalizeSdkRevisionInput(input);
+		if (!revision)
+			throw new SdkSessionCliError("invalid_input", "session.revise requires valid selection or edit input.", 2);
+		return { ...base, operation, capability: operation, target: revision };
+	}
 	if (operation === "session.create" || operation === "session.fork") {
 		if (typeof input.cwd !== "string" || input.cwd.length === 0)
 			throw new SdkSessionCliError("invalid_input", `${operation} requires a string cwd in the input payload.`, 2);
@@ -2284,6 +2327,7 @@ function lifecycleMutationRequest(
 			2,
 		);
 	const target = input as JsonRecord & { sessionId: string };
+
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
 	if (operation === "session.close") return { ...base, operation, capability: operation, target };
 	if (operation === "session.reconcile_uncertain")
@@ -2309,15 +2353,16 @@ async function resolveCloseAuthority(
 	if (!("sessions" in listed.result))
 		throw new SdkSessionCliError("malformed_response", "broker returned a scoped result for session close", 1);
 	const row = listed.result.sessions.find(session => session.sessionId === sessionId);
+	if (row === undefined) throw sdkPublicFailure("not_found", { sessionId }, "pre-effect");
 	if (
-		row === undefined ||
 		typeof row.endpointGeneration !== "number" ||
 		!Number.isSafeInteger(row.endpointGeneration) ||
 		row.endpointGeneration <= 0 ||
 		typeof row.endpointIncarnation !== "string" ||
 		!/^[a-f0-9]{64}$/u.test(row.endpointIncarnation)
 	)
-		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} has no live endpoint authority.`, 1);
+		// Refused while resolving authority: no close request was sent and no key was bound.
+		throw sdkPublicFailure("session_unavailable", { sessionId }, "pre-send");
 	return { endpointGeneration: row.endpointGeneration, endpointIncarnation: row.endpointIncarnation };
 }
 
@@ -2395,12 +2440,25 @@ async function runRawGlobal(
 	const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 	const response = await lifecycle.execute(lifecycleMutationRequest(operation, input, args.idempotencyKey, timeoutMs));
 	try {
-		if (!response.ok) throw lifecyclePublicFailure(response);
+		if (!response.ok) {
+			const failure = lifecyclePublicFailure(response);
+			// Ordinary close checks for an indexed target before dispatching close or
+			// signalling it. Do not generalize that proof to other lifecycle operations
+			// or the separate stale-retirement path.
+			if (operation === "session.close" && input.forceRetireStale !== true && response.error.code === "not_found")
+				throw new PublicCommandFailure({ ...failure.input, proof: "pre-effect" });
+			throw failure;
+		}
 	} catch (error) {
-		throw normalizeSessionFailure(error, {
+		const failure = normalizeSessionFailure(error, {
 			...args,
 			sessionId: typeof input.sessionId === "string" ? input.sessionId : args.sessionId,
 		});
+		// The raw global command path does not name the operation; carry it so a busy or stale
+		// close gets close guidance (wait and retry the same key) instead of steering advice.
+		throw operation === "session.close"
+			? new PublicCommandFailure({ ...failure.input, sessionClose: true })
+			: failure;
 	}
 	return response;
 }
@@ -2504,6 +2562,8 @@ export async function runSdkSessionCli(
 			const input = await inputFromArgs(args);
 			if (input.sessionId !== undefined && input.sessionId !== sessionId)
 				throw new SdkSessionCliError("invalid_input", "Close sessionId does not match the selected session.", 2);
+			if (args.ifIdle && Object.hasOwn(input, "ifIdle") && input.ifIdle !== true)
+				throw new SdkSessionCliError("invalid_input", "--if-idle conflicts with the JSON input ifIdle value.", 2);
 			const secretError = validateAdapterSecretFields("session.close", input);
 			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 			const lifecycle = deps.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);
@@ -2524,8 +2584,10 @@ export async function runSdkSessionCli(
 					"endpointGeneration and endpointIncarnation must identify a valid endpoint authority.",
 					2,
 				);
-			const target = { ...input, sessionId, ...(authority ?? {}) };
-			const requestKey = args.idempotencyKey ?? sessionCloseRequestKey(sessionId, authority!);
+			const target = { ...input, sessionId, ...(authority ?? {}), ...(args.ifIdle ? { ifIdle: true } : {}) };
+			const requestKey =
+				args.idempotencyKey ??
+				`${sessionCloseRequestKey(sessionId, authority!)}${target.ifIdle === true ? ":if-idle" : ""}`;
 			// Closing never attaches: a Router attachment registers this process as a
 			// live client and renews the host's abandonment window, which is the
 			// opposite of what a close is for. The Broker answers the lifecycle

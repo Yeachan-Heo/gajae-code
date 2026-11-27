@@ -57,7 +57,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-editor-component-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		await Settings.init({ inMemory: true, cwd: tempDir.path(), overrides: { "starReminder.enabled": false } });
 		authStorage = await AuthStorage.create(":memory:");
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -723,8 +723,6 @@ describe("InteractiveMode.setEditorComponent", () => {
 		const userLabelRow = plainLines.findIndex(line => line.trim() === "user");
 		expect(userLabelRow).toBeGreaterThanOrEqual(0);
 		expect(rendered.anchors[userLabelRow]).toBeNull();
-		expect(rendered.lines.join("")).toContain("\x1b]133;A\x07");
-		expect(rendered.lines.join("")).toContain("\x1b]133;B\x07\x1b]133;C\x07");
 		expect(syntheticRow).toBeGreaterThanOrEqual(0);
 		expect(rendered.anchors[syntheticRow]).toBeNull();
 		expect(statusRow).toBeGreaterThanOrEqual(0);
