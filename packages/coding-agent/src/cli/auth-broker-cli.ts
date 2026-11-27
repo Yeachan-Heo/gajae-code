@@ -70,6 +70,7 @@ type AuthBrokerCliErrorCode =
 	| "broker_unavailable"
 	| "credential_import_failed"
 	| "credential_migration_failed"
+	| "credential_logout_failed"
 	| "auth_broker_command_failed";
 
 function stableErrorForAction(action: AuthBrokerAction): { code: AuthBrokerCliErrorCode; message: string } {
@@ -80,6 +81,8 @@ function stableErrorForAction(action: AuthBrokerAction): { code: AuthBrokerCliEr
 			return { code: "credential_import_failed", message: "Credential import failed." };
 		case "migrate":
 			return { code: "credential_migration_failed", message: "Credential migration failed." };
+		case "logout":
+			return { code: "credential_logout_failed", message: "Credential logout failed." };
 		default:
 			return { code: "auth_broker_command_failed", message: "Auth broker command failed." };
 	}
@@ -276,7 +279,13 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	const provider = resolveOAuthStorageProvider(providerArg);
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	try {
-		store.deleteAuthCredentialsForProvider(provider, "logged out by user");
+		try {
+			store.deleteAuthCredentialsForProvider(provider, "logged out by user");
+		} catch (error) {
+			// Nothing was disabled, so the broker keeps serving these credentials.
+			writeCommandFailure("logout", flags, error);
+			return;
+		}
 		process.stdout.write(`Logged out of ${provider}\n`);
 	} finally {
 		store.close();

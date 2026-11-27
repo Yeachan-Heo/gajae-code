@@ -9964,7 +9964,15 @@ export class AgentSession {
 				msg.provider === "github-copilot" &&
 				msg.errorMessage?.includes("GitHub Copilot authentication failed")
 			) {
-				await this.#modelRegistry.authStorage.remove("github-copilot");
+				try {
+					await this.#modelRegistry.authStorage.remove("github-copilot");
+				} catch (error) {
+					// The credential is still stored; the next authentication failure retries the
+					// invalidation. Post-turn handling must still run.
+					logger.warn("Failed to invalidate GitHub Copilot credentials after an auth failure", {
+						error: String(error),
+					});
+				}
 			}
 
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {

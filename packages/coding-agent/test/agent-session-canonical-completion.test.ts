@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
@@ -454,6 +455,36 @@ describe("AgentSession canonical completion", () => {
 				.map(entry => entry.message.role),
 		).toEqual(["assistant"]);
 		expect(removed).toEqual(["removed"]);
+	});
+
+	it("finishes post-turn handling and keeps the Copilot credential when its invalidation cannot be written", async () => {
+		const { agent, manager, session } = await setup();
+		await authStorage!.set("github-copilot", { type: "api_key", key: "stale-copilot-token" });
+		const admin = new Database(path.join(tempDir!.path(), "auth.db"));
+		try {
+			admin.run(
+				"CREATE TRIGGER fail_disable BEFORE UPDATE OF disabled_cause ON auth_credentials WHEN NEW.disabled_cause IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disable rejected by test trigger'); END",
+			);
+		} finally {
+			admin.close();
+		}
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: { role: "user", content: "committed", timestamp: Date.now() },
+		});
+		const terminal = assistant();
+		agent.emitExternalEvent({ type: "message_end", message: terminal });
+		agent.emitExternalEvent({ type: "agent_end", messages: [terminal] });
+		await withTimeout(session.awaitSessionSettlement(), 5_000, "Failed Copilot invalidation blocked settlement");
+
+		// The row is still active on disk, so memory keeps it as well.
+		expect(authStorage!.has("github-copilot")).toBe(true);
+		expect(
+			manager
+				.getBranch()
+				.filter(entry => entry.type === "message")
+				.map(entry => entry.message.role),
+		).toEqual(["user", "assistant"]);
 	});
 
 	it("joins its own pending admission, not only the already released predecessor", async () => {

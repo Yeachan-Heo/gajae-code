@@ -649,8 +649,10 @@ describe("AuthStorage openai-codex workspaces", () => {
 			store.setOAuthOrganizationNameIfUnset = () => {
 				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
 			};
-			// The store swallows delete failures, so the duplicate stays active on disk.
-			store.deleteAuthCredential = () => {};
+			// The delete fails, so the duplicate stays active on disk.
+			store.deleteAuthCredential = () => {
+				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+			};
 
 			await refreshLegacy(legacyId, TEAM.id);
 

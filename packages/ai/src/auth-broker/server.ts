@@ -725,10 +725,19 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const parsed = await parseBody(req, credentialDisableRequestSchema, { allowEmpty: true });
 					if (!parsed.ok) return parsed.response;
 					const cause = "disabled via auth-broker";
-					const ok =
-						parsed.data.expectedRevision === undefined
-							? opts.storage.disableCredentialById(id, cause)
-							: opts.storage.disableCredentialByIdIfRevision(id, parsed.data.expectedRevision, cause);
+					let ok: boolean;
+					try {
+						ok =
+							parsed.data.expectedRevision === undefined
+								? opts.storage.disableCredentialById(id, cause)
+								: opts.storage.disableCredentialByIdIfRevision(id, parsed.data.expectedRevision, cause);
+					} catch (error) {
+						// The broker store did not persist the disable; the row is still active,
+						// so the client must keep its mirror row instead of treating it as gone.
+						const message = cleanReason(error) ?? "Credential disable failed";
+						logger.warn("auth-broker disable failed", { id, peer, error: message });
+						return json(500, { error: message });
+					}
 					if (!ok) {
 						logger.info("auth-broker disable miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
