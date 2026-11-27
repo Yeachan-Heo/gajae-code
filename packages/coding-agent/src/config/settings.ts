@@ -7233,25 +7233,33 @@ let globalInitOptions: SettingsOptions | null = null;
  * `off`: deliberately more conservative than the loader, so a file that cannot be read never lifts an
  * `off` the operator may have set in it. That answer is not cached, because the error may be
  * transient: the next read tries the file again. The warning is logged once per path.
+ *
+ * A `fresh` read (a refusal decision's) bypasses the cache and never writes it, so a refusal never
+ * changes the mode later factories read. It must not drop a refusal it cannot justify, so a read error
+ * there reads as unset (the factory's decision stands), with its own warning, once per path.
  */
 const operatorOwnershipModes = new Map<string, unknown>();
 const operatorOwnershipUnreadableWarned = new Set<string>();
-function operatorOwnershipMode(configPath: string): unknown {
-	if (operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
+const operatorOwnershipRereadWarned = new Set<string>();
+function operatorOwnershipMode(configPath: string, fresh = false): unknown {
+	if (!fresh && operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
 	let mode: unknown;
 	let content: string | undefined;
 	try {
 		content = fs.readFileSync(configPath, "utf8");
 	} catch (error) {
 		if (!isEnoent(error)) {
-			if (!operatorOwnershipUnreadableWarned.has(configPath)) {
-				operatorOwnershipUnreadableWarned.add(configPath);
-				logger.warn("Session ownership is off: the global config could not be read", {
-					configPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
+			const warned = fresh ? operatorOwnershipRereadWarned : operatorOwnershipUnreadableWarned;
+			if (!warned.has(configPath)) {
+				warned.add(configPath);
+				logger.warn(
+					fresh
+						? "Session ownership kept a refusal: the global config could not be reread"
+						: "Session ownership is off: the global config could not be read",
+					{ configPath, error: error instanceof Error ? error.message : String(error) },
+				);
 			}
-			return "off";
+			return fresh ? undefined : "off";
 		}
 	}
 	if (content !== undefined) {
@@ -7263,7 +7271,7 @@ function operatorOwnershipMode(configPath: string): unknown {
 			// Malformed YAML: the default applies, as it does for the loader.
 		}
 	}
-	operatorOwnershipModes.set(configPath, mode);
+	if (!fresh) operatorOwnershipModes.set(configPath, mode);
 	return mode;
 }
 
@@ -7272,11 +7280,15 @@ function operatorOwnershipMode(configPath: string): unknown {
 // because the session modules sit below config in the import graph.
 // The global layer only: a project or runtime value, including a null or scalar `session` parent
 // that would replace the user's whole `session` object in the merge, never reaches the mode.
-setSessionOwnershipSettingSource(() =>
-	globalInstance
+// A `fresh` read (a refusal decision) rereads the file even under process settings, which do not
+// hot-reload on every platform. Only an explicit `off` or `observe` in it lowers the refusal.
+setSessionOwnershipSettingSource(options => {
+	if (options?.fresh)
+		return operatorOwnershipMode(path.join(globalInstance?.getAgentDir() ?? getAgentDir(), "config.yml"), true);
+	return globalInstance
 		? globalInstance.getGlobal("session.ownership.mode")
-		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml")),
-);
+		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml"));
+});
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -7293,6 +7305,7 @@ export function resetSettingsForTest(): void {
 	globalInitOptions = null;
 	operatorOwnershipModes.clear();
 	operatorOwnershipUnreadableWarned.clear();
+	operatorOwnershipRereadWarned.clear();
 }
 
 /**

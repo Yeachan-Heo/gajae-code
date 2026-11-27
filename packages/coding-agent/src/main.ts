@@ -106,7 +106,15 @@ import {
 	SessionTranscriptOversizedError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
-import { type SessionOwnerSurface, sessionOwnerSurface, setSessionOwnerSurface } from "./session/session-ownership";
+import {
+	SessionHeldError,
+	type SessionOwnerSurface,
+	SessionOwnershipError,
+	sessionHeldForkCommand,
+	sessionOwnerHolderPhrase,
+	sessionOwnerSurface,
+	setSessionOwnerSurface,
+} from "./session/session-ownership";
 import { dropProjectSuppliedSessionOwnershipOverride, sessionOwnershipModeFor } from "./session/session-ownership-mode";
 import { resolveStartupAuthConfig } from "./session/startup-auth-config";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
@@ -968,7 +976,29 @@ export class SessionNotFoundError extends Error {
 	}
 }
 
-export function operatorFacingSessionOpenMessage(value: unknown): string | undefined {
+/**
+ * The CLI refusal for a session another process holds (design §3.3), with the command that
+ * continues it in a copy. Only a safe id is printed; any other id may hold any text.
+ */
+function sessionHeldCliMessage(error: SessionHeldError, print: boolean): string {
+	const holder = sessionOwnerHolderPhrase(error.holder);
+	const fork = sessionHeldForkCommand(error.sessionId, { print });
+	if (!fork)
+		return `error: this session is open for writing in ${holder}.\nOnly one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
+	return `error: session ${error.sessionId.slice(0, 8)} is open for writing in ${holder}.\nOnly one process can write a session at a time. Close it there, or continue in a copy:\n  ${fork}`;
+}
+
+/** Why `--continue` or `autoResume` started a new session (design §3.3). */
+function heldContinueNotice(error: SessionHeldError): string {
+	return `Your most recent session is open in ${sessionOwnerHolderPhrase(error.holder)}, so a new session was started. Run gjc --resume to pick a session.`;
+}
+
+export function operatorFacingSessionOpenMessage(
+	value: unknown,
+	options: { readonly print?: boolean } = {},
+): string | undefined {
+	if (value instanceof SessionHeldError) return sessionHeldCliMessage(value, options.print === true);
+	if (value instanceof SessionOwnershipError) return value.operatorMessage;
 	const code =
 		value instanceof SessionForkDeclinedError
 			? value.code
@@ -1385,11 +1415,26 @@ async function flushChangelogVersion(): Promise<void> {
 	}
 }
 
+/**
+ * How a launch reports that `--continue` or `autoResume` started fresh because the session it would
+ * continue is held: `-p --continue` refuses instead, unless `interactive`.
+ */
+export interface SessionStartupNotices {
+	readonly interactive: boolean;
+	readonly notice: (message: string) => void;
+}
+
+const STDERR_STARTUP_NOTICES: SessionStartupNotices = {
+	interactive: false,
+	notice: message => process.stderr.write(`${message}\n`),
+};
+
 export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	activeSettings: Settings = settings,
 	surface: SessionOwnerSurface = sessionOwnerSurface(),
+	startup: SessionStartupNotices = STDERR_STARTUP_NOTICES,
 ): Promise<SessionManager | undefined> {
 	// `gjc acp` never builds an agent here: its sessions run in broker-launched hosts, or in the
 	// process that owns them. A persisting manager would open, and claim, a session it never uses.
@@ -1498,16 +1543,26 @@ export async function createSessionManager(
 			ownership,
 		);
 	}
-	if (parsed.continue) {
-		return await SessionManager.continueRecent(
-			cwd,
-			sessionDestination(),
-			undefined,
-			migrationPolicy,
-			sessionMemoryMode,
-			ownership,
-		);
-	}
+	// Enforce ends `continueRecent`'s search at a held session it would continue (design §1 row 4):
+	// gjc then starts fresh with a notice, except `-p --continue`, which asked for that session and
+	// refuses (row 10).
+	const continueOrStartFresh = async (refuseWhenHeld: boolean): Promise<SessionManager> => {
+		try {
+			return await SessionManager.continueRecent(
+				cwd,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+				ownership,
+			);
+		} catch (error) {
+			if (!(error instanceof SessionHeldError) || refuseWhenHeld) throw error;
+			startup.notice(heldContinueNotice(error));
+			return SessionManager.create(cwd, sessionDestination(), undefined, ownership);
+		}
+	};
+	if (parsed.continue) return await continueOrStartFresh(!startup.interactive);
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
@@ -1529,14 +1584,8 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(
-			cwd,
-			sessionDestination(),
-			undefined,
-			migrationPolicy,
-			sessionMemoryMode,
-			ownership,
-		);
+		// The user did not ask to continue, so even `-p` starts fresh, with the notice on stderr (D7).
+		const manager = await continueOrStartFresh(false);
 		if (manager.hasHistoryEntries()) {
 			parsed.continue = true;
 		}
@@ -2513,9 +2562,13 @@ export async function runRootCommand(
 				parsedArgs,
 				cwd,
 				settingsInstance,
+				sessionOwnerSurface(),
+				isInteractive
+					? { interactive: true, notice: message => notifs.push({ kind: "warn", message }) }
+					: STDERR_STARTUP_NOTICES,
 			);
 		} catch (error) {
-			const message = operatorFacingSessionOpenMessage(error);
+			const message = operatorFacingSessionOpenMessage(error, { print: !isInteractive });
 			if (!message) throw error;
 			process.stderr.write(`${message}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;

@@ -375,9 +375,13 @@ export async function materializeExternalSessionImport(
 	}
 	const importedAt = (options.now?.() ?? new Date()).toISOString();
 	const manager = SessionManager.create(options.cwd, options.destination);
-	// The import's claim gate: enforce (5a) refuses a `held` or `failed` outcome here.
+	// The import's claim gate: enforce refuses a failed claim of the new id here, before any write.
 	const claims = sessionClaimSetOf(manager);
-	if (claims.claiming) await claims.settled();
+	const refusal = claims.claiming ? await claims.refusal() : undefined;
+	if (refusal) {
+		await manager.close().catch(() => {});
+		throw new SessionImportError("io_failed", "persist", refusal.operatorMessage);
+	}
 	const destination = manager.getDestinationForFork();
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) {

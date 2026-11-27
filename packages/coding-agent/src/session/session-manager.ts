@@ -185,12 +185,13 @@ import {
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	attemptSessionClaim,
+	claimRefusal,
 	claimsUnder,
 	type ResolvedSessionOwnership,
 	resolveSessionOwnership,
 	type SessionClaimAttempt,
+	type SessionClaimOutcome,
 	SessionClaimSet,
-	type SessionClaimStatus,
 	type SessionOwnershipDecision,
 	sessionClaimSetCapability,
 } from "./internal/session-claim-set";
@@ -294,7 +295,13 @@ import {
 	toRecapLineageEntry,
 } from "./recap";
 import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
-import { probeSessionOwners, type SessionOwnerClaim, type SessionOwnerProbe } from "./session-ownership";
+import {
+	probeSessionOwners,
+	SessionHeldError,
+	type SessionOwnerClaim,
+	type SessionOwnerProbe,
+	SessionOwnershipError,
+} from "./session-ownership";
 import { isStagedSessionPath, SESSION_STAGING_DIRNAME } from "./session-staging-paths";
 import type {
 	ManagedSessionSecurityContext,
@@ -4481,11 +4488,18 @@ interface BoundedTranscriptInspection {
 	cwd: string | undefined;
 }
 
+/**
+ * The header of a transcript, read from its first line. `growing: true` accepts a transcript that a
+ * live holder is appending to: the header line itself never changes, only the size and mtime do.
+ */
 function inspectTranscriptHeaderBounded(
 	filePath: string,
 	storage: SessionStorage,
 	maxBytes: number,
-): { ok: true; inspection: { cwd: string | undefined } } | { ok: false; error: ResumeTailError } {
+	options: { readonly growing?: boolean } = {},
+): { ok: true; inspection: { cwd: string | undefined; sessionId: string } } | { ok: false; error: ResumeTailError } {
+	const stable = (left: SessionStorageStat, right: SessionStorageStat) =>
+		options.growing === true || sameResumeStat(left, right);
 	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
 	let before: SessionStorageStat;
 	try {
@@ -4500,7 +4514,7 @@ function inspectTranscriptHeaderBounded(
 	try {
 		const length = Math.min(before.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1);
 		const range = storage.readRangeSync(canonicalPath, 0, length);
-		if (!sameResumeStat(before, range.stat)) return { ok: false, error: { kind: "error", reason: "unstable" } };
+		if (!stable(before, range.stat)) return { ok: false, error: { kind: "error", reason: "unstable" } };
 		const newline = range.bytes.indexOf(0x0a);
 		if (newline < 0 || newline > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES)
 			return { ok: false, error: { kind: "error", reason: "malformed" } };
@@ -4509,8 +4523,11 @@ function inspectTranscriptHeaderBounded(
 		if (header.type !== "session" || typeof header.id !== "string")
 			return { ok: false, error: { kind: "error", reason: "malformed" } };
 		const after = storage.statSync(canonicalPath);
-		if (!sameResumeStat(before, after)) return { ok: false, error: { kind: "error", reason: "unstable" } };
-		return { ok: true, inspection: { cwd: typeof header.cwd === "string" ? header.cwd : undefined } };
+		if (!stable(before, after)) return { ok: false, error: { kind: "error", reason: "unstable" } };
+		return {
+			ok: true,
+			inspection: { cwd: typeof header.cwd === "string" ? header.cwd : undefined, sessionId: header.id },
+		};
 	} catch {
 		return { ok: false, error: { kind: "error", reason: "malformed" } };
 	}
@@ -10622,8 +10639,9 @@ export class SessionManager {
 		this.#applyFreshSessionMetadata(fresh);
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#retireEphemeralArtifacts();
-		this.#writeTerminalBreadcrumb(resolvedSessionFile);
+		// Before the breadcrumb, the first write: a factory's claim refuses here in enforce.
 		if (this.#ownershipClaims.claiming) await this.#ownershipClaims.claim(fresh.sessionId);
+		this.#writeTerminalBreadcrumb(resolvedSessionFile);
 		await this.#rewriteFile();
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
@@ -23602,7 +23620,11 @@ export class SessionManager {
 		const migrationClaim: SessionClaimAttempt = claimsUnder(owner)
 			? await attemptSessionClaim(owner, sessionId)
 			: { status: "none" };
-		if (migrationClaim.status === "held" && options?.readInPlaceWhenHeld) return filePath;
+		// A fork's source is read where it is whenever it cannot be claimed for its migration: held
+		// elsewhere, or a claim enforce would refuse (a failed one). Any other caller is refused.
+		const refusal = claimRefusal(owner, sessionId, migrationClaim);
+		if (options?.readInPlaceWhenHeld && (migrationClaim.status === "held" || refusal)) return filePath;
+		if (refusal) throw refusal;
 		let opened: ManagedOpenCandidateResult;
 		try {
 			opened = await openManagedCandidateForWrite(
@@ -24594,6 +24616,55 @@ export class SessionManager {
 		ownership?: SessionOwnershipDecision,
 	): Promise<SessionManager> {
 		const owner = resolveSessionOwnership(ownership);
+		const admission = await SessionManager.#admitExistingTranscript(owner, filePath, storage);
+		try {
+			return await SessionManager.#openAdmitted(
+				filePath,
+				destinationInput,
+				storage,
+				migrationPolicy,
+				sessionMemoryMode,
+				owner,
+			);
+		} finally {
+			// The manager took its own share of the claim; this one only covered the open.
+			admission?.release();
+		}
+	}
+
+	/**
+	 * Enforce's claim of an existing transcript's header id, taken before `open` reads, builds or
+	 * writes anything for it (5a): the bounded paths build session-memory sidecars, and every path may
+	 * sanitize or write the breadcrumb, before the manager's own claim. That claim then shares this
+	 * one. Nothing outside enforce, and nothing for a transcript whose header cannot be read here: a
+	 * missing one gets a fresh id, claimed where it is minted; an unreadable one fails in the open.
+	 */
+	static async #admitExistingTranscript(
+		owner: ResolvedSessionOwnership,
+		filePath: string,
+		storage: SessionStorage,
+	): Promise<SessionOwnerClaim | undefined> {
+		if (owner === "exempt" || owner.mode !== "enforce" || !(storage instanceof FileSessionStorage)) return undefined;
+		// A holder appending to the transcript changes its size, never its header.
+		const header = inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES, {
+			growing: true,
+		});
+		if (!header.ok) return undefined;
+		const sessionId = header.inspection.sessionId;
+		const attempt = await attemptSessionClaim(owner, sessionId);
+		const refusal = claimRefusal(owner, sessionId, attempt);
+		if (refusal) throw refusal;
+		return attempt.status === "claimed" ? attempt.claim : undefined;
+	}
+
+	static async #openAdmitted(
+		filePath: string,
+		destinationInput: SessionDestinationInput | undefined,
+		storage: SessionStorage,
+		migrationPolicy: SessionDirectoryMigrationPolicy,
+		sessionMemoryMode: SessionMemoryMode,
+		owner: ResolvedSessionOwnership,
+	): Promise<SessionManager> {
 		const destination =
 			destinationInput === undefined
 				? explicitDestination(path.dirname(filePath))
@@ -24748,19 +24819,8 @@ export class SessionManager {
 			if (!boundedAdmission) {
 				const inspected = inspectResumeSessionFile(filePath, storage);
 				if ("kind" in inspected) {
-					if (inspected.reason === "missing") {
-						const manager = new SessionManager(
-							getProjectDir(),
-							destination.directory,
-							true,
-							owner,
-							storage,
-							destination,
-						);
-						manager.#sessionMemoryMode = sessionMemoryMode;
-						await SessionManager.#initializeMissingForOpen(manager, filePath);
-						return manager;
-					}
+					if (inspected.reason === "missing")
+						return await SessionManager.#openMissing(filePath, destination, owner, storage, sessionMemoryMode);
 					if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
 					throw new Error(`Could not open session: ${inspected.reason}`);
 				}
@@ -24795,19 +24855,8 @@ export class SessionManager {
 				? { ok: true as const, inspection: { cwd: (strictSmallInspection.entries[0] as SessionHeader).cwd } }
 				: inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (!inspected.ok) {
-				if (inspected.error.reason === "missing") {
-					const manager = new SessionManager(
-						getProjectDir(),
-						destination.directory,
-						true,
-						owner,
-						storage,
-						destination,
-					);
-					manager.#sessionMemoryMode = sessionMemoryMode;
-					await SessionManager.#initializeMissingForOpen(manager, filePath);
-					return manager;
-				}
+				if (inspected.error.reason === "missing")
+					return await SessionManager.#openMissing(filePath, destination, owner, storage, sessionMemoryMode);
 				if (inspected.error.reason === "oversized")
 					throw new SessionTranscriptOversizedError(inspected.error.size ?? 0);
 				throw new Error(`Could not open session: ${inspected.error.reason}`);
@@ -25034,19 +25083,8 @@ export class SessionManager {
 		managedInspectionStore = undefined;
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
-			if (inspected.reason === "missing") {
-				const manager = new SessionManager(
-					getProjectDir(),
-					destination.directory,
-					true,
-					owner,
-					storage,
-					destination,
-				);
-				manager.#sessionMemoryMode = sessionMemoryMode;
-				await SessionManager.#initializeMissingForOpen(manager, filePath);
-				return manager;
-			}
+			if (inspected.reason === "missing")
+				return await SessionManager.#openMissing(filePath, destination, owner, storage, sessionMemoryMode);
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
 			if (inspected.reason === "context_too_large") throw new SessionContextTooLargeError(inspected.size ?? 0);
 			throw new Error(`Could not open session: ${inspected.reason}`);
@@ -25069,13 +25107,31 @@ export class SessionManager {
 	 * `open` of a missing path: a fresh session, claimed before its header is written. A failed
 	 * open keeps no claim: if the header write throws, the lock goes with the manager that never opened.
 	 */
-	static async #initializeMissingForOpen(manager: SessionManager, filePath: string): Promise<void> {
+	/**
+	 * A missing transcript at `filePath`: a fresh session created there. Enforce's refusal of its
+	 * claim leaves nothing behind, not even the session directory, when this open created it.
+	 */
+	static async #openMissing(
+		filePath: string,
+		destination: SessionDestination,
+		owner: ResolvedSessionOwnership,
+		storage: SessionStorage,
+		sessionMemoryMode: SessionMemoryMode,
+	): Promise<SessionManager> {
+		const directory = destination.directory;
+		const createdHere = storage instanceof FileSessionStorage && !fs.existsSync(directory);
+		const manager = new SessionManager(getProjectDir(), directory, true, owner, storage, destination);
+		manager.#sessionMemoryMode = sessionMemoryMode;
+		const created = createdHere ? await fs.promises.lstat(directory, { bigint: true }) : undefined;
 		try {
 			await manager.#initSessionFile(filePath, true);
 		} catch (error) {
 			manager.#ownershipClaims.releaseAll();
+			if (error instanceof SessionHeldError || error instanceof SessionOwnershipError)
+				await removeCreatedDirectoryIfEmpty(directory, created && { dev: created.dev, ino: created.ino });
 			throw error;
 		}
+		return manager;
 	}
 
 	/**
@@ -26239,7 +26295,7 @@ export class SessionManager {
 				migrationPolicy,
 				sessionMemoryMode,
 				owner,
-				{ claim: undefined, status: "none" },
+				{ claim: undefined, outcome: { status: "none" } },
 			);
 		return SessionManager.#openExistingStrictUnderClaim(
 			identity,
@@ -26260,9 +26316,14 @@ export class SessionManager {
 		owner: ResolvedSessionOwnership,
 	): Promise<StrictSessionOpenResult> {
 		// Claimed before the migration and the sanitize persist; handed to the manager once it exists,
-		// and released on every path that ends before that.
+		// and released on every path that ends before that. Enforce refuses here, before anything exists.
 		const attempt = await attemptSessionClaim(owner, identity.sessionId);
-		const pending = { claim: attempt.status === "claimed" ? attempt.claim : undefined, status: attempt.status };
+		const refusal = claimRefusal(owner, identity.sessionId, attempt);
+		if (refusal) throw refusal;
+		const pending = {
+			claim: attempt.status === "claimed" ? attempt.claim : undefined,
+			outcome: attempt.status === "claimed" ? { status: "claimed" as const } : attempt,
+		};
 		try {
 			return await SessionManager.#openExistingStrictClaimed(
 				identity,
@@ -26285,7 +26346,7 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy,
 		sessionMemoryMode: SessionMemoryMode,
 		owner: ResolvedSessionOwnership,
-		pending: { claim: SessionOwnerClaim | undefined; readonly status: SessionClaimStatus },
+		pending: { claim: SessionOwnerClaim | undefined; readonly outcome: SessionClaimOutcome },
 	): Promise<StrictSessionOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -26326,7 +26387,7 @@ export class SessionManager {
 		const header = entries[0] as SessionHeader;
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, owner, storage, destination);
-		manager.#ownershipClaims.noteOutcome(identity.sessionId, pending.status);
+		manager.#ownershipClaims.noteOutcome(identity.sessionId, pending.outcome);
 		if (pending.claim) manager.#ownershipClaims.add(pending.claim);
 		pending.claim = undefined;
 		manager.#sessionMemoryMode = sessionMemoryMode;
@@ -26359,7 +26420,8 @@ export class SessionManager {
 	}
 
 	/**
-	 * Continue the most recent session, or create new if none.
+	 * Continue the most recent session, or create new if none. In enforce, throws `SessionHeldError`
+	 * when the session it would continue is open for writing in another process.
 	 * @param cwd Working directory
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.gjc/agent/sessions/<encoded-cwd>/).
 	 */
@@ -26374,7 +26436,52 @@ export class SessionManager {
 		const owner = resolveSessionOwnership(ownership);
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
+		const boundedCandidate = (selectedSize: number | undefined): boolean =>
+			selectedSize !== undefined &&
+			selectedSize > eagerHydrationMaxBytes() &&
+			selectedSize <= BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES &&
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" &&
+					process.platform !== "win32" &&
+					selectedSize >= autoModeMinTranscriptBytes()));
+		// Whether a candidate enforce refused as held would have been chosen, decided without a
+		// writable open and by today's rules: a bounded candidate must be continuable; any other one
+		// is chosen once its read-only inspection passes, or ends the search with its size error.
+		const heldCandidateWouldBeChosen = async (selectedPath: string): Promise<boolean> => {
+			let selectedSize: number | undefined;
+			try {
+				selectedSize = storage.statSync(selectedPath).size;
+			} catch {}
+			if (boundedCandidate(selectedSize)) {
+				let snapshot: SessionManager | undefined;
+				try {
+					snapshot = await SessionManager.openReadOnlySnapshot(selectedPath, storage);
+					return canContinuePersistedHistory(snapshot.buildSessionContext().messages);
+				} catch {
+					// Unreadable as a snapshot: count it as chosen, so the search still ends at it.
+					return true;
+				} finally {
+					await snapshot?.close().catch(() => undefined);
+				}
+			}
+			const inspected = await SessionManager.inspectSessionTailReadOnly(selectedPath, storage);
+			return (
+				inspected.kind !== "error" || inspected.reason === "oversized" || inspected.reason === "context_too_large"
+			);
+		};
+		// Per candidate, in today's order (design §1 row 4): enforce refuses a held candidate inside its
+		// open, before any write. A held candidate that would have been chosen ends the search with that
+		// refusal, for the caller to start fresh or refuse; one that is not continuable is skipped.
 		const openSelectedStrictly = async (selectedPath: string): Promise<SessionManager | undefined> => {
+			try {
+				return await openCandidate(selectedPath);
+			} catch (error) {
+				if (error instanceof SessionHeldError && !(await heldCandidateWouldBeChosen(selectedPath)))
+					return undefined;
+				throw error;
+			}
+		};
+		const openCandidate = async (selectedPath: string): Promise<SessionManager | undefined> => {
 			let selectedSize: number | undefined;
 			try {
 				selectedSize = storage.statSync(selectedPath).size;
@@ -26398,15 +26505,7 @@ export class SessionManager {
 					{ ownership: owner },
 				);
 			}
-			const boundedSelected =
-				selectedSize !== undefined &&
-				selectedSize > eagerHydrationMaxBytes() &&
-				selectedSize <= BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES &&
-				(sessionMemoryMode === "enabled" ||
-					(sessionMemoryMode === "auto" &&
-						process.platform !== "win32" &&
-						selectedSize >= autoModeMinTranscriptBytes()));
-			if (boundedSelected) {
+			if (boundedCandidate(selectedSize)) {
 				const manager = await SessionManager.open(
 					openPath,
 					destination,

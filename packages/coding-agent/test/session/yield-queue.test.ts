@@ -338,3 +338,83 @@ describe("YieldQueue", () => {
 		expect(harness.streamingMessages.map(messageText)).toEqual(["second", "first"]);
 	});
 });
+
+describe("YieldQueue step-boundary drain", () => {
+	type BoundaryEntry = Entry & { boundary: boolean };
+
+	function registerBoundaryKind(harness: ReturnType<typeof createHarness>) {
+		const built: string[][] = [];
+		harness.queue.register<BoundaryEntry>("items", {
+			isStale: entry => entry.stale === true,
+			deliverAtStepBoundary: entry => entry.boundary,
+			build: entries => {
+				built.push(entries.map(entry => entry.id));
+				return userMessage(entries.map(entry => entry.id).join(","));
+			},
+		});
+		return built;
+	}
+
+	test("returns eligible entries and leaves ineligible ones, in order, for the before-yield flush", async () => {
+		const harness = createHarness(true);
+		registerBoundaryKind(harness);
+		harness.queue.enqueue("items", { id: "a", boundary: true });
+		harness.queue.enqueue("items", { id: "held-1", boundary: false });
+		harness.queue.enqueue("items", { id: "b", boundary: true });
+		harness.queue.enqueue("items", { id: "held-2", boundary: false });
+
+		expect(harness.queue.drainStepBoundary().map(messageText)).toEqual(["a,b"]);
+		// Nothing eligible remains: a second boundary yields nothing.
+		expect(harness.queue.drainStepBoundary()).toEqual([]);
+		expect(harness.streamingMessages).toHaveLength(0);
+
+		await harness.queue.flush("streaming");
+		expect(harness.streamingMessages.map(messageText)).toEqual(["held-1,held-2"]);
+		expect(harness.queue.has()).toBe(false);
+	});
+
+	test("delivers each entry once: the before-yield flush finds nothing after a boundary drain", async () => {
+		const harness = createHarness(true);
+		const built = registerBoundaryKind(harness);
+		harness.queue.enqueue("items", { id: "a", boundary: true });
+
+		expect(harness.queue.drainStepBoundary().map(messageText)).toEqual(["a"]);
+		await harness.queue.flush("streaming");
+
+		expect(harness.streamingMessages).toHaveLength(0);
+		expect(built).toEqual([["a"]]);
+		expect(harness.queue.has()).toBe(false);
+	});
+
+	test("drops stale eligible entries and skips kinds without a boundary predicate", async () => {
+		const harness = createHarness(true);
+		registerBoundaryKind(harness);
+		harness.queue.register<Entry>("plain", {
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+		harness.queue.enqueue("items", { id: "gone", boundary: true, stale: true });
+		harness.queue.enqueue("plain", { id: "plain" });
+
+		expect(harness.queue.drainStepBoundary()).toEqual([]);
+		expect(harness.queue.has("items")).toBe(false);
+		expect(harness.queue.has("plain")).toBe(true);
+
+		await harness.queue.flush("streaming");
+		expect(harness.streamingMessages.map(messageText)).toEqual(["plain"]);
+	});
+
+	test("a throwing predicate keeps the entry on the before-yield path", async () => {
+		const harness = createHarness(true);
+		harness.queue.register<Entry>("items", {
+			deliverAtStepBoundary: () => {
+				throw new Error("predicate failure");
+			},
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+		harness.queue.enqueue("items", { id: "kept" });
+
+		expect(harness.queue.drainStepBoundary()).toEqual([]);
+		await harness.queue.flush("streaming");
+		expect(harness.streamingMessages.map(messageText)).toEqual(["kept"]);
+	});
+});

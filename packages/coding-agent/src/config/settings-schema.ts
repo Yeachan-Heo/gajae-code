@@ -482,7 +482,8 @@ export const SETTINGS_SCHEMA = {
 	// Single-owner session claims. The whole `session.ownership.` namespace is global-only (see
 	// settings.ts), and later sub-flags sit beside `mode`, so the mode is a leaf, not the parent.
 	// Hidden from the settings UI; operators change it with `gjc config set` or the config file.
-	// `off` makes no claim and no lock call; `observe` claims and counts and never refuses.
+	// `off` makes no claim and no lock call; `observe` claims and counts and never refuses; `enforce`
+	// also refuses to open a session another process holds.
 	"session.ownership.mode": {
 		type: "enum",
 		// Kept equal to SESSION_OWNERSHIP_MODES and DEFAULT_SESSION_OWNERSHIP_MODE (a test checks);
@@ -490,7 +491,7 @@ export const SETTINGS_SCHEMA = {
 		values: ["off", "observe", "enforce"] as const,
 		default: "observe",
 		description:
-			"Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything.",
+			"Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything, enforce refuses to open a session another process holds.",
 	},
 	"workspaceTree.mode": {
 		type: "enum",
