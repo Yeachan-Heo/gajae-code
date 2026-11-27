@@ -1416,43 +1416,53 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		expect(manager.isSessionStarred()).toBe(false);
 	});
 
-	it("a failure on the first of three queued star toggles leaves the third's value until its own outcome", async () => {
-		const place = await workspace();
-		const { file } = await committed(place);
+	it("a write failure on the first of queued star toggles leaves the last one's value, then the transcript's", async () => {
 		// No ownership here: the latched write failure keeps close() from releasing a claim.
-		SessionOwnershipTestHooks.mode = "off";
-		const manager = keep(await SessionManager.open(file, place.destination));
-		const titleWaits = Promise.withResolvers<void>();
-		let fences = 0;
-		let atFirstFailure: boolean | undefined;
-		SessionManagerTestHooks.beforeTitlePatchPersistence = () => titleWaits.promise;
-		SessionManagerTestHooks.beforePersistPatchFence = () => {
-			fences += 1;
-			if (fences === 2) throw new Error("injected write failure");
-		};
-		try {
-			const blocker = manager.setSessionName("blocker", "user");
-			const toggles: Promise<unknown>[] = [];
-			for (const starred of [true, false, true]) {
+		for (const sequence of [
+			[true, false, true],
+			[true, false],
+		]) {
+			const place = await workspace();
+			const { file } = await committed(place);
+			SessionOwnershipTestHooks.mode = "off";
+			const manager = keep(await SessionManager.open(file, place.destination));
+			const titleWaits = Promise.withResolvers<void>();
+			let fences = 0;
+			let atFirstFailure: boolean | undefined;
+			SessionManagerTestHooks.beforeTitlePatchPersistence = () => titleWaits.promise;
+			SessionManagerTestHooks.beforePersistPatchFence = () => {
+				fences += 1;
+				if (fences === 2) throw new Error("injected write failure");
+			};
+			try {
+				const blocker = manager.setSessionName("blocker", "user");
+				const toggles: Promise<unknown>[] = [];
+				for (const starred of sequence) {
+					await Bun.sleep(10);
+					const toggle = manager.setSessionStarred(starred);
+					if (toggles.length === 0)
+						toggle.catch(() => {
+							atFirstFailure = manager.isSessionStarred();
+						});
+					toggles.push(toggle);
+				}
 				await Bun.sleep(10);
-				const toggle = manager.setSessionStarred(starred);
-				if (toggles.length === 0)
-					toggle.catch(() => {
-						atFirstFailure = manager.isSessionStarred();
-					});
-				toggles.push(toggle);
+				titleWaits.resolve();
+				const outcomes = await Promise.allSettled([blocker, ...toggles]);
+				const expected: string[] = ["fulfilled", ...sequence.map(() => "rejected")];
+				expect(outcomes.map(outcome => outcome.status as string)).toEqual(expected);
+			} finally {
+				delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+				delete SessionManagerTestHooks.beforePersistPatchFence;
 			}
-			await Bun.sleep(10);
-			titleWaits.resolve();
-			const outcomes = await Promise.allSettled([blocker, ...toggles]);
-			expect(outcomes.map(outcome => outcome.status)).toEqual(["fulfilled", "rejected", "rejected", "rejected"]);
-		} finally {
-			delete SessionManagerTestHooks.beforeTitlePatchPersistence;
-			delete SessionManagerTestHooks.beforePersistPatchFence;
+			// The first's failure left the last toggle's value; every toggle failed, so memory ends where
+			// the transcript is.
+			expect({ sequence, atFirstFailure }).toEqual({ sequence, atFirstFailure: sequence.at(-1) });
+			expect({ sequence, starred: manager.isSessionStarred() }).toEqual({
+				sequence,
+				starred: (await transcriptHeader(file)).starred,
+			});
 		}
-		// The first's failure left the third's value; the failures that followed settled the rest.
-		expect(atFirstFailure).toBe(true);
-		expect(manager.isSessionStarred()).toBe((await transcriptHeader(file)).starred);
 	});
 
 	it("enforce: Fork from a refused turn continues in a copy and leaves the original to its holder", async () => {

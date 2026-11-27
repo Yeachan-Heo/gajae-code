@@ -20061,7 +20061,7 @@ export class SessionManager {
 			onPersistenceStart?: () => void;
 			onPersistenceCheck?: () => void;
 			isPersistenceOwner?: () => boolean;
-			/** On any other failure, put this patch's fields back as they were before it (setSessionStarred). */
+			/** On any other failure too, put this patch's fields back to what the transcript holds (setSessionStarred). */
 			restoreOnFailure?: boolean;
 		},
 	): Promise<void> {
@@ -20080,9 +20080,6 @@ export class SessionManager {
 		);
 		const group = (field: HeaderField) => (field === "titleSource" ? "title" : field);
 		for (const field of fields) state.lastApplied.set(group(field), token);
-		const before = fields.map(
-			field => [field, { present: header[field] !== undefined, value: header[field] }] as const,
-		);
 		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
 		// The star companion record is built at write time, from what the transcript holds then.
@@ -20102,19 +20099,15 @@ export class SessionManager {
 				() => this.#markHeaderCommitted(header, patch, fields),
 			);
 		} catch (error) {
+			// An ownership refusal (nothing written), or any failure where the caller asks: put back what
+			// the transcript holds, so no later full rewrite writes a header the transcript never received.
 			// Only fields no later patch has set since: a later patch's own write or failure settles those.
-			const owned = fields.filter(field => state.lastApplied.get(group(field)) === token);
-			// Enforce's write gate refused the patch before anything was written: put back what the
-			// transcript holds, so no later full rewrite writes a header the transcript never received.
-			if (isOwnershipWriteRefusal(error) && this.#fileEntries.includes(header)) {
+			// A failure after the append landed finds this patch's value already committed.
+			if ((isOwnershipWriteRefusal(error) || options?.restoreOnFailure) && this.#fileEntries.includes(header)) {
+				const owned = fields.filter(field => state.lastApplied.get(group(field)) === token);
 				this.#restoreHeaderFields(
 					header,
 					owned.map(field => [field, state.committed.get(field) ?? { present: false, value: undefined }] as const),
-				);
-			} else if (options?.restoreOnFailure) {
-				this.#restoreHeaderFields(
-					header,
-					before.filter(([field]) => owned.includes(field)),
 				);
 			}
 			throw error;
