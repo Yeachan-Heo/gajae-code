@@ -211,7 +211,8 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	 * Stop every iterator of this stream as if its consumer had returned early,
 	 * so `onConsumerClose` runs. An iterator parked on the next event wakes now;
 	 * one that is between events exits before yielding again. A forwarder whose
-	 * own consumer left calls this to hand the cancellation to its source.
+	 * own consumer left calls this to hand the cancellation to its source. The
+	 * close is permanent: later iterators of the same stream return immediately.
 	 */
 	closeConsumers(): void {
 		this.#consumersClosed = true;

@@ -369,6 +369,60 @@ describe("streamSimple credential attribution", () => {
 		expect(result.credentialId).toBe(3);
 		if (path === "admission") expect(admissions).toBe(1);
 	});
+
+	it("closes a callback-only replacement attempt when the consumer leaves while onAuthError is pending", async () => {
+		const started: string[] = [];
+		const cleanups: string[] = [];
+		const authResolved = Promise.withResolvers<{ apiKey: string; credentialId: number }>();
+		registerCustomApi(
+			API,
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				const apiKey = options?.apiKey ?? "";
+				started.push(apiKey);
+				if (apiKey === "first-key") return textStream("auth-error");
+				const message = assistant([""]);
+				// Ignores options.signal; cleans up only through the consumer-close hook.
+				const stream: AssistantMessageEventStream = new AssistantMessageEventStream(() => {
+					cleanups.push(apiKey);
+					setTimeout(() => {
+						message.stopReason = "aborted";
+						message.errorMessage = "Request was aborted";
+						stream.push({ type: "error", reason: "aborted", error: message });
+					}, 1);
+				});
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "text_start", contentIndex: 0, partial: message });
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		let authCalls = 0;
+		const stream = streamSimple(model(), context, {
+			apiKey: "first-key",
+			credentialId: 1,
+			onAuthError: async () => {
+				authCalls += 1;
+				return authResolved.promise;
+			},
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		// The consumer is parked on its first read while the 401 is being resolved.
+		const firstRead = iterator.next();
+		while (authCalls === 0) await Bun.sleep(0);
+		const closed = iterator.return?.();
+		authResolved.resolve({ apiKey: "second-key", credentialId: 2 });
+
+		await firstRead;
+		await closed;
+		const result = await stream.result();
+
+		expect(started).toEqual(["first-key", "second-key"]);
+		expect(cleanups).toEqual(["second-key"]);
+		expect(result.stopReason).toBe("aborted");
+	});
 });
 
 describe("streamSimple credential attribution through the Anthropic adapter", () => {
