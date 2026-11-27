@@ -38,6 +38,7 @@ import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/ha
 import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
 import {
 	AutoresearchRunsStore,
+	autoresearchRunsPaths,
 	buildAutoresearchExperimentState,
 	createAutoresearchExperimentConfig,
 	type MetricDirection,
@@ -472,6 +473,15 @@ export async function autoresearchWrite(input: {
 		...metric,
 	};
 	await persistAutoresearchMission({ cwd: input.cwd, sessionId: resolvedSessionId, mission });
+	// Create the runs.jsonl file if it doesn't exist
+	const runsPaths = autoresearchRunsPaths(input.cwd, resolvedSessionId);
+	try {
+		await fs.stat(runsPaths.runsPath);
+	} catch (error) {
+		if (isEnoent(error)) {
+			await Bun.write(runsPaths.runsPath, "");
+		}
+	}
 	let ledgerEvent: AutoresearchLedgerEvent | undefined;
 	if (existing === null) {
 		ledgerEvent = await appendAutoresearchLedger(
@@ -515,24 +525,35 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
-	// Close out the outgoing ledger first so the retired copy ends with its clear.
-	const ledgerEvent = await appendAutoresearchLedger(
-		cwd,
-		{ event: "mission_cleared", slug: existing?.slug ?? "" },
-		resolvedSessionId,
-	);
+
 	let retiredTo: string | undefined;
-	let deleted = existing !== null;
+	let deleted = false;
+	let ledgerEvent: AutoresearchLedgerEvent | undefined;
+
 	if (existing) {
+		// Close out the outgoing ledger BEFORE retiring so the retired copy ends with its clear.
+		ledgerEvent = await appendAutoresearchLedger(
+			cwd,
+			{ event: "mission_cleared", slug: existing.slug },
+			resolvedSessionId,
+		);
+		// Mission exists, retire it
 		retiredTo = await retireAutoresearchMissionArtifacts(paths, existing.slug);
+		deleted = true;
 	} else {
 		// If mission.json is missing but other artifacts remain, it means a prior clear
 		// was interrupted mid-move. Retry moving any remaining artifacts to recovery.
 		// Use a generic slug for the recovery directory since mission metadata is unavailable.
 		const hasArtifacts = await checkHasAnyArtifacts(paths);
 		if (hasArtifacts) {
+			// Append the ledger event for recovery BEFORE retiring
+			ledgerEvent = await appendAutoresearchLedger(
+				cwd,
+				{ event: "mission_cleared", slug: "recovered" },
+				resolvedSessionId,
+			);
 			retiredTo = await retireAutoresearchMissionArtifacts(paths, "recovered");
-			deleted = true; // Artifacts were recovered even though mission.json was missing
+			deleted = true;
 		}
 	}
 	await reconcileAutoresearchState(cwd, existing, resolvedSessionId, { active: false, phase: "complete" });
@@ -540,7 +561,7 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		ok: true,
 		cleared: deleted,
 		missionPath: paths.missionPath,
-		ledgerEvent,
+		...(ledgerEvent ? { ledgerEvent } : {}),
 		...(retiredTo ? { retiredTo } : {}),
 	};
 }
@@ -797,6 +818,15 @@ export async function autoresearchIntake(input: {
 		...(parsed.metricDirection === undefined ? {} : { metricDirection: parsed.metricDirection }),
 	};
 	await persistAutoresearchMission({ cwd: input.cwd, sessionId: resolvedSessionId, mission });
+	// Create the runs.jsonl file if it doesn't exist
+	const intakeRunsPaths = autoresearchRunsPaths(input.cwd, resolvedSessionId);
+	try {
+		await fs.stat(intakeRunsPaths.runsPath);
+	} catch (error) {
+		if (isEnoent(error)) {
+			await Bun.write(intakeRunsPaths.runsPath, "");
+		}
+	}
 	let ledgerEvent: AutoresearchLedgerEvent | undefined;
 	if (existing === null) {
 		ledgerEvent = await appendAutoresearchLedger(
