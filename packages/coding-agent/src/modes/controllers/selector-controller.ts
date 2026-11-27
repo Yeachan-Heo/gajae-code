@@ -2721,7 +2721,8 @@ export class SelectorController {
 		| { readonly kind: "continued"; readonly admission: SessionOwnerClaim | undefined }
 		| undefined
 	> {
-		const handover = await findSessionHandoverTarget(error, getAgentDir());
+		const agentDir = getAgentDir();
+		const handover = await findSessionHandoverTarget(error, agentDir);
 		let note: string | undefined;
 		for (;;) {
 			const { title, options } = heldSessionWarningDialog(error, { continueHere: handover !== undefined, note });
@@ -2731,7 +2732,7 @@ export class SelectorController {
 					break;
 				case "continue": {
 					if (!handover || this.ctx.isStopped?.()) return undefined;
-					const outcome = await handOverSession(handover, resolveSessionOwnership());
+					const outcome = await handOverSession(error, agentDir, resolveSessionOwnership());
 					if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
 					note = outcome.message;
 					continue;

@@ -597,7 +597,7 @@ A broker `session.resume` with no live endpoint to reuse first probes the claim,
 - under `observe`, resume goes on as before ownership. Beside an embedding such as the desktop app, it launches a host, and that host counts the conflict. A TUI started with `GJC_SDK_DISABLE=1` gets the old `endpoint_stale` answer, and no host is launched.
 - under `enforce`, resume fails with `live_session`, a message naming the holder, and `holder: { surface, pid }`, and launches nothing.
 
-If the holder lets go while the broker waits, resume goes on as before ownership: it launches a host if no live row remains, and a live generation-0 row that remains gets the old answer.
+If the holder lets go while the broker waits, resume goes on as before ownership: it launches a host if no live row remains, and a live generation-0 row that remains gets the old answer. Under `enforce` a live generation-0 row of another process is itself waited on as a holder, even with the claim free: that is a terminal taking the session over with Continue here (below).
 
 The broker reads the mode at the probe and at every poll of the wait, taking its own mode lowered by an explicit lower value in `config.yml`. So `off` set during a wait ends the wait, and `observe` set during a wait stops its refusal. The broker's own mode is cached at its first ownership read, so a raise reaches it only after a restart. A host it launches reads `config.yml` when it starts, though, so after a raise to `enforce`, a holder with no index row is still refused, through that host's claim.
 

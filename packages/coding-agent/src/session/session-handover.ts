@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex } from "../sdk/broker/session-index";
+import { resolveSessionLocator, SessionIndex, type SessionLocatorV2 } from "../sdk/broker/session-index";
 import { createBrokerSessionLifecycleService } from "../sdk/lifecycle/broker-client";
 import { attemptSessionClaim, claimRefusal, type ResolvedSessionOwnership } from "./internal/session-claim-set";
 import type { SessionHeldError, SessionOwnerClaim } from "./session-ownership";
@@ -33,6 +33,15 @@ export type SessionHandoverOutcome =
 export const SESSION_HANDOVER_BUSY_MESSAGE = "The session is running a turn; try again when it finishes.";
 
 const HANDOVER_ACTOR = { id: "gjc-continue-here", namespace: "session:handover" } as const;
+
+/** This process's generation-0 index row for the session while it takes it over. */
+interface FenceRow {
+	readonly sessionId: string;
+	readonly locator: SessionLocatorV2;
+	readonly endpointGeneration: 0;
+	readonly pid: number;
+	readonly processIncarnation?: string;
+}
 /** An idle close waits up to three bounded teardown windows (graceful, SIGTERM, SIGKILL) before it answers. */
 const HANDOVER_CLOSE_TIMEOUT_MS = 30_000;
 
@@ -78,33 +87,50 @@ export async function findSessionHandoverTarget(
  *    or work lease answers `busy`. It answers once the host process has exited.
  * 3. This process claims the session. From here the broker's resume waits on the claim until this
  *    process publishes its endpoint, so the fence row is withdrawn on every outcome.
+ *
+ * The host is looked up again on every attempt, so a retry after `busy` uses its current endpoint
+ * authority; a host that has exited meanwhile leaves only the claim to take.
  */
 export async function handOverSession(
-	target: SessionHandoverTarget,
+	error: SessionHeldError,
+	agentDir: string,
 	ownership: ResolvedSessionOwnership,
 ): Promise<SessionHandoverOutcome> {
-	const index = new SessionIndex(target.agentDir);
+	const target = await findSessionHandoverTarget(error, agentDir);
+	if (!target) return await claimHandedOver(error.sessionId, ownership);
+	const index = new SessionIndex(agentDir);
 	const incarnation = processIncarnation(process.pid);
-	const fence = {
-		sessionId: target.sessionId,
-		locator: await resolveSessionLocator(target.cwd, target.agentDir),
-		endpointGeneration: 0,
-		pid: process.pid,
-		...(incarnation ? { processIncarnation: incarnation } : {}),
-	};
-	await index.append({ type: "host_registered", ...fence });
+	let fence: FenceRow | undefined;
 	try {
-		const refused = await closeIdleHost(target);
-		if (refused) return refused;
-		const attempt = await attemptSessionClaim(ownership, target.sessionId);
-		const refusal = claimRefusal(ownership, target.sessionId, attempt);
-		if (refusal) return { kind: "refused", message: refusal.operatorMessage };
-		return { kind: "closed", claim: attempt.status === "claimed" ? attempt.claim : undefined };
+		const row: FenceRow = {
+			sessionId: target.sessionId,
+			locator: await resolveSessionLocator(target.cwd, agentDir),
+			endpointGeneration: 0,
+			pid: process.pid,
+			...(incarnation ? { processIncarnation: incarnation } : {}),
+		};
+		await index.append({ type: "host_registered", ...row });
+		fence = row;
+		return (await closeIdleHost(target)) ?? (await claimHandedOver(target.sessionId, ownership));
+	} catch (failure) {
+		logger.warn("Continue here could not fence the session handover", { error: String(failure) });
+		return { kind: "refused", message: "The session index could not be updated to hand the session over." };
 	} finally {
-		await index.append({ type: "host_unregistered", ...fence }).catch(failure => {
-			logger.warn("Could not withdraw the Continue here fence row", { error: String(failure) });
-		});
+		if (fence)
+			await index.append({ type: "host_unregistered", ...fence }).catch(failure => {
+				logger.warn("Could not withdraw the Continue here fence row", { error: String(failure) });
+			});
 	}
+}
+
+async function claimHandedOver(
+	sessionId: string,
+	ownership: ResolvedSessionOwnership,
+): Promise<SessionHandoverOutcome> {
+	const attempt = await attemptSessionClaim(ownership, sessionId);
+	const refusal = claimRefusal(ownership, sessionId, attempt);
+	if (refusal) return { kind: "refused", message: refusal.operatorMessage };
+	return { kind: "closed", claim: attempt.status === "claimed" ? attempt.claim : undefined };
 }
 
 async function closeIdleHost(target: SessionHandoverTarget): Promise<SessionHandoverOutcome | undefined> {

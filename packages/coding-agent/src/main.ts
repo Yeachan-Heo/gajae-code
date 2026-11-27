@@ -1557,7 +1557,8 @@ export async function createSessionManager(
 		): Promise<HeldStartupResolution | undefined> => {
 			const refusal = await probe;
 			if (!refusal) return undefined;
-			const handover = await findSessionHandoverTarget(refusal, activeSettings.getAgentDir());
+			const agentDir = activeSettings.getAgentDir();
+			const handover = await findSessionHandoverTarget(refusal, agentDir);
 			let note: string | undefined;
 			for (;;) {
 				const choice = await held.choose(refusal, { continueHere: handover !== undefined, note });
@@ -1566,7 +1567,7 @@ export async function createSessionManager(
 						break;
 					case "continue": {
 						if (!handover) continue;
-						const outcome = await handOverSession(handover, resolveSessionOwnership(ownership));
+						const outcome = await handOverSession(refusal, agentDir, resolveSessionOwnership(ownership));
 						if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
 						note = outcome.message;
 						continue;
@@ -2365,10 +2366,9 @@ export async function runRootCommand(
 			check: async (session: SessionInfo): Promise<HeldSession | undefined> => {
 				const error = await SessionManager.probeHeldTranscript(session.path, heldOwnership);
 				if (!error) return undefined;
-				const target = await findSessionHandoverTarget(error, handoverAgentDir);
-				if (!target) return { error };
+				if (!(await findSessionHandoverTarget(error, handoverAgentDir))) return { error };
 				const handOver = async (): Promise<SessionHandoverOutcome> => {
-					const outcome = await handOverSession(target, heldOwnership);
+					const outcome = await handOverSession(error, handoverAgentDir, heldOwnership);
 					if (outcome.kind === "closed") {
 						handoverAdmission?.release();
 						handoverAdmission = outcome.claim;
