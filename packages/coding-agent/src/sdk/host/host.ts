@@ -11,6 +11,7 @@ import { redactBrokerRuntimeCapabilities, redactObservedRequestContent } from ".
 import { type EventFrame, type EventReplayGap, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
 import { RESPONSE_CEILING_BYTES } from "./query/handlers";
+import { awaitHostRegistrationTestHold } from "./registration-test-hold";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
@@ -607,6 +608,10 @@ export class SessionSdkHost {
 	}
 
 	async registerWithBroker(writer: BrokerIndexWriter): Promise<void> {
+		// Test-only and inert (nothing awaited) unless the operator's environment sets it. A host
+		// stopped during the hold has `#started` false, so it publishes nothing below.
+		const testHold = awaitHostRegistrationTestHold(this.#options.sessionId);
+		if (testHold) await testHold;
 		this.#registration = { writer, generation: this.events.generation };
 		if (this.#started) await this.#publishRegistration(writer);
 		if (this.#started)

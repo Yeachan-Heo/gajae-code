@@ -118,7 +118,6 @@ import {
 	type SessionIndexEvent,
 } from "../broker/session-index";
 import {
-	awaitHostRegistrationTestHold,
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
 	masterAttestationForEffectiveHost,
@@ -9909,8 +9908,6 @@ export function createNotificationsExtension(
 						pid: process.pid,
 						processIncarnation: hostProcessIncarnation,
 					});
-					throwIfLifecycleStopped();
-					await awaitHostRegistrationTestHold(id);
 					throwIfLifecycleStopped();
 					let registration: SessionIndexEvent | undefined;
 					await host.registerWithBroker({
