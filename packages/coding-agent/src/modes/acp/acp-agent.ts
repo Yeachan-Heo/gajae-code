@@ -4725,8 +4725,9 @@ export class AcpAgent implements Agent {
 			if (current) void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		} catch (attachError) {
 			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${String(attachError)}`);
-			// A close that ran meanwhile now owns the session: it is not a recovery failure.
-			if (this.#sessionEpoch(id) !== epoch) return;
+			// A close, delete or disposal that started meanwhile now owns the session: it is not a
+			// recovery failure. Same predicate as the in-place re-attach's `closing`.
+			if (this.#disposed || this.#tearingDown.has(id) || this.#sessionEpoch(id) !== epoch) return;
 			await this.#reportReattachFailed(id, cwd, attachError);
 		}
 	}
