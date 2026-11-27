@@ -11,6 +11,7 @@ import { isCompiledBinary } from "@gajae-code/utils/env";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { parseLinuxProcParentPid, parseLinuxProcStartTime, parseLinuxProcState } from "../gjc-runtime/linux-proc";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { isReleasedSession, openSessionIdReader, type ReleasedSession } from "./bash-shell-release";
 import { fatalCatchableSignals, signalExitCode } from "./bash-shell-signals";
 import {
 	BASH_SHELL_RUNTIME_ARG,
@@ -60,8 +61,15 @@ function enableLinuxChildSubreaper(): void {
 	} catch {}
 }
 
-async function reapLinuxSubreaperChildren(): Promise<void> {
+async function reapLinuxSubreaperChildren(releasedSessions: ReadonlyMap<number, ReleasedSession>): Promise<void> {
 	if (process.platform !== "linux") return;
+	const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
+	// Without a session reader a released session cannot be recognized, so every
+	// adopted child is reaped (fail closed).
+	const sessionReader = releasedSessions.size > 0 ? openSessionIdReader() : undefined;
+	const isReleased = (pid: number): boolean =>
+		sessionReader !== undefined &&
+		isReleasedSession(sessionReader.sessionIdOf(pid), releasedSessions, sessionId => Process.observe(sessionId));
 	for (let wave = 0; wave < 3; wave++) {
 		await Bun.sleep(wave === 0 ? 5 : 25);
 		let entries: string[];
@@ -86,12 +94,13 @@ async function reapLinuxSubreaperChildren(): Promise<void> {
 				const current = await Bun.file(`/proc/${pid}/stat`).text();
 				if (parseLinuxProcStartTime(current) !== startTime || parseLinuxProcParentPid(current) !== process.pid)
 					continue;
-				const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
+				if (isReleased(pid)) continue;
 				const owned = Process.fromPid(pid);
 				if (owned?.incarnation === `linux:${startTime}`) owned.killTree(9);
 			} catch {}
 		}
 	}
+	sessionReader?.close();
 }
 
 async function reapLinuxAdoptedZombies(excludedPid: number | undefined): Promise<void> {
@@ -277,6 +286,7 @@ export async function runBashShellSupervisor(): Promise<void> {
 	let terminating = false;
 	let protocolToken: string | undefined;
 	let ownershipLedgerPath: string | undefined;
+	let releasedSessions = new Map<number, ReleasedSession>();
 
 	const terminateRuntime = (): void => {
 		if (terminating) return;
@@ -294,6 +304,11 @@ export async function runBashShellSupervisor(): Promise<void> {
 			if (!request.token || request.token !== protocolToken) return;
 			if (request.type === "run") pendingRuns.push(request.id);
 		} catch {
+			return;
+		}
+		if (request.type === "release") {
+			// The guardian resolved these sessions; the runtime has no part in release.
+			releasedSessions = new Map((request.sessions ?? []).map(session => [session.id, session]));
 			return;
 		}
 		if (request.type === "init" && request.ownershipLedger && worker.pid) {
@@ -379,7 +394,7 @@ export async function runBashShellSupervisor(): Promise<void> {
 		stopZombieReaper();
 		const resultSignal = signalFromExit(code, signal);
 		if (code === 0 && resultSignal === null) {
-			await reapLinuxSubreaperChildren();
+			await reapLinuxSubreaperChildren(releasedSessions);
 			// The runtime has already flushed its final protocol response and its
 			// reparented descendants have been reaped. Let the live guardian retire
 			// the remaining owned process group without any stale post-exit PGID use.
@@ -412,7 +427,7 @@ export async function runBashShellSupervisor(): Promise<void> {
 			message: `Shell runtime exited with ${resultSignal ?? `code ${code ?? "unknown"}`}.`,
 		} satisfies BashShellWorkerResponse;
 		process.stdout.write(`${JSON.stringify(retiring)}\n`);
-		await reapLinuxSubreaperChildren();
+		await reapLinuxSubreaperChildren(releasedSessions);
 		process.exit(1);
 	});
 

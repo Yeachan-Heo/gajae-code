@@ -116,6 +116,11 @@ Direct SDK `AgentSession.executeBash()` also captures its minimized-original pub
 - Background work / cancellation
   - Async and auto-background jobs continue after the initial tool return.
   - Cancellation aborts the native run; Escape and `job cancel` kill a PTY, while overlay disposal alone is non-owning for folded work.
+  - Processes a command leaves running when its shell closes (`packages/coding-agent/src/exec/bash-shell-guardian.ts`):
+    - After the command completes normally, every session it detached into with `setsid()` is released and keeps running (for example `git gc --auto` with `gc.autoDetach`). `IsolatedShell` sends a `release` record; the guardian resolves the sessions and the supervisor honors them (`packages/coding-agent/src/exec/bash-shell-release.ts`).
+    - Background jobs that stay in the shell's session (`cmd &`, `nohup cmd &`) are killed.
+    - A cancelled, timed-out, or signal-killed command releases nothing, so everything it started is killed, including detached sessions. On macOS the published shared SDK broker is the one exception.
+    - A process that a released process later moves into yet another new session is not released.
 
 ## Limits & Caps
 - Default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`).

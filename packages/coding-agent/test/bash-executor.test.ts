@@ -23,6 +23,7 @@ import {
 	parseOwnershipRecord,
 	retainOwnedProcess,
 } from "@gajae-code/coding-agent/exec/bash-shell-guardian";
+import { isReleasedSession, type ReleasedSession } from "@gajae-code/coding-agent/exec/bash-shell-release";
 import {
 	createUtf8LineDecoder,
 	parseAuthenticatedWorkerResponse,
@@ -34,6 +35,7 @@ import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
 import { $ } from "bun";
 import { safeRmSync } from "../../../scripts/safe-cleanup";
+import { parseLinuxProcState } from "../src/gjc-runtime/linux-proc";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 
 const BACKGROUND_COMPLETION_RACE_MS = 750;
@@ -159,6 +161,24 @@ describe("executeBash", () => {
 		const result = extendOwnedDarwinAncestry(known, candidates);
 		expect(result).toEqual([42, 43]);
 		expect(known).toEqual(new Set([100n, 500n, 600n]));
+	});
+
+	it("recognizes a released session only while its leader is gone or the same incarnation", () => {
+		const released = new Map<number, ReleasedSession>([
+			[700, { id: 700, leaderIncarnation: "leader-a" }],
+			[800, { id: 800, leaderIncarnation: null }],
+		]);
+		const present = (incarnation: string) => () => ({ status: "present" as const, incarnation });
+		const absent = () => ({ status: "absent" as const });
+		const unknown = () => ({ status: "unknown" as const });
+		expect(isReleasedSession(700, released, present("leader-a"))).toBe(true);
+		expect(isReleasedSession(700, released, absent)).toBe(true);
+		// A different leader incarnation is a new session on a reused pid.
+		expect(isReleasedSession(700, released, present("leader-b"))).toBe(false);
+		expect(isReleasedSession(700, released, unknown)).toBe(false);
+		expect(isReleasedSession(800, released, absent)).toBe(true);
+		expect(isReleasedSession(800, released, present("leader-c"))).toBe(false);
+		expect(isReleasedSession(900, released, absent)).toBe(false);
 	});
 	let tempDir: string;
 
@@ -1214,7 +1234,10 @@ describe("executeBash", () => {
 		}
 	});
 
-	it("spares the published SDK broker and its session hosts but reaps other detached descendants (#7998)", async () => {
+	// A normally completed run releases every session it detached into, so the broker
+	// identity rule only decides anything for a run that is cancelled (#7998's
+	// cancelled watcher job).
+	it("spares the published SDK broker and its session hosts but reaps other detached descendants of a cancelled run (#7998)", async () => {
 		if (process.platform !== "darwin") return;
 		const agentDir = path.join(tempDir, "agent");
 		const brokerFile = path.join(tempDir, "broker.pid");
@@ -1235,6 +1258,8 @@ describe("executeBash", () => {
 			`python3 -c ${$.escape(daemon(brokerFile, hostFile))} ${brokerArgs} </dev/null >/dev/null 2>&1 &`,
 			`python3 -c ${$.escape(daemon(strayFile))} </dev/null >/dev/null 2>&1 &`,
 			`while [ ! -s ${$.escape(discoveryFile)} ] || [ ! -s ${$.escape(hostFile)} ] || [ ! -s ${$.escape(strayFile)} ]; do sleep 0.01; done`,
+			`touch ${$.escape(path.join(tempDir, "ready"))}`,
+			"sleep 30",
 		].join("\n");
 		const readPid = async (file: string): Promise<number> => {
 			for (let attempt = 0; attempt < 500; attempt++) {
@@ -1254,8 +1279,9 @@ describe("executeBash", () => {
 		};
 		const shell = new IsolatedShell();
 		const survivors: number[] = [];
+		const controller = new AbortController();
 		try {
-			const run = shell.run({ command, cwd: tempDir, timeoutMs: 10_000 });
+			const run = shell.run({ command, cwd: tempDir, timeoutMs: 10_000, signal: controller.signal });
 			const brokerPid = await readPid(brokerFile);
 			survivors.push(brokerPid);
 			const incarnation = processIncarnation(brokerPid);
@@ -1275,7 +1301,9 @@ describe("executeBash", () => {
 					heartbeatAt: Date.now(),
 				}),
 			);
-			expect(await run).toMatchObject({ exitCode: 0, cancelled: false });
+			while (!fs.existsSync(path.join(tempDir, "ready"))) await Bun.sleep(10);
+			controller.abort();
+			expect(await run).toMatchObject({ cancelled: true });
 			const hostPid = await readPid(hostFile);
 			survivors.push(hostPid);
 			const strayPid = await readPid(strayFile);
@@ -1303,7 +1331,7 @@ describe("executeBash", () => {
 		}
 	});
 
-	it("reaps a broker-shaped descendant that is not the published broker (#7998)", async () => {
+	it("reaps a broker-shaped descendant of a cancelled run that is not the published broker (#7998)", async () => {
 		if (process.platform !== "darwin") return;
 		const agentDir = path.join(tempDir, "agent");
 		const brokerFile = path.join(tempDir, "impostor.pid");
@@ -1326,14 +1354,18 @@ describe("executeBash", () => {
 		);
 		const code = `import os,time\nif os.fork(): os._exit(0)\nos.setsid()\nos.closerange(3, 256)\nopen(${JSON.stringify(brokerFile)}, "w").write(str(os.getpid()))\ntime.sleep(60)\n`;
 		const shell = new IsolatedShell();
+		const controller = new AbortController();
 		let impostorPid: number | undefined;
 		try {
-			const result = await shell.run({
-				command: `python3 -c ${$.escape(code)} sdk broker-internal --agent-dir ${$.escape(agentDir)} </dev/null >/dev/null 2>&1 &\nwhile [ ! -s ${$.escape(brokerFile)} ]; do sleep 0.01; done`,
+			const run = shell.run({
+				command: `python3 -c ${$.escape(code)} sdk broker-internal --agent-dir ${$.escape(agentDir)} </dev/null >/dev/null 2>&1 &\nwhile [ ! -s ${$.escape(brokerFile)} ]; do sleep 0.01; done\nsleep 30`,
 				cwd: tempDir,
 				timeoutMs: 10_000,
+				signal: controller.signal,
 			});
-			expect(result).toMatchObject({ exitCode: 0, cancelled: false });
+			while (!fs.existsSync(brokerFile) || fs.statSync(brokerFile).size === 0) await Bun.sleep(10);
+			controller.abort();
+			expect(await run).toMatchObject({ cancelled: true });
 			impostorPid = Number.parseInt(fs.readFileSync(brokerFile, "utf8"), 10);
 			await shell.close();
 			let alive = true;
@@ -1591,6 +1623,141 @@ describe("executeBash", () => {
 		expect(pid).toBeGreaterThan(0);
 		expect(() => process.kill(pid, 0)).not.toThrow();
 		expect(() => process.kill(pid, "SIGKILL")).not.toThrow();
+	});
+
+	describe("sessions a command detaches into", () => {
+		// Mirrors `git commit` -> `git gc --auto` -> detached repack: the middle process
+		// works for DETACH_DELAY_SECONDS (longer than the guardian's 100ms ownership
+		// scan, so it is always tracked), then forks a `setsid()` daemon and exits.
+		const DETACH_DELAY_SECONDS = "0.3";
+		const DAEMONIZE_SCRIPT = [
+			"import os, sys, time",
+			"pid_file, delay = sys.argv[1], float(sys.argv[2])",
+			"if os.fork() == 0:",
+			"    time.sleep(delay)",
+			"    if os.fork() == 0:",
+			"        os.setsid()",
+			"        open(pid_file + '.tmp', 'w').write(str(os.getpid()))",
+			"        os.rename(pid_file + '.tmp', pid_file)",
+			"        time.sleep(30)",
+			"        os._exit(0)",
+			"    while not os.path.exists(pid_file):",
+			"        time.sleep(0.01)",
+			"    os._exit(0)",
+			"os.wait()",
+		].join("\n");
+		const daemonized: number[] = [];
+
+		const daemonizeCommand = (pidFile: string): string => {
+			const script = path.join(tempDir, "daemonize.py");
+			fs.writeFileSync(script, DAEMONIZE_SCRIPT);
+			return `python3 ${JSON.stringify(script)} ${JSON.stringify(pidFile)} ${DETACH_DELAY_SECONDS}`;
+		};
+		const readDaemonPid = (pidFile: string): number => {
+			const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8"), 10);
+			daemonized.push(pid);
+			return pid;
+		};
+		// A killed daemon can linger as a zombie until its reaper collects it; that is dead.
+		const isAlive = (pid: number): boolean => {
+			try {
+				process.kill(pid, 0);
+			} catch {
+				return false;
+			}
+			if (process.platform !== "linux") return true;
+			try {
+				return parseLinuxProcState(fs.readFileSync(`/proc/${pid}/stat`, "utf8")) !== "Z";
+			} catch {
+				return false;
+			}
+		};
+		const waitForExit = async (pid: number): Promise<boolean> => {
+			for (let attempt = 0; attempt < 150 && isAlive(pid); attempt++) await Bun.sleep(20);
+			return !isAlive(pid);
+		};
+
+		afterEach(() => {
+			for (const pid of daemonized.splice(0)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+		});
+
+		it("keeps a session a normally completed one-shot command detached into", async () => {
+			if (process.platform === "win32") return;
+			const pidFile = path.join(tempDir, "one-shot-daemon.pid");
+			const result = await executeBash(daemonizeCommand(pidFile), { cwd: tempDir, timeout: 10_000, oneShot: true });
+			expect(result).toMatchObject({ exitCode: 0, cancelled: false });
+			const daemon = readDaemonPid(pidFile);
+			// executeBash awaits the one-shot shell's close, so its cleanup has already run.
+			await Bun.sleep(300);
+			expect(isAlive(daemon)).toBe(true);
+		}, 20_000);
+
+		it("keeps a released session through persistent shell disposal", async () => {
+			if (process.platform === "win32") return;
+			const pidFile = path.join(tempDir, "persistent-daemon.pid");
+			const result = await executeBash(daemonizeCommand(pidFile), {
+				cwd: tempDir,
+				timeout: 10_000,
+				sessionKey: "released-session-dispose",
+			});
+			expect(result).toMatchObject({ exitCode: 0, cancelled: false });
+			const daemon = readDaemonPid(pidFile);
+			await disposeAllShellSessions();
+			await Bun.sleep(300);
+			expect(isAlive(daemon)).toBe(true);
+		}, 20_000);
+
+		it("keeps a released session when a later command kills the shell runtime", async () => {
+			if (process.platform === "win32") return;
+			const pidFile = path.join(tempDir, "runtime-death-daemon.pid");
+			const shell = new IsolatedShell();
+			try {
+				expect(
+					await shell.run({ command: daemonizeCommand(pidFile), cwd: tempDir, timeoutMs: 10_000 }),
+				).toMatchObject({
+					exitCode: 0,
+					cancelled: false,
+				});
+				const daemon = readDaemonPid(pidFile);
+				// The runtime dying makes the supervisor reap everything it adopted.
+				const killed = await shell.run({ command: "kill -KILL $$", cwd: tempDir, timeoutMs: 10_000 });
+				expect(killed.signal).toBe("SIGKILL");
+				await shell.close();
+				await Bun.sleep(300);
+				expect(isAlive(daemon)).toBe(true);
+			} finally {
+				await shell.close();
+			}
+		}, 20_000);
+
+		it("reaps a detached session when the command times out", async () => {
+			if (process.platform === "win32") return;
+			const pidFile = path.join(tempDir, "timeout-daemon.pid");
+			const result = await executeBash(`${daemonizeCommand(pidFile)}; sleep 30`, {
+				cwd: tempDir,
+				timeout: 2_000,
+				oneShot: true,
+			});
+			expect(result.cancelled).toBe(true);
+			expect(await waitForExit(readDaemonPid(pidFile))).toBe(true);
+		}, 20_000);
+
+		it("reaps a background job that stayed in the shell session", async () => {
+			if (process.platform === "win32") return;
+			const result = await executeBash('python3 -c "import time; time.sleep(30)" & echo $!', {
+				cwd: tempDir,
+				timeout: 5_000,
+				oneShot: true,
+			});
+			const job = Number.parseInt(result.output.trim(), 10);
+			daemonized.push(job);
+			expect(job).toBeGreaterThan(0);
+			expect(await waitForExit(job)).toBe(true);
+		}, 20_000);
 	});
 
 	it("times out commands", async () => {
