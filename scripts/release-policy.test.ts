@@ -7,6 +7,7 @@ const repoRoot = path.join(import.meta.dir, "..");
 const ciWorkflowPath = path.join(repoRoot, ".github/workflows/ci.yml");
 const publicSiteWorkflowPath = path.join(repoRoot, ".github/workflows/public-site-sync.yml");
 const releaseScriptPath = path.join(repoRoot, "scripts/release.ts");
+const releaseSimplifiedPath = path.join(repoRoot, "scripts/release-simplified.ts");
 
 async function workflow(): Promise<string> {
 	return Bun.file(ciWorkflowPath).text();
@@ -454,6 +455,17 @@ describe("stable release policy", () => {
 		expect(releaseScript).toContain("corrections require a newer version");
 		expect(releaseScript).toContain("Keep the published tag immutable; do not retag, delete, or force-push it.");
 		expect(releaseScript).not.toMatch(/git tag -f|git push origin v\$\{version\} --force/u);
+	});
+
+	// #8004 deleted the stray release-simplified entrypoint, which hardcoded a
+	// stale version and committed before checking for an existing tag. A backmerge
+	// resurrected it, so pin both the removal and the canonical wiring.
+	test("keeps the deleted release-simplified entrypoint gone and the release script canonical", async () => {
+		expect(await Bun.file(releaseSimplifiedPath).exists()).toBe(false);
+		const pkg = JSON.parse(await Bun.file(path.join(repoRoot, "package.json")).text()) as {
+			scripts?: Record<string, string>;
+		};
+		expect(pkg.scripts?.release).toBe("bun scripts/release.ts");
 	});
 
 	// #4257 regression: a merge that resolves package.json conflicts with a
