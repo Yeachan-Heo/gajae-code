@@ -165,22 +165,42 @@ export function sessionOwnershipOverrideWasRead(): boolean {
 	return cachedOverride !== undefined;
 }
 
-let settingSource: (() => unknown) | undefined;
+/** `fresh` asks for the value on disk now, past any cache, where the source has one. */
+export type SessionOwnershipSettingSource = (options?: { readonly fresh?: boolean }) => unknown;
+
+let settingSource: SessionOwnershipSettingSource | undefined;
 
 /**
  * Settings supplies the operator's global `session.ownership.mode` value: the process settings, or,
  * before `Settings.init`, the agent directory's config file. Without a source the default applies.
  */
-export function setSessionOwnershipSettingSource(source: (() => unknown) | undefined): void {
+export function setSessionOwnershipSettingSource(source: SessionOwnershipSettingSource | undefined): void {
 	settingSource = source;
 }
 
-function readSettingSource(): unknown {
+function readSettingSource(options?: { readonly fresh?: boolean }): unknown {
 	try {
-		return settingSource?.();
+		return settingSource?.(options);
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * The mode as the operator has it now, for a refusal decision (5a). A refusal needs `enforce` both
+ * here and in the mode its factory read, so this can only lower a decision: `gjc config set
+ * session.ownership.mode off` reaches a running process's next refusal. It rereads the operator's
+ * config file. Only an explicit lower value lowers it: a file that names no mode, or cannot be read
+ * (the source then reports no value), leaves the factory's decision as it was, and so does the
+ * environment override unless it lowers.
+ */
+export function liveSessionOwnershipMode(): SessionOwnershipMode {
+	const forced = sessionOwnershipTestHookSlot().mode;
+	if (forced !== undefined) return forced;
+	const configured = parseMode(readSettingSource({ fresh: true })) ?? "enforce";
+	if (configured === "off") return "off";
+	cachedOverride ??= readOverride();
+	return resolveSessionOwnershipMode(configured, cachedOverride.value);
 }
 
 /**

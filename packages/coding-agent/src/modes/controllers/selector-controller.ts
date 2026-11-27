@@ -82,8 +82,10 @@ import {
 	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
+import { SessionHeldError, sessionHeldForkCommand } from "../../session/session-ownership";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -2413,7 +2415,11 @@ export class SelectorController {
 					// unhandled rejection that can kill the process. Do not auto-retry.
 					done();
 					void this.handleResumeSession(sessionPath).catch(error => {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						// A refusal (a session open in another process, under enforce) carries operator text.
+						// `/fork` here would fork the current session, so name the command that copies this one.
+						const fork = error instanceof SessionHeldError ? sessionHeldForkCommand(error.sessionId) : undefined;
+						const message = operatorErrorMessage(error, String(error));
+						this.ctx.showError(fork ? `${message} To continue it in a copy, quit and run: ${fork}` : message);
 					});
 				},
 				() => {
