@@ -85,11 +85,11 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		return ends;
 	}
 
-	function stubCompact(usageLimited: (apiKey: string, firstKey: string) => boolean) {
+	function stubCompact(usageLimited: (apiKey: string, firstKey: string) => boolean, errorMessage = USAGE_LIMIT) {
 		let firstKey: string | undefined;
 		return vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model, apiKey) => {
 			firstKey ??= apiKey;
-			if (usageLimited(apiKey, firstKey)) throw new Error(USAGE_LIMIT);
+			if (usageLimited(apiKey, firstKey)) throw new Error(errorMessage);
 			return {
 				summary: `summary via ${apiKey}`,
 				shortSummary: "short",
@@ -117,6 +117,24 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 		expect(ends).toHaveLength(1);
 		expect(ends[0]?.errorMessage).toBeUndefined();
 		expect(ends[0]?.result).toBeDefined();
+	});
+
+	it("rotates off an account the provider gates with a per-model credits_required 429", async () => {
+		session = createSession();
+		const ends = collectCompactionEnds(session);
+		// Observed live: retrying the same account three times never succeeded.
+		const compactSpy = stubCompact(
+			(apiKey, firstKey) => apiKey === firstKey,
+			'Summarization failed: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for this model.","details":{"error_code":"credits_required","disabled_reason":"org_level_disabled"}}}',
+		);
+
+		await session.runIdleCompaction();
+
+		const keys = compactSpy.mock.calls.map(call => call[2]);
+		expect(keys).toHaveLength(2);
+		expect(keys[1]).not.toBe(keys[0]);
+		expect(ends).toHaveLength(1);
+		expect(ends[0]?.errorMessage).toBeUndefined();
 	});
 
 	it("rotates to a credential inserted while the failed row is being marked", async () => {

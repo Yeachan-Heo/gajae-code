@@ -1027,6 +1027,37 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
 	});
 
+	it("surfaces a per-model credits_required 429 without retrying the same account", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "rate_limit_error",
+						message: "Usage credits are required for this model.",
+						details: { error_code: "credits_required", disabled_reason: "org_level_disabled" },
+					},
+				}),
+				{ status: 429, headers: { "content-type": "application/json" } },
+			);
+		}) as FetchImpl;
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("credits_required");
+	});
+
 	it("disables Anthropic SDK retries for a large custom request with a first-event ceiling", async () => {
 		let attempts = 0;
 		const fetchMock = (async () => {
