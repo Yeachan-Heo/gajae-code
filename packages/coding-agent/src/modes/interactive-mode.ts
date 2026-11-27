@@ -2797,12 +2797,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * warning, through `/resume`'s flow for this session's own file, with Fork and Cancel only.
 	 */
 	handleRefusedSessionTurn(error: SessionHeldError | SessionOwnershipError, input: SubmittedUserInput): void {
-		const restored = !input.customType && input.text.length > 0;
+		const restored = !input.customType && (input.text.length > 0 || (input.images?.length ?? 0) > 0);
 		if (restored) {
 			this.rebuildChatFromMessages("reconcile-same-transcript");
 			const typed = this.editor.getText();
-			this.editor.setText(typed.length === 0 ? input.text : `${typed}\n${input.text}`);
+			if (input.text.length > 0) this.editor.setText(typed.length === 0 ? input.text : `${typed}\n${input.text}`);
 			if (input.images?.length) this.pendingImages = [...this.pendingImages, ...input.images];
+			this.updateEditorChrome();
+			this.ui.requestRender();
 		}
 		const sessionFile = this.sessionManager.getSessionFile();
 		if (
