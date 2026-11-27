@@ -641,9 +641,13 @@ describe("dormant", () => {
 		};
 		expect(manifest.exports["./session/session-ownership"]).toBeNull();
 		expect(manifest.exports["./session/session-ownership.js"]).toBeNull();
+		expect(manifest.exports["./session/session-owner-holder"]).toBeNull();
+		expect(manifest.exports["./session/session-owner-holder.js"]).toBeNull();
 		for (const specifier of [
 			"@gajae-code/coding-agent/session/session-ownership",
 			"@gajae-code/coding-agent/session/session-ownership.js",
+			"@gajae-code/coding-agent/session/session-owner-holder",
+			"@gajae-code/coding-agent/session/session-owner-holder.js",
 		]) {
 			expect(() => Bun.resolveSync(specifier, import.meta.dir)).toThrow();
 		}
