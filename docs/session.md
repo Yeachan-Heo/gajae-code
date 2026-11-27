@@ -624,7 +624,14 @@ Under `enforce`, a session open for writing in another process is refused before
 
 A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. A lock timeout (a stalled network filesystem, for example) skips that one claim only: the next claim tries again.
 
-A session whose claim was not taken when it opened (another process held it, or the lock timed out or failed) is claimed again when a turn starts, before the turn writes anything, so a terminal that opened a session its holder later let go of becomes the session's owner at its next prompt. The re-attempt backs off: at most once every 5 seconds for a held session, and from 10 seconds doubling to 5 minutes after a timeout or failure. Under `observe` the turn always runs, claimed or not. Under `enforce`, a held session is checked at every turn: if another process now holds it, the turn is not started and nothing is written, the holder keeps the session, and the TUI shows the held-session warning (Fork, Continue here for a broker-launched holder, or Cancel, which keeps the unsent message in the editor), while `-p` and the SDK get `SessionHeldError`. A re-attempt that times out under `enforce` lets that turn run without a claim and shows a warning. Subagent sessions never claim. With `off`, nothing is re-attempted.
+A session whose claim was not taken when it opened (another process held it, or the lock timed out or failed) is claimed again when a turn starts, so a terminal that opened a session its holder later let go of becomes the session's owner at a later prompt. The re-attempt backs off from the open: at most once every 5 seconds for a held session, and from 10 seconds doubling to 5 minutes after a timeout or failure. A re-attempt that finds the same outcome again is not counted again. Under `observe` the re-attempt runs beside the turn and the turn never waits for it. Under `enforce`, the turn waits for it, and a held or failed claim is re-attempted at every turn:
+
+- If another process now holds the session, the turn is not started and the holder keeps the session. The TUI shows the held-session warning with **Fork** and **Cancel**, and the unsent message goes back to the editor. `-p` and the SDK get `SessionHeldError`, and a session host or ACP client gets the operator message with the generic `internal` code.
+- From then on, every other write to that session from this process is refused with `SessionHeldError` before it is written: a title, a rename, a compaction, an extension's entry or an SDK append. A switch, fork or new session still works, and a later turn re-attempts the claim.
+- A claim that fails (an owners-directory error) refuses the turn, as at open.
+- A re-attempt that times out lets that turn run without a claim and shows a warning.
+
+Subagent sessions never claim. With `off`, nothing is re-attempted.
 
 Operator notes:
 
