@@ -29,6 +29,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	#activeConsumerCount = 0;
 	done = false;
 	#failed = false;
+	#consumersClosed = false;
 	#error: unknown = undefined;
 	finalResultPromise: Promise<R>;
 	resolveFinalResult!: (result: R) => void;
@@ -206,6 +207,17 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		}
 	}
 
+	/**
+	 * Stop every iterator of this stream as if its consumer had returned early,
+	 * so `onConsumerClose` runs. An iterator parked on the next event wakes now;
+	 * one that is between events exits before yielding again. A forwarder whose
+	 * own consumer left calls this to hand the cancellation to its source.
+	 */
+	closeConsumers(): void {
+		this.#consumersClosed = true;
+		this.endWaiting();
+	}
+
 	fail(err: unknown): void {
 		if (this.done) return;
 		this.done = true;
@@ -224,6 +236,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		this.#activeConsumerCount += 1;
 		try {
 			while (true) {
+				if (this.#consumersClosed) return;
 				const node = this.#dequeueEvent();
 				if (node !== undefined) {
 					yield node.event;

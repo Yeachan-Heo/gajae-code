@@ -417,7 +417,8 @@ function pipeAssistantStream(
 	inner: AssistantMessageEventStream,
 	signal?: AbortSignal,
 	onStreamCreated?: () => void,
-): void {
+): () => void {
+	const iteration = closableIteration(inner);
 	void (async () => {
 		try {
 			let admitted = false;
@@ -426,7 +427,8 @@ function pipeAssistantStream(
 				admitted = true;
 				onStreamCreated?.();
 			};
-			for await (const event of inner) {
+			for await (const event of iteration.events) {
+				if (iteration.isClosed()) break;
 				if (event.type !== "start") markAdmission();
 				outer.push(event);
 				// The inner provider stream owns abort semantics (it receives the
@@ -438,11 +440,42 @@ function pipeAssistantStream(
 					return;
 				}
 			}
+			// A closed consumer still gets a settled result: the provider ends
+			// its stream once its cleanup runs, exactly as without the close.
+			if (iteration.isClosed()) markAdmission();
 			if (!outer.done) outer.end(await inner.result());
 		} catch (error) {
 			outer.fail(error);
 		}
 	})();
+	return iteration.close;
+}
+
+interface ClosableIteration {
+	events: AssistantMessageEventStream;
+	isClosed(): boolean;
+	close(): void;
+}
+
+/**
+ * Iterate a provider stream on behalf of an outer stream's consumer.
+ *
+ * `close()` stops the iteration even while it is parked waiting for the next
+ * event and runs the inner stream's own `onConsumerClose` cleanup. Aborting the
+ * request signal alone never reaches a provider that cleans up only through
+ * that hook.
+ */
+function closableIteration(inner: AssistantMessageEventStream): ClosableIteration {
+	let closed = false;
+	return {
+		events: inner,
+		isClosed: () => closed,
+		close: () => {
+			if (closed) return;
+			closed = true;
+			inner.closeConsumers();
+		},
+	};
 }
 
 export function streamFromLazyImport(
@@ -755,7 +788,11 @@ export function streamSimple<TApi extends Api>(
 		: undefined;
 	if (retryApiKey) {
 		const consumerAbortController = new AbortController();
-		const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
+		let closeActiveAttempt: (() => void) | undefined;
+		const outer = new AssistantMessageEventStream(() => {
+			consumerAbortController.abort();
+			closeActiveAttempt?.();
+		});
 		const requestSignal = options?.signal
 			? AbortSignal.any([options.signal, consumerAbortController.signal])
 			: consumerAbortController.signal;
@@ -788,7 +825,10 @@ export function streamSimple<TApi extends Api>(
 					onStreamCreated: markAdmission,
 					signal: requestSignal,
 				});
-				for await (const event of inner) {
+				const iteration = closableIteration(inner);
+				closeActiveAttempt = iteration.close;
+				for await (const event of iteration.events) {
+					if (iteration.isClosed()) break;
 					if (!emittedReplayUnsafeEvent && event.type === "start") {
 						bufferedEvents.push(event);
 						continue;
@@ -897,9 +937,37 @@ function stampCredentialId(event: AssistantMessageEvent, credentialId: number): 
 }
 
 /**
- * Dispatch one request and record its stored credential row on every partial,
- * terminal, and result message, so the persisted turn names the account that
- * produced it.
+ * Whether a terminal message carries facts only a provider response can supply:
+ * an HTTP status, or a diagnostic minted from structured provider metadata. A
+ * transport exception, a local timeout, or an abort before any response has
+ * none of these.
+ */
+function carriesProviderResponse(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error" && message.stopReason !== "aborted") return true;
+	return (
+		message.errorStatus !== undefined ||
+		message.transportFailure?.status !== undefined ||
+		message.providerDiagnostic !== undefined
+	);
+}
+
+/**
+ * Whether this event proves the provider answered the request. `start` does
+ * not: providers emit it before the request is sent.
+ */
+function isProviderResponseEvidence(event: AssistantMessageEvent): boolean {
+	if (event.type === "start") return false;
+	if (event.type === "error") return carriesProviderResponse(event.error);
+	return true;
+}
+
+/**
+ * Dispatch one request and record its stored credential row on every message
+ * the provider's response produced (partials, the terminal message, and the
+ * result), so the persisted turn names the account that served it. Until the
+ * provider has answered, nothing is stamped: a failure before any response
+ * stays unattributed, while a response-backed error (401, 429) and anything
+ * after the first streamed event keep the row.
  */
 function streamWithCredentialAttribution<TApi extends Api>(
 	model: Model<TApi>,
@@ -912,17 +980,24 @@ function streamWithCredentialAttribution<TApi extends Api>(
 		? AbortSignal.any([options.signal, consumerAbortController.signal])
 		: consumerAbortController.signal;
 	const inner = dispatchStreamSimple(model, context, { ...options, signal });
-	const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
+	const iteration = closableIteration(inner);
+	const outer = new AssistantMessageEventStream(() => {
+		consumerAbortController.abort();
+		iteration.close();
+	});
 	void (async () => {
+		let responded = false;
 		try {
-			for await (const event of inner) {
-				stampCredentialId(event, credentialId);
+			for await (const event of iteration.events) {
+				if (iteration.isClosed()) break;
+				responded ||= isProviderResponseEvidence(event);
+				if (responded) stampCredentialId(event, credentialId);
 				outer.push(event);
 				if (outer.done) return;
 			}
 			if (outer.done) return;
 			const result = await inner.result();
-			setCredentialId(result, credentialId);
+			if (responded || carriesProviderResponse(result)) setCredentialId(result, credentialId);
 			outer.end(result);
 		} catch (error) {
 			outer.fail(error);
@@ -962,8 +1037,11 @@ function dispatchStreamSimple<TApi extends Api>(
 			maxTokens: resolvedRequestMaxTokens,
 		});
 		if (!options?.onStreamCreated) return events;
-		const forwarded = new AssistantMessageEventStream();
-		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
+		// The provider stream may clean up only through its own consumer-close
+		// hook, so the forwarder hands an early close through to it.
+		let closeEvents: (() => void) | undefined;
+		const forwarded = new AssistantMessageEventStream(() => closeEvents?.());
+		closeEvents = pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
 		return forwarded;
 	}
 	if (options?.customApiRegistry !== undefined && !isBuiltInApi(model.api)) {

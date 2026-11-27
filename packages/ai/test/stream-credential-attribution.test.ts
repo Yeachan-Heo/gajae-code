@@ -6,6 +6,7 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	Context,
+	FetchImpl,
 	Model,
 	SimpleStreamOptions,
 } from "@gajae-code/ai/types";
@@ -126,6 +127,62 @@ describe("streamSimple credential attribution", () => {
 		expect(snapshots).toEqual([5, 5]);
 		expect(result.stopReason).toBe("error");
 		expect(result.credentialId).toBe(5);
+	});
+
+	it.each([
+		{ name: "a transport exception", stopReason: "error" as const, errorMessage: "fetch failed: ECONNREFUSED" },
+		{ name: "an abort before the first event", stopReason: "aborted" as const, errorMessage: "Request was aborted" },
+	])("leaves $name before any provider response unattributed", async ({ stopReason, errorMessage }) => {
+		registerCustomApi(
+			API,
+			() => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					// One object for start and error, as the Anthropic adapter does.
+					const message = assistant();
+					stream.push({ type: "start", partial: message });
+					message.stopReason = stopReason;
+					message.errorMessage = errorMessage;
+					message.transportFailure = { kind: "transport" };
+					stream.push({ type: "error", reason: stopReason, error: message });
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const { snapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 6 }),
+		);
+
+		expect(snapshots).toEqual([undefined, undefined]);
+		expect(result.stopReason).toBe(stopReason);
+		expect("credentialId" in result).toBe(false);
+	});
+
+	it("keeps the credential row on an abort after the response started", async () => {
+		registerCustomApi(
+			API,
+			() => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = assistant(["par"]);
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "text_start", contentIndex: 0, partial: message });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "par", partial: message });
+					message.stopReason = "aborted";
+					message.errorMessage = "Request was aborted";
+					stream.push({ type: "error", reason: "aborted", error: message });
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const { result } = await collect(streamSimple(model(), context, { apiKey: "stored-key", credentialId: 8 }));
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.credentialId).toBe(8);
 	});
 
 	it("leaves the field absent for an external key", async () => {
@@ -257,5 +314,112 @@ describe("streamSimple credential attribution", () => {
 		await Bun.sleep(0);
 
 		expect(providerSignal?.aborted).toBe(true);
+	});
+
+	it.each([
+		{ name: "an attributed request", path: "plain" as const },
+		{ name: "an auth-retrying attributed request", path: "retry" as const },
+		{ name: "an admission-tracked attributed request", path: "admission" as const },
+	])("runs a callback-only provider cleanup and settles when the consumer of $name stops early", async ({ path }) => {
+		let cleanups = 0;
+		let admissions = 0;
+		registerCustomApi(
+			API,
+			() => {
+				const message = assistant([""]);
+				// Ignores options.signal; its only cleanup is the consumer-close hook,
+				// which ends the stream asynchronously like a real transport teardown.
+				const stream: AssistantMessageEventStream = new AssistantMessageEventStream(() => {
+					cleanups += 1;
+					setTimeout(() => {
+						message.stopReason = "aborted";
+						message.errorMessage = "Request was aborted";
+						stream.push({ type: "error", reason: "aborted", error: message });
+					}, 1);
+				});
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "text_start", contentIndex: 0, partial: message });
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const stream = streamSimple(model(), context, {
+			apiKey: "stored-key",
+			credentialId: 3,
+			...(path === "retry" ? { onAuthError: async () => undefined } : {}),
+			...(path === "admission"
+				? {
+						onStreamCreated: () => {
+							admissions += 1;
+						},
+					}
+				: {}),
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		expect((await iterator.next()).value?.type).toBe("start");
+		await iterator.return?.();
+
+		const result = await stream.result();
+		expect(cleanups).toBe(1);
+		expect(result.stopReason).toBe("aborted");
+		// The response had started (text_start), so the abort keeps its row.
+		expect(result.credentialId).toBe(3);
+		if (path === "admission") expect(admissions).toBe(1);
+	});
+});
+
+describe("streamSimple credential attribution through the Anthropic adapter", () => {
+	const anthropicModel: Model<"anthropic-messages"> = {
+		id: "claude-test",
+		name: "Claude Test",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 1024,
+	};
+
+	function run(fetchImpl: FetchImpl): Promise<AssistantMessage> {
+		return streamSimple(anthropicModel, context, {
+			apiKey: "sk-ant-api-test",
+			credentialId: 12,
+			fetch: fetchImpl,
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+		}).result();
+	}
+
+	function errorResponse(status: number, type: string): Response {
+		return new Response(JSON.stringify({ type: "error", error: { type, message: type } }), {
+			status,
+			headers: { "content-type": "application/json" },
+		});
+	}
+
+	it("leaves a transport failure before any response unattributed", async () => {
+		const result = await run((async () => {
+			throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:443"), { code: "ECONNREFUSED" });
+		}) as FetchImpl);
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBeUndefined();
+		expect("credentialId" in result).toBe(false);
+	});
+
+	it.each([
+		{ status: 401, type: "authentication_error" },
+		{ status: 429, type: "rate_limit_error" },
+	])("keeps the credential row on a $status provider response", async ({ status, type }) => {
+		const result = await run((async () => errorResponse(status, type)) as FetchImpl);
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(status);
+		expect(result.credentialId).toBe(12);
 	});
 });
