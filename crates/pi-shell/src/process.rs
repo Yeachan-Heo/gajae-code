@@ -6,6 +6,9 @@ use anyhow::Result;
 
 use crate::cancel::CancelToken;
 
+#[cfg(any(windows, test))]
+mod ownership;
+
 /// Current state of a process reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessStatus {
@@ -34,8 +37,9 @@ pub enum ProcessObservation {
 		incarnation: String,
 	},
 	/// The operating system positively confirmed that no process currently
-	/// has this pid. This is proof of death, not merely an unread process
-	/// table.
+	/// has this pid, or (Windows) that the process has exited even though an
+	/// open handle still keeps its object queryable. This is proof of death,
+	/// not merely an unread process table.
 	Absent,
 	/// The query could not determine liveness: permission denial, a platform
 	/// limitation, an invalid (non-positive) pid, or a transient I/O
@@ -315,6 +319,12 @@ mod platform {
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
 			self.descendants_observed().unwrap_or_default()
+		}
+
+		/// The baseline walk; this platform's observation never omits an
+		/// unreadable candidate while reporting success.
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			self.descendants_observed()
 		}
 
 		/// `None` when this process's own task list could not be read, i.e. the
@@ -727,6 +737,12 @@ mod platform {
 			self.descendants_observed().unwrap_or_default()
 		}
 
+		/// The baseline walk; this platform's observation never omits an
+		/// unreadable candidate while reporting success.
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			self.descendants_observed()
+		}
+
 		/// `None` when the process table could not be observed at all. Callers
 		/// that terminate descendants MUST NOT treat that as an empty
 		/// descendant set.
@@ -1024,7 +1040,7 @@ mod platform {
 	/// `KERN_PROC_PID` reports the same identity fields for every process
 	/// visible to the caller.
 	#[derive(Clone, Copy)]
-	struct ProcInfo {
+	pub(super) struct ProcInfo {
 		pid:          i32,
 		ppid:         i32,
 		pgid:         i32,
@@ -1292,9 +1308,10 @@ mod platform {
 		sync::Arc,
 	};
 
-	use smallvec::SmallVec;
-
-	use super::{ProcessObservation, ProcessStatus};
+	use super::{
+		ProcessObservation, ProcessStatus,
+		ownership::{self, PinnedIdentity, SnapshotEntry},
+	};
 
 	#[repr(C)]
 	#[allow(non_snake_case, reason = "Windows PROCESSENTRY32W field names must match Win32 ABI")]
@@ -1373,6 +1390,7 @@ mod platform {
 	const PROCESS_REFERENCE_ACCESS: u32 =
 		PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
 	const WAIT_OBJECT_0: u32 = 0;
+	const WAIT_TIMEOUT: u32 = 258;
 
 	#[link(name = "kernel32")]
 	unsafe extern "system" {
@@ -1477,7 +1495,7 @@ mod platform {
 
 		/// Kernel-derived identity evidence for this exact process incarnation.
 		pub fn incarnation(&self) -> String {
-			format!("windows:{}", self.creation_time)
+			windows_incarnation(self.creation_time)
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -1493,11 +1511,13 @@ mod platform {
 				.unwrap_or_default()
 		}
 
+		/// Direct children whose ownership by this process is proven; see
+		/// [`Self::owned_descendants`].
 		pub fn children(&self) -> Vec<Self> {
-			let Some(tree) = build_process_tree() else {
-				return Vec::new();
-			};
-			Self::children_from_tree(self.pid, &tree)
+			self
+				.owned_descendants(1)
+				.map(|(children, _complete)| children)
+				.unwrap_or_default()
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -1511,61 +1531,80 @@ mod platform {
 
 		/// `None` when the Toolhelp snapshot could not be taken at all. Callers
 		/// that terminate descendants MUST NOT treat that as an empty
-		/// descendant set.
+		/// descendant set. The result is the proven subset: a candidate whose
+		/// identity could not be read is omitted, so it is never signalled.
 		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
-			let tree = build_process_tree()?;
+			self
+				.owned_descendants(usize::MAX)
+				.map(|(descendants, _complete)| descendants)
+		}
+
+		/// Like [`Self::descendants_observed`], but `None` also when any
+		/// candidate's identity could not be read. A pre-command baseline must
+		/// be complete: an omitted pre-existing child would later look newly
+		/// spawned and become a termination target (#7765).
+		pub fn descendants_complete(&self) -> Option<Vec<Self>> {
+			let (descendants, complete) = self.owned_descendants(usize::MAX)?;
+			complete.then_some(descendants)
+		}
+
+		/// Descendants, at most `depth_limit` levels deep, whose ownership by
+		/// this pinned process is proven; deepest first, so leaves are
+		/// signalled before their parents.
+		///
+		/// Windows never reparents an orphan: it keeps its dead creator's number
+		/// as `th32ParentProcessID`, and that number is reused. A child is
+		/// accepted only when its own handle confirms the snapshot's parent
+		/// number and it was created strictly after the parent (the invariant
+		/// is stated in `process::ownership`). The current process and its
+		/// provable ancestors are never selected or walked through. Anything
+		/// whose ownership cannot be proven is skipped together with its
+		/// subtree.
+		///
+		/// Limit: creation times come from the system clock. If the clock is
+		/// stepped backwards between the creation of an orphan and the creation
+		/// of a later holder of its dead parent's number, the order proof does
+		/// not hold for that pair.
+		fn owned_descendants(&self, depth_limit: usize) -> Option<(Vec<Self>, bool)> {
+			let snapshot = process_snapshot()?;
 			let Ok(root) = u32::try_from(self.pid) else {
-				return Some(Vec::new());
+				return Some((Vec::new(), true));
 			};
-			let mut visited: HashSet<u32> = HashSet::new();
-			visited.insert(root);
-			let mut out = Vec::new();
-			Self::collect_descendants_from_tree(root, &tree, &mut visited, &mut out);
-			Some(out)
-		}
-
-		fn children_from_tree(pid: i32, tree: &HashMap<u32, SmallVec<[u32; 4]>>) -> Vec<Self> {
-			let Ok(pid_u32) = u32::try_from(pid) else {
-				return Vec::new();
-			};
-			tree
-				.get(&pid_u32)
+			let protected = current_process_lineage();
+			let mut opened: HashMap<u32, Self> = HashMap::new();
+			let result = ownership::owned_descendants(
+				root,
+				self.creation_time,
+				&snapshot,
+				&protected,
+				depth_limit,
+				|pid| {
+					let process = Self::from_pid(i32::try_from(pid).ok()?)?;
+					let identity = process.pinned_identity()?;
+					opened.insert(pid, process);
+					Some(identity)
+				},
+			);
+			// Return proven PIDs with completeness flag separate.
+			// Termination uses proven PIDs; completeness is checked separately at the
+			// baseline caching boundary in current_descendant_pids_observed.
+			let processes: Vec<Self> = result
+				.pids
 				.into_iter()
-				.flatten()
-				.filter_map(|&child_pid| {
-					let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
-					(child.status() == ProcessStatus::Running).then_some(child)
-				})
-				.collect()
+				.filter_map(|pid| opened.remove(&pid))
+				.collect();
+			Some((processes, result.complete))
 		}
 
-		fn collect_descendants_from_tree(
-			parent: u32,
-			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
-			visited: &mut HashSet<u32>,
-			out: &mut Vec<Self>,
-		) {
-			let Some(children) = tree.get(&parent) else {
-				return;
-			};
-			for &child_pid in children {
-				if !visited.insert(child_pid) {
-					continue;
-				}
-				let Ok(child_pid_i) = i32::try_from(child_pid) else {
-					continue;
-				};
-				let Some(child) = Self::from_pid(child_pid_i) else {
-					continue;
-				};
-				if child.status() != ProcessStatus::Running {
-					continue;
-				}
-				// Post-order: collect grandchildren first so leaves are signalled before
-				// their parents during tree termination.
-				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
-				out.push(child);
-			}
+		/// Parent number, creation time and liveness, all read through this
+		/// process's own handle.
+		fn pinned_identity(&self) -> Option<PinnedIdentity> {
+			let info = process_basic_information(self.handle.as_raw())?;
+			Some(PinnedIdentity {
+				parent_pid:    u32::try_from(info.inherited_from_unique_process_id).ok()?,
+				creation_time: self.creation_time,
+				running:       self.status() == ProcessStatus::Running,
+			})
 		}
 
 		pub fn kill(&self, _signal: i32) -> bool {
@@ -1803,9 +1842,9 @@ mod platform {
 		}
 	}
 
-	/// Build a map of `parent_pid` -> [`child_pids`] for all processes.
-	fn build_process_tree() -> Option<HashMap<u32, SmallVec<[u32; 4]>>> {
-		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
+	/// Read every process's pid and parent number from one Toolhelp snapshot.
+	fn process_snapshot() -> Option<Vec<SnapshotEntry>> {
+		let mut entries = Vec::new();
 		let snapshot = create_process_snapshot()?;
 
 		let mut entry = process_entry();
@@ -1817,10 +1856,10 @@ mod platform {
 		}
 
 		loop {
-			tree
-				.entry(entry.th32ParentProcessID)
-				.or_default()
-				.push(entry.th32ProcessID);
+			entries.push(SnapshotEntry {
+				pid:        entry.th32ProcessID,
+				parent_pid: entry.th32ParentProcessID,
+			});
 
 			// SAFETY: `snapshot` remains a valid Toolhelp snapshot handle, and `entry`
 			// remains a writable `PROCESSENTRY32W` with its ABI size preserved.
@@ -1838,7 +1877,30 @@ mod platform {
 			}
 		}
 
-		Some(tree)
+		Some(entries)
+	}
+
+	/// Read a process's identity with query-only access. Used for the ancestor
+	/// climb, which never signals what it opens.
+	fn query_identity(pid: u32) -> Option<PinnedIdentity> {
+		let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)?;
+		let creation_time = process_creation_time(handle.as_raw())?;
+		let info = process_basic_information(handle.as_raw())?;
+		// SAFETY: `handle` is an owned process handle opened with `SYNCHRONIZE`. A
+		// zero timeout makes this a non-blocking liveness probe.
+		let running = unsafe { WaitForSingleObject(handle.as_raw(), 0) } != WAIT_OBJECT_0;
+		Some(PinnedIdentity {
+			parent_pid: u32::try_from(info.inherited_from_unique_process_id).ok()?,
+			creation_time,
+			running,
+		})
+	}
+
+	/// The current process plus every ancestor it can prove. No walk selects or
+	/// traverses these.
+	fn current_process_lineage() -> HashSet<u32> {
+		let self_pid = std::process::id();
+		ownership::protected_lineage(self_pid, query_identity(self_pid), query_identity)
 	}
 
 	/// Process groups are not exposed on Windows.
@@ -1857,28 +1919,48 @@ mod platform {
 	const ERROR_INVALID_PARAMETER: u32 = 87;
 
 	/// Read-only observation of whether `pid` currently names a verifiable
-	/// process incarnation. Never signals, kills, reaps, or waits.
+	/// process incarnation. Never signals, kills, reaps, or blocks on exit.
 	pub fn observe_pid(pid: i32) -> ProcessObservation {
 		if pid <= 0 {
 			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
 		}
-		if let Some(process) = Process::from_pid(pid) {
-			return ProcessObservation::Present { incarnation: process.incarnation() };
-		}
 		let Ok(pid_u32) = u32::try_from(pid) else {
 			return ProcessObservation::Unknown { reason_code: "invalid_pid".to_owned() };
 		};
-		// `Process::from_pid` failed above; probe again with the minimal query
-		// access right so a permission-restricted-but-alive process (which denies
-		// the fuller `PROCESS_REFERENCE_ACCESS` set) is not misreported as absent.
+		// Observation needs no termination authority. Open its own read-only
+		// reference rather than going through `from_pid`, which accepts an exited
+		// process whose object a handle still pins and would report it as present.
+		if let Some(handle) = open_process(pid_u32, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) {
+			// An open handle pins the process object, not its liveness: Windows
+			// keeps exited objects queryable while any handle remains open. Query
+			// the exit state on this same pinned identity without blocking. Do not
+			// use `status()`, which conservatively maps failed probes to Running.
+			// SAFETY: this owned handle has SYNCHRONIZE access and remains valid
+			// throughout the zero-timeout query; this does not wait for exit.
+			return match unsafe { WaitForSingleObject(handle.as_raw(), 0) } {
+				WAIT_OBJECT_0 => ProcessObservation::Absent,
+				WAIT_TIMEOUT => match process_creation_time(handle.as_raw()) {
+					Some(creation_time) => {
+						ProcessObservation::Present { incarnation: windows_incarnation(creation_time) }
+					},
+					None => {
+						ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() }
+					},
+				},
+				_ => ProcessObservation::Unknown { reason_code: "exit_state_unavailable".to_owned() },
+			};
+		}
+		// The query-plus-synchronize request failed above; probe again with
+		// query-only access so denial of SYNCHRONIZE is not treated as absence.
 		// SAFETY: `OpenProcess` takes the access mask and pid by value and does not
 		// dereference caller-owned memory. The handle, if any, is immediately
 		// wrapped for RAII closure.
 		let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_u32) };
 		if let Some(owned) = OwnedHandle::from_raw(handle) {
-			// The process exists (the OS handed back a valid handle) but identity
-			// (creation time) could not be pinned by `Process::from_pid`'s stricter
-			// access request — not proof of death.
+			// This process object may be live or exited. Query-only access does
+			// not permit the SYNCHRONIZE exit-state probe, and failure of the
+			// stricter reference request is not proof of death. Keep this unknown
+			// rather than broadening rights or inferring liveness from a handle.
 			drop(owned);
 			return ProcessObservation::Unknown { reason_code: "identity_unavailable".to_owned() };
 		}
@@ -1890,6 +1972,11 @@ mod platform {
 		} else {
 			ProcessObservation::Unknown { reason_code: "permission_denied".to_owned() }
 		}
+	}
+
+	/// Incarnation string for a Windows process with this creation time.
+	fn windows_incarnation(creation_time: u64) -> String {
+		format!("windows:{creation_time}")
 	}
 
 	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
@@ -1963,9 +2050,9 @@ impl Process {
 	/// queried") or [`Self::status`] mapping an identity-check failure to
 	/// [`ProcessStatus::Exited`] on Darwin, `observe` keeps positive OS-reported
 	/// absence separate from every inconclusive outcome. It never signals,
-	/// kills, reaps, waits on, or spawns any process — it only reads existing
-	/// kernel state (pidfd status on Linux, `sysctl`/`kill(pid, 0)` on macOS,
-	/// `OpenProcess` on Windows).
+	/// kills, reaps, blocks waiting on, or spawns any process — it only reads
+	/// existing kernel state (pidfd status on Linux, `sysctl`/`kill(pid, 0)` on
+	/// macOS, `OpenProcess` and a zero-timeout exit-state query on Windows).
 	pub fn observe(pid: i32) -> ProcessObservation {
 		platform::observe_pid(pid)
 	}
@@ -2128,6 +2215,19 @@ impl Process {
 			self
 				.inner
 				.descendants_observed()?
+				.into_iter()
+				.map(Self::from_inner)
+				.collect(),
+		)
+	}
+
+	/// `None` unless the whole descendant set was observed, with no candidate
+	/// omitted for an unreadable identity. Only baselines need this.
+	fn live_descendants_complete(&self) -> Option<Vec<Self>> {
+		Some(
+			self
+				.inner
+				.descendants_complete()?
 				.into_iter()
 				.map(Self::from_inner)
 				.collect(),
@@ -2537,14 +2637,15 @@ pub fn current_descendant_pids() -> HashSet<i32> {
 	current_descendant_pids_observed().unwrap_or_default()
 }
 
-/// `None` when the process tree could not be observed, i.e. the returned set
-/// would be an unproven baseline rather than a genuinely empty one.
+/// `None` when the process tree could not be completely observed, i.e. the
+/// returned set would be an unproven baseline rather than a genuinely complete
+/// one.
 #[must_use]
 pub fn current_descendant_pids_observed() -> Option<HashSet<i32>> {
 	let process = Process::from_pid(i32::try_from(std::process::id()).unwrap_or_default())?;
 	Some(
 		process
-			.live_descendants_observed()?
+			.live_descendants_complete()?
 			.into_iter()
 			.map(|child| child.pid())
 			.collect(),
@@ -2962,17 +3063,8 @@ mod tests {
 
 		child.kill().expect("kill owned child");
 		child.wait().expect("reap owned child");
-		// Release the child handle before asserting absence. `wait` reaps the
-		// child but `std::process::Child` closes the underlying handle only on
-		// drop, and Windows keeps a process object — with its creation-time
-		// identity, so `OpenProcess` and `from_pid` both still succeed — alive
-		// for as long as any handle to it is open. Holding `child` past the
-		// reap therefore pins the very incarnation this test waits to see
-		// disappear (observed in CI: `Present { incarnation:
-		// "windows:134341044275280593" }` for the whole 2s poll budget). The
-		// assertion below still demands a positive `Absent`, so dropping the
-		// handle removes a fixture artifact rather than weakening the contract.
-		drop(child);
+		// `child` stays alive here: on Windows its handle keeps the exited process
+		// object queryable, and `observe` must still report it as `Absent`.
 
 		// Process-table absence is not guaranteed to be visible to the very next
 		// observation on every platform; poll briefly for the confirmed-dead
@@ -2991,8 +3083,6 @@ mod tests {
 			ProcessObservation::Absent,
 			"owned exited child must observe as positively absent",
 		);
-		// observe() and from_pid() must never disagree about a confirmed-dead pid.
-		assert!(Process::from_pid(pid).is_none());
 	}
 
 	/// Non-positive pids can never name a single process (0 is reserved,

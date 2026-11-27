@@ -51,7 +51,7 @@ describe("GJC MCP quarantine surface", () => {
 		expect(interactiveMode).not.toContain("MCPCommandController");
 	});
 
-	it("keeps public MCP guidance aligned with the slash-command quarantine", async () => {
+	it("keeps public MCP guidance aligned with the session-control boundary", async () => {
 		const schema = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "config", "mcp-schema.json"),
 		).text();
@@ -60,7 +60,12 @@ describe("GJC MCP quarantine surface", () => {
 
 		expect(schema).not.toContain("for example /mcp reauth");
 		expect(schema).toContain("no public MCP OAuth authorization or reauthorization entry path is provided");
-		expect(normalizedStandaloneMcp).toContain("do not register a top-level `/mcp` command");
+		expect(normalizedStandaloneMcp).toContain(
+			"Ordinary interactive sessions without the MCP session-control capability, and all ACP sessions, do not register a top-level `/mcp` command",
+		);
+		expect(normalizedStandaloneMcp).toContain(
+			"They are unavailable in ACP, print modes, SDK sessions, and subagents",
+		);
 		expect(normalizedStandaloneMcp).toContain("they do not initiate MCP OAuth authorization");
 		expect(normalizedStandaloneMcp).toContain(
 			"there is no public MCP OAuth authorization or reauthorization entry path",

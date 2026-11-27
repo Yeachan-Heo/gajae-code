@@ -9,9 +9,10 @@ export type OAuthCredentials = {
 	profileArn?: string;
 	/**
 	 * Organization the token is scoped to. One Anthropic account can belong to
-	 * several organizations (e.g. a Team workspace and a personal Max plan); each
-	 * login is bound to exactly one of them, so the organization is part of the
-	 * credential's identity.
+	 * several organizations (e.g. a Team workspace and a personal Max plan), and one
+	 * ChatGPT login can belong to several workspaces (for OpenAI Codex this is the
+	 * workspace id, `chatgpt_account_id`). Each login is bound to exactly one of
+	 * them, so the organization is part of the credential's identity.
 	 */
 	organizationId?: string;
 	/** Display name of {@link organizationId}. */
@@ -113,6 +114,11 @@ export interface OAuthController {
 	onProgress?(message: string): void;
 	onManualCodeInput?(): Promise<string>;
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
+	/**
+	 * Called when an OAuth provider requires explicit confirmation before proceeding.
+	 * Return true to confirm and proceed, false to abort the authorization.
+	 */
+	onConfirmWarning?(warning: { provider: string; message: string }): Promise<boolean>;
 	signal?: AbortSignal;
 	fetch?: typeof globalThis.fetch;
 }

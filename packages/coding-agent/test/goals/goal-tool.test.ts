@@ -490,4 +490,27 @@ describe("GoalTool", () => {
 		expect(opDescribe).toContain("pause");
 		expect(opDescribe).toContain("without exiting goal mode");
 	});
+
+	it("resumed goal does not regress to paused state if restoration completes after resume", async () => {
+		// Regression test for issue #7947: when restoring a paused goal from the durable
+		// session branch, if operateGoal("resume") is called before the asynchronous
+		// onThreadResumed() completes, the restored state must not overwrite the active state.
+		const harness = createRuntimeHarness({
+			enabled: false, // paused
+			mode: "active",
+			goal: createGoal({ objective: "Paused goal", status: "paused" }),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		// Resume the paused goal
+		const resumed = await tool.execute("call-resume", { op: "resume" });
+		expect(resumed.details?.goal?.status).toBe("active");
+		expect(harness.getState()?.enabled).toBe(true);
+		expect(harness.getState()?.mode).toBe("active");
+	});
 });

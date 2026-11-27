@@ -18,7 +18,7 @@ import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
 	type AuthCredentialStore,
-	assertCanonicalMCPOAuthBinding,
+	assertMCPOAuthBindingTransportAdmitted,
 	type CachedCredentialHealth,
 	type CachedUsagePresentation,
 	type CredentialDispatchTicket,
@@ -553,6 +553,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				provider: entry.provider,
 				credentialKind: metadata?.type ?? entry.credential.type,
 				identityLabel: metadata?.identity ?? snapshotIdentityLabel(entry),
+				...snapshotIdentityFields(entry),
 				disabled: false,
 				disabledCause: null,
 			});
@@ -1145,14 +1146,17 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		client: MCPOAuthRefreshClient,
 		signal?: AbortSignal,
 	): Promise<OAuthCredential> {
+		// Entry precondition: a direct caller must not hand the broker a client
+		// secret for a transport-disallowed binding. AuthStorage asserts the same
+		// thing before delegating, but this public entry point has to defend itself.
+		assertMCPOAuthBindingTransportAdmitted(credential.mcpBinding);
 		await this.#client.refreshMCPCredential(credentialId, client, signal);
 		await this.refreshSnapshot(signal);
 		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		if (accepted?.credential.type !== "oauth") {
 			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
-		assertCanonicalMCPOAuthBinding(credential.mcpBinding);
-		assertCanonicalMCPOAuthBinding(accepted.credential.mcpBinding);
+		assertMCPOAuthBindingTransportAdmitted(accepted.credential.mcpBinding);
 		if (
 			accepted.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
 			accepted.credential.mcpBinding.tokenEndpoint !== credential.mcpBinding.tokenEndpoint
@@ -1507,6 +1511,24 @@ function isErrorStatus(error: unknown, status: number): boolean {
 function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 	if (entry.credential.type !== "oauth") return null;
 	return formatOAuthIdentityLabel(entry.credential);
+}
+
+/**
+ * Payload-free identity fields of an active OAuth snapshot row, matching what the local SQLite inventory exposes, so
+ * inventory consumers (`gjc accounts prefer`) can find a unique email, account id, or organization id in broker mode.
+ */
+function snapshotIdentityFields(
+	entry: SnapshotEntry,
+): Pick<CredentialInventoryRecord, "accountId" | "email" | "projectId" | "organizationId" | "organizationName"> {
+	const credential = entry.credential;
+	if (credential.type !== "oauth") return {};
+	return {
+		...(credential.accountId ? { accountId: credential.accountId } : {}),
+		...(credential.email ? { email: credential.email } : {}),
+		...(credential.projectId ? { projectId: credential.projectId } : {}),
+		...(credential.organizationId ? { organizationId: credential.organizationId } : {}),
+		...(credential.organizationName ? { organizationName: credential.organizationName } : {}),
+	};
 }
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {

@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { logger, postmortem } from "@gajae-code/utils";
+import { logger, postmortem, redactCrashSecrets } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
@@ -26,6 +26,7 @@ import {
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
 	type TelegramDaemonOptions,
+	type TelegramDaemonStopCause,
 	TelegramNotificationDaemon,
 } from "./telegram-daemon";
 import {
@@ -37,7 +38,8 @@ import {
 
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
-	requestStop(reason?: "reload" | "signal" | "stop"): void;
+	requestStop(reason?: "reload" | "signal" | "stop" | "unhandled_rejection"): void;
+	getStopCause(): TelegramDaemonStopCause | undefined;
 	prepareDoctorRestart?(): void;
 	cancelDoctorRestart?(): void;
 	doctorOccupancy?(): {
@@ -584,6 +586,12 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	//
 	// `finally` covers a returning or throwing run(); the postmortem hook covers
 	// the fatal paths that call `process.exit()` without unwinding this frame.
+	const onUnhandledRejection = (reason: unknown): void => {
+		daemon.requestStop("unhandled_rejection");
+		const redacted = redactCrashSecrets(String(reason instanceof Error ? reason.message : reason));
+		logger.warn(`notifications: unhandled rejection: ${redacted}`);
+	};
+	process.on("unhandledRejection", onUnhandledRejection);
 	const recordOwnerStopped = (): Promise<boolean> =>
 		markDaemonOwnerStopped({
 			settings: settings as Settings,
@@ -591,10 +599,23 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 			acquisitionId: ownerId,
 			pid: deps.processPid ?? process.pid,
 			now: deps.now,
+			stopCause: daemon.getStopCause(),
 		});
+	// Register owner-state callback first so it runs LAST in the postmortem sequence
+	// (postmortem runs callbacks in reverse registration order). This ensures the
+	// unhandled-rejection callback runs first and sets the stop cause synchronously
+	// before owner-state reads it via daemon.getStopCause().
 	const unregisterPostmortem = postmortem.register("telegram-daemon:owner-state", async () => {
 		await recordOwnerStopped();
 	});
+	const unregisterUnhandledRejectionPostmortem = postmortem.register(
+		"telegram-daemon:unhandled-rejection",
+		(reason: postmortem.Reason) => {
+			if (reason === postmortem.Reason.UNHANDLED_REJECTION) {
+				daemon.requestStop("unhandled_rejection");
+			}
+		},
+	);
 	try {
 		const doctorTick = async (): Promise<void> => {
 			const request = await readTelegramDoctorControlRequest(settings as Settings);
@@ -647,6 +668,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		unschedule(watchdog);
 		process.off("SIGTERM", onSignal);
 		process.off("SIGINT", onSignal);
+		process.off("unhandledRejection", onUnhandledRejection);
+		unregisterUnhandledRejectionPostmortem();
 		unregisterPostmortem();
 		await recordOwnerStopped();
 	}

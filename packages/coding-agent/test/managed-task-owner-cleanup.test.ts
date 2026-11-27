@@ -3,6 +3,13 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	listManagedCandidates,
+	type ManagedCandidate,
+	type ManagedScope,
+	ManagedSessionScopeTestHooks,
+	resolveManagedScope,
+} from "../src/sdk/session-readonly/scope";
 import type {
 	ManagedGcSessionRetirementReceipt,
 	ManagedGcSessionRetirementTarget,
@@ -10,17 +17,12 @@ import type {
 import {
 	bindManagedGcSessionRetirementTarget,
 	deleteManagedSessionCandidate,
-	listManagedCandidates,
-	type ManagedCandidate,
 	type ManagedDeleteCandidateResult,
-	type ManagedScope,
-	ManagedSessionScopeTestHooks,
 	managedDirectoryIdentityForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
 	readManagedGcSessionRetirementReceipt,
 	reconcileManagedTombstones,
-	resolveManagedScope,
 	resolveManagedScopeForWrite,
 	taskArtifactOwnerStorageContextForScope,
 } from "../src/session/internal/managed-session-scope";

@@ -1,7 +1,18 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
+import { commitModelAssignments } from "@gajae-code/coding-agent/config/model-profile-activation";
 import {
+	commitDurableModelProfileOwnership,
+	type DurableModelProfileOwnership,
+	ModelProfileOwnershipConflictError,
+	readDurableModelProfileOwnership,
+	readDurableModelProfileOwnershipFromRaw,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
+import type { GjcModelAssignmentTargetId } from "@gajae-code/coding-agent/config/model-registry";
+import {
+	formatModelSelectorValue,
 	resolveAgentModelPatterns,
 	resolveModelOverride,
 	resolveModelRoleValue,
@@ -9,15 +20,16 @@ import {
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { AgentSessionProfileInstalledOverrideState } from "../src/session/agent-session";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { TempDir } from "@gajae-code/utils";
+import {
+	type AgentSessionProfileInstalledOverrideState,
+	type ModelSelectionRollbackDurableState,
+	SharedControlPublicationError,
+} from "../src/session/agent-session";
+import { loadTestTheme } from "./helpers/test-theme";
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
@@ -34,6 +46,8 @@ function createControllerContext() {
 		role: string;
 		options?: {
 			cause?: "user-selection";
+			observedOwnership?: DurableModelProfileOwnership;
+			assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
 			selector?: string;
 			thinkingLevel?: ThinkingLevel;
 			onMutationStarted?: () => void;
@@ -63,6 +77,7 @@ function createControllerContext() {
 		model: model("provider-a", "current") as Model | undefined,
 		thinkingLevel: ThinkingLevel.Medium as ThinkingLevel | undefined,
 		sessionId: "session-1",
+		dispose: vi.fn(async () => {}),
 		scopedModels: [],
 		modelRegistry: {
 			getAvailable: () => [selectedModel],
@@ -75,6 +90,7 @@ function createControllerContext() {
 			getDiscoverableProviders: () => [],
 			getAvailableModelProfileNames: () => [],
 			getModelProfiles: () => new Map(),
+			getModelProfile: () => undefined,
 			resolveCanonicalModel: () => undefined,
 			getApiKey: vi.fn(async (_model?: Model, _sessionId?: string): Promise<string | undefined> => "key"),
 			getSessionCanonicalVariant: () => undefined,
@@ -86,6 +102,8 @@ function createControllerContext() {
 			role: string,
 			options?: {
 				cause?: "user-selection";
+				observedOwnership?: DurableModelProfileOwnership;
+				assignments?: ReadonlyMap<GjcModelAssignmentTargetId, string>;
 				selector?: string;
 				thinkingLevel?: ThinkingLevel;
 				onMutationStarted?: () => void;
@@ -94,6 +112,15 @@ function createControllerContext() {
 		) {
 			setModelCalls.push({ model: nextModel, role, options });
 			options?.onMutationStarted?.();
+			const assignments = new Map(options?.assignments);
+			assignments.set(
+				"default",
+				formatModelSelectorValue(
+					options?.selector ?? `${nextModel.provider}/${nextModel.id}`,
+					options?.thinkingLevel,
+				),
+			);
+			await commitModelAssignments(settings, assignments, options?.observedOwnership);
 			this.model = nextModel;
 			if (options?.thinkingLevel) this.thinkingLevel = options.thinkingLevel;
 			this.markProfileRoleOverrideManual("modelRoles", role);
@@ -103,7 +130,11 @@ function createControllerContext() {
 		recordModelSelectionUsage: vi.fn(),
 		beginModelSelectionUsage: () => 1,
 		setDefaultFallbackRuntimeModel,
-		async restoreModelSelectionForRollback(nextModel: Model | undefined, thinkingLevel: ThinkingLevel | undefined) {
+		async restoreModelSelectionForRollback(
+			nextModel: Model | undefined,
+			thinkingLevel: ThinkingLevel | undefined,
+			_durable?: ModelSelectionRollbackDurableState,
+		) {
 			this.model = nextModel;
 			this.thinkingLevel = thinkingLevel;
 		},
@@ -168,6 +199,9 @@ function createControllerContext() {
 		setThinkingLevel(thinkingLevel: ThinkingLevel) {
 			this.thinkingLevel = thinkingLevel;
 		},
+		async setThinkingLevelForSession(thinkingLevel: ThinkingLevel) {
+			this.thinkingLevel = thinkingLevel;
+		},
 		getActiveModelProfile: () => activeModelProfile,
 		isFastForProvider: () => false,
 		isFastForSubagentProvider: () => false,
@@ -220,8 +254,8 @@ function selectMenuAction(selector: ModelSelectorComponent, actionIndex: number)
 
 describe("SelectorController model batch assignments", () => {
 	beforeAll(async () => {
-		testTheme = await getThemeByName("red-claw");
-		installTestTheme();
+		testTheme = await loadTestTheme();
+		setThemeInstance(testTheme);
 	});
 	test("all role agents selection writes every role-agent override and leaves DEFAULT unchanged", async () => {
 		const { ctx, settings, setModelCalls } = createControllerContext();
@@ -269,10 +303,19 @@ describe("SelectorController model batch assignments", () => {
 				role: "default",
 				options: {
 					cause: "user-selection",
+					observedOwnership: { schemaVersion: 1, version: 0, marker: { kind: "inherit" } },
 					onMutationStarted: expect.any(Function),
 					recordUsage: false,
 					selector: "provider-a/selected",
 					thinkingLevel: ThinkingLevel.Inherit,
+					assignments: new Map([
+						["default", "provider-a/selected"],
+						["executor", "provider-a/selected"],
+						["architect", "provider-a/selected"],
+						["planner", "provider-a/selected"],
+						["critic", "provider-a/selected"],
+						["image", "provider-a/selected"],
+					]),
 				},
 			},
 		]);
@@ -308,14 +351,204 @@ describe("SelectorController model batch assignments", () => {
 		expect(session.getProfileInstalledOverrideState().manualModelRoles).toEqual(new Set());
 	});
 
+	test("an unknown shared outcome is never compensated over", async () => {
+		const { ctx, session } = createControllerContext();
+		const before = session.model;
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		session.setModel = async (nextModel, _role, options) => {
+			options?.onMutationStarted?.();
+			session.model = nextModel;
+			throw new SharedControlPublicationError("set default model", {
+				kind: "unknown",
+				ids: ["forward"],
+				error: new Error("durability_unproven"),
+			});
+		};
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(session.model).not.toBe(before);
+		expect(ctx.showError).toHaveBeenCalledTimes(1);
+		expect(ctx.showError.mock.calls[0]![0]).not.toContain("rollback");
+	});
+
+	test("a shared session compensates through one durable-aware restore", async () => {
+		const { ctx, session } = createControllerContext();
+		const before = session.model;
+		const beforeThinking = session.thinkingLevel;
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		Object.assign(session, { usesSharedControlPublication: () => true });
+		session.setModel = async (nextModel, _role, options) => {
+			options?.onMutationStarted?.();
+			session.model = nextModel;
+			throw new Error("post-selection synchronization failed");
+		};
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(restoreModel).toHaveBeenCalledTimes(1);
+		expect(restoreModel.mock.calls[0]).toEqual([
+			before,
+			beforeThinking,
+			{
+				defaultChain: { state: undefined },
+				resumeDefault: { selector: "provider-a/original-default:medium" },
+			},
+		]);
+		// The legacy chain and resume-default writes are not issued for a shared session.
+		expect(session.setConfiguredModelChain).not.toHaveBeenCalled();
+		expect(session.recordResumeDefaultModel).not.toHaveBeenCalled();
+		expect(session.model).toBe(before);
+	});
+
+	test("failed assignment never restores a stale projection over a newer committed owner", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-a" });
+		session.setActiveModelProfile("profile-a");
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		session.setModel = async (_nextModel, _role, options) => {
+			options?.onMutationStarted?.();
+			await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-b" }, [
+				{ path: "modelRoles", op: "set", value: { default: "provider-b/winner" } },
+			]);
+			throw new Error("selection superseded after durable publication");
+		};
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(
+			expect.stringContaining("selection superseded after durable publication"),
+		);
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 2,
+			marker: { kind: "profile", profile: "profile-b" },
+		});
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-b");
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-b/winner" });
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(session.dispose).toHaveBeenCalledTimes(1);
+	});
+
+	test("credential preflight cannot consume or restore a newer profile owner's state", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const owner = await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-a" });
+		session.setActiveModelProfile("profile-a");
+		const started = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		session.modelRegistry.getApiKey.mockImplementationOnce(() => {
+			started.resolve();
+			return credential.promise;
+		});
+		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+		session.setModel = async (_nextModel, _role, options) => {
+			expect(options?.observedOwnership).toEqual(owner);
+			options?.onMutationStarted?.();
+			const winner = readDurableModelProfileOwnership(settings);
+			throw new ModelProfileOwnershipConflictError(owner.version, winner.version, winner.marker);
+		};
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await started.promise;
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-b" }, [
+			{ path: "modelRoles", op: "set", value: { default: "provider-b/winner" } },
+		]);
+		session.setActiveModelProfile("profile-b");
+		const winnerModel = model("provider-b", "winner");
+		session.model = winnerModel;
+		credential.resolve("key");
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("changed concurrently"));
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 2,
+			marker: { kind: "profile", profile: "profile-b" },
+		});
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-b/winner" });
+		expect(session.model).toBe(winnerModel);
+		expect(session.getActiveModelProfile()).toBe("profile-b");
+		expect(restoreModel).not.toHaveBeenCalled();
+		expect(session.dispose).toHaveBeenCalledTimes(1);
+	});
+
+	test("role-only preflight cannot overwrite a new owner in an initially unprofiled session", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const started = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		session.modelRegistry.getApiKey.mockImplementationOnce(() => {
+			started.resolve();
+			return credential.promise;
+		});
+		const selector = await openReadySelector(ctx);
+		selectMenuAction(selector, 1);
+		await started.promise;
+		const winner = await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-b" }, [
+			{ path: "task.agentModelOverrides", op: "set", value: { architect: "provider-b/winner" } },
+		]);
+		credential.resolve("key");
+		await settleSelectorInput();
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("changed concurrently"));
+		expect(readDurableModelProfileOwnership(settings)).toEqual(winner);
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ architect: "provider-b/winner" });
+	});
+
+	test("rollback checks the disk owner even when its Settings snapshot is stale", async () => {
+		const temp = TempDir.createSync("profile-selector-rollback-");
+		const agentDir = path.join(temp.path(), "agent");
+		const settings = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "profile-a" });
+		const writer = await Settings.loadForScope({ cwd: temp.path(), agentDir });
+		try {
+			const { ctx, session } = createControllerContext();
+			ctx.settings = settings;
+			session.setActiveModelProfile("profile-a");
+			const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
+			const reported = Promise.withResolvers<void>();
+			ctx.showError.mockImplementation(() => reported.resolve());
+			session.setModel = async (_nextModel, _role, options) => {
+				options?.onMutationStarted?.();
+				await commitDurableModelProfileOwnership(writer, { kind: "profile", profile: "profile-b" }, [
+					{ path: "modelRoles", op: "set", value: { default: "provider-b/winner" } },
+				]);
+				expect(readDurableModelProfileOwnership(settings).marker).toEqual({
+					kind: "profile",
+					profile: "profile-a",
+				});
+				throw new Error("another process committed profile-b");
+			};
+			const selector = await openReadySelector(ctx);
+			selectMenuAction(selector, 0);
+			await reported.promise;
+
+			const raw = Bun.YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text()) as Record<
+				string,
+				unknown
+			>;
+			expect(readDurableModelProfileOwnershipFromRaw(raw)).toMatchObject({
+				version: 2,
+				marker: { kind: "profile", profile: "profile-b" },
+			});
+			expect((raw.modelRoles as Record<string, unknown>).default).toBe("provider-b/winner");
+			expect(restoreModel).not.toHaveBeenCalled();
+			expect(session.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			await writer.close();
+			await settings.close();
+			temp.removeSync();
+		}
+	});
+
 	test("rolls back all targets when a later role setting write fails", async () => {
 		const { ctx, settings, session } = createControllerContext();
 		const originalModel = session.model;
-		const originalSetAgentModelOverride = settings.setAgentModelOverride.bind(settings);
-		vi.spyOn(settings, "setAgentModelOverride").mockImplementation((role, value) => {
-			if (role === "architect") throw new Error("role write failed");
-			originalSetAgentModelOverride(role, value);
-		});
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("role write failed"));
 		const selector = await openReadySelector(ctx);
 
 		selectMenuAction(selector, 7);
@@ -332,9 +565,7 @@ describe("SelectorController model batch assignments", () => {
 	test("restores a model-less session when all-target assignment fails", async () => {
 		const { ctx, settings, session } = createControllerContext();
 		session.model = undefined;
-		vi.spyOn(settings, "setAgentModelOverride").mockImplementation(() => {
-			throw new Error("role write failed");
-		});
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("role write failed"));
 		const selector = await openReadySelector(ctx);
 
 		selectMenuAction(selector, 7);
@@ -347,9 +578,7 @@ describe("SelectorController model batch assignments", () => {
 	test("role-only assignment failure restores profile-owned default state without rewriting the live model", async () => {
 		const { ctx, settings, session } = createControllerContext();
 		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
-		vi.spyOn(settings, "setAgentModelOverride").mockImplementation(() => {
-			throw new Error("role write failed");
-		});
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("role write failed"));
 		const selector = await openReadySelector(ctx);
 
 		selectMenuAction(selector, 6);
@@ -583,6 +812,7 @@ describe("SelectorController model batch assignments", () => {
 				role: "default",
 				options: {
 					cause: "user-selection",
+					observedOwnership: { schemaVersion: 1, version: 0, marker: { kind: "inherit" } },
 					onMutationStarted: expect.any(Function),
 					recordUsage: false,
 					selector: "provider-a/selected",

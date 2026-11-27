@@ -70,13 +70,17 @@ Flow in `main.ts`:
 
 1. Handled early (before interactive/session startup).
 2. Calls `exportFromFile(inputPath, outputPath?)`.
-3. `SessionManager.open(inputPath)` loads entries, then HTML is generated and written.
+3. `SessionManager.openReadOnlySnapshot(inputPath)` loads a detached, read-only snapshot, then HTML is generated and written. The snapshot throws `read_only_snapshot` from transcript appends and edits, rename, star, branch, rewrite, new or switched sessions, enabling session memory, fork, draft save and consume, artifact writes, blob writes, `moveTo`, dropping any session, uncommitted-session discard, verified delete, starring this session, and state restore. `getArtifactManager` and `ensureArtifactManager` return null on a snapshot. Shared-session appends are rejected because a snapshot is never a managed destination. `appendMessageDurably` returns a failure outcome instead of throwing, and writes nothing. Starring a different session through the picker method still works.
 4. Process prints `Exported to: ...` and exits.
 
 Behavior details:
 
 - Missing input file surfaces as `File not found: <path>`.
 - This path does not create an `AgentSession` and does not mutate any running session.
+- Export never writes to the transcript, its artifact directory, the managed session store, or the terminal breadcrumb: no patch records, migration rewrite, session-memory sidecars, or managed-store copy. Load-time replay-metadata sanitation applies in memory only. Shared content-addressed blobs and the resident cache under the agent dir may still be written, as on any load.
+- A transcript above the 128 MiB eager-load limit (up to about 2 GiB) opens through the bounded session-memory loader. This does not apply on Windows, which still refuses every transcript above 128 MiB because it lacks the owner-only private sidecar cache. The loader's sidecar files and build lock go to a private owner-only directory under the agent dir's sidecar cache, never beside the source. `close()`, `closeStrict()`, a failed open and process shutdown remove that directory. The HTML streams from the transcript, but only the bytes validated at open. Lines appended later are ignored, and a source that was replaced or truncated since the open is refused. The bounded loader serves only linear, current-version (v5) transcripts that contain a compaction and no `header_patch` or `entry_patch` records. Any other transcript above 128 MiB fails with `... cannot be streamed (<reason>)`, one whose file changed during the open fails with `Session transcript changed while it was being read ...; retry when the session is idle`, and one whose last line is incomplete fails with a message naming both causes: it is still being written (retry when the session is idle), or an earlier write was interrupted (retrying does not fix it). A transcript above the bounded limit fails with `Session transcript is too large to export`.
+- A transcript exported through the bounded loader to a regular (or not yet existing) output file is written to an owner-only temp file beside the output and renamed over it only when complete. A failed or interrupted export of such a transcript therefore never truncates or replaces an existing file. Every other export, including in-session `/export` and `/share` and any non-regular target, opens and truncates the output in place.
+- A transcript caught mid-append (a torn last line or a size change during the read) fails to export rather than exporting a prefix.
 
 ### `/dump` (interactive clipboard export)
 

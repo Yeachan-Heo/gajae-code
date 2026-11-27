@@ -33,8 +33,9 @@ jobs:
               return 'not-pr';
             }
 
-            // Match the exact command so similarly prefixed text cannot notify reviewers.
-            if (comment.body.trim() !== '/re-review') {
+            // The first line must be exactly the command, so similarly prefixed text
+            // cannot notify reviewers; notes for the reviewers may follow on later lines.
+            if (comment.body.trim().split(/\r?\n/, 1)[0].trim() !== '/re-review') {
               return 'no-match';
             }
 

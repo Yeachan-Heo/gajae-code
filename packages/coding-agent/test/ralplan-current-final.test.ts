@@ -223,6 +223,79 @@ describe("resolveRalplanCurrentFinal", () => {
 		if (resolution.ok) return;
 		expect(resolution.refusal.code).toBe("missing_state");
 	});
+	it("accepts a reviewed final recorded with the skill's per-pass stage_n", async () => {
+		// Per-pass: all stages of one consensus pass share the same stage_n.
+		// planner=1 opens; then revision/architect/critic/final all share stageN=2.
+		await writeRun([
+			{ stage: "planner", stageN: 1, body: "plan v1\n" },
+			{ stage: "revision", stageN: 2, body: "revision v2\n" },
+			{ stage: "architect", stageN: 2, body: "architect v2\n" },
+			{ stage: "critic", stageN: 2, body: "critic v2\n" },
+			{ stage: "post-interview", stageN: 2, body: "post-interview v2\n" },
+			{ stage: "final", stageN: 2, body: "final v2\n" },
+		]);
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId: SESSION });
+		expect(resolution.ok).toBe(true);
+		if (!resolution.ok) return;
+		expect(resolution.descriptor.finalSha256).toBe(sha256("final v2\n"));
+		expect(resolution.descriptor.plannerSha256).toBe(sha256("revision v2\n"));
+		expect(resolution.descriptor.reviewerSha256).toEqual({
+			architect: sha256("architect v2\n"),
+			critic: sha256("critic v2\n"),
+		});
+	});
+
+	it("refuses a same-pass final whose reviewers were recorded before its revision", async () => {
+		// architect and critic have stageN=2 but appear before revision in index order,
+		// so they are not "after the opener" in document order.
+		await writeRun([
+			{ stage: "planner", stageN: 1, body: "plan v1\n" },
+			{ stage: "architect", stageN: 2, body: "architect v2\n" },
+			{ stage: "critic", stageN: 2, body: "critic v2\n" },
+			{ stage: "revision", stageN: 2, body: "revision v2\n" },
+			{ stage: "final", stageN: 2, body: "final v2\n" },
+		]);
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId: SESSION });
+		expect(resolution.ok).toBe(false);
+		if (resolution.ok) return;
+		expect(resolution.refusal.code).toBe("missing_reviewers");
+	});
+
+	it("refuses a same-pass final followed by another stage of that pass", async () => {
+		// A revision appended after final2 means final2 is no longer the last row.
+		await writeRun([
+			{ stage: "planner", stageN: 1, body: "plan v1\n" },
+			{ stage: "revision", stageN: 2, body: "revision v2\n" },
+			{ stage: "architect", stageN: 2, body: "architect v2\n" },
+			{ stage: "critic", stageN: 2, body: "critic v2\n" },
+			{ stage: "post-interview", stageN: 2, body: "post-interview v2\n" },
+			{ stage: "final", stageN: 2, body: "final v2\n" },
+			{ stage: "revision", stageN: 2, body: "revision v2b\n" },
+		]);
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId: SESSION });
+		expect(resolution.ok).toBe(false);
+		if (resolution.ok) return;
+		expect(resolution.refusal.code).toBe("final_not_last");
+	});
+	it("refuses a final appended after a newer-pass stage", async () => {
+		// planner1, architect1, critic1 belong to pass 1.
+		// revision3, architect3, critic3 belong to pass 3.
+		// final2 was recorded for pass 2, but pass 3 stages exist in the index —
+		// stageN 3 > finalRow.stageN 2, so the final is not the latest.
+		await writeRun([
+			{ stage: "planner", stageN: 1, body: "plan v1\n" },
+			{ stage: "architect", stageN: 1, body: "architect v1\n" },
+			{ stage: "critic", stageN: 1, body: "critic v1\n" },
+			{ stage: "revision", stageN: 3, body: "revision v3\n" },
+			{ stage: "architect", stageN: 3, body: "architect v3\n" },
+			{ stage: "critic", stageN: 3, body: "critic v3\n" },
+			{ stage: "final", stageN: 2, body: "final v2\n" },
+		]);
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId: SESSION });
+		expect(resolution.ok).toBe(false);
+		if (resolution.ok) return;
+		expect(resolution.refusal.code).toBe("final_not_last");
+	});
 });
 
 const ORDINARY_ASK = { questions: [{ id: "q", question: "Which way?", options: [{ label: "A" }] }] };
@@ -279,5 +352,19 @@ describe("ralplan execution approval through the ultragoal ask guard", () => {
 		await expect(
 			assertUltragoalAskAllowed(cwd, { sessionId: SESSION }, undefined, RALPLAN_APPROVAL_ASK),
 		).rejects.toThrow(/refused the ralplan execution approval: no ralplan run state/);
+	});
+	it("admits the approval ask for a per-pass stage_n final", async () => {
+		await createUltragoalPlan({ cwd, brief: "Implement the repair", sessionId: SESSION });
+		await writeRun([
+			{ stage: "planner", stageN: 1, body: "plan v1\n" },
+			{ stage: "revision", stageN: 2, body: "revision v2\n" },
+			{ stage: "architect", stageN: 2, body: "architect v2\n" },
+			{ stage: "critic", stageN: 2, body: "critic v2\n" },
+			{ stage: "post-interview", stageN: 2, body: "post-interview v2\n" },
+			{ stage: "final", stageN: 2, body: "final v2\n" },
+		]);
+		await expect(
+			assertUltragoalAskAllowed(cwd, { sessionId: SESSION }, undefined, RALPLAN_APPROVAL_ASK),
+		).resolves.toBeUndefined();
 	});
 });

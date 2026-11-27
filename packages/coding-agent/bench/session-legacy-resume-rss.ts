@@ -11,6 +11,7 @@
  *   bun --expose-gc packages/coding-agent/bench/session-legacy-resume-rss.ts
  */
 
+import { mulberry32 } from "../test/helpers/seeded-random";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -89,16 +90,6 @@ function parseArgs(argv: string[]): CliArgs {
 	return args;
 }
 
-function mulberry32(seed: number): () => number {
-	let state = seed;
-	return () => {
-		state |= 0;
-		state = (state + 0x6d2b79f5) | 0;
-		let value = Math.imul(state ^ (state >>> 15), 1 | state);
-		value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
-		return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
-	};
-}
 
 function deterministicText(seed: number, bytes: number): string {
 	const next = mulberry32(seed);

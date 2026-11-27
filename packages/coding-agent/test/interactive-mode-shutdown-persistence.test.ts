@@ -8,6 +8,7 @@ import { InteractiveMode } from "../src/modes/interactive-mode";
 import { initTheme } from "../src/modes/theme/theme";
 import { AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 
 describe("interactive shutdown persistence", () => {
@@ -76,5 +77,41 @@ describe("interactive shutdown persistence", () => {
 		await mode.shutdown();
 		expect(quit).toHaveBeenCalledWith(0);
 		expect(stderr.mock.calls.map(call => String(call[0])).join("")).not.toContain("Shutdown incomplete:");
+	});
+
+	test("quits cleanly from a session whose transcript another process changed", async () => {
+		const root = tempDir.path();
+		const destination = () => SessionManager.managedDestination(root, path.join(root, "agent"));
+		const writerA = SessionManager.create(root, destination());
+		writerA.appendMessage({ role: "user", content: "from A", timestamp: 1 });
+		await writerA.ensureOnDisk();
+		const file = writerA.getSessionFile();
+		if (!file) throw new Error("Expected a persisted transcript");
+		const writerB = await SessionManager.open(file, destination());
+		writerB.appendMessage({ role: "user", content: "from B", timestamp: 2 });
+		await writerB.flush();
+		await writerB.close();
+		expect(() => writerA.appendMessage({ role: "user", content: "refused", timestamp: 3 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		const peerTranscript = await Bun.file(file).text();
+		mode.stop();
+		await session.dispose();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { tools: [], messages: [] } }),
+			sessionManager: writerA,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(auth, path.join(root, "models.json")),
+		});
+		mode = new InteractiveMode(session, "test");
+		vi.spyOn(mode.ui.terminal, "drainInput").mockResolvedValue();
+		vi.spyOn(mode, "stop").mockImplementation(() => {});
+		vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		const quit = vi.spyOn(postmortem, "quit").mockResolvedValue();
+
+		await expect(mode.shutdown()).resolves.toBeUndefined();
+
+		expect(quit).toHaveBeenCalledWith(0);
+		expect(await Bun.file(file).text()).toBe(peerTranscript);
 	});
 });

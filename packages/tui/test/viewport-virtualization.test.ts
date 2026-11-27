@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, renderMetrics, TUI } from "@gajae-code/tui";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal, visible } from "./virtual-terminal";
 
 const FLAG = "PI_TUI_VIRTUAL_VIEWPORT";
 
@@ -26,16 +26,6 @@ class CachedLines implements Component {
 	render(_width: number): string[] {
 		return this.#lines; // stable array + stable string instances for unchanged lines
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
-	await Bun.sleep(1);
-	await term.flush();
-}
-
-function visible(term: VirtualTerminal): string[] {
-	return term.getViewport().map(line => line.trimEnd());
 }
 
 describe("virtual viewport rendering (W1b / F1)", () => {

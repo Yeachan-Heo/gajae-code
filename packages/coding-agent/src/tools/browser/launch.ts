@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { getPuppeteerDir } from "@gajae-code/utils/dirs";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import * as logger from "@gajae-code/utils/logger";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { $which } from "@gajae-code/utils/which";
 import * as browsers from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
@@ -24,6 +25,7 @@ import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type
 import stealthPermissionsScript from "../puppeteer/14_stealth_permissions.txt" with { type: "text" };
 import stealthWebrtcScript from "../puppeteer/15_stealth_webrtc.txt" with { type: "text" };
 import { ToolError } from "../tool-errors";
+import * as deferredProfileCleanup from "./deferred-profile-cleanup";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
 
@@ -397,7 +399,70 @@ export interface LaunchHeadlessOptions {
 	geo?: { timezone?: string; locale?: string };
 }
 
-export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
+export interface LaunchHeadlessResult {
+	browser: Browser;
+	/**
+	 * The userDataDir gjc created when profileWarmupDir was not provided.
+	 * undefined if profileWarmupDir was used (caller-supplied dir).
+	 * When set, gjc owns this dir and must remove it after Chrome exits.
+	 */
+	createdUserDataDir?: string;
+}
+
+/**
+ * Attempt to remove a profile directory with bounded retry on transient EBUSY errors.
+ * Chrome may still hold files when launch fails or during disconnection, so retry
+ * with brief delays before giving up. Returns explicit result indicating success or failure.
+ *
+ * On EBUSY after exhausting retries, throws to signal to caller that deferral may be needed.
+ * On other errors after first attempt, logs but returns {removed: false, error}.
+ */
+export async function cleanupProfileDirWithRetry(
+	dir: string,
+	maxRetries = 10,
+	delay = 50,
+): Promise<{ removed: true } | { removed: false; error: Error }> {
+	let lastErr: Error | undefined;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+			if (attempt > 0) {
+				logger.debug("Successfully cleaned up headless profile dir after retry", {
+					dir,
+					attempt,
+				});
+			}
+			return { removed: true };
+		} catch (err) {
+			lastErr = err as Error;
+			const isEBUSY = lastErr.message.includes("EBUSY");
+			if (!isEBUSY) {
+				// Not a transient EBUSY. Log and return failure.
+				logger.debug("Failed to clean up headless profile dir (non-transient error)", {
+					dir,
+					attempt,
+					error: lastErr.message,
+				});
+				return { removed: false, error: lastErr };
+			}
+			if (attempt === maxRetries) {
+				// Exhausted retries on EBUSY. Log and rethrow to signal deferral.
+				logger.debug("Exhausted retries for profile dir cleanup due to EBUSY", {
+					dir,
+					attempt,
+					error: lastErr.message,
+				});
+				throw lastErr;
+			}
+			// Transient EBUSY: wait a bit and retry
+			await Bun.sleep(delay);
+		}
+	}
+	// Fallthrough (should not reach here with current loop logic)
+	return { removed: false, error: lastErr ?? new Error("Cleanup failed with unknown error") };
+}
+
+export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
 	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
 	const initialViewport = {
 		width: vp.width,
@@ -405,6 +470,17 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
 	};
 	const puppeteer = await loadPuppeteer();
+
+	// Create userDataDir if not provided. This prevents puppeteer from creating
+	// its own temp profile which can fail to clean up with EBUSY on Windows (#8076).
+	// When we pass userDataDir to puppeteer.launch(), it won't try to remove it.
+	let userDataDir = opts.profileWarmupDir;
+	let createdUserDataDir: string | undefined;
+	if (!userDataDir) {
+		userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-headless-profile-"));
+		createdUserDataDir = userDataDir;
+	}
+
 	const launchArgs = [
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
@@ -414,11 +490,8 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		// interface only; 15_stealth_webrtc.txt adds a candidate-level guard.
 		"--force-webrtc-ip-handling-policy=default_public_interface_only",
 		`--window-size=${initialViewport.width},${initialViewport.height}`,
+		`--user-data-dir=${userDataDir}`,
 	];
-	if (opts.profileWarmupDir) {
-		// Isolated copy only (caller guarantees). Never point this at a live profile.
-		launchArgs.push(`--user-data-dir=${opts.profileWarmupDir}`);
-	}
 	const proxy = trustedBrowserEnv("PUPPETEER_PROXY");
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);
@@ -436,16 +509,67 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	if (browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS")) {
 		launchArgs.push("--ignore-certificate-errors");
 	}
-	const launchEnv = opts.geo?.timezone ? { ...process.env, TZ: opts.geo.timezone } : undefined;
-	return await puppeteer.launch({
-		headless: opts.headless,
-		defaultViewport: opts.headless ? initialViewport : null,
-		executablePath: await ensureChromiumExecutable(),
-		args: launchArgs,
-		...(launchEnv ? { env: launchEnv } : {}),
-		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
-		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
-	});
+	// Puppeteer defaults the browser's environment to `process.env`, which holds
+	// the project `.env`; always pass the filtered one so a project `LD_PRELOAD`
+	// cannot load into Chromium.
+	const launchEnv: Record<string, string> = projectSafeSpawnEnv();
+	if (opts.geo?.timezone) launchEnv.TZ = opts.geo.timezone;
+
+	try {
+		const browser = await puppeteer.launch({
+			headless: opts.headless,
+			userDataDir,
+			defaultViewport: opts.headless ? initialViewport : null,
+			executablePath: await ensureChromiumExecutable(),
+			args: launchArgs,
+			env: launchEnv,
+			ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
+			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+		});
+		return { browser, createdUserDataDir };
+	} catch (err) {
+		// If launch fails and we created or were given a userDataDir, attempt cleanup with retry.
+		// Chrome may still be starting up and holding files when launch fails,
+		// so a transient EBUSY error should trigger a bounded retry, not abandon cleanup.
+		// If cleanup fails with EBUSY even after retries, hand off to deferred cleanup
+		// to prevent leaking temp directories. Preserve the original launch error regardless
+		// of cleanup outcome.
+		const dirToCleanup = createdUserDataDir || opts.profileWarmupDir;
+		if (dirToCleanup) {
+			try {
+				const cleanupResult = await cleanupProfileDirWithRetry(dirToCleanup);
+				if (!cleanupResult.removed) {
+					logger.debug("Failed to clean up profile directory after launch failure", {
+						dir: dirToCleanup,
+						error: cleanupResult.error.message,
+					});
+				}
+			} catch (cleanupErr) {
+				// If cleanup failed with EBUSY despite retries, defer the cleanup
+				const cleanupError = cleanupErr as Error;
+				if (cleanupError.message.includes("EBUSY")) {
+					try {
+						deferredProfileCleanup.deferProfileDirCleanup(dirToCleanup);
+						logger.debug("Deferred profile directory cleanup due to EBUSY", {
+							dir: dirToCleanup,
+						});
+					} catch (deferErr) {
+						logger.warn("Failed to defer profile directory cleanup", {
+							dir: dirToCleanup,
+							error: (deferErr as Error).message,
+						});
+					}
+				} else {
+					// Not EBUSY but some other error that wasn't caught above, just log it
+					logger.debug("Unexpected error from cleanup retry", {
+						dir: dirToCleanup,
+						error: cleanupError.message,
+					});
+				}
+			}
+		}
+		throw err;
+	}
 }
 
 export async function applyViewport(

@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getPluginsLockfile, getPluginsNodeModules, getPluginsPackageJson, isEnoent } from "@gajae-code/utils";
 import { getConfigDirPaths } from "../../config";
+import { installedPluginNames } from "./installed-names";
 import { installLegacyPiSpecifierShim } from "./legacy-pi-compat";
 import type { InstalledPlugin, PluginManifest, PluginRuntimeConfig, ProjectPluginOverrides } from "./types";
 
@@ -50,12 +51,12 @@ async function loadProjectOverrides(cwd: string): Promise<ProjectPluginOverrides
  */
 export async function getEnabledPlugins(cwd: string): Promise<InstalledPlugin[]> {
 	const pkgJsonPath = getPluginsPackageJson();
-	let pkg: { dependencies?: Record<string, string> };
+	// A missing package.json is not "nothing installed": `plugin link` never creates it.
+	let pkg: { dependencies?: Record<string, string> } = {};
 	try {
 		pkg = await Bun.file(pkgJsonPath).json();
 	} catch (err) {
-		if (isEnoent(err)) return [];
-		throw err;
+		if (!isEnoent(err)) throw err;
 	}
 
 	const nodeModulesPath = getPluginsNodeModules();
@@ -63,11 +64,10 @@ export async function getEnabledPlugins(cwd: string): Promise<InstalledPlugin[]>
 		return [];
 	}
 
-	const deps = pkg.dependencies || {};
 	const runtimeConfig = await loadRuntimeConfig();
 	const projectOverrides = await loadProjectOverrides(cwd);
 	const plugins: InstalledPlugin[] = [];
-	for (const [name] of Object.entries(deps)) {
+	for (const name of installedPluginNames(pkg.dependencies, runtimeConfig)) {
 		const pluginPkgPath = path.join(nodeModulesPath, name, "package.json");
 		let pluginPkg: { version: string; gjc?: PluginManifest; pi?: PluginManifest };
 		try {

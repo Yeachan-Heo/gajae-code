@@ -95,6 +95,18 @@ export declare class DoctorJournalAuthority {
 }
 
 /**
+ * A held kernel lock. It ends on `release()`, when the handle is garbage
+ * collected, or when the process exits. Release closes the descriptor
+ * synchronously, with no time budget.
+ */
+export declare class FileLock {
+  /** Whether this handle still holds its lock. */
+  get held(): boolean
+  /** Release the lock. Idempotent. */
+  release(): void
+}
+
+/**
  * Long-lived macOS appearance observer.
  *
  * Subscribes to `AppleInterfaceThemeChangedNotification` via
@@ -414,7 +426,8 @@ export declare class Process {
    * Unlike [`Self::from_pid`] returning `null` (which conflates a confirmed-
    * dead pid with one that simply could not be queried), this keeps positive
    * OS-reported absence separate from every inconclusive outcome. It never
-   * signals, kills, reaps, waits on, or spawns any process.
+   * signals, kills, reaps, blocks waiting for, or spawns any process. Windows
+   * checks exit state with a zero-timeout wait on its own handle.
    */
   static observe(pid: number): NativeProcessObservation
   /** Operating-system process identifier for this process reference. */
@@ -686,7 +699,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_19_0(): void
+export declare function __piNativesV0_22_2(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -770,6 +783,8 @@ export interface AstFindOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Aggregated search statistics and any parse or compile diagnostics. */
@@ -930,6 +945,8 @@ export interface AstReplaceOptions {
   signal?: unknown
   /** Wall-clock timeout for the worker task in milliseconds. */
   timeoutMs?: number
+  /** When true, `path` was already checked and is not trimmed. */
+  literalPath?: boolean
 }
 
 /** Summary of an ast-grep rewrite pass, including whether disk writes occurred. */
@@ -1386,6 +1403,61 @@ export interface ExtractSegmentsResult {
   after: string
   /** Visible width of the `after` segment. */
   afterWidth: number
+}
+
+/** Result of `tryAcquireFileLock`. */
+export interface FileLockAcquireResult {
+  status: FileLockAcquireStatus
+  /** Present only when `status` is `acquired`. */
+  lock?: FileLock
+  /**
+   * Stable failure code: an errno name such as `EACCES`, or one of
+   * `not_regular_file`, `foreign_owner`, `not_owner_only`, `multiple_links`,
+   * `unsupported_platform`, `timed_out`, `invalid_path`, `panic`.
+   */
+  code?: string
+  message?: string
+}
+
+/** Outcome of `tryAcquireFileLock`. */
+export declare enum FileLockAcquireStatus {
+  Acquired = 'acquired',
+  /** Another lock handle holds it, in this process or another one. */
+  Held = 'held',
+  Unavailable = 'unavailable',
+  TimedOut = 'timed_out',
+  Failed = 'failed'
+}
+
+/** Why a call has no answer. */
+export declare enum FileLockFailure {
+  /** No lock is possible here; callers may fail open. */
+  Unavailable = 'unavailable',
+  /** The call exceeded its time budget; no lock is held. */
+  TimedOut = 'timed_out',
+  /**
+   * Any other error, including permission, ownership and symlink refusals;
+   * callers must fail closed.
+   */
+  Failed = 'failed'
+}
+
+/** Result of `probeFileLock`. */
+export interface FileLockProbeResult {
+  state: FileLockProbeState
+  /** Present only when `state` is `unknown`. */
+  reason?: FileLockFailure
+  code?: string
+  message?: string
+}
+
+/** State reported by `probeFileLock`. */
+export declare enum FileLockProbeState {
+  Free = 'free',
+  /** A lock handle holds it, in this process or another one. */
+  Held = 'held',
+  /** The probe has no answer; see `reason`. */
+  Unknown = 'unknown'
 }
 
 /** Resolved filesystem entry kind for glob filters and match metadata. */
@@ -2302,6 +2374,24 @@ export interface NativeExactUnlinkResult {
    * namespace mutation.
    */
   windowsErrorCode?: string
+  /**
+   * ACL failure details: offending principal (account name or SID string).
+   * Present only when code is `acl_present` on Windows exact-replace
+   * pre-mutation failures.
+   */
+  aclFailurePrincipal?: string
+  /**
+   * ACL failure detail: whether the offending ACE is inherited from a parent
+   * directory. Present only when code is `acl_present` on Windows
+   * exact-replace pre-mutation failures.
+   */
+  aclFailureInherited?: boolean
+  /**
+   * ACL failure detail: identifies which path failed ACL validation
+   * (`source` or `destination`). Present only when code is `acl_present` on
+   * Windows exact-replace pre-mutation failures.
+   */
+  aclFailureSide?: string
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */
@@ -2314,6 +2404,16 @@ export interface NativeNoReplaceResult {
   primitive: string
   phase: string
   diagnostic: NativePublishDiagnostic
+}
+
+/**
+ * Bounded, read-only owner-private file bytes. Failures never contain paths or
+ * bytes.
+ */
+export interface NativeOwnerOnlyFileReadResult {
+  ok: boolean
+  data?: Uint8Array
+  code?: string
 }
 
 /** Result of applying or checking owner-only path security. */
@@ -2421,7 +2521,8 @@ export interface NativePermissionRepairResult {
  * - `"present"` — `incarnation` is the exact kernel-reported identity
  *   evidence.
  * - `"absent"` — the OS positively confirmed no process currently has this
- *   pid.
+ *   pid, or (Windows) that the process has exited while a handle still keeps
+ *   its object queryable.
  * - `"unknown"` — `reasonCode` explains why liveness could not be determined
  *   (e.g. an invalid pid, a permission denial, or a platform limitation); this
  *   is never proof of death.
@@ -2573,6 +2674,18 @@ export interface PresentationLease {
   registrationEpoch: number
 }
 
+/**
+ * Report whether any lock handle, in any process including this one, holds
+ * the lock at `path`, without taking it.
+ *
+ * A missing sidecar is `free` and is not created. The probe is a read-lock
+ * query (`F_OFD_GETLK` on Linux, `F_GETLK` on macOS, which also reports
+ * `flock` holders there), so it never takes the lock and a shared holder reads
+ * as `free`. `timeoutMs` bounds the caller's wait (default 2000, clamped to
+ * 1-60000).
+ */
+export declare function probeFileLock(path: string, timeoutMs?: number | undefined | null): Promise<FileLockProbeResult>
+
 export declare function probeWindowsJobMemory(): WindowsJobMemoryProbeResult
 
 /** Current state of a process reference. */
@@ -2670,6 +2783,27 @@ export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxH
  * Returns an error if clipboard access fails or image encoding fails.
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
+
+/**
+ * Read a private regular file under a private lifecycle directory on
+ * macOS/Linux.
+ *
+ * `max_bytes` must be an integer in 1..=65536. Both
+ * same-descriptor reads are bounded; no path, digest, descriptor, or partial
+ * bytes are returned on failure.
+ */
+export declare function readOwnerOnlyFile(path: string, maxBytes: number): NativeOwnerOnlyFileReadResult
+
+/**
+ * Re-apply raw mode to `fd` when a direct termios change left it cooked.
+ *
+ * Applies the transform Bun's `setRawMode(true)` uses (libuv's
+ * `UV_TTY_MODE_RAW`) to the live termios with `TCSANOW`, so the tty never
+ * enters an echoing mode. Returns `true` when it had to restore raw mode.
+ * Returns `false` when the tty was already raw, and in that case issues no
+ * `tcsetattr`. Throws when `fd` is not a tty and on non-Unix hosts.
+ */
+export declare function reassertRawTty(fd: number): boolean
 
 export interface RecoveryFsIdentity {
   dev: string
@@ -2821,6 +2955,14 @@ export interface ReplyEvent {
   /** One-shot receipt binding this callback to the atomically claimed reply. */
   replyReceiptId: string
 }
+
+/**
+ * Re-assert the console code pages recorded before the first shell command.
+ *
+ * The Windows TUI calls this before each frame, because a background shell
+ * child sharing the console may have switched them (#7760). No-op elsewhere.
+ */
+export declare function restoreConsoleCodePagesForRender(): void
 
 /**
  * Retain the existing no-follow SDK publication objects after one-time
@@ -3053,6 +3195,16 @@ export declare function supportsLanguage(lang: string): boolean
 export declare function truncateLinesToWidth(lines: Array<string>, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): Array<string>
 
 export declare function truncateToWidth(text: string, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): string
+
+/**
+ * Try to take an exclusive lock on the sidecar at `path` without waiting.
+ *
+ * Creates the sidecar (mode 0600) when missing. The sidecar must be a
+ * regular file owned by this user, with no group or other permission bits and
+ * one link, reached without following a symlink. `timeoutMs` bounds the
+ * caller's wait (default 2000, clamped to 1-60000).
+ */
+export declare function tryAcquireFileLock(path: string, timeoutMs?: number | undefined | null): Promise<FileLockAcquireResult>
 
 /**
  * Verify owner-only security for the exact caller descriptor and retained

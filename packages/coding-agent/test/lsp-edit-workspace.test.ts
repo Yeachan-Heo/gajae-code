@@ -1,12 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertInsideWorkspace } from "../src/lsp/workspace-path";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const tempDirs = trackTempDirs();
 
 describe("assertInsideWorkspace", () => {
 	it("allows a workspace file and rejects a symlink that leaves it", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "lsp-edit-"));
+		const root = await tempDirs.mkdtemp(path.join(tmpdir(), "lsp-edit-"));
 		const workspace = path.join(root, "repo");
 		await mkdir(workspace);
 		const inside = path.join(workspace, "note.txt");
@@ -21,7 +24,7 @@ describe("assertInsideWorkspace", () => {
 	});
 
 	it("allows a new file whose parent does not exist yet and rejects one under an outside link", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "lsp-edit-new-"));
+		const root = await tempDirs.mkdtemp(path.join(tmpdir(), "lsp-edit-new-"));
 		const workspace = path.join(root, "repo");
 		await mkdir(path.join(workspace, "src"), { recursive: true });
 		const created = path.join(workspace, "src", "newdir", "a.ts");

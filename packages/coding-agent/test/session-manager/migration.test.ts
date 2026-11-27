@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
-import {
-	CURRENT_SESSION_VERSION,
-	type FileEntry,
-	migrateSessionEntries,
-} from "@gajae-code/coding-agent/session/session-manager";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
+import { type FileEntry, migrateSessionEntries } from "@gajae-code/coding-agent/session/session-manager";
 
 function v1Messages(): FileEntry[] {
 	return [

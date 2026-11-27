@@ -15,12 +15,68 @@ gjc_session_git_dirty_boolean() {
 }
 
 
+# Owner lifecycle state is written by pathname. Before each write, refuse a
+# directory whose existing components, walked from the filesystem root with
+# lstat, are not all real directories, and a named file that exists as anything
+# but a single-link regular file. These are pathname checks, like the TypeScript
+# writers': a component swapped after it was inspected is not detected.
+# The path is walked as spelled, the way the writer will open it, so a `..`
+# component (which the kernel resolves through a preceding link) is refused.
+#   gjc_session_require_private_path <directory> [<file>...]
+#   gjc_session_require_private_path --create <directory>
+# --create makes each missing component owner-only, checking it as it goes.
+gjc_session_require_private_path() {
+  python3 - "$@" <<'PY'
+import os, stat, sys
+args = sys.argv[1:]
+create = args[:1] == ["--create"]
+if create: args = args[1:]
+if not args or (create and len(args) != 1): raise SystemExit("usage: gjc_session_require_private_path [--create] <directory> [<file>...]")
+def native(target):
+    # macOS resolves only its system aliases; every other link is refused.
+    if sys.platform == "darwin":
+        for alias in ("/var", "/tmp", "/etc"):
+            if target == alias or target.startswith(f"{alias}/"): return f"/private{target}"
+    return target
+def spelled(target):
+    # No normalization: os.path.abspath would fold `link/..` lexically.
+    return target if os.path.isabs(target) else os.path.join(os.getcwd(), target)
+def walk(directory):
+    components = [component for component in spelled(directory).split("/") if component not in ("", ".")]
+    if ".." in components: raise SystemExit(f"unsafe owner lifecycle path: {directory}")
+    current = "/"
+    # Without `..`, dropping empty and `.` components names the same file.
+    for component in native("/" + "/".join(components)).split("/"):
+        if not component: continue
+        current = os.path.join(current, component)
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            if not create: return
+            try: os.mkdir(current, 0o700)
+            except FileExistsError: pass
+            mode = os.lstat(current).st_mode
+        if not stat.S_ISDIR(mode): raise SystemExit(f"unsafe owner lifecycle path: {current}")
+try:
+    walk(args[0])
+    for file in args[1:]:
+        walk(os.path.dirname(spelled(file)))
+        try: info = os.lstat(file)
+        except FileNotFoundError: continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise SystemExit(f"unsafe owner lifecycle path: {file}")
+except OSError as error:
+    raise SystemExit(f"unsafe owner lifecycle path: {error.strerror}")
+PY
+}
+
+
 gjc_session_write_public_marker() {
   local path="${1:?marker path required}"
   local kind="${2:?marker kind required}"
   local session="${3:?session required}"
   local generation="${4:?generation required}"
-  mkdir -p "$(dirname "$path")"
+  gjc_session_require_private_path --create "$(dirname "$path")" || return 1
+  gjc_session_require_private_path "$(dirname "$path")" "$path" || return 1
   python3 - "$path" "$kind" "$session" "$generation" <<'PY'
 import json
 import os
@@ -93,6 +149,8 @@ PY
   local generation="${5:?generation required}"
   local kind="${6:-}"
   local transition_lock="${generation_path%.json}.transition.lock"
+  gjc_session_require_private_path "$(dirname "$alias_path")" "$alias_path" || return 1
+  gjc_session_require_private_path "$(dirname "$generation_path")" "$transition_lock" "$(dirname "$generation_path")/owner-locks.sqlite" || return 1
   if [[ "${GJC_SESSION_TRANSITION_LOCK_HELD:-0}" != 1 ]]; then
     exec {gjc_alias_lock_fd}>"$transition_lock"
     flock -x "$gjc_alias_lock_fd"
@@ -106,6 +164,7 @@ canonical_path, alias_path, generation_path, session, generation, kind = sys.arg
 lock_path = os.path.join(os.path.dirname(generation_path), "owner-locks.sqlite")
 database = sqlite3.connect(lock_path, timeout=7)
 temporary = f"{alias_path}.{os.getpid()}.tmp"
+created = False
 try:
     os.chmod(lock_path, 0o600)
     database.execute("BEGIN IMMEDIATE")
@@ -119,13 +178,15 @@ try:
     if kind: alias["kind"] = kind
     if kind == "owner_incident": alias["incident_dedupe"] = f"{session}:{generation}"
     with open(temporary, "x", encoding="utf-8") as handle:
+        created = True
         json.dump(alias, handle, separators=(",", ":")); handle.write("\n")
     os.replace(temporary, alias_path)
     database.commit()
 except Exception:
     database.rollback()
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
+    if created:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
     raise
 finally:
     database.close()
@@ -148,7 +209,9 @@ PY
   local prompt_accepted="${7:-false}"
   local final_present="${8:-false}"
   local generation="${9:?generation required}"
-  mkdir -p "$(dirname "$vanished_json")"
+  gjc_session_require_private_path --create "$(dirname "$vanished_json")" || return 1
+  # The record is published with an exclusive link, so an existing leaf is only
+  # read and compared; its own link count is legitimately 2 while a peer publishes.
   python3 - "$vanished_json" "$session" "$workdir" "$reason" "$phase" "$severity" "$prompt_accepted" "$final_present" "$generation" <<'PY'
 import json
 import os

@@ -1,10 +1,57 @@
 import { describe, expect, it } from "bun:test";
-import { scanPublicCommand } from "../src/cli/public-command-entry";
+import { Command } from "@gajae-code/utils/cli";
+import { dispatchPublicCommand, scanPublicCommand } from "../src/cli/public-command-entry";
 
 const id = "a".repeat(32);
 const sha256 = "b".repeat(64);
 
 describe("inert public command entry scanner", () => {
+	it("forwards JSON to broker attestation but preserves the broker run argv", async () => {
+		const received: string[][] = [];
+		class CaptureCommand extends Command {
+			async run(): Promise<void> {
+				received.push([...this.argv]);
+			}
+		}
+		const agentDir = "/tmp/gjc-attestation-boundary-test";
+		for (const argv of [
+			[
+				"broker",
+				"attest-spawn-anchors",
+				"--agent-dir",
+				agentDir,
+				"--evidence",
+				"first",
+				"--evidence",
+				"second",
+				"--json",
+			],
+			["broker", "run", "--agent-dir", agentDir, "--json"],
+		]) {
+			await dispatchPublicCommand(argv, {
+				command: "sdk",
+				bin: "gjc",
+				version: "test",
+				load: async () => CaptureCommand,
+			});
+		}
+		expect(received).toEqual([
+			[
+				"broker",
+				"attest-spawn-anchors",
+				"--agent-dir",
+				agentDir,
+				"--evidence",
+				"first",
+				"--evidence",
+				"second",
+				"--json",
+			],
+			["broker", "run", "--agent-dir", agentDir],
+		]);
+		expect(scanPublicCommand("sdk", received[0]!).flags.evidence).toEqual(["first", "second"]);
+	});
+
 	it("resolves deepest exact paths and leaves operation IDs as operands", () => {
 		const result = scanPublicCommand("sdk", [
 			"session",

@@ -27,8 +27,10 @@ Generated local-memory artifacts are private runtime state, not a public tool or
 | Subcommand            | Effect                                         |
 | --------------------- | ---------------------------------------------- |
 | `view`                | Show the current memory injection payload      |
-| `clear` / `reset`     | Delete all memory data and generated artifacts |
+| `clear` / `reset`     | Delete every memory row and memory job in the shared database, and only the current project's directory |
 | `enqueue` / `rebuild` | Force consolidation to run at next startup     |
+
+`/memory clear` and `/memory reset` delete every memory row and memory job in the shared local database; the delete is not limited to the current project. Filesystem cleanup removes only the memory directory for the current project path. That directory name replaces `/`, `\`, and `:` with `-`, so project paths that differ only in those characters (for example `/var/proj/alpha` and `/var/proj-alpha`) share one directory, and clearing either removes it. Backend `clear` follows the same rule for the local store.
 
 ## How it works
 

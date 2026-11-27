@@ -55,6 +55,7 @@ function createContext(options: {
 			getSessionFile: () => "/tmp/project/sessions/active.jsonl",
 			getSessionId: () => "session-id",
 			isManagedDestination: () => false,
+			switchTargetAdmission: () => undefined,
 		},
 		statusContainer: { clear: vi.fn() },
 		pendingMessagesContainer: { clear: vi.fn() },

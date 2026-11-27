@@ -1,6 +1,8 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import * as z from "zod/v4";
+import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import bisectDescription from "../prompts/tools/bisect.md" with { type: "text" };
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
@@ -172,8 +174,11 @@ async function evaluatePredicate(
 		// Re-check at the checked-out candidate. The pre-start check reads scripts
 		// from the starting tree; bisect then checks out another commit.
 		await assertPredicateDoesNotInjectTmux(run, cwd, signal);
+		// Same environment as a bash tool command: without `env`, Bun hands the
+		// predicate the autoloaded project `.env` (hook variables included).
 		const child = Bun.spawn(["sh", "-c", run], {
 			cwd,
+			env: { ...projectSafeSpawnEnv(), ...NON_INTERACTIVE_ENV },
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",

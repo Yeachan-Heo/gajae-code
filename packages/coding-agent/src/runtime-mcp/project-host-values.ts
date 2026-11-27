@@ -25,11 +25,23 @@ export function nativeMcpSource(level: "user" | "project", filePath: string): So
  * True when this server was loaded from untrusted project MCP config.
  * Every project-level provider is untrusted, including providers other than
  * native `.gjc/mcp.json` and repo-root `mcp.json`. User scope and a tools-only
- * load stay on the previous path.
+ * load stay on the previous path, except an explicit lifecycle origin below.
  */
 export function isUntrustedProjectMcpSource(source: SourceMeta | undefined, toolsOnly: boolean): boolean {
 	if (toolsOnly || !source || source.level !== "project") return false;
 	return true;
+}
+
+/**
+ * Lifecycle `mcpServers` are written to a tools-only file. That load is
+ * project-level and tools-only, so the short-circuit above would treat
+ * model-supplied `!` and sensitive host names as trusted. Only the origin
+ * flag the lifecycle host sets counts. A caller-selected exact config stays
+ * trusted even when an ancestor directory uses the lifecycle prefix.
+ */
+export function isUntrustedLifecycleToolsOnlySource(source: SourceMeta | undefined, toolsOnly: boolean): boolean {
+	if (!toolsOnly || source?.level !== "project") return false;
+	return source.lifecycleOrigin === true;
 }
 
 export type ProjectHostValueDecision =

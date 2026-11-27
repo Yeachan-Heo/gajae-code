@@ -50,6 +50,69 @@ async function expectIntegrationBase(root: string, ref: string, base: string): P
 
 describe("ultragoal Git integration base resolution", () => {
 	it.each([
+		"dev",
+		"develop",
+		"main",
+		"master",
+		"origin/dev",
+		"origin/develop",
+		"origin/main",
+		"origin/master",
+		"refs/heads/dev",
+		"refs/remotes/origin/dev",
+	])("ignores tag-only default candidate %s and fails closed without a branch baseline", async candidate => {
+		await withIntegrationFixture(async root => {
+			await fixtureGit(root, "branch", "-m", "feature");
+			await commitFixtureFile(root, "feature.txt");
+			await fixtureGit(root, "tag", candidate);
+			await expect(resolveGitBase(root)).rejects.toThrow("unable to resolve an authoritative integration base");
+			await expect(computeCheckpointChangeSet(root)).rejects.toThrow(
+				"unable to resolve an authoritative integration base",
+			);
+		});
+	});
+
+	it.each([
+		"dev",
+		"develop",
+		"main",
+		"master",
+		"origin/dev",
+		"origin/develop",
+		"origin/main",
+		"origin/master",
+	])("captures committed paths despite a tag shadowing branch candidate %s", async candidate => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "branch", "-m", "feature");
+			const ref = candidate.startsWith("origin/") ? `refs/remotes/${candidate}` : `refs/heads/${candidate}`;
+			await fixtureGit(root, "update-ref", ref, baseline);
+			await commitFixtureFile(root, "feature.txt");
+			await fixtureGit(root, "tag", candidate);
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths.map(row => row.path)).toEqual(["feature.txt"]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+			expect(changeSet?.rawDiff).toContain("+feature.txt");
+		});
+	});
+
+	it.each([
+		"refs/heads/dev",
+		"refs/remotes/origin/dev",
+	])("ignores qualified-looking tag %s when a genuine branch baseline exists", async candidate => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "checkout", "-b", "feature");
+			await commitFixtureFile(root, "feature.txt");
+			await fixtureGit(root, "tag", candidate);
+			await expectIntegrationBase(root, "refs/heads/develop", baseline);
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths.map(row => row.path)).toEqual(["feature.txt"]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+		});
+	});
+
+	it.each([
 		"develop",
 		"dev",
 		"main",
@@ -57,8 +120,8 @@ describe("ultragoal Git integration base resolution", () => {
 	])("excludes checked-out local %s and captures committed changes beyond a distinct ancestor", async branch => {
 		await withIntegrationFixture(async (root, baseline) => {
 			await fixtureGit(root, "branch", "-m", branch);
-			const integration = branch === "main" ? "dev" : "main";
-			await fixtureGit(root, "branch", integration);
+			const integration = branch === "main" ? "refs/heads/dev" : "refs/heads/main";
+			await fixtureGit(root, "update-ref", integration, baseline);
 			await commitFixtureFile(root, "feature.txt");
 			await expectIntegrationBase(root, integration, baseline);
 
@@ -113,7 +176,7 @@ describe("ultragoal Git integration base resolution", () => {
 			await Bun.write(path.join(root, "baseline.txt"), "changed\n");
 
 			const changeSet = await computeCheckpointChangeSet(root);
-			expect(changeSet?.baseRef).toBe("dev");
+			expect(changeSet?.baseRef).toBe("refs/heads/dev");
 			expect(changeSet?.mergeBase).toBe(await fixtureGit(root, "rev-parse", "HEAD"));
 			expect(changeSet?.paths).toEqual([
 				{ path: "baseline.txt", oldPath: undefined, status: "modified", category: "other" },
@@ -128,7 +191,7 @@ describe("ultragoal Git integration base resolution", () => {
 		await withIntegrationFixture(async (root, baseline) => {
 			await fixtureGit(root, "update-ref", "refs/remotes/origin/develop", baseline);
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "origin/develop", baseline);
+			await expectIntegrationBase(root, "refs/remotes/origin/develop", baseline);
 		});
 	});
 
@@ -136,7 +199,7 @@ describe("ultragoal Git integration base resolution", () => {
 		await withIntegrationFixture(async root => {
 			await commitFixtureFile(root, "feature.txt");
 			await fixtureGit(root, "branch", "dev");
-			expect(await resolveGitBase(root)).toBe("dev");
+			expect(await resolveGitBase(root)).toBe("refs/heads/dev");
 		});
 	});
 
@@ -152,7 +215,7 @@ describe("ultragoal Git integration base resolution", () => {
 		await withIntegrationFixture(async (root, baseline) => {
 			await fixtureGit(root, "checkout", "--detach");
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "develop", baseline);
+			await expectIntegrationBase(root, "refs/heads/develop", baseline);
 		});
 	});
 
@@ -160,10 +223,10 @@ describe("ultragoal Git integration base resolution", () => {
 		await withIntegrationFixture(async (root, baseline) => {
 			await fixtureGit(root, "checkout", "-b", "feature");
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "develop", baseline);
+			await expectIntegrationBase(root, "refs/heads/develop", baseline);
 
 			const changeSet = await computeCheckpointChangeSet(root);
-			expect(changeSet?.baseRef).toBe("develop");
+			expect(changeSet?.baseRef).toBe("refs/heads/develop");
 			expect(changeSet?.mergeBase).toBe(baseline);
 			expect(changeSet?.paths).toEqual([
 				{ path: "feature.txt", oldPath: undefined, status: "added", category: "other" },
@@ -180,7 +243,7 @@ describe("ultragoal Git integration base resolution", () => {
 			await fixtureGit(root, "checkout", "-b", "feature");
 			await fixtureGit(root, "branch", "-D", "develop");
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "origin/develop", baseline);
+			await expectIntegrationBase(root, "refs/remotes/origin/develop", baseline);
 		});
 	});
 
@@ -191,7 +254,7 @@ describe("ultragoal Git integration base resolution", () => {
 			const base = await commitFixtureFile(root, "integration.txt");
 			await fixtureGit(root, "checkout", "-b", "feature");
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "develop", base);
+			await expectIntegrationBase(root, "refs/heads/develop", base);
 		});
 	});
 
@@ -202,7 +265,7 @@ describe("ultragoal Git integration base resolution", () => {
 			const base = await commitFixtureFile(root, "integration.txt");
 			await fixtureGit(root, "checkout", "-b", "feature");
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "dev", base);
+			await expectIntegrationBase(root, "refs/heads/dev", base);
 		});
 	});
 
@@ -215,7 +278,7 @@ describe("ultragoal Git integration base resolution", () => {
 			await fixtureGit(root, "checkout", "-b", "feature");
 			await fixtureGit(root, "branch", "-D", "develop");
 			await commitFixtureFile(root, "feature.txt");
-			await expectIntegrationBase(root, "origin/dev", baseline);
+			await expectIntegrationBase(root, "refs/remotes/origin/dev", baseline);
 		});
 	});
 

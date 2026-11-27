@@ -337,6 +337,10 @@ export function formatLifecycleOutcome(r: SessionLifecycleResponse, verb?: Lifec
 			return "\u26a0\ufe0f Close refused: that session is not GJC-managed or did not match.";
 		case "not_found":
 			return "\u2753 No matching session was found.";
+		case "live_session":
+			// Resume of a session another process holds without an SDK endpoint yet; the broker's
+			// path-free message names that process.
+			return `\u23f3 ${r.message}`;
 		case "unsupported_platform":
 			return "Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.";
 		case "terminal_uncertain":

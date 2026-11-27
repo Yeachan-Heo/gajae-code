@@ -66,11 +66,7 @@ function createRuntime(outputs: string[], availableModels = [] as Model[]): Slas
 			setModel: async () => undefined,
 		},
 		sessionManager: {},
-		settings: {
-			get: () => ({}),
-			getModelRole: () => undefined,
-			getStorage: () => ({ getModelUsageOrder: () => [] }),
-		},
+		settings: Settings.isolated(),
 		cwd: process.cwd(),
 		output: (text: string) => outputs.push(text),
 		refreshCommands: () => undefined,

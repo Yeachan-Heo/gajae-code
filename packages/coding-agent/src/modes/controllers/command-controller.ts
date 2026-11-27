@@ -2,10 +2,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
+import { collapseUsageLimitsForDisplay, getEnvApiKey, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
@@ -32,6 +32,7 @@ import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -614,23 +615,7 @@ export class CommandController {
 		}
 	}
 
-	handleCopyCommand(sub?: string) {
-		switch (sub) {
-			case "code":
-				return this.#copyCode();
-			case "all":
-				return this.#copyAllCode();
-			case "cmd":
-				return this.#copyLastCommand();
-			case "last":
-			case undefined:
-				return this.#copyLastMessage();
-			default:
-				this.ctx.showError(`Unknown subcommand: ${sub}. Use code, all, cmd, or last.`);
-		}
-	}
-
-	#copyLastMessage() {
+	handleCopyCommand() {
 		const assistantText = this.ctx.session.getLastAssistantText();
 		if (assistantText) {
 			this.#doCopy(assistantText, "Copied last agent message to clipboard");
@@ -646,78 +631,6 @@ export class CommandController {
 		}
 
 		this.ctx.showError("No agent messages to copy yet.");
-	}
-
-	#copyCode() {
-		const text = this.ctx.session.getLastAssistantText();
-		if (!text) {
-			this.ctx.showError("No agent messages to copy yet.");
-			return;
-		}
-		const matches = [...text.matchAll(/^```[^\n]*\n([\s\S]*?)^```/gm)];
-		const lastMatch = matches.at(-1);
-		if (!lastMatch) {
-			this.ctx.showWarning("No code block found in the last agent message.");
-			return;
-		}
-		this.#doCopy(lastMatch[1].replace(/\n$/, ""), "Copied last code block to clipboard");
-	}
-
-	#copyAllCode() {
-		const text = this.ctx.session.getLastAssistantText();
-		if (!text) {
-			this.ctx.showError("No agent messages to copy yet.");
-			return;
-		}
-		const matches = [...text.matchAll(/^```[^\n]*\n([\s\S]*?)^```/gm)];
-		if (matches.length === 0) {
-			this.ctx.showWarning("No code blocks found in the last agent message.");
-			return;
-		}
-		const combined = matches.map(m => m[1].replace(/\n$/, "")).join("\n\n");
-		this.#doCopy(combined, `Copied ${matches.length} code block${matches.length > 1 ? "s" : ""} to clipboard`);
-	}
-
-	#extractEvalCode(args: unknown): string | undefined {
-		if (!args || typeof args !== "object") return undefined;
-		const cells = (args as { cells?: unknown }).cells;
-		if (!Array.isArray(cells)) return undefined;
-
-		const codeBlocks: string[] = [];
-		for (const cell of cells) {
-			if (!cell || typeof cell !== "object") continue;
-			const code = (cell as { code?: unknown }).code;
-			if (typeof code === "string" && code.length > 0) {
-				codeBlocks.push(code);
-			}
-		}
-
-		return codeBlocks.length > 0 ? codeBlocks.join("\n\n") : undefined;
-	}
-
-	#copyLastCommand() {
-		const messages = this.ctx.session.messages;
-		// Walk backwards to find the last bash/eval tool call
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i];
-			if (msg.role !== "assistant") continue;
-			const toolCalls = msg.content.filter((c): c is ToolCall => c.type === "toolCall");
-			for (let j = toolCalls.length - 1; j >= 0; j--) {
-				const tc = toolCalls[j];
-				if (tc.name === "bash" && typeof tc.arguments?.command === "string") {
-					this.#doCopy(tc.arguments.command, "Copied last bash command to clipboard");
-					return;
-				}
-				if (tc.name === "eval") {
-					const code = this.#extractEvalCode(tc.arguments);
-					if (code) {
-						this.#doCopy(code, "Copied last eval code to clipboard");
-						return;
-					}
-				}
-			}
-		}
-		this.ctx.showWarning("No bash or eval command found in the conversation.");
 	}
 
 	#doCopy(content: string, label: string) {
@@ -776,7 +689,8 @@ export class CommandController {
 			const provider = this.ctx.session.model?.provider;
 			const mode = resolveAppendOnlyMode(setting, provider ?? "");
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
-			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
+			const settingLabel =
+				setting === "auto" ? `${setting} (${provider ?? "?"})` : sanitizeDisplayLine(String(setting));
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
 		}
 		if (stats.sessionMemory) {
@@ -865,8 +779,12 @@ export class CommandController {
 			for (const server of this.ctx.lspServers) {
 				const statusColor = server.status === "ready" ? "success" : server.status === "error" ? "error" : "warning";
 				const statusText =
-					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
-				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
+					server.status === "error" && server.error
+						? `${server.status}: ${sanitizeDisplayLine(server.error)}`
+						: server.status;
+				const fileTypes = server.fileTypes.map(fileType => sanitizeDisplayLine(fileType)).join(", ");
+				const serverLabel = sanitizeDisplayLine(server.name);
+				info += `${theme.fg("dim", `${serverLabel}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${fileTypes})`)}\n`;
 			}
 		}
 
@@ -879,7 +797,7 @@ export class CommandController {
 				for (const name of mcpServers) {
 					const conn = this.ctx.mcpManager.getConnection(name);
 					const toolCount = conn?.tools?.length ?? 0;
-					info += `${theme.fg("dim", `${name}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
+					info += `${theme.fg("dim", `${sanitizeDisplayLine(name)}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
 				}
 			}
 		}
@@ -1421,6 +1339,13 @@ export class CommandController {
 			this.ctx.showError("Usage: /move <path>");
 			return;
 		}
+		// Refuse before the cwd transition and flush, not from inside them.
+		try {
+			this.ctx.sessionManager.assertLegacyMutationAllowed("move session");
+		} catch (err) {
+			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
 
 		const cwd = this.ctx.sessionManager.getCwd();
 		const resolvedPath = resolveToCwd(unquoted, cwd);
@@ -1456,7 +1381,7 @@ export class CommandController {
 			);
 			this.ctx.ui.requestRender();
 		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Move failed: ${operatorErrorMessage(err, String(err))}`);
 		}
 	}
 
@@ -1491,7 +1416,7 @@ export class CommandController {
 					return;
 				}
 
-				const stored = await this.ctx.sessionManager.setSessionName(generated, "user");
+				const stored = await this.ctx.session.setSessionName(generated, "user");
 				if (!stored) {
 					this.ctx.showError("Session name cannot be empty.");
 					return;
@@ -1501,7 +1426,7 @@ export class CommandController {
 			}
 
 			invalidateSessionTitleGeneration(this.ctx.sessionManager);
-			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
+			const stored = await this.ctx.session.setSessionName(title, "user");
 			if (!stored) {
 				this.ctx.showError("Session name cannot be empty.");
 				return;
@@ -1646,7 +1571,7 @@ export class CommandController {
 			const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
 			await this.ctx.session.prompt(message);
 		} catch (err) {
-			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Failed to load skill: ${operatorErrorMessage(err, String(err))}`);
 		}
 	}
 
@@ -1693,8 +1618,7 @@ export class CommandController {
 			if (outcome === "cancelled") {
 				this.ctx.showError("Compaction cancelled");
 			} else {
-				const message = error instanceof Error ? error.message : String(error);
-				this.ctx.showError(`Compaction failed: ${message}`);
+				this.ctx.showError(`Compaction failed: ${operatorErrorMessage(error, String(error))}`);
 			}
 		} finally {
 			compactingLoader.stop();
@@ -1771,7 +1695,7 @@ export class CommandController {
 			if (message === "Handoff cancelled" || (error instanceof Error && error.name === "AbortError")) {
 				this.ctx.showError("Handoff cancelled");
 			} else {
-				this.ctx.showError(`Handoff failed: ${message}`);
+				this.ctx.showError(`Handoff failed: ${operatorErrorMessage(error, message)}`);
 			}
 			// The failure is non-destructive: the current session is unchanged. If the
 			// document was already generated, preserve it on the clipboard for retry.
@@ -1901,7 +1825,7 @@ function resolveFraction(limit: UsageLimit): number | undefined {
 
 function resolveProviderUsageTotal(reports: UsageReport[]): number {
 	return reports
-		.flatMap(report => report.limits)
+		.flatMap(report => collapseUsageLimitsForDisplay(report.limits))
 		.map(limit => resolveFraction(limit) ?? 0)
 		.reduce((sum, value) => sum + value, 0);
 }
@@ -2091,14 +2015,35 @@ function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
 	return "exhausted";
 }
 
-function formatAggregateAmount(limits: UsageLimit[]): string {
+/** Horizons that meter one quota pool from both ends. */
+const SIBLING_USAGE_WINDOWS: Readonly<Record<string, string>> = { "5h": "7d", "7d": "5h" };
+
+/**
+ * The quota a window row meters, independent of the horizon in its title.
+ * Providers name rows either by pool ("Gemini") or by window ("Claude 7 Day");
+ * only the pool part can pair a 5-hour row with its weekly row.
+ */
+function usagePoolKey(label: string, windowLabel: string): string {
+	const windowText = windowLabel.trim().toLowerCase();
+	const title = label.trim();
+	if (windowText.length === 0) return title;
+	const lower = title.toLowerCase();
+	if (lower.length !== title.length) return title;
+	const index = lower.lastIndexOf(windowText);
+	if (index < 0) return title;
+	const stripped = (title.slice(0, index) + title.slice(index + windowText.length)).replace(/\s+/g, " ").trim();
+	return stripped.length > 0 ? stripped : title;
+}
+
+function formatAggregateAmount(limits: UsageLimit[], notReportedCount = 0): string {
+	const notReportedSuffix = notReportedCount > 0 ? ` · ${notReportedCount} not reported` : "";
 	const fractions = limits
 		.map(limit => resolveFraction(limit))
 		.filter((value): value is number => value !== undefined);
 	if (fractions.length === limits.length && fractions.length > 0) {
 		const sum = fractions.reduce((total, value) => total + value, 0);
 		const avgRemaining = Math.max(0, ((limits.length - sum) / limits.length) * 100);
-		return `${formatNumber(avgRemaining)}% free`;
+		return `${formatNumber(avgRemaining)}% free${notReportedSuffix}`;
 	}
 
 	const amounts = limits
@@ -2108,10 +2053,10 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 		const totalUsed = amounts.reduce((sum, amount) => sum + (amount.used ?? 0), 0);
 		const totalLimit = amounts.reduce((sum, amount) => sum + (amount.limit ?? 0), 0);
 		const remainingPct = totalLimit > 0 ? Math.max(0, 100 - (totalUsed / totalLimit) * 100) : 0;
-		return `${formatNumber(remainingPct)}% free`;
+		return `${formatNumber(remainingPct)}% free${notReportedSuffix}`;
 	}
 
-	return `${limits.length} accts`;
+	return `${limits.length + notReportedCount} accts`;
 }
 
 /**
@@ -2183,6 +2128,16 @@ function resolveColumnWidth(count: number, available: number, trailing: number):
 	return ideal;
 }
 
+/** One `/usage` row: every account that reports one quota pool at one horizon. */
+interface UsageLimitGroup {
+	label: string;
+	poolKey: string;
+	windowId: string;
+	windowLabel: string;
+	limits: UsageLimit[];
+	reports: UsageReport[];
+}
+
 export function renderUsageReports(
 	reports: UsageReport[],
 	uiTheme: typeof theme,
@@ -2215,17 +2170,31 @@ export function renderUsageReports(
 		const providerName = formatProviderName(provider);
 		const reportIndexes = new Map(providerReports.map((report, index) => [report, index]));
 
-		const limitGroups = new Map<
-			string,
-			{ label: string; windowLabel: string; limits: UsageLimit[]; reports: UsageReport[] }
-		>();
+		const displayLimits = new Map<UsageReport, UsageLimit[]>();
+		const reportedWindows = new Map<UsageReport, Set<string>>();
 		for (const report of providerReports) {
-			for (const limit of report.limits) {
+			const limits = collapseUsageLimitsForDisplay(report.limits);
+			displayLimits.set(report, limits);
+			const windows = new Set<string>();
+			for (const limit of limits) {
+				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
+				const windowLabel = limit.window?.label ?? windowId;
+				windows.add(`${usagePoolKey(formatLimitTitle(limit), windowLabel)}|${windowId}`);
+			}
+			reportedWindows.set(report, windows);
+		}
+
+		const limitGroups = new Map<string, UsageLimitGroup>();
+		for (const report of providerReports) {
+			for (const limit of displayLimits.get(report) ?? []) {
 				const windowId = limit.window?.id ?? limit.scope.windowId ?? "default";
 				const key = `${formatLimitTitle(limit)}|${windowId}`;
 				const windowLabel = limit.window?.label ?? windowId;
+				const title = formatLimitTitle(limit);
 				const entry = limitGroups.get(key) ?? {
-					label: formatLimitTitle(limit),
+					label: title,
+					poolKey: usagePoolKey(title, windowLabel),
+					windowId,
 					windowLabel,
 					limits: [],
 					reports: [],
@@ -2233,6 +2202,33 @@ export function renderUsageReports(
 				entry.limits.push(limit);
 				entry.reports.push(report);
 				limitGroups.set(key, entry);
+			}
+		}
+
+		// A report that only surfaces one window of a pool — Antigravity's
+		// `fetchAvailableModels` returns just the active bottleneck window —
+		// would otherwise vanish from the sibling row, leaving only the accounts
+		// that happen to be exhausted and reading as "everyone is out". Keep the
+		// column and mark it unreported so the row stays honest.
+		const notReportedLimits = new Set<UsageLimit>();
+		for (const group of limitGroups.values()) {
+			const siblingWindowId = SIBLING_USAGE_WINDOWS[group.windowId];
+			if (!siblingWindowId) continue;
+			const siblingKey = `${group.poolKey}|${siblingWindowId}`;
+			for (const report of providerReports) {
+				const reported = reportedWindows.get(report);
+				if (!reported || reported.has(`${group.poolKey}|${group.windowId}`)) continue;
+				if (!reported.has(siblingKey)) continue;
+				const limit: UsageLimit = {
+					id: `not-reported:${group.poolKey}:${group.windowId}:${reportIndexes.get(report) ?? 0}`,
+					label: group.label,
+					scope: { provider, windowId: group.windowId },
+					amount: { unit: "percent" },
+					status: "unknown",
+				};
+				notReportedLimits.add(limit);
+				group.limits.push(limit);
+				group.reports.push(report);
 			}
 		}
 
@@ -2248,7 +2244,10 @@ export function renderUsageReports(
 				const reportIndex = reportIndexes.get(report) ?? 0;
 				return {
 					report,
-					total: report.limits.reduce((sum, limit) => sum + (resolveFraction(limit) ?? 0), 0),
+					total: collapseUsageLimitsForDisplay(report.limits).reduce(
+						(sum, limit) => sum + (resolveFraction(limit) ?? 0),
+						0,
+					),
 					label: firstLimit
 						? formatAccountLabel(firstLimit, report, reportIndex)
 						: formatUnlimitedReportLabel(report, reportIndex),
@@ -2260,7 +2259,23 @@ export function renderUsageReports(
 			accountRank.set(entry.report, rank);
 		});
 
-		const renderableGroups = Array.from(limitGroups.values()).map(group => {
+		const orderedGroups = Array.from(limitGroups.values());
+		const labelOrder = new Map<string, number>();
+		for (const group of orderedGroups) {
+			if (!labelOrder.has(group.label)) labelOrder.set(group.label, labelOrder.size);
+		}
+		const windowOrder = (windowLabel: string): number => {
+			const lower = windowLabel.toLowerCase();
+			if (lower.includes("5 hour") || lower === "5h") return 0;
+			if (lower.includes("7 day") || lower.includes("weekly") || lower === "7d") return 1;
+			return 2;
+		};
+		orderedGroups.sort((a, b) => {
+			const labelDiff = (labelOrder.get(a.label) ?? 0) - (labelOrder.get(b.label) ?? 0);
+			if (labelDiff !== 0) return labelDiff;
+			return windowOrder(a.windowLabel) - windowOrder(b.windowLabel);
+		});
+		const renderableGroups = orderedGroups.map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
@@ -2274,15 +2289,32 @@ export function renderUsageReports(
 			});
 			const sortedLimits = entries.map(entry => entry.limit);
 			const sortedReports = entries.map(entry => entry.report);
-			return { group, sortedLimits, sortedReports, amountText: formatAggregateAmount(sortedLimits) };
+			const knownLimits = sortedLimits.filter(limit => !notReportedLimits.has(limit));
+			return {
+				group,
+				sortedLimits,
+				sortedReports,
+				knownLimits,
+				notReportedCount: sortedLimits.length - knownLimits.length,
+				amountText: formatAggregateAmount(knownLimits, sortedLimits.length - knownLimits.length),
+			};
 		});
 
 		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
 		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
 		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
 
-		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
-			const status = resolveAggregateStatus(sortedLimits);
+		for (const {
+			group,
+			sortedLimits,
+			sortedReports,
+			knownLimits,
+			notReportedCount,
+			amountText,
+		} of renderableGroups) {
+			const reportedStatus = resolveAggregateStatus(knownLimits);
+			// An unreported window is missing data, not proof of exhaustion.
+			const status = reportedStatus === "exhausted" && notReportedCount > 0 ? "warning" : reportedStatus;
 			const statusIcon = resolveStatusIcon(status, uiTheme);
 
 			const windowSuffix = formatWindowSuffix(group.label, group.windowLabel, uiTheme);

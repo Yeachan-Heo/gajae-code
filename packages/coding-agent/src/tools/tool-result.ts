@@ -80,6 +80,11 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return this;
 	}
 
+	retention(policy: "bash"): this {
+		this.#meta.retention(policy);
+		return this;
+	}
+
 	done(): AgentToolResult<TDetails> {
 		const meta = this.#meta.get();
 		if (meta) {

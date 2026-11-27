@@ -5,22 +5,14 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
-	AgentMessage,
 	AgentTool,
 	RunCancellationDomain,
 	StreamFn,
 } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
-import { createAssistantMessage, createUserMessage } from "./helpers";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		(message): message is Message =>
-			message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	);
-}
+import { createAssistantMessage, createUserMessage, identityConverter } from "./helpers";
 
 it("provides a non-optional cancellation-aware maintenance lifecycle without a run signal", async () => {
 	const model = createMockModel();
@@ -52,7 +44,7 @@ it("provides a non-optional cancellation-aware maintenance lifecycle without a r
 	const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [tool] };
 	let maintenanceCalls = 0;
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		maintainContext: async (_context, lifecycle) => {
 			maintenanceCalls += 1;
@@ -77,7 +69,7 @@ it("settles a reserved provider lease when stream creation throws synchronously"
 	const model = createMockModel();
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "factory-throw",
@@ -103,7 +95,7 @@ it("settles a provider that resolves after cancellation wins the factory race", 
 	const factoryStarted = Promise.withResolvers<void>();
 	const factory = Promise.withResolvers<AssistantMessageEventStream>();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "late-factory",
@@ -152,7 +144,7 @@ it("settles a late provider even when iterator acquisition throws synchronously"
 		[createUserMessage("cancel")],
 		{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
 		{
-			model: model.model,
+			model: model,
 			convertToLlm: identityConverter,
 			resourceLedger: ledger,
 			resourceRunId: "late-broken-factory",
@@ -230,7 +222,7 @@ it("ends as aborted when cancellation lands while maintenance resolves", async (
 	const events: Array<{ type: string; stopReason?: string; maintenanceOutcome?: string }> = [];
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "maintenance-abort",
@@ -289,7 +281,7 @@ it("requires claimed standalone maintenance ownership and installs its domain be
 	};
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "standalone-maintenance",
@@ -359,7 +351,7 @@ it("rejects reuse of a consumed standalone continuation claim before provider wo
 	};
 	const ledger = createRunResourceLedger();
 	const config: AgentLoopConfig = {
-		model: model.model,
+		model: model,
 		convertToLlm: identityConverter,
 		resourceLedger: ledger,
 		resourceRunId: "standalone-duplicate",
@@ -436,7 +428,7 @@ it("keeps one Agent logical resource domain across single-model maintenance cont
 	};
 	let maintenanceCalls = 0;
 	const agent = new Agent({
-		initialState: { model: model.model, systemPrompt: ["You are helpful."], tools: [tool], messages: [] },
+		initialState: { model: model, systemPrompt: ["You are helpful."], tools: [tool], messages: [] },
 		streamFn,
 	});
 	agent.setMaintainContext(async () => {
@@ -486,7 +478,7 @@ it("rejects an unclaimed fresh-config standalone continuation", async () => {
 			tools: [],
 		},
 		{
-			model: model.model,
+			model: model,
 			convertToLlm: identityConverter,
 			resourceLedger: ledger,
 			resourceRunId: "standalone-bypass",

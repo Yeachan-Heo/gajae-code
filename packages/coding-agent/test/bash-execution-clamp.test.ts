@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/components/bash-execution";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
 import { visibleWidth } from "@gajae-code/tui";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const MAX_DISPLAY_LINE_CHARS = 4000;
 
@@ -10,7 +11,7 @@ describe("BashExecutionComponent #clampDisplayLine", () => {
 	const ui = { requestRender: () => {} } as unknown as TUI;
 
 	beforeEach(async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		setThemeInstance(theme!);
 	});

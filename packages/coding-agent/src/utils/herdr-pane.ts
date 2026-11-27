@@ -260,6 +260,43 @@ export interface HerdrSessionEvent {
 	toolName?: string;
 }
 
+/**
+ * Map session lifecycle events to Herdr agent states: idle at the prompt,
+ * working during an agent run, blocked while the `ask` tool waits for the user.
+ * Shared by the herdr TUI reporter and the herdr-core OSC 7501 reporter so both
+ * surfaces report the same state for the same session.
+ */
+export function createHerdrLifecycleListener(
+	report: (state: HerdrAgentState) => void,
+): (event: HerdrSessionEvent) => void {
+	/** Nesting depth of blocking ask calls; a nested ask must not unblock early. */
+	let askDepth = 0;
+	return event => {
+		switch (event.type) {
+			case "agent_start":
+				askDepth = 0;
+				report("working");
+				break;
+			case "agent_end":
+				askDepth = 0;
+				report("idle");
+				break;
+			case "tool_execution_start":
+				if (event.toolName === "ask") {
+					askDepth += 1;
+					report("blocked");
+				}
+				break;
+			case "tool_execution_end":
+				if (event.toolName === "ask" && askDepth > 0) {
+					askDepth -= 1;
+					if (askDepth === 0) report("working");
+				}
+				break;
+		}
+	};
+}
+
 export interface HerdrReporter {
 	/** Report a new agent state. Deduplicated against the last reported state. */
 	report(state: HerdrAgentState): void;
@@ -771,8 +808,6 @@ function createHerdrReporterWithClaim(
 	let currentState: HerdrAgentState | null = null;
 	let released = false;
 	const releaseAuthority = claimMarker !== undefined;
-	/** Nesting depth of blocking ask calls; a nested ask must not unblock early. */
-	let askDepth = 0;
 	/** Per-reporter title memo scope: re-asserts only this pane's last title. */
 	const titleScope = new HerdrTitleScope();
 
@@ -787,30 +822,7 @@ function createHerdrReporterWithClaim(
 		run(buildHerdrReportArgs(paneEnv.paneId, state, seq), HERDR_REPORT_TIMEOUT_MS);
 	};
 
-	let unsubscribe: (() => void) | null = subscribe(event => {
-		switch (event.type) {
-			case "agent_start":
-				askDepth = 0;
-				report("working");
-				break;
-			case "agent_end":
-				askDepth = 0;
-				report("idle");
-				break;
-			case "tool_execution_start":
-				if (event.toolName === "ask") {
-					askDepth += 1;
-					report("blocked");
-				}
-				break;
-			case "tool_execution_end":
-				if (event.toolName === "ask" && askDepth > 0) {
-					askDepth -= 1;
-					if (askDepth === 0) report("working");
-				}
-				break;
-		}
-	});
+	let unsubscribe: (() => void) | null = subscribe(createHerdrLifecycleListener(report));
 
 	/**
 	 * A replaced server starts with an empty agent registry, and `report` is

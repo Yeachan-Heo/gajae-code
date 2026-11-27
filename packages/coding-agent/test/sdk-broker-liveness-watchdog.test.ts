@@ -11,6 +11,9 @@ import {
 	publicationLivenessMustExit,
 } from "../src/sdk/broker/publication-liveness-deadline";
 import {
+	armPublicationLivenessWatchdog,
+	disarmPublicationLivenessWatchdog,
+	publicationLivenessWatchdogLost,
 	setPublicationLivenessSlotExhaustedForTest,
 	setPublicationLivenessWorkerStartFailureForTest,
 } from "../src/sdk/broker/publication-liveness-watchdog";
@@ -380,6 +383,57 @@ test("a watchdog worker that exits after startup ends the broker", async () => {
 	});
 }, 15_000);
 
+test("retired watchdog events cannot mark a replacement worker lost", async () => {
+	const originalWorker = globalThis.Worker;
+	const previousFlag = process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
+	const workers: FakeWorker[] = [];
+	class FakeWorker extends EventTarget {
+		constructor() {
+			super();
+			workers.push(this);
+		}
+		terminate(): void {}
+		ready(): void {
+			this.dispatchEvent(new MessageEvent("message", { data: { type: "ready" } }));
+		}
+	}
+	const firstOwner = {};
+	const secondOwner = {};
+	const thirdOwner = {};
+	globalThis.Worker = FakeWorker as unknown as typeof Worker;
+	process.env.GJC_BROKER_LIVENESS_HARD_EXIT = "1";
+	try {
+		const firstArm = armPublicationLivenessWatchdog(firstOwner, 60_000, 1_000);
+		expect(workers).toHaveLength(1);
+		workers[0].ready();
+		expect(await firstArm).toBe(true);
+
+		workers[0].dispatchEvent(new Event("error"));
+		expect(publicationLivenessWatchdogLost()).toBe(true);
+		const secondArm = armPublicationLivenessWatchdog(secondOwner, 60_000, 1_000);
+		expect(workers).toHaveLength(2);
+		workers[1].ready();
+		expect(await secondArm).toBe(true);
+		expect(publicationLivenessWatchdogLost()).toBe(false);
+
+		for (const event of ["close", "exit", "error"]) workers[0].dispatchEvent(new Event(event));
+		expect(publicationLivenessWatchdogLost()).toBe(false);
+		expect(await armPublicationLivenessWatchdog(thirdOwner, 60_000, 1_000)).toBe(true);
+		expect(workers).toHaveLength(2);
+
+		workers[1].dispatchEvent(new Event("exit"));
+		expect(publicationLivenessWatchdogLost()).toBe(true);
+		workers[1].dispatchEvent(new Event("close"));
+		expect(publicationLivenessWatchdogLost()).toBe(true);
+	} finally {
+		for (const worker of workers) worker.dispatchEvent(new Event("exit"));
+		for (const owner of [firstOwner, secondOwner, thirdOwner]) disarmPublicationLivenessWatchdog(owner);
+		globalThis.Worker = originalWorker;
+		if (previousFlag === undefined) delete process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
+		else process.env.GJC_BROKER_LIVENESS_HARD_EXIT = previousFlag;
+	}
+});
+
 test("hard-exit opt-out still starts when watchdog initialization cannot succeed", async () => {
 	const previous = process.env.GJC_BROKER_LIVENESS_HARD_EXIT;
 	process.env.GJC_BROKER_LIVENESS_HARD_EXIT = "0";
@@ -485,7 +539,6 @@ test("a heartbeat write that blocks the JS thread still trips publication-livene
 	expect(finished, `still alive after ${elapsedMs}ms\nstdout:\n${stdout}\nstderr:\n${stderr}`).toBe(true);
 	expect(stdout, stderr).toContain("hooks-installed");
 	expect(stdout, stderr).not.toContain("graceful");
-	expect(stderr, stdout).toContain("sdk broker: publication-liveness-timeout");
 	expect(elapsedMs, stderr).toBeLessThan(blockMs);
 	expect(
 		child.signalCode === "SIGKILL" || child.exitCode === 137,

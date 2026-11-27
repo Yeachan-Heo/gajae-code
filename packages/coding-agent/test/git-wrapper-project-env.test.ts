@@ -17,6 +17,9 @@ const PLANTED_KEYS = [
 	"GIT_CONFIG_KEY_0",
 	"GIT_CONFIG_VALUE_0",
 	"GIT_SSH_COMMAND",
+	"GIT_ASKPASS",
+	"SSH_ASKPASS",
+	"SSH_ASKPASS_REQUIRE",
 	"GH_PAGER",
 	"GH_FORCE_TTY",
 	"PAGER",
@@ -90,6 +93,28 @@ async function runProbe(
 	return fs.existsSync(target.marker);
 }
 
+/** An askpass program: records the call and answers the prompt without reading stdin. */
+function askpassScript(target: Project): string {
+	const askpass = path.join(target.cwd, "askpass.sh");
+	fs.writeFileSync(askpass, `#!/bin/sh\necho ran >> "${target.marker}"\necho probe\n`, { mode: 0o755 });
+	return askpass;
+}
+
+/** Serve a git remote that always demands HTTP Basic credentials. */
+async function withAuthRemote<T>(run: (remote: string) => Promise<T>): Promise<T> {
+	const server = Bun.serve({
+		port: 0,
+		hostname: "127.0.0.1",
+		fetch: () =>
+			new Response("auth required", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="probe"' } }),
+	});
+	try {
+		return await run(`http://127.0.0.1:${server.port}/probe.git`);
+	} finally {
+		server.stop(true);
+	}
+}
+
 describe.skipIf(process.platform === "win32")("git and gh wrappers ignore project .env hooks", () => {
 	it("does not run a project core.hooksPath pre-commit hook on commit", async () => {
 		const target = project();
@@ -111,6 +136,33 @@ describe.skipIf(process.platform === "win32")("git and gh wrappers ignore projec
 		fs.writeFileSync(path.join(target.cwd, ".env"), `GIT_SSH_COMMAND=${target.hook}\n`);
 		expect(await runProbe(target, "push", false)).toBe(false);
 	});
+
+	// With no `GIT_ASKPASS` or `core.askPass`, git asks `SSH_ASKPASS` for HTTP
+	// credentials, even with `GIT_TERMINAL_PROMPT=0`. A local remote that always
+	// answers 401 makes `git fetch` prompt.
+	it("does not run a project SSH_ASKPASS for a git credential prompt", async () => {
+		const target = project();
+		const askpass = askpassScript(target);
+		fs.writeFileSync(path.join(target.cwd, ".env"), `SSH_ASKPASS=${askpass}\nSSH_ASKPASS_REQUIRE=force\n`);
+		expect(
+			await withAuthRemote(remote => runProbe(target, "fetch-http", false, { GJC_TEST_HTTP_REMOTE: remote })),
+		).toBe(false);
+		expect(
+			await withAuthRemote(remote => runProbe(target, "fetch-http", true, { GJC_TEST_HTTP_REMOTE: remote })),
+		).toBe(false);
+	}, 30_000);
+
+	it("still runs an SSH_ASKPASS the operator exported", async () => {
+		const target = project();
+		const askpass = askpassScript(target);
+		fs.writeFileSync(path.join(target.cwd, ".env"), `SSH_ASKPASS=${askpass}\n`);
+		const exported = askpass.replace(target.cwd, `${target.cwd}/.`);
+		expect(
+			await withAuthRemote(remote =>
+				runProbe(target, "fetch-http", true, { GJC_TEST_HTTP_REMOTE: remote, SSH_ASKPASS: exported }),
+			),
+		).toBe(true);
+	}, 30_000);
 
 	// Wrapper calls that pass their own variables (e.g. `GIT_INDEX_FILE` for task
 	// worktree trees) spread the process environment. Under `--no-env-file` (the

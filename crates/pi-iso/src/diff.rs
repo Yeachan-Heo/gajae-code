@@ -188,6 +188,8 @@ async fn git_run_allow_exit1(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 
 async fn git_spawn(cwd: &Path, args: &[&str]) -> IsoResult<std::process::Output> {
 	let mut cmd = Command::new("git");
+	cmd.env_clear();
+	cmd.envs(crate::rcopy::git_process_env());
 	cmd.arg("-C").arg(cwd).args(args);
 	cmd.stdin(std::process::Stdio::null());
 	cmd.output().await.map_err(|err| {

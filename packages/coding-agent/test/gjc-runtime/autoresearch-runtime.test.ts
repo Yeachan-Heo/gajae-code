@@ -28,8 +28,6 @@ const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let previousGjcSessionId: string | undefined;
 
-const runtimeSourcePath = path.join(import.meta.dir, "..", "..", "src", "gjc-runtime", "autoresearch-runtime.ts");
-
 beforeAll(() => {
 	previousGjcSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
@@ -109,18 +107,73 @@ describe("autoresearch session layout", () => {
 		expect(paths.ledgerPath).toBe(path.join(sessionDir, "ledger.jsonl"));
 	});
 
-	it("never writes the legacy global autoresearch store (grep-style)", async () => {
-		const source = await Bun.file(runtimeSourcePath).text();
-		// The dead global store path must not appear anywhere in the runtime
-		// source: no write target can resolve there if the literal path is absent.
-		expect(source).not.toContain("~/.gjc/autoresearch");
-		expect(source).not.toContain("getAutoresearchDbPath");
-		expect(source).not.toContain("getAutoresearchProjectDir");
-		expect(source).not.toContain(".gjc/autoresearch");
-		// All persisted targets route through the sanctioned .gjc/** writers.
-		expect(source).toContain("writeGuardedJsonAtomic");
-		expect(source).toContain("appendJsonl");
-	});
+	it("persists session missions and run events without changing legacy stores", async () => {
+		const sandbox = await tempDir();
+		const root = path.join(sandbox, "project");
+		const home = path.join(sandbox, "home");
+		const legacyStores = [root, home].map(dir => path.join(dir, ".gjc", "autoresearch"));
+		for (const dir of legacyStores) {
+			await Bun.write(path.join(dir, "mission.json"), "legacy mission sentinel\n");
+			await Bun.write(path.join(dir, "ledger.jsonl"), "legacy ledger sentinel\n");
+		}
+		// A fresh process isolates HOME and config resolution from this runner.
+		const child = Bun.spawn({
+			cmd: [
+				process.execPath,
+				"--eval",
+				`
+				const { autoresearchWrite, autoresearchLogRun } = require(process.argv[1]);
+				const cwd = process.cwd();
+				for (const sessionId of ["left", "right"]) {
+					await autoresearchWrite({ cwd, sessionId, mode: "web", slug: sessionId, objective: sessionId });
+				}
+				await autoresearchLogRun({ cwd, sessionId: "left", runId: "baseline", status: "keep", description: "measured", metric: 42 });
+				`,
+				path.resolve(import.meta.dir, "../../src/gjc-runtime/autoresearch-runtime.ts"),
+			],
+			cwd: root,
+			env: {
+				...process.env,
+				HOME: home,
+				USERPROFILE: home,
+				XDG_CONFIG_HOME: path.join(home, ".config"),
+				GJC_CONFIG_DIR: path.join(home, ".config", "gjc"),
+				GJC_CODING_AGENT_DIR: path.join(home, ".gjc"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+			killSignal: "SIGKILL",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect({ stdout, stderr, exitCode }).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+		for (const sessionId of ["left", "right"]) {
+			// Literal paths observe persistence independently of the producer's path helper.
+			const dir = path.join(root, ".gjc", `_session-${sessionId}`, "autoresearch");
+			expect(await Bun.file(path.join(dir, "mission.json")).json()).toMatchObject({
+				objective: sessionId,
+				slug: sessionId,
+				mode: "web",
+			});
+			const ledger = (await Bun.file(path.join(dir, "ledger.jsonl")).text())
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as { event: string; metric?: number });
+			expect(ledger.map(row => row.event)).toEqual(
+				sessionId === "left" ? ["mission_created", "run_logged"] : ["mission_created"],
+			);
+			if (sessionId === "left") expect(ledger[1].metric).toBe(42);
+		}
+		for (const dir of legacyStores) {
+			expect((await fs.readdir(dir, { recursive: true })).sort()).toEqual(["ledger.jsonl", "mission.json"]);
+			expect(await Bun.file(path.join(dir, "mission.json")).text()).toBe("legacy mission sentinel\n");
+			expect(await Bun.file(path.join(dir, "ledger.jsonl")).text()).toBe("legacy ledger sentinel\n");
+		}
+	}, 20_000);
 });
 
 describe("autoresearch mission write boundary (AC-16)", () => {
