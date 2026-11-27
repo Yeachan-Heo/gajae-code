@@ -713,7 +713,10 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		expect([auto.getSessionId() === newest.id, args.continue, notices.length]).toEqual([false, undefined, 2]);
 	});
 
-	it("an interactive --resume of a held session warns before the folder question: Fork copies it, Cancel opens nothing (design §1 row 1)", async () => {
+	it.each([
+		"id",
+		"path",
+	] as const)("an interactive --resume <%s> of a held session warns before the folder question: Fork copies it, Cancel opens nothing (design §1 row 1)", async form => {
 		const place = await workspace();
 		const settings = Settings.isolated();
 		// The session belongs to another folder, so a free one would get the y/N fork question first.
@@ -738,7 +741,7 @@ describe.if(supported)("enforce refusals (5a)", () => {
 				forked: (message: string) => forked.push(message),
 			},
 		});
-		const resume = () => ({ resume: source.id }) as Args;
+		const resume = () => ({ resume: form === "id" ? source.id : source.file }) as Args;
 		await expect(
 			createSessionManager(resume(), place.cwd, settings, "terminal", tui("cancel")),
 		).rejects.toBeInstanceOf(SessionResumeCancelledError);
