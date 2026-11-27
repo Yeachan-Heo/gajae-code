@@ -6582,7 +6582,8 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 				// Strip transient/redundant properties that shouldn't be persisted.
 				// - partialJson: streaming accumulator for tool call JSON parsing
 				// - jsonlEvents: raw subprocess streaming events (already saved to artifact files)
-				if (childKey === "partialJson" || childKey === "jsonlEvents") {
+				// - displayContent: TUI-only rendering detail, kept live for TUI but not needed in durable JSONL
+				if (childKey === "partialJson" || childKey === "jsonlEvents" || childKey === "displayContent") {
 					changed = true;
 					return [];
 				}

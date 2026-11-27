@@ -671,6 +671,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const rawOutput = outputLines.join("\n");
 				const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 				const output = truncation.content;
+				const displayText = displayLines.join("\n");
 				const truncated = Boolean(
 					fileLimitReached || perFileLimitReached || result.limitReached || truncation.truncated || linesTruncated,
 				);
@@ -691,14 +692,11 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						: perFileLimitReached
 							? perFileMatchCap
 							: undefined,
+					displayContent: displayText,
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};
 				if (truncation.truncated) details.truncation = truncation;
 				if (linesTruncated) details.linesTruncated = true;
-				// Add displayContent for TUI rendering (clean search output)
-				if (output.length > 0) {
-					details.displayContent = output;
-				}
 				const resultBuilder = toolResult(details)
 					.text(wrapUntrustedContent(output))
 					.limits({ columnMax: linesTruncated ? DEFAULT_MAX_COLUMN : undefined });

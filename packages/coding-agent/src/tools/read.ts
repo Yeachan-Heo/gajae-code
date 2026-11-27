@@ -1706,7 +1706,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const shouldAddHashLines = displayMode.hashLines;
 		const shouldAddLineNumbers = !shouldAddHashLines && displayMode.lineNumbers;
 		const maxColumns = options.raw ? 0 : resolveOutputMaxColumns(this.session.settings);
+		const bodyRawWindow = renderReadWindow(window, false, false, maxColumns);
 		const bodyRenderedWindow = renderReadWindow(window, shouldAddHashLines, shouldAddLineNumbers, maxColumns);
+		const rawWindow = preservePrefix ? `${protectedPrefix}${bodyRawWindow}` : bodyRawWindow;
 		const renderedWindow = preservePrefix ? `${protectedPrefix}${bodyRenderedWindow}` : bodyRenderedWindow;
 		const partialTail = partialTailOf(window);
 		const partialTailWarning = partialTail !== undefined && shouldAddHashLines && bodyFooterPath !== undefined;
@@ -1717,6 +1719,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const selectedContent = windowSegments(window)
 			.map(segment => segment.content)
 			.join("\n");
+		details.displayContent = {
+			text: rawWindow,
+			startLine: preservePrefix
+				? 1
+				: (window.head?.origin.startLine ?? window.tail?.origin.startLine ?? startLineDisplay),
+		};
 
 		let usedLegacyHeadTruncation = false;
 		let outputText = partialTailWarning
@@ -1767,6 +1775,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (snippet.text.length === 0) {
 					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(legacyHeadByteCeiling)} limit. Unable to display a valid UTF-8 snippet.]`;
 				}
+				details.displayContent = { text: snippet.text, startLine: startLineDisplay };
 			} else if (legacy.truncated) {
 				outputText = formatTextWithMode(legacy.content, startLineDisplay, shouldAddHashLines, shouldAddLineNumbers);
 			} else {
@@ -1855,13 +1864,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				startLine: startLineDisplay,
 				totalFileLines: totalLines,
 			});
-		}
-		// Add displayContent for TUI rendering (clean content without model-only formatting)
-		// Use selectedContent if available (clean window segments), fall back to stripped outputText
-		const displayContentText =
-			selectedContent.length > 0 ? selectedContent : stripOutputNotice(outputText, details?.meta);
-		if (displayContentText.length > 0) {
-			details.displayContent = { text: displayContentText, startLine: startLineDisplay };
 		}
 		return resultBuilder.done();
 	}
@@ -2984,7 +2986,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						.join("\n\n");
 					details = {
 						spillEligible: false,
-
+						displayContent: { text: renderedSummary.displayText, startLine: 1 },
 						summary: {
 							lines: countTextLines(renderedSummary.text),
 							elidedSpans: renderedSummary.elidedSpans,
@@ -3158,6 +3160,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							baseWindowResult && partialTailWarning
 								? { ...baseWindowResult, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
 								: baseWindowResult;
+						const rawWindow = renderReadWindow(window, false, false, directionalMaxColumns);
 						let outputText = partialTailWarning
 							? formatOversizedLineWarning(
 									localReadPath,
@@ -3197,7 +3200,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						details = {
 							resolvedPath: absolutePath,
 							suffixResolution,
-
+							displayContent: {
+								text: rawWindow,
+								startLine: window.head?.origin.startLine ?? window.tail?.origin.startLine ?? startLineDisplay,
+							},
 							...(windowResult ? { truncation: windowResult } : {}),
 							spillEligible: !isBareReceipt && selectedContent.length > 0 && !directionalPartial,
 						};
@@ -3296,7 +3302,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							: shouldAddHashLines
 								? false
 								: displayMode.lineNumbers;
+						let capturedDisplayContent: { text: string; startLine: number } | undefined;
 						const formatText = (text: string, startNum: number): string => {
+							capturedDisplayContent = { text, startLine: startNum };
 							return formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
 						};
 
@@ -3360,7 +3368,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							outputText += `\n\n${formatRawReadCapNotice(maxBytesForRead, fileSize, localDirection)}`;
 						}
 
-						// displayContent intentionally not persisted
+						if (capturedDisplayContent) {
+							details.displayContent = capturedDisplayContent;
+						}
 
 						if (!firstLineExceedsLimit && collectedLines.length > 0) {
 							const blocks = scanConflictLines(collectedLines, startLineDisplay);
@@ -3454,6 +3464,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const details: ReadToolDetails = {
 			resolvedPath: entry.absolutePath,
+			displayContent: { text: rawText, startLine: region.startLine },
 		};
 		return toolResult<ReadToolDetails>(details).text(formattedText).sourcePath(entry.absolutePath).done();
 	}

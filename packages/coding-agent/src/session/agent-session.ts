@@ -971,6 +971,8 @@ export type AgentSessionEvent =
 				| "imageBytes"
 				| "messageCount";
 			action: "context-full" | "handoff";
+			/** Emergency reason if triggered by resource floor breach (e.g., "transcriptFile", "heap") */
+			emergencyReason?: string;
 	  }
 	| {
 			type: "auto_compaction_end";
@@ -30753,7 +30755,13 @@ export class AgentSession {
 
 		try {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
-			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
+			await this.#emitSessionEvent({
+				type: "auto_compaction_start",
+				reason,
+				action,
+				...(options?.emergencyReason && { emergencyReason: options.emergencyReason }),
+			});
+
 			if (autoCompactionSignal.aborted) return await emitAborted();
 			// Start the workflow projection in parallel with the synchronous compaction
 			// preparation. Overflow recovery often has no eligible history after the
