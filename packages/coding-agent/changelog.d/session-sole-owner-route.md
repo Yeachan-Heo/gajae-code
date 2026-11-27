@@ -6,3 +6,4 @@
 ### Fixed
 
 - Starring the current session from the session picker no longer adopts transcript entries that another process appended after this process last wrote them. Previously, the next full rewrite (such as a compaction or a pruning pass) could then drop those entries. The star is now refused with "Another process changed this session's transcript", and the transcript is left unchanged.
+- A full transcript rewrite no longer adopts an append that another process made right after the rewrite landed. Previously, the next rewrite could drop that append. The session now stops saving with the same refusal and keeps the other process's entries.
