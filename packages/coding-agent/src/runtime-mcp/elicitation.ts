@@ -1,4 +1,4 @@
-import { untilAborted } from "@gajae-code/utils";
+import { isRecord, untilAborted } from "@gajae-code/utils";
 import type { ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AskAnswerSource, AskRemoteReceipt } from "../tools";
 import type { MCPInputRequestHandler } from "./types";
@@ -13,10 +13,6 @@ interface FormField {
 	label: string;
 	type: "string" | "boolean";
 	choices?: string[];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function displayText(value: string): string {

@@ -1,12 +1,14 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SdkClient } from "../src/sdk/client";
 
 type TestServer = {
 	port: number | undefined;
@@ -42,13 +44,22 @@ async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000
 type SessionListResponse = Record<string, unknown>;
 
 async function createSessionListBroker(
-	responder: (input: Record<string, unknown>) => SessionListResponse,
-): Promise<{ directory: string; agentDir: string; requests: Array<Record<string, unknown>> }> {
+	responder: (input: Record<string, unknown>) => SessionListResponse | undefined,
+): Promise<{
+	directory: string;
+	agentDir: string;
+	requests: Array<Record<string, unknown>>;
+	url: string;
+	token: string;
+	disconnect: () => void;
+}> {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-session-list-"));
 	directories.push(directory);
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const token = "acp-session-list-token";
 	const requests: Array<Record<string, unknown>> = [];
+	let connectionCount = 0;
+	let disconnect = () => {};
 	let server!: TestServer;
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -60,13 +71,22 @@ async function createSessionListBroker(
 		},
 		websocket: {
 			open(socket) {
-				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+				disconnect = () => socket.close();
+				socket.send(
+					JSON.stringify({
+						type: "broker_hello",
+						protocolVersion: 3,
+						connectionId: `connection-${++connectionCount}`,
+					}),
+				);
 			},
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				requests.push(frame);
 				const input = (frame.input ?? {}) as Record<string, unknown>;
-				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...responder(input) }));
+				const response = responder(input);
+				if (response) socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
+				else socket.close();
 			},
 		},
 	});
@@ -84,7 +104,631 @@ async function createSessionListBroker(
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
-	return { directory, agentDir, requests };
+	return {
+		directory,
+		agentDir,
+		requests,
+		url: `ws://127.0.0.1:${server.port!}`,
+		token,
+		disconnect: () => disconnect(),
+	};
+}
+
+async function createEphemeralRouterFixture(
+	options: {
+		losePromptAcknowledgement?: boolean;
+		controlledRetryBackoff?: boolean;
+		turnResultStatus?: "accepted" | "in_flight";
+	} = {},
+) {
+	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-ephemeral-router-"));
+	directories.push(directory);
+	const agentDir = path.join(directory, ".gjc", "agent");
+	const cwd = path.join(directory, "workspace");
+	const sessionId = "ephemeral-router-session";
+	const brokerToken = "ephemeral-router-broker-token";
+	const sessionToken = "ephemeral-router-session-token";
+	const brokerRequests: Array<Record<string, unknown>> = [];
+	const promptInputs: Array<Record<string, unknown>> = [];
+	let sessionConnectionCount = 0;
+	let sessionCloseCount = 0;
+	let replayCount = 0;
+	let recoveryQueryCount = 0;
+	let idleUpdateCount = 0;
+	let watchdogScheduleCount = 0;
+	let completePrompts = false;
+	let disconnectSessionTransport = () => {};
+	let sendSessionFrame = (_frame: Record<string, unknown>) => {};
+	const turnResultRequested = Promise.withResolvers<Record<string, unknown>>();
+	const retryBackoffScheduled = Promise.withResolvers<void>();
+	let fireRetryBackoff = () => {};
+	let sessionServer!: TestServer;
+	sessionServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			const url = new URL(request.url);
+			if (url.searchParams.get("token") !== sessionToken) return new Response("Unauthorized", { status: 401 });
+			if (url.pathname !== "/session") return new Response("Not found", { status: 404 });
+			if (!sessionServer.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				const connectionId = `ephemeral-router-${++sessionConnectionCount}`;
+				disconnectSessionTransport = () => socket.close();
+				sendSessionFrame = frame => socket.send(JSON.stringify(frame));
+				socket.send(JSON.stringify({ type: "hello", connectionId }));
+			},
+			close() {
+				sessionCloseCount++;
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				if (frame.type === "event_replay") {
+					replayCount++;
+					socket.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: true,
+							generation: 1,
+							lastSeq: 0,
+							events: [],
+						}),
+					);
+					return;
+				}
+				if (frame.type === "query_request") {
+					if (frame.query === "turn.result" && options.losePromptAcknowledgement) {
+						recoveryQueryCount++;
+						turnResultRequested.resolve(frame);
+						if (!options.turnResultStatus) return;
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: true,
+								result: {
+									kind: "prompt",
+									sessionId,
+									clientRef: promptInputs[0]?.clientRef,
+									commandId: "ephemeral-command-1",
+									turnId: "ephemeral-turn-1",
+									status: options.turnResultStatus,
+								},
+							}),
+						);
+						return;
+					}
+					const result =
+						frame.query === "runtime.capabilities"
+							? { promptTerminalOutcomeVersion: 1, primaryControlSurface: "cli" }
+							: { page: { items: [], complete: true } };
+					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, result }));
+					return;
+				}
+				if (frame.type === "control_request") {
+					if (frame.operation === "turn.prompt") {
+						promptInputs.push((frame.input ?? {}) as Record<string, unknown>);
+						if (options.losePromptAcknowledgement && !completePrompts) return;
+						const commandId = `ephemeral-command-${promptInputs.length}`;
+						const turnId = `ephemeral-turn-${promptInputs.length}`;
+						socket.send(
+							JSON.stringify({
+								type: "control_response",
+								id: frame.id,
+								ok: true,
+								result: { commandId, turnId, accepted: true },
+							}),
+						);
+						if (completePrompts)
+							socket.send(
+								JSON.stringify({
+									type: "agent_end",
+									sessionId,
+									commandId,
+									turnId,
+									finalText: "reconnected",
+									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+								}),
+							);
+						return;
+					}
+					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: {} }));
+				}
+			},
+		},
+	});
+	servers.push(sessionServer);
+
+	await mkdir(cwd, { recursive: true });
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	await mkdir(path.dirname(endpointPath), { recursive: true });
+	const endpointUrl = `ws://127.0.0.1:${sessionServer.port}/session`;
+	await Bun.write(
+		endpointPath,
+		JSON.stringify({ sessionId, pid: process.pid, url: endpointUrl, token: sessionToken }),
+	);
+	const endpointMtimeMs = (await stat(endpointPath)).mtimeMs;
+	const processIncarnation = brokerProcessIncarnation(process.pid);
+	if (!processIncarnation) throw new Error("Test process incarnation is unavailable.");
+	const locator = { cwd, worktreeRoot: null, stateRoot };
+	const index = await new SessionIndex(agentDir).open();
+	await index.append({
+		type: "host_registered",
+		sessionId,
+		locator,
+		endpointGeneration: 1,
+		pid: process.pid,
+		processIncarnation,
+		hostIncarnation: processIncarnation,
+		endpointMtimeMs,
+		ephemeral: true,
+	});
+	await index.checkpointLiveHeartbeats();
+
+	let brokerServer!: TestServer;
+	brokerServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			if (new URL(request.url).searchParams.get("token") !== brokerToken)
+				return new Response("Unauthorized", { status: 401 });
+			if (!brokerServer.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3, connectionId: "ephemeral-broker" }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				brokerRequests.push(frame);
+				let result: Record<string, unknown> = {};
+				if (frame.operation === "broker.status") result = { capabilities: { ephemeralSessions: true } };
+				if (frame.operation === "session.create")
+					result = {
+						sessionId,
+						endpointGeneration: 1,
+						pid: process.pid,
+						endpointMtimeMs,
+						endpoint: { sessionId, pid: process.pid, url: endpointUrl, token: sessionToken },
+					};
+				if (frame.operation === "session.list") result = { sessions: [] };
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+			},
+		},
+	});
+	servers.push(brokerServer);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: packageJson.version,
+		ownerId: "test-owner",
+		pid: process.pid,
+		incarnation: processIncarnation,
+		host: "127.0.0.1",
+		port: brokerServer.port!,
+		url: `ws://127.0.0.1:${brokerServer.port!}`,
+		token: brokerToken,
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
+
+	const controller = new AbortController();
+	const agent = new AcpAgent(
+		{
+			sessionUpdate: async (notification: SessionNotification) => {
+				const update = notification.update as { sessionUpdate?: string; _meta?: { gjcPhase?: string } };
+				if (update.sessionUpdate === "session_info_update" && update._meta?.gjcPhase === "idle") idleUpdateCount++;
+			},
+			signal: controller.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{
+			agentDir,
+			promptWatchdogClock: {
+				now: () => Date.now(),
+				schedule: (handler: () => void, delayMs: number) => {
+					if (options.controlledRetryBackoff && delayMs <= 1_000) {
+						fireRetryBackoff = handler;
+						retryBackoffScheduled.resolve();
+						return () => {};
+					}
+					watchdogScheduleCount++;
+					const timer = setTimeout(handler, delayMs);
+					timer.unref();
+					return () => clearTimeout(timer);
+				},
+			},
+		},
+	);
+	await bounded(agent.initialize({ protocolVersion: 1, clientCapabilities: {} }), "ephemeral initialize");
+	const created = await bounded(
+		agent.newSession({ cwd, mcpServers: [], _meta: { gjc: { ephemeral: true } } }),
+		"ephemeral session create",
+	);
+	if (created.sessionId !== sessionId) throw new Error("Unexpected ephemeral session id.");
+	await waitFor(() => idleUpdateCount > 0, "ephemeral initial idle publication");
+	return {
+		agent,
+		controller,
+		sessionId,
+		brokerRequests,
+		promptInputs,
+		index,
+		turnResultRequested: turnResultRequested.promise,
+		retryBackoffScheduled: retryBackoffScheduled.promise,
+		fireRetryBackoff: () => fireRetryBackoff(),
+		sendSessionFrame: (frame: Record<string, unknown>) => sendSessionFrame(frame),
+		get sessionConnectionCount() {
+			return sessionConnectionCount;
+		},
+		get sessionCloseCount() {
+			return sessionCloseCount;
+		},
+		get replayCount() {
+			return replayCount;
+		},
+		get recoveryQueryCount() {
+			return recoveryQueryCount;
+		},
+		get watchdogScheduleCount() {
+			return watchdogScheduleCount;
+		},
+		get idleUpdateCount() {
+			return idleUpdateCount;
+		},
+		completePrompts(value: boolean) {
+			completePrompts = value;
+		},
+		disconnectSessionTransport() {
+			disconnectSessionTransport();
+		},
+		async retireHost() {
+			await index.append({
+				type: "session_closed",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				processIncarnation,
+				hostIncarnation: processIncarnation,
+				endpointMtimeMs,
+			});
+		},
+	};
+}
+
+test("ephemeral Router teardown returns the typed unrecoverable error to a waiting prompt", async () => {
+	const fixture = await createEphemeralRouterFixture();
+	try {
+		const pending = fixture.agent
+			.prompt({ sessionId: fixture.sessionId, prompt: [{ type: "text", text: "wait through transport loss" }] })
+			.catch(error => error);
+		await waitFor(() => fixture.promptInputs.length === 1, "ephemeral prompt dispatch");
+		await Bun.sleep(20);
+		await fixture.retireHost();
+		await waitFor(() => fixture.sessionCloseCount > 0, "ephemeral Router teardown");
+		await expect(bounded(pending, "waiting ephemeral prompt failure")).resolves.toMatchObject({
+			code: "ephemeral_session_unrecoverable",
+		});
+		expect(fixture.brokerRequests.some(frame => frame.operation === "session.list")).toBe(false);
+	} finally {
+		fixture.controller.abort();
+	}
+});
+
+test("ephemeral Router teardown preserves the typed unrecoverable error for an idle prompt", async () => {
+	const fixture = await createEphemeralRouterFixture();
+	try {
+		await fixture.retireHost();
+		await waitFor(() => fixture.sessionCloseCount > 0, "idle ephemeral Router teardown");
+		await expect(
+			bounded(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					prompt: [{ type: "text", text: "prompt after temporary session teardown" }],
+				}),
+				"idle ephemeral prompt failure",
+			),
+		).rejects.toMatchObject({ code: "ephemeral_session_unrecoverable" });
+		expect(fixture.promptInputs).toHaveLength(0);
+		expect(fixture.brokerRequests.some(frame => frame.operation === "session.list")).toBe(false);
+	} finally {
+		fixture.controller.abort();
+	}
+});
+
+test("ephemeral transient reconnect reuses the creating agent Router without session.list", async () => {
+	const fixture = await createEphemeralRouterFixture();
+	try {
+		const initialReplayCount = fixture.replayCount;
+		fixture.disconnectSessionTransport();
+		await waitFor(
+			() => fixture.sessionConnectionCount > 1 && fixture.replayCount > initialReplayCount,
+			"ephemeral Router transport reconnect",
+		);
+		fixture.completePrompts(true);
+		await expect(
+			bounded(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					prompt: [{ type: "text", text: "continue after transient reconnect" }],
+				}),
+				"prompt after ephemeral Router reconnect",
+			),
+		).resolves.toMatchObject({ stopReason: "end_turn" });
+		expect(fixture.brokerRequests.map(frame => frame.operation)).not.toContain("session.list");
+		await fixture.index.refresh();
+		expect(fixture.index.listSessions().sessions).toMatchObject([
+			{ sessionId: fixture.sessionId, ephemeral: true, live: true },
+		]);
+		expect(await fixture.agent.listSessions({})).toMatchObject({ sessions: [] });
+	} finally {
+		fixture.controller.abort();
+	}
+});
+
+test("ephemeral lost-ACK reconnect cannot replace the typed failure with terminal_uncertain", async () => {
+	const fixture = await createEphemeralRouterFixture({ losePromptAcknowledgement: true });
+	try {
+		const pending = fixture.agent
+			.prompt({ sessionId: fixture.sessionId, prompt: [{ type: "text", text: "lose this acknowledgement" }] })
+			.catch(error => error);
+		await waitFor(() => fixture.promptInputs.length === 1, "unacknowledged temporary prompt dispatch");
+		fixture.disconnectSessionTransport();
+		const recoveryQuery = await bounded(fixture.turnResultRequested, "lost-ACK recovery query dispatch");
+		expect(recoveryQuery.input).toMatchObject({ kind: "prompt", clientRef: fixture.promptInputs[0]?.clientRef });
+		// Rotate again while the read-only lookup is pending, then report the host's
+		// unknown result explicitly. Silence would exercise the production 5s lookup
+		// deadline, racing Bun's identical 5s test deadline instead of this ordering.
+		fixture.sendSessionFrame({ type: "hello", connectionId: "replacement-with-lost-ack" });
+		fixture.sendSessionFrame({
+			type: "query_response",
+			id: recoveryQuery.id,
+			ok: true,
+			result: { status: "unknown", receiptState: "unknown" },
+		});
+		await expect(bounded(pending, "lost-ACK temporary prompt failure")).resolves.toMatchObject({
+			code: "ephemeral_session_unrecoverable",
+		});
+		await expect(
+			fixture.agent.prompt({ sessionId: fixture.sessionId, prompt: [{ type: "text", text: "later prompt" }] }),
+		).rejects.toMatchObject({ code: "ephemeral_session_unrecoverable" });
+		expect(fixture.promptInputs).toHaveLength(1);
+		expect(fixture.brokerRequests.map(frame => frame.operation)).not.toContain("session.list");
+	} finally {
+		fixture.controller.abort();
+	}
+});
+
+for (const status of ["accepted", "in_flight"] as const) {
+	test(`ephemeral lost-ACK reconnect retains a correlated ${status} turn across repeated connection changes`, async () => {
+		const fixture = await createEphemeralRouterFixture({ losePromptAcknowledgement: true, turnResultStatus: status });
+		try {
+			const pending = fixture.agent.prompt({
+				sessionId: fixture.sessionId,
+				prompt: [{ type: "text", text: "retain this running temporary turn" }],
+			});
+			let promptSettled = false;
+			let prematureSettlement: unknown;
+			void pending.then(
+				value => {
+					promptSettled = true;
+					prematureSettlement = value;
+				},
+				error => {
+					promptSettled = true;
+					prematureSettlement = error;
+				},
+			);
+			await waitFor(() => fixture.promptInputs.length === 1, "temporary lost-ACK prompt dispatch");
+			const initialWatchdogSchedules = fixture.watchdogScheduleCount;
+			fixture.disconnectSessionTransport();
+			await waitFor(() => fixture.recoveryQueryCount === 1, "correlated pending turn recovery");
+			await waitFor(() => fixture.watchdogScheduleCount > initialWatchdogSchedules, "recovered turn watchdog rearm");
+			// Recovery now owns an acknowledged waiter, not an unresolved ACK. A
+			// later connection rotation must recover that same turn rather than
+			// clear its busy state and admit a competing prompt.
+			const recoveredWatchdogSchedules = fixture.watchdogScheduleCount;
+			fixture.sendSessionFrame({ type: "hello", connectionId: "recovered-connection" });
+			fixture.sendSessionFrame({ type: "hello", connectionId: "second-recovered-connection" });
+			await waitFor(
+				() => fixture.recoveryQueryCount >= 2 || promptSettled,
+				"repeated temporary connection recovery",
+			);
+			expect(prematureSettlement).toBeUndefined();
+			await waitFor(
+				() => fixture.watchdogScheduleCount > recoveredWatchdogSchedules,
+				"repeated recovery watchdog rearm",
+			);
+			await expect(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					prompt: [{ type: "text", text: "must not overlap the recovered turn" }],
+				}),
+			).rejects.toMatchObject({ code: "conflict" });
+			const idleBeforeTerminal = fixture.idleUpdateCount;
+			fixture.sendSessionFrame({
+				type: "agent_end",
+				sessionId: fixture.sessionId,
+				commandId: "ephemeral-command-1",
+				turnId: "ephemeral-turn-1",
+				finalText: "the original turn completed",
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			});
+			await expect(bounded(pending, "recovered temporary terminal")).resolves.toMatchObject({
+				stopReason: "end_turn",
+			});
+			expect(fixture.promptInputs).toHaveLength(1);
+			await waitFor(() => fixture.idleUpdateCount > idleBeforeTerminal, "recovered terminal publication");
+			fixture.completePrompts(true);
+			const successor = await bounded(
+				fixture.agent.prompt({
+					sessionId: fixture.sessionId,
+					prompt: [{ type: "text", text: "the session remains usable" }],
+				}),
+				"successor temporary prompt",
+			).catch(error => error);
+			expect(successor).toMatchObject({ stopReason: "end_turn" });
+			expect(fixture.promptInputs).toHaveLength(2);
+			expect(fixture.brokerRequests.map(frame => frame.operation)).not.toContain("session.list");
+		} finally {
+			fixture.controller.abort();
+		}
+	});
+}
+
+test("ephemeral host loss during first-turn backoff settles the waiting retry with the typed error", async () => {
+	const fixture = await createEphemeralRouterFixture({ controlledRetryBackoff: true });
+	try {
+		const pending = fixture.agent
+			.prompt({ sessionId: fixture.sessionId, prompt: [{ type: "text", text: "first turn readiness race" }] })
+			.catch(error => error);
+		await waitFor(() => fixture.promptInputs.length === 1, "temporary first-turn prompt dispatch");
+		const correlation = {
+			sessionId: fixture.sessionId,
+			commandId: "ephemeral-command-1",
+			turnId: "ephemeral-turn-1",
+		};
+		fixture.sendSessionFrame({ type: "agent_start", ...correlation });
+		const outcome = {
+			kind: "failed",
+			code: "prompt_failed",
+			message: "provider not ready",
+			provenance: "agent_failed",
+			providerCode: "provider_unavailable",
+		};
+		fixture.sendSessionFrame({ type: "agent_failed", ...correlation, outcome });
+		fixture.sendSessionFrame({ type: "agent_end", ...correlation, outcome });
+		await bounded(fixture.retryBackoffScheduled, "temporary first-turn backoff reservation");
+		await fixture.retireHost();
+		await waitFor(() => fixture.sessionCloseCount > 0, "temporary host retirement during backoff");
+		fixture.fireRetryBackoff();
+		await expect(bounded(pending, "temporary retry failure")).resolves.toMatchObject({
+			code: "ephemeral_session_unrecoverable",
+		});
+		expect(fixture.promptInputs).toHaveLength(1);
+	} finally {
+		fixture.fireRetryBackoff();
+		fixture.controller.abort();
+	}
+});
+
+for (const capability of [true, false, undefined, "true", "unknown_operation"] as const) {
+	test(`real ACP adapter admits ephemeral create only with exact broker support: ${capability}`, async () => {
+		const broker = await createSessionListBroker(input => {
+			if (input.cwd) return { ok: true, result: { sessionId: "ephemeral-session" } };
+			if (capability === "unknown_operation")
+				return { ok: false, error: { code: "unknown_operation", message: "old broker" } };
+			return { ok: true, result: { capabilities: { ephemeralSessions: capability } } };
+		});
+		const client = await SdkClient.connect(broker.url, broker.token);
+		const adapter = new AcpSdkAdapter({ client });
+		try {
+			const creation = adapter.lifecycle(
+				"session.create",
+				{ cwd: broker.directory, ephemeral: true },
+				"ephemeral-key",
+			);
+			if (capability === true) {
+				await expect(creation).resolves.toMatchObject({ result: { sessionId: "ephemeral-session" } });
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status", "session.create"]);
+			} else {
+				const failure = await creation.catch(error => error);
+				expect(failure).toMatchObject({ code: "ephemeral_unsupported" });
+				expect(acpMcpLaunchFailure(failure, [{ name: "docs", command: "docs", args: [] }])).toBe(failure);
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status"]);
+			}
+		} finally {
+			await adapter.close();
+			await client.close();
+		}
+	});
+}
+
+test("real ACP preserves a lost capability-probe response without dispatching create", async () => {
+	const broker = await createSessionListBroker(() => undefined);
+	const client = await SdkClient.connect(broker.url, broker.token);
+	const adapter = new AcpSdkAdapter({ client });
+	try {
+		await expect(
+			adapter.lifecycle("session.create", { cwd: broker.directory, ephemeral: true }, "probe-loss-key"),
+		).rejects.toMatchObject({ code: "uncertain_after_send", details: { operation: "broker.status" } });
+		expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status"]);
+	} finally {
+		await adapter.close();
+		await client.close();
+	}
+});
+
+test("real ACP ordinary create does not probe broker capabilities", async () => {
+	const broker = await createSessionListBroker(() => ({ ok: true, result: { sessionId: "ordinary" } }));
+	const client = await SdkClient.connect(broker.url, broker.token);
+	const adapter = new AcpSdkAdapter({ client });
+	try {
+		await expect(
+			adapter.lifecycle("session.create", { cwd: broker.directory }, "ordinary-key"),
+		).resolves.toMatchObject({
+			result: { sessionId: "ordinary" },
+		});
+		expect(broker.requests.map(frame => frame.operation)).toEqual(["session.create"]);
+	} finally {
+		await adapter.close();
+		await client.close();
+	}
+});
+
+for (const phase of ["before create", "after create"] as const) {
+	test(`real ACP ephemeral admission rejects an unverified reconnect ${phase}`, async () => {
+		const broker = await createSessionListBroker(input =>
+			input.cwd ? undefined : { ok: true, result: { capabilities: { ephemeralSessions: true } } },
+		);
+		const client = await SdkClient.connect(broker.url, broker.token);
+		const adapter = new AcpSdkAdapter({ client });
+		const originalGlobal = client.global.bind(client);
+		const global = spyOn(client, "global").mockImplementation(async (operation, input, options) => {
+			const result = await originalGlobal(operation, input, options);
+			if (operation === "broker.status" && phase === "before create") {
+				const probedConnectionId = client.connectionId;
+				expect(probedConnectionId).toBeDefined();
+				broker.disconnect();
+				// Reconnection is demand-driven, not started by the close event. The
+				// first connect can still see the old socket until its close arrives.
+				const deadline = Date.now() + 1_000;
+				while (client.connectionId === probedConnectionId && Date.now() < deadline) {
+					await bounded(client.connect(), "capability probe reconnect", 1_000);
+					if (client.connectionId === probedConnectionId) await Bun.sleep(5);
+				}
+				expect(client.connectionId).not.toBe(probedConnectionId);
+			}
+			return result;
+		});
+		try {
+			const failure = await bounded(
+				adapter
+					.lifecycle("session.create", { cwd: broker.directory, ephemeral: true }, "reconnect-key")
+					.catch(error => error),
+				"ephemeral reconnect admission",
+				3_000,
+			);
+			if (phase === "before create") {
+				expect(failure).toMatchObject({ code: "ephemeral_unsupported" });
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status"]);
+			} else {
+				expect(failure).toMatchObject({
+					code: "uncertain_after_send",
+					recovery: { code: "ephemeral_unsupported" },
+				});
+				expect(broker.requests.map(frame => frame.operation)).toEqual(["broker.status", "session.create"]);
+			}
+		} finally {
+			global.mockRestore();
+			await adapter.close();
+			await client.close();
+		}
+	});
 }
 
 test("ACP advertised skill commands require one complete canonical text block", () => {

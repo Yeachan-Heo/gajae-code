@@ -33,13 +33,33 @@ import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
+import { isActivityControlOperation } from "../../sdk/activity-controls";
+import { isAuthorizationControlOperation } from "../../sdk/authorization-controls";
+import { isSdkComposerObservationOperation } from "../../sdk/composer-observation";
+
+import { isSdkDiffObservationOperation } from "../../sdk/diff-observation";
+import {
+	BROKER_LIFECYCLE_OPERATIONS,
+	BROKER_RUNTIME_REVISE_CAPABILITY_FIELD,
+	hasBrokerRuntimeCloseCapability,
+	hasBrokerRuntimeReviseCapability,
+	prohibitBrokerLifecycleOperation,
+} from "../../sdk/host/control/runtime-gate";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { isSdkOperatorOperation } from "../../sdk/operator-controls";
+
+import { isSdkPreferenceOperation } from "../../sdk/preference-controls";
+import { reviseSession } from "../../sdk/revision-controls";
+import { getSdkClientControlOperations, getSessionClientControls } from "../../sdk/session-client-controls";
+import { isSideConversationOperation } from "../../sdk/side-conversation";
+
 import { bashBackgroundControlError } from "../../session/fold-coordinator";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
@@ -110,23 +130,6 @@ const EXTENSION_COMMAND_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"compact",
 	"switchSession",
 ]);
-
-const BROKER_LIFECYCLE_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.close",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.delete",
-]);
-
-function prohibitBrokerLifecycleOperation(operation: string): never {
-	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
-		code: "operation_prohibited",
-	});
-}
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
@@ -209,7 +212,39 @@ export class ExtensionUiController {
 
 	#sdkControl = async (operation: string, input: Record<string, unknown>): Promise<unknown> => {
 		const session = this.ctx.session;
+		if (isSdkPreferenceOperation(operation))
+			return getSessionClientControls(session).preferences.handle(operation, input);
+
+		if (isAuthorizationControlOperation(operation))
+			return getSessionClientControls(session).authorization.execute(operation, input);
+		if (operation === "auth.login")
+			return getSessionClientControls(session).authorization.execute("auth.start", input);
+		if (isSdkOperatorOperation(operation))
+			return getSessionClientControls(session).operator.dispatch(operation, input);
+		if (isActivityControlOperation(operation)) {
+			const activity = getSessionClientControls(session).activity;
+			if (!activity)
+				throw Object.assign(new Error("Owned activity resources are unavailable."), { code: "unavailable" });
+			return activity.control(operation, input);
+		}
+		if (isSideConversationOperation(operation))
+			return getSessionClientControls(session).side.control(operation, input);
+		if (isSdkComposerObservationOperation(operation))
+			return getSessionClientControls(session).composer.dispatch(operation, input);
+		if (isSdkDiffObservationOperation(operation))
+			return getSessionClientControls(session).diff.dispatch(operation, input);
+
 		switch (operation) {
+			case "session.revise": {
+				if (!hasBrokerRuntimeReviseCapability(input)) return prohibitBrokerLifecycleOperation(operation);
+				const { [BROKER_RUNTIME_REVISE_CAPABILITY_FIELD]: _authority, ...request } = input;
+				return reviseSession(session, request);
+			}
+			case "session.close":
+				if (input.ifIdle !== true || !hasBrokerRuntimeCloseCapability(input))
+					return prohibitBrokerLifecycleOperation(operation);
+				session.prepareCloseIfIdle();
+				return { closing: true };
 			case "model.set": {
 				const selector = typeof input.id === "string" ? input.id : "";
 				const rawThinkingLevel = typeof input.thinkingLevel === "string" ? input.thinkingLevel : undefined;
@@ -265,21 +300,25 @@ export class ExtensionUiController {
 								session.credentialSessionId,
 							)
 						: undefined;
-				if (!model || !thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
-					throw Object.assign(new Error("model.set requires a valid model id and concrete thinkingLevel."), {
-						code: "invalid_input",
-					});
+				if (!model)
+					throw Object.assign(new Error("model.set requires a valid model id."), { code: "invalid_input" });
 				// Internal host hooks (never public SDK fields): the bus surface runs
 				// its Q13 config-shadow capture/reconcile inside this selection
 				// admission so a concurrent config.patch cannot race the snapshot.
-				return await session.setDefaultModelSelection(model, thinkingLevel, {
-					...(typeof input.onBeforeMutation === "function"
-						? { onBeforeMutation: input.onBeforeMutation as () => void }
-						: {}),
-					...(typeof input.onAfterMutation === "function"
-						? { onAfterMutation: input.onAfterMutation as () => void }
-						: {}),
-				});
+				const mutationHooks = {
+					onBeforeMutation:
+						typeof input.onBeforeMutation === "function" ? (input.onBeforeMutation as () => void) : undefined,
+					onAfterMutation:
+						typeof input.onAfterMutation === "function" ? (input.onAfterMutation as () => void) : undefined,
+				};
+				// Without an explicit level this is the extension-equivalent selection, which
+				// admits itself; callers must not wrap it in another session admission.
+				if (!hasThinkingLevel) return { changed: await runExtensionSetModel(session, model, mutationHooks) };
+				if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
+					throw Object.assign(new Error("model.set requires a concrete thinkingLevel."), {
+						code: "invalid_input",
+					});
+				return await session.setDefaultModelSelection(model, thinkingLevel, mutationHooks);
 			}
 			case "todo.replace": {
 				const phases = input.items;
@@ -320,10 +359,13 @@ export class ExtensionUiController {
 					throw Object.assign(new Error("permission_mode.set requires prompt, allow, or deny."), {
 						code: "invalid_input",
 					});
+				const changed = session.sdkPermissionMode !== mode;
 				session.setSdkPermissionMode(mode);
-				return { changed: true, mode: session.sdkPermissionMode };
+				return { changed, mode: session.sdkPermissionMode };
 			}
 			case "bash.execute": {
+				if (getSessionClientControls(session).operator.isBusy())
+					throw Object.assign(new Error("An operator execution is active."), { code: "busy" });
 				if (typeof input.cmd !== "string" || input.cmd.trim() === "")
 					throw Object.assign(new Error("bash.execute requires a command."), { code: "invalid_input" });
 				const result = await session.executeBash(input.cmd, undefined, { excludeFromContext: true });
@@ -381,7 +423,7 @@ export class ExtensionUiController {
 				await session.reload();
 				return { reloaded: true };
 			case "service_tier.set":
-				session.setServiceTier(input.tier as never);
+				await session.setServiceTier(input.tier as never);
 				return { changed: true };
 			case "queue.message.remove": {
 				const removed = session.removeQueuedMessageForEditing(String(input.id));
@@ -558,18 +600,12 @@ export class ExtensionUiController {
 					})
 					.catch((err: unknown) => {
 						if (this.#isStopped()) return;
-						this.ctx.showError(
-							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
+						this.ctx.showError(`Extension sendMessage failed: ${operatorErrorMessage(err, String(err))}`);
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
-			appendEntry: (customType, data) => {
-				this.ctx.sessionManager.appendCustomEntry(customType, data);
-			},
-			setLabel: (targetId, label) => {
-				this.ctx.sessionManager.appendLabelChange(targetId, label);
-			},
+			appendEntry: (customType, data) => this.ctx.session.appendCustomEntryInBackground(customType, data),
+			setLabel: (targetId, label) => this.ctx.session.appendLabelChangeInBackground(targetId, label),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
 			resolveTool: name => {
@@ -667,6 +703,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -799,7 +836,7 @@ export class ExtensionUiController {
 					.sendCustomMessage(message, { ...options, origin: "external" })
 					.then(() => this.#applyCustomMessageDisplay(wasStreaming, message.display))
 					.catch((err: unknown) => {
-						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
+						const errorText = `Extension sendMessage failed: ${operatorErrorMessage(err, String(err))}`;
 						if (this.ctx.isBackgrounded) {
 							logger.error(errorText);
 							return;
@@ -808,12 +845,8 @@ export class ExtensionUiController {
 					});
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
-			appendEntry: (customType, data) => {
-				this.ctx.sessionManager.appendCustomEntry(customType, data);
-			},
-			setLabel: (targetId, label) => {
-				this.ctx.sessionManager.appendLabelChange(targetId, label);
-			},
+			appendEntry: (customType, data) => this.ctx.session.appendCustomEntryInBackground(customType, data),
+			setLabel: (targetId, label) => this.ctx.session.appendLabelChangeInBackground(targetId, label),
 			getActiveTools: () => this.ctx.session.getActiveToolNames(),
 			getAllTools: () => this.ctx.session.getAllToolNames(),
 			resolveTool: name => {
@@ -906,6 +939,7 @@ export class ExtensionUiController {
 			onSessionEvent: listener => this.ctx.session.subscribe(listener, { replayPendingFallbackSwitches: false }),
 			setSdkPermissionProvider: provider => this.ctx.session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => this.ctx.session.setClientBridge(bridge),
+			getSdkClientControlOperations: () => getSdkClientControlOperations(this.ctx.session),
 			sdkControl: this.#sdkControl,
 		};
 		const commandActions: ExtensionCommandContextActions = {
@@ -1210,6 +1244,7 @@ export class ExtensionUiController {
 						}
 					: undefined,
 				onExternalEditor: dialogOptions?.onExternalEditor,
+				onInputModeChange: dialogOptions?.onInputModeChange,
 				helpText: dialogOptions?.helpText,
 				initialIndex: dialogOptions?.initialIndex,
 				timeout: dialogOptions?.timeout,
@@ -1563,7 +1598,7 @@ export class ExtensionUiController {
 	}
 
 	async #updateSessionName(name: string): Promise<void> {
-		await this.ctx.sessionManager.setSessionName(name, "user");
+		await this.ctx.session.setSessionName(name, "user");
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 	}
 
@@ -1588,7 +1623,7 @@ export class ExtensionUiController {
 		applyInjectedUserSubmission(this.ctx, { content, queued });
 		void send.catch((err: unknown) => {
 			if (this.#isStopped()) return;
-			this.ctx.showError(`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Extension sendUserMessage failed: ${operatorErrorMessage(err, String(err))}`);
 		});
 		return send;
 	};

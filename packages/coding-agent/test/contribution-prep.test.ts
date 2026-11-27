@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { TempDir } from "@gajae-code/utils";
@@ -25,7 +26,9 @@ describe("contribution prep", () => {
 			"classic ghp_abcdefghijklmnopqrstuvwxyz123456",
 			"oauth gho_abcdefghijklmnopqrstuvwxyz123456",
 			"fine github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890",
-			`${process.env.HOME ?? ""}/project/file.ts`,
+			// The redactor scrubs the home `os.homedir()` reports, which a test process
+			// keeps even when its preload points `HOME` at an isolated directory.
+			`${os.homedir()}/project/file.ts`,
 		].join("\n");
 
 		const redacted = redactContributionPrepText(text, process.cwd());
@@ -38,7 +41,7 @@ describe("contribution prep", () => {
 		expect(redacted).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz123456");
 		expect(redacted).not.toContain("gho_abcdefghijklmnopqrstuvwxyz123456");
 		expect(redacted).not.toContain("github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890");
-		expect(redacted).not.toContain(process.env.HOME ?? "__missing_home__");
+		expect(redacted).not.toContain(os.homedir());
 	});
 
 	it("redacts every supported GitHub token prefix without changing near-misses", () => {

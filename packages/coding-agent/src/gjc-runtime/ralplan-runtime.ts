@@ -3,6 +3,7 @@ import type { Dirent } from "node:fs";
 import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { isSettingsInitialized, Settings } from "../config/settings";
 import { sanitizeImportedString } from "../session-import/redact";
 import { syncSkillActiveState } from "../skill-state/active-state";
@@ -41,6 +42,8 @@ import {
 	type AppendJsonlIdempotentResult,
 	appendJsonl,
 	detectWorkflowEnvelopeIntegrityMismatch,
+	isSamePathIdentity,
+	physicalPathIdentity,
 	readExistingStateForMutation,
 	withWorkflowStateLock,
 	writeArtifact,
@@ -773,7 +776,9 @@ export async function resolveRalplanTargetRoot(
 	for (let index = 0; index < args.length; index += 1) {
 		if (args[index] === "--worktree-root") occurrences.push(index);
 	}
-	if (occurrences.length === 0) return { root: invocationCwd, explicit: false };
+	// Workflow state is persisted under the physical root so it matches every
+	// verifier regardless of which alias spelled the invocation cwd (#7562).
+	if (occurrences.length === 0) return { root: await physicalPathIdentity(invocationCwd), explicit: false };
 	if (occurrences.length > 1) {
 		throw new RalplanCommandError(2, "ralplan --worktree-root may be supplied at most once");
 	}
@@ -806,6 +811,7 @@ export async function resolveRalplanTargetRoot(
 	// resolving a repository root: an unborn or non-commit HEAD still fails the
 	// same validation, while the argv remains shell-safe on every platform.
 	const verified = Bun.spawn(["git", "-C", canonical, "rev-parse", "--verify", "HEAD"], {
+		env: projectSafeSpawnEnv(),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -815,6 +821,7 @@ export async function resolveRalplanTargetRoot(
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
 	}
 	const objectType = Bun.spawn(["git", "-C", canonical, "cat-file", "-t", headObject], {
+		env: projectSafeSpawnEnv(),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -1563,7 +1570,7 @@ async function persistRalplanFinalAdmission(
 				checksum?.algorithm === "sha256" &&
 				typeof checksum.value === "string" &&
 				/^[0-9a-f]{64}$/.test(checksum.value) &&
-				checksum.covered_path === path.resolve(statePath) &&
+				(await isSamePathIdentity(checksum.covered_path, statePath)) &&
 				typeof checksum.computed_at === "string" &&
 				checksum.computed_at.trim() !== "" &&
 				!(await detectWorkflowEnvelopeIntegrityMismatch(statePath))

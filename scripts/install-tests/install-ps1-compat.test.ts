@@ -49,14 +49,14 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Test-TrustedGithubUri");
 		expect(installer).toContain("Assert-OfficialGithubOrigins");
 		expect(installer).toContain("FileMode]::CreateNew");
-		expect(installer).toContain("leftover lock file");
-		expect(installer).not.toContain("Get-Process -Id");
+		expect(installer).toContain("FileOptions]::DeleteOnClose");
 		expect(installer).toContain("Refusing to replace symlink");
 		expect(installer).toContain("FileAttributes]::ReparsePoint");
 		expect(installer).toContain("-UseBasicParsing");
 		expect(installer).not.toContain('No checksum asset on $Tag');
 		expect(installer).toContain('$env:Path = "$InstallDir;"');
-		expect(installer).toContain("Copy-Item -Force -LiteralPath $OutPath");
+		expect(installer).toContain("[System.IO.File]::Move($Source, $Destination)");
+		expect(installer).not.toContain("Move-Item -Force");
 		expect(installer).toContain('throw "Unsupported architecture: x86');
 		expect(installer).toContain("PROCESSOR_ARCHITEW6432");
 		expect(installer).toContain("Test-StableReleaseTag");

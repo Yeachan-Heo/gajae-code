@@ -9,9 +9,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { ownedTempRootTemplate } from "../gjc-runtime/owned-temp-root";
 
 const SNAPSHOT_TIMEOUT_MS = 2_000;
-const SNAPSHOT_ROOT_PREFIX = "gjc-shell-snapshots-";
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
@@ -152,7 +152,7 @@ function createShellSnapshotCache(options: ShellSnapshotCacheOptions) {
 	let lifecycle = 0;
 
 	async function initializeRoot(): Promise<string> {
-		const root = await fs.mkdtemp(path.join(options.tempRoot, SNAPSHOT_ROOT_PREFIX));
+		const root = await fs.mkdtemp(ownedTempRootTemplate(options.tempRoot, "shell_snapshots"));
 		try {
 			await fs.chmod(root, PRIVATE_DIRECTORY_MODE);
 			const stat = await fs.lstat(root);

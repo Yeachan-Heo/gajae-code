@@ -1,5 +1,8 @@
 import { scheduler } from "node:timers/promises";
 
+// Google's structured metadata uses Go duration strings, including abbreviated durations like `30m`.
+const GOOGLE_RPC_RESET_DELAY_PATTERN =
+	/"quotaResetDelay"\s*:\s*"((?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)(ms|s))?)"/i;
 // "reset after 1h2m3s" / "10m15s" / "39s"
 const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i;
 // "Please retry in 250ms" / "Please retry in 12s"
@@ -8,6 +11,35 @@ const PLEASE_RETRY_PATTERN = /Please retry in ([0-9.]+)(ms|s)/i;
 const RETRY_DELAY_FIELD_PATTERN = /"retryDelay":\s*"([0-9.]+)(ms|s)"/i;
 // "try again in 250ms" / "try again in 12s" / "try again in 12sec"
 const TRY_AGAIN_PATTERN = /try again in\s+(\d+(?:\.\d+)?)\s*(ms|s)(?:ec)?/i;
+
+/**
+ * Parse a Go duration string (e.g., "30m", "1h30m", "835.150299ms").
+ * Returns milliseconds as a whole number, or undefined if parsing fails.
+ */
+function parseGoDuration(durationStr: string): number | undefined {
+	let totalMs = 0;
+	const durationRegex = /(\d+(?:\.\d+)?)([hms]+)/g;
+
+	for (const match of durationStr.matchAll(durationRegex)) {
+		const value = Number.parseFloat(match[1]!);
+		const unit = match[2]!.toLowerCase();
+
+		if (Number.isNaN(value)) continue;
+
+		if (unit === "h") {
+			totalMs += value * 60 * 60 * 1000;
+		} else if (unit === "m") {
+			totalMs += value * 60 * 1000;
+		} else if (unit === "s") {
+			totalMs += value * 1000;
+		} else if (unit === "ms") {
+			totalMs += value;
+		}
+	}
+
+	// Floor to whole milliseconds as Google's metadata may have fractional values
+	return totalMs > 0 ? Math.floor(totalMs) : undefined;
+}
 
 /**
  * Server-suggested retry delay extraction. Merges the patterns historically used
@@ -23,6 +55,7 @@ const TRY_AGAIN_PATTERN = /try again in\s+(\d+(?:\.\d+)?)\s*(ms|s)(?:ec)?/i;
  *  - `Please retry in 250ms` / `Please retry in 12s`
  *  - `"retryDelay": "34.074824224s"` (JSON error detail field)
  *  - `try again in 250ms` / `try again in 12s` / `try again in 12sec`
+ *  - Google RPC `quotaResetDelay` metadata with Go duration format (e.g., "30m", "1h30m")
  *
  * Returns `undefined` if no signal is found.
  */
@@ -52,6 +85,13 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 	}
 
 	if (!body) return undefined;
+
+	// Prefer structured Google RPC quotaResetDelay over display text
+	const rpcDelayMatch = GOOGLE_RPC_RESET_DELAY_PATTERN.exec(body);
+	if (rpcDelayMatch?.[1]) {
+		const parsed = parseGoDuration(rpcDelayMatch[1]);
+		if (parsed !== undefined && parsed > 0) return parsed;
+	}
 
 	const quotaMatch = QUOTA_RESET_PATTERN.exec(body);
 	if (quotaMatch) {
@@ -156,7 +196,8 @@ export async function fetchWithRetry(
 		if (!isRetryableStatus(response.status)) return response;
 		if (attempt + 1 >= maxAttempts) return response;
 
-		const hint = extractRetryHint(response, await response.clone().text());
+		// Header hints take precedence and must not wait for an error body to finish.
+		const hint = extractRetryHint(response) ?? extractRetryHint(response, await response.clone().text());
 		if (hint !== undefined && hint > maxDelayMs) return response;
 
 		const delayMs = normalizeRetryDelay(hint ?? resolveDefaultDelay(defaultDelayMs, attempt), maxDelayMs);

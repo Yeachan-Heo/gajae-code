@@ -1,4 +1,5 @@
 import { type Component, padding, Text, truncateToWidth, visibleWidth } from "@gajae-code/tui";
+import { sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme, ThemeColor } from "../modes/theme/theme";
 import { renderStatusLine } from "../tui";
@@ -37,6 +38,16 @@ const RUNNING_STATUSES = new Set(["in_progress"]);
 const PENDING_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
 const FALLBACK_WIDTH = 80;
 
+// Strip terminal controls before tab expansion or width clipping. Theme color
+// codes are applied only after this, so they are not removed with the payload.
+function displayLine(value: string): string {
+	return replaceTabs(sanitizeDisplayLine(value));
+}
+
+function displayBlock(value: string): string {
+	return replaceTabs(sanitizeText(value));
+}
+
 const OP_TITLES: Record<string, string> = {
 	repo_view: "GitHub Repo",
 	pr_checkout: "GitHub PR Checkout",
@@ -61,7 +72,7 @@ function extractIssueId(value: string | undefined): string | undefined {
 	if (/^\d+$/.test(trimmed)) return `#${trimmed}`;
 	const match = trimmed.match(/\/(?:issues|pull)\/(\d+)/);
 	if (match) return `#${match[1]}`;
-	return truncateVisualWidth(trimmed, TRUNCATE_LENGTHS.SHORT);
+	return truncateVisualWidth(displayLine(trimmed), TRUNCATE_LENGTHS.SHORT);
 }
 
 function formatPrIdentifier(pr: string | string[] | undefined): string | undefined {
@@ -85,31 +96,31 @@ function buildOpMeta(args: GithubToolRenderArgs): string[] {
 		case "pr_push": {
 			const id = formatPrIdentifier(args.pr);
 			if (id) meta.push(id);
-			else if (args.branch) meta.push(args.branch);
-			if (args.repo) meta.push(args.repo);
+			else if (args.branch) meta.push(displayLine(args.branch));
+			if (args.repo) meta.push(displayLine(args.repo));
 			break;
 		}
 		case "search_issues":
 		case "search_prs":
 		case "search_code":
 		case "search_commits": {
-			if (args.query) meta.push(truncateVisualWidth(args.query, TRUNCATE_LENGTHS.CONTENT));
-			if (args.repo) meta.push(args.repo);
+			if (args.query) meta.push(truncateVisualWidth(displayLine(args.query), TRUNCATE_LENGTHS.CONTENT));
+			if (args.repo) meta.push(displayLine(args.repo));
 			break;
 		}
 		case "search_repos": {
-			if (args.query) meta.push(truncateVisualWidth(args.query, TRUNCATE_LENGTHS.CONTENT));
+			if (args.query) meta.push(truncateVisualWidth(displayLine(args.query), TRUNCATE_LENGTHS.CONTENT));
 			break;
 		}
 		case "repo_view": {
-			if (args.repo) meta.push(args.repo);
-			if (args.branch) meta.push(args.branch);
+			if (args.repo) meta.push(displayLine(args.repo));
+			if (args.branch) meta.push(displayLine(args.branch));
 			break;
 		}
 		case "run_watch":
 			break;
 		default: {
-			if (args.repo) meta.push(args.repo);
+			if (args.repo) meta.push(displayLine(args.repo));
 			break;
 		}
 	}
@@ -117,32 +128,34 @@ function buildOpMeta(args: GithubToolRenderArgs): string[] {
 }
 
 function getWatchHeader(watch: GhRunWatchViewDetails): string {
+	const repo = displayLine(watch.repo);
 	if (watch.mode === "run" && watch.run) {
 		if (watch.state === "watching") {
-			return `watching run #${watch.run.id} on ${watch.repo}`;
+			return `watching run #${watch.run.id} on ${repo}`;
 		}
 
-		return `run #${watch.run.id} on ${watch.repo}`;
+		return `run #${watch.run.id} on ${repo}`;
 	}
 
-	const shortSha = formatShortSha(watch.headSha) ?? "this commit";
+	const shortSha = formatShortSha(displayLine(watch.headSha ?? "")) ?? "this commit";
 	if (watch.state === "watching") {
-		return `watching ${shortSha} on ${watch.repo}`;
+		return `watching ${shortSha} on ${repo}`;
 	}
 
-	return `workflow runs for ${shortSha} on ${watch.repo}`;
+	return `workflow runs for ${shortSha} on ${repo}`;
 }
 
 function getRunLabel(run: GhRunWatchRunDetails): string {
-	return replaceTabs(run.workflowName ?? run.displayTitle ?? "GitHub Actions");
+	return displayLine(run.workflowName ?? run.displayTitle ?? "GitHub Actions");
 }
 
 function getRunMeta(run: GhRunWatchRunDetails): string[] {
 	const parts: string[] = [];
 	if (run.branch) {
-		parts.push(replaceTabs(run.branch));
+		parts.push(displayLine(run.branch));
 	} else if (run.headSha) {
-		parts.push(formatShortSha(run.headSha) ?? run.headSha);
+		const shortSha = formatShortSha(displayLine(run.headSha));
+		if (shortSha) parts.push(shortSha);
 	}
 	parts.push(`#${run.id}`);
 	return parts;
@@ -207,7 +220,7 @@ function renderJobLine(job: GhRunWatchJobDetails, width: number, theme: Theme): 
 	const styledDuration = durationLabel ? theme.fg(visual.textColor, durationLabel) : undefined;
 	const reservedWidth = visibleWidth(prefix) + (styledDuration ? 1 + visibleWidth(styledDuration) : 0);
 	const nameWidth = Math.max(8, width - reservedWidth);
-	const jobName = theme.fg(visual.textColor, truncateVisualWidth(replaceTabs(job.name), nameWidth));
+	const jobName = theme.fg(visual.textColor, truncateVisualWidth(displayLine(job.name), nameWidth));
 	let line = `${prefix}${jobName}`;
 	if (styledDuration) {
 		line += padding(Math.max(1, width - visibleWidth(line) - visibleWidth(styledDuration)));
@@ -241,9 +254,10 @@ function renderFailedLogs(
 
 	const lines = ["", theme.fg("error", "failed logs")];
 	for (const entry of failedLogs) {
-		const context = entry.workflowName ? `${entry.workflowName}  #${entry.runId}` : `run #${entry.runId}`;
+		const workflowName = entry.workflowName ? displayLine(entry.workflowName) : "";
+		const context = workflowName ? `${workflowName}  #${entry.runId}` : `run #${entry.runId}`;
 		lines.push(
-			theme.fg("error", `${theme.status.error} ${replaceTabs(entry.jobName)}  ${theme.fg("muted", context)}`),
+			theme.fg("error", `${theme.status.error} ${displayLine(entry.jobName)}  ${theme.fg("muted", context)}`),
 		);
 
 		if (!entry.available || !entry.tail) {
@@ -251,8 +265,9 @@ function renderFailedLogs(
 			continue;
 		}
 
-		const tailLines = replaceTabs(entry.tail)
+		const tailLines = displayBlock(entry.tail)
 			.split("\n")
+			.map(line => displayLine(line))
 			.filter(line => line.length > 0);
 		const previewLimit = expanded ? tailLines.length : Math.min(PREVIEW_LIMITS.OUTPUT_COLLAPSED, tailLines.length);
 		for (const line of tailLines.slice(-previewLimit)) {
@@ -277,7 +292,7 @@ function buildWatchLines(
 	const lines = [theme.fg("muted", getWatchHeader(watch))];
 
 	if (watch.note) {
-		lines.push(theme.fg("dim", replaceTabs(watch.note)));
+		lines.push(theme.fg("dim", displayLine(watch.note)));
 	}
 
 	if (watch.mode === "run" && watch.run) {
@@ -334,7 +349,9 @@ function renderFallbackComponent(
 		return new Text(`${header}\n${theme.fg("dim", empty)}`, 0, 0);
 	}
 
-	const allLines = replaceTabs(text).split("\n");
+	const allLines = displayBlock(text)
+		.split("\n")
+		.map(line => displayLine(line));
 
 	return {
 		render(width: number): string[] {
@@ -366,8 +383,10 @@ function renderWatchCall(args: GithubToolRenderArgs, options: RenderResultOption
 			? formatStatusIcon("running", theme, options.spinnerFrame)
 			: formatStatusIcon("pending", theme);
 
-	const runId = typeof args.run === "string" && args.run.trim().length > 0 ? args.run.trim() : undefined;
-	const branch = typeof args.branch === "string" && args.branch.trim().length > 0 ? args.branch.trim() : undefined;
+	const runRaw = typeof args.run === "string" ? args.run.trim() : "";
+	const branchRaw = typeof args.branch === "string" ? args.branch.trim() : "";
+	const runId = displayLine(runRaw).trim();
+	const branch = displayLine(branchRaw).trim();
 
 	const titleText = theme.fg("accent", "GitHub Run Watch");
 	let metaText: string;

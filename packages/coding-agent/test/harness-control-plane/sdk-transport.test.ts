@@ -44,7 +44,7 @@ async function transport() {
 		repo: "/repo",
 		sessionId: "session",
 		connect: async () => client as unknown as SdkClient,
-		readEndpoint: async () => ({ url: "ws://sdk.test", token: "token" }),
+		readEndpoint: async () => ({ url: "ws://127.0.0.1:9", token: "token", pid: process.pid }),
 	});
 }
 
@@ -165,7 +165,8 @@ describe("SDK harness child lifecycle", () => {
 			repo: "/repo",
 			sessionId: "session",
 			discoveryTimeoutMs: 1_000,
-			readEndpoint: async () => (endpointReads++ === 0 ? null : { url: "ws://sdk.test", token: "token" }),
+			readEndpoint: async () =>
+				endpointReads++ === 0 ? null : { url: "ws://127.0.0.1:9", token: "token", pid: process.pid },
 			spawn: () => ({
 				async stop() {
 					stopStarted = true;
@@ -196,7 +197,8 @@ describe("SDK harness child lifecycle", () => {
 			repo: "/repo",
 			sessionId: "close-failures",
 			discoveryTimeoutMs: 1_000,
-			readEndpoint: async () => (endpointReads++ === 0 ? null : { url: "ws://sdk.test", token: "token" }),
+			readEndpoint: async () =>
+				endpointReads++ === 0 ? null : { url: "ws://127.0.0.1:9", token: "token", pid: process.pid },
 			spawn: () => ({
 				async stop() {
 					throw childStopError;

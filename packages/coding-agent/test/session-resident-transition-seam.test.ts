@@ -3,13 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
+import { CURRENT_SESSION_VERSION } from "@gajae-code/coding-agent/sdk/session-readonly/format";
 import { EphemeralBlobStore, MemoryBlobStore } from "@gajae-code/coding-agent/session/blob-store";
 import type {
 	MemoryGuardParticipantDescriptorV1,
 	MemoryGuardSessionManagerCheckpointV1,
 } from "@gajae-code/coding-agent/session/memory-guard-checkpoint-participant";
 import {
-	CURRENT_SESSION_VERSION,
 	type SessionDestinationInput,
 	SessionManager,
 	SessionManagerTestHooks,

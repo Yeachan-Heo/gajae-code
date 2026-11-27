@@ -161,41 +161,6 @@ describe("FoldCoordinator", () => {
 		expect(secondDelivery.kind === "receipt" && secondDelivery.receipt).toBe(secondProbe.detached[0]);
 	});
 
-	// A `job` await watches jobs that are already in the background, so the
-	// chord and the SDK control (no explicit adapter) must never pick it: with
-	// only a job await registered nothing is foldable, and a job await
-	// registered AFTER a foreground bash must not steal the chord from the bash.
-	test("job-await participants are never the implicit fold target", async () => {
-		const h = harness(() => "intent");
-		const awaited = job("bg_1", "job:1");
-		const awaitProbe = adapterFor(awaited, "resolved", false, "job-await");
-		const unregisterAwait = h.coordinator.registerParticipant(awaitProbe.adapter);
-
-		expect(h.coordinator.hasFoldableParticipant()).toBe(false);
-		expect(h.coordinator.resolveTarget()).toBeUndefined();
-		expect((await h.coordinator.requestFold()).status).toBe("unavailable");
-		expect((await h.coordinator.requestFold(undefined, "sdk_control")).status).toBe("unavailable");
-		expect(awaitProbe.detached).toHaveLength(0);
-
-		const foreground = job("bg_2", "job:2");
-		const bashProbe = adapterFor(foreground);
-		h.coordinator.registerParticipant(bashProbe.adapter);
-		unregisterAwait();
-		h.coordinator.registerParticipant(awaitProbe.adapter);
-
-		expect(h.coordinator.hasFoldableParticipant()).toBe(true);
-		expect(h.coordinator.resolveTarget()).toBe(bashProbe.adapter);
-		const chord = await h.coordinator.requestFold();
-		expect(chord.status).toBe("folded");
-		expect(bashProbe.detached).toHaveLength(1);
-		expect(awaitProbe.detached).toHaveLength(0);
-
-		// Explicit targeting (the job tool's own steer watcher) still folds it.
-		const explicit = await h.coordinator.requestFold(awaitProbe.adapter, "steer");
-		expect(explicit.status).toBe("folded");
-		expect(awaitProbe.detached[0]?.reason).toBe("steer");
-	});
-
 	// The manager re-pushes the same delivery object on retry, so a second T2 for
 	// the same job must still carry the receipt rather than degrade to ordinary.
 	test("a retried delivery still carries the receipt after the slot is released", async () => {

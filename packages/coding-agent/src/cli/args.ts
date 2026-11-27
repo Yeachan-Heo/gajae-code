@@ -136,6 +136,7 @@ function takePromptValue(
 }
 
 export function parseArgs(args: string[], authority: ParseArgsAuthority = "local"): Args {
+	args = [...args];
 	const result: Args = {
 		messages: [],
 		fileArgs: [],

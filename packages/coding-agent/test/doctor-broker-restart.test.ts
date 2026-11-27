@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as childProcess from "node:child_process";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -17,21 +17,57 @@ import {
 import { restartBrokerForDoctor } from "../src/sdk/broker/doctor-restart";
 import * as brokerEnsure from "../src/sdk/broker/ensure";
 import { SessionIndex, sessionIndexStartupLockOptions } from "../src/sdk/broker/session-index";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 async function fixture() {
-	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-restart-"));
+	const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-restart-"));
 	const broker = new Broker({ agentDir: dir });
 	const discovery = await broker.start();
 	return { dir, broker, discovery };
 }
 
 describe("doctor broker restart protocol", () => {
+	const previousAutostart = process.env.GJC_SDK_BROKER_AUTOSTART;
+	afterEach(() => {
+		if (previousAutostart === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+		else process.env.GJC_SDK_BROKER_AUTOSTART = previousAutostart;
+	});
+
+	beforeEach(() => {
+		// Tests that call restartBrokerForDoctor need autostart enabled, not attach-only
+		delete process.env.GJC_SDK_BROKER_AUTOSTART;
+	});
+
 	it("distinguishes absent intent from malformed durable intent, at the independent root slot", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-intent-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-intent-"));
 		expect(await readBrokerRestartIntent(dir)).toBeNull();
 		await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
 		await fs.writeFile(brokerRestartIntentPath(dir), "{");
 		await expect(readBrokerRestartIntent(dir)).rejects.toThrow("Malformed broker restart intent.");
+	});
+
+	it("reads an intent cleared while it is being observed as absent", async () => {
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-intent-"));
+		await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
+		const file = brokerRestartIntentPath(dir);
+		await fs.writeFile(
+			file,
+			JSON.stringify({ requestId: "cleared", lease: "lease", expiresAt: Date.now() + 60_000, phase: "committed" }),
+		);
+		// The authorized successor clears the intent between the reader's open and its
+		// lexical revalidation, as it did under the long-index-transaction poll below.
+		const realLstat = fs.lstat;
+		const lstat = spyOn(fs, "lstat").mockImplementation((async (target: string, options?: undefined) => {
+			if (target === file) await fs.unlink(file);
+			return realLstat(target, options);
+		}) as typeof fs.lstat);
+		try {
+			expect(await readBrokerRestartIntent(dir)).toBeNull();
+		} finally {
+			lstat.mockRestore();
+		}
 	});
 
 	it("prepares and commits an idle owner with exact identity, and the durable intent survives lock removal", async () => {
@@ -288,7 +324,7 @@ describe("doctor broker restart protocol", () => {
 	});
 
 	it("restartBrokerForDoctor reports owner_unavailable without throwing when no broker is published", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-no-owner-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-no-owner-"));
 		const outcome = await restartBrokerForDoctor({ agentDir: dir, deadlineMs: 500 });
 		expect(outcome.kind).toBe("owner_unavailable");
 		if (outcome.kind === "owner_unavailable") expect(outcome.reason).toBe("no_discovery");
@@ -501,7 +537,7 @@ describe("doctor broker restart protocol", () => {
 	});
 
 	it("launchAuthorizedBrokerSuccessor refuses to spawn when no intent was ever committed for the request", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-no-intent-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-no-intent-"));
 		const result = await launchAuthorizedBrokerSuccessor({
 			agentDir: dir,
 			requestId: "never-committed",
@@ -513,7 +549,7 @@ describe("doctor broker restart protocol", () => {
 	});
 
 	it("bounds restart intent reads by the successor deadline", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-stalled-intent-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-stalled-intent-"));
 		const stalledRead = Promise.withResolvers<BrokerRestartIntentWithIdentity | null>();
 		const readIntent = spyOn(brokerDiscovery, "readBrokerRestartIntent").mockImplementation(
 			() => stalledRead.promise,
@@ -575,7 +611,7 @@ describe("doctor broker restart protocol", () => {
 	}, 5_000);
 
 	it("bounds stalled successor discovery reads by the committed lease and reaps the child", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-stalled-publication-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-stalled-publication-"));
 		const requestId = "stalled-successor-publication";
 		const deadlineAt = Date.now() + 1_000;
 		const stalledRead = Promise.withResolvers<BrokerDiscovery | null>();
@@ -621,7 +657,7 @@ describe("doctor broker restart protocol", () => {
 	}, 5_000);
 
 	it("retries a retained startup transition and revalidates the committed successor", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-orphan-lock-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-orphan-lock-"));
 		const requestId = "retained-orphan-lock";
 		const expiresAt = Date.now() + 30_000;
 		await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
@@ -669,7 +705,7 @@ describe("doctor broker restart protocol", () => {
 	});
 
 	it("stops retrying startup-lock acquisition at the committed deadline", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-deadline-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-deadline-"));
 		let now = Date.now();
 		const deadlineAt = now + 100;
 		const dateNow = spyOn(Date, "now").mockImplementation(() => now);
@@ -709,7 +745,7 @@ describe("doctor broker restart protocol", () => {
 	});
 
 	it("clears an old lock refusal after reacquiring the startup fence", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-reacquired-lock-"));
+		const dir = await trackedTemp.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-reacquired-lock-"));
 		let now = Date.now();
 		const deadlineAt = now + 60;
 		const dateNow = spyOn(Date, "now").mockImplementation(() => now);
@@ -843,7 +879,9 @@ describe("doctor broker restart protocol", () => {
 	it.skipIf(process.platform === "win32")(
 		"ordinary session-index startup waits until a fresh removal transition is reclaimable",
 		async () => {
-			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-fresh-index-transition-"));
+			const dir = await trackedTemp.mkdtemp(
+				path.join(process.env.TMPDIR ?? "/tmp", "gjc-doctor-fresh-index-transition-"),
+			);
 			const indexPath = path.join(dir, "sdk", "sessions", "index.jsonl");
 			const transitionPath = `${indexPath}.lock.removing`;
 			await fs.mkdir(transitionPath, { recursive: true });

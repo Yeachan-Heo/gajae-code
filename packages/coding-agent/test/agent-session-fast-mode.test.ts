@@ -52,8 +52,8 @@ describe("AgentSession fast-mode predicate", () => {
 		tempDir.removeSync();
 	});
 
-	it("shows fast only for providers that realize priority on the wire", () => {
-		session.setServiceTier("priority");
+	it("shows fast only for providers that realize priority on the wire", async () => {
+		await session.setServiceTier("priority");
 		expect(session.isFastForProvider("anthropic")).toBe(true);
 		expect(session.isFastForProvider("openai")).toBe(true);
 		expect(session.isFastForProvider("deepinfra")).toBe(true);
@@ -64,26 +64,26 @@ describe("AgentSession fast-mode predicate", () => {
 		expect(session.isFastForProvider(undefined)).toBe(false);
 	});
 
-	it("is provider-scoped for claude-only", () => {
-		session.setServiceTier("claude-only");
+	it("is provider-scoped for claude-only", async () => {
+		await session.setServiceTier("claude-only");
 		expect(session.isFastForProvider("anthropic")).toBe(true);
 		expect(session.isFastForProvider("openai")).toBe(false);
 		expect(session.isFastForProvider("openai-codex")).toBe(false);
 		expect(session.isFastForProvider(undefined)).toBe(false);
 	});
 
-	it("isFastModeActive reflects the current model's provider and the configured tier", () => {
+	it("isFastModeActive reflects the current model's provider and the configured tier", async () => {
 		expect(session.isFastModeActive()).toBe(false);
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		// current model is anthropic
 		expect(session.isFastModeActive()).toBe(true);
 		// claude-only still matches the anthropic current model
-		session.setServiceTier("claude-only");
+		await session.setServiceTier("claude-only");
 		expect(session.isFastModeActive()).toBe(true);
 		// openai-only does not match the anthropic current model
-		session.setServiceTier("openai-only");
+		await session.setServiceTier("openai-only");
 		expect(session.isFastModeActive()).toBe(false);
-		session.setServiceTier(undefined);
+		await session.setServiceTier(undefined);
 		expect(session.isFastModeActive()).toBe(false);
 	});
 });
@@ -131,7 +131,7 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 		events.filter(e => e.type === "notice" && e.source === "priority");
 
 	it("preserves the intended tier and only suppresses the current provider after Q1 auto-disable", async () => {
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		const events = await emitDisabledPriority();
 
 		// Intent is preserved (not cleared to undefined).
@@ -145,7 +145,7 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 	});
 
 	it("is provider-scoped: a different provider still shows fast after an anthropic auto-disable", async () => {
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		await emitDisabledPriority();
 		expect(session.isFastModeActive()).toBe(false); // anthropic current, marked
 
@@ -163,7 +163,7 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 	});
 
 	it("does NOT append a service_tier_change(null) entry on Q1 auto-disable", async () => {
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		const beforeCount = serviceTierEntries().length;
 		await emitDisabledPriority();
 		// Only the explicit setServiceTier("priority") entry exists; no null entry appended.
@@ -172,7 +172,7 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 	});
 
 	it("warns only once per provider across repeated disabled-priority messages", async () => {
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		const first = await emitDisabledPriority();
 		const second = await emitDisabledPriority();
 		expect(fastWarnings(first)).toHaveLength(1);
@@ -180,13 +180,13 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 	});
 
 	it("/fast on re-arms after auto-disable even when intent is already enabled (no new history)", async () => {
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		await emitDisabledPriority();
 		expect(session.isFastModeActive()).toBe(false);
 		const historyBefore = serviceTierEntries().length;
 
 		// setFastMode(true) is the `/fast on` path; intent is unchanged ("priority").
-		session.setFastMode(true);
+		await session.setFastMode(true);
 
 		// Marker cleared → current model effective fast ON again.
 		expect(session.isFastModeActive()).toBe(true);
@@ -199,9 +199,9 @@ describe("AgentSession fast-mode Q1 auto-disable (provider-scoped marker)", () =
 	});
 
 	it("explicit /fast off appends a service_tier_change(null) entry", async () => {
-		session.setServiceTier("priority");
+		await session.setServiceTier("priority");
 		const before = serviceTierEntries().length;
-		session.setFastMode(false);
+		await session.setFastMode(false);
 		const entries = serviceTierEntries();
 		expect(entries.length).toBe(before + 1);
 		expect(entries.at(-1)?.serviceTier).toBeNull();

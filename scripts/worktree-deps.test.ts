@@ -13,6 +13,7 @@ import {
 	probeNativeAddon,
 	type WorktreeReport,
 } from "./worktree-deps";
+import { copyImportClosure } from "./test-fixtures/copy-import-closure";
 
 const tempRoots: string[] = [];
 
@@ -297,11 +298,8 @@ describe("worktree readiness report", () => {
 describe("test preload worktree guard", () => {
 	test("fails a dependency-less checkout with the fix instead of a bare module-resolution error", async () => {
 		const root = await tempRoot("gjc-worktree-preload-");
-		const scriptsDir = path.join(root, "scripts");
-		await fs.mkdir(scriptsDir, { recursive: true });
-		for (const file of ["test-preload.ts", "safe-cleanup.ts", "test-agent-dir-isolation.ts", "worktree-deps.ts"]) {
-			await Bun.write(path.join(scriptsDir, file), Bun.file(path.join(import.meta.dir, file)));
-		}
+		// The preload and its local imports (including packages/utils sources), without node_modules.
+		await copyImportClosure(path.join(import.meta.dir, ".."), root, ["scripts/test-preload.ts"]);
 		await Bun.write(path.join(root, "bunfig.toml"), '[test]\npreload = ["./scripts/test-preload.ts"]\n');
 		await Bun.write(
 			path.join(root, "trivial.test.ts"),

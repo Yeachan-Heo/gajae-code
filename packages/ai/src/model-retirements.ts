@@ -1,7 +1,10 @@
-// Retired from advertised catalogs because Cloud Code Assist rejects live calls.
-// Keep the callable alternatives visible: gemini-3.1-pro-low:high and
-// gemini-3.7-flash-tiered.
+// Retired from advertised catalogs because the upstream rejects live calls.
+// - Cloud Code Assist: keep the callable alternatives visible
+//   (gemini-3.1-pro-low:high and gemini-3.7-flash-tiered).
+// - Amazon Bedrock: Fable 5.1 has no EU Geo inference profile; EU callers use
+//   global.anthropic.claude-fable-5-1. See hasBedrockEuInferenceProfile.
 export const RETIRED_MODEL_KEYS = [
+	"amazon-bedrock/eu.anthropic.claude-fable-5-1",
 	"google-antigravity/gemini-3.1-pro-high",
 	"google-antigravity/gemini-3.7-flash-high",
 	"google-antigravity/gemini-3.7-flash-low",

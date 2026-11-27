@@ -113,6 +113,29 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
 ] as const;
 
+// The single-owner attach contract spans processes: a TUI owns the session claim, and ACP and SDK
+// clients attach to its endpoint through the broker without claiming. Its one end-to-end test is
+// named after none of these sources, so basename matching never reaches it. Every file under the
+// SDK host, bus, broker, Router, client, transport, lifecycle client, ACP adapter and SDK CLI,
+// under ACP mode and under the native file lock, selects it; so do the ownership modules, session
+// factories, the interactive mode, SDK startup and activation, and the ownership counter writer
+// listed in BEHAVIORAL_OWNER_TESTS.
+const SESSION_OWNER_ATTACH_TEST = "packages/coding-agent/test/session-owner-remote-attach.test.ts";
+const SESSION_OWNER_ATTACH_PREFIXES = [
+	"packages/coding-agent/src/sdk/host/",
+	"packages/coding-agent/src/sdk/bus/",
+	"packages/coding-agent/src/sdk/broker/",
+	"packages/coding-agent/src/sdk/router/",
+	"packages/coding-agent/src/sdk/client/",
+	"packages/coding-agent/src/sdk/transport/",
+	"packages/coding-agent/src/sdk/acp/",
+	"packages/coding-agent/src/sdk/cli/",
+	"packages/coding-agent/src/sdk/lifecycle/",
+	"packages/coding-agent/src/modes/acp/",
+	// The native lock primitive under the session claim; Rust paths reach behavioralTestsFor too.
+	"crates/pi-natives/src/file_lock/",
+] as const;
+
 // These inputs produce, transform, or define the bundled model catalog. Partial
 // owner-test mapping misses catalog-wide contracts, so changes to these surfaces
 // run the full AI suite.
@@ -142,6 +165,12 @@ function isAiCatalogModelPath(changedPath: string): boolean {
 }
 
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
+	"packages/coding-agent/src/prompts/agent-fragments/browser-aside.md": [
+		"packages/coding-agent/test/sdk-browser-aside-backend.test.ts",
+	],
+	"packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md": [
+		"packages/coding-agent/test/gjc-runtime/ralplan-worktree-root.test.ts",
+	],
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
 	"packages/agent/src/agent.ts": [
 		"packages/agent/test/agent-force-abort.test.ts",
@@ -210,10 +239,22 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/natives/test/fd-workspace-golden.test.ts",
 		"packages/coding-agent/test/workspace-tree.test.ts",
 	],
-	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts", SESSION_OWNER_ATTACH_TEST],
 	// The broker lifecycle e2e suite is not named after lifecycle.ts, so basename
 	// mapping misses its Linux-only regressions on lifecycle changes (#6145 review).
 	"packages/coding-agent/src/sdk/broker/lifecycle.ts": ["packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts"],
+	"packages/coding-agent/src/session/session-ownership.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/session/session-ownership-mode.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/session/session-owners-layout.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/session/internal/session-claim-set.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/cli/session-owners-cli.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/commands/session.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/commands/acp.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/commands/sdk.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/sdk/startup-capability.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/sdk/session-activation.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/coding-agent/src/modes/interactive-mode.ts": [SESSION_OWNER_ATTACH_TEST],
+	"packages/stats/src/session-ownership.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	// The prompt-deadline docs guard derives its expected figure from this schema's
@@ -225,11 +266,13 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts",
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
+		SESSION_OWNER_ATTACH_TEST,
 	],
 	// Session-manager owns the in-memory session lifecycle, whose integration
 	// contract is not basename-matched and needs explicit behavioral-owner coverage.
 	"packages/coding-agent/src/session/session-manager.ts": [
 		"packages/coding-agent/test/session/session-memory-integration.test.ts",
+		SESSION_OWNER_ATTACH_TEST,
 	],
 	// The managed-scope owner-only self-heal budget/latency contract is verified by
 	// a dedicated suite that exercises the bounded walk, targeted repair, and
@@ -251,6 +294,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
+	"scripts/test-preload.ts": ["scripts/test-home-isolation.test.ts"],
+	"scripts/test-home-isolation.ts": ["scripts/test-home-isolation.test.ts"],
+	"scripts/test-home-isolation.test.ts": ["scripts/test-home-isolation.test.ts"],
+	"scripts/fixtures/home-isolation-probe.ts": ["scripts/test-home-isolation.test.ts"],
 	"packages/coding-agent/src/tools/tool-catalog.generated.ts": [
 		"packages/coding-agent/test/tools/tool-catalog.test.ts",
 		"packages/coding-agent/test/tools/discoverable-description-stable.test.ts",
@@ -277,6 +324,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/sdk/session.ts": [
 		...EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
+		SESSION_OWNER_ATTACH_TEST,
 	],
 };
 
@@ -641,8 +689,9 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 // Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
 // `node:fs` resident-cache write semantics, session-index snapshot fsync
 // semantics, fail-closed lock retirement, marketplace backup detachment,
-// native path identity, or native-loader Windows capability probing the fix governs. On Ubuntu the
-// Windows-only regression suites cannot verify those fixes; dev-ci consumes
+// secure-local authority ACLs, native path identity, or native-loader Windows
+// capability probing the fix governs. On Ubuntu the Windows-only regression
+// suites cannot verify those fixes; dev-ci consumes
 // this emitted flag to run and require the windows-latest job whenever any of
 // these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
@@ -653,7 +702,15 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||
+		changedPath === "packages/coding-agent/src/sdk/secure-local-authority.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-secure-local-controls.test.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
+		// Session ownership: the native file lock has no Windows implementation, so every
+		// claim fails open there. Only the windows-latest job can run that path.
+		(changedPath.startsWith("packages/coding-agent/src/session/session-ownership") && changedPath.endsWith(".ts")) ||
+		changedPath === "packages/coding-agent/src/session/internal/session-claim-set.ts" ||
+		changedPath === "packages/coding-agent/test/session/session-ownership.windows.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/session-index.ts" ||
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
 		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
@@ -904,7 +961,7 @@ async function assertCheckedOutSourceHead(sourceSha: string): Promise<void> {
 	}
 }
 
-async function resolveBaseRef(): Promise<string> {
+export async function resolveBaseRef(): Promise<string> {
 	const eventName = Bun.env.GITHUB_EVENT_NAME?.trim();
 	const before = Bun.env.GITHUB_EVENT_BEFORE?.trim();
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();
@@ -1014,6 +1071,10 @@ export function planTasks(
 	// embedded index is generated from, so either side changing must run its gate.
 	// The gate loads the generated corpus through the package barrel, so it is a
 	// native consumer and must bring its own producer.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 		addNativeBuild(tasks);
@@ -1124,10 +1185,14 @@ export function planTargetedTasks(
 	validateTestPaths = false,
 ): Task[] {
 	const tasks = new Map<string, Task>();
-	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath) || isRuntimeMarkdownPath(changedPath));
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
 	// index is generated from, so shipping the edit without regenerating that index is
 	// the one drift class a docs-only PR can introduce. Select just its gate.
+	if (paths.includes("docs/custom-providers-and-multi-account.md")) {
+		addTestFileTask(tasks, "packages/coding-agent/test/custom-provider-docs.test.ts");
+		ensureNativeBuild(tasks);
+	}
 	if (paths.some(isEmbeddedDocsSourcePath)) {
 		addTestFileTask(tasks, EMBEDDED_DOCS_GATE_TEST);
 	}
@@ -1221,12 +1286,12 @@ export function planTargetedTasks(
 			add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
 		}
 
-		if (mappedTests.length > 0) {
+		if (mappedTests.length > 0 || (changedPath.endsWith(".md") && behavioralTestsFor(changedPath).length > 0)) {
 			continue;
 		}
 
 		if (owner) {
-			if (isCodingAgentRuntimePath(changedPath)) {
+			if (isCodingAgentRuntimePath(changedPath) || isRuntimeMarkdownPath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
@@ -1379,7 +1444,11 @@ function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
 // collisions fall back to package-level checks instead of selecting arbitrary tests.
 function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
 	if (isTestFilePath(changedPath)) {
-		return testFiles.includes(changedPath) ? [changedPath] : [];
+		// Discovery can miss a test added in this diff. An existing package test is
+		// still its own focused task. A deleted path is in neither the index nor the
+		// checkout, so it stays off the plan.
+		if (testFiles.includes(changedPath) || packageTestExists(changedPath)) return [changedPath];
+		return [];
 	}
 	const base = path.posix.basename(changedPath).replace(/\.(tsx?|jsx?|mts|cts)$/, "");
 	if (base === "") {
@@ -1394,11 +1463,17 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 	return matches.length === 1 ? matches : [];
 }
 
-// Resolve explicit behavioral-owner tests. Unlike mappedTestsFor(), these tests
-// are additive because an entrypoint's package-level check and smoke coverage
-// remain necessary even when it owns a dedicated contract test.
+// Resolve explicit behavioral-owner tests. These supplement package checks and
+// smoke coverage for code entrypoints. Bundled Markdown uses its mapped consumer
+// tests instead of CLI smoke; its owning-package check is still required.
 function behavioralTestsFor(changedPath: string): readonly string[] {
-	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
+	if (changedPath.endsWith(".md") && (
+		changedPath.startsWith("packages/coding-agent/src/prompts/agents/") ||
+		changedPath.startsWith("packages/coding-agent/src/defaults/gjc/")
+	)) return ["packages/coding-agent/test/default-gjc-definitions.test.ts"];
+	const owners = BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
+	const attachPath = SESSION_OWNER_ATTACH_PREFIXES.some(prefix => changedPath.startsWith(prefix));
+	return attachPath && !owners.includes(SESSION_OWNER_ATTACH_TEST) ? [...owners, SESSION_OWNER_ATTACH_TEST] : owners;
 }
 
 function isCodingAgentShardOneCoveragePath(changedPath: string): boolean {
@@ -1421,6 +1496,12 @@ function ensureNativeBuild(tasks: Map<string, Task>): void {
 	}
 }
 
+// PR targeting must keep bundled source input. Push planning already discovers
+// its owning package and deliberately retains its broader validation policy.
+function isRuntimeMarkdownPath(changedPath: string): boolean {
+	return changedPath.endsWith(".md") && ["packages/coding-agent/src/", "packages/agent/src/", "packages/ai/src/"].some(prefix => changedPath.startsWith(prefix));
+}
+
 export function isDocOrChangelogPath(changedPath: string): boolean {
 	return changedPath.endsWith(".md") || changedPath.startsWith("docs/") || changedPath.startsWith(".gjc/");
 }
@@ -1435,6 +1516,26 @@ function isEmbeddedDocsSourcePath(changedPath: string): boolean {
 
 function isTestFilePath(changedPath: string): boolean {
 	return /\.test\.tsx?$/.test(changedPath);
+}
+
+export function isPackageTestPath(changedPath: string): boolean {
+	return changedPath.startsWith("packages/") && !changedPath.includes("node_modules/") && /\.test\.tsx?$/.test(changedPath);
+}
+
+function packageTestExists(changedPath: string): boolean {
+	if (!isPackageTestPath(changedPath)) return false;
+	if (changedPath.split("/").some(part => part === "" || part === "." || part === "..")) return false;
+	return fsSync.existsSync(path.join(repoRoot, changedPath));
+}
+
+/** Existing package tests with no `test:<path>` task. A path that is not on disk is not an omission. */
+export function omittedPackageTestPaths(
+	paths: readonly string[],
+	taskKeys: readonly string[],
+	fileExists: (changedPath: string) => boolean = packageTestExists,
+): string[] {
+	const keys = new Set(taskKeys);
+	return paths.filter(changedPath => isPackageTestPath(changedPath) && fileExists(changedPath) && !keys.has(`test:${changedPath}`));
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
@@ -2309,6 +2410,10 @@ async function loadCanonicalPlan(): Promise<Task[] | null> {
 		new Set(tasks.map(task => task.key)).size !== tasks.length ||
 		new Set(tasks.map(task => task.identity)).size !== tasks.length
 	) throw new Error("affected-plan-invalid: duplicate task key or identity");
+	if (decoded.mode === "pr") {
+		const omitted = omittedPackageTestPaths(paths, tasks.map(task => task.key));
+		if (omitted.length > 0) throw new Error(`affected-plan-invalid: changed package test omitted from canonical plan: ${omitted.join(", ")}`);
+	}
 	const matrixKey = Bun.env.CI_DEV_MATRIX_KEY?.trim();
 	if (matrixKey) {
 		const task = tasks.find(candidate => candidate.key === matrixKey);

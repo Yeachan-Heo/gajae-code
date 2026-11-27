@@ -930,16 +930,17 @@ export class MCPCommandController {
 	): Promise<"connected" | "connecting" | "disconnected"> {
 		if (!this.ctx.mcpManager) return "disconnected";
 
+		const label = mcpTerminalLabel(name);
 		this.ctx.chatContainer.addChild(new Spacer(1));
 		const frames = theme.spinnerFrames;
 		const initialFrame = frames[0] ?? "|";
-		const statusText = new Text(theme.fg("muted", `${initialFrame} Connecting to "${name}"...`), 1, 0);
+		const statusText = new Text(theme.fg("muted", `${initialFrame} Connecting to "${label}"...`), 1, 0);
 		this.ctx.chatContainer.addChild(statusText);
 		this.ctx.ui.requestRender();
 
 		let frame = 0;
 		const interval = setInterval(() => {
-			statusText.setText(theme.fg("muted", `${frames[frame % frames.length]} Connecting to "${name}"...`));
+			statusText.setText(theme.fg("muted", `${frames[frame % frames.length]} Connecting to "${label}"...`));
 			frame++;
 			this.ctx.ui.requestRender();
 		}, 80);
@@ -956,14 +957,14 @@ export class MCPCommandController {
 				await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 			}
 			if (state === "connected") {
-				statusText.setText(theme.fg("success", `✓ Connected to "${name}"`));
+				statusText.setText(theme.fg("success", `✓ Connected to "${label}"`));
 			} else if (state === "connecting") {
-				statusText.setText(theme.fg("muted", `◌ "${name}" is still connecting...`));
+				statusText.setText(theme.fg("muted", `◌ "${label}" is still connecting...`));
 			} else {
 				statusText.setText(
 					options?.suppressDisconnectedWarning
-						? theme.fg("muted", `◌ Connection check complete for "${name}"`)
-						: theme.fg("warning", `⚠ Could not connect to "${name}" yet`),
+						? theme.fg("muted", `◌ Connection check complete for "${label}"`)
+						: theme.fg("warning", `⚠ Could not connect to "${label}" yet`),
 				);
 			}
 			this.ctx.ui.requestRender();
@@ -1359,6 +1360,7 @@ export class MCPCommandController {
 			this.ctx.showError(`Server name required. Usage: /mcp ${enabled ? "enable" : "disable"} <name>`);
 			return;
 		}
+		const label = mcpTerminalLabel(name);
 
 		try {
 			const found = await this.#findConfiguredServer(name);
@@ -1369,12 +1371,12 @@ export class MCPCommandController {
 				const isDiscovered = this.ctx.mcpManager?.getSource(name);
 				const isCurrentlyDisabled = disabledServers.has(name);
 				if (!isDiscovered && !isCurrentlyDisabled) {
-					this.ctx.showError(`Server "${name}" not found.`);
+					this.ctx.showError(`Server "${label}" not found.`);
 					return;
 				}
 				if (isCurrentlyDisabled === !enabled) {
 					this.#showMessage(
-						["", theme.fg("muted", `Server "${name}" is already ${enabled ? "enabled" : "disabled"}.`), ""].join(
+						["", theme.fg("muted", `Server "${label}" is already ${enabled ? "enabled" : "disabled"}.`), ""].join(
 							"\n",
 						),
 					);
@@ -1391,19 +1393,19 @@ export class MCPCommandController {
 								? theme.fg("muted", "Connecting")
 								: theme.fg("warning", "Not connected yet");
 					this.#showMessage(
-						["", theme.fg("success", `✓ Enabled "${name}"`), "", `  Status: ${status}`, ""].join("\n"),
+						["", theme.fg("success", `✓ Enabled "${label}"`), "", `  Status: ${status}`, ""].join("\n"),
 					);
 				} else {
 					await this.ctx.mcpManager?.disconnectServer(name);
 					await this.ctx.session.refreshMCPTools(this.ctx.mcpManager?.getTools() ?? []);
-					this.#showMessage(["", theme.fg("success", `✓ Disabled "${name}"`), ""].join("\n"));
+					this.#showMessage(["", theme.fg("success", `✓ Disabled "${label}"`), ""].join("\n"));
 				}
 				return;
 			}
 
 			if ((found.config.enabled ?? true) === enabled) {
 				this.#showMessage(
-					["", theme.fg("muted", `Server "${name}" is already ${enabled ? "enabled" : "disabled"}.`), ""].join(
+					["", theme.fg("muted", `Server "${label}" is already ${enabled ? "enabled" : "disabled"}.`), ""].join(
 						"\n",
 					),
 				);
@@ -1427,7 +1429,7 @@ export class MCPCommandController {
 
 			const lines = [
 				"",
-				theme.fg("success", `✓ ${enabled ? "Enabled" : "Disabled"} "${name}" (${found.scope} config)`),
+				theme.fg("success", `✓ ${enabled ? "Enabled" : "Disabled"} "${label}" (${found.scope} config)`),
 			];
 			if (status) {
 				lines.push("");
@@ -1447,11 +1449,12 @@ export class MCPCommandController {
 			this.ctx.showError("Server name required. Usage: /mcp unauth <name>");
 			return;
 		}
+		const label = mcpTerminalLabel(name);
 
 		try {
 			const found = await this.#findConfiguredServer(name);
 			if (!found) {
-				this.ctx.showError(`Server "${name}" not found.`);
+				this.ctx.showError(`Server "${label}" not found.`);
 				return;
 			}
 
@@ -1465,7 +1468,7 @@ export class MCPCommandController {
 			await this.#reloadMCP();
 
 			this.#showMessage(
-				["", theme.fg("success", `✓ Cleared auth for "${name}" (${found.scope} config)`), ""].join("\n"),
+				["", theme.fg("success", `✓ Cleared auth for "${label}" (${found.scope} config)`), ""].join("\n"),
 			);
 		} catch (error) {
 			this.ctx.showError(`Failed to clear auth: ${error instanceof Error ? error.message : String(error)}`);
@@ -1477,20 +1480,21 @@ export class MCPCommandController {
 			this.ctx.showError("Server name required. Usage: /mcp reauth <name>");
 			return;
 		}
+		const label = mcpTerminalLabel(name);
 
 		try {
 			const found = await this.#findConfiguredServer(name);
 			if (!found) {
-				this.ctx.showError(`Server "${name}" not found.`);
+				this.ctx.showError(`Server "${label}" not found.`);
 				return;
 			}
 
 			if (found.config.enabled === false) {
-				this.ctx.showError(`Server "${name}" is disabled. Run /mcp enable ${name} first.`);
+				this.ctx.showError(`Server "${label}" is disabled. Run /mcp enable ${label} first.`);
 				return;
 			}
 			if (found.config.type !== "http" && found.config.type !== "sse") {
-				this.ctx.showError(`Server "${name}" does not use a remote MCP transport.`);
+				this.ctx.showError(`Server "${label}" does not use a remote MCP transport.`);
 				return;
 			}
 
@@ -1504,7 +1508,7 @@ export class MCPCommandController {
 			const oauth = await this.#resolveOAuthEndpointsFromServer(baseConfig, source);
 			const oauthClientSecret = found.config.oauth?.clientSecret ?? currentAuth?.clientSecret ?? "";
 
-			this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));
+			this.#showMessage(["", theme.fg("muted", `Reauthorizing "${label}"...`), ""].join("\n"));
 
 			const oauthResult = await this.handleOAuthFlow(
 				found.config.url,
@@ -1543,7 +1547,7 @@ export class MCPCommandController {
 
 			const lines = [
 				"",
-				theme.fg("success", `✓ Reauthorized "${name}" (${found.scope} config)`),
+				theme.fg("success", `✓ Reauthorized "${label}" (${found.scope} config)`),
 				"",
 				`  Status: ${
 					state === "connected"
@@ -1585,8 +1589,9 @@ export class MCPCommandController {
 			this.ctx.showError("MCP manager not available.");
 			return;
 		}
+		const label = mcpTerminalLabel(name);
 
-		this.#showMessage(["", theme.fg("muted", `Reconnecting to "${name}"...`), ""].join("\n"));
+		this.#showMessage(["", theme.fg("muted", `Reconnecting to "${label}"...`), ""].join("\n"));
 
 		try {
 			const connection = await this.ctx.mcpManager.reconnectServer(name);
@@ -1597,16 +1602,18 @@ export class MCPCommandController {
 				await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 				const serverTools = this.ctx.mcpManager.getTools().filter(t => t.mcpServerName === name);
 				this.#showMessage(
-					["\n", theme.fg("success", `✓ Reconnected to "${name}"`), `  Tools: ${serverTools.length}`, "\n"].join(
+					["\n", theme.fg("success", `✓ Reconnected to "${label}"`), `  Tools: ${serverTools.length}`, "\n"].join(
 						"\n",
 					),
 				);
 			} else {
-				this.ctx.showError(`Failed to reconnect to "${name}". Check server status and logs.`);
+				this.ctx.showError(`Failed to reconnect to "${label}". Check server status and logs.`);
 			}
 		} catch (error) {
 			this.ctx.showError(
-				`Failed to reconnect to "${name}": ${error instanceof Error ? error.message : String(error)}`,
+				`Failed to reconnect to "${label}": ${mcpTerminalLabel(
+					error instanceof Error ? error.message : String(error),
+				)}`,
 			);
 		}
 	}
@@ -1634,7 +1641,7 @@ export class MCPCommandController {
 		if (result.errors.size > 0) {
 			const errorLines = ["", theme.fg("warning", "Some servers failed to connect:"), ""];
 			for (const [serverName, error] of result.errors.entries()) {
-				errorLines.push(`  ${serverName}: ${error}`);
+				errorLines.push(`  ${mcpTerminalLabel(serverName)}: ${mcpTerminalLabel(error)}`);
 			}
 			errorLines.push("");
 			this.#showMessage(errorLines.join("\n"));
@@ -1661,17 +1668,17 @@ export class MCPCommandController {
 			if (resources.length === 0 && templates.length === 0) continue;
 			hasAny = true;
 
-			lines.push(`${theme.fg("accent", name)}:`);
+			lines.push(`${theme.fg("accent", mcpTerminalLabel(name))}:`);
 			for (const r of resources) {
-				const desc = r.description ? ` ${theme.fg("dim", r.description)}` : "";
-				const mime = r.mimeType ? ` ${theme.fg("dim", `[${r.mimeType}]`)}` : "";
-				lines.push(`  ${theme.fg("success", r.uri)}${mime}${desc}`);
+				const desc = r.description ? ` ${theme.fg("dim", mcpTerminalLabel(r.description))}` : "";
+				const mime = r.mimeType ? ` ${theme.fg("dim", `[${mcpTerminalLabel(r.mimeType)}]`)}` : "";
+				lines.push(`  ${theme.fg("success", mcpTerminalLabel(r.uri))}${mime}${desc}`);
 			}
 			if (templates.length > 0) {
 				lines.push(`  ${theme.fg("muted", "Templates:")}`);
 				for (const t of templates) {
-					const desc = t.description ? ` ${theme.fg("dim", t.description)}` : "";
-					lines.push(`    ${theme.fg("accent", t.uriTemplate)}${desc}`);
+					const desc = t.description ? ` ${theme.fg("dim", mcpTerminalLabel(t.description))}` : "";
+					lines.push(`    ${theme.fg("accent", mcpTerminalLabel(t.uriTemplate))}${desc}`);
 				}
 			}
 			lines.push("");
@@ -1702,16 +1709,16 @@ export class MCPCommandController {
 			if (!prompts?.length) continue;
 			hasAny = true;
 
-			lines.push(`${theme.fg("accent", name)}:`);
+			lines.push(`${theme.fg("accent", mcpTerminalLabel(name))}:`);
 			for (const p of prompts) {
-				const commandName = `${name}:${p.name}`;
-				const desc = p.description ? ` ${theme.fg("dim", p.description)}` : "";
+				const commandName = `${mcpTerminalLabel(name)}:${mcpTerminalLabel(p.name)}`;
+				const desc = p.description ? ` ${theme.fg("dim", mcpTerminalLabel(p.description))}` : "";
 				lines.push(`  ${theme.fg("success", `/${commandName}`)}${desc}`);
 				if (p.arguments?.length) {
 					for (const arg of p.arguments) {
 						const required = arg.required ? theme.fg("warning", " *") : "";
-						const argDesc = arg.description ? ` - ${arg.description}` : "";
-						lines.push(`    ${arg.name}=${required}${theme.fg("dim", argDesc)}`);
+						const argDesc = arg.description ? ` - ${mcpTerminalLabel(arg.description)}` : "";
+						lines.push(`    ${mcpTerminalLabel(arg.name)}=${required}${theme.fg("dim", argDesc)}`);
 					}
 				}
 			}
@@ -1757,7 +1764,7 @@ export class MCPCommandController {
 			if (!hasNotifications) continue;
 			hasAny = true;
 
-			lines.push(`${theme.fg("accent", name)}:`);
+			lines.push(`${theme.fg("accent", mcpTerminalLabel(name))}:`);
 			const check = theme.fg("success", "✓");
 			const cross = theme.fg("dim", "✗");
 			if (supportsToolsChanged) lines.push(`  ${check} tools/list_changed`);
@@ -1776,7 +1783,7 @@ export class MCPCommandController {
 				lines.push(`  ${check} resources/subscribe  ${subStatus}`);
 				if (enabled && subscribedUris && subscribedUris.size > 0) {
 					for (const uri of subscribedUris) {
-						lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("dim", uri)}`);
+						lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("dim", mcpTerminalLabel(uri))}`);
 					}
 				}
 			} else if (supportsResources) {

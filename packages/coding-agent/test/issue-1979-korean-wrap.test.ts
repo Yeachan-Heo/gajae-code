@@ -5,9 +5,10 @@ import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/compon
 import { HookSelectorComponent } from "@gajae-code/coding-agent/modes/components/hook-selector";
 import { IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
-import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { Container, Text, TUI, visibleWidth } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const WIDTH = 20;
 const CONTENT_WIDTH = WIDTH - 2; // Assistant Markdown's left and right padding.
@@ -18,8 +19,7 @@ let previousMultiplexerEnv: Map<string, string | undefined>;
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
-	const themeInstance = await getThemeByName("red-claw");
-	if (!themeInstance) throw new Error("Failed to load test theme");
+	const themeInstance = await loadTestTheme();
 	setThemeInstance(themeInstance);
 });
 beforeEach(() => {

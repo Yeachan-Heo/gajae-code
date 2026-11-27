@@ -3,15 +3,10 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { streamOpenAICodexResponses } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { AssistantMessage, Context, Model } from "@gajae-code/ai/types";
 import { createOpenAIResponsesHistoryPayload } from "../src/utils";
+import { createAbortedSignal } from "./helpers";
 
 interface CapturedCodexPayload {
 	readonly input?: unknown[];
-}
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
 }
 
 function createCodexToken(accountId: string): string {

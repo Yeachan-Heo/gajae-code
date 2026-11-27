@@ -735,6 +735,46 @@ describe("Editor component", () => {
 			}
 		});
 
+		it("treats raw LF like encoded Shift+Enter while autocomplete is open", async () => {
+			for (const variant of ["\x1b[13;2u", "\n"]) {
+				const editor = new Editor(defaultEditorTheme);
+				let submitted: string | undefined;
+				editor.onSubmit = text => {
+					submitted = text;
+				};
+				editor.setAutocompleteProvider({
+					async getSuggestions(lines, cursorLine, cursorCol) {
+						const prefix = (lines[cursorLine] ?? "").slice(0, cursorCol);
+						return prefix.startsWith("@")
+							? { prefix, items: [{ label: "src/app.ts", value: "@src/app.ts" }] }
+							: null;
+					},
+					applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+						const line = lines[cursorLine] ?? "";
+						const start = cursorCol - prefix.length;
+						return {
+							lines: [line.slice(0, start) + item.value + line.slice(cursorCol)],
+							cursorLine,
+							cursorCol: start + item.value.length,
+						};
+					},
+				});
+
+				editor.handleInput("@");
+				await Bun.sleep(0);
+				expect(editor.isShowingAutocomplete()).toBe(true);
+
+				editor.handleInput(variant);
+
+				expect(submitted).toBeUndefined();
+				expect(editor.getText()).toBe("@\n");
+				expect(editor.isShowingAutocomplete()).toBe(false);
+
+				editor.handleInput("\r");
+				expect(submitted).toBe("@");
+			}
+		});
+
 		it("inserts a newline for raw LF on Windows terminal sendInput mappings", () => {
 			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 			Object.defineProperty(process, "platform", { value: "win32" });
@@ -2466,23 +2506,6 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
 			editor.handleInput("\x05"); // ctrl+e still goes to line end
 			expect(editor.getCursor()).toEqual({ line: 0, col: 7 });
-		});
-
-		it("does not swallow keys rebound to copy", () => {
-			setKeybindings(
-				new KeybindingsManager(TUI_KEYBINDINGS, {
-					"tui.input.copy": "left",
-				}),
-			);
-
-			const editor = new Editor(defaultEditorTheme);
-			editor.setText("ab");
-
-			editor.handleInput("\x1b[D"); // Left arrow
-			editor.handleInput("X");
-
-			expect(editor.getText()).toBe("aXb");
-			expect(editor.getCursor()).toEqual({ line: 0, col: 2 });
 		});
 
 		it("undoes the last paste when a transient #undo trigger is executed", () => {

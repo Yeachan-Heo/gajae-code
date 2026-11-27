@@ -10,6 +10,7 @@ import type {
 import {
 	type GenericFileLockDirIdentity,
 	genericFileLockDirStaleVerdict,
+	isNativeLockContentionCode,
 	processStartTime as portableProcessStartTime,
 	readFileLockObservationForGc,
 } from "../config/file-lock";
@@ -160,7 +161,16 @@ async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
 const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
-const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "sharing_violation"]);
+// Native `access_denied` (STATUS_ACCESS_DENIED) on Windows is a peer handle inside the tree,
+// the same transient contention as `sharing_violation`.
+const TRANSIENT_LOCK_ERROR_CODES = new Set([
+	"EPERM",
+	"EACCES",
+	"EBUSY",
+	"ENOTEMPTY",
+	"access_denied",
+	"sharing_violation",
+]);
 
 interface TransitionDirectoryGeneration {
 	dev: bigint;
@@ -2271,7 +2281,7 @@ async function recoverPendingTransitionRelease(
 				}
 			}
 			const captured = nativeSessionStateLock().snapshotDirectoryTree(nativeTransitionPath);
-			if (captured.code === "sharing_violation") return false;
+			if (isNativeLockContentionCode(captured.code)) return false;
 			if (
 				!captured.ok ||
 				!captured.snapshot ||
@@ -2294,7 +2304,7 @@ async function recoverPendingTransitionRelease(
 				return false;
 			}
 			const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativeTransitionPath, captured.snapshot);
-			if (removed.code === "sharing_violation") return false;
+			if (isNativeLockContentionCode(removed.code)) return false;
 			if (removed.ok || removed.code === "not_found") {
 				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
@@ -2774,7 +2784,7 @@ function captureLegacyDirectoryTree(
 	if (captured.ok && captured.snapshot) return captured.snapshot;
 	if (captured.code === "not_found" || captured.code === "not_directory" || captured.code === "not_a_directory")
 		return null;
-	if (captured.code === "sharing_violation")
+	if (isNativeLockContentionCode(captured.code))
 		throw new SessionStateLockUnavailableError(transientNativeResultError(captured.code));
 	throw new SessionStateLockUnavailableError(
 		new Error(`Legacy lock directory could not be captured: ${captured.code ?? "unknown"}.`),
@@ -2894,7 +2904,7 @@ async function reclaimStaleDirectoryLock(
 					throw new SessionStateLockUnavailableError(error);
 				}
 			}
-			if (removed.code === "sharing_violation")
+			if (isNativeLockContentionCode(removed.code))
 				throw new SessionStateLockUnavailableError(transientNativeResultError(removed.code));
 			if (removed.code === "identity_mismatch") return "absent_or_changed";
 			throw new SessionStateLockUnavailableError(

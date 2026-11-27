@@ -119,6 +119,8 @@ describe("discoverExternalCredentials", () => {
 			expect(cred.credential.access).toBe(CODEX_ACCESS);
 			expect(cred.credential.refresh).toBe(CODEX_REFRESH);
 			expect(cred.credential.accountId).toBe("acct-codex-123");
+			// The ChatGPT workspace id scopes the row, so importing one workspace never replaces another.
+			expect(cred.credential.organizationId).toBe("acct-codex-123");
 		}
 	});
 

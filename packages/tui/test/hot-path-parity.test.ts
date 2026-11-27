@@ -5,7 +5,7 @@ import { Input } from "../src/components/input";
 import { TUI } from "../src/tui";
 import { __textHelperPerfCounters, applyBackgroundToLine, padding, visibleWidth } from "../src/utils";
 import { defaultEditorTheme } from "./test-themes";
-import { VirtualTerminal } from "./virtual-terminal";
+import { settle, VirtualTerminal } from "./virtual-terminal";
 
 class RecordingTerminal extends VirtualTerminal {
 	writes: string[] = [];
@@ -13,11 +13,6 @@ class RecordingTerminal extends VirtualTerminal {
 		this.writes.push(data);
 		super.write(data);
 	}
-}
-
-async function settle(term: VirtualTerminal): Promise<void> {
-	await Bun.sleep(50);
-	await term.flush();
 }
 
 function assertSameGeometry(actual: string[], expected: string[]): void {
@@ -35,7 +30,7 @@ async function capture(line: string): Promise<string> {
 	tui.addChild({ render: () => [line], invalidate() {} });
 	try {
 		tui.start();
-		await settle(term);
+		await settle(term, 50);
 		return term.writes.join("");
 	} finally {
 		tui.stop();
@@ -78,12 +73,12 @@ describe("renderer hot-path byte parity", () => {
 		tui.addChild({ render: () => [...lines], invalidate() {} });
 		try {
 			tui.start();
-			await settle(term);
+			await settle(term, 50);
 			const before = term.getViewport();
 			expect(before.slice(0, 4).map(line => line.trimEnd())).toEqual(["界".repeat(6), "界".repeat(6), "語", "界"]);
 			__textHelperPerfCounters.reset();
 			tui.requestRender(true);
-			await settle(term);
+			await settle(term, 50);
 			// Ignore cell padding and trailing empty viewport rows only; leading and
 			// interior blank rows must retain their positions across a forced repaint.
 			const after = term.getViewport();

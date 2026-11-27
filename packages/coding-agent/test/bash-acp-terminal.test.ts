@@ -27,14 +27,9 @@ function makeSession(bridge: ClientBridge, options: SessionOptions = {}): ToolSe
 				if (key === "astEdit.enabled") return false;
 				if (key === "search.enabled") return false;
 				if (key === "find.enabled") return false;
-				if (key === "tools.artifactTailBytes") return options.tailKiB;
-				if (key === "tools.artifactHeadBytes") return options.headKiB;
+				if (key === "tools.bashOutputTailBytes") return options.tailKiB;
+				if (key === "tools.bashOutputHeadBytes") return options.headKiB;
 				return undefined;
-			},
-			has(key: string) {
-				if (key === "tools.artifactTailBytes") return options.tailKiB !== undefined;
-				if (key === "tools.artifactHeadBytes") return options.headKiB !== undefined;
-				return false;
 			},
 			getBashInterceptorRules() {
 				return [];

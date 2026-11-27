@@ -4,21 +4,15 @@
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import { GenAIAttr, PiGenAIAttr } from "@gajae-code/agent-core/telemetry";
 import type { AgentContext, AgentLoopConfig, AgentMessage } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { setProjectDir } from "@gajae-code/utils";
 import { context, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { identityConverter } from "../helpers";
 
 const CANARY = "gjc-capture-canary";
 const ENV_NAME = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
 
 async function main(): Promise<void> {
 	const beforeLoop = process.env.OTEL_CAPTURE_TRUST_BEFORE_LOOP;

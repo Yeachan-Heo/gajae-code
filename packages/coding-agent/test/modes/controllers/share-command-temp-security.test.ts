@@ -3,9 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { loadTestTheme } from "../../helpers/test-theme";
 
 const originalAgentDir = getAgentDir();
 const originalAgentDirOverride = process.env.GJC_CODING_AGENT_DIR;
@@ -53,8 +54,7 @@ async function waitForFile(file: string): Promise<void> {
 
 describe("/share temporary export security", () => {
 	beforeAll(async () => {
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Expected red-claw theme");
+		const theme = await loadTestTheme();
 		setThemeInstance(theme);
 	});
 

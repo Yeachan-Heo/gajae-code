@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai";
+import { ConfigError } from "@gajae-code/coding-agent/config/config-file";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { CustomProviderWizardComponent } from "@gajae-code/coding-agent/modes/components/custom-provider-wizard";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
@@ -267,6 +268,115 @@ describe("provider onboarding wizard red-team", () => {
 			for (const char of "visible-model") selector.handleInput(char);
 			const selectorText = visibleText(selector);
 			expect(selectorText).toContain("visible-model");
+		});
+	});
+
+	it("reports setup failure instead of success when the merged models config cannot load", async () => {
+		await withRegistry(async registry => {
+			const modelsPath = path.join(tempAgentDir!, "models.yml");
+			// Schema-valid but semantically unloadable: the loader rejects this
+			// provider for having models and no credential source.
+			const broken = [
+				"providers:",
+				"  broken:",
+				"    baseUrl: https://broken.example/v1",
+				"    api: openai-completions",
+				"    auth: apiKey",
+				"    models:",
+				"      - id: broken-model",
+				"",
+			].join("\n");
+			await Bun.write(modelsPath, broken);
+
+			const ctx = createControllerContext(registry, () => undefined);
+			const controller = new SelectorController(ctx);
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			driveWizard(wizard, { providerId: "new-provider", models: "new-model" });
+			const errorRendered = Promise.withResolvers<void>();
+			ctx.ui.requestRender = () => errorRendered.resolve();
+			wizard.handleInput("\n");
+			await errorRendered.promise;
+
+			const rendered = visibleText(wizard);
+			expect(rendered).toContain("Provider setup failed");
+			expect(rendered).toContain("Provider broken: custom models need a credential source");
+			expect(ctx.statuses).toEqual([]);
+			// The atomic rename never ran, so the original broken file is untouched
+			// and no partially configured provider was appended.
+			expect(await Bun.file(modelsPath).text()).toBe(broken);
+		});
+	});
+
+	it("surfaces a post-refresh load error instead of the success banner", async () => {
+		await withRegistry(async registry => {
+			const modelsPath = path.join(tempAgentDir!, "models.yml");
+			const broken = [
+				"providers:",
+				"  broken:",
+				"    baseUrl: https://broken.example/v1",
+				"    api: openai-completions",
+				"    auth: apiKey",
+				"    models:",
+				"      - id: broken-model",
+				"",
+			].join("\n");
+			const originalRefresh = registry.refresh.bind(registry);
+			registry.refresh = async (mode, credentialSessionId) => {
+				// Simulate the written file becoming unloadable before the refresh
+				// reads it; the registry's own loader reports the error.
+				await Bun.write(modelsPath, broken);
+				await originalRefresh(mode, credentialSessionId);
+			};
+
+			const ctx = createControllerContext(registry, () => undefined);
+			const controller = new SelectorController(ctx);
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			driveWizard(wizard, { providerId: "post-refresh-provider", models: "post-refresh-model" });
+			const errorRendered = Promise.withResolvers<void>();
+			ctx.ui.requestRender = () => errorRendered.resolve();
+			wizard.handleInput("\n");
+			await errorRendered.promise;
+
+			expect(registry.getError()).toBeDefined();
+			const rendered = visibleText(wizard).replace(/\s+/g, " ");
+			expect(rendered).toContain("Provider setup failed: Provider 'post-refresh-provider' was written to");
+			expect(rendered).toContain(
+				"its apiKeyEnv reference is in models.yml and the key itself stays in the environment",
+			);
+			expect(rendered).toContain(modelsPath);
+			expect(rendered).toContain("re-run setup with --force");
+			expect(rendered).not.toContain("configured as");
+			expect(ctx.statuses).toEqual([]);
+		});
+	});
+
+	it("does not fail setup for a non-models registry error", async () => {
+		await withRegistry(async registry => {
+			// registry.getError() also reports accepted model-preset registry failures;
+			// a corrupt preset registry must not turn a loadable provider into a
+			// setup failure.
+			registry.getError = () =>
+				new ConfigError("model-preset-registry", undefined, {
+					err: new Error("corrupt preset registry"),
+					stage: "Registry",
+				});
+			const ctx = createControllerContext(registry, () => undefined);
+			const controller = new SelectorController(ctx);
+			controller.showCustomProviderWizard();
+			const wizard = ctx.ui.focused as CustomProviderWizardComponent;
+			driveWizard(wizard, { providerId: "preset-error-provider", models: "preset-error-model" });
+			const success = Promise.withResolvers<void>();
+			ctx.showStatus = message => {
+				ctx.statuses.push(message);
+				if (message.includes("configured as")) success.resolve();
+			};
+			wizard.handleInput("\n");
+			await success.promise;
+
+			expect(ctx.statuses.join("\n")).toContain("Provider 'preset-error-provider' configured");
+			expect(ctx.statuses.join("\n")).not.toContain("Provider setup failed");
 		});
 	});
 

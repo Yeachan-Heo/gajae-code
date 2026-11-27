@@ -1,14 +1,12 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { HookSelectorComponent } from "@gajae-code/coding-agent/modes/components/hook-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { CURSOR_MARKER, type TUI } from "@gajae-code/tui";
 import type { AutocompleteItem, AutocompleteProvider } from "@gajae-code/tui/autocomplete";
+import { loadTestTheme } from "./helpers/test-theme";
 
 beforeAll(async () => {
-	const themeInstance = await getThemeByName("red-claw");
-	if (!themeInstance) {
-		throw new Error("Failed to load dark theme for tests");
-	}
+	const themeInstance = await loadTestTheme();
 	setThemeInstance(themeInstance);
 });
 
@@ -89,6 +87,34 @@ class AtFileProvider implements AutocompleteProvider {
 }
 
 describe("HookSelectorComponent inline custom input", () => {
+	it("reports authoritative custom, clarification and selector mode transitions", () => {
+		const modes: string[] = [];
+		const submitted: string[] = [];
+		const component = new HookSelectorComponent(
+			TITLE,
+			[...OPTIONS, CLARIFY],
+			() => {},
+			() => {},
+			{
+				customInput: { optionLabel: OTHER, onSubmit: text => submitted.push(text) },
+				clarificationInput: { optionLabel: CLARIFY, onSubmit: text => submitted.push(text) },
+				onInputModeChange: mode => modes.push(mode),
+			},
+		);
+		try {
+			moveToOther(component);
+			component.handleInput("\r");
+			component.handleInput("draft");
+			component.handleInput("\x1b");
+			component.handleInput("\x1b[B");
+			component.handleInput("\r");
+			expect(modes).toEqual(["custom_editor", "selector", "clarification_editor"]);
+			expect(submitted).toEqual([]);
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("keeps the title and option list visible after opening the input", () => {
 		const { component, calls } = createSelector();
 		moveToOther(component);
@@ -314,6 +340,22 @@ describe("HookSelectorComponent inline custom input", () => {
 		// With the dropdown closed, enter now submits the completed file link.
 		component.handleInput("\r");
 		expect(calls.submitted).toEqual(["@src/app.ts"]);
+	});
+
+	it("inserts a newline for every Shift+Enter encoding, including the Shift+Enter→LF terminal mapping", () => {
+		for (const variant of ["\n", "\x1b[13;2u", "\x1b[27;2;13~", "\x1b[13;2~"]) {
+			const { component, calls } = createSelector();
+			moveToOther(component);
+			component.handleInput("\r");
+
+			component.handleInput("a");
+			component.handleInput(variant);
+			component.handleInput("b");
+			expect(calls.submitted).toEqual([]);
+
+			component.handleInput("\r");
+			expect(calls.submitted).toEqual(["a\nb"]);
+		}
 	});
 
 	it("without an autocomplete provider, @ stays literal and enter submits it", async () => {

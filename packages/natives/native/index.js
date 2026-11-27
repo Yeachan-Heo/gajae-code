@@ -20,6 +20,7 @@ nativeBindings.initNativeCrashDiagnostics?.();
 export const ComputerController = nativeBindings.ComputerController;
 export const DiffStream = nativeBindings.DiffStream;
 export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
+export const FileLock = nativeBindings.FileLock;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const NativeDiagnosticSnapshot = nativeBindings.NativeDiagnosticSnapshot;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
@@ -35,7 +36,7 @@ export const TtyWriter = nativeBindings.TtyWriter;
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_19_0 = nativeBindings.__piNativesV0_19_0;
+export const __piNativesV0_22_2 = nativeBindings.__piNativesV0_22_2;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -99,10 +100,13 @@ export const openRecoveryFsRoot = nativeBindings.openRecoveryFsRoot;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
 export const pdfToMarkdown = nativeBindings.pdfToMarkdown;
+export const probeFileLock = nativeBindings.probeFileLock;
 export const probeWindowsJobMemory = nativeBindings.probeWindowsJobMemory;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
 export const rasterizeSvg = nativeBindings.rasterizeSvg;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
+export const readOwnerOnlyFile = nativeBindings.readOwnerOnlyFile;
+export const reassertRawTty = nativeBindings.reassertRawTty;
 export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoReplacePath;
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;
 export const renameNoReplacePath = nativeBindings.renameNoReplacePath;
@@ -110,6 +114,7 @@ export const renameNoReplacePathAsync = nativeBindings.renameNoReplacePathAsync;
 export const renderMermaidAscii = nativeBindings.renderMermaidAscii;
 export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermissions;
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
+export const restoreConsoleCodePagesForRender = nativeBindings.restoreConsoleCodePagesForRender;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;
 export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride;
@@ -121,6 +126,7 @@ export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
 export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;
 export const truncateToWidth = nativeBindings.truncateToWidth;
+export const tryAcquireFileLock = nativeBindings.tryAcquireFileLock;
 export const verifyOwnerOnlyFdSecurity = nativeBindings.verifyOwnerOnlyFdSecurity;
 export const verifyOwnerOnlyPathSecurity = nativeBindings.verifyOwnerOnlyPathSecurity;
 export const verifyOwnerOnlyPathSecurityExpected = nativeBindings.verifyOwnerOnlyPathSecurityExpected;
@@ -147,6 +153,23 @@ export const Ellipsis = {
 	Unicode: 0,
 	Ascii: 1,
 	Omit: 2,
+};
+export const FileLockAcquireStatus = {
+	Acquired: "acquired",
+	Held: "held",
+	Unavailable: "unavailable",
+	TimedOut: "timed_out",
+	Failed: "failed",
+};
+export const FileLockFailure = {
+	Unavailable: "unavailable",
+	TimedOut: "timed_out",
+	Failed: "failed",
+};
+export const FileLockProbeState = {
+	Free: "free",
+	Held: "held",
+	Unknown: "unknown",
 };
 export const FileType = {
 	File: 1,

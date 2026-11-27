@@ -1,0 +1,43 @@
+{
+  "models": {
+    "chat_20706": {
+      "isInternal": true,
+      "quotaInfo": {
+        "remainingFraction": 1
+      }
+    },
+    "claude-opus-5-5-medium": {
+      "displayName": "Claude Opus 5.5 (Medium)",
+      "quotaInfo": {
+        "remainingFraction": 0.055549,
+        "resetTime": "2026-10-28T04:44:12Z"
+      }
+    },
+    "claude-sonnet-5-5-high": {
+      "displayName": "Claude Sonnet 5.5 (High)",
+      "quotaInfo": {
+        "remainingFraction": 0.055549,
+        "resetTime": "2026-10-28T04:44:12Z"
+      }
+    },
+    "gemini-3.5-flash-lite": {
+      "displayName": "Gemini 3.5 Flash Lite",
+      "quotaInfo": {
+        "remainingFraction": 0.21197523,
+        "resetTime": "2026-11-02T05:26:50Z"
+      }
+    },
+    "gemini-4-argon-high": {
+      "displayName": "Gemini 4 Argon (High)",
+      "quotaInfo": {
+        "remainingFraction": 0.21197523,
+        "resetTime": "2026-11-02T05:26:50Z"
+      }
+    },
+    "tab_flash_lite_preview": {
+      "quotaInfo": {
+        "remainingFraction": 1
+      }
+    }
+  }
+}

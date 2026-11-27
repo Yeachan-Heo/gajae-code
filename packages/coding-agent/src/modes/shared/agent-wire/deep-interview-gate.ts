@@ -155,7 +155,7 @@ export function questionToGate(question: AskGateQuestion): OpenGateInput {
 		kind: question.workflowGate?.kind ?? "question",
 		schema,
 		options: question.options.map((o, i) => ({
-			value: o.label,
+			value: { selected: [o.label] },
 			label: o.label,
 			description: i === question.recommended ? "recommended" : undefined,
 		})),
@@ -276,9 +276,7 @@ export function classifyAskGateDisposition(
 	const question: AskGateQuestion = {
 		id: questionId,
 		question: typeof gate.context?.prompt === "string" ? gate.context.prompt : questionId,
-		options: (gate.options ?? []).map(option => ({
-			label: typeof option.value === "string" ? option.value : option.label,
-		})),
+		options: (gate.options ?? []).map(option => ({ label: option.label })),
 		multi: (state as Record<string, unknown>).multi === true,
 		allowEmpty: (state as Record<string, unknown>).allow_empty === true,
 	};

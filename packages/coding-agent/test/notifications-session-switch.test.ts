@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../src/extensibility/shared-events";
@@ -32,14 +33,8 @@ import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
  */
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await sleep(25);
-	}
-	throw new Error(`timed out waiting for ${label}`);
-}
+const waitFor = (pred: () => boolean, ms = 4000, label = "condition"): Promise<void> =>
+	waitForCondition(pred, ms, { intervalMs: 25, label, sleep });
 
 function deferred<T = void>(): {
 	promise: Promise<T>;

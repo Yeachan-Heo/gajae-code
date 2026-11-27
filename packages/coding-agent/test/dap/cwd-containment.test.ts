@@ -1,19 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
+import { lcgUnit } from "../../../utils/test/helpers/prng";
 import { cwdEscapesWorkspace } from "../../src/dap/session";
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
 
 describe("DAP runInTerminal workspace containment", () => {
 	test("holds seeded path containment properties with native separators (seed 0x6858c0de)", () => {
-		const random = seededRandom(0x6858c0de);
+		const random = lcgUnit(0x6858c0de);
 		const randomInt = (max: number): number => Math.floor(random() * max);
 
 		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {

@@ -479,12 +479,13 @@ function frameStoredLocalExecution(text: string): string {
 }
 
 /**
- * Frame debug tool text at the model boundary. Output capture and pre-admission
- * spill already cut the excerpt; do not slice this string again.
+ * Frame debug and bisect tool text at the model boundary. Output capture, the
+ * bisect receipt, and pre-admission spill already cut the excerpt; do not slice
+ * this string again.
  */
 function frameDebugToolResult(message: ToolResultMessage): (TextContent | ImageContent)[] {
 	const content = getPrunedToolResultContent(message);
-	if (message.toolName !== "debug") return content;
+	if (message.toolName !== "debug" && message.toolName !== "bisect") return content;
 	return content.map(block => (block.type === "text" ? { ...block, text: wrapUntrustedContent(block.text) } : block));
 }
 

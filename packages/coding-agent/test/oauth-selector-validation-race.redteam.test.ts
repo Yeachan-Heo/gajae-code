@@ -2,22 +2,18 @@ import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { clearProviderAuthHealth, getProviderAuthHealth } from "@gajae-code/coding-agent/config/provider-auth-health";
 import { OAuthSelectorComponent } from "@gajae-code/coding-agent/modes/components/oauth-selector";
-import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { loadTestTheme } from "./helpers/test-theme";
 
-let testTheme = await getThemeByName("red-claw");
-
-function installTestTheme(): void {
-	if (!testTheme) throw new Error("Failed to load red-claw test theme");
-	setThemeInstance(testTheme);
-}
+let testTheme = await loadTestTheme();
 
 function stripAnsi(value: string): string {
 	return value.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function renderedText(selector: OAuthSelectorComponent): string {
-	installTestTheme();
+	setThemeInstance(testTheme);
 	return selector.render(240).map(stripAnsi).join("\n");
 }
 
@@ -33,8 +29,8 @@ async function flushValidation(): Promise<void> {
 }
 
 beforeEach(async () => {
-	testTheme = await getThemeByName("red-claw");
-	installTestTheme();
+	testTheme = await loadTestTheme();
+	setThemeInstance(testTheme);
 });
 
 describe("OAuth selector validation generation race", () => {

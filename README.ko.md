@@ -22,9 +22,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App 살펴보기 → 데스크톱·셀프 호스팅 웹 GUI</strong></kbd></a>
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App (지원 중단)</strong></kbd></a>
   <br/>
-  <sub>커뮤니티가 만드는 실험적 서드파티 프로젝트이며, Gajae-Code의 공식 퍼스트파티 앱이 아닙니다.</sub>
+  <sub>지원 중단: 이 커뮤니티 서드파티 앱은 더 이상 관리되지 않습니다(마지막 릴리스 v2.0.0-beta.20, 2026-09-25). 앱 내 업데이터와 번들 SDK가 오래되었으므로 새로 설치하지 마세요.</sub>
 </p>
 
 <p align="center">

@@ -16,8 +16,8 @@ import {
 	emptyAgentRunSummary,
 } from "@gajae-code/agent-core/run-collector";
 import { EXECUTE_TOOL_STATUS_ATTR, GenAIAttr, PiGenAIAggregateAttr } from "@gajae-code/agent-core/telemetry";
-import type { AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AgentEvent, AgentLoopConfig, AgentTool } from "@gajae-code/agent-core/types";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type {
@@ -29,7 +29,7 @@ import type {
 	TimeInput,
 	Tracer,
 } from "@opentelemetry/api";
-import { createUserMessage } from "./helpers";
+import { createUserMessage, identityConverter } from "./helpers";
 
 interface RecordedSpan {
 	readonly name: string;
@@ -97,10 +97,6 @@ function makeFakeSpan(record: RecordedSpan): Span {
 		},
 	};
 	return span;
-}
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
 function makeUsage(

@@ -385,6 +385,15 @@ function findSourceValueSpans(line: string): Array<{ start: number; end: number 
 	}
 }
 
+/**
+ * The numbers of the `[image N]` references the editor writes for attached images, in text order (repeats kept).
+ * The editor uses them to pick the images a prompt sends; the transcript uses them to tell which of a message's
+ * images its text already names.
+ */
+export function imageReferenceNumbers(text: string): number[] {
+	return Array.from(text.matchAll(/\[image ([1-9]\d*)\]/g), match => Number.parseInt(match[1] ?? "", 10));
+}
+
 export function locatePastedImageReferenceAroundCursor(
 	line: string,
 	cursorCol: number,
@@ -422,4 +431,9 @@ export function locatePastedImageReferenceAroundCursor(
 
 		if (cursorCol === placeholderEnd) return { imageIndex, startCol, endCol: placeholderEnd };
 	}
+}
+
+/** Image files among absolute paths (macOS pasteboard file list), in order. */
+export function imageFilePathsFromList(paths: readonly string[]): string[] {
+	return paths.filter(candidate => path.posix.isAbsolute(candidate) && IMAGE_FILE_EXTENSION_PATTERN.test(candidate));
 }

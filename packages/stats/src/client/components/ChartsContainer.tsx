@@ -13,6 +13,7 @@ import { useMemo } from "react";
 import { Line } from "react-chartjs-2";
 import type { ModelTimeSeriesPoint, TimeRange } from "../types";
 import { useSystemTheme } from "../useSystemTheme";
+import { buildModelPreferenceSeries } from "./chart-shared";
 import { formatRangeTick, rangeMeta } from "./range-meta";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
@@ -61,7 +62,7 @@ export function ChartsContainer({ modelSeries, timeRange }: ChartsContainerProps
 		labels: chartData.data.map(d => formatRangeTick(d.timestamp, timeRange)),
 		datasets: chartData.series.map((seriesName, index) => ({
 			label: seriesName,
-			data: chartData.data.map(d => d[seriesName] ?? 0),
+			data: chartData.data.map(d => d.shares[seriesName] ?? 0),
 			borderColor: MODEL_COLORS[index % MODEL_COLORS.length],
 			backgroundColor: `${MODEL_COLORS[index % MODEL_COLORS.length]}20`,
 			fill: true,
@@ -154,68 +155,4 @@ export function ChartsContainer({ modelSeries, timeRange }: ChartsContainerProps
 			</div>
 		</div>
 	);
-}
-
-function buildModelPreferenceSeries(
-	points: ModelTimeSeriesPoint[],
-	topN = 5,
-): {
-	data: Array<Record<string, number>>;
-	series: string[];
-} {
-	if (points.length === 0) return { data: [], series: [] };
-
-	const totals = new Map<string, { model: string; provider: string; total: number }>();
-	for (const point of points) {
-		const key = `${point.model}::${point.provider}`;
-		const existing = totals.get(key);
-		if (existing) {
-			existing.total += point.requests;
-		} else {
-			totals.set(key, { model: point.model, provider: point.provider, total: point.requests });
-		}
-	}
-
-	const sorted = [...totals.entries()].map(([key, value]) => ({ key, ...value })).sort((a, b) => b.total - a.total);
-	const topEntries = sorted.slice(0, topN);
-	const topKeys = new Set(topEntries.map(entry => entry.key));
-
-	const topModelCounts = new Map<string, number>();
-	for (const entry of topEntries) {
-		topModelCounts.set(entry.model, (topModelCounts.get(entry.model) ?? 0) + 1);
-	}
-
-	const labelByKey = new Map<string, string>();
-	for (const entry of topEntries) {
-		const showProvider = (topModelCounts.get(entry.model) ?? 0) > 1;
-		labelByKey.set(entry.key, showProvider ? `${entry.model} (${entry.provider})` : entry.model);
-	}
-
-	const dataMap = new Map<number, Record<string, number>>();
-
-	for (const point of points) {
-		const key = `${point.model}::${point.provider}`;
-		const bucket = dataMap.get(point.timestamp) ?? { timestamp: point.timestamp, total: 0 };
-		bucket.total += point.requests;
-		const seriesLabel = topKeys.has(key) ? (labelByKey.get(key) ?? point.model) : "Other";
-		bucket[seriesLabel] = (bucket[seriesLabel] ?? 0) + point.requests;
-		dataMap.set(point.timestamp, bucket);
-	}
-
-	const series = topEntries.map(entry => labelByKey.get(entry.key) ?? entry.model);
-	if ([...dataMap.values()].some(row => (row.Other ?? 0) > 0)) {
-		series.push("Other");
-	}
-
-	const data = [...dataMap.values()]
-		.sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0))
-		.map(row => {
-			const total = row.total ?? 0;
-			for (const key of series) {
-				row[key] = total > 0 ? ((row[key] ?? 0) / total) * 100 : 0;
-			}
-			return row;
-		});
-
-	return { data, series };
 }

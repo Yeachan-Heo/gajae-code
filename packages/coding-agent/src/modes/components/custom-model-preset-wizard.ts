@@ -1,9 +1,17 @@
 import { Container, Input, matchesKey, Spacer, Text, TruncatedText } from "@gajae-code/tui";
+import { sanitizeDisplayLine } from "@gajae-code/utils";
 import { MODEL_PROFILE_NAME_PATTERN } from "../../config/model-registry";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { theme } from "../theme/theme";
 import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 import { DynamicBorder } from "./dynamic-border";
+
+/** One display row. Sanitize the whole field before it is drawn. */
+function formatSnapshotField(value: string | readonly string[]): string {
+	const raw = typeof value === "string" ? value : value.join(",");
+	return sanitizeDisplayLine(raw);
+}
+
 export interface CustomModelPresetWizardSubmit {
 	name: string;
 	profile: ModelProfileConfig;
@@ -93,9 +101,13 @@ export class CustomModelPresetWizardComponent extends Container {
 	#addSnapshotPreview(): void {
 		this.#contentContainer.addChild(new Text(theme.fg("muted", "Snapshot:"), 0, 0));
 		for (const [role, selector] of Object.entries(this.#snapshot.model_mapping)) {
-			this.#contentContainer.addChild(new Text(`  ${role}: ${selector}`, 0, 0));
+			if (selector === undefined) continue;
+			this.#contentContainer.addChild(
+				new Text(`  ${formatSnapshotField(role)}: ${formatSnapshotField(selector)}`, 0, 0),
+			);
 		}
-		this.#contentContainer.addChild(new Text(`  providers: ${this.#snapshot.required_providers.join(", ")}`, 0, 0));
+		const providers = this.#snapshot.required_providers.map(provider => formatSnapshotField(provider)).join(", ");
+		this.#contentContainer.addChild(new Text(`  providers: ${providers}`, 0, 0));
 		this.#contentContainer.addChild(new Spacer(1));
 	}
 

@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { lcgUnit } from "../../utils/test/helpers/prng";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * Bun autoloads cwd/.env into process.env before getProxyForUrl runs. A project
@@ -28,8 +28,6 @@ const PROXY_KEYS = [
 
 const PROJECT = "http://project.proxy:8080";
 const SHELL = "http://shell.proxy:8080";
-const tempDirs: string[] = [];
-
 interface ProxySelectionCase {
 	provider: string;
 	envName: string;
@@ -41,16 +39,8 @@ interface ProbeOptions {
 	worktreeCwd?: string;
 }
 
-function tempDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-proxy-env-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const trustDirs = createTrustTempDirs("gjc-proxy-env-trust-");
+const { tempDir, projectDir } = trustDirs;
 
 async function selectedProxy(
 	cwd: string,
@@ -96,14 +86,6 @@ async function runProbe(cwd: string, args: string[], options: ProbeOptions): Pro
 	return stdout.trim();
 }
 
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
-
 function generatedToken(random: () => number): string {
 	return Math.floor(random() * 0x1_0000_0000)
 		.toString(36)
@@ -112,39 +94,39 @@ function generatedToken(random: () => number): string {
 
 describe("getProxyForUrl project dotenv", () => {
 	it("ignores PI_PROXY when only the project dotenv sets it", async () => {
-		expect(await selectedProxy(tempDir(`PI_PROXY=${PROJECT}\n`))).toBeNull();
+		expect(await selectedProxy(projectDir(`PI_PROXY=${PROJECT}\n`))).toBeNull();
 	});
 
 	it("ignores PI_PROXY_ANTHROPIC when only the project dotenv sets it", async () => {
-		expect(await selectedProxy(tempDir(`PI_PROXY_ANTHROPIC=${PROJECT}\n`))).toBeNull();
+		expect(await selectedProxy(projectDir(`PI_PROXY_ANTHROPIC=${PROJECT}\n`))).toBeNull();
 	});
 
 	it("ignores HTTPS_PROXY when only the project dotenv sets it", async () => {
-		expect(await selectedProxy(tempDir(`HTTPS_PROXY=${PROJECT}\n`))).toBeNull();
+		expect(await selectedProxy(projectDir(`HTTPS_PROXY=${PROJECT}\n`))).toBeNull();
 	});
 
 	it("ignores https_proxy when only the project dotenv sets it", async () => {
-		expect(await selectedProxy(tempDir(`https_proxy=${PROJECT}\n`))).toBeNull();
+		expect(await selectedProxy(projectDir(`https_proxy=${PROJECT}\n`))).toBeNull();
 	});
 
 	it("ignores ALL_PROXY when only the project dotenv sets it", async () => {
-		expect(await selectedProxy(tempDir(`ALL_PROXY=${PROJECT}\n`))).toBeNull();
+		expect(await selectedProxy(projectDir(`ALL_PROXY=${PROJECT}\n`))).toBeNull();
 	});
 
 	it("ignores HTTP_PROXY when only the project dotenv sets it", async () => {
 		expect(
-			await selectedProxy(tempDir(`HTTP_PROXY=${PROJECT}\n`), {
+			await selectedProxy(projectDir(`HTTP_PROXY=${PROJECT}\n`), {
 				target: "http://api.example.com/v1",
 			}),
 		).toBeNull();
 	});
 
 	it("ignores a dynamic project dotenv PI_PROXY", async () => {
-		expect(await selectedProxy(tempDir(`TARGET=${PROJECT}\nPI_PROXY=$TARGET\n`))).toBeNull();
+		expect(await selectedProxy(projectDir(`TARGET=${PROJECT}\nPI_PROXY=$TARGET\n`))).toBeNull();
 	});
 
 	it("ignores PI_PROXY when the shell value equals the project declaration", async () => {
-		expect(await selectedProxy(tempDir(`PI_PROXY=${PROJECT}\n`), { inherited: { PI_PROXY: PROJECT } })).toBeNull();
+		expect(await selectedProxy(projectDir(`PI_PROXY=${PROJECT}\n`), { inherited: { PI_PROXY: PROJECT } })).toBeNull();
 	});
 
 	it("keeps a PI_PROXY inherited from the launching shell", async () => {
@@ -156,25 +138,29 @@ describe("getProxyForUrl project dotenv", () => {
 	});
 
 	it("keeps a shell PI_PROXY when the project dotenv declares a different comparable value", async () => {
-		expect(await selectedProxy(tempDir(`PI_PROXY=${PROJECT}\n`), { inherited: { PI_PROXY: SHELL } })).toBe(SHELL);
+		expect(await selectedProxy(projectDir(`PI_PROXY=${PROJECT}\n`), { inherited: { PI_PROXY: SHELL } })).toBe(SHELL);
 	});
 
 	it("ignores a different shell PI_PROXY when the project declaration is dynamic", async () => {
 		expect(
-			await selectedProxy(tempDir(`TARGET=${PROJECT}\nPI_PROXY=$TARGET\n`), { inherited: { PI_PROXY: SHELL } }),
+			await selectedProxy(projectDir(`TARGET=${PROJECT}\nPI_PROXY=$TARGET\n`), { inherited: { PI_PROXY: SHELL } }),
 		).toBeNull();
 	});
 
 	it("ignores a different shell PI_PROXY when the project declaration has quoted inner whitespace", async () => {
-		expect(await selectedProxy(tempDir(`PI_PROXY=" ${PROJECT} "\n`), { inherited: { PI_PROXY: SHELL } })).toBeNull();
+		expect(
+			await selectedProxy(projectDir(`PI_PROXY=" ${PROJECT} "\n`), { inherited: { PI_PROXY: SHELL } }),
+		).toBeNull();
 	});
 
 	it("selects the shell HTTPS_PROXY when the project dotenv sets PI_PROXY", async () => {
-		expect(await selectedProxy(tempDir(`PI_PROXY=${PROJECT}\n`), { inherited: { HTTPS_PROXY: SHELL } })).toBe(SHELL);
+		expect(await selectedProxy(projectDir(`PI_PROXY=${PROJECT}\n`), { inherited: { HTTPS_PROXY: SHELL } })).toBe(
+			SHELL,
+		);
 	});
 
 	it("uses startup dotenv provenance when first selecting a proxy after a worktree cwd change", async () => {
-		const project = tempDir(`PI_PROXY=${PROJECT}\n`);
+		const project = projectDir(`PI_PROXY=${PROJECT}\n`);
 		const worktree = tempDir();
 		expect(
 			await selectedProxy(project, {
@@ -185,7 +171,7 @@ describe("getProxyForUrl project dotenv", () => {
 	});
 
 	it("preserves proxy provenance invariants for seeded generated declarations", async () => {
-		const random = seededRandom(0x6833);
+		const random = lcgUnit(0x6833);
 		const declarations: string[] = [];
 		const cases: ProxySelectionCase[] = [];
 		const expected: string[] = [];
@@ -226,7 +212,7 @@ describe("getProxyForUrl project dotenv", () => {
 		}
 
 		expect(
-			await selectedProxies(tempDir(`${declarations.join("\n")}\n`), cases, {
+			await selectedProxies(projectDir(`${declarations.join("\n")}\n`), cases, {
 				inherited: { HTTPS_PROXY: fallback },
 			}),
 		).toEqual(expected);

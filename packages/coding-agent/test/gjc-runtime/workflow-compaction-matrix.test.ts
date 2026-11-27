@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { TempDir } from "@gajae-code/utils";
+import type { TempDir } from "@gajae-code/utils";
 import { resolveUltragoalValidationApplicability } from "../../src/gjc-runtime/ultragoal-validation-policy";
 import {
 	hashWorkflowRecoveryProjection,
@@ -25,6 +25,9 @@ import {
 	projectUltragoalRun,
 	type WorkflowRecoveryProjection,
 } from "../../src/gjc-runtime/workflow-recovery-projection";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 const SESSION_ID = "compaction-matrix";
 
@@ -135,7 +138,7 @@ describe("#4560 forced-compaction comparative matrix", () => {
 		fixture: Fixture,
 		compactions: number,
 	): Promise<{ projections: WorkflowRecoveryProjection[]; root: string }> {
-		const temp = TempDir.createSync("@pi-4560-matrix-");
+		const temp = trackedTemp.tempDirSync("@pi-4560-matrix-");
 		const root = temp.path();
 		await seedPlan(root, fixtureGoals(fixture), "Ship the durable recovery contract");
 		const projections: WorkflowRecoveryProjection[] = [];
@@ -269,7 +272,7 @@ describe("#4560 forced-compaction window coverage", () => {
 	let tempDir: TempDir;
 
 	beforeEach(() => {
-		tempDir = TempDir.createSync("@pi-4560-matrix-");
+		tempDir = trackedTemp.tempDirSync("@pi-4560-matrix-");
 	});
 
 	afterEach(() => {

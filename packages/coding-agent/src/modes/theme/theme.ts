@@ -1812,6 +1812,37 @@ export function getDetectedThemeSettingsPath(): "theme.dark" | "theme.light" {
 	return detectTerminalBackground() === "light" ? "theme.light" : "theme.dark";
 }
 
+// Whether the terminal's OSC 11 answer can change the active theme. The terminal
+// polls OSC 11 only while this holds.
+var appearanceDemandCallback: ((needed: boolean) => void) | undefined;
+var reportedAppearanceDemand: boolean | undefined;
+
+function terminalAppearanceSelectsTheme(): boolean {
+	return autoDetectedTheme && autoDarkTheme !== autoLightTheme && !shouldUseMacOSAppearanceFallback();
+}
+
+function syncAppearanceDemand(): void {
+	if (!appearanceDemandCallback) return;
+	const needed = terminalAppearanceSelectsTheme();
+	if (needed === reportedAppearanceDemand) return;
+	reportedAppearanceDemand = needed;
+	appearanceDemandCallback(needed);
+}
+
+/**
+ * Register the sink for terminal appearance demand. Called now with the current demand and
+ * again whenever auto-detection or the dark/light mapping changes it. Returns a function
+ * that unregisters the sink.
+ */
+export function onTerminalAppearanceDemandChange(callback: (needed: boolean) => void): () => void {
+	appearanceDemandCallback = callback;
+	reportedAppearanceDemand = undefined;
+	syncAppearanceDemand();
+	return () => {
+		if (appearanceDemandCallback === callback) appearanceDemandCallback = undefined;
+	};
+}
+
 // ============================================================================
 // Global Theme Instance
 // ============================================================================
@@ -1854,6 +1885,7 @@ export async function initTheme(
 	autoDetectedTheme = true;
 	autoDarkTheme = darkTheme ?? "red-claw";
 	autoLightTheme = lightTheme ?? "blue-crab";
+	syncAppearanceDemand();
 	if (enableWatcher && shouldUseMacOSAppearanceFallback()) {
 		const bindings = loadNativeThemeBindings();
 		if (bindings) macOSReportedAppearance = bindings.detectMacOSAppearance() ?? undefined;
@@ -1892,6 +1924,7 @@ export async function setTheme(
 		}
 		if (!shouldApply()) return { success: false, error: "Theme change cancelled" };
 		autoDetectedTheme = false;
+		syncAppearanceDemand();
 		previewThemeActive = false;
 		currentThemeName = name;
 		theme = loadedTheme;
@@ -1971,6 +2004,7 @@ export async function restoreThemePreview(name: string): Promise<{ success: bool
  */
 export function enableAutoTheme(): void {
 	autoDetectedTheme = true;
+	syncAppearanceDemand();
 	reevaluateAutoTheme("enableAutoTheme");
 }
 
@@ -1981,6 +2015,7 @@ export function enableAutoTheme(): void {
 export function setAutoThemeMapping(mode: "dark" | "light", themeName: string): void {
 	if (mode === "dark") autoDarkTheme = themeName;
 	else autoLightTheme = themeName;
+	syncAppearanceDemand();
 	reevaluateAutoTheme("setAutoThemeMapping");
 }
 
@@ -1997,6 +2032,7 @@ export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
 
 export function setThemeInstance(themeInstance: Theme): void {
 	autoDetectedTheme = false;
+	syncAppearanceDemand();
 	previewThemeActive = false;
 	theme = themeInstance;
 	currentThemeName = "<in-memory>";

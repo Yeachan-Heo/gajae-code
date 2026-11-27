@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * `findApiKey()` supplies the credential for every Exa MCP call, and that key
@@ -17,23 +16,7 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "exa-api-key-probe.ts");
 const KEY = "EXA_API_KEY";
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-exa-key-trust-"));
-	tempDirs.push(dir);
-	return dir;
-}
-
-function projectDir(dotenv?: string): string {
-	const dir = tempDir();
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const { tempDir, projectDir } = createTrustTempDirs("gjc-exa-key-trust-");
 
 async function keyIn(cwd: string, overrides: Record<string, string> = {}): Promise<string | null> {
 	const env: Record<string, string> = {};
