@@ -13,7 +13,6 @@ import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/t
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { formatFileWriteError, writeFileAtomically } from "./atomic-file-write";

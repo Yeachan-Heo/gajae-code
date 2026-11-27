@@ -3,7 +3,6 @@ import { replaceText } from "../../src/edit/diff";
 import { findMatch, seekSequence } from "../../src/edit/modes/replace";
 import { normalizeToLF } from "../../src/edit/normalize";
 
-
 const longLine = `${"a".repeat(512)} TARGET ${"b".repeat(512)}`;
 
 const cases = [

@@ -9,7 +9,6 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import type { ReadToolDetails } from "@gajae-code/coding-agent/tools/read";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 
-
 function textOutput(result: AgentToolResult<ReadToolDetails>): string {
 	return result.content
 		.filter(c => c.type === "text")
@@ -189,8 +188,6 @@ describe("read tool multi-range selector", () => {
 			else expect(textOutput(diskResult)).not.toContain(`200|200|${"x".repeat(20)}`);
 			if (truncation === "last") expect(textOutput(diskResult)).not.toContain(`50|50|${"x".repeat(20)}`);
 			else expect(textOutput(diskResult)).toContain(`50|50|${"x".repeat(20)}`);
-
-
 		}
 	});
 
@@ -231,31 +228,30 @@ describe("read tool multi-range selector", () => {
 			readTextFile: async () => source,
 		});
 		const archiveSession = createSession(tmpDir);
-			const cases = [
-				{ name: "disk", session: diskSession, path: `${filePath}:1-2,4-4` },
-				{ name: "ACP", session: acpSession, path: `${filePath}:1-2,4-4` },
-				{ name: "archive", session: archiveSession, path: `${archivePath}:docs/partial-disclosure.txt:1-2,4-4` },
-			] as const;
+		const cases = [
+			{ name: "disk", session: diskSession, path: `${filePath}:1-2,4-4` },
+			{ name: "ACP", session: acpSession, path: `${filePath}:1-2,4-4` },
+			{ name: "archive", session: archiveSession, path: `${archivePath}:docs/partial-disclosure.txt:1-2,4-4` },
+		] as const;
 
 		for (const testCase of cases) {
-				const result = await new ReadTool(testCase.session).execute(`partial-${testCase.name}`, {
-					path: testCase.path,
-					truncation: "both",
-				});
-				const text = textOutput(result);
-						expect(text).toContain("Showing last");
-				expect(text).toContain("delta");
-				expect(text).not.toContain("0 lines elided");
-				expect(text).not.toContain("omitted lines 2-1");
-				const omittedRange = /omitted lines (\d+)-(\d+)/.exec(text);
-				expect(omittedRange === null || Number(omittedRange[1]) <= Number(omittedRange[2])).toBe(true);
-				const partialLine = text.split("\n").find(line => line.startsWith("Z"));
-				expect(partialLine).toBeDefined();
-				expect(partialLine).not.toMatch(/^\d+\|/);
-				expect(text).not.toMatch(/^\d+[a-z]{2}\|Z/m);
-				expect(result.details?.meta?.limits?.columnTruncated?.maxColumn).toBe(768);
+			const result = await new ReadTool(testCase.session).execute(`partial-${testCase.name}`, {
+				path: testCase.path,
+				truncation: "both",
+			});
+			const text = textOutput(result);
+			expect(text).toContain("Showing last");
+			expect(text).toContain("delta");
+			expect(text).not.toContain("0 lines elided");
+			expect(text).not.toContain("omitted lines 2-1");
+			const omittedRange = /omitted lines (\d+)-(\d+)/.exec(text);
+			expect(omittedRange === null || Number(omittedRange[1]) <= Number(omittedRange[2])).toBe(true);
+			const partialLine = text.split("\n").find(line => line.startsWith("Z"));
+			expect(partialLine).toBeDefined();
+			expect(partialLine).not.toMatch(/^\d+\|/);
+			expect(text).not.toMatch(/^\d+[a-z]{2}\|Z/m);
+			expect(result.details?.meta?.limits?.columnTruncated?.maxColumn).toBe(768);
 			expect(result.details?.spillEligible).toBe(false);
-
 		}
 	});
 

@@ -1,9 +1,8 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { EDIT_MODE_STRATEGIES } from "@gajae-code/coding-agent/edit";
 import { editToolRenderer } from "@gajae-code/coding-agent/edit/renderer";
-import { getEditRequestTargetInventory, type PerFileDiffPreview } from "@gajae-code/coding-agent/edit/streaming";
+import { getEditRequestTargetInventory } from "@gajae-code/coding-agent/edit/streaming";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";

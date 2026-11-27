@@ -2,11 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, StopReason, ToolCall, ToolResultMessage, Usage } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	applyPatchSchema,
-	patchEditSchema,
-	replaceEditSchema,
-} from "@gajae-code/coding-agent/edit";
+import { applyPatchSchema, patchEditSchema, replaceEditSchema } from "@gajae-code/coding-agent/edit";
 import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import {
 	BTW_MAX_TOOL_STATUS_LINE_UTF8_BYTES,

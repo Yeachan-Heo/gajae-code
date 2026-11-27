@@ -517,7 +517,6 @@ import { clampTimeout } from "../tools/tool-timeouts";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { generateSessionRecap, selectRecapModel } from "../utils/recap-generator";
 import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";

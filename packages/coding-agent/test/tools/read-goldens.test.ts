@@ -5,7 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { EditTool } from "@gajae-code/coding-agent/edit";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
@@ -214,8 +213,6 @@ function textOf(result: ReadResult): string {
 		.map(block => block.text ?? "")
 		.join("\n");
 }
-
-
 
 function createSession(cwd: string, settings: Settings, artifactDir: string, bridgeText?: string): ToolSession {
 	const sessionDir = path.join(cwd, "session-output");
@@ -501,9 +498,7 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 			...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
 		});
 		const bridgeText =
-			entry.name === "acp-bare-parity"
-				? fs.readFileSync(path.join(fixture.root, "prose.txt"), "utf8")
-				: undefined;
+			entry.name === "acp-bare-parity" ? fs.readFileSync(path.join(fixture.root, "prose.txt"), "utf8") : undefined;
 		const session = createSession(fixture.root, settings, fixture.artifactDir, bridgeText);
 		const tool = wrapToolWithMetaNotice(new ReadTool(session));
 		const value =
@@ -584,26 +579,19 @@ describe("read truncation golden harness", () => {
 		}
 
 		expect(manifest).toHaveLength(43);
-		const phaseZeroGoldenFiles = manifest
-			.filter(entry => entry.phase === 0).length;
+		const phaseZeroGoldenFiles = manifest.filter(entry => entry.phase === 0).length;
 		expect(phaseZeroGoldenFiles).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 		expect(actualGoldenFiles("invariant").size).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 	});
 
-
 	it("keeps archive range fixtures above line and byte budgets", () => {
-		const large = JSON.parse(
-			fs.readFileSync(goldenPath("invariant", "archive-large-ranged"), "utf8"),
-		) as Captured;
-		const bytes = JSON.parse(
-			fs.readFileSync(goldenPath("invariant", "archive-bytes-ranged"), "utf8"),
-		) as Captured;
+		const large = JSON.parse(fs.readFileSync(goldenPath("invariant", "archive-large-ranged"), "utf8")) as Captured;
+		const bytes = JSON.parse(fs.readFileSync(goldenPath("invariant", "archive-bytes-ranged"), "utf8")) as Captured;
 		expect(large.text.length).toBeGreaterThan(0);
 		expect((large.truncation as { totalLines: number }).totalLines).toBe(3_200);
 		expect(bytes.text.length).toBeGreaterThan(0);
 		expect((bytes.truncation as { totalBytes: number }).totalBytes).toBeGreaterThanOrEqual(60 * 1024);
 	});
-
 
 	it("rejects phase-1 entries when a phase-0 runner attempts to execute them", () => {
 		const phaseOne = manifest.find(entry => entry.phase === 1);
@@ -612,11 +600,7 @@ describe("read truncation golden harness", () => {
 	});
 
 	it("keeps writeGolden restricted to changed/ and update mode", () => {
-		expect(() => writeGolden("invariant", "guard", {} as Captured)).toThrow(
-			/refusing to write invariant\/guard/,
-		);
-		expect(() => writeGolden("surface", "guard", {} as Captured)).toThrow(
-			/refusing to write surface\/guard/,
-		);
+		expect(() => writeGolden("invariant", "guard", {} as Captured)).toThrow(/refusing to write invariant\/guard/);
+		expect(() => writeGolden("surface", "guard", {} as Captured)).toThrow(/refusing to write surface\/guard/);
 	});
 });

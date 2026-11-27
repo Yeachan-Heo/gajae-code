@@ -2,12 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	adjustIndentation,
-	computeEditDiff,
-	DEFAULT_FUZZY_THRESHOLD,
-	findMatch,
-} from "@gajae-code/coding-agent/edit";
+import { adjustIndentation, computeEditDiff, DEFAULT_FUZZY_THRESHOLD, findMatch } from "@gajae-code/coding-agent/edit";
 
 describe("findMatch", () => {
 	describe("exact matching", () => {

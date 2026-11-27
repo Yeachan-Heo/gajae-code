@@ -2,8 +2,6 @@
  * Resolve line-display mode for file-like outputs (read, grep, @file mentions).
  */
 
-import { resolveEditMode } from "./edit-mode";
-
 export interface FileDisplayMode {
 	lineNumbers: boolean;
 }

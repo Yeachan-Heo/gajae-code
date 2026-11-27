@@ -419,7 +419,6 @@ describe("column cap plain-secret cut", () => {
 			const raw = textOf(await tool.execute("read-raw", { path: `${file}:raw` }, undefined, undefined, context));
 			expect(raw).toContain(CANARY);
 			expect(raw).toContain(FILLER.repeat(30));
-
 		} finally {
 			await settings.close();
 			rmSync(root, { recursive: true, force: true });

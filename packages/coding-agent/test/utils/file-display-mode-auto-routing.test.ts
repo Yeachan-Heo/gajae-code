@@ -63,18 +63,15 @@ describe("resolveFileDisplayMode", () => {
 		expect(mode.lineNumbers).toBe(true);
 	});
 
-
-
 	test("raw reads suppress line numbers", () => {
 		const raw = resolveFileDisplayMode(makeSession({ model: "zai/glm-4.7", readLineNumbers: true }), { raw: true });
 		expect(raw.lineNumbers).toBe(false);
 	});
 
 	test("immutable reads respect readLineNumbers setting", () => {
-		const immutable = resolveFileDisplayMode(
-			makeSession({ model: "zai/glm-4.7", readLineNumbers: true }),
-			{ immutable: true },
-		);
+		const immutable = resolveFileDisplayMode(makeSession({ model: "zai/glm-4.7", readLineNumbers: true }), {
+			immutable: true,
+		});
 		expect(immutable.lineNumbers).toBe(true);
 	});
 });

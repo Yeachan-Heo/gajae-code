@@ -1998,8 +1998,6 @@ describe("AgentSession retry fallback", () => {
 		});
 		expect(replaceCapture2.tools.edit.description).toBe(replaceCapture.tools.edit.description);
 		expect(replaceCapture2.tools.edit.parameters).toBe(replaceCapture.tools.edit.parameters);
-
-
 	});
 	it("normalizes suppression by base selector and clears it on model refresh", async () => {
 		const future = Date.now() + 60_000;

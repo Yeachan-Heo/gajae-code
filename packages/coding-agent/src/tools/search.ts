@@ -600,17 +600,17 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						}
 						return nextWidth;
 					}, 0);
-				let lastEmittedLine: number | undefined;
-				const gutterPad = " ".repeat(lineNumberWidth + 1);
-				for (const match of fileMatches) {
-					const pushLine = (lineNumber: number, line: string, isMatch: boolean, recordable: boolean) => {
-						if (lastEmittedLine !== undefined && lineNumber > lastEmittedLine + 1) {
-							modelOut.push("...");
-							displayOut.push(`${gutterPad}│...`);
-						}
-						modelOut.push(formatMatchLine(lineNumber, line, isMatch));
-						displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
-						lastEmittedLine = lineNumber;
+					let lastEmittedLine: number | undefined;
+					const gutterPad = " ".repeat(lineNumberWidth + 1);
+					for (const match of fileMatches) {
+						const pushLine = (lineNumber: number, line: string, isMatch: boolean, _recordable: boolean) => {
+							if (lastEmittedLine !== undefined && lineNumber > lastEmittedLine + 1) {
+								modelOut.push("...");
+								displayOut.push(`${gutterPad}│...`);
+							}
+							modelOut.push(formatMatchLine(lineNumber, line, isMatch));
+							displayOut.push(formatCodeFrameLine(isMatch ? "*" : " ", lineNumber, line, lineNumberWidth));
+							lastEmittedLine = lineNumber;
 						};
 						if (match.contextBefore) {
 							for (const ctx of match.contextBefore) {

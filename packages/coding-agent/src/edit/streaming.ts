@@ -13,15 +13,12 @@
  * the injected `editMode` rather than probing argument shape.
  */
 
-import { sanitizeText } from "@gajae-code/utils";
-
 // Patch envelope markers (apply_patch mode)
 const BEGIN_PATCH_MARKER = "*** Begin Patch";
 const END_PATCH_MARKER = "*** End Patch";
 const ABORT_MARKER = "*** Abort";
 
 import type { Theme } from "../modes/theme/theme";
-import { replaceTabs, truncateToWidth } from "../tools/render-utils";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { computeEditDiff, type DiffError, type DiffResult } from "./diff";
 import { type ApplyPatchEntry, expandApplyPatchToEntries, expandApplyPatchToPreviewEntries } from "./modes/apply-patch";
@@ -111,7 +108,6 @@ function extractTrailingPartialJsonPath(partialJson: string | undefined): string
 	return trailingPath;
 }
 
-
 /**
  * `apply_patch` carries operation metadata inside the envelope rather than in structured `edits`,
  * so the collapsed card has to read op/rename off the first parsed entry to stay accurate while live.
@@ -141,7 +137,6 @@ export function getEditRequestTargetInventory(
 				: undefined;
 	const edits = Array.isArray(values.edits) ? values.edits : [];
 
-
 	// Legacy call sites render the shared edit card without threading `renderContext.editMode`;
 	// a free-form `input` string is only ever an apply_patch envelope there.
 	if (editMode === "apply_patch" || (editMode === undefined && typeof values.input === "string")) {
@@ -164,9 +159,6 @@ export function getEditRequestTargetInventory(
 	const partialPath = options.isPartial ? extractTrailingPartialJsonPath(partialJson) : undefined;
 	return { paths: orderedDistinctPaths([topLevelPath, ...editPaths, partialPath]) };
 }
-
-const STREAMING_PLACEHOLDER_LINES = 12;
-const STREAMING_PLACEHOLDER_WIDTH = 80;
 
 // -----------------------------------------------------------------------------
 // Partial-JSON handling
@@ -399,8 +391,6 @@ function buildApplyPatchNaturalOrderPreviews(input: string): PerFileDiffPreview[
 	}
 	return previews.length > 0 ? previews : null;
 }
-
-
 
 interface ApplyPatchArgs {
 	input?: string;

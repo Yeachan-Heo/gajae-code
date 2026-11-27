@@ -33,7 +33,6 @@ describe("dropIncompleteLastEdit", () => {
 	});
 });
 
-
 describe("apply_patch streaming preview (trailing partial line)", () => {
 	const strategy = EDIT_MODE_STRATEGIES.apply_patch;
 	let tmpDir: string;

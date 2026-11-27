@@ -235,7 +235,6 @@ describe("parseCommandArgs + substituteArgs integration", () => {
 	});
 });
 
-
 describe("tool prompt descriptions", () => {
 	test("retains browser safety, structured-action, and shipped-reference contracts", () => {
 		expect(browserDescription).toContain("MUST call `open` before `run` or `act`");
@@ -250,8 +249,6 @@ describe("tool prompt descriptions", () => {
 		expect(browserDescription).toContain("gjc://tools/browser.md");
 		expect(browserDescription).toContain('"action":"run"');
 	});
-
-
 });
 
 // ============================================================================

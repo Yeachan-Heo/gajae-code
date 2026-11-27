@@ -499,8 +499,6 @@ describe("write resolves conflicts via conflict://N", () => {
 		expect(await Bun.file(filePath).text()).toBe("line 1\nresolved by hand\nline N\n");
 	});
 
-
-
 	it("`write conflict://*` bulk-resolves every registered conflict, per-entry token expansion", async () => {
 		const fileA = path.join(tempDir, "bulkA.ts");
 		const fileB = path.join(tempDir, "bulkB.ts");

@@ -47,11 +47,7 @@ export * from "./normalize";
 export * from "./renderer";
 export * from "./streaming";
 
-type TInput =
-	| typeof replaceEditSchema
-	| typeof patchEditSchema
-	| typeof vimSchema
-	| typeof applyPatchSchema;
+type TInput = typeof replaceEditSchema | typeof patchEditSchema | typeof vimSchema | typeof applyPatchSchema;
 
 type VimParams = z.infer<typeof vimSchema>;
 type EditParams = ReplaceParams | PatchParams | VimParams | ApplyPatchParams;
@@ -266,7 +262,7 @@ async function executeApplyPatchPerFile(
 		} catch (err) {
 			const errorText = err instanceof Error ? err.message : String(err);
 			perFileResults.push({ path, diff: "", isError: true, errorText });
-			contentTexts.push(`Error editing ${path}: ${errorText}`)
+			contentTexts.push(`Error editing ${path}: ${errorText}`);
 		}
 
 		// Emit partial result after each file so UI shows progressive completion

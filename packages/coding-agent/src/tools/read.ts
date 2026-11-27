@@ -3147,8 +3147,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							firstLineExceedsLimit,
 						};
 
-
-
 						const shouldAddLineNumbers = rawSelector ? false : displayMode.lineNumbers;
 						let capturedDisplayContent: { text: string; startLine: number } | undefined;
 						const formatText = (text: string, startNum: number): string => {

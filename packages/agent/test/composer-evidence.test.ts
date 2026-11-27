@@ -191,8 +191,8 @@ describe("composer-evidence report", () => {
 		expect(report.l3RefusalReasons).toEqual([]);
 		expect(report.min_k_per_scenario_role).toBe(3);
 		expect(report.role_counts).toEqual({ candidate: 51, baseline: 51 });
-		expect(report.planned_records).toBe(108);
-		expect(report.captured_records).toBe(108);
+		expect(report.planned_records).toBe(102);
+		expect(report.captured_records).toBe(102);
 		expect(report.trace_sha256).toBe("trace-hash");
 		expect(report.manifest_sha256).toBe("manifest-hash");
 	});

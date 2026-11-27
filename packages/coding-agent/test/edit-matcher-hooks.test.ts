@@ -50,7 +50,6 @@ describe("edit matcher hooks", () => {
 		]);
 	});
 
-
 	test("replace projects new_text from each edit, never old_text or the argument encoding", () => {
 		const tool = new EditTool(makeSession(), "replace");
 		const args = {
