@@ -309,4 +309,33 @@ describe("AgentSession startup continuation lifecycle", () => {
 			),
 		).toHaveLength(1);
 	});
+
+	it("emits cancelled agent_end when preflight is aborted before volatile context construction", async () => {
+		// Regression test for PR #7048 Finding #2:
+		// When continuation is aborted before volatile context construction completes,
+		// the check immediately after session admission should detect the abort
+		// and throw promptPreflightCancelledError, resulting in a cancelled agent_end.
+		// This prevents unnecessary volatile context and MCP instruction construction.
+		const pending = new AssistantMessageEventStream();
+		await createManagedSession(() => pending);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		// Start continuation which will reach session admission and begin volatile context building
+		const continuation = session!.continuePersistedHistory();
+
+		// Give it a moment to start (but not wait for full consumer - that would be too late)
+		await Bun.sleep(50);
+
+		// Abort the continuation
+		await session!.abort();
+		await continuation;
+		await session!.waitForIdle();
+
+		// Should emit cancelled agent_end indicating the abort happened
+		const agentEnds = events.filter(event => event.type === "agent_end");
+		expect(agentEnds.length).toBeGreaterThanOrEqual(1);
+		const cancelledEnd = agentEnds.find(e => e.stopReason === "cancelled");
+		expect(cancelledEnd).toBeDefined();
+	});
 });

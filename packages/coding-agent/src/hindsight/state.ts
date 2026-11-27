@@ -201,6 +201,10 @@ export class HindsightSessionState {
 	missionsSet: Set<string>;
 	lastRetainedTurn: number;
 	hasRecalledForFirstTurn: boolean;
+	/** Epoch counter for fencing stale recalls. Incremented on resetConversationTracking. */
+	#conversationEpoch = 0;
+	/** Pending recall attempt generation counter, used to invalidate stale recalls. */
+	#recallAttemptGeneration = 0;
 	lastRecallSnippet?: string;
 	lastInjectedRecallSnippetHash?: string;
 	/** Cached `<mental_models>` block injected into developer instructions. */
@@ -246,6 +250,14 @@ export class HindsightSessionState {
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 		this.lastInjectedRecallSnippetHash = undefined;
+		// Increment epoch to fence any pending stale recalls from this epoch
+		this.#conversationEpoch++;
+	}
+
+	/** Invalidate the outstanding recall so it cannot write state. */
+	invalidateOutstandingRecall(): void {
+		// Increment the generation counter to invalidate any pending recall attempt
+		this.#recallAttemptGeneration++;
 	}
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
@@ -399,6 +411,9 @@ export class HindsightSessionState {
 
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
+		// Capture the current epoch to fence stale recalls
+		const epoch = this.#conversationEpoch;
+		const generation = ++this.#recallAttemptGeneration;
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(m => m.role === "user");
 		if (!lastUser) return;
@@ -407,6 +422,11 @@ export class HindsightSessionState {
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return;
+
+		// Fence check: if epoch changed, this recall is stale (session was reset)
+		if (this.#conversationEpoch !== epoch) return;
+		// Invalidation check: if a newer generation was started, this recall was invalidated
+		if (this.#recallAttemptGeneration !== generation) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;

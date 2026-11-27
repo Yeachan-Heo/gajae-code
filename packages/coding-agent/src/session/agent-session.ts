@@ -8290,6 +8290,12 @@ export class AgentSession {
 	getAgentId(): string | undefined {
 		return this.#agentId;
 	}
+
+	/** Get the current prompt generation/attempt epoch. Used to fence state mutations across session transitions. */
+	getPromptGeneration(): number {
+		return this.#promptGeneration;
+	}
+
 	get isDisposed(): boolean {
 		return this.#isDisposed;
 	}
@@ -16557,33 +16563,65 @@ export class AgentSession {
 		if (!canContinuePersistedHistory(this.agent.state.messages)) {
 			throw new Error("Cannot continue from persisted message history");
 		}
-		await this.#awaitStartupTurnBarrier();
+		// Agent.continue creates its controller synchronously at loop entry. Until
+		// then, abort() must cancel this preparation through the session's existing
+		// preflight signal rather than being lost against an idle agent.
+		const generation = this.#promptGeneration;
+		const preflightSignal = this.#promptPreflightAbortController.signal;
+		await this.#awaitPromptPreflight(generation, preflightSignal, this.#awaitStartupTurnBarrier(preflightSignal));
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
-		await this.#withSessionAdmission("prompt", async () => {});
+		await this.#withSessionAdmission("prompt", async () => {}, preflightSignal);
+		this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
 		try {
-			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
+			// Stage volatile context and MCP instructions to apply in a single replaceMessages
+			// after the preflight check succeeds. If preflight is cancelled before the run is
+			// accepted, these messages are never added, avoiding rollback races.
+			const messagesToAdd: AgentMessage[] = [];
+
+			const volatileProjectContextMessage = await this.#awaitPromptPreflight(
+				generation,
+				preflightSignal,
+				this.#buildVolatileProjectContextMessage(),
+			);
 			if (!this.#isLatestRetainedEphemeralCopy(volatileProjectContextMessage)) {
-				this.agent.appendMessage(volatileProjectContextMessage);
+				messagesToAdd.push(volatileProjectContextMessage);
 			}
+
 			const untrustedMcpServerInstructionsMessage = this.#buildUntrustedMcpServerInstructionsMessage();
 			if (
 				untrustedMcpServerInstructionsMessage &&
 				!this.#isLatestRetainedEphemeralCopy(untrustedMcpServerInstructionsMessage)
 			) {
-				this.agent.appendMessage(untrustedMcpServerInstructionsMessage);
+				messagesToAdd.push(untrustedMcpServerInstructionsMessage);
 			}
+
 			const hindsightState = this.getHindsightSessionState();
-			await hindsightState?.maybeRecallOnAgentStart();
+			await this.#awaitPromptPreflight(
+				generation,
+				preflightSignal,
+				Promise.resolve(hindsightState?.maybeRecallOnAgentStart()),
+			);
 			hindsightRecall = hindsightState?.getRecallSnippetForInjection();
+
+			// Re-check after the awaited preparation: a handoff can engage during the
+			// volatile-context/hindsight awaits above and this would otherwise start a
+			// turn against the session being handed off.
+			this.#assertExternalSessionIngress();
+			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
+
+			// Apply all staged messages in a single replaceMessages call after the preflight
+			// check succeeds. This ensures they are never partially written if the preflight
+			// is cancelled.
+			let messagesToApply = [...this.agent.state.messages, ...messagesToAdd];
 			if (hindsightRecall) {
-				const messages = this.agent.state.messages;
-				const lastUserIndex = messages.findLastIndex(message => message.role === "user");
+				const lastUserIndex = messagesToApply.findLastIndex(message => message.role === "user");
 				if (lastUserIndex !== -1) {
-					this.agent.replaceMessages([
-						...messages.slice(0, lastUserIndex),
+					messagesToApply = [
+						...messagesToApply.slice(0, lastUserIndex),
 						{
 							role: "custom",
 							customType: "hindsight-recall",
@@ -16592,17 +16630,14 @@ export class AgentSession {
 							attribution: "agent",
 							timestamp: Date.now(),
 						},
-						...messages.slice(lastUserIndex),
-					]);
+						...messagesToApply.slice(lastUserIndex),
+					];
 				} else {
 					hindsightRecall = undefined;
 				}
 			}
-			// Re-check after the awaited preparation: a handoff can engage during the
-			// volatile-context/hindsight awaits above and this would otherwise start a
-			// turn against the session being handed off.
-			this.#assertExternalSessionIngress();
-			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
+			this.agent.replaceMessages(messagesToApply);
+
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
@@ -16612,6 +16647,12 @@ export class AgentSession {
 				},
 			});
 			if (continuationSdkRunToken === undefined) await this.#waitForPostPromptRecovery();
+		} catch (error) {
+			if (isPromptPreflightCancelledError(error)) {
+				const hindsightState = this.getHindsightSessionState();
+				hindsightState?.invalidateOutstandingRecall();
+			}
+			throw error;
 		} finally {
 			await this.#settleEndedInFlight(
 				inFlightPrompt,
