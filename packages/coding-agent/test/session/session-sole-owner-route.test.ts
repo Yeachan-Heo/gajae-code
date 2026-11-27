@@ -3,7 +3,8 @@
  * of its session, claimed under enforce, writes on the legacy route instead of shared publication.
  * The truth table of `SessionManager.isSoleOwnerRoute()` and the AgentSession funnel it feeds.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +17,7 @@ import { Settings } from "../../src/config/settings";
 import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
 import { AgentSession } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { type SessionDestinationInput, SessionManager } from "../../src/session/session-manager";
 import {
@@ -35,6 +37,7 @@ const stores: AuthStorage[] = [];
 const extraClaims: SessionOwnerClaim[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	try {
 		// A session whose writes a peer's append stopped rethrows that refusal when it closes.
 		for (const session of sessions.splice(0)) await session.dispose().catch(() => undefined);
@@ -395,6 +398,23 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		await expect(sessionManager.rewriteEntries()).rejects.toThrow(/identity_mismatch/);
 		expect(await Bun.file(file).text()).toBe(before);
 		expect(before).toContain("peer entry");
+	});
+
+	it("enforce, sole owner: a rewrite adopts only its own bytes; an append right after it fails later writes closed", async () => {
+		const { sessionManager, file } = await prompted("enforce");
+		const foreign = `${JSON.stringify({ type: "custom", id: "foreign1", parentId: null, timestamp: new Date().toISOString(), customType: "foreign" })}\n`;
+		const replace = ManagedSessionDescendantStore.prototype.replaceExpectedIdentitySync;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync").mockImplementationOnce(function (
+			this: ManagedSessionDescendantStore,
+			...args
+		) {
+			replace.apply(this, args);
+			// Another writer appends between the replace and its read-back.
+			fsSync.appendFileSync(file, foreign);
+		});
+		await expect(sessionManager.rewriteEntries()).rejects.toThrow("managed_append_identity_mismatch");
+		await expect(sessionManager.rewriteEntries()).rejects.toThrow(/identity_mismatch/);
+		expect(await Bun.file(file).text()).toContain('"customType":"foreign"');
 	});
 
 	it("enforce, sole owner: Move Session refuses a transcript a peer appended to; nothing moves", async () => {

@@ -17443,7 +17443,17 @@ export class SessionManager {
 				}
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+				// The replace returns no identity, so it is read back: only the bytes just written may
+				// become this manager's identity. An append that landed in between is another writer's,
+				// and adopting it would let the next rewrite drop it.
+				const written = this.#captureManagedPersistIdentity(sessionFile);
+				if (
+					written.size !== bytes.byteLength ||
+					written.sha256 !== crypto.createHash("sha256").update(bytes).digest("hex")
+				)
+					// The kept, now stale identity fails every later write closed; undefined would not.
+					throw new ManagedAppendIdentityMismatchError(relativePath);
+				this.#managedPersistExpectedIdentity = written;
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				return;
 			}
