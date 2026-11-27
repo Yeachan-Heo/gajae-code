@@ -1406,6 +1406,11 @@ describe("default GJC tmux launch", () => {
 	});
 
 	it("targeted resume under enforce leaves every claim to the inner process: the launcher claims nothing (design §1 row 21)", async () => {
+		// The owners directory lives under this test's own home, never the operator's.
+		const previousHome = SessionOwnershipTestHooks.homeOverride;
+		SessionOwnershipTestHooks.homeOverride = fs.realpathSync(
+			fs.mkdtempSync(path.join(launchTestRoot, "owners-home-")),
+		);
 		SessionOwnershipTestHooks.mode = "enforce";
 		try {
 			const before = sessionOwnershipCounters();
@@ -1431,6 +1436,8 @@ describe("default GJC tmux launch", () => {
 			expect(await probeSessionOwner("abc123")).toEqual({ state: "free" });
 		} finally {
 			delete SessionOwnershipTestHooks.mode;
+			if (previousHome === undefined) delete SessionOwnershipTestHooks.homeOverride;
+			else SessionOwnershipTestHooks.homeOverride = previousHome;
 		}
 	});
 
