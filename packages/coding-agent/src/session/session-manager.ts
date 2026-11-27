@@ -24715,6 +24715,11 @@ export class SessionManager {
 		return attempt.status === "claimed" ? attempt.claim : undefined;
 	}
 
+	/** The surface and mode this manager claims with, for a claim taken on its behalf (Continue here). */
+	get ownershipDecision(): ResolvedSessionOwnership {
+		return this.#ownershipClaims.ownership;
+	}
+
 	/**
 	 * Enforce's admission of a switch target (design §1 rows 3 and 9): `open`'s pre-claim of the
 	 * target's header id, taken before the switch emits any event or begins its transition. It throws

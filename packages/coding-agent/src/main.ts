@@ -61,8 +61,8 @@ import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
-import type { HeldSessionChoice } from "./modes/components/session-held-warning";
-import type { SessionSelectionResult } from "./modes/components/session-selector";
+import type { HeldSessionChoice, HeldSessionWarningOptions } from "./modes/components/session-held-warning";
+import type { HeldSession, SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
@@ -82,6 +82,8 @@ import {
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import {
+	DIRECT_SESSION_REGISTRATION_ATTEMPTS,
+	isTransientSessionIndexLockError,
 	newMasterAttestationEpoch,
 	resolveSessionLocator,
 	SessionIndex,
@@ -97,6 +99,7 @@ import { probeHeldSessions, resolveSessionOwnership } from "./session/internal/s
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
+import { findSessionHandoverTarget, handOverSession } from "./session/session-handover";
 import {
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
@@ -110,6 +113,7 @@ import {
 } from "./session/session-manager";
 import {
 	SessionHeldError,
+	type SessionOwnerClaim,
 	type SessionOwnerSurface,
 	SessionOwnershipError,
 	sessionHeldForkCommand,
@@ -1459,10 +1463,15 @@ export interface SessionStartupNotices {
 	 * process holds asks here whether to fork it (design §3.1); without it the open refuses.
 	 */
 	readonly held?: {
-		readonly choose: (error: SessionHeldError) => Promise<HeldSessionChoice>;
+		readonly choose: (error: SessionHeldError, options: HeldSessionWarningOptions) => Promise<HeldSessionChoice>;
 		readonly forked: (message: string) => void;
 	};
 }
+
+/** What the held-session warning at launch resolved to, when it did not cancel. */
+type HeldStartupResolution =
+	| { readonly kind: "forked"; readonly manager: SessionManager }
+	| { readonly kind: "continued"; readonly admission: SessionOwnerClaim | undefined };
 
 const STDERR_STARTUP_NOTICES: SessionStartupNotices = {
 	interactive: false,
@@ -1536,28 +1545,47 @@ export async function createSessionManager(
 		// Fork, which copies it here and also answers the different-folder question below (design §1
 		// row 1). A race past this probe still meets the open's own refusal.
 		// `undefined`, with nothing awaited, outside enforce or without a terminal to ask on.
-		const forkIfHeld = (sourcePath: string): Promise<SessionManager | undefined> | undefined => {
+		// Continue here (design §13 L1) closes a broker-launched holder and resolves to the claim
+		// that covers the open below, released once the open has claimed or failed.
+		const forkIfHeld = (
+			sourcePath: string,
+			continueHere: boolean,
+		): Promise<HeldStartupResolution | undefined> | undefined => {
 			const held = startup.held;
 			const probe = held && SessionManager.probeHeldTranscript(sourcePath, ownership);
-			return held && probe ? forkWhenHeld(sourcePath, held, probe) : undefined;
+			return held && probe ? forkWhenHeld(sourcePath, held, probe, continueHere) : undefined;
 		};
 		const forkWhenHeld = async (
 			sourcePath: string,
 			held: NonNullable<SessionStartupNotices["held"]>,
 			probe: Promise<SessionHeldError | undefined>,
-		): Promise<SessionManager | undefined> => {
+			continueHere: boolean,
+		): Promise<HeldStartupResolution | undefined> => {
 			const refusal = await probe;
 			if (!refusal) return undefined;
-			const choice = await held.choose(refusal);
-			switch (choice) {
-				case "fork":
-					break;
-				case "cancel":
-					throw new SessionResumeCancelledError();
-				default: {
-					const unknown: never = choice;
-					throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+			const agentDir = activeSettings.getAgentDir();
+			const handover = continueHere ? await findSessionHandoverTarget(refusal, agentDir) : undefined;
+			let note: string | undefined;
+			for (;;) {
+				const choice = await held.choose(refusal, { continueHere: handover !== undefined, note });
+				switch (choice) {
+					case "fork":
+						break;
+					case "continue": {
+						if (!handover) continue;
+						const outcome = await handOverSession(refusal, agentDir, resolveSessionOwnership(ownership));
+						if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
+						note = outcome.message;
+						continue;
+					}
+					case "cancel":
+						throw new SessionResumeCancelledError();
+					default: {
+						const unknown: never = choice;
+						throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+					}
 				}
+				break;
 			}
 			const forked = await SessionManager.forkFrom(
 				sourcePath,
@@ -1569,22 +1597,27 @@ export async function createSessionManager(
 				ownership,
 			);
 			held.forked(sessionHeldForkedNotice(refusal));
-			return forked;
+			return { kind: "forked", manager: forked };
+		};
+		const openAfterHandover = async (
+			held: HeldStartupResolution | undefined,
+			open: () => Promise<SessionManager>,
+		): Promise<SessionManager> => {
+			try {
+				return await open();
+			} finally {
+				if (held?.kind === "continued") held.admission?.release();
+			}
 		};
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			const forking = forkIfHeld(sessionArg);
-			const forked = forking && (await forking);
-			if (forked) return forked;
+			const forking = forkIfHeld(sessionArg, true);
+			const held = forking && (await forking);
+			if (held?.kind === "forked") return held.manager;
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
 				: SessionManager.explicitDestination(path.dirname(sessionArg));
-			return await SessionManager.open(
-				sessionArg,
-				destination,
-				undefined,
-				migrationPolicy,
-				sessionMemoryMode,
-				ownership,
+			return await openAfterHandover(held, () =>
+				SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode, ownership),
 			);
 		}
 		const match = await resolveResumableSession(
@@ -1597,13 +1630,16 @@ export async function createSessionManager(
 		if (!match) {
 			throw new SessionNotFoundError(sessionArg);
 		}
-		const forking = forkIfHeld(match.session.path);
-		const forked = forking && (await forking);
-		if (forked) return forked;
-		if (match.scope === "global") {
-			const normalizedCwd = normalizePathForComparison(cwd);
-			const normalizedMatchCwd = normalizePathForComparison(match.session.cwd || cwd);
-			if (normalizedCwd !== normalizedMatchCwd) {
+		// A session from another folder is only ever forked here, so the held warning offers Fork
+		// (which answers this question too), not Continue here.
+		const otherFolder =
+			match.scope === "global" &&
+			normalizePathForComparison(cwd) !== normalizePathForComparison(match.session.cwd || cwd);
+		const forking = forkIfHeld(match.session.path, !otherFolder);
+		const held = forking && (await forking);
+		if (held?.kind === "forked") return held.manager;
+		return await openAfterHandover(held, async () => {
+			if (otherFolder) {
 				const shouldFork = await promptForkSession(match.session);
 				if (!shouldFork) {
 					throw new SessionForkDeclinedError(sessionArg, match.session.cwd);
@@ -1618,15 +1654,15 @@ export async function createSessionManager(
 					ownership,
 				);
 			}
-		}
-		return await SessionManager.open(
-			match.session.path,
-			sessionDestination(),
-			undefined,
-			migrationPolicy,
-			sessionMemoryMode,
-			ownership,
-		);
+			return await SessionManager.open(
+				match.session.path,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+				ownership,
+			);
+		});
 	}
 	// Enforce ends `continueRecent`'s search at a held session it would continue (design §1 row 4):
 	// gjc then starts fresh with a notice, except `-p --continue`, which asked for that session and
@@ -1972,13 +2008,6 @@ export interface DirectSessionRegistration {
 
 const NOOP_DIRECT_SESSION_REGISTRATION: DirectSessionRegistration = { syncIdentity: async () => {} };
 
-/**
- * Appends allowed for one successor registration before the switch gives up and
- * keeps the predecessor registered. `SessionIndex.append` takes the shared index
- * lock independently per append, so a peer holding it is a transient failure.
- */
-const DIRECT_SESSION_REGISTRATION_ATTEMPTS = 3;
-
 /** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
 export async function registerDirectSession(
 	sessionManager: DirectSessionManager | undefined,
@@ -2111,16 +2140,8 @@ export async function registerDirectSession(
 				// Only lock contention self-heals. A refused release is an identity
 				// verdict; retrying it would mask a committed registration whose lock
 				// generation no longer matches.
-				const code = (error as NodeJS.ErrnoException | undefined)?.code;
-				const transient =
-					code === "sharing_violation" ||
-					code === "access_denied" ||
-					code === "EBUSY" ||
-					code === "EPERM" ||
-					code === "EACCES" ||
-					code === "ENOTEMPTY" ||
-					code === "removal_record_busy";
-				if (!transient || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
+				if (!isTransientSessionIndexLockError(error) || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS)
+					throw error;
 				await Bun.sleep(50 * attempt);
 			}
 		}
@@ -2329,9 +2350,15 @@ export async function runRootCommand(
 			heldOwnership,
 			sessions.map(session => session.id),
 		);
+		const handoverAgentDir = deps.settings?.getAgentDir() ?? getAgentDir();
 		const held = heldProbe && {
 			sessions: await heldProbe,
-			check: async (session: SessionInfo) => SessionManager.probeHeldTranscript(session.path, heldOwnership),
+			check: async (session: SessionInfo): Promise<HeldSession | undefined> => {
+				const error = await SessionManager.probeHeldTranscript(session.path, heldOwnership);
+				if (!error) return undefined;
+				if (!(await findSessionHandoverTarget(error, handoverAgentDir))) return { error };
+				return { error, handOver: () => handOverSession(error, handoverAgentDir, heldOwnership) };
+			},
 		};
 		const selection = deps.selectResumeSession
 			? await deps.selectResumeSession(sessions)
@@ -2339,7 +2366,15 @@ export async function runRootCommand(
 		if (selection.kind === "cancelled") {
 			return;
 		}
-		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
+		// Continue here's claim (design §13 L1) covers the open below until the open's own claim lands.
+		const handoverAdmission = selection.kind === "selected" ? selection.admission : undefined;
+		// Released in the `finally` below once loaded; a failed load must release it here.
+		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd }).catch(
+			(error: unknown) => {
+				handoverAdmission?.release();
+				throw error;
+			},
+		);
 		try {
 			const resumeMigrationPolicy =
 				scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
@@ -2395,6 +2430,7 @@ export async function runRootCommand(
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		} finally {
+			handoverAdmission?.release();
 			try {
 				await scopedSettings.close?.();
 			} catch (error) {
