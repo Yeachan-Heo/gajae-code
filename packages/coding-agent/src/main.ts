@@ -97,7 +97,7 @@ import { probeHeldSessions, resolveSessionOwnership } from "./session/internal/s
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
-import { findSessionHandoverTarget, handOverSession, type SessionHandoverOutcome } from "./session/session-handover";
+import { findSessionHandoverTarget, handOverSession } from "./session/session-handover";
 import {
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
@@ -2363,8 +2363,6 @@ export async function runRootCommand(
 			heldOwnership,
 			sessions.map(session => session.id),
 		);
-		// Continue here's claim (design §13 L1) covers the open below until the open's own claim lands.
-		let handoverAdmission: SessionOwnerClaim | undefined;
 		const handoverAgentDir = deps.settings?.getAgentDir() ?? getAgentDir();
 		const held = heldProbe && {
 			sessions: await heldProbe,
@@ -2372,24 +2370,17 @@ export async function runRootCommand(
 				const error = await SessionManager.probeHeldTranscript(session.path, heldOwnership);
 				if (!error) return undefined;
 				if (!(await findSessionHandoverTarget(error, handoverAgentDir))) return { error };
-				const handOver = async (): Promise<SessionHandoverOutcome> => {
-					const outcome = await handOverSession(error, handoverAgentDir, heldOwnership);
-					if (outcome.kind === "closed") {
-						handoverAdmission?.release();
-						handoverAdmission = outcome.claim;
-					}
-					return outcome;
-				};
-				return { error, handOver };
+				return { error, handOver: () => handOverSession(error, handoverAgentDir, heldOwnership) };
 			},
 		};
 		const selection = deps.selectResumeSession
 			? await deps.selectResumeSession(sessions)
 			: await selectSession(sessions, parsedArgs.sessionDir, held);
 		if (selection.kind === "cancelled") {
-			handoverAdmission?.release();
 			return;
 		}
+		// Continue here's claim (design §13 L1) covers the open below until the open's own claim lands.
+		const handoverAdmission = selection.kind === "selected" ? selection.admission : undefined;
 		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
 		try {
 			const resumeMigrationPolicy =

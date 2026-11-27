@@ -199,13 +199,20 @@ describe("SessionSelectorComponent resume consent", () => {
 		expect(warning).not.toContain("Continue here");
 	});
 
-	it("Continue here hands over, then resumes through the inspection; a refusal warns again with its reason", async () => {
+	it("Continue here confirms before it hands over; a refusal warns again; the claim rides with the selection", async () => {
 		const error = new SessionHeldError("01a21a7f-82ff-7332-bee3-31b605a15de0", { surface: "sdk-host", pid: 4242 });
 		const results: SessionSelectionResult[] = [];
 		const inspect = vi.fn(async () => inspection("one", "resumable"));
+		const claim = {
+			sessionId: "one",
+			surface: "terminal",
+			shared: false,
+			released: false,
+			release: vi.fn(),
+		} as const;
 		const outcomes: SessionHandoverOutcome[] = [
 			{ kind: "refused", message: SESSION_HANDOVER_BUSY_MESSAGE },
-			{ kind: "closed", claim: undefined },
+			{ kind: "closed", claim },
 		];
 		const handOver = vi.fn(async () => outcomes.shift()!);
 		const component = selector(inspect, results);
@@ -214,20 +221,33 @@ describe("SessionSelectorComponent resume consent", () => {
 		component.handleInput("\n");
 		await Bun.sleep(0);
 		expect(text(component)).toContain("Continue here");
+		// Nothing is closed before the final yes: the read-only inspection and the confirmation first.
 		component.handleInput("h");
+		await Bun.sleep(0);
+		expect(text(component)).toContain("Resume this session?");
+		expect(handOver).not.toHaveBeenCalled();
+		component.handleInput("y");
 		await Bun.sleep(0);
 		const refused = text(component);
 		expect(refused).toContain("This session is open in another process");
 		expect(refused).toContain(SESSION_HANDOVER_BUSY_MESSAGE);
-		expect(inspect).not.toHaveBeenCalled();
 
 		component.handleInput("h");
 		await Bun.sleep(0);
-		expect(handOver).toHaveBeenCalledTimes(2);
-		expect(inspect).toHaveBeenCalledTimes(1);
-		expect(text(component)).toContain("Resume this session?");
 		component.handleInput("y");
-		expect(results).toEqual([expect.objectContaining({ kind: "selected", path: "/tmp/one.jsonl" })]);
+		await Bun.sleep(0);
+		expect(handOver).toHaveBeenCalledTimes(2);
+		// The tail is read again under the claim before the selection settles.
+		expect(inspect).toHaveBeenCalledTimes(3);
+		expect(results).toEqual([
+			expect.objectContaining({
+				kind: "selected",
+				path: "/tmp/one.jsonl",
+				action: "continue-tail",
+				admission: claim,
+			}),
+		]);
+		expect(claim.release).not.toHaveBeenCalled();
 	});
 
 	it("observes async onSelect rejections without unhandled rejection (#3804)", async () => {
