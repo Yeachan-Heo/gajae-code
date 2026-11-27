@@ -38,6 +38,7 @@ import {
 } from "./deep-interview-state";
 import {
 	DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD,
+	RESOLUTION_THRESHOLDS,
 	resolveConfiguredAmbiguityThreshold,
 } from "./deep-interview-threshold";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
@@ -88,12 +89,6 @@ export interface DeepInterviewCommandResult {
 	stdout?: string;
 	stderr?: string;
 }
-
-const RESOLUTION_THRESHOLDS = {
-	quick: 0.6,
-	standard: 0.5,
-	deep: 0.35,
-} as const;
 
 const TRACE_MAX_RELEVANT_PATHS = 12;
 const TRACE_MAX_PACKAGE_HINTS = 8;

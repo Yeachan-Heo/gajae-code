@@ -289,9 +289,17 @@ describe("deep-interview invocation arguments contract", () => {
 });
 
 describe("deep-interview threshold discoverability at kickoff (#7316)", () => {
-	it("tells the user how to change the threshold in the kickoff announcement", () => {
+	it("tells the user how to change the threshold in a way that matches the threshold source", () => {
+		expect(skill).toContain("> <thresholdChangeLine>");
 		expect(skill).toContain(
-			"> To change the target: start with `--quick` (60%), `--standard` (50%), `--deep` (35%), or `--threshold <n>`, or save `gjc.deepInterview.ambiguityThreshold` in `.gjc/config.yml`.",
+			"- `default`, `flag:--quick`, `flag:--standard`, or `flag:--deep`: `To change the target: start with --quick (60%), --standard (50%), --deep (35%), or --threshold <n> (for example /skill:deep-interview --quick <idea>), or save gjc.deepInterview.ambiguityThreshold in .gjc/config.yml.`",
+		);
+		// A configured value beats the mode flags, so the config-path wording must not advertise them as overrides.
+		expect(skill).toContain(
+			"- a config file path: `To change the target: edit gjc.deepInterview.ambiguityThreshold in <resolvedThresholdSource>, or start with --threshold <n>. --quick/--standard/--deep do not override a configured value.`",
+		);
+		expect(skill).toContain(
+			"- `flag:--threshold` or any other source: `To change the target: start with a different --threshold <n>.`",
 		);
 	});
 

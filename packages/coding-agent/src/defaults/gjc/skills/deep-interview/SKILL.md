@@ -276,14 +276,19 @@ The first line of this announcement MUST be exactly the Phase 0 threshold marker
 >
 > Starting deep interview. I'll ask targeted questions to understand your idea thoroughly before building anything. After each answer, I'll show your clarity score. We'll proceed to execution once ambiguity drops below <resolvedThresholdPercent>.
 >
-> To change the target: start with `--quick` (60%), `--standard` (50%), `--deep` (35%), or `--threshold <n>`, or save `gjc.deepInterview.ambiguityThreshold` in `.gjc/config.yml`.
+> <thresholdChangeLine>
 > <thresholdRecommendationLine>
 >
 > **Your idea:** "{initial_idea}"
 > **Project type:** {greenfield|brownfield}
 > **Current ambiguity:** 100% (we haven't started yet)
 
-`<thresholdRecommendationLine>` is emitted only when `<resolvedThresholdSource>` is exactly `default`; otherwise omit that line. It names one mode recommended for this idea, chosen from the initial idea's scope, blast radius, and initial ambiguity (a small, bounded, low-risk idea recommends `--quick` or `--standard`; a broad, cross-cutting, or high-risk idea recommends `--deep` or keeps the 5% default), with a one-line reason, in the form `Suggested for this idea: --<mode> (<percent>), because <reason>. Restart with that flag to use it.` When the recommendation is the 5% default, say that the current target already fits. This line is advisory only: never change `<resolvedThreshold>` or its source because of it, and never add an extra `ask` for it.
+`<thresholdChangeLine>` depends on `<resolvedThresholdSource>`, following the precedence `--threshold` > configured value > `--quick`/`--standard`/`--deep` > default:
+- `default`, `flag:--quick`, `flag:--standard`, or `flag:--deep`: `To change the target: start with --quick (60%), --standard (50%), --deep (35%), or --threshold <n> (for example /skill:deep-interview --quick <idea>), or save gjc.deepInterview.ambiguityThreshold in .gjc/config.yml.`
+- a config file path: `To change the target: edit gjc.deepInterview.ambiguityThreshold in <resolvedThresholdSource>, or start with --threshold <n>. --quick/--standard/--deep do not override a configured value.`
+- `flag:--threshold` or any other source: `To change the target: start with a different --threshold <n>.`
+
+`<thresholdRecommendationLine>` is emitted only when `<resolvedThresholdSource>` is exactly `default`; otherwise omit that line. It names one mode recommended for this idea, chosen from the initial idea's scope, blast radius, and initial ambiguity (a small, bounded, low-risk idea recommends `--quick` or `--standard`; a broad, cross-cutting, or high-risk idea recommends `--deep` or keeps the 5% default), with a one-line reason, in the form `Suggested for this idea: --<mode> (<percent>), because <reason>. Restart with /skill:deep-interview --<mode> <idea> to use it.` When the recommendation is the 5% default, say that the current target already fits. This line is advisory only: never change `<resolvedThreshold>` or its source because of it, and never add an extra `ask` for it.
 
 Before emitting the prose lines in this announcement, apply the self-proofread once (DIPP-5); keep the required threshold marker and the quoted `{initial_idea}` unchanged.
 

@@ -414,6 +414,72 @@ describe("GJC native skill-state hooks", () => {
 		);
 	});
 
+	describe("/skill:deep-interview activation threshold precedence (#7316)", () => {
+		async function seedThreshold(
+			root: string,
+			sessionId: string,
+			options: { args?: string; agentDir?: string },
+		): Promise<{ threshold: number; threshold_source: string }> {
+			const agentDir = options.agentDir ?? path.join(root, "isolated-agent");
+			const state = await ensureWorkflowSkillActivationState({
+				cwd: root,
+				skill: "deep-interview",
+				sessionId,
+				args: options.args,
+				agentDir,
+			});
+			return await Bun.file(state?.initialized_state_path ?? "").json();
+		}
+
+		async function writeProjectThreshold(root: string, value: number): Promise<string> {
+			const configPath = path.join(root, ".gjc", "config.yml");
+			await Bun.write(configPath, `gjc:\n  deepInterview:\n    ambiguityThreshold: ${value}\n`);
+			return configPath;
+		}
+
+		it("applies a resolution flag from the skill arguments when nothing is configured", async () => {
+			const root = await cwd();
+			const modeState = await seedThreshold(root, "session-flag-quick", { args: "--quick build a todo app" });
+			expect(modeState.threshold).toBeCloseTo(0.6);
+			expect(modeState.threshold_source).toBe("flag:--quick");
+		});
+
+		it("lets a configured value beat a resolution flag", async () => {
+			const root = await cwd();
+			const configPath = await writeProjectThreshold(root, 0.2);
+			const modeState = await seedThreshold(root, "session-config-beats-flag", { args: "--deep build a todo app" });
+			expect(modeState.threshold).toBeCloseTo(0.2);
+			expect(await fs.realpath(modeState.threshold_source)).toBe(await fs.realpath(configPath));
+		});
+
+		it("lets an explicit --threshold beat a configured value", async () => {
+			const root = await cwd();
+			await writeProjectThreshold(root, 0.2);
+			const modeState = await seedThreshold(root, "session-threshold-beats-config", {
+				args: "--threshold 0.3 build a todo app",
+			});
+			expect(modeState.threshold).toBeCloseTo(0.3);
+			expect(modeState.threshold_source).toBe("flag:--threshold");
+		});
+
+		it("ignores an invalid --threshold instead of failing activation", async () => {
+			const root = await cwd();
+			const modeState = await seedThreshold(root, "session-invalid-threshold", { args: "--threshold 1.5 idea" });
+			expect(modeState.threshold).toBeCloseTo(0.05);
+			expect(modeState.threshold_source).toBe("default");
+		});
+
+		it("resolves user config from the session's agentDir, not the process-global profile", async () => {
+			const root = await cwd();
+			const agentDir = path.join(root, "session-profile");
+			const userConfig = path.join(agentDir, "config.yml");
+			await Bun.write(userConfig, "gjc:\n  deepInterview:\n    ambiguityThreshold: 0.15\n");
+			const modeState = await seedThreshold(root, "session-profile-config", { args: "idea", agentDir });
+			expect(modeState.threshold).toBeCloseTo(0.15);
+			expect(await fs.realpath(modeState.threshold_source)).toBe(await fs.realpath(userConfig));
+		});
+	});
+
 	it("repeated activation preserves newer guarded source mode-state and stale-skips active snapshot", async () => {
 		const root = await cwd();
 		const sessionId = "session-repeat-activation";

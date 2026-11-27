@@ -3,10 +3,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { resolveSkillScopeTrust, type SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
-import {
-	DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD,
-	resolveConfiguredAmbiguityThreshold,
-} from "../gjc-runtime/deep-interview-threshold";
+import { resolveSkillActivationAmbiguityThreshold } from "../gjc-runtime/deep-interview-threshold";
 import { captureRepositoryBinding, publicRepositoryBinding } from "../gjc-runtime/repository-binding";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
@@ -376,6 +373,10 @@ interface SeedSkillActivationStateInput {
 	nowIso?: string;
 	stateDir?: string;
 	activeSubskills?: SkillActiveEntry["active_subskills"];
+	/** Raw invocation arguments after the skill name (threshold flags are read from them). */
+	args?: string;
+	/** The session's effective agent directory, for profile-scoped settings. */
+	agentDir?: string;
 }
 
 interface SeedSkillActivationWrite {
@@ -442,12 +443,15 @@ async function seedSkillActivationState(
 		...(repositoryBinding ? { repository_binding: repositoryBinding } : {}),
 	};
 	if (skill === "deep-interview") {
-		// Seed the same configured threshold the CLI seed resolves, so the skill's
-		// Phase 0 (which trusts pre-resolved state) never reports a configured
-		// value as `default` (#7316).
-		const configured = await resolveConfiguredAmbiguityThreshold(input.cwd);
-		modeState.threshold = configured?.threshold ?? DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
-		modeState.threshold_source = configured?.source ?? "default";
+		// Seed with the CLI seed's precedence (invocation flags, the session
+		// profile's config, then the default) because the skill's Phase 0 trusts
+		// pre-resolved state (#7316).
+		const resolved = await resolveSkillActivationAmbiguityThreshold(input.cwd, {
+			args: input.args,
+			agentDir: input.agentDir,
+		});
+		modeState.threshold = resolved.threshold;
+		modeState.threshold_source = resolved.source;
 	}
 
 	const modeWrite = guardedStateWriteReceipt(
@@ -557,7 +561,10 @@ async function restoreSupersededPlanningEntries(
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
 	const match = detectPrimarySkillKeyword(input.text);
 	if (!match) return null;
-	return (await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", input)).state;
+	const keywordEnd = input.text.indexOf(match.keyword);
+	const args = keywordEnd >= 0 ? input.text.slice(keywordEnd + match.keyword.length) : undefined;
+	return (await seedSkillActivationState(match.skill, match.keyword, "gjc-skill-state-hook", { ...input, args }))
+		.state;
 }
 
 export interface EnsureWorkflowSkillActivationInput {
@@ -569,6 +576,10 @@ export interface EnsureWorkflowSkillActivationInput {
 	nowIso?: string;
 	stateDir?: string;
 	activeSubskills?: SkillActiveEntry["active_subskills"];
+	/** Raw `/skill:<name>` arguments, forwarded to the activation seed. */
+	args?: string;
+	/** The session's effective agent directory, forwarded to the activation seed. */
+	agentDir?: string;
 }
 
 export interface WorkflowSkillActivationSeed {
@@ -610,6 +621,8 @@ export async function ensureWorkflowSkillActivationSeed(
 		nowIso: input.nowIso,
 		stateDir: input.stateDir,
 		activeSubskills: input.activeSubskills,
+		args: input.args,
+		agentDir: input.agentDir,
 	});
 	const state = seed.state;
 	return {
