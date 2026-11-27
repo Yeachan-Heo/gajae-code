@@ -203,6 +203,22 @@ export function liveSessionOwnershipMode(): SessionOwnershipMode {
 	return resolveSessionOwnershipMode(configured, cachedOverride.value);
 }
 
+const MODE_RANK: Readonly<Record<SessionOwnershipMode, number>> = { off: 0, observe: 1, enforce: 2 };
+
+/**
+ * The mode for a decision a running process makes now: `processMode` (the mode its process or
+ * factory read), lowered by {@link liveSessionOwnershipMode}. Only an explicit lower value in the
+ * operator's config file (or a lowering environment override) lowers it, and nothing raises it, so
+ * `gjc config set session.ownership.mode off` reaches a running process's next decision.
+ */
+export function liveSessionOwnershipModeFor(
+	processMode: SessionOwnershipMode = sessionOwnershipMode(),
+): SessionOwnershipMode {
+	if (processMode === "off") return "off";
+	const live = liveSessionOwnershipMode();
+	return MODE_RANK[live] < MODE_RANK[processMode] ? live : processMode;
+}
+
 /**
  * The mode for this process now. With the setting `off` it returns before reading the environment,
  * so `off` does no work beyond reading the setting.

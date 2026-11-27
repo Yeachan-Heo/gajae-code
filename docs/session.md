@@ -593,12 +593,20 @@ Right before the final `fetch` hand-off (after transport transforms such as gzip
 
 A process that opens a persisted session for writing takes a claim on it: a kernel lock on a sidecar under `~/.gjc/runtime/session-owners/`, with a small holder record beside it. The lock ends when the holder exits, however it exits, so a crashed or killed `gjc` leaves no lock behind. The sidecar file itself stays: one `.session-owner` sidecar accumulates per session ever opened, until sidecar pruning lands. The sidecars are empty and harmless; do not delete them by hand while gjc runs, because a deleted sidecar lets a second process lock a new one for the same session. `gjc doctor` warns only above 100,000 of them. Remote clients (ACP editors, `gjc sdk`, the notification daemons) attach to the endpoint of the process that owns the session and never claim. When no process is running the session, the host the broker launches for it is that owner and claims it as `sdk-host`.
 
+A broker `session.resume` with no live endpoint to reuse first probes the claim, in `observe` and `enforce`. The probe takes nothing. If another process holds the session, for example a TUI that is still starting or has just switched to it, the broker waits for that process's endpoint and returns it as `reused: true`. The wait lasts at most 2 seconds under `observe` and 8 seconds under `enforce`, never longer than the request's readiness timeout, and it counts from when the broker received the request, so resumes queued on the same session do not add their waits up. If no endpoint appears:
+- under `observe`, resume goes on as before ownership. Beside an embedding such as the desktop app, it launches a host, and that host counts the conflict. A TUI started with `GJC_SDK_DISABLE=1` gets the old `endpoint_stale` answer, and no host is launched.
+- under `enforce`, resume fails with `live_session`, a message naming the holder, and `holder: { surface, pid }`, and launches nothing.
+
+If the holder lets go while the broker waits, resume goes on as before ownership: it launches a host if no live row remains, and a live generation-0 row that remains gets the old answer.
+
+The broker reads the mode at the probe and at every poll of the wait, taking its own mode lowered by an explicit lower value in `config.yml`. So `off` set during a wait ends the wait, and `observe` set during a wait stops its refusal. The broker's own mode is cached at its first ownership read, so a raise reaches it only after a restart. A host it launches reads `config.yml` when it starts, though, so after a raise to `enforce`, a holder with no index row is still refused, through that host's claim.
+
 The global setting `session.ownership.mode` decides what claims do:
 
 | Mode | Behaviour |
 | --- | --- |
 | `off` | No claims and no lock calls. The process is invisible to other processes' claims. |
-| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. |
+| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. A broker resume of a held session waits briefly for the holder's endpoint first (above). |
 | `enforce` | Claims as `observe` does, and a session another process holds is not opened for writing (below). Not the default yet. |
 
 Under `enforce`, a session open for writing in another process is refused before anything is written to it:
@@ -607,7 +615,7 @@ Under `enforce`, a session open for writing in another process is refused before
 - `gjc --continue` in the TUI, and `autoResume` (in the TUI and with `-p`), start a new session instead and say why: `Your most recent session is open in another terminal (pid N), so a new session was started.` A held candidate that could not have been continued anyway is skipped, as before.
 - The SDK session factories (`SessionManager.open`, `openExistingStrict`, `continueRecent`) and `createAgentSession` throw `SessionHeldError`, with `holder` naming the process (its surface and pid). A fork's source is never refused: `gjc --fork` reads a held source where it is.
 - An owners directory that fails its safety checks refuses the session too (`SessionOwnershipError`), as the append lock does.
-- Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. Only when no endpoint is live does the broker launch a host, and that host's open is refused; the broker reports it as `spawn_failed`.
+- Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. If a launched host's open is refused anyway (another process claimed the session after the broker checked), the broker reports the same `live_session` outcome as the resume wait above.
 
 A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. One lock timeout (a stalled network filesystem, for example) turns claims off for the rest of that process, so later opens never wait for the lock again.
 
