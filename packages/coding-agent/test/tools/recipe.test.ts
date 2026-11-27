@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createReadonlySessionManager, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import {
 	buildPromptModel,
@@ -13,6 +15,7 @@ import {
 	tasksFromCargoMetadata,
 	titleFromOp,
 } from "@gajae-code/coding-agent/tools/implementations";
+import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
 
 const detectedRunners: DetectedRunner[] = [
 	{
@@ -166,6 +169,44 @@ describe("recipe", () => {
 		const result = await tool!.execute("tool-call", { op: "say-ok" });
 		const text = result.content.find(block => block.type === "text")?.text ?? "";
 		expect(text).toContain("ok");
+	});
+
+	it("budgets an oversized recipe result by the Bash retention keys, not the shared artifact keys", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recipe-budget-"));
+		tempDirs.push(dir);
+		// ~4 KiB of output: under the 8 KiB Bash tail so BashTool's own capture
+		// leaves it intact, over the 1 KiB inline cap so the wrapper reshapes it.
+		const script =
+			"echo HEADMARK; for i in $(seq 1 120); do echo line-$i-xxxxxxxxxxxxxxxxxxxxxxxx; done; echo TAILMARK";
+		await Bun.write(path.join(dir, "package.json"), JSON.stringify({ scripts: { spew: script } }, null, 2));
+		await Bun.write(path.join(dir, "bun.lock"), "");
+		// Conflicting policies: shared keys ask for a head, Bash keys forbid one.
+		const settings = Settings.isolated({
+			"tools.maxInlineResultBytes": 1,
+			"tools.artifactHeadBytes": 20,
+			"tools.bashOutputHeadBytes": 0,
+			"tools.bashOutputTailBytes": 8,
+		});
+		const tool = await RecipeTool.createIf(createTestSession(dir, settings));
+		expect(tool).not.toBeNull();
+		const manager = SessionManager.inMemory();
+		const save = vi.spyOn(manager, "saveArtifact").mockImplementation(async () => "art-recipe");
+		try {
+			const context = { settings, sessionManager: createReadonlySessionManager(manager) } as AgentToolContext;
+			const result = await wrapToolWithMetaNotice(tool!).execute(
+				"tool-call",
+				{ op: "spew" },
+				undefined,
+				undefined,
+				context,
+			);
+			expect(save).toHaveBeenCalledTimes(1);
+			const text = result.content.find(block => block.type === "text")?.text ?? "";
+			expect(text).toContain("TAILMARK");
+			expect(text).not.toContain("HEADMARK");
+		} finally {
+			save.mockRestore();
+		}
 	});
 
 	it("keeps root package scripts bare and exposes workspace package scripts as package-name/script tasks", async () => {

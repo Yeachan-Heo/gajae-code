@@ -10,6 +10,7 @@ import type {
 import {
 	type GenericFileLockDirIdentity,
 	genericFileLockDirStaleVerdict,
+	isNativeLockContentionCode,
 	processStartTime as portableProcessStartTime,
 	readFileLockObservationForGc,
 } from "../config/file-lock";
@@ -160,7 +161,16 @@ async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
 const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
-const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "sharing_violation"]);
+// Native `access_denied` (STATUS_ACCESS_DENIED) on Windows is a peer handle inside the tree,
+// the same transient contention as `sharing_violation`.
+const TRANSIENT_LOCK_ERROR_CODES = new Set([
+	"EPERM",
+	"EACCES",
+	"EBUSY",
+	"ENOTEMPTY",
+	"access_denied",
+	"sharing_violation",
+]);
 
 interface TransitionDirectoryGeneration {
 	dev: bigint;
@@ -896,6 +906,24 @@ function ownerStartIdentity(pid: number): { start_time: string; start_time_forma
 	if (portableStartTime !== null)
 		return { start_time: portableStartTime, start_time_format: PORTABLE_START_TIME_FORMAT };
 	return { start_time: "unknown" };
+}
+
+/**
+ * Parse owner-record bytes, treating a trailing run of NUL bytes like the space padding
+ * `writeOwnerBytes` emits.
+ *
+ * NTFS and file-system filters (cloud sync placeholders, crash recovery) can publish a
+ * file length whose tail data never landed, and that tail reads back as zero-filled.
+ * The complete record before it is still a fully attributable owner, so it is judged by
+ * the same validation as any other record. Rejecting it as unparseable instead wedges
+ * the lock forever with `lock_owner_record_unprovenanced`, even when it is a released
+ * tombstone. Only TRAILING NULs are stripped: a NUL anywhere inside the document still
+ * fails `JSON.parse`.
+ */
+function parseOwnerRecordBytes(bytes: string): unknown {
+	let end = bytes.length;
+	while (end > 0 && bytes.charCodeAt(end - 1) === 0) end--;
+	return JSON.parse(end === bytes.length ? bytes : bytes.slice(0, end));
 }
 
 function validLockOwner(value: unknown): value is SessionStateLockOwner {
@@ -1637,7 +1665,7 @@ async function rewriteHeldOwnerRecord(
 		if (canonical.bytes !== writtenBytes.toString("utf8")) {
 			let successor: unknown;
 			try {
-				successor = JSON.parse(canonical.bytes);
+				successor = parseOwnerRecordBytes(canonical.bytes);
 			} catch {
 				successor = null;
 			}
@@ -1706,7 +1734,7 @@ async function acquireOwnerLock(
 		if (!current) throw error;
 		let observed: unknown;
 		try {
-			observed = JSON.parse(current.bytes);
+			observed = parseOwnerRecordBytes(current.bytes);
 		} catch {
 			throw error;
 		}
@@ -1746,7 +1774,7 @@ async function acquireOwnerLock(
 async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
 	let owner: unknown;
 	try {
-		owner = JSON.parse(held.bytes);
+		owner = parseOwnerRecordBytes(held.bytes);
 	} catch {
 		owner = null;
 	}
@@ -1807,7 +1835,7 @@ async function reclaimStaleOwnerRecord(
 	if (!snapshot) return "absent_or_changed";
 	let owner: unknown;
 	try {
-		owner = JSON.parse(snapshot.bytes);
+		owner = parseOwnerRecordBytes(snapshot.bytes);
 	} catch {
 		owner = null;
 	}
@@ -1912,7 +1940,7 @@ async function releaseTransitionClaim(
 ): Promise<void> {
 	let heldOwner: SessionStateLockOwner;
 	try {
-		heldOwner = JSON.parse(held.bytes) as SessionStateLockOwner;
+		heldOwner = parseOwnerRecordBytes(held.bytes) as SessionStateLockOwner;
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
 	}
@@ -2005,7 +2033,7 @@ async function reclaimStaleTransitionClaim(
 	if (!ownerSnapshot) return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	let owner: unknown;
 	try {
-		owner = JSON.parse(ownerSnapshot.bytes);
+		owner = parseOwnerRecordBytes(ownerSnapshot.bytes);
 	} catch {
 		return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	}
@@ -2203,7 +2231,7 @@ async function recoverPendingTransitionRelease(
 			if (!pendingOwner) return false;
 			let parsed: Partial<SessionStateLockOwner>;
 			try {
-				parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+				parsed = parseOwnerRecordBytes(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 			} catch {
 				// A rewrite can truncate the held inode and fail before replacement
 				// bytes land. The malformed payload is still ours only when its object
@@ -2237,7 +2265,7 @@ async function recoverPendingTransitionRelease(
 				pendingOwner = await captureRegularLockOwner(ownerFile);
 				if (!pendingOwner) return false;
 				try {
-					parsed = JSON.parse(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
+					parsed = parseOwnerRecordBytes(pendingOwner.bytes) as Partial<SessionStateLockOwner>;
 				} catch {
 					return false;
 				}
@@ -2253,7 +2281,7 @@ async function recoverPendingTransitionRelease(
 				}
 			}
 			const captured = nativeSessionStateLock().snapshotDirectoryTree(nativeTransitionPath);
-			if (captured.code === "sharing_violation") return false;
+			if (isNativeLockContentionCode(captured.code)) return false;
 			if (
 				!captured.ok ||
 				!captured.snapshot ||
@@ -2276,7 +2304,7 @@ async function recoverPendingTransitionRelease(
 				return false;
 			}
 			const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativeTransitionPath, captured.snapshot);
-			if (removed.code === "sharing_violation") return false;
+			if (isNativeLockContentionCode(removed.code)) return false;
 			if (removed.ok || removed.code === "not_found") {
 				clearPendingTransitionRelease(pendingKey, pending);
 				return true;
@@ -2756,7 +2784,7 @@ function captureLegacyDirectoryTree(
 	if (captured.ok && captured.snapshot) return captured.snapshot;
 	if (captured.code === "not_found" || captured.code === "not_directory" || captured.code === "not_a_directory")
 		return null;
-	if (captured.code === "sharing_violation")
+	if (isNativeLockContentionCode(captured.code))
 		throw new SessionStateLockUnavailableError(transientNativeResultError(captured.code));
 	throw new SessionStateLockUnavailableError(
 		new Error(`Legacy lock directory could not be captured: ${captured.code ?? "unknown"}.`),
@@ -2876,7 +2904,7 @@ async function reclaimStaleDirectoryLock(
 					throw new SessionStateLockUnavailableError(error);
 				}
 			}
-			if (removed.code === "sharing_violation")
+			if (isNativeLockContentionCode(removed.code))
 				throw new SessionStateLockUnavailableError(transientNativeResultError(removed.code));
 			if (removed.code === "identity_mismatch") return "absent_or_changed";
 			throw new SessionStateLockUnavailableError(

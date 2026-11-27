@@ -15,6 +15,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, getLocalRootsDir, getSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { discoverAuthStorage } from "../src/sdk/session";
 import { AgentStorage } from "../src/session/agent-storage";
+import { tryResolveInternalUrlSync } from "../src/tui/hyperlink";
 
 function createTtsrRule(name: string): Rule {
 	return {
@@ -170,6 +171,147 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	}, 20_000);
+
+	async function reopenUninitializedManagedSession(prefix: string) {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const initialManager = SessionManager.create(cwd, destination);
+		initialManager.appendMessage({ role: "user", content: "older session", timestamp: Date.now() });
+		await initialManager.flush();
+		const sessionFile = initialManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted managed session path");
+		await initialManager.close();
+		// This process never ran the migration gate for the reopened session's local root.
+		const manager = await SessionManager.open(sessionFile, destination);
+		const localOptions = {
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			isManagedDestination: () => manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => manager.getSessionId(),
+		};
+		tempDirs.push(resolveLocalRoot(localOptions));
+		return { manager, localOptions };
+	}
+
+	it("resolves local:// synchronously for a reopened managed session that never had legacy local data", async () => {
+		const { manager, localOptions } = await reopenUninitializedManagedSession("gjc-sdk-local-fresh-reopen");
+		try {
+			const localRoot = resolveLocalRoot(localOptions);
+			// An earlier process that failed this resolution left the root behind without a marker.
+			fs.mkdirSync(localRoot, { recursive: true, mode: 0o700 });
+			expect(fs.existsSync(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).toBe(false);
+
+			expect(manager.getManagedLegacyLocalMigrationSource()?.hasLegacySourceSync()).toBe(false);
+			expect(resolveLocalUrlToPath("local://PLAN.md", localOptions)).toBe(path.join(localRoot, "PLAN.md"));
+			expect(fs.readFileSync(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+		} finally {
+			await manager.close();
+		}
+	}, 20_000);
+
+	it("keeps refusing sync resolution for a reopened managed session whose legacy local data is unmigrated", async () => {
+		const { manager, localOptions } = await reopenUninitializedManagedSession("gjc-sdk-local-legacy-reopen");
+		try {
+			const artifactsDir = manager.getArtifactsDir();
+			if (!artifactsDir) throw new Error("Expected managed artifacts path");
+			const legacyLocalRoot = path.join(artifactsDir, "local");
+			fs.mkdirSync(legacyLocalRoot, { recursive: true, mode: 0o700 });
+			fs.writeFileSync(path.join(legacyLocalRoot, "PLAN.md"), "legacy plan", { mode: 0o600 });
+
+			// Without getArtifactsDir the resolver can only learn about the legacy tree from the probe.
+			const probeOnlyOptions = { ...localOptions, getArtifactsDir: undefined };
+			expect(manager.getManagedLegacyLocalMigrationSource()?.hasLegacySourceSync()).toBe(true);
+			expect(() => resolveLocalUrlToPath("local://PLAN.md", probeOnlyOptions)).toThrow(
+				"local:// legacy migration must complete before path resolution",
+			);
+			expect(fs.existsSync(path.join(resolveLocalRoot(localOptions), ".gjc-local-legacy-migrated-v1"))).toBe(false);
+		} finally {
+			await manager.close();
+		}
+	}, 20_000);
+
+	it("treats a managed session as legacy-unknown while a cwd move transition is in flight", async () => {
+		const { manager } = await reopenUninitializedManagedSession("gjc-sdk-local-move-window");
+		try {
+			expect(manager.getManagedLegacyLocalMigrationSource()?.hasLegacySourceSync()).toBe(false);
+			let duringTransition: boolean | undefined;
+			await manager.runExclusiveCwdMoveTransition(async () => {
+				duringTransition = manager.getManagedLegacyLocalMigrationSource()?.hasLegacySourceSync();
+			});
+			expect(duringTransition).toBe(true);
+		} finally {
+			await manager.close();
+		}
+	}, 20_000);
+
+	it("treats a managed session whose store binding changed as legacy-unknown", async () => {
+		const { manager } = await reopenUninitializedManagedSession("gjc-sdk-local-rebound");
+		try {
+			const source = manager.getManagedLegacyLocalMigrationSource();
+			expect(source?.hasLegacySourceSync()).toBe(false);
+			const sessionDir = manager.getSessionDir();
+			const moved = `${sessionDir}-rebound`;
+			fs.renameSync(sessionDir, moved);
+			tempDirs.push(moved);
+			fs.mkdirSync(sessionDir, { recursive: true });
+			expect(source?.hasLegacySourceSync()).toBe(true);
+		} finally {
+			await manager.close();
+		}
+	}, 20_000);
+
+	it("resolves a transcript local:// link against a switch successor before its migration gate settles", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-switch-window-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const sessionFiles: string[] = [];
+		for (const text of ["first", "second"]) {
+			const created = SessionManager.create(cwd, destination);
+			created.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+			await created.flush();
+			sessionFiles.push(created.getSessionFile()!);
+			await created.close();
+		}
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: await SessionManager.open(sessionFiles[0]!, destination),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		const originalSetSessionFile = SessionManager.prototype.setSessionFile;
+		let windowLink: string | undefined;
+		let successorRoot: string | undefined;
+		SessionManager.prototype.setSessionFile = async function (this: SessionManager, ...args) {
+			const result = await originalSetSessionFile.apply(this, args);
+			// The manager now reports the successor, but the switch has not run its migration gate.
+			successorRoot = resolveLocalRoot({ getSessionId: () => this.getSessionId() });
+			windowLink = tryResolveInternalUrlSync("local://notes.md");
+			return result;
+		};
+		try {
+			await session.switchSession(sessionFiles[1]!);
+		} finally {
+			SessionManager.prototype.setSessionFile = originalSetSessionFile;
+			await session.dispose();
+		}
+		tempDirs.push(successorRoot!);
+		expect(windowLink).toBe(path.join(successorRoot!, "notes.md"));
+		expect(fs.readFileSync(path.join(successorRoot!, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+	}, 30_000);
 
 	it("migrates a switched managed session's legacy local:// root before resolution (#2925)", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-switch-${Snowflake.next()}-`));

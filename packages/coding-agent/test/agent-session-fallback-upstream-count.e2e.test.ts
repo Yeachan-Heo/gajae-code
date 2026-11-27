@@ -55,11 +55,17 @@ function typedRateLimitStream(
 	model: Model,
 	retryAfterMs: number,
 	errorMessage = "rate limit exceeded",
+	openaiErrorCode?: string,
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage & {
-			transportFailure: { kind: "transport"; status: number; headers: Record<string, string> };
+			transportFailure: {
+				kind: "transport";
+				status: number;
+				headers: Record<string, string>;
+				openaiErrorCode?: string;
+			};
 		} = {
 			role: "assistant",
 			content: [],
@@ -78,7 +84,12 @@ function typedRateLimitStream(
 			errorMessage,
 			errorStatus: 429,
 			timestamp: Date.now(),
-			transportFailure: { kind: "transport", status: 429, headers: { "retry-after-ms": String(retryAfterMs) } },
+			transportFailure: {
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after-ms": String(retryAfterMs) },
+				...(openaiErrorCode === undefined ? {} : { openaiErrorCode }),
+			},
 		};
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
@@ -697,7 +708,15 @@ describe("AgentSession fallback upstream request counts", () => {
 
 		expect(prepareSpy).toHaveBeenCalled();
 		expect(calls).toEqual([selector(primary), selector(primary)]);
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		// Two runs, two terminals: the overflow predecessor keeps its own agent_end
+		// (published before the successor's) instead of being displaced by it.
+		expect(events.filter(event => event.type === "agent_start")).toHaveLength(2);
+		const ends = events.filter(
+			(event): event is Extract<AgentSessionEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		expect(ends).toHaveLength(2);
+		expect(ends[0]!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error", errorStatus: 400 });
+		expect(ends[1]!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			content: [{ type: "text", text: "Queued successor completed" }],
@@ -1210,6 +1229,115 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(calls).toEqual([selector(fallback)]);
 	});
 
+	it("waits on the same entry while the account's parallel-request slots are full", async () => {
+		const calls: string[] = [];
+		let saturatedReplies = 3;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 1_000, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		// One fallback attempt per entry: an ordinary 429 would advance at once.
+		const { primary, fallback } = createSession(1, streamFn);
+
+		await session!.prompt("Every slot on the head account is busy");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary), selector(primary), selector(primary)]);
+		expect(session!.model).toMatchObject({ provider: primary.provider, id: primary.id });
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary))).toBe(false);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(fallback))).toBe(false);
+		// Each wait honours the provider's Retry-After as a floor.
+		const waits = waitSpy.mock.calls.map(([delay]) => delay as number).filter(delay => delay >= 1_000);
+		expect(waits.length).toBe(3);
+	});
+
+	it("advances instead of re-sending early when Retry-After outlasts the remaining wait budget", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary)
+				? typedRateLimitStream(model, 10_000, "5 requests already running", "session_limit_reached")
+				: successfulStream(model);
+		};
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.concurrencyWaitMs": 5_000 });
+
+		await session!.prompt("The provider asks for longer than we may wait");
+		await session!.waitForIdle();
+
+		// No probe of the head before its 10s Retry-After: the failure takes the ordinary path at once.
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(waitSpy.mock.calls.map(([delay]) => delay as number).filter(delay => delay > 0 && delay < 10_000)).toEqual(
+			[],
+		);
+	});
+
+	it("keeps concurrency polls positive and capped when generic retry delays are zero", async () => {
+		let saturatedReplies = 3;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 0, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		const { primary } = createSession(1, streamFn, { "retry.baseDelayMs": 0, "retry.maxDelayMs": 0 });
+
+		await session!.prompt("Zero generic retry delays");
+		await session!.waitForIdle();
+
+		const waits = waitSpy.mock.calls.map(([delay]) => delay as number);
+		expect(waits).toHaveLength(3);
+		for (const wait of waits) {
+			expect(wait).toBeGreaterThanOrEqual(100);
+			expect(wait).toBeLessThanOrEqual(15_000);
+		}
+	});
+
+	it("adds positive jitter after a dominating Retry-After so waiters do not retry in lockstep", async () => {
+		let saturatedReplies = 1;
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === selector(primary) && saturatedReplies > 0) {
+				saturatedReplies--;
+				return typedRateLimitStream(model, 30_000, "5 requests already running", "session_limit_reached");
+			}
+			return successfulStream(model);
+		};
+		const { primary } = createSession(1, streamFn);
+		const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+		try {
+			await session!.prompt("Retry-After dominates the poll cap");
+			await session!.waitForIdle();
+		} finally {
+			random.mockRestore();
+		}
+
+		const waits = waitSpy.mock.calls.map(([delay]) => delay as number).filter(delay => delay >= 30_000);
+		expect(waits).toHaveLength(1);
+		expect(waits[0]).toBeGreaterThan(30_000);
+	});
+
+	it("treats parallel-request saturation as an ordinary rate limit once the wait budget is off", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary)
+				? typedRateLimitStream(model, 1_000, "5 requests already running", "session_limit_reached")
+				: successfulStream(model);
+		};
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.concurrencyWaitMs": 0 });
+
+		await session!.prompt("No waiting allowed");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(session!.model).toMatchObject({ provider: fallback.provider, id: fallback.id });
+	});
+
 	it("lets exactly one session claim a half-open probe", () => {
 		const head = "anthropic/claude-sonnet-4-5";
 		modelRegistry.openSelectorCircuit(head, 1, 1, Date.now() - 1);
@@ -1379,6 +1507,101 @@ describe("AgentSession fallback upstream request counts", () => {
 		]);
 	});
 
+	it("does not retry the same entry before Retry-After deadline (Finding 1)", async () => {
+		// When Retry-After exceeds remaining budget, the ordinary rate-limit path must not
+		// re-send to the same entry before the provider's deadline. Instead, advance to the
+		// next entry. Record timestamps and selectors to prove this.
+		const requestLog: Array<{ selector: string; timestampMs: number }> = [];
+		const retryAfterMs = 10_000; // 10 second deadline
+		const budgetMs = 5_000; // 5 second budget (exceeds)
+		let firstAttemptTime = 0;
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			const now = Date.now();
+			requestLog.push({ selector: selector(model), timestampMs: now });
+
+			if (selector(model) === selector(primary) && requestLog.length === 1) {
+				firstAttemptTime = now;
+				// Return concurrency 429 with 10s Retry-After on first attempt only
+				return typedRateLimitStream(model, retryAfterMs, "5 requests already running", "session_limit_reached");
+			}
+			// All other attempts succeed
+			return successfulStream(model);
+		};
+
+		const { primary, fallback } = createSession(1, streamFn, {
+			"fallback.concurrencyWaitMs": budgetMs,
+		});
+
+		await session!.prompt("Retry-After exceeds budget, must advance instead of retrying");
+		await session!.waitForIdle();
+
+		// Verify request sequence: primary once, then fallback, then success
+		const selectors = requestLog.map(r => r.selector);
+		expect(selectors).toEqual([selector(primary), selector(fallback)]);
+
+		// Critical: verify no same-entry request before Retry-After deadline
+		for (const { selector: sel, timestampMs } of requestLog) {
+			if (sel === selector(primary)) {
+				// All primary requests should be at or after the initial attempt
+				// (there should only be one, at the start)
+				expect(timestampMs).toBe(firstAttemptTime);
+			}
+		}
+
+		expect(session!.model).toMatchObject({ provider: fallback.provider, id: fallback.id });
+	});
+
+	it("bounds poll count with Retry-After: 0 using principled interval (Finding 2)", async () => {
+		// When Retry-After is 0, polling should be bounded by budget/min_interval, not by time alone.
+		// With default budget (300s) and 1s min interval, max ~300 polls.
+		// Use Retry-After: 0 and try many times to verify bounded behavior.
+		const requestLog: Array<{ selector: string; timestampMs: number }> = [];
+		let saturatedCount = 0;
+		const maxSaturated = 500; // Try way more than the poll limit should allow
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			const now = Date.now();
+			requestLog.push({ selector: selector(model), timestampMs: now });
+
+			if (selector(model) === selector(primary)) {
+				if (saturatedCount < maxSaturated) {
+					saturatedCount++;
+					// Return concurrency 429 with Retry-After: 0 (minimum poll interval)
+					return typedRateLimitStream(model, 0, "5 requests already running", "session_limit_reached");
+				}
+			}
+			// Fallback or primary after saturation limit succeeds
+			return successfulStream(model);
+		};
+
+		const { primary } = createSession(1, streamFn, {
+			"fallback.concurrencyWaitMs": 300_000, // Default 300s budget
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		await session!.prompt("Poll count should be bounded even with Retry-After: 0");
+		await session!.waitForIdle();
+
+		// Count primary attempts to verify polling was bounded
+		// Budget 300s / interval 1s = ~300 max polls
+		// Allow buffer but verify well below 500
+		const primaryAttempts = requestLog.filter(r => r.selector === selector(primary)).length;
+		expect(primaryAttempts).toBeLessThan(350); // Well below 500, but accounting for timing variance
+		expect(primaryAttempts).toBeGreaterThan(100); // Should have tried multiple times
+		// Every same-entry poll waits at least the 1 s floor the ceiling assumes, so the
+		// polls actually span the configured budget instead of bursting through it.
+		// (The generic retry delay is 0 ms here, so every positive wait is a concurrency poll.)
+		const pollWaits = waitSpy.mock.calls.map(([ms]) => Number(ms)).filter(ms => ms > 0);
+		expect(pollWaits.length).toBeGreaterThan(100);
+		expect(Math.min(...pollWaits)).toBeGreaterThanOrEqual(1_000);
+		expect(pollWaits.length).toBeLessThanOrEqual(300_000 / 1_000);
+
+		// Should eventually advance and succeed
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
 	it("keeps a one-entry chain non-managed and token-free", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primary) throw new Error("Expected bundled test model");
@@ -1404,5 +1627,193 @@ describe("AgentSession fallback upstream request counts", () => {
 		await session!.waitForIdle();
 
 		expect(calls).toEqual([{ selector: selector(primary), fallbackManaged: undefined, fallbackAttempt: undefined }]);
+	});
+
+	it("scopes Retry-After budget flag per entry so fallback gets normal retries (Issue 1)", async () => {
+		// When entry A hits Retry-After that exceeds budget, the flag is set to that entry's selector.
+		// When we advance to entry B, the flag should NOT apply, allowing B to use normal retry logic.
+		// Without the fix: flag stays global, so B gets immediately advanced (exhausted).
+		// With the fix: flag is scoped to A's selector, so B gets normal retries.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primarySelector = selector(getBundledModel("anthropic", "claude-sonnet-4-5")!);
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				if (primaryAttempts === 1) {
+					// Return concurrency 429 with Retry-After that exceeds budget
+					return typedRateLimitStream(model, 10_000, "5 requests already running", "session_limit_reached");
+				}
+			}
+			// Fallback: First attempt returns a 429, next attempts succeed
+			if (selector(model) !== primarySelector) {
+				fallbackAttempts++;
+				if (fallbackAttempts === 1) {
+					// Fallback's first attempt also fails (simulating another provider issue)
+					return typedRateLimitStream(model, 500, "service temporarily unavailable", "rate_limit_exceeded");
+				}
+			}
+			// All other attempts succeed
+			return successfulStream(model);
+		};
+
+		const { fallback: f } = createSession(5, streamFn, {
+			"fallback.concurrencyWaitMs": 5_000, // Budget 5s, Retry-After 10s (exceeds for primary)
+		});
+
+		await session!.prompt("Test per-entry Retry-After flag scoping");
+		await session!.waitForIdle();
+
+		// Verify: primary should have 1 attempt, then advance
+		expect(primaryAttempts).toBe(1);
+		// Fallback should retry after its first failure, then succeed
+		expect(fallbackAttempts).toBeGreaterThanOrEqual(2);
+		// Should eventually succeed on fallback
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("respects Retry-After deadline when poll ceiling is reached (Issue 2)", async () => {
+		// When poll ceiling is reached with Retry-After, we should advance to fallback
+		// rather than immediately retrying the same entry. Test verifies that after
+		// hitting the ceiling, we transition away from primary instead of continuing retries.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primarySelector = selector(getBundledModel("anthropic", "claude-sonnet-4-5")!);
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				// Return 429 with small Retry-After to test poll ceiling behavior using concurrency-typed code
+				return typedRateLimitStream(model, 100, "concurrency limit exceeded", "concurrency_limit_exceeded");
+			}
+			// Fallback
+			fallbackAttempts++;
+			if (fallbackAttempts <= 1) {
+				// First fallback attempt also fails
+				return typedRateLimitStream(model, 100, "rate limit", "rate_limit_exceeded");
+			}
+			// Succeed on second attempt
+			return successfulStream(model);
+		};
+
+		const { fallback: f } = createSession(50, streamFn, {
+			// Reasonable budget to hit ceiling after multiple polls (each poll is ~1000ms minimum)
+			"fallback.concurrencyWaitMs": 15_000,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		await session!.prompt("Test poll ceiling triggers fallback advance");
+		await session!.waitForIdle();
+
+		// When poll ceiling is hit, we should advance to fallback instead of retrying primary forever
+		expect(primaryAttempts).toBeGreaterThan(1);
+		expect(primaryAttempts).toBeLessThan(100); // Should be bounded, not infinite
+		expect(fallbackAttempts).toBeGreaterThan(0); // Should have tried fallback
+		// Final model should be fallback (which succeeded)
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+	});
+
+	it("records Retry-After deadline when budget is exhausted with pending concurrency saturation (Issue 7796)", async () => {
+		// When concurrency-wait budget is spent and a new 429 with Retry-After arrives,
+		// the deadline must be tracked to prevent same-selector retries before the deadline.
+		// This test exhausts the budget, triggers a new 429, and verifies the deadline
+		// prevents immediate same-selector retries.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const primarySelector = selector(primaryModel);
+		const retryAfterMs = 2000; // 2-second deadline
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				// Return concurrency-typed 429 with Retry-After
+				return typedRateLimitStream(
+					model,
+					retryAfterMs,
+					"too many concurrent requests",
+					"too_many_concurrent_requests",
+				);
+			}
+			// Fallback
+			fallbackAttempts++;
+			// Always succeed on fallback to test the deadline enforcement
+			return successfulStream(model);
+		};
+
+		const { fallback: f } = createSession(50, streamFn, {
+			// Very small budget to exhaust quickly
+			"fallback.concurrencyWaitMs": 100,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		const requestsBefore = primaryAttempts;
+		await session!.prompt("Exhaust budget then verify deadline");
+		await session!.waitForIdle();
+
+		// Verify that primary was attempted and then we switched to fallback
+		expect(primaryAttempts).toBeGreaterThan(requestsBefore);
+		expect(fallbackAttempts).toBeGreaterThan(0);
+		// Final model should be fallback (which succeeded)
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+
+		// When deadline is recorded on budget exhaustion, we should quickly advance to fallback
+		// rather than retry the primary many times (each would add ~100ms Retry-After to deadline).
+		// With a 100ms budget, we expect a small number of primary attempts before advancing.
+		expect(primaryAttempts).toBeLessThan(10); // Should not retry indefinitely
+	});
+
+	it("enforces concurrency Retry-After deadline before credential rotation (Issue 7796)", async () => {
+		// When a typed concurrency 429 with Retry-After exceeds the remaining budget,
+		// the deadline must be enforced even when credential rotation is available.
+		// A rotating credential should not retry the same selector before the deadline.
+		let primaryAttempts = 0;
+		let fallbackAttempts = 0;
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const primarySelector = selector(primaryModel);
+		const retryAfterMs = 1000; // 1-second deadline
+
+		const streamFn: AgentOptions["streamFn"] = model => {
+			if (selector(model) === primarySelector) {
+				primaryAttempts++;
+				// Return concurrency-typed 429 with Retry-After that exceeds budget
+				return typedRateLimitStream(
+					model,
+					retryAfterMs,
+					"too many concurrent requests",
+					"too_many_concurrent_requests",
+				);
+			}
+			// Fallback
+			fallbackAttempts++;
+			// Always succeed on fallback
+			return successfulStream(model);
+		};
+
+		const { fallback: f } = createSession(50, streamFn, {
+			// Very small budget (200ms) vs Retry-After (1s)
+			"fallback.concurrencyWaitMs": 200,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+		});
+
+		const requestsBefore = primaryAttempts;
+		await session!.prompt("Test credential rotation deadline enforcement");
+		await session!.waitForIdle();
+
+		// Verify primary was attempted and deadline was enforced
+		expect(primaryAttempts).toBeGreaterThan(requestsBefore);
+		expect(fallbackAttempts).toBeGreaterThan(0);
+		// Final model should be fallback (which succeeded)
+		expect(session!.model).toMatchObject({ provider: f.provider, id: f.id });
+
+		// Most importantly: credential rotation should not bypass the deadline.
+		// With a 200ms budget and a 1s Retry-After, we should NOT see many primary
+		// attempts (would indicate deadline was not enforced before rotation).
+		expect(primaryAttempts).toBeLessThan(5);
 	});
 });

@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { logger } from "@gajae-code/utils";
+import { waitForCondition } from "../../../utils/test/helpers/wait-for";
 import { liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
+import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
 const servers: Bun.Server<unknown>[] = [];
@@ -16,14 +19,8 @@ function tmpPath(name: string): string {
 	return path;
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error("waitFor timed out");
-}
+const waitFor = (predicate: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 function isAlive(pid: number): boolean {
 	try {
@@ -260,6 +257,52 @@ rl.on("line", line => {
 		await Bun.sleep(750);
 		expect(await readPidList(pidFile)).toEqual(pidsAtDisconnect);
 		expect(manager.getConnectionStatus("backoff")).toBe("disconnected");
+	});
+
+	test("automatic reconnect after a transport close handles a rejected reconnect", async () => {
+		const serverScript = `
+const rl = require("readline").createInterface({ input: process.stdin });
+rl.on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "closing", version: "1" } } }) + "\\n");
+  } else if (msg.method === "tools/list") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "ok", inputSchema: { type: "object" } }] } }) + "\\n");
+  }
+});
+`;
+		const manager = new MCPManager(process.cwd());
+		managers.push(manager);
+		const config = { type: "stdio" as const, command: process.execPath, args: ["-e", serverScript], timeout: 1_000 };
+		const result = await manager.connectServers({ expected: config, unexpected: config }, {});
+		expect(result.connectedServers.toSorted()).toEqual(["expected", "unexpected"]);
+		const expectedConnection = manager.getConnection("expected");
+		const unexpectedConnection = manager.getConnection("unexpected");
+		if (!expectedConnection || !unexpectedConnection) throw new Error("expected both connections");
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		const unexpected = new Error("reconnect exploded");
+		const reconnect = vi.spyOn(manager, "reconnectServer").mockImplementation(async name => {
+			throw name === "expected" ? new MCPExpectedFailure() : unexpected;
+		});
+		const logged = vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			expectedConnection.transport.onClose?.();
+			unexpectedConnection.transport.onClose?.();
+			await waitFor(() => reconnect.mock.calls.length === 2, 1_000);
+			await Bun.sleep(20);
+			expect(reconnect.mock.calls.map(call => call[0]).toSorted()).toEqual(["expected", "unexpected"]);
+			expect(logged.mock.calls.filter(call => call[0] === "MCP automatic reconnect failed")).toEqual([
+				["MCP automatic reconnect failed", { path: "mcp:unexpected", error: unexpected }],
+			]);
+		} finally {
+			reconnect.mockRestore();
+			logged.mockRestore();
+			process.off("unhandledRejection", onUnhandled);
+		}
+		expect(unhandled).toEqual([]);
 	});
 });
 

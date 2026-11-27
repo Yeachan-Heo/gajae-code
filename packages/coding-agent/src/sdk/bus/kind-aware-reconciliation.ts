@@ -5,10 +5,12 @@ import { createHash, randomUUID } from "node:crypto";
  * Preserves Q26 admit/first-terminal/capacity semantics; indexes and caps are per-kind.
  */
 
+import { PreflightAdmissionLedger } from "../preflight-admissions";
 import {
 	failedPromptOutcome,
 	failureEvidence,
 	failureProviderDiagnostic,
+	isPreservedProviderFailure,
 	type PromptFailureEvidence,
 	providerDiagnosticField,
 	publicTerminalOutcome,
@@ -43,18 +45,6 @@ import type {
 } from "./reconciliation-store";
 
 const EMPTY_PROMPT_FAILURE = { code: "prompt_failed", message: "Prompt submission failed." } as const;
-const PRESERVED_PROVIDER_FAILURE_CODES = new Set([
-	"provider_down",
-	"provider_unavailable",
-	"provider_rejected",
-	"upstream_stream_interrupted",
-	"argument_validation",
-	"execution",
-	"upstream_error",
-	"transport_reset",
-]);
-const isPreservedProviderFailure = (code: string | undefined): boolean =>
-	code !== undefined && (PRESERVED_PROVIDER_FAILURE_CODES.has(code) || code.startsWith("provider_http_"));
 const STOP_REASONS: readonly SdkPromptStopReason[] = [
 	"end_turn",
 	"max_tokens",
@@ -179,7 +169,13 @@ export interface SteerReconciliationResult {
 
 export interface KindAwareReconciliation {
 	admit(kind: ReconciliationKind, clientRef?: string): void;
-	releaseAdmission(kind: ReconciliationKind, clientRef?: string): void;
+	/** Makes an admitted submission's generated correlation observable through `turn.result` during preflight. */
+	bindAdmission(kind: ReconciliationKind, clientRef: string | undefined, correlation: PromptCorrelation): void;
+	/**
+	 * Releases an admission that was never accepted. A `rejection` records the definite
+	 * preflight failure so `turn.result` reports it instead of `unknown`.
+	 */
+	releaseAdmission(kind: ReconciliationKind, clientRef?: string, rejection?: { cause: unknown }): void;
 	noteAccepted(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
@@ -266,6 +262,7 @@ export function createKindAwareReconciliation(
 	let clientRefIndex = new Map<string, string>();
 	const reservedClientRefs = new Map<ReconciliationKind, Set<string>>();
 	const reservations: Array<{ kind: ReconciliationKind; clientRef?: string }> = [];
+	const admissions = new PreflightAdmissionLedger(now);
 	let mutationChain: Promise<void> = Promise.resolve();
 
 	const keyOf = (kind: ReconciliationKind, correlation: PromptCorrelation) =>
@@ -454,8 +451,17 @@ export function createKindAwareReconciliation(
 		if (clientRef !== undefined) reserved.add(clientRef);
 	};
 
-	const releaseAdmission = (kind: ReconciliationKind, clientRef?: string) => {
+	const bindAdmission = (kind: ReconciliationKind, clientRef: string | undefined, correlation: PromptCorrelation) => {
+		if (kind === "terminal") return;
+		if (!reservations.some(record => record.kind === kind && record.clientRef === clientRef)) return;
+		admissions.admitted(kind, clientRef, correlation);
+	};
+
+	const releaseAdmission = (kind: ReconciliationKind, clientRef?: string, rejection?: { cause: unknown }) => {
 		consumeReservation(kind, clientRef);
+		if (kind === "terminal") return;
+		if (rejection) admissions.rejected(kind, clientRef, rejection.cause);
+		else admissions.accepted(kind, clientRef);
 	};
 
 	const noteAccepted = async (
@@ -478,6 +484,7 @@ export function createKindAwareReconciliation(
 			return { value: undefined, changed: true };
 		});
 		consumeReservation(kind, clientRef);
+		if (kind !== "terminal") admissions.accepted(kind, clientRef);
 	};
 
 	const noteTransition = async (
@@ -937,7 +944,13 @@ export function createKindAwareReconciliation(
 					? keyOf(kind, { commandId: selector.commandId, turnId: selector.turnId })
 					: undefined;
 		const record = key === undefined ? undefined : records.get(key);
-		if (!record || record.kind === "steer") return { status: "unknown", receiptState: "unknown" };
+		if (!record || record.kind === "steer")
+			return (
+				(kind === "terminal" ? undefined : admissions.lookup(kind, selector)) ?? {
+					status: "unknown",
+					receiptState: "unknown",
+				}
+			);
 		const identity = {
 			// Durable terminal markers (kind "terminal") are not prompt/skill
 			// invocation pages: never surface them under a prompt/skill kind.
@@ -1072,6 +1085,7 @@ export function createKindAwareReconciliation(
 
 	return {
 		admit,
+		bindAdmission,
 		releaseAdmission,
 		noteAccepted,
 		noteTransition,

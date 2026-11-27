@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
-import * as native from "@gajae-code/natives";
+import * as clipboard from "@gajae-code/coding-agent/utils/clipboard";
 
 function createController(options: { assistantText?: string; hasAssistantMessage?: boolean; handoffText?: string }) {
 	const showStatus = vi.fn();
@@ -25,7 +25,9 @@ describe("/copy command", () => {
 	});
 
 	it("copies the latest assistant text", async () => {
-		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
+		const copySpy = vi
+			.spyOn(clipboard, "copyToClipboard")
+			.mockResolvedValue({ status: "attempted", transport: "auto", reason: "test" });
 		const { controller, showStatus, showError } = createController({
 			assistantText: "latest **markdown** response",
 		});
@@ -39,7 +41,9 @@ describe("/copy command", () => {
 		expect(showError).not.toHaveBeenCalled();
 	});
 	it("falls back to the fresh handoff context when no assistant message exists", async () => {
-		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
+		const copySpy = vi
+			.spyOn(clipboard, "copyToClipboard")
+			.mockResolvedValue({ status: "attempted", transport: "auto", reason: "test" });
 		const { controller, showStatus, showError } = createController({
 			handoffText: "<handoff-context>\n## Goal\nContinue\n</handoff-context>",
 		});
@@ -54,7 +58,9 @@ describe("/copy command", () => {
 	});
 
 	it("does not fall back to stale handoff context after a textless assistant response", () => {
-		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
+		const copySpy = vi
+			.spyOn(clipboard, "copyToClipboard")
+			.mockResolvedValue({ status: "attempted", transport: "auto", reason: "test" });
 		const { controller, showStatus, showError } = createController({
 			hasAssistantMessage: true,
 			handoffText: "<handoff-context>\n## Goal\nContinue\n</handoff-context>",
@@ -68,7 +74,9 @@ describe("/copy command", () => {
 	});
 
 	it("shows an error when no assistant message or handoff context exists", () => {
-		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
+		const copySpy = vi
+			.spyOn(clipboard, "copyToClipboard")
+			.mockResolvedValue({ status: "attempted", transport: "auto", reason: "test" });
 		const { controller, showStatus, showError } = createController({
 			hasAssistantMessage: false,
 		});

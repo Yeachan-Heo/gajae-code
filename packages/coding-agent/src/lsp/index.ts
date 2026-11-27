@@ -12,6 +12,7 @@ import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
+	closeDocument,
 	ensureFileOpen,
 	getActiveClients,
 	getOrCreateClient,
@@ -1649,12 +1650,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				try {
 					const client = await getOrCreateClient(serverConfig, this.session.cwd);
 					for (const { oldUri } of pairs) {
-						if (client.openFiles.has(oldUri)) {
-							await sendNotification(client, "textDocument/didClose", {
-								textDocument: { uri: oldUri },
-							});
-							client.openFiles.delete(oldUri);
-						}
+						if (client.openFiles.has(oldUri)) await closeDocument(client, oldUri);
 					}
 					await sendNotification(client, "workspace/didRenameFiles", lspParams);
 				} catch (err) {

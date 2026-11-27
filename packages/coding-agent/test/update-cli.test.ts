@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { logger, VERSION } from "@gajae-code/utils";
-import { runCli } from "../src/cli";
+import { lcgUnit } from "../../utils/test/helpers/prng";
 import * as installActivation from "../src/cli/install-activation";
 import {
 	buildActivationRecord,
@@ -14,8 +14,8 @@ import {
 	snapshotDirectory,
 	snapshotRegularFile,
 } from "../src/cli/install-activation";
-import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
-import type { BinaryReplacementOptions, BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
+
+import type { BinaryReplacementOptions, BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	ActivationRetryCandidateRepointError,
 	assertSupportedLinuxLibcForTest,
@@ -23,6 +23,7 @@ import {
 	compareVersionsForTest,
 	defaultUserBinaryPathForTest,
 	formatBinaryDownloadFailureMessageForTest,
+	formatInstallationRollbackAclError,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	formatVerifiedBinaryInvocation,
@@ -30,6 +31,7 @@ import {
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
 	InstallationAccessDeniedError,
+	InstallationRollbackAclPresentError,
 	isProtectedSourcePathForTest,
 	isUpdateBackupNameForTest,
 	isUpdateStagingNameForTest,
@@ -73,14 +75,6 @@ async function writeFixtureFile(filePath: string, content: string | Uint8Array, 
 	await fs.chmod(filePath, mode);
 }
 
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
-
 function generatedHex(random: () => number, length: number): string {
 	const digits = "0123456789abcdef";
 	return Array.from({ length }, () => digits.charAt(Math.floor(random() * digits.length))).join("");
@@ -112,225 +106,6 @@ describe("verified binary invocation formatting", () => {
 		expect(formatVerifiedBinaryInvocation("/my bin/O'Brien/‘’‚‛;$HOME`id`/gjc", platform)).toBe(
 			"'/my bin/O'\\''Brien/‘’‚‛;$HOME`id`/gjc'",
 		);
-	});
-});
-
-describe("macOS community app integration", () => {
-	const release = { tag: "v999.0.0", version: "999.0.0", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
-
-	it.each(["binary", "migrate"] as const)("offers once after successful %s recovery and defaults", async method => {
-		await initTheme();
-		const root = await makeTempDir();
-		const calls: string[] = [];
-		await runUpdateCommand(
-			{ force: false, check: false },
-			{
-				platform: "darwin",
-				getLatestRelease: async () => release,
-				resolveUpdateTarget: async () => ({ method, path: path.join(root, "gjc") }),
-				verifyMigrationTarget: async () => ({ ok: false }),
-				performUpdate: async () => {
-					calls.push("install");
-					return { ok: true, path: path.join(root, "gjc") };
-				},
-				runPostUpdateRecovery: async () => {
-					calls.push("recovery");
-				},
-				refreshInstalledDefaultSkills: async () => {
-					calls.push("defaults");
-				},
-				offerMacosCommunityApp: async deps => {
-					expect(deps?.platform).toBe("darwin");
-					expect(fsNode.existsSync(path.join(root, ".gjc-install.lock"))).toBe(false);
-					calls.push("offer");
-					return { status: "skipped", reason: "declined" };
-				},
-				recordTelemetryEvent: () => {},
-			},
-		);
-		expect(calls).toEqual(["install", "recovery", "defaults", "offer"]);
-	});
-
-	it.each([false, true])("reused migration releases its lock before offering; check=%s", async check => {
-		await initTheme();
-		const root = await makeTempDir();
-		const lock = path.join(root, ".gjc-install.lock");
-		const calls: string[] = [];
-		await runUpdateCommand(
-			{ force: false, check },
-			{
-				platform: "darwin",
-				getLatestRelease: async () => release,
-				resolveUpdateTarget: async () => ({ method: "migrate", path: path.join(root, "gjc") }),
-				verifyMigrationTarget: async () => {
-					expect(fsNode.existsSync(lock)).toBe(!check);
-					calls.push("verify");
-					return { ok: true };
-				},
-				performUpdate: async () => {
-					throw new Error("unexpected install");
-				},
-				runPostUpdateRecovery: async () => {
-					throw new Error("unexpected recovery");
-				},
-				refreshInstalledDefaultSkills: async () => {
-					throw new Error("unexpected defaults");
-				},
-				offerMacosCommunityApp: async () => {
-					expect(fsNode.existsSync(lock)).toBe(false);
-					calls.push("offer");
-					return { status: "skipped", reason: "declined" };
-				},
-				recordTelemetryEvent: () => {},
-			},
-		);
-		expect(calls).toEqual(check ? ["verify"] : ["verify", "offer"]);
-		expect(fsNode.existsSync(lock)).toBe(false);
-	});
-
-	it("writes the shared disclosure to stderr before prompting", async () => {
-		await initTheme();
-		const root = await makeTempDir();
-		const stderr: string[] = [];
-		let prompts = 0;
-		let disclosureAtPrompt = "";
-		const write = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
-			stderr.push(String(chunk));
-			return true;
-		});
-		try {
-			await runUpdateCommand(
-				{ force: false, check: false },
-				{
-					platform: "darwin",
-					getLatestRelease: async () => release,
-					resolveUpdateTarget: async () => ({ method: "binary", path: path.join(root, "gjc") }),
-					performUpdate: async () => ({ ok: true, path: path.join(root, "gjc") }),
-					runPostUpdateRecovery: async () => {},
-					refreshInstalledDefaultSkills: async () => {},
-					offerMacosCommunityApp: options =>
-						offerMacosCommunityApp({
-							...options,
-							env: {},
-							arch: "arm64",
-							homeDir: root,
-							stdinIsTTY: true,
-							stdoutIsTTY: true,
-							command: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
-							prompt: async () => {
-								prompts++;
-								disclosureAtPrompt = stderr.join("");
-								return false;
-							},
-						}),
-					recordTelemetryEvent: () => {},
-				},
-			);
-			expect(prompts).toBe(1);
-			expect(disclosureAtPrompt).toContain("experimental, community-built THIRD-PARTY software");
-			expect(disclosureAtPrompt).toContain("separately licensed, with no first-party support");
-			expect(disclosureAtPrompt).toContain("https://github.com/devswha/gajae-code-app\n");
-		} finally {
-			write.mockRestore();
-		}
-	});
-	it.each([
-		"linux",
-		"check",
-		"up-to-date",
-		"failed",
-		"throw",
-		"suppressed",
-	] as const)("preserves update behavior for %s", async scenario => {
-		await initTheme();
-		let offers = 0;
-		const events: string[] = [];
-		const warnings: string[] = [];
-		const warning = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
-			warnings.push(String(chunk));
-			return true;
-		});
-		const exit = new Error("exit");
-		const deps: UpdateCommandDependencies = {
-			platform: scenario === "linux" ? "linux" : "darwin",
-			getLatestRelease: async () => (scenario === "up-to-date" ? { ...release, version: "0.0.1" } : release),
-			resolveUpdateTarget: async () => ({ method: "binary", path: "/verified/gjc" }),
-			performUpdate: async () => {
-				if (scenario === "failed") throw new Error("core update failed");
-				return { ok: true, path: "/verified/gjc" };
-			},
-			runPostUpdateRecovery: async () => {},
-			refreshInstalledDefaultSkills: async () => {},
-			offerMacosCommunityApp: async options => {
-				offers++;
-				if (scenario === "throw") throw new Error(`\x1b[31moptional failure\x1b[0m\n${"x".repeat(1_000)}`);
-				const result = await offerMacosCommunityApp({
-					...options,
-					env: { GJC_NO_COMMUNITY_APP: "1" },
-					prompt: async () => {
-						throw new Error("must not prompt");
-					},
-					fetchImpl: async () => {
-						throw new Error("must not fetch");
-					},
-				});
-				expect(result).toEqual({ status: "skipped", reason: "suppressed by environment" });
-				return result;
-			},
-			recordTelemetryEvent: event => {
-				events.push(event);
-			},
-			exit: () => {
-				throw exit;
-			},
-		};
-		try {
-			const result = runUpdateCommand({ force: false, check: scenario === "check" }, deps);
-			if (scenario === "failed") await expect(result).rejects.toBe(exit);
-			else await result;
-			expect(offers).toBe(scenario === "throw" || scenario === "suppressed" ? 1 : 0);
-			if (scenario === "throw") {
-				expect(events).toContain("update_install_completed");
-				expect(events).not.toContain("update_install_failed");
-				expect(warnings.join("\n")).toContain("optional failure");
-				expect(warnings.join("\n")).toContain("https://github.com/devswha/gajae-code-app");
-				expect(warnings.join("")).not.toContain("\x1b");
-				expect(warnings.join("")).not.toContain("x".repeat(513));
-				expect(warnings.join("")).toContain("GJC remains installed.");
-			}
-		} finally {
-			warning.mockRestore();
-		}
-	});
-
-	it("dispatches only exact single-argument capability and internal offer flags", async () => {
-		const stdout: string[] = [];
-		const write = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
-			stdout.push(String(chunk));
-			return true;
-		});
-		try {
-			await runCli(["--supports-macos-community-app"]);
-			expect(stdout.join("")).toBe("macos-community-app-offer\n");
-		} finally {
-			write.mockRestore();
-		}
-		for (const args of [
-			["--supports-macos-community-app", "--help"],
-			["--supports-macos-community-app=yes", "--help"],
-			["--internal-macos-community-app-offer", "--help"],
-			["--internal-macos-community-app-offer"],
-		]) {
-			const result = Bun.spawnSync([process.execPath, "src/cli.ts", ...args], {
-				cwd: path.join(repoRoot, "packages/coding-agent"),
-				env: { ...process.env, GJC_NO_COMMUNITY_APP: "1" },
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			expect(result.exitCode).toBe(0);
-			expect(result.stdout.toString()).not.toContain("macos-community-app-offer\n");
-			if (args.length > 1) expect(result.stdout.toString()).toContain("USAGE");
-		}
 	});
 });
 
@@ -508,6 +283,152 @@ describe("update-cli release lookup", () => {
 				fetchImpl: async () => new Response("limited", { status: 403 }),
 			}),
 		).rejects.toThrow("GITHUB_TOKEN");
+	});
+
+	it("skips stable releases without the binary asset for the current platform", async () => {
+		const requested: string[] = [];
+		const skipped: Array<{ tag: string; version: string }> = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: "stable",
+			requiredBinaryAsset: "gjc-linux-x64",
+			onSkippedRelease: (tag, version) => skipped.push({ tag, version }),
+			fetchImpl: async url => {
+				requested.push(String(url));
+				// Return multiple releases: v9.9.9 without the asset, v9.9.8 with it
+				return new Response(
+					JSON.stringify([
+						{
+							tag_name: "v9.9.9",
+							draft: false,
+							prerelease: false,
+							assets: [{ name: "gjc-darwin-arm64" }, { name: "gjc-windows-x64.exe" }],
+						},
+						{
+							tag_name: "v9.9.8",
+							draft: false,
+							prerelease: false,
+							assets: [{ name: "gjc-linux-x64" }, { name: "gjc-darwin-arm64" }],
+						},
+					]),
+					{ status: 200, headers: new Headers() },
+				);
+			},
+		});
+
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50&page=1");
+		expect(skipped).toEqual([{ tag: "v9.9.9", version: "9.9.9" }]);
+		expect(release.tag).toBe("v9.9.8");
+		expect(release.version).toBe("9.9.8");
+		expect(release.warnings).toEqual(["release v9.9.9 has no asset for gjc-linux-x64 yet"]);
+	});
+
+	it("throws when no stable releases have the required binary asset", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				channel: "stable",
+				requiredBinaryAsset: "gjc-linux-x64",
+				fetchImpl: async () =>
+					new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.9",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-darwin-arm64" }],
+							},
+							{
+								tag_name: "v9.9.8",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-windows-x64.exe" }],
+							},
+						]),
+						{ status: 200 },
+					),
+			}),
+		).rejects.toThrow("no published release with the gjc-linux-x64 asset yet");
+	});
+
+	it("paginates through releases to find stable release with required asset", async () => {
+		const requested: string[] = [];
+		const skipped: Array<{ tag: string; version: string }> = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			channel: "stable",
+			requiredBinaryAsset: "gjc-linux-x64",
+			onSkippedRelease: (tag, version) => skipped.push({ tag, version }),
+			fetchImpl: async url => {
+				requested.push(String(url));
+				const urlStr = String(url);
+				// First page: only nightly releases
+				if (urlStr.includes("page=1")) {
+					return new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.10-nightly.1.0.g123abc",
+								draft: false,
+								prerelease: true,
+								assets: [],
+							},
+							{
+								tag_name: "v9.9.9-nightly.2.0.g456def",
+								draft: false,
+								prerelease: true,
+								assets: [],
+							},
+						]),
+						{
+							status: 200,
+							headers: new Headers({
+								link: '<https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?page=2&per_page=50>; rel="next"',
+							}),
+						},
+					);
+				}
+				// Second page: stable releases, v9.9.8 without asset, v9.9.7 with it
+				if (urlStr.includes("page=2")) {
+					return new Response(
+						JSON.stringify([
+							{
+								tag_name: "v9.9.8",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-darwin-arm64" }],
+							},
+							{
+								tag_name: "v9.9.7",
+								draft: false,
+								prerelease: false,
+								assets: [{ name: "gjc-linux-x64" }, { name: "gjc-darwin-arm64" }],
+							},
+						]),
+						{ status: 200, headers: new Headers() },
+					);
+				}
+				return new Response("Unexpected URL", { status: 404 });
+			},
+		});
+
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50&page=1");
+		expect(requested).toContain("https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=50&page=2");
+		expect(skipped).toEqual([{ tag: "v9.9.8", version: "9.9.8" }]);
+		expect(release.tag).toBe("v9.9.7");
+		expect(release.version).toBe("9.9.7");
+	});
+
+	it("throws explicit error when rate limited during asset-aware release lookup", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				channel: "stable",
+				requiredBinaryAsset: "gjc-linux-x64",
+				fetchImpl: async () => new Response("Rate limited", { status: 429 }),
+			}),
+		).rejects.toThrow(/responded 429.*binary asset verification.*GITHUB_TOKEN.*bun install -g gajae-code@latest/);
 	});
 });
 
@@ -1916,6 +1837,299 @@ async function replaceBinaryFixture(options: Omit<BinaryReplacementOptions, "ori
 }
 
 describe("update-cli binary replacement", () => {
+	it("reports a postcheck identity conflict without disclosing unknown primary errors", () => {
+		const rollback = new InstallationRollbackAclPresentError(
+			"binary",
+			"backup  two",
+			{
+				aclFailurePrincipal: "S-1-5-32-545",
+				aclFailureInherited: false,
+			},
+			false,
+		);
+		const conflict = new AggregateError(
+			[new Error("installation_postcheck_identity_changed"), rollback],
+			"installation_rollback_unverified",
+		);
+		const unknown = new AggregateError(
+			[new Error("private-primary-sentinel"), rollback],
+			"installation_rollback_unverified",
+		);
+		expect(formatInstallationRollbackAclError(conflict)).toContain(
+			"installed target identity changed after verification",
+		);
+		expect(formatInstallationRollbackAclError(unknown)).toContain("unclassified installation failure");
+		expect(formatInstallationRollbackAclError(unknown)).not.toContain("private-primary-sentinel");
+		expect(formatInstallationRollbackAclError(unknown)).toContain("backup  two");
+		expect(formatInstallationRollbackAclError(unknown)).not.toContain("icacls");
+	});
+
+	it("supersedes a pre-promotion record for an older candidate instead of refusing the newer release (#6096)", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const staleStage = path.join(dir, "gjc.new.stale.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(staleStage, "stale binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stale = (await snapshotRegularFile(staleStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		// A failed promotion toward 15.1.7 left a staged record; the live target is
+		// still the exact recorded baseline.
+		await createActivationRecordFile(
+			buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: staleStage,
+				stagingIdentity: stale.identity,
+				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
+			}),
+		);
+		await writeFixtureFile(nextStage, "new binary");
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status).toBe("valid");
+		if (record.status === "valid") {
+			expect(record.record.phase).toBe("verified");
+			expect(record.record.candidate.version).toBe("15.1.8");
+		}
+	});
+
+	async function driftedRecordFixture(): Promise<{
+		dir: string;
+		targetPath: string;
+		staleStage: string;
+		nextStage: string;
+		backupName: string;
+	}> {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const staleStage = path.join(dir, "gjc.new.stale.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(staleStage, "stale binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stale = (await snapshotRegularFile(staleStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile(
+			buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: staleStage,
+				stagingIdentity: stale.identity,
+				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
+			}),
+		);
+		const record = await readActivationRecord(targetPath);
+		if (record.status !== "valid") throw new Error("fixture record must be valid");
+		// The installed bytes no longer match the recorded baseline.
+		await writeFixtureFile(targetPath, "changed binary");
+		await writeFixtureFile(nextStage, "new binary");
+		return { dir, targetPath, staleStage, nextStage, backupName: record.record.backupName };
+	}
+
+	it("keeps refusing a drifted record once its promotion retired the old target to the backup name", async () => {
+		const { dir, targetPath, nextStage, backupName } = await driftedRecordFixture();
+		// Retained replacement retires the old target to backupName first: a promotion may have reached the target.
+		await writeFixtureFile(path.join(dir, backupName), "old binary");
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	it("keeps refusing a drifted record whose staged candidate has left its recorded path", async () => {
+		const { dir, targetPath, staleStage, nextStage } = await driftedRecordFixture();
+		await fs.rm(staleStage);
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	it("keeps refusing a drifted record whose staged candidate at the recorded path was changed", async () => {
+		const { dir, targetPath, staleStage, nextStage } = await driftedRecordFixture();
+		await writeFixtureFile(staleStage, "tampered");
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("changed binary");
+	});
+
+	// The no-baseline guard is enforced twice: `!record.baseline.exists` and
+	// `!record.targetIdentity` (buildActivationRecord rejects a record with both).
+	// Removing either guard alone leaves the other holding, so this test fails only
+	// when both are removed.
+	it("keeps refusing a first-install record after a binary appeared outside the transaction", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const staleStage = path.join(dir, "gjc.new.stale.exe");
+		const nextStage = path.join(dir, "gjc.new.next.exe");
+		await writeFixtureFile(staleStage, "stale binary");
+		const stale = (await snapshotRegularFile(staleStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile(
+			buildActivationRecord({
+				targetPath,
+				originalTargetAbsent: true,
+				parentIdentity: parent,
+				stagingPath: staleStage,
+				stagingIdentity: stale.identity,
+				candidate: { digest: stale.identity.sha256, version: "15.1.7" },
+			}),
+		);
+		await writeFixtureFile(targetPath, "reinstalled binary");
+		await writeFixtureFile(nextStage, "new binary");
+
+		await expect(
+			replaceBinaryFixture({
+				targetPath,
+				tempPath: nextStage,
+				backupPath: path.join(dir, "gjc.exe.bak"),
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("activation_transaction_requires_reconciliation");
+		expect(await Bun.file(targetPath).text()).toBe("reinstalled binary");
+	});
+
+	it("recovers an update interrupted before promotion after the installer replaced the target", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const firstStage = path.join(dir, `gjc.new.${crypto.randomUUID()}.exe`);
+		const backupPath = path.join(dir, "gjc.exe.bak");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(firstStage, "new binary");
+
+		// A real update whose promotion is denied leaves a pending_activation record.
+		const replaceSpy = vi
+			.spyOn(native, "exactReplaceRetained")
+			.mockReturnValueOnce({ ok: false, code: "access_denied", windowsErrorCode: "0xC0000022" });
+		try {
+			await expect(
+				replaceBinaryFixture({
+					targetPath,
+					tempPath: firstStage,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("access_denied");
+		} finally {
+			replaceSpy.mockRestore();
+		}
+		const pending = await readActivationRecord(targetPath);
+		expect(pending.status === "valid" && pending.record.phase).toBe("pending_activation");
+
+		// install.ps1 swaps the target by rename, then the user updates to a newer release.
+		const installed = path.join(dir, `gjc.install.${crypto.randomUUID()}.exe`);
+		await writeFixtureFile(installed, "reinstalled binary");
+		await fs.rename(targetPath, path.join(dir, "gjc.exe.previous"));
+		await fs.rename(installed, targetPath);
+		const nextStage = path.join(dir, `gjc.new.${crypto.randomUUID()}.exe`);
+		await writeFixtureFile(nextStage, "newer binary");
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath: path.join(dir, "gjc.exe.bak.next"),
+			expectedVersion: "15.1.9",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.9", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("newer binary");
+		expect(await Bun.file(path.join(dir, "gjc.exe.bak.next")).text()).toBe("reinstalled binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status === "valid" && record.record.phase).toBe("verified");
+	});
+
+	it("supersedes a never-promoted record after the target was reinstalled from outside", async () => {
+		const { dir, targetPath, nextStage } = await driftedRecordFixture();
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: nextStage,
+			backupPath: path.join(dir, "gjc.exe.bak"),
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status).toBe("valid");
+		if (record.status === "valid") {
+			expect(record.record.phase).toBe("verified");
+			expect(record.record.candidate.version).toBe("15.1.8");
+		}
+	});
+
+	it.each(["15.1.7", "15.1.8"])("recovers after a rename-based reinstall for candidate %s", async version => {
+		const { dir, targetPath, nextStage } = await driftedRecordFixture();
+		const retryStage = path.join(dir, `gjc.new.${crypto.randomUUID()}.exe`);
+		await writeFixtureFile(retryStage, "stale binary");
+		const before = (await snapshotRegularFile(targetPath))!;
+		const replacement = path.join(dir, "reinstalled.exe");
+		await writeFixtureFile(replacement, "reinstalled binary");
+		await fs.rename(targetPath, path.join(dir, "external-original.exe"));
+		await fs.rename(replacement, targetPath);
+		expect((await snapshotRegularFile(targetPath))!.identity.ino).not.toBe(before.identity.ino);
+
+		const result = await replaceBinaryFixture({
+			targetPath,
+			tempPath: version === "15.1.7" ? retryStage : nextStage,
+			backupPath: path.join(dir, "gjc.exe.bak.next"),
+			expectedVersion: version,
+			verifyInstalledVersion: async () => ({ ok: true, actual: version, path: targetPath }),
+		});
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe(version === "15.1.7" ? "stale binary" : "new binary");
+		expect(await Bun.file(path.join(dir, "gjc.exe.bak.next")).text()).toBe("reinstalled binary");
+		const record = await readActivationRecord(targetPath);
+		expect(record.status).toBe("valid");
+		if (record.status === "valid") {
+			expect(record.record.phase).toBe("verified");
+			expect(record.record.candidate.version).toBe(version);
+		}
+	});
+
 	it("reports a denied promotion and reuses its pending stage without leaving a duplicate", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc.exe");
@@ -2757,6 +2971,81 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(backupPath).text()).toBe("old binary");
 	});
 
+	it("reports the verification failure and rollback ACL diagnostic to the update user", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "new binary");
+		const replaceNative = native.exactReplaceRetained;
+		const snapshot = installActivation.snapshotRegularFile;
+		let rollbackRefused = false;
+		const snapshotSpy = vi.spyOn(installActivation, "snapshotRegularFile").mockImplementation(async file => {
+			if (rollbackRefused && file === targetPath) throw new Error("post-rollback snapshot failed");
+			return snapshot(file);
+		});
+		let calls = 0;
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation((...args) => {
+			if (calls++ === 0) return replaceNative(...args);
+			rollbackRefused = true;
+			return {
+				ok: false,
+				code: "acl_present",
+				aclFailurePrincipal: "SandboxUsers",
+				aclFailureInherited: false,
+				aclFailureSide: "source",
+			};
+		});
+		const errors: string[] = [];
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => errors.push(String(message)));
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async () => ({
+						tag: "v999.0.0",
+						version: "999.0.0",
+						registry: DEFAULT_NPM_REGISTRY,
+						warnings: [],
+					}),
+					resolveUpdateTarget: async () => ({ method: "binary", path: targetPath }),
+					performUpdate: async () =>
+						replaceBinaryFixture({
+							targetPath,
+							tempPath,
+							backupPath,
+							expectedVersion: "999.0.0",
+							verifyInstalledVersion: async () => ({
+								ok: false,
+								actual: "999.0.0",
+								path: targetPath,
+								smokeTestFailed: true,
+								smokeTestOutput: `customer-private-sentinel \u001b[31m Authorization: Bearer abcdefghijklmnopqrstuvwxyz ${"x".repeat(1200)}`,
+							}),
+						}),
+					exit: () => undefined as never,
+				},
+			);
+			expect(calls).toBe(2);
+			expect(errors.join("\n")).toContain("installation_rollback_unverified");
+			expect(errors.join("\n")).toContain("installed runtime smoke-test failed");
+			expect(errors.join("\n")).toContain("SandboxUsers");
+			expect(errors.join("\n")).toContain(backupPath);
+			expect(errors.join("\n")).not.toContain("abcdefghijklmnopqrstuvwxyz");
+			expect(errors.join("\n")).not.toContain("customer-private-sentinel");
+			expect(errors.join("\n")).not.toContain("\u001b");
+			expect(errors.join("\n")).not.toContain("x".repeat(600));
+			expect(errors.join("\n")).toContain("Inspect the uncertain activation before retrying");
+			expect(errors.join("\n")).not.toContain("gjc update }");
+			expect(errors.join("\n")).not.toContain("reinstall");
+		} finally {
+			errorSpy.mockRestore();
+			replaceSpy.mockRestore();
+			snapshotSpy.mockRestore();
+		}
+	});
+
 	it("keeps the replacement only after it reports the expected version", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");
@@ -2830,7 +3119,7 @@ describe("update artifact filename recognition", () => {
 	it("recognizes generated names only for their target and exact extension", () => {
 		const targetPath = path.join("/install", "gjc");
 		const extendedTargetPath = path.join("/install", "gjc.exe");
-		const random = seededRandom(0x6866cafe);
+		const random = lcgUnit(0x6866cafe);
 
 		for (let index = 0; index < 64; index++) {
 			const id = generatedUpdateId(random);

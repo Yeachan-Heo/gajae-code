@@ -14,11 +14,12 @@ import {
 	subagentBodyCacheTestHooks,
 	subagentToolRenderer,
 } from "../../src/tools/subagent-render";
+import { loadTestTheme } from "../helpers/test-theme";
 
 let theme: Theme;
 
 beforeAll(async () => {
-	theme = (await getThemeByName("red-claw"))!;
+	theme = (await loadTestTheme())!;
 	expect(theme).toBeDefined();
 	setThemeInstance(theme);
 });
@@ -442,6 +443,27 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("Model: anthropic/claude-opus-4-8");
 		expect(out).toContain("requested openai-codex/gpt-5.5");
 		expect(out).toContain("fell back");
+	});
+
+	it("names the fallback reason instead of assuming missing credentials", () => {
+		const fallback = (modelFallbackReason?: string) =>
+			render({
+				subagents: [
+					snapshot({
+						id: "0-Fallback",
+						effectiveModel: "devin/swe-2-flash-medium",
+						requestedModel: "hms-relay/deepseek-v4.1-flash-free",
+						modelFellBack: true,
+						...(modelFallbackReason ? { modelFallbackReason } : {}),
+					}),
+				],
+			});
+		// A managed chain switch after a 429 is not a credential problem.
+		expect(fallback("rate_limit")).toContain("fell back — rate limit");
+		expect(fallback("rate_limit")).not.toContain("no credentials");
+		expect(fallback("no_credentials")).toContain("fell back — no credentials");
+		// Free text never reaches the panel.
+		expect(fallback("Upstream said: <b>nope</b>")).not.toContain("nope");
 	});
 });
 

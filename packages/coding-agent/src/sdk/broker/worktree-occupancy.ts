@@ -3,56 +3,14 @@
  *
  * Both launch paths need this answer and must not disagree about it: the broker
  * refuses a lifecycle launch into an occupied worktree, and the interactive
- * `gjc --worktree` launch refuses for the same reason. Keeping one predicate —
- * and one definition of "still running" — here prevents the two from drifting
- * into different notions of liveness.
+ * `gjc --worktree` launch refuses for the same reason. This module keeps one
+ * occupancy predicate, and reuses the single liveness definition from
+ * `process-incarnation.ts`, so the two launch paths cannot drift.
  */
 
-import type * as NativeBindings from "@gajae-code/natives";
 import { resolveEquivalentPath } from "@gajae-code/utils";
-import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
-import { processIncarnation } from "./process-incarnation";
+import { observeProcess, type ProcessObservation } from "./process-incarnation";
 import type { IndexedSession } from "./session-index";
-
-function nativeLifecycle(): typeof NativeBindings {
-	return require("@gajae-code/natives") as typeof NativeBindings;
-}
-
-export type ProcessObservation = "alive" | "exited" | "uncertain";
-
-/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
-export function observeProcess(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	readIncarnation: (pid: number) => string | undefined = processIncarnation,
-): ProcessObservation {
-	if (process.platform === "win32") {
-		try {
-			const reference = nativeLifecycle().Process.fromPid(pid);
-			if (reference?.status() !== "running") return "exited";
-		} catch {
-			return "uncertain";
-		}
-		if (!expectedIncarnation) return "uncertain";
-		const actualIncarnation = readIncarnation(pid);
-		if (!actualIncarnation) return "uncertain";
-		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-	}
-	try {
-		process.kill(pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
-	}
-	if (process.platform === "linux") {
-		const probe = probeLinuxProcPidSync(pid);
-		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
-			return "exited";
-	}
-	if (!expectedIncarnation) return "uncertain";
-	const actualIncarnation = readIncarnation(pid);
-	if (!actualIncarnation) return "uncertain";
-	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
-}
 
 /**
  * The id of a session still occupying `worktreePath`, or null when it is free.

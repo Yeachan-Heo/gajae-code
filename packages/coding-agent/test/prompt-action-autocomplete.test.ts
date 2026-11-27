@@ -62,7 +62,7 @@ describe("prompt action autocomplete", () => {
 			"Open command help",
 			"Copy current line",
 			"Copy whole prompt",
-			"Paste image from clipboard",
+			"Paste image or text from clipboard",
 			"Paste text from configured clipboard",
 			"Scroll to previous user input",
 			"Undo",
@@ -77,7 +77,7 @@ describe("prompt action autocomplete", () => {
 		expect(suggestions?.items.find(item => item.label === "Copy whole prompt")?.description).toBe(
 			keybindings.getDisplayString("app.clipboard.copyPrompt"),
 		);
-		expect(suggestions?.items.find(item => item.label === "Paste image from clipboard")?.description).toBe(
+		expect(suggestions?.items.find(item => item.label === "Paste image or text from clipboard")?.description).toBe(
 			keybindings.getDisplayString("app.clipboard.pasteImage"),
 		);
 		expect(suggestions?.items.find(item => item.label === "Paste text from configured clipboard")?.description).toBe(
@@ -315,7 +315,7 @@ describe("prompt action autocomplete", () => {
 		});
 
 		const suggestions = await provider.getSuggestions(["please #paste-image"], 0, 19);
-		const item = suggestions?.items.find(entry => entry.label === "Paste image from clipboard");
+		const item = suggestions?.items.find(entry => entry.label === "Paste image or text from clipboard");
 		expect(item).toBeDefined();
 		if (!item || !suggestions) {
 			throw new Error("expected paste image suggestion");

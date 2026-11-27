@@ -13,10 +13,9 @@
  */
 
 import { createHash } from "node:crypto";
+import { isRecord } from "@gajae-code/utils";
 import { redactImportedText } from "./redact";
 import type { ImportedConversation, ImportedMessage, ImportQuarantineRecord, SessionImportCounts } from "./types";
-
-type JsonRecord = Record<string, unknown>;
 
 export interface CodexParseResult {
 	conversation: ImportedConversation;
@@ -26,10 +25,6 @@ export interface CodexParseResult {
 }
 
 const MAX_EVIDENCE_LINE_CHARS = 400;
-
-function isRecord(value: unknown): value is JsonRecord {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function textFromContentBlocks(content: unknown): string {
 	if (typeof content === "string") return content;

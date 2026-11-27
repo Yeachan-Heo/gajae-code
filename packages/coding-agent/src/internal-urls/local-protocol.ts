@@ -35,6 +35,12 @@ export interface ManagedLegacyLocalMigrationEntry {
 
 /** Opaque authority for a managed session's legacy `local` artifact tree. */
 export interface ManagedLegacyLocalMigrationSource {
+	/**
+	 * Synchronously reports whether the legacy `local` tree may exist. Return
+	 * false only when it is provably absent (ENOENT); any other probe failure must
+	 * return true so the async migration gate stays in charge.
+	 */
+	hasLegacySourceSync(): boolean;
 	capture(): Promise<{
 		readonly snapshot: NativeDirectoryTreeSnapshot;
 		readonly entries: readonly ManagedLegacyLocalMigrationEntry[];
@@ -829,6 +835,16 @@ async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEnt
 	if (!removed.ok) throw new Error(`Legacy local:// migration retirement failed: ${removed.code}`);
 }
 
+/** Exclusive marker write; a settled marker from a concurrent initializer (e.g. the sync resolver's `absent`) is accepted. */
+async function writeMigrationMarker(marker: string, value: string): Promise<void> {
+	try {
+		await fs.writeFile(marker, value, { mode: 0o600, flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		if (!(await readMigrationMarker(marker))) throw new Error("Unsafe local:// migration marker");
+	}
+}
+
 function previousManagedLocalRoot(options: LocalProtocolOptions): string | null {
 	if (options.isManagedDestination?.() === false || !options.getSessionId?.()) return null;
 	let temporaryRoot: string;
@@ -847,6 +863,13 @@ function previousManagedLocalMigrationSource(options: LocalProtocolOptions): Man
 	if (!legacyRoot) return null;
 	const legacyParent = path.dirname(legacyRoot);
 	return {
+		hasLegacySourceSync: () => {
+			try {
+				return lstatIfPresentSync(legacyRoot) !== undefined;
+			} catch {
+				return true;
+			}
+		},
 		capture: async () => {
 			let rootStat: fsSync.Stats;
 			try {
@@ -1054,7 +1077,7 @@ async function migrateLegacyLocal(
 	if (await recoverMigrationStaging(localRoot, scratchParent)) foundSource = true;
 	await removeEmptyMigrationStaging(localRoot, scratchParent);
 	const value = cleanupPending ? "cleanup_pending\n" : foundSource ? "verified\n" : "absent\n";
-	await fs.writeFile(marker, value, { mode: 0o600, flag: "wx" });
+	await writeMigrationMarker(marker, value);
 }
 
 async function migrateArtifactsLegacyLocal(
@@ -1104,6 +1127,13 @@ async function migrateArtifactsLegacyLocal(
 const initializedLocalRoots = new Map<string, ManagedRootIdentity>();
 /** A directory this process created and has not finished migrating. */
 const pendingCreatedRoots = new Map<string, ManagedRootIdentity>();
+/**
+ * Pinned roots whose legacy migration settled with no legacy source left
+ * (`absent` or `verified`). When such a root disappears (temp sweeper, `gjc gc`,
+ * manual cleanup) there is nothing left to migrate, so the sync resolver may
+ * re-create it instead of failing every later access closed.
+ */
+const legacyRetiredRoots = new Set<string>();
 const initializingLocalRoots = new Map<string, Promise<string>>();
 
 function assertRememberedManagedRoot(localRoot: string, recorded: ManagedRootIdentity): void {
@@ -1126,6 +1156,29 @@ function rememberManagedRoot(localRoot: string, expected: ManagedRootIdentity): 
 	if (!sameManagedRoot(stat, expected)) throw new Error("Unsafe local:// root");
 	initializedLocalRoots.set(localRoot, managedRootIdentity(stat));
 	pendingCreatedRoots.delete(localRoot);
+	const marker = readMarkerValueSync(localRoot);
+	if (marker === "absent\n" || marker === "verified\n") legacyRetiredRoots.add(localRoot);
+	else legacyRetiredRoots.delete(localRoot);
+}
+
+function readMarkerValueSync(localRoot: string): string | null {
+	try {
+		return fsSync.readFileSync(path.join(localRoot, LEGACY_MIGRATION_MARKER), "utf8");
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
+}
+
+/** Whether the pinned managed parent is gone entirely; any other lstat failure stays unsafe. */
+function managedParentRemovedSync(localRoot: string): boolean {
+	try {
+		fsSync.lstatSync(path.dirname(localRoot));
+		return false;
+	} catch (error) {
+		if (isEnoent(error)) return true;
+		throw new Error("Unsafe local:// root");
+	}
 }
 
 /**
@@ -1216,7 +1269,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 		return;
 	}
 	const recorded = initializedLocalRoots.get(localRoot);
-	if (recorded) {
+	if (recorded && !managedParentRemovedSync(localRoot)) {
 		assertManagedParentSync(localRoot);
 		let present: fsSync.Stats | undefined;
 		try {
@@ -1240,6 +1293,10 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 	const parentStat = fsSync.lstatSync(scratchParent);
 	if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("Unsafe local:// root");
 	assertAdoptedManagedRoot(parentStat);
+	// A missing root cannot hold a settled marker, so a pending legacy source fails
+	// here before mkdir. Creating the root first left one marker-less directory per
+	// refused sync resolution that local-root GC never prunes.
+	if (!lstatIfPresentSync(localRoot)) assertNoPendingLegacySync(options, localRoot, recorded);
 	let adoptedExisting = false;
 	try {
 		fsSync.mkdirSync(localRoot, { mode: 0o700 });
@@ -1264,23 +1321,10 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
-	if (options.getManagedLegacyLocalMigrationSource?.()) {
-		throw new Error("local:// legacy migration must complete before path resolution");
-	}
-	const artifactsDir = options.getArtifactsDir?.();
-	if (artifactsDir && fsSync.existsSync(path.resolve(artifactsDir, "local"))) {
-		throw new Error("local:// legacy migration must complete before path resolution");
-	}
+	assertNoPendingLegacySync(options, localRoot, recorded);
 	const previousRoot = previousManagedLocalRoot(options);
-	if (previousRoot) {
-		let previousRootExists = false;
-		try {
-			fsSync.lstatSync(previousRoot);
-			previousRootExists = true;
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-		}
-		if (previousRootExists) throw new Error("local:// legacy migration must complete before path resolution");
+	if (previousRoot && lstatIfPresentSync(previousRoot)) {
+		throw new Error("local:// legacy migration must complete before path resolution");
 	}
 	try {
 		fsSync.writeFileSync(marker, "absent\n", { mode: 0o600, flag: "wx" });
@@ -1292,6 +1336,32 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 			throw new Error("Unsafe local:// migration marker");
 	}
 	rememberManagedRoot(localRoot, managedRootIdentity(rootStat));
+}
+
+function lstatIfPresentSync(target: string): fsSync.Stats | undefined {
+	try {
+		return fsSync.lstatSync(target);
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	}
+}
+
+function assertNoPendingLegacySync(
+	options: LocalProtocolOptions,
+	localRoot: string,
+	recorded: ManagedRootIdentity | undefined,
+): void {
+	// A pinned root whose migration already retired (or never had) a legacy source
+	// has nothing left to copy; only a pending source needs the async gate.
+	const legacyRetired = recorded !== undefined && legacyRetiredRoots.has(localRoot);
+	if (!legacyRetired && options.getManagedLegacyLocalMigrationSource?.()?.hasLegacySourceSync()) {
+		throw new Error("local:// legacy migration must complete before path resolution");
+	}
+	const artifactsDir = options.getArtifactsDir?.();
+	if (artifactsDir && fsSync.existsSync(path.resolve(artifactsDir, "local"))) {
+		throw new Error("local:// legacy migration must complete before path resolution");
+	}
 }
 
 export function resolveLocalRoot(options: LocalProtocolOptions): string {
@@ -1359,6 +1429,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		LocalProtocolHandler.#ownedOverrides = [];
 		initializedLocalRoots.clear();
 		pendingCreatedRoots.clear();
+		legacyRetiredRoots.clear();
 		initializingLocalRoots.clear();
 	}
 

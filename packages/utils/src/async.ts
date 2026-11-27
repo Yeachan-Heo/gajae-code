@@ -5,6 +5,8 @@
  */
 export function withTimeout<T>(promise: Promise<T>, ms: number, message: string, signal?: AbortSignal): Promise<T> {
 	if (signal?.aborted) {
+		// The operation has already started, even when cancellation wins immediately.
+		void promise.catch(() => {});
 		const reason = signal.reason instanceof Error ? signal.reason : new Error("Aborted");
 		return Promise.reject(reason);
 	}

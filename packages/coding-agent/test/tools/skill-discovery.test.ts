@@ -12,6 +12,9 @@ import { SkillDiscoveryTool } from "@gajae-code/coding-agent/tools/skill-discove
 import { $ } from "bun";
 import { safeRm } from "../../../../scripts/safe-cleanup";
 import { discoverRuntimeSkills } from "../../src/extensibility/runtime-skill-discovery";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 async function makeSkill(
 	root: string,
@@ -66,7 +69,7 @@ function runtimeSkillSettings(overrides: Record<string, unknown> = {}): Settings
 
 describe("SkillDiscoveryTool", () => {
 	it("discovers and invokes a repository-confined skills root symlink without trusting a later escape", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-linked-project-skill-"));
+		const root = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-linked-project-skill-"));
 		const cwd = path.join(root, "repo");
 		const home = path.join(root, "home");
 		const link = path.join(cwd, ".gjc", "skills");
@@ -113,7 +116,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("discovers project runtime skills from .gjc/skills", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skills-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-project-skills-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
 		const settings = runtimeSkillSettings();
 
@@ -129,7 +132,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("discovers and invokes a trusted user skill symlink outside its scan root", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-tool-"));
+		const root = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-tool-"));
 		const cwd = path.join(root, "project");
 		const home = path.join(root, "home");
 		const userSkillsRoot = path.join(home, ".gjc", "agent", "skills");
@@ -162,7 +165,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("does not let project policy grant access to external user skill symlinks", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-project-trust-"));
+		const root = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-project-trust-"));
 		const cwd = path.join(root, "project");
 		const home = path.join(root, "home");
 		const userSkillsRoot = path.join(home, ".gjc", "agent", "skills");
@@ -216,7 +219,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("preserves exact skill-name tokens without broadening unnamed partial matches", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-exact-name-skill-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-exact-name-skill-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "aws", "Cloud operations router");
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "harbor", "Container registry router");
 		const tool = new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() }));
@@ -238,8 +241,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("discovers user runtime skills from ~/.gjc/skills", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-cwd-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-cwd-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-home-"));
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill");
 			const settings = runtimeSkillSettings();
@@ -257,8 +260,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("discovers runtime skills from the session's custom agent profile", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-skills-cwd-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-skills-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-profile-skills-cwd-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-profile-skills-home-"));
 		const profileDir = path.join(home, "profiles", "review");
 		try {
 			await makeSkill(path.join(home, ".gjc", "agent", "skills"), "default-only", "Default profile skill");
@@ -281,7 +284,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("does not classify home .gjc skills as project skills while walking up", async () => {
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-home-skill-boundary-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-home-skill-boundary-"));
 		const cwd = path.join(home, "work", "project", "nested");
 		await fs.mkdir(cwd, { recursive: true });
 		await makeSkill(path.join(home, ".gjc", "skills"), "home-helper", "Home helper skill", "Home body.");
@@ -322,8 +325,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("discovers bundled workflow skills from the catalog with filesystem precedence and notices", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bundled-discovery-cwd-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bundled-discovery-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-bundled-discovery-cwd-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-bundled-discovery-home-"));
 		const policy = { enabled: true, trustProjectSkills: true, trustUserSkills: true };
 		try {
 			let result = await discoverRuntimeSkills({ cwd, home, source: "all", policy });
@@ -386,7 +389,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("returns bundled built-in skills without allowing filesystem copies to shadow them or growing the core prompt catalog", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-builtins-suppressed-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-builtins-suppressed-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
 		await makeSkill(
 			path.join(cwd, ".gjc", "skills"),
@@ -453,7 +456,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("loads selected discovered skill content through the skill invocation path", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-selected-skill-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-selected-skill-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Loaded narrowly.");
 		const settings = runtimeSkillSettings();
 		const sent: Array<{ content: string; details?: unknown }> = [];
@@ -475,7 +478,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("keeps bundled workflow candidates when filesystem skills are disabled", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-disabled-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skills-disabled-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Blocked body.");
 		const settings = runtimeSkillSettings({ "skills.enabled": false });
 
@@ -503,7 +506,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("explains empty results caused by disabled discovery scopes, and stays silent for genuine emptiness", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
 
 		// Requested scope is fully disabled: empty result carries a scope notice.
@@ -541,7 +544,7 @@ describe("SkillDiscoveryTool", () => {
 		// The home is pinned to an empty directory: the developer's real
 		// ~/.claude/skills would otherwise contribute convention-import
 		// diagnostics and make this case pass or fail per machine.
-		const emptyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
+		const emptyRoot = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
 		const emptyCwd = path.join(emptyRoot, "cwd");
 		const emptyHome = path.join(emptyRoot, "home");
 		await fs.mkdir(emptyCwd);
@@ -575,7 +578,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("explains zero-candidate topic queries as conjunctive filtering instead of a missing catalog", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-topic-query-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skills-topic-query-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "deploy-lens", "Deployment advisory lens");
 
 		const settings = runtimeSkillSettings();
@@ -599,8 +602,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("discovers canonical and legacy user roots in native precedence order", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-root-cwd-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-root-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-root-cwd-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-root-home-"));
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -675,8 +678,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("uses the default and PI_CONFIG_DIR canonical user roots", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-canonical-cwd-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-canonical-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-canonical-cwd-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-user-canonical-home-"));
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		try {
@@ -720,7 +723,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("keeps hidden runtime skills discoverable and exactly invocable", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hidden-runtime-skill-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-hidden-runtime-skill-"));
 		try {
 			await makeSkill(
 				path.join(cwd, ".gjc", "skills"),
@@ -769,8 +772,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("applies policy before realpath/name dedup, then query, sort, and limit", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-discovery-pipeline-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-discovery-pipeline-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skill-discovery-pipeline-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skill-discovery-pipeline-home-"));
 		try {
 			const skillsDir = path.join(cwd, ".gjc", "skills");
 			const alphaPath = await makeSkill(skillsDir, "alpha", "Sort alpha", "Alpha body.");
@@ -809,8 +812,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("applies source enable flags and skill filters to discovery and invocation", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-home-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Project body.");
 		await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill", "User body.");
 		try {
@@ -870,8 +873,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("advertises project .claude/skills and .codex/skills as import candidates with zero configuration", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-home-"));
 		await makeSkill(path.join(cwd, ".claude", "skills"), "claude-helper", "Claude convention helper");
 		await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
 
@@ -903,8 +906,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("reports project convention candidates before a populated user convention home", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-budget-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-budget-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-convention-budget-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-convention-budget-home-"));
 		await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
 		// A real operator home routinely holds far more convention skills than the
 		// bounded diagnostic budget; they must not hide the project's own skill.
@@ -922,8 +925,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("applies runtime precedence: project .gjc beats user, convention copies stay import candidates", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-home-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-home-"));
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "shared", "User copy");
 			await makeSkill(path.join(cwd, ".codex", "skills"), "shared", "Codex copy");
@@ -959,7 +962,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("diagnoses protected-name collisions, ignored, disabled, and include-filtered skills", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discovery-diagnostics-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-discovery-diagnostics-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "ralplan", "On-disk built-in impostor");
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "ignored-one", "Ignored helper");
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "disabled-one", "Disabled helper");
@@ -987,7 +990,7 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("diagnoses invalid frontmatter and missing descriptions", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-invalid-skill-diagnostics-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-invalid-skill-diagnostics-"));
 		const noFrontmatterDir = path.join(cwd, ".gjc", "skills", "no-frontmatter");
 		await fs.mkdir(noFrontmatterDir, { recursive: true });
 		await fs.writeFile(path.join(noFrontmatterDir, "SKILL.md"), "# No Frontmatter\n\nPlain markdown body.\n", "utf8");
@@ -1017,8 +1020,8 @@ describe("SkillDiscoveryTool", () => {
 	// discovery skipped it, a configured skill was invocable by exact name and absent
 	// from every search, so it could only be used by someone who already knew it existed.
 	it("discovers skills from skills.customDirectories", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-cwd-"));
-		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-root-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-cwd-"));
+		const custom = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-root-"));
 		await makeSkill(custom, "vendor-helper", "Vendor helper skill for invoicing");
 		const settings = runtimeSkillSettings({ "skills.customDirectories": [custom] });
 
@@ -1035,8 +1038,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("resolves a skills.customDirectories skill by name", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-byname-cwd-"));
-		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-byname-root-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-byname-cwd-"));
+		const custom = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-byname-root-"));
 		await makeSkill(custom, "vendor-runbook", "Vendor runbook skill", "Runbook body.");
 		const settings = runtimeSkillSettings({ "skills.customDirectories": [custom] });
 
@@ -1059,9 +1062,9 @@ describe("SkillDiscoveryTool", () => {
 	// Naming a directory is explicit consent, so custom directories stay visible when
 	// ambient user-scope discovery is switched off. loadSkills applies the same rule.
 	it("keeps custom directories visible when user scope trust is disabled", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-cwd-"));
-		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-home-"));
-		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-root-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-cwd-"));
+		const home = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-home-"));
+		const custom = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-root-"));
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "ambient-helper", "Ambient user skill");
 			await makeSkill(custom, "declared-helper", "Declared custom skill");
@@ -1080,8 +1083,8 @@ describe("SkillDiscoveryTool", () => {
 	});
 
 	it("stops scanning custom directories when skills.enabled is false", async () => {
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-off-cwd-"));
-		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-off-root-"));
+		const cwd = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-off-cwd-"));
+		const custom = await trackedTemp.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-off-root-"));
 		await makeSkill(custom, "disabled-helper", "Disabled custom skill");
 		const settings = runtimeSkillSettings({
 			"skills.enabled": false,

@@ -13,6 +13,7 @@ import {
 } from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import vimDescription from "../prompts/tools/vim.md" with { type: "text" };
+import { wrapUntrustedContent } from "../session/messages";
 import { CachedOutputBlock } from "../tui/output-block";
 import { renderStatusLine } from "../tui/status-line";
 import { VimBuffer } from "../vim/buffer";
@@ -531,7 +532,8 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 			errorLocation,
 			statusMessage,
 		);
-		const resultText = modelDiff ? `${renderVimDetails(details)}\n\nDiff:\n${modelDiff}` : renderVimDetails(details);
+		const rendered = modelDiff ? `${renderVimDetails(details)}\n\nDiff:\n${modelDiff}` : renderVimDetails(details);
+		const resultText = wrapUntrustedContent(rendered);
 		const builder = toolResult<VimToolDetails>(details).text(resultText);
 		if (engine.diagnostics) {
 			builder.diagnostics(engine.diagnostics.summary, engine.diagnostics.messages ?? []);

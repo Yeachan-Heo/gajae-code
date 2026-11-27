@@ -64,12 +64,23 @@ export function approvalGate(context: WorkflowGateContext = {}): OpenGateInput {
 		},
 		required: ["decision"],
 		additionalProperties: false,
+		anyOf: [
+			{ properties: { decision: { enum: ["approve", "reject"] } } },
+			{
+				properties: { decision: { const: "request-changes" }, comments: { type: "string", pattern: "\\S" } },
+				required: ["comments"],
+			},
+		],
 	};
 	return {
 		stage: "ralplan",
 		kind: "approval",
 		schema,
-		options: APPROVAL_DECISIONS.map(d => ({ value: d, label: d })),
+		// Requesting changes needs genuine user comments, not a one-click answer.
+		options: APPROVAL_DECISIONS.filter(d => d !== "request-changes").map(d => ({
+			value: { decision: d },
+			label: d,
+		})),
 		context: { title: context.title ?? "Approve the plan?", ...context },
 	};
 }
@@ -89,7 +100,7 @@ export function executionGate(context: WorkflowGateContext = {}): OpenGateInput 
 		stage: "ultragoal",
 		kind: "execution",
 		schema,
-		options: EXECUTION_DECISIONS.map(d => ({ value: d, label: d })),
+		options: EXECUTION_DECISIONS.map(d => ({ value: { decision: d }, label: d })),
 		context: { title: context.title ?? "Approve execution?", ...context },
 	};
 }

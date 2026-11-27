@@ -30,6 +30,7 @@ export interface CoordinatorNamespace {
 	identity: string;
 }
 
+/** Namespace digests: sorted keys; rejects undefined/function/symbol/bigint instead of encoding them. */
 function canonicalJson(value: unknown): string {
 	if (value === null || typeof value === "boolean" || typeof value === "number") return JSON.stringify(value);
 	if (typeof value === "string") return JSON.stringify(value);

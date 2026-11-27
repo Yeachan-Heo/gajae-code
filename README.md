@@ -22,9 +22,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Explore Gajae-Code App → Desktop &amp; self-hosted web GUI</strong></kbd></a>
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App (deprecated)</strong></kbd></a>
   <br/>
-  <sub>Experimental, community-built third-party project — not an official first-party Gajae-Code app.</sub>
+  <sub>Deprecated: this community-built third-party app is no longer maintained (last release v2.0.0-beta.20, 2026-09-25). Its in-app updater and bundled SDK are out of date; do not install it for new setups.</sub>
 </p>
 
 <p align="center">
@@ -338,9 +338,9 @@ three honestly different levels of support.
   <a href="https://onorca.dev"><img src="https://www.google.com/s2/favicons?domain=onorca.dev&sz=64" width="28" alt="Orca logo" /><br/><strong>Orca</strong></a><br/>
   <sub><a href="https://github.com/stablyai/orca">repo</a></sub>
 </td>
-<td align="center">★★★★☆<br/><sub>works, one field</sub></td>
-<td>GJC runs as a custom CLI agent, one worktree per session, with Orca's diff review, terminal splits, SSH worktrees, and mobile companion. No usage tracking or account hot-swap yet.</td>
-<td><strong>Settings → Agents</strong><br/>add command <code>gjc</code></td>
+<td align="center">★★★☆☆<br/><sub>workaround</sub></td>
+<td>GJC runs in a worktree terminal with Orca's diff review, terminal splits, and mobile companion. Override a built-in agent's command with <code>gjc</code> (custom agent registration not yet supported upstream).</td>
+<td><strong>Settings → Agents</strong><br/>override a built-in agent command with <code>gjc</code>
 </tr>
 <tr>
 <td align="center">
@@ -365,9 +365,7 @@ gjc setup paseo --check    # pass / stale / drift, with a machine-readable --jso
 gjc setup paseo --remove   # rolls back only the keys GJC itself created
 ```
 
-Orca, in one field: install GJC (see [docs/install.md](docs/install.md)), then add a custom agent
-with command `gjc` and no arguments. Orca pre-fills a permission-bypass flag for agents that expose
-one — GJC has none by design, so leave the arguments empty and keep GJC's own approval gates.
+Orca: install GJC (see [docs/install.md](docs/install.md)), then override a built-in agent's command with `gjc` in **Settings → Agents** (custom agent registration is not yet supported upstream; see [stablyai/orca#36718](https://github.com/stablyai/orca/issues/36718)). GJC has no permission-bypass flag by design, so leave arguments empty and keep GJC's own approval gates. Full integration guide in [docs/terminal-app-integrations.md](docs/terminal-app-integrations.md).
 
 **[Full integration guide → docs/terminal-app-integrations.md](docs/terminal-app-integrations.md)** —
 per-host setup, verification, cancel semantics, troubleshooting tables, and what each host cannot reach yet.
@@ -416,7 +414,7 @@ gjc setup defaults --check
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
 | [Paseo](https://paseo.sh) | `gjc setup paseo` | GJC registers itself as an ACP provider and rolls itself back with `--remove`; Paseo owns its own config files. |
-| [Orca](https://onorca.dev) | `gjc` as a custom agent command | Orca launches GJC in its own worktree terminal; GJC keeps its own approval gates. |
+| [Orca](https://onorca.dev) | override a built-in agent's command with `gjc` | Orca launches GJC in a worktree terminal; custom agent registration not yet supported upstream. GJC keeps its own approval gates. |
 | [T3 Code](https://t3.codes) | none yet — experimental | No GJC harness upstream ([proposal](https://github.com/pingdotgg/t3code/discussions/7290)); run GJC beside it until a driver lands. |
 | External controller / bot | Coordinator MCP, `gjc sdk session`, or a configured managed adapter | External controllers use broker-bound, credential-free surfaces rather than scrollback or direct endpoint transports. The host-neutral `gjc-sdk-*` skills compose `gjc sdk session` and install no coordinator integration. |
 

@@ -89,17 +89,23 @@ async function realOrLexical(target: string): Promise<string> {
 }
 
 /**
- * Native astEdit canonicalizes one file and writes that real path. Directory
- * scans do not follow links. A lexical path inside cwd uses the real cwd as
- * the reference root; an explicit path outside cwd uses its real parent, so a
- * direct file there still applies. Returns the lexical path that would leave
- * that root, if any.
+ * Native astEdit canonicalizes the search root and writes that real path.
+ * Directory scans do not follow entry links, but the root itself is followed.
+ * A lexical path inside cwd uses the real cwd; an explicit path outside cwd
+ * uses its real parent, so a direct file or real directory there still applies.
+ * Returns the lexical path that would leave that root, if any.
+ *
+ * Directory checks are opt-in so a symlink file can still preview. Pass
+ * `directories: true` before a directory preview and again before apply.
  */
 export async function astEditSingleFileOutsideReferenceRoot(
 	cwd: string,
 	candidatePaths: readonly string[],
 	signal?: AbortSignal,
+	scope: { files?: boolean; directories?: boolean } = {},
 ): Promise<string | undefined> {
+	const checkFiles = scope.files !== false;
+	const checkDirectories = scope.directories === true;
 	signal?.throwIfAborted();
 	const resolvedCwd = path.resolve(cwd);
 	const realCwd = await realOrLexical(resolvedCwd);
@@ -110,7 +116,12 @@ export async function astEditSingleFileOutsideReferenceRoot(
 		try {
 			followed = await fs.realpath(lexical);
 		} catch (error) {
-			if (isEnoent(error)) continue;
+			if (isEnoent(error)) {
+				// A missing name that trim() would rewrite is a different entry.
+				// Skipping it lets the native writer select that sibling.
+				if (checkDirectories && lexical !== lexical.trim()) return lexical;
+				continue;
+			}
 			throw error;
 		}
 		let stat: Awaited<ReturnType<typeof fs.stat>>;
@@ -120,7 +131,13 @@ export async function astEditSingleFileOutsideReferenceRoot(
 			if (isEnoent(error)) continue;
 			throw error;
 		}
-		if (!stat.isFile()) continue;
+		if (stat.isFile()) {
+			if (!checkFiles) continue;
+		} else if (stat.isDirectory()) {
+			if (!checkDirectories) continue;
+		} else {
+			continue;
+		}
 		const root =
 			staysInside(resolvedCwd, lexical) || staysInside(realCwd, lexical)
 				? realCwd

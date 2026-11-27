@@ -157,6 +157,21 @@ describe("sdk session CLI keeps definite rejection codes", () => {
 		expect(rendered.stdout).not.toContain("/private/outside/path");
 	});
 
+	test("an operator abort to a host without operator authority is a final not-applied refusal", async () => {
+		const rendered = await renderPublicCommandFailure(
+			sdkPublicFailure("operator_control_unsupported", { sessionId: "session-1" }),
+			{ command: ["sdk", "session", "raw", "control"], json: true },
+		);
+		expect(rendered.envelope.error).toMatchObject({
+			code: "authorization_denied",
+			outcomeCertainty: "not-applied",
+			retryability: "no",
+		});
+		expect(diagnosticCodes(rendered.envelope)).toEqual(["sdk_operator_control_unsupported"]);
+		// Distinct from a stale endpoint, whose guidance is to re-resolve and retry.
+		expect(rendered.envelope.error.code).not.toBe("endpoint_stale");
+	});
+
 	test("unmapped host codes still collapse to operation_failed without diagnostics", async () => {
 		const rendered = await renderPublicCommandFailure(sdkPublicFailure("some_unmapped_host_code"), {
 			command: ["sdk", "session", "send"],

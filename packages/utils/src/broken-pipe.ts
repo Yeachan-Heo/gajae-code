@@ -90,6 +90,17 @@ export interface ProcessStdoutEpipeClassifier {
 	isAttributableProcessStdoutEpipe(error: unknown): boolean;
 }
 
+/**
+ * A classifier for process-level stderr peer-closed errors (`EPIPE`, `EIO`,
+ * `EBADF`). Its direct-write evidence is private to each factory instance, so
+ * only the owner that intercepted `process.stderr.write` can mark an error
+ * for this classifier.
+ */
+export interface ProcessStderrEpipeClassifier {
+	markDirectProcessStderrWriteError(error: unknown): void;
+	isAttributableProcessStderrEpipe(error: unknown): boolean;
+}
+
 export function createProcessStdoutEpipeClassifier(): ProcessStdoutEpipeClassifier {
 	const directProcessStdoutWriteErrors = new WeakSet<object>();
 	const initialStdoutIdentity = isUsableFileDescriptor(process.stdout.fd)
@@ -132,6 +143,27 @@ export function createProcessStdoutEpipeClassifier(): ProcessStdoutEpipeClassifi
 			if (!fd.available || !isUsableFileDescriptor(fd.value)) return false;
 
 			return hasCurrentStdoutIdentity(fd.value);
+		},
+	};
+}
+
+export function createProcessStderrEpipeClassifier(): ProcessStderrEpipeClassifier {
+	const directProcessStderrWriteErrors = new WeakSet<object>();
+
+	return {
+		markDirectProcessStderrWriteError(error: unknown): void {
+			if (isObjectLike(error)) directProcessStderrWriteErrors.add(error);
+		},
+		isAttributableProcessStderrEpipe(error: unknown): boolean {
+			if (!isObjectLike(error)) return false;
+
+			const code = readErrorProperty(error, "code");
+			if (!code.available || typeof code.value !== "string" || !PROCESS_STDOUT_PEER_CLOSED_CODES.has(code.value))
+				return false;
+
+			// Only errors marked by the process.stderr.write wrapper count: unlike stdout there is
+			// no fd/syscall fallback, so an unrelated EPIPE (e.g. a child pipe) still crashes loudly.
+			return directProcessStderrWriteErrors.has(error);
 		},
 	};
 }

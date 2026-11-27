@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { Effort, getBundledModel } from "@gajae-code/ai";
+import { createMockModel, type MockModelOptions } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -714,5 +714,670 @@ describe("AgentSession steer-on-interrupt", () => {
 		const users = h.s.agent.state.messages.filter(m => m.role === "user").map(m => JSON.stringify(m.content));
 		expect(users.some(t => t.includes("stop and do this instead"))).toBe(true);
 		expect(assistantCount(h.s)).toBe(2);
+	});
+
+	describe("run-bound steers (expectedPromptHandle)", () => {
+		function buildHeldSession(responses: MockModelOptions["responses"]) {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+			const mock = createMockModel({ responses });
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				toolInterruptPolicy: "finish_tools",
+				steeringMode: "all",
+				streamFn: mock.stream,
+			});
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+			return { mock, agent, s: session };
+		}
+		const sendSteer = (s: AgentSession, text: string, expectedPromptHandle?: string | null) =>
+			s.sendUserMessage(text, { deliverAs: "steer", expectedPromptHandle } as never);
+		const sawText = (
+			calls: Array<{ context: { messages: Array<{ role: string; content: unknown }> } }>,
+			text: string,
+		) =>
+			calls.some(call =>
+				call.context.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes(text),
+				),
+			);
+
+		it("drops an unconsumed bound steer when its run is interrupted while unbound steers rearm", async () => {
+			const h = buildHeldSession([
+				{ content: ["A done"], delayMs: 60_000 },
+				{ content: ["B handled"] },
+				{ content: ["unexpected"] },
+			]);
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			expect(handleA).toBeDefined();
+			await sendSteer(h.s, "bound-steer-held-9f1", handleA);
+			await sendSteer(h.s, "unbound-steer-kept-4c2");
+			expect(h.s.getQueuedMessages().steering).toEqual(["bound-steer-held-9f1", "unbound-steer-kept-4c2"]);
+
+			await h.s.abort({ cause: "user_interrupt" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+
+			expect(h.mock.calls).toHaveLength(2);
+			expect(sawText(h.mock.calls.slice(1), "unbound-steer-kept-4c2")).toBe(true);
+			expect(sawText(h.mock.calls, "bound-steer-held-9f1")).toBe(false);
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			expect(h.agent.hasQueuedMessages()).toBe(false);
+		});
+
+		it("rejects a bound steer whose run ended and successor started during the admission await", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const releaseSuccessor = Promise.withResolvers<void>();
+			const releaseCommit = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				async () => {
+					await releaseSuccessor.promise;
+					return { content: ["B done"] };
+				},
+			]);
+			let first: Promise<void> | undefined;
+			let second: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				const commitEntered = Promise.withResolvers<void>();
+				const stale = h.s.sendUserMessage("stale-bound-after-await-7d3", {
+					deliverAs: "steer",
+					expectedPromptHandle: handleA,
+					onPreflightAcceptCommit: async () => {
+						commitEntered.resolve();
+						await releaseCommit.promise;
+					},
+				} as never);
+				stale.catch(() => {});
+				await commitEntered.promise;
+
+				// A ends naturally while the admission barrier is held; B starts before release.
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+				second = h.s.prompt("task B");
+				await waitUntil(() => h.mock.calls.length === 2);
+				expect(h.s.activePromptHandle).toBeDefined();
+				expect(h.s.activePromptHandle).not.toBe(handleA);
+				releaseCommit.resolve();
+
+				await expect(stale).rejects.toMatchObject({ code: "turn_not_active" });
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+				releaseSuccessor.resolve();
+				await second;
+				await h.s.waitForIdle();
+				expect(sawText(h.mock.calls, "stale-bound-after-await-7d3")).toBe(false);
+				expect(h.mock.calls).toHaveLength(2);
+			} finally {
+				releaseA.resolve();
+				releaseCommit.resolve();
+				releaseSuccessor.resolve();
+				await Promise.all([first?.catch(() => {}), second?.catch(() => {})]);
+			}
+		});
+
+		it("drops an unconsumed bound steer when its run completes naturally instead of promoting it", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["B done"] },
+			]);
+			let first: Promise<void> | undefined;
+			let second: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				// The run may not dequeue steering, so the bound steer is still unconsumed at its end.
+				h.agent.setSteeringAdmissionFence(() => true);
+				await sendSteer(h.s, "bound-natural-end-6c5", handleA);
+				expect(h.s.getQueuedMessages().steering).toEqual(["bound-natural-end-6c5"]);
+
+				releaseA.resolve();
+				await first;
+				h.agent.setSteeringAdmissionFence(undefined);
+				await h.s.waitForIdle();
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+				expect(h.agent.hasQueuedMessages()).toBe(false);
+
+				second = h.s.prompt("task B");
+				await second;
+				await h.s.waitForIdle();
+				expect(h.mock.calls).toHaveLength(2);
+				expect(sawText(h.mock.calls, "bound-natural-end-6c5")).toBe(false);
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			} finally {
+				h.agent.setSteeringAdmissionFence(undefined);
+				releaseA.resolve();
+				await Promise.all([first?.catch(() => {}), second?.catch(() => {})]);
+			}
+		});
+
+		it("rejects a null target without demoting it and leaves unbound steers unchanged", async () => {
+			const h = buildHeldSession([{ content: ["A done"], delayMs: 60_000 }, { content: ["B handled"] }]);
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+
+			await expect(sendSteer(h.s, "null-target-steer-2a8", null)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+			await sendSteer(h.s, "plain-unbound-steer-5e6");
+			expect(h.s.getQueuedMessages()).toEqual({ steering: ["plain-unbound-steer-5e6"], followUp: [] });
+			await h.s.abort({ cause: "user_interrupt" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+			expect(sawText(h.mock.calls, "plain-unbound-steer-5e6")).toBe(true);
+			expect(sawText(h.mock.calls, "null-target-steer-2a8")).toBe(false);
+		});
+
+		it("does not hold a bound steer for the replacement run on cancelAndSubmit", async () => {
+			const h = buildHeldSession([
+				{ content: ["A done"], delayMs: 60_000 },
+				{ content: ["B handled"] },
+				{ content: ["unexpected"] },
+			]);
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			await sendSteer(h.s, "bound-steer-cas-3b7", handleA);
+			await sendSteer(h.s, "unbound-steer-cas-8d4");
+
+			expect(await h.s.cancelAndSubmit("replacement-prompt-1e9")).toEqual({ kind: "submitted" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+
+			expect(sawText(h.mock.calls.slice(1), "replacement-prompt-1e9")).toBe(true);
+			expect(sawText(h.mock.calls.slice(1), "unbound-steer-cas-8d4")).toBe(true);
+			expect(sawText(h.mock.calls, "bound-steer-cas-3b7")).toBe(false);
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			expect(h.agent.hasQueuedMessages()).toBe(false);
+		});
+
+		it("manual compaction of the live run discards its bound steers and keeps unbound ones", async () => {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+			const toolStarted = Promise.withResolvers<void>();
+			const releaseTool = Promise.withResolvers<void>();
+			const blockingTool = {
+				name: "blocks",
+				description: "Blocks until aborted or released.",
+				parameters: { type: "object" as const, properties: {} },
+				execute: async (_id: string, _params: unknown, signal?: AbortSignal) => {
+					toolStarted.resolve();
+					const aborted = Promise.withResolvers<void>();
+					if (signal?.aborted) aborted.resolve();
+					else signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+					await Promise.race([releaseTool.promise, aborted.promise]);
+					return { content: [{ type: "text" as const, text: "done" }] };
+				},
+			};
+			const mock = createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall", name: "blocks", arguments: {} }] },
+					{ content: ["B handled"] },
+					{ content: ["unexpected"] },
+				],
+			});
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [blockingTool as never], messages: [] },
+				steeringMode: "all",
+				streamFn: mock.stream,
+			});
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const sessionManager = SessionManager.inMemory();
+			sessionManager.appendMessage({ role: "user", content: "old context ".repeat(100), timestamp: 1 });
+			sessionManager.appendMessage({ role: "user", content: "recent context", timestamp: 2 });
+			const extensionRunner = {
+				hasHandlers: vi.fn((eventType: string) => eventType === "session_before_compact"),
+				hasToolResultMediation: vi.fn().mockReturnValue(false),
+				emitBeforeAgentStart: vi.fn().mockImplementation(async () => ({ messages: [] })),
+				emit: vi.fn().mockImplementation(async (event: unknown) => {
+					const preparation = (event as { preparation?: { firstKeptEntryId: string; tokensBefore: number } })
+						.preparation;
+					if (!preparation) return undefined;
+					return {
+						compaction: {
+							summary: "compacted summary",
+							shortSummary: "compacted",
+							firstKeptEntryId: preparation.firstKeptEntryId,
+							tokensBefore: preparation.tokensBefore,
+							details: {},
+						},
+					};
+				}),
+			};
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				settings,
+				extensionRunner: extensionRunner as never,
+				modelRegistry,
+			});
+			session.settings.override("compaction.keepRecentTokens", 1);
+			const s = session;
+			let first: Promise<void> | undefined;
+			try {
+				first = s.prompt("task A");
+				await toolStarted.promise;
+				const handleA = s.activePromptHandle;
+				expect(handleA).toBeDefined();
+				await sendSteer(s, "bound-steer-compact-5a1", handleA);
+				await sendSteer(s, "unbound-steer-compact-7b2");
+				expect(s.getQueuedMessages().steering).toEqual(["bound-steer-compact-5a1", "unbound-steer-compact-7b2"]);
+
+				await s.compact();
+				await first.catch(() => {});
+				await s.waitForIdle();
+
+				expect(sawText(mock.calls, "bound-steer-compact-5a1")).toBe(false);
+				expect(sawText(mock.calls, "unbound-steer-compact-7b2")).toBe(true);
+				expect(s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+				expect(agent.hasQueuedMessages()).toBe(false);
+			} finally {
+				releaseTool.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
+		type Promotion = { startsOwnRun?: boolean; removed?: boolean };
+		const sendFollowUp = (
+			s: AgentSession,
+			text: string,
+			expectedPromptHandle?: string | null,
+			onQueuedPromoted?: (promotion: Promotion) => void,
+		) => s.sendUserMessage(text, { deliverAs: "followUp", expectedPromptHandle, onQueuedPromoted });
+		const countRunStarts = (s: AgentSession) => {
+			const starts: string[] = [];
+			const unsubscribe = s.subscribe(event => {
+				if (event.type === "agent_start") starts.push(s.activePromptHandle ?? "");
+			});
+			return { starts, unsubscribe };
+		};
+
+		it("delivers a bound follow-up inside its own run without starting another run", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["follow-up handled"] },
+				{ content: ["unexpected"] },
+			]);
+			const runs = countRunStarts(h.s);
+			const promotions: Promotion[] = [];
+			let first: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				expect(handleA).toBeDefined();
+				await sendFollowUp(h.s, "bound-follow-up-same-run-1a7", handleA, p => promotions.push(p));
+				expect(h.s.getQueuedMessages().followUp).toEqual(["bound-follow-up-same-run-1a7"]);
+
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+
+				expect(h.mock.calls).toHaveLength(2);
+				expect(sawText(h.mock.calls.slice(1), "bound-follow-up-same-run-1a7")).toBe(true);
+				expect(promotions).toEqual([{ startsOwnRun: false }]);
+				expect(runs.starts).toEqual([handleA!]);
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			} finally {
+				runs.unsubscribe();
+				releaseA.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
+		it("rejects a follow-up bound to an ended run or to no run without queueing it", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["unexpected"] },
+			]);
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			releaseA.resolve();
+			await first;
+			await h.s.waitForIdle();
+
+			await expect(sendFollowUp(h.s, "ended-run-follow-up-3c9", handleA)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+			await expect(sendFollowUp(h.s, "no-run-follow-up-8e2", null)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+			await h.s.waitForIdle();
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			expect(h.agent.hasQueuedMessages()).toBe(false);
+			expect(h.mock.calls).toHaveLength(1);
+		});
+
+		it("rejects a bound follow-up whose run ended and successor started during the admission await", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const releaseSuccessor = Promise.withResolvers<void>();
+			const releaseCommit = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				async () => {
+					await releaseSuccessor.promise;
+					return { content: ["B done"] };
+				},
+				{ content: ["unexpected"] },
+			]);
+			let first: Promise<void> | undefined;
+			let second: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				const commitEntered = Promise.withResolvers<void>();
+				const stale = h.s.sendUserMessage("stale-bound-follow-up-5b4", {
+					deliverAs: "followUp",
+					expectedPromptHandle: handleA,
+					onPreflightAcceptCommit: async () => {
+						commitEntered.resolve();
+						await releaseCommit.promise;
+					},
+				});
+				stale.catch(() => {});
+				await commitEntered.promise;
+
+				// A ends while the admission is held; B is live when it resumes.
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+				second = h.s.prompt("task B");
+				await waitUntil(() => h.mock.calls.length === 2);
+				expect(h.s.activePromptHandle).toBeDefined();
+				expect(h.s.activePromptHandle).not.toBe(handleA);
+				releaseCommit.resolve();
+
+				await expect(stale).rejects.toMatchObject({ code: "turn_not_active" });
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+				releaseSuccessor.resolve();
+				await second;
+				await h.s.waitForIdle();
+				expect(h.mock.calls).toHaveLength(2);
+				expect(sawText(h.mock.calls, "stale-bound-follow-up-5b4")).toBe(false);
+			} finally {
+				releaseA.resolve();
+				releaseCommit.resolve();
+				releaseSuccessor.resolve();
+				await Promise.all([first?.catch(() => {}), second?.catch(() => {})]);
+			}
+		});
+
+		it("discards a bound follow-up its run ends without reading while an unbound one still reaches the next run", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["next run"] },
+				{ content: ["next run 2"] },
+				{ content: ["next run 3"] },
+			]);
+			const runs = countRunStarts(h.s);
+			const bound: Promotion[] = [];
+			const unbound: Promotion[] = [];
+			let first: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				await sendFollowUp(h.s, "bound-unread-follow-up-7f3", handleA, p => bound.push(p));
+				await sendFollowUp(h.s, "unbound-follow-up-kept-2d6", undefined, p => unbound.push(p));
+				expect(h.s.getQueuedMessages().followUp).toEqual([
+					"bound-unread-follow-up-7f3",
+					"unbound-follow-up-kept-2d6",
+				]);
+
+				// The run pauses at its stop point, so it never reads its follow-up queue:
+				// both follow-ups are still queued, and live, when its terminal is published.
+				h.agent.setShouldPause(() => true);
+				releaseA.resolve();
+				await first;
+				h.agent.setShouldPause(undefined);
+				await h.s.waitForIdle();
+
+				expect(bound).toEqual([{ startsOwnRun: true, removed: true }]);
+				expect(h.s.getQueuedMessages().followUp).not.toContain("bound-unread-follow-up-7f3");
+				await h.s.prompt("task B");
+				await h.s.waitForIdle();
+
+				expect(sawText(h.mock.calls, "bound-unread-follow-up-7f3")).toBe(false);
+				expect(sawText(h.mock.calls.slice(1), "unbound-follow-up-kept-2d6")).toBe(true);
+				expect(unbound).toHaveLength(1);
+				expect(unbound[0]?.removed).toBeUndefined();
+				expect(runs.starts[0]).toBe(handleA!);
+				expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			} finally {
+				runs.unsubscribe();
+				h.agent.setShouldPause(undefined);
+				releaseA.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
+		it("discards a bound follow-up on a user interrupt instead of carrying it to the next run", async () => {
+			const h = buildHeldSession([
+				{ content: ["A done"], delayMs: 60_000 },
+				{ content: ["next run"] },
+				{ content: ["next run 2"] },
+			]);
+			const bound: Promotion[] = [];
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			await sendFollowUp(h.s, "bound-interrupted-follow-up-4a1", handleA, p => bound.push(p));
+
+			await h.s.abort({ cause: "user_interrupt" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+			await h.s.prompt("task B");
+			await h.s.waitForIdle();
+
+			expect(bound).toEqual([{ startsOwnRun: true, removed: true }]);
+			expect(sawText(h.mock.calls, "bound-interrupted-follow-up-4a1")).toBe(false);
+			expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		});
+
+		it("does not hand a bound follow-up to the replacement run on cancelAndSubmit", async () => {
+			const h = buildHeldSession([
+				{ content: ["A done"], delayMs: 60_000 },
+				{ content: ["replacement handled"] },
+				{ content: ["unexpected"] },
+			]);
+			const bound: Promotion[] = [];
+			const first = h.s.prompt("task A");
+			await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+			const handleA = h.s.activePromptHandle;
+			await sendFollowUp(h.s, "bound-follow-up-cas-6e8", handleA, p => bound.push(p));
+			await sendFollowUp(h.s, "unbound-follow-up-cas-9b1");
+
+			expect(await h.s.cancelAndSubmit("replacement-prompt-2f4")).toEqual({ kind: "submitted" });
+			await first.catch(() => {});
+			await h.s.waitForIdle();
+
+			expect(sawText(h.mock.calls.slice(1), "replacement-prompt-2f4")).toBe(true);
+			expect(sawText(h.mock.calls, "bound-follow-up-cas-6e8")).toBe(false);
+			expect(bound).toEqual([{ startsOwnRun: true, removed: true }]);
+			expect(h.s.getQueuedMessages().followUp).not.toContain("bound-follow-up-cas-6e8");
+		});
+
+		it("refuses to send a bound follow-up now instead of aborting its run or resubmitting its text", async () => {
+			const releaseA = Promise.withResolvers<void>();
+			const h = buildHeldSession([
+				async () => {
+					await releaseA.promise;
+					return { content: ["A done"] };
+				},
+				{ content: ["bound handled in run A"] },
+				{ content: ["unexpected"] },
+			]);
+			const runs = countRunStarts(h.s);
+			const bound: Promotion[] = [];
+			let first: Promise<void> | undefined;
+			try {
+				first = h.s.prompt("task A");
+				await waitUntil(() => h.agent.state.isStreaming && h.mock.calls.length === 1);
+				const handleA = h.s.activePromptHandle;
+				await sendFollowUp(h.s, "bound-send-now-8c3", handleA, p => bound.push(p));
+				const entry = h.s.getQueuedMessageEntries().find(e => e.text === "bound-send-now-8c3");
+				expect(entry).toBeDefined();
+
+				expect(await h.s.cancelAndSubmit(entry!.text, { queuedEntryId: entry!.id })).toEqual({
+					kind: "refused",
+					reason: "run_bound",
+				});
+				expect(h.agent.state.isStreaming).toBe(true);
+				expect(h.s.activePromptHandle).toBe(handleA);
+				expect(h.s.getQueuedMessages().followUp).toEqual(["bound-send-now-8c3"]);
+
+				releaseA.resolve();
+				await first;
+				await h.s.waitForIdle();
+
+				const seen = h.mock.calls.filter(call =>
+					call.context.messages.some(
+						message => message.role === "user" && JSON.stringify(message.content).includes("bound-send-now-8c3"),
+					),
+				);
+				expect(seen).toHaveLength(1);
+				expect(h.mock.calls).toHaveLength(2);
+				expect(bound).toEqual([{ startsOwnRun: false }]);
+				expect(runs.starts).toEqual([handleA!]);
+			} finally {
+				runs.unsubscribe();
+				releaseA.resolve();
+				await first?.catch(() => {});
+			}
+		});
+
+		it("applies steer after pending explicit model selection completes, not before", async () => {
+			const initialModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!initialModel) throw new Error("Expected bundled Anthropic test model to exist");
+
+			const targetModel = {
+				id: "target-model",
+				name: "Target Model",
+				api: "anthropic-messages" as const,
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com/v1",
+				reasoning: true,
+				thinking: { mode: "effort" as const, minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text" as const],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 8_192,
+				maxTokens: 2_048,
+			};
+
+			let releaseTool: (() => void) | undefined;
+			const toolStarted = Promise.withResolvers<void>();
+			const blockingTool = {
+				name: "blocks",
+				description: "Blocks until released, allowing model selection to be pending.",
+				parameters: { type: "object" as const, properties: {} },
+				execute: async () => {
+					toolStarted.resolve();
+					await new Promise<void>(resolve => {
+						releaseTool = resolve;
+					});
+					return { content: [{ type: "text" as const, text: "tool finished" }] };
+				},
+			};
+
+			const mock = createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall" as const, name: "blocks", arguments: {} }] },
+					{ content: ["steer handled with target model"] },
+				],
+			});
+
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model: initialModel, systemPrompt: ["Test"], tools: [blockingTool as never], messages: [] },
+				streamFn: mock.stream,
+			});
+
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${initialModel.provider}/${initialModel.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+			// Start the initial turn with a blocking tool to keep the turn busy
+			const initialPromise = session.prompt("run the blocking tool");
+			await toolStarted.promise;
+
+			// Start model selection to an explicit target model (this creates a selection fence)
+			const selectionStarted = Promise.withResolvers<void>();
+			const selectionCompleted = Promise.withResolvers<void>();
+			const selectionPromise = (async () => {
+				selectionStarted.resolve();
+				await session.setDefaultModelSelection(targetModel, ThinkingLevel.Off);
+				selectionCompleted.resolve();
+			})();
+
+			await selectionStarted.promise;
+			Bun.sleep(10); // Give selection fence time to be created
+
+			// Now send a steer via session.prompt while the turn is busy AND model selection is pending.
+			// This tests through AgentSession.#promptInternal admission logic, verifying that the steer
+			// waits behind the explicit model-selection fence but bypasses hot-reload fences.
+			const steerPromise = session.prompt("respond with target model info", {
+				streamingBehavior: "steer",
+				steerQueuePolicy: "sequential",
+			});
+
+			// Release the blocking tool so the initial turn can complete
+			releaseTool?.();
+
+			// The steer should be queued and delivered after the model selection completes
+			await initialPromise.catch(() => {});
+			await selectionPromise;
+			await selectionCompleted.promise;
+			await steerPromise.catch(() => {});
+
+			// Wait for the steer to be processed
+			await session.waitForIdle();
+
+			// Verify the steer was handled and the session used the target model
+			expect(
+				session.agent.state.messages.some(
+					m => m.role === "user" && JSON.stringify(m.content).includes("respond with target model info"),
+				),
+			).toBe(true);
+
+			// Verify the target model was selected (the selection fence ensured this)
+			expect(session.model?.id).toBe("target-model");
+		});
 	});
 });

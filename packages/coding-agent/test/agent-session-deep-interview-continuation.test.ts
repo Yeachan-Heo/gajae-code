@@ -417,10 +417,11 @@ describe("AgentSession deep-interview continuation", () => {
 			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
 
 			const releaseStateRead = Promise.withResolvers<void>();
-			const originalRead = activeStateModule.readVisibleSkillActiveState;
+			const originalRead = activeStateModule.readVisibleSkillActiveStateWithStatus;
 			let staleStateReadPending = false;
-			vi.spyOn(activeStateModule, "readVisibleSkillActiveState").mockImplementation(async (...args) => {
-				const activeState = await originalRead(...args);
+			vi.spyOn(activeStateModule, "readVisibleSkillActiveStateWithStatus").mockImplementation(async (...args) => {
+				const result = await originalRead(...args);
+				const activeState = result.state;
 				if (
 					activeState?.active_skills?.some(entry => entry.skill === "assistant-helpers") &&
 					activeState.active_skills.some(entry => entry.skill === "deep-interview")
@@ -428,7 +429,7 @@ describe("AgentSession deep-interview continuation", () => {
 					staleStateReadPending = true;
 					await releaseStateRead.promise;
 				}
-				return activeState;
+				return result;
 			});
 
 			try {

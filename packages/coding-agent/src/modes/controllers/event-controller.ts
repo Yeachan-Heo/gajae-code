@@ -4,6 +4,7 @@ import type { AssistantMessage, ImageContent } from "@gajae-code/ai/core";
 import { parseRateLimitReason } from "@gajae-code/ai/core";
 import { type Component, Loader, TERMINAL, Text } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import {
@@ -1095,7 +1096,7 @@ export class EventController {
 			this.ctx.showWarning(lastAssistant?.errorMessage ? TEXTLESS_INCOMPLETE_WARNING : TEXTLESS_LENGTH_WARNING);
 		}
 		this.sendCompletionNotification();
-		this.ctx.promptSuggestion?.onAgentEnd();
+		this.ctx.promptSuggestion?.onAgentEnd(event.stopReason);
 	}
 
 	async #handleAutoCompactionStart(
@@ -1328,7 +1329,7 @@ export class EventController {
 			const proc = Bun.spawn(completionNotifyShellCommand(command), {
 				cwd: payload.cwd,
 				env: {
-					...process.env,
+					...projectSafeSpawnEnv(),
 					...buildCompletionNotifyEnv(payload),
 				},
 				stdin: "ignore",

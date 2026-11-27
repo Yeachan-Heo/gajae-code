@@ -10,7 +10,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { AsyncJobManager } from "../../src/async";
 import { kNoAuth } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
-import { getThemeByName } from "../../src/modes/theme/theme";
+
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, PromptOptions } from "../../src/session/agent-session";
 import { subagentRunOutcomeFromSingleResult } from "../../src/task";
@@ -22,6 +22,7 @@ import type { ToolSession } from "../../src/tools";
 import { capCodePointsAndBytes, SubagentTool } from "../../src/tools/implementations";
 import type { SubagentToolDetails } from "../../src/tools/subagent";
 import { subagentBodyCacheTestHooks, subagentToolRenderer } from "../../src/tools/subagent-render";
+import { loadTestTheme } from "../helpers/test-theme";
 
 function createSession(agentId = "0-Main"): ToolSession {
 	return {
@@ -406,8 +407,7 @@ describe("SubagentTool", () => {
 
 		// Cached renderer path: body renders the summary and the await cache
 		// signature participates (rendering twice must not break).
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Expected test theme");
+		const theme = await loadTestTheme();
 		const render = (value: SubagentToolDetails) =>
 			Bun.stripANSI(
 				subagentToolRenderer
@@ -487,8 +487,7 @@ describe("SubagentTool", () => {
 		// Streaming/dynamic render (isPartial: true) and terminal cached render
 		// both carry the real summary; every rendered line stays within the
 		// requested width and contains no raw tabs.
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Expected test theme");
+		const theme = await loadTestTheme();
 		const details = result.details as SubagentToolDetails;
 		for (const isPartial of [true, false]) {
 			const width = 64;
@@ -508,8 +507,7 @@ describe("SubagentTool", () => {
 	});
 
 	it("renders local_snapshot_failure with serialization-defect guidance, not staging-limit guidance (#4618)", async () => {
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Expected test theme");
+		const theme = await loadTestTheme();
 		const details: SubagentToolDetails = {
 			subagents: [
 				{
@@ -540,8 +538,7 @@ describe("SubagentTool", () => {
 		expect(rendered).not.toContain("staging-buffer limit");
 	});
 	it("renders setup failures and invalidates the static body cache when the cause changes", async () => {
-		const theme = await getThemeByName("red-claw");
-		if (!theme) throw new Error("Expected test theme");
+		const theme = await loadTestTheme();
 		const details = (setupFailureSummary: string): SubagentToolDetails => ({
 			subagents: [
 				{

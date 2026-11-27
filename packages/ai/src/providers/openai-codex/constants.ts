@@ -9,7 +9,7 @@ export const OPENAI_HEADERS = {
 	ACCOUNT_ID: "chatgpt-account-id",
 	ORIGINATOR: "originator",
 	SESSION_ID: "session_id",
-	CONVERSATION_ID: "conversation_id",
+	ROUTING_HINT: "x-codex-routing-hint",
 } as const;
 
 export const OPENAI_HEADER_VALUES = {
@@ -21,9 +21,21 @@ export const OPENAI_HEADER_VALUES = {
 export const URL_PATHS = {
 	RESPONSES: "/responses",
 	CODEX_RESPONSES: "/codex/responses",
+	CODEX_IMAGES_GENERATIONS: "/codex/images/generations",
+	CODEX_IMAGES_EDITS: "/codex/images/edits",
 } as const;
 
 export const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
+
+/**
+ * Build the `x-codex-routing-hint` value for a request (codex-rs
+ * `build_routing_hint_header`): the requested model slug plus the explicit
+ * service tier when one is set. Callers set it only on ChatGPT-OAuth requests
+ * to the Codex backend; API-key OpenAI traffic never carries it.
+ */
+export function codexRoutingHint(model: string, serviceTier: string | null | undefined): string {
+	return serviceTier ? `model=${model};tier=${serviceTier}` : `model=${model}`;
+}
 
 /**
  * Extract account ID from a OpenAI code backend JWT access token.

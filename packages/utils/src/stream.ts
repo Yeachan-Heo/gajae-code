@@ -321,10 +321,7 @@ function flushSseEvent(state: SseEventState): ServerSentEvent | null {
 }
 
 function pushSseLine(line: Uint8Array, state: SseEventState): ServerSentEvent | null {
-	// `appendAndFlushLines` splits on LF only; strip a trailing CR so CRLF sources
-	// don't leak `\r` into field values.
-	let end = line.length;
-	if (end > 0 && line[end - 1] === 0x0d /* '\r' */) end--;
+	const end = line.length;
 	if (end === 0) return flushSseEvent(state);
 
 	// Comment line: keep in `raw` for diagnostic context, skip parsing.
@@ -356,6 +353,50 @@ function pushSseLine(line: Uint8Array, state: SseEventState): ServerSentEvent | 
 	return null;
 }
 
+// SSE accepts CR, LF and CRLF. Keep this framing separate from readLines and
+// JSONL, whose LF-only behavior must not change.
+class SseLineBuffer {
+	#buffer = new ConcatSink();
+	#afterCr = false;
+
+	*append(
+		chunk: Uint8Array,
+		checkPendingBytes: (bytes: number) => void,
+	): Generator<{ line: Uint8Array | null; bytes: number; cr: boolean }> {
+		let start = 0;
+		for (let i = 0; i < chunk.length; i++) {
+			const byte = chunk[i];
+			if (this.#afterCr) {
+				this.#afterCr = false;
+				if (byte === LF) {
+					start = i + 1;
+					yield { line: null, bytes: 1, cr: false };
+					continue;
+				}
+				yield { line: null, bytes: 0, cr: false };
+			}
+			if (byte !== LF && byte !== 0x0d) continue;
+			checkPendingBytes(this.pendingBytes + i - start + 1);
+			this.#buffer.append(chunk.subarray(start, i));
+			const line = this.#buffer.flush() ?? new Uint8Array(0);
+			this.#afterCr = byte === 0x0d;
+			yield { line, bytes: line.length + 1, cr: this.#afterCr };
+			this.#buffer.clear();
+			start = i + 1;
+		}
+		checkPendingBytes(this.pendingBytes + chunk.length - start);
+		this.#buffer.append(chunk.subarray(start));
+	}
+
+	get pendingBytes(): number {
+		return this.#buffer.flush()?.length ?? 0;
+	}
+
+	flush(): Uint8Array | undefined {
+		return this.#buffer.flush();
+	}
+}
+
 /**
  * Stream raw Server-Sent Events from an HTTP response body.
  *
@@ -381,32 +422,66 @@ export async function* readSseEvents(
 	signal?: AbortSignal,
 	options?: SseReadOptions,
 ): AsyncGenerator<ServerSentEvent> {
-	const lineBuffer = new ConcatSink();
+	const lineBuffer = new SseLineBuffer();
 	const state: SseEventState = { event: null, data: null, raw: [] };
 	const source = createAbortableStream(stream, signal);
 	let eventBytes = 0;
 	let totalBytes = 0;
+	let crBoundaryBytes: number | undefined;
+	let heldEvent: ServerSentEvent | undefined;
+	const checkEventBytes = (bytes: number) => {
+		if (options?.maxEventBytes !== undefined && bytes > options.maxEventBytes) {
+			throw new Error("SSE event exceeds size limit");
+		}
+	};
 	try {
 		for await (const chunk of source) {
 			totalBytes += chunk.length;
 			if (options?.maxTotalBytes !== undefined && totalBytes > options.maxTotalBytes) {
 				throw new Error("SSE stream exceeds size limit");
 			}
-			for (const line of lineBuffer.appendAndFlushLines(
-				chunk,
-				() => (options?.maxEventBytes ?? Infinity) - eventBytes,
-			)) {
-				eventBytes += line.length + 1;
+			for (const { line, bytes, cr } of lineBuffer.append(chunk, bytes => checkEventBytes(eventBytes + bytes))) {
+				if (line === null) {
+					if (bytes === 0) {
+						crBoundaryBytes = undefined;
+						if (heldEvent) {
+							yield heldEvent;
+							heldEvent = undefined;
+						}
+						continue;
+					}
+					// The LF of CRLF still counts toward the original byte budget,
+					// including when the CR already dispatched the event.
+					if (crBoundaryBytes !== undefined) checkEventBytes(crBoundaryBytes + bytes);
+					else {
+						eventBytes += bytes;
+						checkEventBytes(eventBytes);
+					}
+					crBoundaryBytes = undefined;
+					continue;
+				}
+				crBoundaryBytes = undefined;
+				eventBytes += bytes;
+				checkEventBytes(eventBytes);
 				const event = pushSseLine(line, state);
-				if (line.length === 0 || (line.length === 1 && line[0] === 0x0d)) eventBytes = 0;
-				if (event) yield event;
+				if (line.length === 0) {
+					if (cr) crBoundaryBytes = eventBytes;
+					eventBytes = 0;
+				}
+				if (event) {
+					// At an exact-limit CR boundary, only a following LF can
+					// put this event over budget. Resolve that byte before delivery.
+					if (crBoundaryBytes !== undefined && options?.maxEventBytes === crBoundaryBytes) heldEvent = event;
+					else yield event;
+				}
 			}
+			checkEventBytes(eventBytes + lineBuffer.pendingBytes);
 		}
+		if (heldEvent) yield heldEvent;
 		// Treat any trailing partial line (no terminating LF) as a complete line.
-		if (!lineBuffer.isEmpty) {
+		if (lineBuffer.pendingBytes > 0) {
 			const tail = lineBuffer.flush();
 			if (tail) {
-				lineBuffer.clear();
 				const event = pushSseLine(tail, state);
 				if (event) yield event;
 			}

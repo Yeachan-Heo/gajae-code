@@ -6,18 +6,14 @@ import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/p
 import { detectOpenAICompat, resolveOpenAICompat } from "../src/providers/openai-completions-compat";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
 import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
+import { createAbortedSignal } from "./helpers";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 
 afterEach(() => {
 	global.fetch = originalFetch;
 });
-
-function createAbortedSignal(): AbortSignal {
-	const controller = new AbortController();
-	controller.abort();
-	return controller.signal;
-}
 
 function toObject(value: unknown): object | null {
 	return typeof value === "object" && value !== null ? value : null;
@@ -41,15 +37,6 @@ function getNestedString(value: unknown, key: string): string | undefined {
 	const property = Reflect.get(obj, key);
 	return typeof property === "string" ? property : undefined;
 }
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function createMockFetch(events: unknown[]): typeof fetch {
 	async function mockFetch(_input: string | URL | Request, _init?: RequestInit): Promise<Response> {
 		return createSseResponse(events);
@@ -117,12 +104,6 @@ describe("reasoning models avoid incompatible forced tool_choice", () => {
 		tools: [echoTool],
 	};
 
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
-
 	function kimiOpencodeGoModel(id = "kimi-k2.6"): Model<"openai-completions"> {
 		return {
 			...getBundledModel("openai", "gpt-4o-mini"),
@@ -155,7 +136,7 @@ describe("reasoning models avoid incompatible forced tool_choice", () => {
 		streamOpenAICompletions(model, ctx, {
 			...opts,
 			apiKey: "test-key",
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			onPayload: payload => resolve(payload),
 		});
 		return promise;
@@ -277,12 +258,6 @@ describe("OpenCode Go DeepSeek omits unsupported tool_choice", () => {
 		tools: [echoTool],
 	};
 
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
-
 	async function capturePayload(
 		opts: Parameters<typeof streamOpenAICompletions>[2],
 	): Promise<Record<string, unknown>> {
@@ -290,7 +265,7 @@ describe("OpenCode Go DeepSeek omits unsupported tool_choice", () => {
 		streamOpenAICompletions(getBundledModel("opencode-go", "deepseek-v4-pro"), context, {
 			...opts,
 			apiKey: "test-key",
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			onPayload: payload => resolve(payload),
 		});
 		return (await promise) as Record<string, unknown>;
@@ -2153,5 +2128,104 @@ describe("direct DeepSeek chat-template token stripping", () => {
 
 		expect(text).toBe("去改前端交互描述：让我找到对应位置并修改。");
 		expect(text).not.toContain("<｜Assistant｜>");
+	});
+});
+
+// #911
+describe("Mistral typed content parts assemble into visible text", () => {
+	const model: Model<"openai-completions"> = {
+		...getBundledModel("mistral", "mistral-medium-2604"),
+	};
+
+	it("normalizes array-of-parts delta.content into the assembled text without [object Object]", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { content: [{ type: "text", text: "Hello" }] },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { content: [{ type: "text", text: ", world" }] },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => (b as { text: string }).text)
+			.join("");
+
+		expect(text).not.toContain("[object Object]");
+		expect(text).toBe("Hello, world");
+	});
+
+	it("handles mixed string and array-of-parts content shapes within one stream", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "plain " } }],
+			},
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: {
+							content: [
+								{ type: "text", text: "and " },
+								{ type: "text", text: "typed" },
+							],
+						},
+					},
+				],
+			},
+			{
+				id: "chatcmpl-mistral-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => (b as { text: string }).text)
+			.join("");
+
+		expect(text).not.toContain("[object Object]");
+		expect(text).toBe("plain and typed");
 	});
 });

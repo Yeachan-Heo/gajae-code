@@ -163,7 +163,7 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
 - `enumerateRenamePairs()` returns one `{oldUri,newUri}` pair for a file or walks every regular file in a directory tree.
 - Sends `workspace/willRenameFiles` with `{ files: pairs }` to every non-custom LSP server; collects returned `WorkspaceEdit`s and server notes.
 - Preview mode (`apply === false`) only formats those edits.
-- Apply mode runs each returned `WorkspaceEdit`, renames the source path on disk, sends `textDocument/didClose` for every renamed open file, deletes those `openFiles` entries, then sends `workspace/didRenameFiles`.
+- Apply mode runs each returned `WorkspaceEdit`, renames the source path on disk, sends `textDocument/didClose` for every renamed open file, deletes those `openFiles` entries and their cached diagnostics, then sends `workspace/didRenameFiles`.
 
 **Output text**
 - Preview: `Rename preview: <file-count label> → <dest>` plus per-server edit summaries and optional server notes.
@@ -259,16 +259,19 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
   - Caches LSP clients per `command:cwd`, with `pendingRequests`, `diagnostics`, `openFiles`, `serverCapabilities`, and project-load state.
   - Caches custom linter clients by `serverName:cwd`.
   - Updates client `lastActivity`; optional idle-timeout cleanup is driven by `setIdleTimeout()`.
+  - Each `openFiles` entry records `lastUsedAt` (open, sync, refresh, save). Before sending a `didOpen`, the client sends `didClose` for documents unused for `OPEN_FILE_IDLE_MS` that have no in-flight file operation, and drops their cached diagnostics. Whether a server then frees memory is up to the server: typescript-language-server unloads the tsconfig project of the closed documents once none of its documents is open, and other servers are not guaranteed to release anything on `didClose`. Refreshing a tracked document whose file was deleted also closes it.
 - Background work / cancellation
   - Every request has an abortable timeout signal.
   - Aborting an in-flight LSP request sends `$/cancelRequest`.
   - Background message readers persist for each live client until process exit/shutdown.
+  - Stopping a client sends `shutdown`, then the `exit` notification, and waits up to `5_000ms` for the server to exit on its own before disposing its process group.
 
 ## Limits & Caps
 - Tool timeout clamp: default `20`, min `5`, max `60` seconds — `TOOL_TIMEOUTS.lsp` in `packages/coding-agent/src/tools/tool-timeouts.ts`.
 - LSP request default timeout inside `sendRequest()`: `30_000ms` — `DEFAULT_REQUEST_TIMEOUT_MS` in `packages/coding-agent/src/lsp/client.ts`.
 - Warmup initialize timeout default: `5_000ms` — `WARMUP_TIMEOUT_MS` in `packages/coding-agent/src/lsp/client.ts`.
 - Project-load wait fallback: `15_000ms` — `PROJECT_LOAD_TIMEOUT_MS` in `packages/coding-agent/src/lsp/client.ts`.
+- Open-document idle window: `5 min` — `OPEN_FILE_IDLE_MS` in `packages/coding-agent/src/lsp/client.ts`.
 - Idle-client sweep interval when enabled: `60_000ms` — `IDLE_CHECK_INTERVAL_MS` in `packages/coding-agent/src/lsp/client.ts`.
 - Diagnostic message output cap: first `50` messages — `DIAGNOSTIC_MESSAGE_LIMIT` in `packages/coding-agent/src/lsp/index.ts`.
 - Single-file diagnostics wait: `3_000ms` — `SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS`.

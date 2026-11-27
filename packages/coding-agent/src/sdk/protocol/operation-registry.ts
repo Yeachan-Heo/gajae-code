@@ -71,175 +71,225 @@ function dispositions(
 	return { ...genericSafe, ...overrides };
 }
 
+// IDs are permanent identities, not tuple positions; omitted operations leave gaps.
 const controls = [
-	["turn.prompt", "Submit a new turn prompt."],
-	["turn.steer", "Steer the active turn."],
-	["turn.follow_up", "Queue a follow-up turn."],
-	["turn.abort", "Abort the active turn."],
-	["turn.abort_and_prompt", "Abort the active turn and submit a replacement prompt."],
-	["ask.answer", "Answer an outstanding user question."],
-	["workflow.gate_answer", "Answer a workflow gate."],
-	["workflow.plan_approve", "Approve a workflow plan."],
-	["skill.invoke", "Invoke a skill."],
-	["mode.plan.set", "Set plan mode."],
-	["mode.goal.operate", "Operate goal mode."],
-	["todo.replace", "Replace the session todo list."],
-	["model.set", "Set the active model, optionally promoting its effective thinking level as the default."],
-	["model.cycle", "Cycle the active model."],
-	["thinking.set", "Set thinking level."],
-	["thinking.cycle", "Cycle thinking level."],
-	["permission_mode.set", "Set permission mode."],
-	["queue.steering_mode.set", "Set steering queue mode."],
-	["queue.follow_up_mode.set", "Set follow-up queue mode."],
-	["queue.tool_interrupt_policy.set", "Set whether a steer aborts or finishes in-flight tools."],
-	["compaction.run", "Run context compaction."],
-	["compaction.auto.set", "Set automatic compaction."],
-	["retry.auto.set", "Set automatic retry."],
-	["retry.abort", "Abort retry backoff."],
-	["bash.execute", "Execute managed bash."],
-	["bash.abort", "Abort managed bash."],
-	["session.new", "Create a session."],
-	["session.fork", "Fork the active session."],
-	["session.resume", "Resume a session."],
-	["session.close", "Close the active session."],
-	["session.switch", "Switch the active session."],
-	["session.branch", "Create a session branch."],
-	["session.rename", "Rename a session."],
-	["session.handoff", "Hand off a session."],
-	["session.export_html", "Export session HTML."],
-	["config.patch", "Patch runtime configuration; secret fields are rejected outside secure local paths."],
-	["runtime.reload", "Reload allowlisted runtime components."],
-	["auth.login", "Begin secure authentication login."],
-	["host_tools.register", "Register a host-tool callback provider."],
-	["host_uri.register", "Register a host-URI callback provider."],
-	["service_tier.set", "Set service tier intent."],
-	["tools.active.set", "Replace the active tool set."],
-	["queue.message.remove", "Remove a queued message by stable ID."],
-	["queue.message.move", "Move a queued message by stable ID."],
-	["queue.message.update", "Update a queued message by stable ID."],
-	["extension.set_enabled", "Enable or disable an extension."],
-	["context.clear", "Clear active conversation context."],
-	["session.delete", "Permanently delete a saved session."],
-	["session.cwd.move", "Move a session working directory."],
-	["retry.last", "Retry the last interrupted or failed turn."],
-	["retry.now", "Immediately retry pending backoff."],
-	["bash.background", "Move active managed bash to the background."],
-	["model.profile.set", "Activate a model profile for the current session."],
-	["turn.image.begin", "Begin a bounded host-owned image upload."],
-	["turn.image.append", "Append a canonical base64 image chunk."],
-	["turn.image.finish", "Verify and stage a complete image."],
-	["turn.image.discard", "Discard an unfinished or staged image."],
+	["C01", "turn.prompt", "Submit a new turn prompt."],
+	["C02", "turn.steer", "Steer the active turn."],
+	["C03", "turn.follow_up", "Queue a follow-up turn."],
+	["C04", "turn.abort", "Abort the active turn."],
+	[
+		"C05",
+		"turn.abort_and_prompt",
+		"Abort the requester's own active turn and submit a replacement prompt; otherwise queue a steer bound to the selected run, never a successor.",
+	],
+	["C06", "ask.answer", "Answer an outstanding user question."],
+	["C07", "workflow.gate_answer", "Answer a workflow gate."],
+	["C08", "workflow.plan_approve", "Approve a workflow plan."],
+	["C09", "skill.invoke", "Invoke a skill."],
+	["C10", "mode.plan.set", "Set plan mode."],
+	["C11", "mode.goal.operate", "Operate goal mode."],
+	["C12", "todo.replace", "Replace the session todo list."],
+	["C13", "model.set", "Set the active model, optionally promoting its effective thinking level as the default."],
+	["C14", "model.cycle", "Cycle the active model."],
+	["C15", "thinking.set", "Set thinking level."],
+	["C16", "thinking.cycle", "Cycle thinking level."],
+	["C17", "permission_mode.set", "Set permission mode."],
+	["C18", "queue.steering_mode.set", "Set steering queue mode."],
+	["C19", "queue.follow_up_mode.set", "Set follow-up queue mode."],
+	["C20", "queue.tool_interrupt_policy.set", "Set whether a steer aborts or finishes in-flight tools."],
+	["C21", "compaction.run", "Run context compaction."],
+	["C22", "compaction.auto.set", "Set automatic compaction."],
+	["C23", "retry.auto.set", "Set automatic retry."],
+	["C24", "retry.abort", "Abort retry backoff."],
+	["C25", "bash.execute", "Execute managed bash."],
+	["C26", "bash.abort", "Abort managed bash."],
+	["C27", "session.new", "Create a session."],
+	["C28", "session.fork", "Fork the active session."],
+	["C29", "session.resume", "Resume a session."],
+	["C30", "session.close", "Close the active session."],
+	["C31", "session.switch", "Switch the active session."],
+	["C32", "session.branch", "Create a session branch."],
+	["C33", "session.rename", "Rename a session."],
+	["C34", "session.handoff", "Hand off a session."],
+	["C35", "session.export_html", "Export session HTML."],
+	["C36", "config.patch", "Patch runtime configuration; secret fields are rejected outside secure local paths."],
+	["C37", "runtime.reload", "Reload allowlisted runtime components."],
+	["C38", "auth.login", "Begin secure authentication login."],
+	["C39", "host_tools.register", "Register a host-tool callback provider."],
+	["C40", "host_uri.register", "Register a host-URI callback provider."],
+	["C41", "service_tier.set", "Set service tier intent."],
+	["C42", "tools.active.set", "Replace the active tool set."],
+	["C43", "queue.message.remove", "Remove a queued message by stable ID."],
+	["C44", "queue.message.move", "Move a queued message by stable ID."],
+	["C45", "queue.message.update", "Update a queued message by stable ID."],
+	["C46", "extension.set_enabled", "Enable or disable an extension."],
+	["C47", "context.clear", "Clear active conversation context."],
+	["C48", "session.delete", "Permanently delete a saved session."],
+	["C49", "session.cwd.move", "Move a session working directory."],
+	["C50", "retry.last", "Retry the last interrupted or failed turn."],
+	["C51", "retry.now", "Immediately retry pending backoff."],
+	["C52", "bash.background", "Move active managed bash to the background."],
+	["C53", "model.profile.set", "Activate a model profile for the current session."],
+	["C54", "turn.image.begin", "Begin a bounded host-owned image upload."],
+	["C55", "turn.image.append", "Append a canonical base64 image chunk."],
+	["C56", "turn.image.finish", "Verify and stage a complete image."],
+	["C57", "turn.image.discard", "Discard an unfinished or staged image."],
+	["C58", "permission.channel.set", "Enable or disable session-owned external permission polling."],
+	["C59", "permission.respond", "Answer a pending external permission request."],
+	["C60", "btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
+	["C69", "operator.execute", "Admit session-owned Bash or Python execution with observable terminal results."],
+	["C70", "operator.cancel", "Request cancellation of one exact operator execution."],
+	["C72", "activity.cancel", "Cancel an exact owner-scoped activity when its backend supports cancellation."],
+	["C73", "activity.pause", "Pause an exact resumable detached task."],
+	["C74", "activity.resume", "Resume an exact detached task, optionally with a message."],
+	["C75", "activity.delete", "Delete an exact activity when its backend supports deletion."],
+	["C76", "activity.acknowledge", "Acknowledge the failure latch for an exact observed activity snapshot."],
+	["C77", "mcp.suspend", "Suspend an exact factory-manager MCP server target."],
+	["C78", "mcp.resume", "Resume an exact factory-manager MCP server target."],
+	["C79", "mcp.reconnect", "Reconnect an exact factory-manager MCP server target."],
+	["C80", "btw.open", "Capture frozen side context and optionally admit its first question."],
+	["C81", "btw.submit", "Admit a follow-up in an exact frozen side conversation."],
+	["C82", "btw.cancel", "Request cancellation of an exact side turn."],
+	["C83", "btw.close", "Retire an exact side conversation without touching the main transcript."],
+	["C61", "model.role.set", "Set or clear a session-owned task-role model selection."],
+	["C62", "model.select", "Select a concrete model with explicit session or global default scope."],
+	["C63", "model.profile.select", "Select a profile with explicit session or global default scope."],
+	["C64", "config.write", "Validate and write configuration with explicit session, global, or project scope."],
+	["C65", "auth.start", "Start a secure-local provider authorization flow."],
+	["C66", "auth.answer", "Answer an exact secure-local authorization challenge."],
+	["C67", "auth.cancel", "Cancel an exact secure-local authorization flow."],
+	["C68", "auth.apiKey.store", "Store a provider API key through secure-local authority."],
+	["C84", "session.revise", "Broker-authorized same-session revision executor; not a public endpoint control."],
 ] as const;
 
 const globals = [
-	["session.list", "List saved sessions."],
-	["session.get_endpoint", "Get the session endpoint credential for a local machine attachment."],
-	["session.create", "Create a saved session."],
-	["session.fork", "Fork a saved session."],
-	["session.resume", "Resume a saved session."],
-	["session.close", "Close a saved session."],
-	["session.delete", "Delete a saved session."],
-	["session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
-	["session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
-	["session.lookup", "Read a prior session.create outcome without replaying it."],
-] as const;
-
-const queries = [
-	["transcript.list", "List transcript entries."],
-	["transcript.body", "Read transcript body."],
-	["context.get", "Read session context."],
-	["goal.list/get", "List or get goals."],
-	["todo.list", "List todos."],
-	["diff.list_files", "List changed files."],
-	["diff.list_hunks", "List diff hunks."],
-	["diff.read_hunk", "Read a diff hunk."],
-	["usage.get", "Read usage."],
-	["models.list/current", "List models or read the current model."],
-	["skill.list/state", "List skills or read skill state."],
-	["workflow.gates.list", "List workflow gates."],
-	["config.list/get", "List or read non-secret configuration."],
-	["session.metadata", "Read session metadata."],
-	["session.stats", "Read session statistics."],
-	["session.branch_candidates", "List branch candidates."],
-	["session.last_assistant", "Read the last assistant message."],
-	["runtime.capabilities", "Read runtime capabilities."],
-	["auth.providers", "List authentication provider status without credentials."],
-	["tools.list", "List tools."],
-	["queue.messages.list", "List queued messages."],
-	["extensions.list", "List extensions without secrets."],
-	["resource.body", "Read a bounded resource continuation."],
-	["artifact.read", "Read a bounded artifact range."],
-	["runtime.jobs.list", "List managed jobs."],
-	["turn.result", "Read the authoritative durable result of a submitted turn by command/turn IDs or clientRef."],
+	["G01", "session.list", "List saved sessions."],
+	["G02", "session.get_endpoint", "Get the session endpoint credential for a local machine attachment."],
+	["G03", "session.create", "Create a saved session."],
+	["G04", "session.fork", "Fork a saved session."],
+	["G05", "session.resume", "Resume a saved session."],
+	["G06", "session.close", "Close a saved session."],
+	["G07", "session.delete", "Delete a saved session."],
+	["G08", "session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
+	["G09", "session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
+	["G10", "session.lookup", "Read a prior session.create outcome without replaying it."],
 	[
-		"models.profiles.list",
-		"List the effective embedded, signed-registry, and configured model profiles for this session.",
-	],
-	["providers.list/active", "List active providers."],
-	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
-	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
-	[
-		"session.progress",
-		"Read the read-only project progress snapshot (gjc.project_progress.v1) derived from durable session state.",
+		"G11",
+		"session.revise",
+		"Revise a user entry in the same session through Broker authority, preserving sibling history.",
 	],
 ] as const;
 
 // Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
-const queryIds = [
-	"Q01",
-	"Q02",
-	"Q03",
-	"Q04",
-	"Q05",
-	"Q06",
-	"Q07",
-	"Q08",
-	"Q09",
-	"Q10",
-	"Q11",
-	"Q12",
-	"Q13",
-	"Q14",
-	"Q15",
-	"Q16",
-	"Q17",
-	"Q18",
-	"Q19",
-	"Q20",
-	"Q21",
-	"Q22",
-	"Q23",
-	"Q24",
-	"Q25",
-	"Q26",
-	"Q27",
-	"Q29",
-	"Q30",
-	"Q31",
-	"Q32",
+const queries = [
+	["Q01", "transcript.list", "List transcript entries."],
+	["Q02", "transcript.body", "Read transcript body."],
+	["Q03", "context.get", "Read session context."],
+	["Q04", "goal.list/get", "List or get goals."],
+	["Q05", "todo.list", "List todos."],
+	["Q06", "diff.list_files", "List changed files."],
+	["Q07", "diff.list_hunks", "List diff hunks."],
+	["Q08", "diff.read_hunk", "Read a diff hunk."],
+	["Q09", "usage.get", "Read usage."],
+	["Q10", "models.list/current", "List models or read the current model."],
+	["Q11", "skill.list/state", "List skills or read skill state."],
+	["Q12", "workflow.gates.list", "List workflow gates."],
+	["Q13", "config.list/get", "List or read non-secret configuration."],
+	["Q14", "session.metadata", "Read session metadata."],
+	["Q15", "session.stats", "Read session statistics."],
+	["Q16", "session.branch_candidates", "List branch candidates."],
+	["Q17", "session.last_assistant", "Read the last assistant message."],
+	["Q18", "runtime.capabilities", "Read runtime capabilities."],
+	["Q19", "auth.providers", "List authentication provider status without credentials."],
+	["Q20", "tools.list", "List tools."],
+	["Q21", "queue.messages.list", "List queued messages."],
+	["Q22", "extensions.list", "List extensions without secrets."],
+	["Q23", "resource.body", "Read a bounded resource continuation."],
+	["Q24", "artifact.read", "Read a bounded artifact range."],
+	["Q25", "runtime.jobs.list", "List managed jobs."],
+	[
+		"Q26",
+		"turn.result",
+		"Read the authoritative durable result of a submitted turn by command/turn IDs or clientRef.",
+	],
+	[
+		"Q27",
+		"models.profiles.list",
+		"List the effective embedded, signed-registry, and configured model profiles for this session.",
+	],
+	["Q29", "providers.list/active", "List active providers."],
+	["Q30", "session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
+	["Q31", "turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
+	[
+		"Q32",
+		"session.progress",
+		"Read the read-only project progress snapshot (gjc.project_progress.v1) derived from durable session state.",
+	],
+	["Q33", "permission.requests.list", "Read the live session-owned pending external permission requests."],
+	["Q34", "ask.requests.list", "List pending ordinary interactive ask requests and their answer schemas."],
+	["Q35", "model.roles.get", "Observe configured and effective task-role models and their selection source."],
+	[
+		"Q36",
+		"auth.providers.status",
+		"Read enrollment support and credential-free provider status under secure-local authority.",
+	],
+	["Q37", "auth.status", "Read one provider enrollment status under secure-local authority."],
+	["Q38", "auth.read", "Read an exact secure-local authorization flow and ephemeral challenge."],
+	["Q39", "operator.read", "Read bounded operator output deltas and terminal status by execution identity."],
+	["Q40", "activity.snapshot", "Read bounded owner-scoped jobs, detached tasks, cron entries and failure state."],
+	["Q41", "activity.detail", "Read supported bounded output for an exact owner-scoped activity."],
+	["Q42", "mcp.snapshot", "Read bounded MCP states and supported controls with opaque target references."],
+	["Q46", "btw.read", "Read bounded side history and cursor-scoped streamed deltas."],
+	["Q43", "composer.catalog", "Observe the session's effective prompt, skill and supported slash-command catalog."],
+	["Q44", "composer.complete", "Compute session-owned completion replacement text and cursor."],
+	["Q45", "session.info", "Read a bounded selected-session information projection."],
+	["Q47", "diff.scopes", "List installed SDK diff observation scopes."],
+	["Q48", "diff.summary", "Capture a bounded working-tree diff snapshot including staged and untracked files."],
+	["Q49", "diff.file", "Read a bounded file patch by its frozen snapshot reference."],
 ] as const;
-
-function queryId(index: number): string {
-	const id = queryIds[index];
-	if (!id) throw new Error("Query registry IDs are out of sync with query definitions.");
-	return id;
-}
 
 const queryAliases: Readonly<Record<string, readonly string[]>> = {
 	Q26: [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS],
 };
 
 const reverse = [
-	["terminal.create/output/release/wait", "Direct terminal lifecycle requests."],
-	["filesystem.read/write", "Direct filesystem read and write requests."],
-	["permission.request", "Request a permission decision."],
-	["ui.select/confirm/input/editor/open_url", "Request host UI interaction."],
-	["host_tool.invoke/cancel/update/result", "Direct host-tool callback requests."],
-	["host_uri.read/write/cancel/result", "Direct host-URI callback requests."],
+	["R01", "terminal.create/output/release/wait", "Direct terminal lifecycle requests."],
+	["R02", "filesystem.read/write", "Direct filesystem read and write requests."],
+	["R03", "permission.request", "Request a permission decision."],
+	["R04", "ui.select/confirm/input/editor/open_url", "Request host UI interaction."],
+	["R05", "host_tool.invoke/cancel/update/result", "Direct host-tool callback requests."],
+	["R06", "host_uri.read/write/cancel/result", "Direct host-URI callback requests."],
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["C54", "C55", "C56", "C57"].includes(id))
+	if (["C38", "C65", "C66", "C67", "C68", "C84"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
+	if (["C80", "C81", "C82", "C83"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
+	if (["C61", "C62", "C63", "C64", "C69", "C70", "C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
+	if (["C54", "C55", "C56", "C57", "C58", "C59"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
 			discord: "prohibited",
@@ -258,15 +308,6 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 			daemonCli: "prohibited",
 		});
 	if (id === "C52") return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
-	if (id === "C38")
-		return dispositions({
-			telegram: "prohibited",
-			discord: "prohibited",
-			slack: "prohibited",
-			mcp: "prohibited",
-			acp: "provider_only",
-			daemonCli: "machine_only",
-		});
 	if (["C39", "C40"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -280,6 +321,60 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 }
 
 function controlErrors(id: string): string[] {
+	if (["C69", "C70"].includes(id))
+		return [
+			"invalid_input",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"not_found",
+			"already_terminal",
+			"stale_cursor",
+			"backend_failure",
+		];
+	if (["C72", "C73", "C74", "C75", "C76", "C77", "C78", "C79"].includes(id))
+		return [
+			"invalid_input",
+			"invalid_owner",
+			"disposed",
+			"not_found",
+			"stale_generation",
+			"read_only",
+			"already_terminal",
+			"no_live_job",
+			"control_in_progress",
+			"not_running",
+			"no_live_handle",
+			"already_running",
+			"already_queued",
+			"context_unavailable",
+			"no_runner",
+			"resume_failed",
+			"owner_shutdown_in_progress",
+			"stale_session",
+			"session_transitioning",
+			"stale_target",
+			"busy",
+			"unavailable",
+			"unsupported",
+			"unknown_effect",
+			"backend_failure",
+		];
+	if (["C80", "C81"].includes(id))
+		return ["invalid_input", "resource_gone", "busy", "unknown_effect", "redaction_failed"];
+	if (["C82", "C83"].includes(id)) return ["invalid_input", "resource_gone", "busy"];
+	if (id === "C84")
+		return [
+			"invalid_input",
+			"busy",
+			"resource_gone",
+			"revision_cancelled",
+			"revision_not_applied",
+			"revision_failed",
+			"provider_failed",
+		];
+
 	const errors: Record<string, string[]> = {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
 		// refuses a session with no selected model before admission. The code is
@@ -293,9 +388,17 @@ function controlErrors(id: string): string[] {
 		],
 		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
-		C06: ["action_claimed"],
+		C06: ["stale_request"],
 		C07: ["action_claimed", "terminal_uncertain"],
-		C05: ["invalid_request", "busy", "model_not_selected"],
+		C05: [
+			"invalid_request",
+			"busy",
+			"model_not_selected",
+			"turn_not_active",
+			"client_ref_conflict",
+			"reconciliation_capacity",
+			"reconciliation_persist_failed",
+		],
 		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],
@@ -317,6 +420,20 @@ function controlErrors(id: string): string[] {
 		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
+		C60: ["invalid_input", "busy", "unavailable"],
+		C61: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed"],
+		C62: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
+		C63: ["invalid_input", "stale_preferences", "preference_busy", "preference_failed", "persistence_unavailable"],
+		C64: [
+			"invalid_input",
+			"secret_field_forbidden",
+			"stale_preferences",
+			"preference_busy",
+			"persistence_unavailable",
+			"preference_failed",
+		],
+		C58: ["invalid_input", "provider_lease_conflict"],
+		C59: ["invalid_input", "resource_gone"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }
@@ -339,14 +456,67 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["Q36", "Q37", "Q38"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
+	if (["Q44", "Q45", "Q33", "Q39", "Q40", "Q41", "Q42", "Q47", "Q48", "Q49"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "machine_only",
+		});
 	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31", "Q32"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }
 
+function queryErrors(id: string): string[] {
+	const common = [
+		"invalid_input",
+		"resource_gone",
+		"unavailable",
+		"operation_not_session_owned",
+		"response_too_large",
+	];
+	if (["Q36", "Q37", "Q38"].includes(id)) return [...common, "operation_prohibited", "internal"];
+	if (id === "Q39") return [...common, ...controlErrors("C69")];
+	if (["Q40", "Q41", "Q42"].includes(id)) return [...common, ...controlErrors("C72")];
+	if (id === "Q46") return [...common, "busy"];
+	if (["Q43", "Q44", "Q45"].includes(id))
+		return [...common, "disposed", "stale_session", "session_transitioning", "backend_failure"];
+	if (["Q06", "Q07", "Q08", "Q47", "Q48", "Q49"].includes(id))
+		return [
+			...common,
+			"not_git_repository",
+			"diff_too_large",
+			"git_failure",
+			"busy",
+			"disposed",
+			"stale_session",
+			"session_transitioning",
+			"stale_ref",
+		];
+	if (id === "Q35") return [...common, "stale_preferences", "preference_busy", "preference_failed"];
+	return id === "Q29"
+		? ["invalid_request", "resource_gone", "internal"]
+		: id === "Q27"
+			? ["invalid_request", "resource_gone", "model_profile_registry_error"]
+			: id === "Q32"
+				? ["invalid_request", "resource_gone", "unavailable"]
+				: ["invalid_request", "resource_gone"];
+}
+
 export const OPERATIONS: readonly Operation[] = [
-	...controls.map(([sdkId, description], index) => {
-		const id = `C${String(index + 1).padStart(2, "0")}`;
+	...controls.map(([id, sdkId, description]) => {
 		return {
 			id,
 			sdkId,
@@ -354,7 +524,25 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52"] as string[]).includes(id)
+				: (
+							[
+								"C25",
+								"C52",
+								"C59",
+								"C60",
+								"C38",
+								"C65",
+								"C66",
+								"C67",
+								"C68",
+								"C69",
+								"C70",
+								"C80",
+								"C81",
+								"C82",
+								"C83",
+							] as string[]
+						).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),
@@ -363,8 +551,7 @@ export const OPERATIONS: readonly Operation[] = [
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),
-	...globals.map(([sdkId, description], index) => {
-		const id = `G${String(index + 1).padStart(2, "0")}`;
+	...globals.map(([id, sdkId, description]) => {
 		return {
 			id,
 			sdkId,
@@ -372,78 +559,91 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: "idempotent" as const,
 			errorCodes:
-				id === "G02"
-					? ["endpoint_credential_forbidden"]
-					: id === "G10"
-						? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
-						: ["G03", "G04", "G05"].includes(id)
-							? [
-									"invalid_request",
-									"unknown_model_profile",
-									"model_profile_registry_error",
-									"legacy_lifecycle_ambiguous",
-								]
-							: ["G06", "G07", "G08"].includes(id)
-								? ["invalid_request", "legacy_lifecycle_ambiguous"]
-								: ["invalid_request"],
+				id === "G11"
+					? [
+							"invalid_input",
+							"busy",
+							"resource_gone",
+							"operation_prohibited",
+							"idempotency_conflict",
+							"revision_cancelled",
+							"revision_not_applied",
+							"revision_failed",
+							"provider_failed",
+						]
+					: id === "G02"
+						? ["endpoint_credential_forbidden"]
+						: id === "G10"
+							? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
+							: ["G03", "G04", "G05"].includes(id)
+								? [
+										"invalid_request",
+										"unknown_model_profile",
+										"model_profile_registry_error",
+										"legacy_lifecycle_ambiguous",
+									]
+								: ["G06", "G07", "G08"].includes(id)
+									? ["invalid_request", "legacy_lifecycle_ambiguous"]
+									: ["invalid_request"],
 			adapterDispositions:
-				id === "G02"
+				id === "G11"
 					? dispositions({
 							telegram: "prohibited",
 							discord: "prohibited",
 							slack: "prohibited",
 							mcp: "prohibited",
-							acp: "machine_only",
+							acp: "prohibited",
 							daemonCli: "machine_only",
 						})
-					: id === "G10"
+					: id === "G02"
 						? dispositions({
 								telegram: "prohibited",
 								discord: "prohibited",
 								slack: "prohibited",
 								mcp: "prohibited",
-								acp: "prohibited",
-								daemonCli: "generic_safe",
+								acp: "machine_only",
+								daemonCli: "machine_only",
 							})
-						: id === "G09"
+						: id === "G10"
 							? dispositions({
 									telegram: "prohibited",
 									discord: "prohibited",
 									slack: "prohibited",
 									mcp: "prohibited",
 									acp: "prohibited",
-									daemonCli: "prohibited",
+									daemonCli: "generic_safe",
 								})
-							: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
-								? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-								: dispositions(),
+							: id === "G09"
+								? dispositions({
+										telegram: "prohibited",
+										discord: "prohibited",
+										slack: "prohibited",
+										mcp: "prohibited",
+										acp: "prohibited",
+										daemonCli: "prohibited",
+									})
+								: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
+									? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
+									: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),
-	...queries.map(([sdkId, description], index) => {
-		const id = queryId(index);
+	...queries.map(([id, sdkId, description]) => {
 		return {
 			id,
 			sdkId,
 			kind: "query" as const,
 			description,
 			idempotency: "idempotent" as const,
-			errorCodes:
-				id === "Q29"
-					? ["invalid_request", "resource_gone", "internal"]
-					: id === "Q27"
-						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
-						: id === "Q32"
-							? ["invalid_request", "resource_gone", "unavailable"]
-							: ["invalid_request", "resource_gone"],
+			errorCodes: [...new Set(queryErrors(id))],
 			continuityClass: queryContinuityClass(id),
 			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),
-	...reverse.map(([sdkId, description], index) => ({
-		id: `R${String(index + 1).padStart(2, "0")}`,
+	...reverse.map(([id, sdkId, description]) => ({
+		id,
 		sdkId,
 		kind: "reverse" as const,
 		description,

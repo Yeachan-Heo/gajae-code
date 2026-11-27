@@ -363,6 +363,27 @@ describe("fallback transport facts", () => {
 		expect(classify({ "retry-after": past })).toEqual({ class: "rate_limit", retryAfterMs: 0 });
 	});
 
+	it("marks a typed parallel-request saturation 429 as concurrency-limited", () => {
+		// Shape of an OpenAI SDK APIError for a relay that caps requests in flight.
+		const saturated = Object.assign(new Error("429 Your account can run 5 requests at once"), {
+			status: 429,
+			headers: { "retry-after": "1" },
+			error: { type: "rate_limit_error", code: "session_limit_reached", session_limit: 5 },
+		});
+		expect(classifyFallbackTrigger(transportFailureFacts(saturated))).toEqual({
+			class: "rate_limit",
+			retryAfterMs: 1000,
+			concurrencyLimited: true,
+		});
+		expect(
+			classifyFallbackTrigger({ kind: "transport", status: 429, openaiErrorCode: "rate_limit_exceeded" }),
+		).toEqual({ class: "rate_limit" });
+		// A concurrency code never upgrades a non-rate-limit failure.
+		expect(
+			classifyFallbackTrigger({ kind: "transport", status: 503, openaiErrorCode: "session_limit_reached" }),
+		).toEqual({ class: "server" });
+	});
+
 	it("does not classify application error text as a transport failure", () => {
 		for (const message of ["internal error", "rate limit exceeded", "invalid API key"]) {
 			expect(classifyFallbackTrigger(new Error(message))).toEqual({ class: "other" });

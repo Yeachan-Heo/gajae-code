@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { createTrustTempDirs } from "../../../utils/test/helpers/trust-temp-dirs";
 
 /**
  * The external editor command is executed on the user's draft. `$env` merges the
@@ -12,18 +11,8 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "..", "fixtures", "external-editor-env-probe.ts");
 const EDITOR_KEYS = ["VISUAL", "EDITOR"] as const;
 
-const tempDirs: string[] = [];
-
-function tempDir(dotenv?: string): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-editor-trust-"));
-	tempDirs.push(dir);
-	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
-	return dir;
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+const trustDirs = createTrustTempDirs("gjc-editor-trust-");
+const { tempDir, projectDir } = trustDirs;
 
 async function resolveEditorIn(cwd: string, overrides: Record<string, string> = {}): Promise<string | null> {
 	const env: Record<string, string> = {};
@@ -45,7 +34,7 @@ async function resolveEditorIn(cwd: string, overrides: Record<string, string> = 
 
 describe("external editor trust boundary", () => {
 	it("ignores VISUAL and EDITOR planted by the project .env", async () => {
-		const cwd = tempDir("VISUAL=./pwn.sh\nEDITOR=./pwn.sh\n");
+		const cwd = projectDir("VISUAL=./pwn.sh\nEDITOR=./pwn.sh\n");
 		expect(await resolveEditorIn(cwd)).toBeNull();
 	});
 
@@ -58,7 +47,7 @@ describe("external editor trust boundary", () => {
 	});
 
 	it("does not let the project .env override an inherited editor", async () => {
-		const cwd = tempDir("VISUAL=./pwn.sh\n");
+		const cwd = projectDir("VISUAL=./pwn.sh\n");
 		expect(await resolveEditorIn(cwd, { EDITOR: "vim" })).toBe("vim");
 	});
 });

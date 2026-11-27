@@ -49,7 +49,7 @@
 						"anyOf": [
 							{
 								"type": "string",
-								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$"
 							},
 							{
 								"type": "array",
@@ -59,14 +59,14 @@
 									"anyOf": [
 										{
 											"type": "string",
-											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$"
 										},
 										{
 											"type": "object",
 											"minProperties": 1,
 											"maxProperties": 1,
 											"propertyNames": {
-												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|org:\\S+|[^@\\s:]+@[^@\\s]+)$"
 											},
 											"additionalProperties": {
 												"type": "number",
@@ -94,6 +94,22 @@
 						"disabled"
 					],
 					"default": "copy-retain"
+				},
+				"ownership": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"off",
+								"observe",
+								"enforce"
+							],
+							"description": "Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything, enforce refuses to open a session another process holds.",
+							"default": "observe"
+						}
+					},
+					"additionalProperties": false
 				},
 				"resumeModelBehavior": {
 					"type": "string",
@@ -583,6 +599,17 @@
 			},
 			"additionalProperties": false
 		},
+		"recap": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Generate a short recap after completed turns for session listings. Uses the default model and may incur model usage; never adds recap text to the conversation.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"modelTags": {
 			"type": "object",
 			"additionalProperties": true,
@@ -843,13 +870,23 @@
 				},
 				"artifactTailBytes": {
 					"type": "number",
-					"description": "Amount of tail content kept inline when output spills to artifact",
+					"description": "Amount of tail content kept inline when a tool result spills to an artifact. The Bash tool uses `tools.bashOutputTailBytes` instead.",
 					"default": 20
 				},
 				"artifactHeadBytes": {
 					"type": "number",
-					"description": "Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+					"description": "Amount of head content kept inline alongside the tail when a tool result spills to an artifact (middle elision). 0 disables — keep tail only. The Bash tool uses `tools.bashOutputHeadBytes` instead.",
 					"default": 20
+				},
+				"bashOutputTailBytes": {
+					"type": "number",
+					"description": "Tail window the Bash tool keeps inline from command output; the full stream is saved as an artifact when storage is available. Deliberately small so callers prefer focused commands and the search/find tools.",
+					"default": 1
+				},
+				"bashOutputHeadBytes": {
+					"type": "number",
+					"description": "Head window the Bash tool keeps inline alongside the tail (middle elision) so the start of long command output stays visible. 0 keeps the tail only.",
+					"default": 0
 				},
 				"outputMaxColumns": {
 					"type": "number",
@@ -1427,6 +1464,10 @@
 				"circuitMaxCooldownMs": {
 					"type": "number",
 					"default": 1800000
+				},
+				"concurrencyWaitMs": {
+					"type": "number",
+					"default": 300000
 				}
 			},
 			"additionalProperties": false
@@ -1576,7 +1617,7 @@
 		},
 		"promptSuggestions": {
 			"type": "boolean",
-			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+			"description": "Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 			"default": false
 		},
 		"telemetry": {
@@ -2711,7 +2752,8 @@
 						"parallel",
 						"kagi",
 						"synthetic",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"default": "auto"
 				},
@@ -2736,7 +2778,8 @@
 							"parallel",
 							"kagi",
 							"synthetic",
-							"searxng"
+							"searxng",
+							"keenable"
 						]
 					},
 					"description": "Ordered fallback web search providers after the active model native provider",
@@ -3203,7 +3246,8 @@
 						"kagi",
 						"synthetic",
 						"parallel",
-						"searxng"
+						"searxng",
+						"keenable"
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"

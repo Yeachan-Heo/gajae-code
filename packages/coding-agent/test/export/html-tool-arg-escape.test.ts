@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
+import { TEMPLATE } from "../../src/export/html/template.generated";
 
 const templateJs = readFileSync(new URL("../../src/export/html/template.js", import.meta.url), "utf8");
 
@@ -22,8 +23,8 @@ function escapeHtml(text: unknown): string {
 	return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function load(name: string, extras: Record<string, unknown> = {}) {
-	const body = extractFunction(templateJs, name);
+function load(name: string, extras: Record<string, unknown> = {}, source = templateJs) {
+	const body = extractFunction(source, name);
 	const params = [
 		"escapeHtml",
 		"shortenPath",
@@ -67,11 +68,47 @@ describe("session HTML tool argument escaping", () => {
 		expect(html).toContain("&lt;img");
 	});
 
-	it("ships the escaped renderers in the generated export template", () => {
-		const generated = readFileSync(new URL("../../src/export/html/template.generated.ts", import.meta.url), "utf8");
-		expect(generated).toContain("escapeHtml(String(start))");
-		expect(generated).toContain("escapeHtml(String(args.line))");
-		expect(generated).toContain("rawStatus === 'completed'");
+	it("escapes tool arguments in the shipped export template", () => {
+		const pathDisplay = load("pathDisplay", {}, TEMPLATE) as (
+			filePath: string,
+			offset?: unknown,
+			limit?: unknown,
+		) => string;
+		expect(pathDisplay("src/app.ts", 10, 3)).toContain(":10-12");
+		const readHtml = pathDisplay("src/app.ts", "<img src=x onerror=alert(1)>", 1);
+		expect(readHtml).not.toContain("<img");
+		expect(readHtml).toContain("&lt;img src=x onerror=alert(1)&gt;");
+
+		const renderLsp = load("renderLsp", {}, TEMPLATE) as (name: string, args: Record<string, unknown>) => string;
+		const lspHtml = renderLsp("lsp", { action: "definition", line: "1</span><img src=x onerror=alert(1)>" });
+		expect(lspHtml).not.toContain("<img");
+		expect(lspHtml).toContain("1&lt;/span&gt;&lt;img src=x onerror=alert(1)&gt;");
+
+		const renderTodoWrite = load("renderTodoWrite", {}, TEMPLATE) as (
+			name: string,
+			args: Record<string, unknown>,
+			result: { details: { phases: Array<{ name: string; tasks: Array<{ status: string; content: string }> }> } },
+		) => string;
+		const todoHtml = renderTodoWrite(
+			"todo_write",
+			{},
+			{
+				details: {
+					phases: [
+						{
+							name: "A",
+							tasks: [
+								{ status: "completed", content: "ship" },
+								{ status: 'pending"><img src=x onerror=alert(1)>', content: "deploy" },
+							],
+						},
+					],
+				},
+			},
+		);
+		expect(todoHtml).toContain('class="todo-task todo-completed"');
+		expect(todoHtml).toContain('class="todo-task todo-pending"');
+		expect(todoHtml).not.toContain("<img");
 	});
 
 	it("keeps a known todo status class and drops a status that breaks the attribute", () => {

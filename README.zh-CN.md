@@ -22,9 +22,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ 探索 Gajae-Code App → 桌面端与自托管 Web GUI</strong></kbd></a>
+  <a href="https://github.com/devswha/gajae-code-app"><kbd><strong>🖥️ Gajae-Code App（已弃用）</strong></kbd></a>
   <br/>
-  <sub>这是由社区构建的实验性第三方项目，并非 Gajae-Code 官方第一方应用。</sub>
+  <sub>已弃用：此社区构建的第三方应用已不再维护（最后版本 v2.0.0-beta.20，2026-09-25）。其应用内更新器和内置 SDK 已过时，请勿用于新安装。</sub>
 </p>
 
 <p align="center">

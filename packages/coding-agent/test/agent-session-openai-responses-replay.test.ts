@@ -23,6 +23,9 @@ import * as agentsModule from "@gajae-code/coding-agent/task/agents";
 import * as discoveryModule from "@gajae-code/coding-agent/task/discovery";
 import * as eventBusModule from "@gajae-code/coding-agent/utils/event-bus";
 import { Snowflake } from "@gajae-code/utils";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 function createUsage(): Usage {
 	return {
@@ -266,7 +269,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("sanitizes stale assistant replay metadata during startup resume while preserving user payloads", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-startup-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-startup-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const preservedUserPayload = createUserHistoryPayload();
 		const assistantText = "Loaded assistant response";
@@ -311,7 +314,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("sanitizes stale Responses-family assistant replay metadata for direct SessionManager.open consumers", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-open-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-open-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const assistantText = "Codex assistant snapshot";
 
@@ -335,7 +338,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("sanitizes multiple stale managed assistants in memory without rewriting on open", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-managed-open-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-3793-managed-open-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const assistantTexts = ["First stale managed assistant", "Second stale managed assistant"];
 		const destination = SessionManager.managedDestination(tempDir, path.join(tempDir, "agent"));
@@ -388,7 +393,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("sanitizes a managed transcript larger than 20 MiB in memory without rewriting on open", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-3793-large-managed-open-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-3793-large-managed-open-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const assistantTexts = Array.from(
 			{ length: 256 },
@@ -441,8 +448,10 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	}, 30_000);
 
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
-		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`));
-		const forkDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-target-${Snowflake.next()}-`));
+		const sourceDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`),
+		);
+		const forkDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-target-${Snowflake.next()}-`));
 		tempDirs.push(sourceDir, forkDir);
 		const preservedUserPayload = createUserHistoryPayload();
 		const assistantText = "Forked assistant snapshot";
@@ -473,7 +482,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("keeps same-file reload safe without resetting live provider state after startup sanitization", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const assistantText = "Reloaded assistant response";
 
@@ -515,7 +524,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("builds sanitized fork seeds while sharing cache identity without provider transport state", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fork-seed-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-fork-seed-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const parentManager = SessionManager.create(tempDir, tempDir);
 		const { session: parent, authStorage: parentAuthStorage } = await createSessionHarness(tempDir, parentManager, {
@@ -651,7 +660,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("propagates appendOnlyPrefixSnapshot through buildForkContextSeed when append-only mode is active", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-default-append-only-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-fc-default-append-only-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const parentManager = SessionManager.create(tempDir, tempDir);
 
@@ -689,7 +698,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("preserves a forked child seeded prefix across compaction and prune rewrites", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-seeded-rewrite-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-fc-seeded-rewrite-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const parentManager = SessionManager.create(tempDir, tempDir);
 		const { session: parent, authStorage: parentAuthStorage } = await createSessionHarness(tempDir, parentManager, {
@@ -811,7 +820,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	}, 30_000);
 
 	it("spawns bundled executor and architect via TaskTool with inheritContext: bounded through the production path", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const parentManager = SessionManager.create(tempDir, tempDir);
 
@@ -979,7 +988,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("keeps provider session state when same-file reload only changes message metadata", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-metadata-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-505-reload-metadata-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const assistantText = "Reloaded metadata-only response";
 
@@ -1028,7 +1039,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("captures session-manager state when custom message details are proxy-backed", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-capture-proxy-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-505-capture-proxy-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const proxyDetails = new Proxy({ ok: true, nested: { value: "preserved" } }, {});
@@ -1047,7 +1060,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("reloads when current session contains proxy-backed custom message details", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-proxy-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-proxy-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const { session, authStorage } = await createSessionHarness(tempDir, sessionManager);
@@ -1075,7 +1088,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("resets provider session state when same-file reload restores different messages under the same model", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-content-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-505-reload-content-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const assistantText = "Reloaded content change response";
 
@@ -1130,7 +1145,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("preserves bash signal metadata across persisted reload and provider replay normalization", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-5291-bash-signal-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-5291-bash-signal-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
@@ -1195,7 +1210,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("resets provider session state when same-file reload restores a different saved model", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-model-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-model-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const assistantText = "Reloaded model change response";
 
@@ -1237,7 +1252,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("resets plain openai-responses provider state when same-file reload restores a different saved model", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-openai-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(
+			path.join(os.tmpdir(), `pi-issue-505-reload-openai-${Snowflake.next()}-`),
+		);
 		tempDirs.push(tempDir);
 		const assistantText = "Reloaded openai responses model change";
 
@@ -1270,7 +1287,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("switches sessions without requiring write access during load-time sanitization", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-switch-fail-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-switch-fail-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
 		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
@@ -1305,7 +1322,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		"EPERM",
 		"EROFS",
 	] as const)("publishes a read-only successor and retries local:// setup after %s", async code => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-readonly-local-switch-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `gjc-readonly-local-switch-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
 		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
@@ -1352,7 +1369,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("rolls back an unrelated local-root failure with predecessor authority intact", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-local-switch-rollback-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `gjc-local-switch-rollback-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const currentSessionManager = SessionManager.create(tempDir, tempDir);
 		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
@@ -1389,7 +1406,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("clears provider session state and sanitizes loaded assistant metadata when switching sessions", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-switch-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-switch-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const preservedUserPayload = createUserHistoryPayload();
 		const assistantText = "Switched assistant response";
@@ -1432,7 +1449,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("does not reintroduce stale assistant replay metadata when navigating to another branch after load sanitization", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-tree-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-tree-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const branchAssistantText = "Archived branch assistant";
 
@@ -1481,7 +1498,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 	});
 
 	it("resets provider session state when starting a brand-new session", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-new-${Snowflake.next()}-`));
+		const tempDir = trackedTemp.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-new-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const { session, authStorage } = await createSessionHarness(tempDir, sessionManager);

@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { NativeExactFileIdentity } from "@gajae-code/natives";
+import { isRecord } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatchesWithCurrent, atomicYamlPathHash, type CasReceipt } from "../../config/atomic-yaml-patch";
 import {
@@ -49,10 +50,6 @@ export interface DoctorConfigRepairResult {
 	readonly after?: unknown;
 	readonly journalPath?: string;
 	readonly afterChecks?: readonly DoctorCheck[];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function getAt(root: Record<string, unknown>, dotted: string): unknown {

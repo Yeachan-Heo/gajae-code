@@ -1,11 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { sanitizeText } from "@gajae-code/utils";
-import { getThemeByName } from "../../src/modes/theme/theme";
+
 import { searchToolRenderer } from "../../src/tools/search";
+import { loadTestTheme } from "../helpers/test-theme";
 
 describe("searchToolRenderer", () => {
 	it("keeps summary and truncation rows inside the collapsed line budget", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 

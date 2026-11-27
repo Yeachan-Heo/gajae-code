@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
@@ -61,14 +62,8 @@ test("finalized turn_stream without a messageRef keeps legacy keyless behaviour 
 // ---------------------------------------------------------------------------
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await sleep(25);
-	}
-	throw new Error(`timeout waiting for ${label}`);
-}
+const waitFor = (pred: () => boolean, ms: number, label: string): Promise<void> =>
+	waitForCondition(pred, ms, { intervalMs: 25, label, sleep });
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = { type: string; connectionId?: string; phase?: string; text?: string; messageRef?: string };

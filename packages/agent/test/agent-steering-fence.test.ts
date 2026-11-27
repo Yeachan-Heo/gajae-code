@@ -53,7 +53,7 @@ function harness(): Harness {
 		handler: { content: ["reply"] },
 	});
 	const agent = new Agent({
-		initialState: { model: mock.model, systemPrompt: ["test"], tools: [waitTool], messages: [] },
+		initialState: { model: mock, systemPrompt: ["test"], tools: [waitTool], messages: [] },
 		streamFn: mock.stream,
 	});
 	return {
@@ -132,5 +132,62 @@ describe("Agent steering admission fence", () => {
 		expect(h.mock.calls.some(call => JSON.stringify(call.context.messages).includes("handle this instead"))).toBe(
 			true,
 		);
+	});
+});
+
+describe("Agent step-boundary message provider", () => {
+	it("delivers provider messages into the next model call of the same run", async () => {
+		const h = harness();
+		let polls = 0;
+		h.agent.setStepBoundaryMessageProvider(() => {
+			polls += 1;
+			return polls === 1 ? [userMessage("background result")] : [];
+		});
+		const run = h.agent.prompt("run tool");
+		await h.entered;
+		h.release();
+		await run;
+
+		expect(polls).toBe(1);
+		expect(h.mock.calls).toHaveLength(2);
+		expect(JSON.stringify(h.mock.calls[1]?.context.messages)).toContain("background result");
+	});
+
+	// A fold fences steering until its pause checkpoint; the provider must not be
+	// drained into the run being wound down either, or the entry would be lost.
+	it("does not consult the provider while steering admission is fenced", async () => {
+		const h = harness();
+		h.agent.setSteeringAdmissionFence(() => true);
+		let polls = 0;
+		h.agent.setStepBoundaryMessageProvider(() => {
+			polls += 1;
+			return [userMessage("background result")];
+		});
+		const run = h.agent.prompt("run tool");
+		await h.entered;
+		h.release();
+		await run;
+
+		expect(polls).toBe(0);
+		expect(h.mock.calls.some(call => JSON.stringify(call.context.messages).includes("background result"))).toBe(
+			false,
+		);
+	});
+
+	it("does not consult the provider once the run is aborted during a tool", async () => {
+		const h = harness();
+		let polls = 0;
+		h.agent.setStepBoundaryMessageProvider(() => {
+			polls += 1;
+			return [userMessage("background result")];
+		});
+		const run = h.agent.prompt("run tool");
+		await h.entered;
+		h.agent.abort();
+		h.release();
+		await run.catch(() => {});
+
+		expect(polls).toBe(0);
+		expect(h.mock.calls).toHaveLength(1);
 	});
 });

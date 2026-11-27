@@ -6,7 +6,7 @@
  * - Default (hook): Enter inserts newline, Ctrl+Enter submits, bordered popup
  * - Prompt-style (ask): Enter submits, Shift+Enter inserts newline, legacy ask chrome
  */
-import { Container, Editor, matchesKey, Spacer, Text, type TUI } from "@gajae-code/tui";
+import { Container, Editor, isBareLineFeed, matchesKey, Spacer, Text, type TUI } from "@gajae-code/tui";
 import { getEditorTheme, theme } from "../../modes/theme/theme";
 import { matchesAppExternalEditor, matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
@@ -15,10 +15,6 @@ import { DynamicBorder } from "./dynamic-border";
 export interface HookEditorOptions {
 	/** When true, use prompt-style keybindings with the legacy ask prompt chrome. */
 	promptStyle?: boolean;
-}
-
-function isWindowsRawLfNewlineInput(keyData: string): boolean {
-	return process.platform === "win32" && keyData === "\n";
 }
 
 export class HookEditorComponent extends Container {
@@ -96,10 +92,10 @@ export class HookEditorComponent extends Container {
 			return;
 		}
 
-		// Submit on Enter and Ctrl+Enter encodings. On Windows, raw LF is reserved for
-		// terminal newline mappings (Shift+Enter/Ctrl+J); plain Enter reports CR.
+		// Submit on Enter and Ctrl+Enter encodings. A bare LF is the newline chord
+		// (Ctrl+J, Shift+Enter→LF terminal mappings), as in the main composer.
 		if (
-			!isWindowsRawLfNewlineInput(keyData) &&
+			!isBareLineFeed(keyData) &&
 			(matchesKey(keyData, "enter") || matchesKey(keyData, "return") || matchesKey(keyData, "ctrl+enter"))
 		) {
 			this.#onSubmitCallback(this.#editor.getText());

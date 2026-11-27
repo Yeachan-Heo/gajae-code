@@ -160,6 +160,9 @@ describe("generated JSON Schemas", () => {
 			"me",
 			"me@@example.com",
 			"project:p-1",
+			"org:org-1",
+			"org:",
+			"org:Acme Team",
 			"me @example.com",
 		]) {
 			expect(pattern.test(candidate)).toBe(parsePreferenceAccount(candidate) !== undefined);

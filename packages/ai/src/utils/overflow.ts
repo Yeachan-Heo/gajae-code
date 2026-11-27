@@ -222,7 +222,7 @@ export function classifyContextOverflow(
 	transportFailure?: TransportFailureFacts,
 	contextWindow?: number,
 ): boolean {
-	if (transportFailure?.status === 429) return false;
+	if (transportFailure?.status === 429 || transportFailure?.status === 402) return false;
 	const typedCodes = transportCodes(transportFailure);
 	if (typedCodes.some(code => OVERFLOW_PROVIDER_CODES.has(code))) return true;
 	// A specific non-overflow cause (auth, quota, rate limit) is authoritative

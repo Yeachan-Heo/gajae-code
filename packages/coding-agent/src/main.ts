@@ -21,15 +21,17 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@gajae-code/utils";
+import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
+import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import chalk from "chalk";
 import { selectAppendSystemPromptFile } from "./cli/append-system-prompt";
-import type { Args } from "./cli/args";
+import { type Args, resolvePlanModelOverride } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { fetchGithubChannelRelease } from "./cli/github-release";
 import { buildInitialMessage } from "./cli/initial-message";
 import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
-import { selectSession } from "./cli/session-picker";
+import { promptHeldSession, selectSession } from "./cli/session-picker";
 import { getConfigDirs } from "./config";
 import { FileLockAcquireError, FileLockStagingCleanupError } from "./config/file-lock";
 import {
@@ -59,7 +61,8 @@ import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
-import type { SessionSelectionResult } from "./modes/components/session-selector";
+import type { HeldSessionChoice, HeldSessionWarningOptions } from "./modes/components/session-held-warning";
+import type { HeldSession, SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
@@ -70,6 +73,7 @@ import type { MCPManager } from "./runtime-mcp";
 // Leaf path, not the barrel: the capability registry must stay out of the
 // runtime-mcp import graph that every root command would otherwise load.
 import { attachExactMcpControls } from "./runtime-mcp/redaction";
+import { issueSessionMcpControlGrant } from "./runtime-mcp/session-controls-grant";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -78,17 +82,25 @@ import {
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import {
+	DIRECT_SESSION_REGISTRATION_ATTEMPTS,
+	isTransientSessionIndexLockError,
 	newMasterAttestationEpoch,
 	resolveSessionLocator,
 	SessionIndex,
 	type SessionLocatorV2,
 } from "./sdk/broker/session-index";
+import type { ResumeSessionIdentity } from "./sdk/session-readonly/storage";
 import type { AgentSession } from "./session/agent-session";
-import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
-import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
-import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
-	type ResumeSessionIdentity,
+	ManagedAppendIdentityMismatchError,
+	RESUME_REJECTED_OPERATOR_MESSAGE,
+} from "./session/internal/managed-session-storage";
+import { probeHeldSessions, resolveSessionOwnership } from "./session/internal/session-claim-set";
+import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
+import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
+import { setPrimaryControlSurface } from "./session/primary-control-surface";
+import { findSessionHandoverTarget, handOverSession } from "./session/session-handover";
+import {
 	resolveResumableSession,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionArtifactCapacityError,
@@ -99,6 +111,18 @@ import {
 	SessionTranscriptOversizedError,
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
+import {
+	SessionHeldError,
+	type SessionOwnerClaim,
+	type SessionOwnerSurface,
+	SessionOwnershipError,
+	sessionHeldForkCommand,
+	sessionHeldForkedNotice,
+	sessionOwnerHolderPhrase,
+	sessionOwnerSurface,
+	setSessionOwnerSurface,
+} from "./session/session-ownership";
+import { dropProjectSuppliedSessionOwnershipOverride, sessionOwnershipModeFor } from "./session/session-ownership-mode";
 import { resolveStartupAuthConfig } from "./session/startup-auth-config";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
 import {
@@ -108,11 +132,13 @@ import {
 } from "./setup/frictionless-onboarding";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
+import { parseSlashCommand } from "./slash-commands/helpers/parse";
 import { resolvePromptInput } from "./system-prompt";
 import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } from "./task/token-log";
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
+import { installHerdrCoreStatusReporter } from "./utils/herdr-core-status";
 import { installHerdrReporter } from "./utils/herdr-pane";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -257,8 +283,6 @@ export function resolveAcpStartupOptions(
 		| "resume"
 		| "sessionDir"
 		| "skills"
-		| "slow"
-		| "smol"
 		| "plan"
 		| "systemPrompt"
 		| "thinking"
@@ -299,8 +323,6 @@ export function resolveAcpStartupOptions(
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
 		...(parsed.skills !== undefined ? ["--skills"] : []),
-		...(parsed.slow ? ["--slow"] : []),
-		...(parsed.smol ? ["--smol"] : []),
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
 		...(parsed.tmux ? ["--tmux"] : []),
@@ -416,11 +438,11 @@ export async function submitInteractiveInput(
 				agentEnd.promise.then(() => ({ type: "agent_end" as const })),
 			]);
 			if (result.type === "error") {
-				const errorMessage = result.error instanceof Error ? result.error.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(result.error);
 				mode.showError(errorMessage);
 			} else if (result.type === "agent_end") {
 				void prompt.catch((error: unknown) => {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					const errorMessage = operatorErrorMessage(error);
 					mode.showError(errorMessage);
 				});
 			}
@@ -428,7 +450,7 @@ export async function submitInteractiveInput(
 			agentEnd.dispose();
 		}
 	} catch (error: unknown) {
-		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+		const errorMessage = operatorErrorMessage(error);
 		mode.showError(errorMessage);
 	} finally {
 		mode.finishPendingSubmission(input);
@@ -772,11 +794,13 @@ export async function applyStartupModelProfiles(args: StartupModelProfileArgs): 
 
 async function exitForStartupModelProfileError(args: StartupModelProfileArgs, error: unknown): Promise<never> {
 	const message = error instanceof Error ? error.message : String(error);
-	process.stderr.write(
+	// Startup model profiles are applied before anything ran in the resumed session, so
+	// a fence rejection here means this resume itself did not happen.
+	const operatorMessage =
 		error instanceof ManagedAppendIdentityMismatchError
-			? `${error.operatorMessage}\n`
-			: `${chalk.red(`Error: ${message}`)}\n`,
-	);
+			? RESUME_REJECTED_OPERATOR_MESSAGE
+			: composeOperatorMessage(error);
+	process.stderr.write(operatorMessage ? `${operatorMessage}\n` : `${chalk.red(`Error: ${message}`)}\n`);
 	await args.session.dispose();
 	process.exit(1);
 }
@@ -959,7 +983,58 @@ export class SessionNotFoundError extends Error {
 	}
 }
 
-export function operatorFacingSessionOpenMessage(value: unknown): string | undefined {
+/** Cancel chosen in the held-session warning at launch: gjc exits 0 without opening anything (design §3.1). */
+export class SessionResumeCancelledError extends Error {
+	constructor() {
+		super("Resume cancelled");
+		this.name = "SessionResumeCancelledError";
+	}
+}
+
+/**
+ * Where a printed `gjc --fork` must look for the session it copies: the transcript path the launch
+ * named, and the `--session-dir` it searched, both absolute. An id alone resolves only in the
+ * default store.
+ */
+export interface SessionHeldForkSource {
+	readonly source?: string;
+	readonly sessionDir?: string;
+}
+
+export function sessionHeldForkSourceFor(parsed: Args, cwd: string): SessionHeldForkSource {
+	const resume = typeof parsed.resume === "string" ? parsed.resume : undefined;
+	const pathForm =
+		resume !== undefined && (resume.includes("/") || resume.includes("\\") || resume.endsWith(".jsonl"));
+	return {
+		...(pathForm ? { source: path.resolve(cwd, resume) } : {}),
+		...(parsed.sessionDir ? { sessionDir: path.resolve(cwd, parsed.sessionDir) } : {}),
+	};
+}
+
+/**
+ * The CLI refusal for a session another process holds (design §3.3), with the command that
+ * continues it in a copy. Only a safe id, and a path quoted for the shell, is printed.
+ */
+function sessionHeldCliMessage(error: SessionHeldError, print: boolean, fork: SessionHeldForkSource): string {
+	const holder = sessionOwnerHolderPhrase(error.holder);
+	const command = sessionHeldForkCommand(error.sessionId, { print, ...fork });
+	if (!command)
+		return `error: this session is open for writing in ${holder}.\nOnly one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
+	return `error: session ${error.sessionId.slice(0, 8)} is open for writing in ${holder}.\nOnly one process can write a session at a time. Close it there, or continue in a copy:\n  ${command}`;
+}
+
+/** Why `--continue` or `autoResume` started a new session (design §3.3). */
+function heldContinueNotice(error: SessionHeldError): string {
+	return `Your most recent session is open in ${sessionOwnerHolderPhrase(error.holder)}, so a new session was started. Run gjc --resume to pick a session.`;
+}
+
+export function operatorFacingSessionOpenMessage(
+	value: unknown,
+	options: { readonly print?: boolean; readonly fork?: SessionHeldForkSource } = {},
+): string | undefined {
+	if (value instanceof SessionHeldError)
+		return sessionHeldCliMessage(value, options.print === true, options.fork ?? {});
+	if (value instanceof SessionOwnershipError) return value.operatorMessage;
 	const code =
 		value instanceof SessionForkDeclinedError
 			? value.code
@@ -1024,7 +1099,7 @@ export async function runInteractiveMode(
 	resumeAction?: "continue-tail" | "open-idle",
 	startDeferredMcpConfig?: CreateAgentSessionResult["startDeferredMcpConfig"],
 	startDeferredModelProfiles?: DeferredModelProfileStartup,
-	options?: { stopAfterFirstPaint?: boolean },
+	options?: { stopAfterFirstPaint?: boolean; openModelSelectorWithFallback?: string },
 ): Promise<void> {
 	const mode = createInteractiveMode
 		? createInteractiveMode({
@@ -1096,6 +1171,13 @@ export async function runInteractiveMode(
 			mode.showStatus(notify.message);
 		}
 	}
+
+	// Open model selector on startup if session has no model and a fallback message.
+	if (options?.openModelSelectorWithFallback) {
+		mode.showWarning(options.openModelSelectorWithFallback);
+		mode.showModelSelector();
+	}
+
 	if (startDeferredMcpConfig) {
 		mode.showStatus("Connecting MCP tools…");
 		void startDeferredMcpConfig()
@@ -1145,45 +1227,131 @@ export async function runInteractiveMode(
 		}
 	};
 
+	let deferredInitialMessage: string | undefined;
+	let deferredInitialImages: ImageContent[] | undefined;
+	const deferredInitialMessages: string[] = [];
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
 			try {
 				await session.continuePersistedHistory();
 			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(error);
 				mode.showError(errorMessage);
 			}
 		}
 
+		// When model selector is opened on startup, defer initial message dispatch until after
+		// model selection completes (model is now set). If no model remains, treat as user cancellation.
 		if (initialMessage !== undefined) {
-			try {
-				maybeGenerateStartupTitle(initialMessage, initialImages);
-				await session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				mode.showError(errorMessage);
+			// Only dispatch now if a model is selected. Otherwise defer until after model selection.
+			if (!session.model && options?.openModelSelectorWithFallback) {
+				// Model selector was opened but hasn't completed yet. Defer the message.
+				deferredInitialMessage = initialMessage;
+				deferredInitialImages = initialImages;
+			} else {
+				try {
+					maybeGenerateStartupTitle(initialMessage, initialImages);
+					await session.prompt(initialMessage, { images: initialImages });
+				} catch (error: unknown) {
+					const errorMessage = operatorErrorMessage(error);
+					mode.showError(errorMessage);
+				}
 			}
 		}
+
+		// Process positional startup prompts, deferring non-recovery messages when model selector is open.
+		// Recovery commands like /login and /model must execute immediately to allow user recovery.
+		const isRecoveryCommand = (text: string): boolean => {
+			const parsed = parseSlashCommand(text);
+			return parsed?.name === "login" || parsed?.name === "model" || parsed?.name === "models";
+		};
 
 		for (const message of initialMessages) {
 			try {
 				let text = message;
+				const isRecovery = isRecoveryCommand(text);
+
 				const slashResult = await executeBuiltinSlashCommand(text, {
 					ctx: mode,
 					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
 				});
+				// If command was handled (returned true), we're done with this message
 				if (slashResult === true) continue;
-				if (typeof slashResult === "string") text = slashResult;
-				maybeGenerateStartupTitle(text);
-				await session.prompt(text);
+
+				// Recovery commands must be executed immediately, even with model selector open.
+				// Non-recovery messages are deferred if model selector is open and no model is selected.
+				if (!session.model && options?.openModelSelectorWithFallback && !isRecovery) {
+					if (typeof slashResult === "string") text = slashResult;
+					deferredInitialMessages.push(text);
+				} else {
+					// Model is available, selector is not open, or this is a recovery command: execute immediately
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				}
 			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				const errorMessage = operatorErrorMessage(error);
 				mode.showError(errorMessage);
 			}
 		}
 
 		while (true) {
+			// If we have deferred startup messages but no model yet, wait for model selection to complete
+			// before accepting user input. This ensures the model selector completes and sets session.model
+			// before we call getUserInput().
+			if ((deferredInitialMessage !== undefined || deferredInitialMessages.length > 0) && !session.model) {
+				// Wait for model to be set (with a reasonable polling interval to avoid busy-waiting)
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const checkInterval = setInterval(() => {
+					if (session.model) {
+						clearInterval(checkInterval);
+						resolve();
+					}
+				}, 50); // Check every 50ms
+				// Safety timeout: if model is not set after 10 seconds, proceed anyway
+				setTimeout(() => {
+					clearInterval(checkInterval);
+					resolve();
+				}, 10000);
+				await promise;
+			}
+
+			// Send deferred initial message if model is now selected (after model selector completes)
+			if (deferredInitialMessage !== undefined && session.model) {
+				const messageToSend = deferredInitialMessage;
+				const imagesToSend = deferredInitialImages;
+				deferredInitialMessage = undefined;
+				deferredInitialImages = undefined;
+				try {
+					maybeGenerateStartupTitle(messageToSend, imagesToSend);
+					await session.prompt(messageToSend, { images: imagesToSend });
+				} catch (error: unknown) {
+					const errorMessage = operatorErrorMessage(error);
+					mode.showError(errorMessage);
+				}
+			}
+
+			// Send deferred positional startup prompts if model is now selected
+			while (deferredInitialMessages.length > 0 && session.model) {
+				const message = deferredInitialMessages.shift()!;
+				try {
+					let text = message;
+					const slashResult = await executeBuiltinSlashCommand(text, {
+						ctx: mode,
+						handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+					});
+					if (slashResult === true) continue;
+					if (typeof slashResult === "string") text = slashResult;
+					maybeGenerateStartupTitle(text);
+					await session.prompt(text);
+				} catch (error: unknown) {
+					const errorMessage = operatorErrorMessage(error);
+					mode.showError(errorMessage);
+				}
+			}
+
 			const input = await mode.getUserInput();
 			await submitInteractiveInput(mode, session, input);
 		}
@@ -1198,6 +1366,26 @@ export async function runInteractiveMode(
 		await Promise.race([inputLoop, deferredModelProfileFailure]);
 	} catch (error) {
 		if (!(error instanceof DeferredModelProfileStartupError)) throw error;
+		// Drain any remaining deferred startup prompts before shutdown,
+		// so user messages are properly dispatched even when model profile fails.
+		// This ensures prompts are processed in order before the error is re-thrown.
+		while (deferredInitialMessages.length > 0 && session.model) {
+			const message = deferredInitialMessages.shift()!;
+			try {
+				let text = message;
+				const slashResult = await executeBuiltinSlashCommand(text, {
+					ctx: mode,
+					handleBackgroundCommand: () => mode.handleBackgroundCommand(),
+				});
+				if (slashResult === true) continue;
+				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
+				await session.prompt(text);
+			} catch (promptError: unknown) {
+				const errorMessage = operatorErrorMessage(promptError);
+				mode.showError(errorMessage);
+			}
+		}
 		try {
 			await mode.shutdown();
 		} finally {
@@ -1263,11 +1451,45 @@ async function flushChangelogVersion(): Promise<void> {
 	}
 }
 
+/**
+ * How a launch reports that `--continue` or `autoResume` started fresh because the session it would
+ * continue is held: `-p --continue` refuses instead, unless `interactive`.
+ */
+export interface SessionStartupNotices {
+	readonly interactive: boolean;
+	readonly notice: (message: string) => void;
+	/**
+	 * Only for a launch that can show the TUI (a TTY): under enforce, `--resume` of a session another
+	 * process holds asks here whether to fork it (design §3.1); without it the open refuses.
+	 */
+	readonly held?: {
+		readonly choose: (error: SessionHeldError, options: HeldSessionWarningOptions) => Promise<HeldSessionChoice>;
+		readonly forked: (message: string) => void;
+	};
+}
+
+/** What the held-session warning at launch resolved to, when it did not cancel. */
+type HeldStartupResolution =
+	| { readonly kind: "forked"; readonly manager: SessionManager }
+	| { readonly kind: "continued"; readonly admission: SessionOwnerClaim | undefined };
+
+const STDERR_STARTUP_NOTICES: SessionStartupNotices = {
+	interactive: false,
+	notice: message => process.stderr.write(`${message}\n`),
+};
+
 export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	activeSettings: Settings = settings,
+	surface: SessionOwnerSurface = sessionOwnerSurface(),
+	startup: SessionStartupNotices = STDERR_STARTUP_NOTICES,
 ): Promise<SessionManager | undefined> {
+	// `gjc acp` never builds an agent here: its sessions run in broker-launched hosts, or in the
+	// process that owns them. A persisting manager would open, and claim, a session it never uses.
+	if (parsed.mode === "acp") return SessionManager.inMemory(cwd);
+	// Read once, from the settings this launch uses, for whichever factory runs below.
+	const ownership = { surface, mode: sessionOwnershipModeFor(activeSettings.getGlobal("session.ownership.mode")) };
 	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 	const sessionMemoryMode = activeSettings.get("sessionMemory.mode");
 	const sessionDestination = () =>
@@ -1290,6 +1512,7 @@ export async function createSessionManager(
 				undefined,
 				migrationPolicy,
 				sessionMemoryMode,
+				ownership,
 			);
 		}
 		const match = await resolveResumableSession(
@@ -1309,6 +1532,7 @@ export async function createSessionManager(
 			undefined,
 			migrationPolicy,
 			sessionMemoryMode,
+			ownership,
 		);
 	}
 
@@ -1317,11 +1541,84 @@ export async function createSessionManager(
 	}
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
+		// Under enforce, a session another process holds is never opened: the launch warns and offers
+		// Fork, which copies it here and also answers the different-folder question below (design §1
+		// row 1). A race past this probe still meets the open's own refusal.
+		// `undefined`, with nothing awaited, outside enforce or without a terminal to ask on.
+		// Continue here (design §13 L1) closes a broker-launched holder and resolves to the claim
+		// that covers the open below, released once the open has claimed or failed.
+		const forkIfHeld = (
+			sourcePath: string,
+			continueHere: boolean,
+		): Promise<HeldStartupResolution | undefined> | undefined => {
+			const held = startup.held;
+			const probe = held && SessionManager.probeHeldTranscript(sourcePath, ownership);
+			return held && probe ? forkWhenHeld(sourcePath, held, probe, continueHere) : undefined;
+		};
+		const forkWhenHeld = async (
+			sourcePath: string,
+			held: NonNullable<SessionStartupNotices["held"]>,
+			probe: Promise<SessionHeldError | undefined>,
+			continueHere: boolean,
+		): Promise<HeldStartupResolution | undefined> => {
+			const refusal = await probe;
+			if (!refusal) return undefined;
+			const agentDir = activeSettings.getAgentDir();
+			const handover = continueHere ? await findSessionHandoverTarget(refusal, agentDir) : undefined;
+			let note: string | undefined;
+			for (;;) {
+				const choice = await held.choose(refusal, { continueHere: handover !== undefined, note });
+				switch (choice) {
+					case "fork":
+						break;
+					case "continue": {
+						if (!handover) continue;
+						const outcome = await handOverSession(refusal, agentDir, resolveSessionOwnership(ownership));
+						if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
+						note = outcome.message;
+						continue;
+					}
+					case "cancel":
+						throw new SessionResumeCancelledError();
+					default: {
+						const unknown: never = choice;
+						throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+					}
+				}
+				break;
+			}
+			const forked = await SessionManager.forkFrom(
+				sourcePath,
+				cwd,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+				ownership,
+			);
+			held.forked(sessionHeldForkedNotice(refusal));
+			return { kind: "forked", manager: forked };
+		};
+		const openAfterHandover = async (
+			held: HeldStartupResolution | undefined,
+			open: () => Promise<SessionManager>,
+		): Promise<SessionManager> => {
+			try {
+				return await open();
+			} finally {
+				if (held?.kind === "continued") held.admission?.release();
+			}
+		};
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+			const forking = forkIfHeld(sessionArg, true);
+			const held = forking && (await forking);
+			if (held?.kind === "forked") return held.manager;
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
 				: SessionManager.explicitDestination(path.dirname(sessionArg));
-			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode);
+			return await openAfterHandover(held, () =>
+				SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode, ownership),
+			);
 		}
 		const match = await resolveResumableSession(
 			sessionArg,
@@ -1333,10 +1630,16 @@ export async function createSessionManager(
 		if (!match) {
 			throw new SessionNotFoundError(sessionArg);
 		}
-		if (match.scope === "global") {
-			const normalizedCwd = normalizePathForComparison(cwd);
-			const normalizedMatchCwd = normalizePathForComparison(match.session.cwd || cwd);
-			if (normalizedCwd !== normalizedMatchCwd) {
+		// A session from another folder is only ever forked here, so the held warning offers Fork
+		// (which answers this question too), not Continue here.
+		const otherFolder =
+			match.scope === "global" &&
+			normalizePathForComparison(cwd) !== normalizePathForComparison(match.session.cwd || cwd);
+		const forking = forkIfHeld(match.session.path, !otherFolder);
+		const held = forking && (await forking);
+		if (held?.kind === "forked") return held.manager;
+		return await openAfterHandover(held, async () => {
+			if (otherFolder) {
 				const shouldFork = await promptForkSession(match.session);
 				if (!shouldFork) {
 					throw new SessionForkDeclinedError(sessionArg, match.session.cwd);
@@ -1348,30 +1651,43 @@ export async function createSessionManager(
 					undefined,
 					migrationPolicy,
 					sessionMemoryMode,
+					ownership,
 				);
 			}
+			return await SessionManager.open(
+				match.session.path,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+				ownership,
+			);
+		});
+	}
+	// Enforce ends `continueRecent`'s search at a held session it would continue (design §1 row 4):
+	// gjc then starts fresh with a notice, except `-p --continue`, which asked for that session and
+	// refuses (row 10).
+	const continueOrStartFresh = async (refuseWhenHeld: boolean): Promise<SessionManager> => {
+		try {
+			return await SessionManager.continueRecent(
+				cwd,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+				ownership,
+			);
+		} catch (error) {
+			if (!(error instanceof SessionHeldError) || refuseWhenHeld) throw error;
+			startup.notice(heldContinueNotice(error));
+			return SessionManager.create(cwd, sessionDestination(), undefined, ownership);
 		}
-		return await SessionManager.open(
-			match.session.path,
-			sessionDestination(),
-			undefined,
-			migrationPolicy,
-			sessionMemoryMode,
-		);
-	}
-	if (parsed.continue) {
-		return await SessionManager.continueRecent(
-			cwd,
-			sessionDestination(),
-			undefined,
-			migrationPolicy,
-			sessionMemoryMode,
-		);
-	}
+	};
+	if (parsed.continue) return await continueOrStartFresh(!startup.interactive);
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, SessionManager.explicitDestination(parsed.sessionDir));
+		return SessionManager.create(cwd, SessionManager.explicitDestination(parsed.sessionDir), undefined, ownership);
 	}
 	// A lifecycle `/session_create` child must start a FRESH session that adopts
 	// the pre-allocated id (GJC_SESSION_ID), never auto-resume existing history in
@@ -1389,19 +1705,19 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(
-			cwd,
-			sessionDestination(),
-			undefined,
-			migrationPolicy,
-			sessionMemoryMode,
-		);
+		// The user did not ask to continue, so even `-p` starts fresh, with the notice on stderr (D7).
+		const manager = await continueOrStartFresh(false);
 		if (manager.hasHistoryEntries()) {
 			parsed.continue = true;
 		}
 		return manager;
 	}
-	return SessionManager.create(cwd, SessionManager.managedDestination(cwd, activeSettings.getAgentDir()));
+	return SessionManager.create(
+		cwd,
+		SessionManager.managedDestination(cwd, activeSettings.getAgentDir()),
+		undefined,
+		ownership,
+	);
 }
 
 async function maybeAutoChdir(parsed: Args): Promise<void> {
@@ -1692,13 +2008,6 @@ export interface DirectSessionRegistration {
 
 const NOOP_DIRECT_SESSION_REGISTRATION: DirectSessionRegistration = { syncIdentity: async () => {} };
 
-/**
- * Appends allowed for one successor registration before the switch gives up and
- * keeps the predecessor registered. `SessionIndex.append` takes the shared index
- * lock independently per append, so a peer holding it is a transient failure.
- */
-const DIRECT_SESSION_REGISTRATION_ATTEMPTS = 3;
-
 /** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
 export async function registerDirectSession(
 	sessionManager: DirectSessionManager | undefined,
@@ -1831,16 +2140,8 @@ export async function registerDirectSession(
 				// Only lock contention self-heals. A refused release is an identity
 				// verdict; retrying it would mask a committed registration whose lock
 				// generation no longer matches.
-				const code = (error as NodeJS.ErrnoException | undefined)?.code;
-				const transient =
-					code === "sharing_violation" ||
-					code === "access_denied" ||
-					code === "EBUSY" ||
-					code === "EPERM" ||
-					code === "EACCES" ||
-					code === "ENOTEMPTY" ||
-					code === "removal_record_busy";
-				if (!transient || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
+				if (!isTransientSessionIndexLockError(error) || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS)
+					throw error;
 				await Bun.sleep(50 * attempt);
 			}
 		}
@@ -1942,34 +2243,6 @@ function directSessionIndexLockFailureMessage(error: unknown, agentDir: string):
 	return `Session index lock publication failed; no session was registered.\nLock: ${lockPath}\nCode: ${code}\n${error.message}`;
 }
 
-export interface ModelRoleOverrides {
-	smol?: string;
-	slow?: string;
-	plan?: string;
-}
-
-/**
- * Resolve the ephemeral `smol`/`slow`/`plan` model-role overrides.
- *
- * Precedence per role is CLI flag > documented `GJC_*_MODEL` > legacy
- * `PI_*_MODEL`, matching the repo-wide GJC-first/PI-fallback convention.
- * Resolution reads the process environment via `$pickenv`, which trims values
- * and treats empty/whitespace as unset; it is deliberately kept separate from
- * credential env resolution (`$credentialEnv`/`$pickCredentialEnv`). The
- * function is pure and stateless, so it reads fresh each call and a later
- * invocation never inherits an earlier one's values.
- */
-export function resolveModelRoleOverrides(parsed: Pick<Args, "smol" | "slow" | "plan">): ModelRoleOverrides {
-	const overrides: ModelRoleOverrides = {};
-	const smol = parsed.smol ?? $pickenv("GJC_SMOL_MODEL", "PI_SMOL_MODEL");
-	const slow = parsed.slow ?? $pickenv("GJC_SLOW_MODEL", "PI_SLOW_MODEL");
-	const plan = parsed.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
-	if (smol) overrides.smol = smol;
-	if (slow) overrides.slow = slow;
-	if (plan) overrides.plan = plan;
-	return overrides;
-}
-
 /**
  * Apply the `--no-pty` / `--no-title` terminal-control flags to the environment.
  *
@@ -1990,17 +2263,49 @@ export function applyTerminalControlFlagsToEnv(
 		env.PI_NO_TITLE = "1";
 	}
 }
+
+/**
+ * Whether the live `HERDR_BIN_PATH` must not be used as Herdr's executable.
+ *
+ * A static project declaration is rejected when the live value is that
+ * declaration, including surrounding whitespace. A dynamic declaration is
+ * ambiguous with Bun's preload, so any live value is rejected and Herdr falls
+ * back to `PATH`. A shell export is kept when the project declaration is
+ * absent or is a different static string.
+ */
+export function rejectProjectHerdrBinPath(
+	runtime: string | undefined,
+	declared: string | undefined,
+	dynamic: boolean,
+): boolean {
+	if (runtime === undefined) return false;
+	if (dynamic) return true;
+	if (declared === undefined) return false;
+	return runtime === declared || runtime.trim() === declared;
+}
+
+/** Drop a project-supplied Herdr executable before this command spawns anything. */
+export function dropProjectSuppliedHerdrBinPath(env: NodeJS.ProcessEnv): void {
+	const snapshot = startupProjectEnvSnapshot();
+	const key = canonicalEnvKey("HERDR_BIN_PATH");
+	if (!rejectProjectHerdrBinPath(env.HERDR_BIN_PATH, snapshot.values[key], snapshot.dynamic.has(key))) return;
+	delete env.HERDR_BIN_PATH;
+}
+
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
+	dropProjectSuppliedHerdrBinPath(process.env);
+	dropProjectSuppliedSessionOwnershipOverride(process.env, startupProjectEnvSnapshot());
 	const parsedArgs = parsed;
 	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;
 	let autoChdirApplied = false;
 	let bareResumeSessionManager: SessionManager | undefined;
 	let bareResumeAction: "continue-tail" | "open-idle" | undefined;
+	let bareResumeForkedNotice: string | undefined;
 	let bareResumeCleanupFailed = false;
 
 	if (isBareResume(parsedArgs)) {
@@ -2038,28 +2343,77 @@ export async function runRootCommand(
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
 		}
+		// Under enforce, rows other processes hold are marked, and choosing one warns (design §1 row 2).
+		// The mode comes from the operator's config: picker consent comes before the scoped settings load.
+		const heldOwnership = resolveSessionOwnership({ surface: "terminal" });
+		const heldProbe = probeHeldSessions(
+			heldOwnership,
+			sessions.map(session => session.id),
+		);
+		const handoverAgentDir = deps.settings?.getAgentDir() ?? getAgentDir();
+		const held = heldProbe && {
+			sessions: await heldProbe,
+			check: async (session: SessionInfo): Promise<HeldSession | undefined> => {
+				const error = await SessionManager.probeHeldTranscript(session.path, heldOwnership);
+				if (!error) return undefined;
+				if (!(await findSessionHandoverTarget(error, handoverAgentDir))) return { error };
+				return { error, handOver: () => handOverSession(error, handoverAgentDir, heldOwnership) };
+			},
+		};
 		const selection = deps.selectResumeSession
 			? await deps.selectResumeSession(sessions)
-			: await selectSession(sessions, parsedArgs.sessionDir);
+			: await selectSession(sessions, parsedArgs.sessionDir, held);
 		if (selection.kind === "cancelled") {
 			return;
 		}
-		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
+		// Continue here's claim (design §13 L1) covers the open below until the open's own claim lands.
+		const handoverAdmission = selection.kind === "selected" ? selection.admission : undefined;
+		// Released in the `finally` below once loaded; a failed load must release it here.
+		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd }).catch(
+			(error: unknown) => {
+				handoverAdmission?.release();
+				throw error;
+			},
+		);
 		try {
 			const resumeMigrationPolicy =
 				scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 			let opened: StrictSessionOpenResult;
+			const destination = parsedArgs.sessionDir
+				? SessionManager.explicitDestination(parsedArgs.sessionDir)
+				: SessionManager.managedDestination(resumeCwd, scopedSettings.getAgentDir());
+			// Opened before Settings.init, so the mode comes from the scoped settings.
+			const ownership = {
+				surface: "terminal" as const,
+				mode: sessionOwnershipModeFor(scopedSettings.getGlobal("session.ownership.mode")),
+			};
 			try {
-				opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
-					selection.identity,
-					parsedArgs.sessionDir
-						? SessionManager.explicitDestination(parsedArgs.sessionDir)
-						: SessionManager.managedDestination(resumeCwd, scopedSettings.getAgentDir()),
-					undefined,
-					resumeMigrationPolicy,
-				);
+				// Fork from the held-session warning: the copy opens idle; the held source is read in place.
+				opened =
+					selection.kind === "fork"
+						? {
+								kind: "opened",
+								manager: await SessionManager.forkFrom(
+									selection.path,
+									resumeCwd,
+									destination,
+									undefined,
+									resumeMigrationPolicy,
+									undefined,
+									ownership,
+								),
+							}
+						: await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
+								selection.identity,
+								destination,
+								undefined,
+								resumeMigrationPolicy,
+								undefined,
+								ownership,
+							);
 			} catch (error) {
-				process.stderr.write(`${operatorFacingSessionOpenMessage(error) ?? BARE_RESUME_OPEN_ERROR}\n`);
+				const fork = sessionHeldForkSourceFor(parsedArgs, resumeCwd);
+				process.stderr.write(`${operatorFacingSessionOpenMessage(error, { fork }) ?? BARE_RESUME_OPEN_ERROR}\n`);
 				if (!deps.suppressProcessExit) process.exitCode = 1;
 				return;
 			}
@@ -2069,12 +2423,14 @@ export async function runRootCommand(
 				return;
 			}
 			bareResumeSessionManager = opened.manager;
-			bareResumeAction = selection.action;
+			bareResumeAction = selection.kind === "fork" ? "open-idle" : selection.action;
+			if (selection.kind === "fork") bareResumeForkedNotice = sessionHeldForkedNotice(selection.error);
 		} catch (error) {
 			process.stderr.write(`${operatorFacingSessionOpenMessage(error) ?? BARE_RESUME_OPEN_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		} finally {
+			handoverAdmission?.release();
 			try {
 				await scopedSettings.close?.();
 			} catch (error) {
@@ -2104,6 +2460,7 @@ export async function runRootCommand(
 	}
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
+	if (bareResumeForkedNotice) notifs.push({ kind: "info", message: bareResumeForkedNotice });
 
 	// Keep store authority and persistent pin intent in the same startup snapshot.
 	// Injected discoverers own their auth unless they also supply a config resolver.
@@ -2221,6 +2578,7 @@ export async function runRootCommand(
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
+	if (mode !== "acp") setSessionOwnerSurface(isInteractive ? "terminal" : "print");
 	// One-shot print runs (`gjc -p`, auto-print) never display provider usage, so
 	// credential selection must not probe usage endpoints from every short-lived
 	// process; it reuses reports that long-lived hosts already cached (#5939).
@@ -2229,19 +2587,12 @@ export async function runRootCommand(
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
-	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted).
-	// Precedence per role: CLI flag > documented GJC_*_MODEL > legacy PI_*_MODEL.
-	const roleOverrides = resolveModelRoleOverrides(parsedArgs);
-	if (roleOverrides.smol || roleOverrides.slow || roleOverrides.plan) {
-		settingsInstance.overrideModelRoles({
-			...(roleOverrides.smol ? { smol: roleOverrides.smol } : {}),
-			...(roleOverrides.slow ? { slow: roleOverrides.slow } : {}),
-			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
-		});
-	}
+	// Plan mode switches to the `plan` model role; --plan / GJC_PLAN_MODEL override it
+	// for this run only (ephemeral, not persisted).
+	const planModelOverride = resolvePlanModelOverride(parsedArgs);
+	if (planModelOverride) settingsInstance.overrideModelRoles({ plan: planModelOverride });
 	// Apply --clipboard-transport / --clipboard-ssh-host as ephemeral runtime
-	// overrides (CLI > persisted config > "auto" default). Not persisted —
-	// mirrors the role-override precedence above.
+	// overrides (CLI > persisted config > "auto" default). Not persisted.
 	if (parsedArgs.clipboardTransport) {
 		settingsInstance.override("clipboard.transport", parsedArgs.clipboardTransport);
 	}
@@ -2364,12 +2715,33 @@ export async function runRootCommand(
 				parsedArgs,
 				cwd,
 				settingsInstance,
+				sessionOwnerSurface(),
+				isInteractive
+					? {
+							interactive: true,
+							notice: message => notifs.push({ kind: "warn", message }),
+							...(hasResumePickerTerminal()
+								? {
+										held: {
+											choose: promptHeldSession,
+											forked: (message: string) => notifs.push({ kind: "info", message }),
+										},
+									}
+								: {}),
+						}
+					: STDERR_STARTUP_NOTICES,
 			);
 		} catch (error) {
-			const message = operatorFacingSessionOpenMessage(error);
-			if (!message) throw error;
-			process.stderr.write(`${message}\n`);
-			if (!deps.suppressProcessExit) process.exitCode = 1;
+			// Cancel in the held-session warning exits 0, through the same cleanup, printing nothing.
+			if (!(error instanceof SessionResumeCancelledError)) {
+				const message = operatorFacingSessionOpenMessage(error, {
+					print: !isInteractive,
+					fork: sessionHeldForkSourceFor(parsedArgs, cwd),
+				});
+				if (!message) throw error;
+				process.stderr.write(`${message}\n`);
+				if (!deps.suppressProcessExit) process.exitCode = 1;
+			}
 			authStorage.close();
 			stopThemeWatcher();
 			await postmortem.cleanup();
@@ -2478,7 +2850,12 @@ export async function runRootCommand(
 	// defer; their connect evidence is published during session creation).
 	// ACP/print/SDK sessions connect eagerly and are not carved out here.
 	if (isInteractive) {
+		// Root TUI sessions may control conventional autoload declarations after first paint.
+		// The grant is minted here only; SDK callers of createAgentSession cannot mint one.
+		// Exact --mcp-config sessions retain their existing capability path.
 		sessionOptions.deferMcpConfigStartup = true;
+		if (sessionOptions.mcpConfigPath === undefined && sessionOptions.enableMcpAutoload !== false)
+			sessionOptions.sessionMcpControlGrant = issueSessionMcpControlGrant();
 	}
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup
@@ -2529,11 +2906,14 @@ export async function runRootCommand(
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
 	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
+	// ACP mode never builds an agent on this manager (its sessions run in
+	// broker-launched hosts), so registering it would only advertise a session that
+	// ACP `session/list` shows and `session/load` cannot open.
 	const sessionAgentDir = settingsInstance.getAgentDir();
 	let directSessionRegistration: DirectSessionRegistration;
 	try {
 		directSessionRegistration = await (deps.registerDirectSession ?? registerDirectSession)(
-			sessionManager,
+			mode === "acp" ? undefined : sessionManager,
 			sessionAgentDir,
 			process.env.GJC_LIFECYCLE_REQUEST_ID,
 			{
@@ -2624,8 +3004,10 @@ export async function runRootCommand(
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		liveSession = session;
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
-		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
+		// Herdr integration: report gjc lifecycle state when running in a herdr TUI
+		// pane (`herdr pane report-agent`) or an herdr-core terminal (OSC 7501).
 		installHerdrReporter(listener => session.subscribe(listener));
+		installHerdrCoreStatusReporter(listener => session.subscribe(listener), { interactive: isInteractive });
 
 		// Exact MCP capability attaches at the root interactive entry point.
 		// Granted by creation path, not by call order:
@@ -2677,7 +3059,14 @@ export async function runRootCommand(
 			}
 		}
 
-		if (modelFallbackMessage && shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive)) {
+		// Model fallback without a usable model in interactive mode will open the selector,
+		// so skip the warn notification. Non-interactive/print/RPC will fail with exit 1.
+		const shouldOpenModelSelectorOnStartup = isInteractive && !session.model && modelFallbackMessage;
+		if (
+			modelFallbackMessage &&
+			shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive) &&
+			!shouldOpenModelSelectorOnStartup
+		) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 
@@ -2757,6 +3146,9 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
+						{
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				}
 			} catch (error) {
@@ -2797,7 +3189,10 @@ export async function runRootCommand(
 						bareResumeAction,
 						startDeferredMcpConfig,
 						startDeferredModelProfiles,
-						{ stopAfterFirstPaint: true },
+						{
+							stopAfterFirstPaint: true,
+							openModelSelectorWithFallback: shouldOpenModelSelectorOnStartup ? modelFallbackMessage : undefined,
+						},
 					);
 				} catch (error) {
 					logger.warn("Timing probe interactive boot failed", { error: String(error) });
@@ -2839,9 +3234,9 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
+	if (args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor();
+		await runManagedOwnerSupervisor(args);
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {

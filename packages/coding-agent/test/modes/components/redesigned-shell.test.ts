@@ -124,11 +124,7 @@ describe("redesigned interactive shell chrome", () => {
 		const wideLines = new UserMessageComponent(prompt).render(160);
 		const contentWidths = (lines: string[]) =>
 			lines
-				.map(line =>
-					Bun.stripANSI(line)
-						.replace(/\x1b\]133;[ABC]\x07/g, "")
-						.trimEnd(),
-				)
+				.map(line => Bun.stripANSI(line).trimEnd())
 				.filter(line => line.includes("안녕하세요"))
 				.map(line => visibleWidth(line));
 
@@ -276,13 +272,13 @@ describe("redesigned interactive shell chrome", () => {
 		expect(stripped).toContain("          print('b')");
 	});
 
-	it("keeps OSC 133 prompt markers scoped to the message body", () => {
-		const rendered = new UserMessageComponent("hello").render(80);
+	it("renders user messages without OSC 133 shell-prompt marks", () => {
+		// A prompt mark tells the terminal the foreground program ended. Tern then
+		// resets the Kitty keyboard flags gjc pushed, so Shift+Enter submits.
+		const rendered = new UserMessageComponent("hello").render(80).join("");
 
-		expect(rendered[0]).not.toContain("\x1b]133;A\x07");
-		expect(rendered[1]).not.toContain("\x1b]133;A\x07");
-		expect(rendered[2]).toContain("\x1b]133;A\x07");
-		expect(rendered[rendered.length - 1]).toContain("\x1b]133;B\x07\x1b]133;C\x07");
+		expect(rendered).toContain("hello");
+		expect(rendered).not.toMatch(/\x1b\]133;/);
 	});
 
 	it("budgets footer prefixes before truncating pulse", () => {

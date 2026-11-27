@@ -7,6 +7,7 @@ import {
 	clearToolChoiceIncapabilityRegistryForTests,
 	getToolChoiceCapabilityOverride,
 } from "../src/utils/tool-choice-capability";
+import { createAbortedSignal } from "./helpers";
 import {
 	collectEvents,
 	createBaseModel,
@@ -147,11 +148,6 @@ describe("OpenAI completions tool choice capability", () => {
 describe("OpenAI completions empty-tool choice serialization", () => {
 	// #1227: Explicit tools: [] opts out; only undefined tools with history retains
 	// the Anthropic-proxy tools: [] sentinel. Neither empty shape sends tool_choice.
-	function abortedSignal(): AbortSignal {
-		const controller = new AbortController();
-		controller.abort();
-		return controller.signal;
-	}
 
 	function bedrockModel(): Model<"openai-completions"> {
 		return {
@@ -172,7 +168,7 @@ describe("OpenAI completions empty-tool choice serialization", () => {
 		streamOpenAICompletions(bedrockModel(), context, {
 			...opts,
 			apiKey: "test-key",
-			signal: abortedSignal(),
+			signal: createAbortedSignal(),
 			onPayload: payload => resolve(payload),
 		});
 		return (await promise) as Record<string, unknown>;

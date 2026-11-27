@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { RawArgumentValidationResult, Tool, ToolCall } from "@gajae-code/ai/types";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
+import fc from "fast-check";
 import * as z from "zod/v4";
 
 function captureMessage(run: () => void): string {
@@ -1159,5 +1160,782 @@ describe("Tool argument coercion", () => {
 		expect(message).toContain('rejected keys: "');
 		expect(message).not.toContain("k8");
 		expect(message.length).toBeLessThan(800);
+	});
+
+	it("names the rejected fields without echoing the caller's arguments", () => {
+		const tool: Tool = {
+			name: "echo",
+			description: "",
+			parameters: z.object({ timeoutMs: z.number().max(120000), note: z.string().optional() }),
+		};
+		const canary = "sk_live_canary_9f8e7d6c5b4a";
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-echo",
+			name: "echo",
+			arguments: { timeoutMs: 999999, note: canary },
+		};
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		// The path and the constraint are what repairs the call; the payload is not.
+		expect(message).toContain('Validation failed for tool "echo"');
+		expect(message).toContain("/timeoutMs");
+		expect(message).not.toContain("Received arguments:");
+		expect(message).not.toContain(canary);
+		expect(message).not.toContain("999999");
+	});
+
+	it("bounds the rejected-field list", () => {
+		const shape: Record<string, z.ZodTypeAny> = {};
+		const args: Record<string, unknown> = {};
+		for (let index = 0; index < 20; index += 1) {
+			shape[`field${index}`] = z.number();
+			args[`field${index}`] = "not-a-number-and-not-coercible";
+		}
+		const tool: Tool = { name: "many", description: "", parameters: z.object(shape) };
+		const toolCall: ToolCall = { type: "toolCall", id: "call-many", name: "many", arguments: args };
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toContain("Rejected fields:");
+		expect(message).toContain("and 8 more");
+	});
+
+	describe("explicit null on optional properties", () => {
+		const tool: Tool = {
+			name: "update_issue",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					note: { type: ["string", "null"] },
+					assignee: { anyOf: [{ type: "string" }, { type: "null" }] },
+					label: { type: "string" },
+				},
+				required: ["id"],
+			},
+		};
+		const call = (args: Record<string, unknown>): ToolCall => ({
+			type: "toolCall",
+			id: "call-null",
+			name: tool.name,
+			arguments: args,
+		});
+
+		it("keeps a null the property schema accepts", () => {
+			expect(validateToolArguments(tool, call({ id: "1", note: null, assignee: null }))).toEqual({
+				id: "1",
+				note: null,
+				assignee: null,
+			});
+		});
+
+		it("drops a null the property schema rejects", () => {
+			expect(validateToolArguments(tool, call({ id: "1", label: null, note: "x" }))).toEqual({ id: "1", note: "x" });
+		});
+
+		it("distinguishes string 'null' sentinel from JSON null", () => {
+			// String "null" is an LLM sentinel meaning "omit this field"
+			const result = validateToolArguments(tool, call({ id: "1", note: "null", assignee: null }));
+			// String "null" should be deleted (it's a sentinel)
+			// JSON null should be preserved (schema accepts it)
+			expect(result).toEqual({ id: "1", assignee: null });
+		});
+
+		it("preserves JSON null for nullable optional with no default", () => {
+			const result = validateToolArguments(tool, call({ id: "1", note: null }));
+			expect(result).toEqual({ id: "1", note: null });
+		});
+	});
+
+	describe("nullable optional with default value", () => {
+		const tool: Tool = {
+			name: "update_field",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					status: {
+						type: ["string", "null"],
+						default: "pending",
+					},
+					tags: {
+						type: "array",
+						items: { type: "string" },
+						default: [],
+					},
+				},
+				required: ["id"],
+			},
+		};
+		const call = (args: Record<string, unknown>): ToolCall => ({
+			type: "toolCall",
+			id: "call-default",
+			name: tool.name,
+			arguments: args,
+		});
+
+		it("preserves explicit JSON null instead of applying default", () => {
+			// Issue 1: If schema accepts null, preserve the explicit null
+			// Don't apply the default
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("deletes non-nullable optional fields with null", () => {
+			// For non-nullable optional fields that receive null, delete the field
+			const nonNullableTool: Tool = {
+				name: "update_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: {
+							type: "string",
+							default: "pending",
+						},
+					},
+					required: ["id"],
+				},
+			};
+			const nonNullableCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-default",
+				name: nonNullableTool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(nonNullableTool, nonNullableCall({ id: "1", status: null }));
+			// For non-nullable optional, the field is deleted (not defaulted)
+			expect(result).toEqual({ id: "1" });
+		});
+
+		it("applies default for required non-nullable fields with null", () => {
+			// For required fields that don't accept null, apply default
+			const requiredNonNullTool: Tool = {
+				name: "update_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: {
+							type: "string",
+							default: "pending",
+						},
+					},
+					required: ["id", "status"],
+				},
+			};
+			const requiredNonNullCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-default",
+				name: requiredNonNullTool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(requiredNonNullTool, requiredNonNullCall({ id: "1", status: null }));
+			// For required non-nullable, apply default
+			expect(result).toEqual({ id: "1", status: "pending" });
+		});
+
+		it("preserves JSON null for required nullable field even with default", () => {
+			const requiredTool: Tool = {
+				name: "update_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: {
+							type: ["string", "null"],
+							default: "pending",
+						},
+					},
+					required: ["id", "status"],
+				},
+			};
+			const requiredCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-default",
+				name: requiredTool.name,
+				arguments: args,
+			});
+			// When schema accepts null, preserve it even if field is required and has default
+			const result = validateToolArguments(requiredTool, requiredCall({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+	});
+
+	describe("nullable optional with local $ref", () => {
+		const tool: Tool = {
+			name: "update_ref_field",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					id: { type: "string" },
+					status: { $ref: "#/$defs/nullableStatus" },
+				},
+				required: ["id"],
+				$defs: {
+					nullableStatus: {
+						type: ["string", "null"],
+					},
+				},
+			},
+		};
+		const call = (args: Record<string, unknown>): ToolCall => ({
+			type: "toolCall",
+			id: "call-ref",
+			name: tool.name,
+			arguments: args,
+		});
+
+		it("preserves null through local $ref resolution", () => {
+			// Issue 3: Ensure $ref is resolved correctly for null validation
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("removes null for non-accepting $ref", () => {
+			const nonNullTool: Tool = {
+				name: "update_ref_field",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/nonNullStatus" },
+					},
+					required: ["id"],
+					$defs: {
+						nonNullStatus: {
+							type: "string",
+						},
+					},
+				},
+			};
+			const nonNullCall = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-ref",
+				name: nonNullTool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(nonNullTool, nonNullCall({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1" });
+		});
+	});
+
+	describe("chained local $ref resolution", () => {
+		it("preserves null through 2-hop chained $refs", () => {
+			// A -> B -> final type accepting null
+			const tool: Tool = {
+				name: "chained_2hop",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { type: ["string", "null"] },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-2hop",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("removes null through 2-hop chained $refs when final type rejects null", () => {
+			// A -> B -> final type NOT accepting null
+			const tool: Tool = {
+				name: "chained_2hop_nonull",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { type: "string" },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-2hop-nonull",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1" });
+		});
+
+		it("preserves null through 3-hop chained $refs", () => {
+			// A -> B -> C -> final type accepting null
+			const tool: Tool = {
+				name: "chained_3hop",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { $ref: "#/$defs/refC" },
+						refC: { type: ["string", "null"] },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-3hop",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1", status: null });
+		});
+
+		it("removes null through 3-hop chained $refs when final type rejects null", () => {
+			// A -> B -> C -> final type NOT accepting null
+			const tool: Tool = {
+				name: "chained_3hop_nonull",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						status: { $ref: "#/$defs/refA" },
+					},
+					required: ["id"],
+					$defs: {
+						refA: { $ref: "#/$defs/refB" },
+						refB: { $ref: "#/$defs/refC" },
+						refC: { type: "string" },
+					},
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-3hop-nonull",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", status: null }));
+			expect(result).toEqual({ id: "1" });
+		});
+	});
+
+	describe("nullable normalization invariants (fixed examples)", () => {
+		it("preserves accepted null across anyOf schema variants", () => {
+			const tool: Tool = {
+				name: "test_anyof",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						// anyOf variant of nullable
+						value: { anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }] },
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-anyof",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", value: null }));
+			expect(result).toEqual({ id: "1", value: null });
+		});
+
+		it("preserves accepted null across oneOf schema variants", () => {
+			const tool: Tool = {
+				name: "test_oneof",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						// oneOf variant of nullable
+						value: { oneOf: [{ type: "string" }, { type: "null" }] },
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-oneof",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", value: null }));
+			expect(result).toEqual({ id: "1", value: null });
+		});
+
+		it("removes rejected null across array elements", () => {
+			const tool: Tool = {
+				name: "test_array_null",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						tags: {
+							type: "array",
+							items: { type: "string" },
+						},
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-array",
+				name: tool.name,
+				arguments: args,
+			});
+			// Arrays don't have optional property processing, they're handled separately
+			const result = validateToolArguments(tool, call({ id: "1", tags: ["a", "b"] }));
+			expect(result).toEqual({ id: "1", tags: ["a", "b"] });
+		});
+
+		it("preserves null in nested objects with nullable properties", () => {
+			const tool: Tool = {
+				name: "test_nested",
+				description: "",
+				parameters: {
+					type: "object",
+					properties: {
+						id: { type: "string" },
+						metadata: {
+							type: "object",
+							properties: {
+								tag: { type: ["string", "null"] },
+							},
+						},
+					},
+					required: ["id"],
+				},
+			};
+			const call = (args: Record<string, unknown>): ToolCall => ({
+				type: "toolCall",
+				id: "call-nested",
+				name: tool.name,
+				arguments: args,
+			});
+			const result = validateToolArguments(tool, call({ id: "1", metadata: { tag: null } }));
+			expect(result).toEqual({ id: "1", metadata: { tag: null } });
+		});
+	});
+
+	describe("nullable normalization invariants (property-based with fast-check)", () => {
+		it("preserves accepted null across generated nullable schema variants", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 2 }).chain(variant =>
+						fc
+							.record({
+								includeDefault: fc.boolean(),
+							})
+							.map(({ includeDefault }) => ({ variant, includeDefault })),
+					),
+					config => {
+						let propertySchema: Record<string, unknown>;
+
+						// Generate different nullable schema variants
+						switch (config.variant) {
+							case 0: // anyOf variant
+								propertySchema = {
+									anyOf: [{ type: "string" }, { type: "integer" }, { type: "null" }],
+								};
+								break;
+							case 1: // oneOf variant
+								propertySchema = {
+									oneOf: [{ type: "string" }, { type: "null" }],
+								};
+								break;
+							case 2: // type array variant
+								propertySchema = { type: ["string", "integer", "null"] };
+								break;
+							default:
+								throw new Error("Invalid variant");
+						}
+
+						if (config.includeDefault) {
+							propertySchema = { ...propertySchema, default: null };
+						}
+
+						const tool: Tool = {
+							name: "test_nullable",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									value: propertySchema,
+								},
+								required: ["id"],
+							},
+						};
+
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `call-${config.variant}`,
+							name: tool.name,
+							arguments: { id: "test", value: null },
+						};
+
+						const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+						// Invariant: accepted null must be preserved
+						expect(result.value).toBe(null);
+					},
+				),
+				{ numRuns: 100 },
+			);
+		});
+
+		it("removes rejected null from non-nullable optional properties", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 2 }).chain(variant =>
+						fc
+							.record({
+								includeDefault: fc.boolean(),
+							})
+							.map(({ includeDefault }) => ({ variant, includeDefault })),
+					),
+					config => {
+						let propertySchema: Record<string, unknown>;
+
+						// Generate non-nullable schema variants
+						switch (config.variant) {
+							case 0: // anyOf without null
+								propertySchema = {
+									anyOf: [{ type: "string" }, { type: "integer" }],
+								};
+								break;
+							case 1: // oneOf without null
+								propertySchema = {
+									oneOf: [{ type: "string" }, { type: "boolean" }],
+								};
+								break;
+							case 2: // type array without null
+								propertySchema = { type: ["string", "integer"] };
+								break;
+							default:
+								throw new Error("Invalid variant");
+						}
+
+						if (config.includeDefault) {
+							propertySchema = { ...propertySchema, default: "fallback" };
+						}
+
+						// Always optional to test null removal behavior
+						const tool: Tool = {
+							name: "test_non_nullable_optional",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									value: propertySchema,
+								},
+								required: ["id"],
+							},
+						};
+
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `call-${config.variant}`,
+							name: tool.name,
+							arguments: { id: "test", value: null },
+						};
+
+						const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+						// Invariant: rejected null should be removed for optional non-nullable properties
+						expect(result).not.toHaveProperty("value");
+					},
+				),
+				{ numRuns: 100 },
+			);
+		});
+
+		it("preserves null in nested objects across generated schema depths", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 1, max: 3 }).chain(depth =>
+						fc
+							.record({
+								includeNullInLeaf: fc.boolean(),
+							})
+							.map(({ includeNullInLeaf }) => ({ depth, includeNullInLeaf })),
+					),
+					config => {
+						// Build nested property schema based on depth
+						const leafSchema = config.includeNullInLeaf ? { type: ["string", "null"] } : { type: "string" };
+
+						let propertySchema: Record<string, unknown> = leafSchema;
+
+						for (let i = 1; i < config.depth; i++) {
+							propertySchema = {
+								type: "object",
+								properties: {
+									nested: propertySchema,
+								},
+							};
+						}
+
+						const tool: Tool = {
+							name: "test_nested_nullable",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									data: propertySchema,
+								},
+								required: ["id"],
+							},
+						};
+
+						// Build nested value based on depth
+						let nestedValue: unknown = null;
+						for (let i = 1; i < config.depth; i++) {
+							nestedValue = { nested: nestedValue };
+						}
+
+						const toolCall: ToolCall = {
+							type: "toolCall",
+							id: `call-nested-${config.depth}`,
+							name: tool.name,
+							arguments: { id: "test", data: nestedValue },
+						};
+
+						const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+						// Invariant: null in nested structures should be preserved if schema allows it
+						if (config.includeNullInLeaf) {
+							// Traverse nested structure to find the leaf
+							let current: unknown = result.data;
+							for (let i = 1; i < config.depth; i++) {
+								current = (current as Record<string, unknown>).nested;
+							}
+							expect(current).toBe(null);
+						}
+					},
+				),
+				{ numRuns: 50 },
+			);
+		});
+
+		it("enforces sibling constraints when $ref is present (property-based)", () => {
+			fc.assert(
+				fc.property(
+					fc.integer({ min: 0, max: 1 }).chain(strategy =>
+						fc
+							.record({
+								testNull: fc.boolean(),
+							})
+							.map(({ testNull }) => ({ strategy, testNull })),
+					),
+					config => {
+						// Strategy 0: $ref to union + sibling type constraint
+						// Strategy 1: $ref to union + sibling enum constraint
+						let propertySchema: Record<string, unknown>;
+
+						if (config.strategy === 0) {
+							// $ref accepts string|number, but sibling type:string further constrains
+							propertySchema = {
+								$ref: "#/$defs/StringOrNumber",
+								type: "string",
+							};
+						} else {
+							// $ref accepts string|boolean, but sibling enum constrains to ["a", "b"]
+							propertySchema = {
+								$ref: "#/$defs/StringOrBoolean",
+								enum: ["a", "b"],
+							};
+						}
+
+						const tool: Tool = {
+							name: "sibling_constraint_test",
+							description: "",
+							parameters: {
+								type: "object",
+								properties: {
+									id: { type: "string" },
+									value: propertySchema,
+								},
+								required: ["id"],
+								$defs: {
+									StringOrNumber: { type: ["string", "number"] },
+									StringOrBoolean: { type: ["string", "boolean"] },
+								},
+							},
+						};
+
+						if (config.testNull) {
+							// Test with null: should be rejected due to sibling constraints
+							const toolCall: ToolCall = {
+								type: "toolCall",
+								id: `call-sibling-null-${config.strategy}`,
+								name: tool.name,
+								arguments: { id: "test", value: null },
+							};
+
+							const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+							// Sibling constraints should reject null
+							expect("value" in result).toBe(false);
+						} else {
+							// Test with valid value: should be accepted
+							const value = config.strategy === 0 ? "hello" : "a";
+							const toolCall: ToolCall = {
+								type: "toolCall",
+								id: `call-sibling-valid-${config.strategy}`,
+								name: tool.name,
+								arguments: { id: "test", value },
+							};
+
+							const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
+
+							// Valid values should be preserved
+							expect(result.value).toBe(value);
+						}
+					},
+				),
+				{ numRuns: 50 },
+			);
+		});
 	});
 });

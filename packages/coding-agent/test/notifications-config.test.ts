@@ -43,6 +43,8 @@ import {
 	daemonPaths,
 	ensureTelegramDaemonRunning,
 	renewDaemonHeartbeat,
+	type TelegramDaemonOptions,
+	type TelegramDaemonStopCause,
 } from "../src/sdk/bus/telegram-daemon";
 import {
 	createLightweightDaemonSettings,
@@ -627,11 +629,14 @@ describe("notifications config", () => {
 				if (index === 0) {
 					let daemonConstructed = false;
 					class UnexpectedDaemon {
-						constructor() {
+						constructor(_opts: TelegramDaemonOptions) {
 							daemonConstructed = true;
 						}
 						async run(): Promise<void> {}
 						requestStop(): void {}
+						getStopCause(): TelegramDaemonStopCause | undefined {
+							return undefined;
+						}
 					}
 					await expect(
 						runDaemonInternal(["--agent-dir", agentDir, "--owner-id", "owner"], {
@@ -969,7 +974,7 @@ describe("notifications config", () => {
 			settings.getStorage()?.close();
 		}
 	});
-	test("with-current repair does not restore stale validation after a concurrent different notification repair", async () => {
+	test("with-current repair refuses raced preparation without restoring stale validation", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-current-concurrent-repair-"));
 		tempDirs.push(root);
 		const agentDir = path.join(root, "agent");
@@ -992,7 +997,11 @@ describe("notifications config", () => {
 			settings.set("notifications.enabled", true);
 			continueBuilder.resolve();
 
-			const receipt = await pendingReceipt;
+			await expect(pendingReceipt).rejects.toThrow("Settings changed while the atomic batch was preparing");
+			expect(settings.getNotificationSettingsSnapshot()).toMatchObject({ enabled: true, redact: false });
+			const receipt = await settings.commitAtomicBatchWithCurrent(() => [
+				{ path: "notifications.redact", op: "set", value: true },
+			]);
 			expect(settings.getNotificationSettingsSnapshot()).toMatchObject({ enabled: true, redact: true });
 			expect(await receipt.restore()).toMatchObject({ status: "restored" });
 			expect(settings.getNotificationSettingsSnapshot()).toMatchObject({ enabled: true, redact: false });
@@ -1001,7 +1010,7 @@ describe("notifications config", () => {
 			settings.getStorage()?.close();
 		}
 	});
-	test("with-current same-value notification mutations still fence validation rollback", async () => {
+	test("with-current same-value mutations fence preparation and preserve notification validation on retry", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-current-same-value-"));
 		tempDirs.push(root);
 		const agentDir = path.join(root, "agent");
@@ -1024,7 +1033,11 @@ describe("notifications config", () => {
 			settings.set("notifications.enabled", true);
 			continueBuilder.resolve();
 
-			const receipt = await pendingReceipt;
+			await expect(pendingReceipt).rejects.toThrow("Settings changed while the atomic batch was preparing");
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			const receipt = await settings.commitAtomicBatchWithCurrent(() => [
+				{ path: "notifications.enabled", op: "set", value: true },
+			]);
 			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
 			expect(await receipt.restore()).toMatchObject({ status: "restored" });
 			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");

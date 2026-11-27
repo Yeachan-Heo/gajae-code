@@ -213,7 +213,7 @@ describe("deferred shell execution publication boundary", () => {
 
 		first.turn.finish();
 		await expect(first.prompt).rejects.toThrow(
-			'Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry; persisted: []; pending: ["printf retry"]',
+			'Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them; persisted: []; pending: ["printf retry"]',
 		);
 
 		expect(shellMessages(harness.agent.state.messages, "bashExecution")).toHaveLength(1);
@@ -260,7 +260,7 @@ describe("deferred shell execution publication boundary", () => {
 
 		first.turn.finish();
 		await expect(first.prompt).rejects.toThrow(
-			'Failed to persist 3 of 5 deferred bash execution messages; 2 persisted, failed messages remain pending for retry; persisted: ["cmd1","cmd2"]; pending: ["cmd3","cmd4","cmd5"]',
+			'Failed to persist 3 of 5 deferred bash execution messages; 2 persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them; persisted: ["cmd1","cmd2"]; pending: ["cmd3","cmd4","cmd5"]',
 		);
 
 		expect(bashCommands(harness.agent.state.messages)).toEqual(["cmd1", "cmd2", "cmd3", "cmd4", "cmd5"]);
@@ -299,11 +299,11 @@ describe("deferred shell execution publication boundary", () => {
 
 		first.turn.finish();
 		await expect(first.prompt).rejects.toThrow(
-			'Failed to persist 4 of 5 deferred bash execution messages; 1 persisted, failed messages remain pending for retry; persisted: ["cmd1"]; pending: ["cmd2","cmd3","cmd4","cmd5"]',
+			'Failed to persist 4 of 5 deferred bash execution messages; 1 persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them; persisted: ["cmd1"]; pending: ["cmd2","cmd3","cmd4","cmd5"]',
 		);
 
 		await expect(harness.session.prompt("again")).rejects.toThrow(
-			'Failed to persist 2 of 4 deferred bash execution messages; 2 persisted, failed messages remain pending for retry; persisted: ["cmd2","cmd3"]; pending: ["cmd4","cmd5"]',
+			'Failed to persist 2 of 4 deferred bash execution messages; 2 persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them; persisted: ["cmd2","cmd3"]; pending: ["cmd4","cmd5"]',
 		);
 
 		const third = await harness.startTurn("again");
@@ -335,7 +335,7 @@ describe("deferred shell execution publication boundary", () => {
 
 		first.turn.finish();
 		await expect(first.prompt).rejects.toThrow(
-			'Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry; persisted: []; pending: ["cmd1"]',
+			'Failed to persist 1 of 1 deferred bash execution message; 0 persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them; persisted: []; pending: ["cmd1"]',
 		);
 
 		expect(events.at(-1)).toBe("agent_end");

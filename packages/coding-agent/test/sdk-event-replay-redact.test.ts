@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { lcg32 } from "../../utils/test/helpers/prng";
 import { SessionEventStream, SessionSdkHost, setSessionOutboundRedact } from "../src/sdk/host";
 
 const MARKER = "PLAINTEXT_REPLAY_MARKER";
@@ -11,17 +12,9 @@ const REDACTED_KINDS = [
 	"tool_activity",
 ] as const;
 
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(1664525, state) + 1013904223) >>> 0;
-		return state;
-	};
-}
-
 describe("session event replay redaction", () => {
 	test("property: session id capture, seed 516, 64 inputs", () => {
-		const next = mulberry32(516);
+		const next = lcg32(516);
 		const alphabet = "abcdefghijklmnopqrstuvwxyz";
 		const genId = (): string => {
 			let id = "s";
@@ -73,7 +66,7 @@ describe("session event replay redaction", () => {
 	});
 
 	test("property: replay kind filter, seed 516, 64 inputs", () => {
-		const next = mulberry32(516);
+		const next = lcg32(516);
 		const alphabet = "abcdefghijklmnopqrstuvwxyz_";
 		const kinds: string[] = [];
 		for (let i = 0; i < 64; i++) {

@@ -3,6 +3,8 @@ import {
 	clampThinkingLevelForModel,
 	type Effort,
 	getMiniMaxThinkingMode,
+	getSupportedEfforts,
+	isAnthropicThinkingAlwaysOn,
 	THINKING_EFFORTS,
 } from "@gajae-code/ai/model-thinking";
 import type { Model } from "@gajae-code/ai/types";
@@ -51,7 +53,21 @@ export function toReasoningEffort(level: ThinkingLevel | undefined): Effort | un
 }
 
 /**
- * Resolves a selector against the current model while preserving explicit "off".
+ * Whether "off" is an honest choice for `model`. Always-on models (Fable 5.2+) think when
+ * thinking is omitted and reject an explicit disable, so Off would be shown but not applied.
+ */
+export function modelSupportsThinkingOff(model: Model | undefined): boolean {
+	return model === undefined || !isAnthropicThinkingAlwaysOn(model.id);
+}
+
+/** Lowest real effort of an always-on model, which is what an Off request resolves to. */
+function alwaysOnFloor(model: Model): Effort | undefined {
+	return clampThinkingLevelForModel(model, getSupportedEfforts(model)[0]);
+}
+
+/**
+ * Resolves a selector against the current model while preserving explicit "off" where the
+ * model can honor it; on always-on models Off resolves to the lowest supported effort.
  */
 export function resolveThinkingLevelForModel(
 	model: Model | undefined,
@@ -61,7 +77,7 @@ export function resolveThinkingLevelForModel(
 		return undefined;
 	}
 	if (level === ThinkingLevel.Off) {
-		return ThinkingLevel.Off;
+		return model && !modelSupportsThinkingOff(model) ? alwaysOnFloor(model) : ThinkingLevel.Off;
 	}
 	return clampThinkingLevelForModel(model, level);
 }
@@ -70,8 +86,11 @@ export function clampExplicitThinkingLevelForModel(
 	model: Model | undefined,
 	level: ThinkingLevel | undefined,
 ): ThinkingLevel | undefined {
-	if (level === undefined || level === ThinkingLevel.Inherit || level === ThinkingLevel.Off) {
+	if (level === undefined || level === ThinkingLevel.Inherit) {
 		return level;
+	}
+	if (level === ThinkingLevel.Off) {
+		return model && !modelSupportsThinkingOff(model) ? alwaysOnFloor(model) : level;
 	}
 	return clampThinkingLevelForModel(model, level);
 }

@@ -334,7 +334,6 @@
     "resolveLarkLidPlaceholders",
     "resolveManagedAgentDirForScope",
     "resolveManagedSessionScope",
-    "resolveModelRoleOverrides",
     "resolveResumableSession",
     "resolveSkillSlashCommands",
     "resolveWelcomeIntroTickMs",

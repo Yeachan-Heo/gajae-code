@@ -1,7 +1,7 @@
 import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
-import { logger, TempDir } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../../package.json" with { type: "json" };
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
@@ -12,7 +12,11 @@ import {
 	type ExactSessionAuthorityOptions,
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
+	retireExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(75_000);
 
@@ -50,6 +54,10 @@ type Fixture = {
 	/** Releases a previously hung session/update transport. */
 	releaseSessionUpdates(): void;
 	sendIdle(): void;
+	/** Retires the host's index row, as a host that exits between turns does. */
+	retireHost(): Promise<void>;
+	/** Makes the broker's exact saved-session lookup omit the session (`undefined` restores it). */
+	omitSavedSession(omission: { reason: string; detailCode?: string } | undefined): void;
 	dispose(): void;
 	queryCalls: string[];
 	sendTerminal(frame: Record<string, unknown>): void;
@@ -104,7 +112,7 @@ export function createFixture(
 	} = {},
 ): Promise<Fixture> {
 	return (async () => {
-		const tempDir = TempDir.createSync("@acp-cancel-settlement-");
+		const tempDir = trackedTemp.tempDirSync("@acp-cancel-settlement-");
 		const agentDir = path.join(tempDir.path(), "agent");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const token = "acp-cancel-settlement-token";
@@ -121,6 +129,8 @@ export function createFixture(
 		let pendingPromptAck: { socket: TestSocket; id: unknown } | undefined;
 		let deferredPromptAckUsed = false;
 		let hangUpdates = false;
+		/** While set, the broker's exact saved-session lookup omits the session for this reason. */
+		let savedSessionOmission: { reason: string; detailCode?: string } | undefined;
 		let promptNumber = 0;
 		let lastPromptClientRef: string | undefined;
 		let watchdogNow = 0;
@@ -238,10 +248,12 @@ export function createFixture(
 						let result: unknown;
 						if (frame.operation === "session.list") {
 							result = resolvingSavedSession
-								? {
-										sessions: [],
-										savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
-									}
+								? savedSessionOmission
+									? { sessions: [], savedSessionOmission: { sessionId, ...savedSessionOmission } }
+									: {
+											sessions: [],
+											savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
+										}
 								: {
 										sessions: [
 											{
@@ -486,6 +498,12 @@ export function createFixture(
 			sendIdle,
 			queryCalls,
 			sendTerminal,
+			retireHost: async () => {
+				await retireExactSessionAuthority({ ...authorityOptions, indexSeq: authorityIndexSeq++ }, authority);
+			},
+			omitSavedSession: omission => {
+				savedSessionOmission = omission;
+			},
 			dispose: () => {
 				releaseHang.resolve();
 				abort.abort();
@@ -775,6 +793,37 @@ test("a pre-admission no_active_turn abort is retried after prompt acknowledgeme
 		await bounded(admittedAbortIssued.promise, "terminal abort after prompt acknowledgement");
 		expect(abortCalls).toBe(2);
 		expect(await bounded(pending, "acknowledged cancellation settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an uncertain pre-admission abort is retried after prompt acknowledgement", async () => {
+	let abortCalls = 0;
+	const admittedAbortIssued = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		deferPromptAcknowledgement: true,
+		abortAcknowledgement: () => {
+			abortCalls++;
+			if (abortCalls === 1) return { ok: true, selection: "turn", turn: "uncertain" };
+			admittedAbortIssued.resolve();
+			return { ok: true, selection: "turn", turn: "stopped", terminal: "terminal_no_effect" };
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel before uncertain prompt acknowledgement");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		expect(fixture.hasPendingPromptAcknowledgement()).toBe(true);
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		expect(abortCalls).toBe(1);
+
+		fixture.acknowledgePendingPrompt();
+		await bounded(admittedAbortIssued.promise, "abort retry after uncertain pre-admission result");
+		expect(abortCalls).toBe(2);
+		expect(await bounded(pending, "settled uncertain cancellation")).toEqual({ stopReason: "cancelled" });
 	} finally {
 		fixture.dispose();
 	}
@@ -3518,6 +3567,32 @@ test("cancel in flight before follow-up admission still settles the cancelled pr
 		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		abortGate.resolve();
+		fixture.dispose();
+	}
+});
+
+// Session single-owner step 6: after the host closes between turns (Continue here), a prompt
+// re-attaches the session in place. A saved-session lookup that is only busy (a migration in
+// progress) must not end the session: that prompt fails undelivered and the next one recovers.
+test("a re-attach that meets a busy saved-session lookup keeps the session for the next prompt", async () => {
+	const fixture = await createFixture();
+	try {
+		const first = prompt(fixture, "before the host closes");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first prompt")).toEqual({ stopReason: "end_turn" });
+
+		await fixture.retireHost();
+		fixture.omitSavedSession({ reason: "scope_unavailable", detailCode: "migration_busy" });
+		await expect(bounded(prompt(fixture, "during the migration"), "prompt during migration")).rejects.toThrow();
+		expect(fixture.promptDeliveryCount()).toBe(1);
+
+		fixture.omitSavedSession(undefined);
+		const recovered = prompt(fixture, "after the migration");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "recovered prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(recovered, "recovered prompt")).toEqual({ stopReason: "end_turn" });
+	} finally {
 		fixture.dispose();
 	}
 });

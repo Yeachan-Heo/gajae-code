@@ -179,33 +179,43 @@ export type JsonSchemaObject = {
 	const?: unknown;
 };
 
-interface BooleanDef {
+export interface SettingApplication {
+	kind: "next-run" | "host-presentation" | "reload" | "restart";
+	reason: string;
+}
+
+interface SettingApplicationMetadata {
+	/** Absent means application behavior has not been classified for the portable catalog. */
+	application?: SettingApplication;
+}
+
+interface BooleanDef extends SettingApplicationMetadata {
 	type: "boolean";
 	default?: boolean;
 	ui?: UiBoolean;
 }
 
-interface StringDef {
+interface StringDef extends SettingApplicationMetadata {
 	type: "string";
 	default: string | undefined;
 	ui?: UiString;
 }
 
-interface NumberDef {
+interface NumberDef extends SettingApplicationMetadata {
 	type: "number";
 	default: number;
 	validate?: (value: number) => boolean;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> {
+interface EnumDef<T extends readonly string[]> extends SettingApplicationMetadata {
 	type: "enum";
 	values: T;
 	default: T[number];
 	ui?: UiEnum<T>;
 }
 
-interface ArrayDef<T> {
+interface ArrayDef<T> extends SettingApplicationMetadata {
 	type: "array";
 	default: T[];
 	items?: { enum: readonly string[] };
@@ -227,7 +237,7 @@ interface ConstrainedRecordValueDef {
 	description: string;
 }
 
-interface ConstrainedRecordDef<T> {
+interface ConstrainedRecordDef<T> extends SettingApplicationMetadata {
 	type: "constrained-record";
 	default: T;
 	keys: readonly string[];
@@ -236,14 +246,14 @@ interface ConstrainedRecordDef<T> {
 	ui?: UiBase;
 }
 
-interface RecordDef<T> {
+interface RecordDef<T> extends SettingApplicationMetadata {
 	type: "record";
 	default: Record<string, T>;
 	valueSchema?: RecordValueDef;
 	ui?: UiBase;
 }
 
-export interface OptionalObjectDef<T> {
+export interface OptionalObjectDef<T> extends SettingApplicationMetadata {
 	type: "optional-object";
 	default: undefined;
 	jsonSchema: JsonSchemaObject;
@@ -468,6 +478,20 @@ export const SETTINGS_SCHEMA = {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
+	},
+	// Single-owner session claims. The whole `session.ownership.` namespace is global-only (see
+	// settings.ts), and later sub-flags sit beside `mode`, so the mode is a leaf, not the parent.
+	// Hidden from the settings UI; operators change it with `gjc config set` or the config file.
+	// `off` makes no claim and no lock call; `observe` claims and counts and never refuses; `enforce`
+	// also refuses to open a session another process holds.
+	"session.ownership.mode": {
+		type: "enum",
+		// Kept equal to SESSION_OWNERSHIP_MODES and DEFAULT_SESSION_OWNERSHIP_MODE (a test checks);
+		// listed here so the schema imports nothing new.
+		values: ["off", "observe", "enforce"] as const,
+		default: "observe",
+		description:
+			"Single-owner session claims: off makes none, observe claims and counts conflicts without refusing anything, enforce refuses to open a session another process holds.",
 	},
 	"workspaceTree.mode": {
 		type: "enum",
@@ -806,6 +830,16 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
+	"recap.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "context",
+			label: "Session Recap",
+			description:
+				"Generate a short recap after completed turns for session listings. Uses the default model and may incur model usage; never adds recap text to the conversation.",
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
@@ -1110,7 +1144,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "Artifact tail size (KB)",
-			description: "Amount of tail content kept inline when output spills to artifact",
+			description:
+				"Amount of tail content kept inline when a tool result spills to an artifact. The Bash tool uses `tools.bashOutputTailBytes` instead.",
 			options: [
 				{ value: "1", label: "1 KB", description: "~250 tokens" },
 				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
@@ -1130,7 +1165,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Artifact head size (KB)",
 			description:
-				"Amount of head content kept inline alongside the tail when output spills to artifact (middle elision). 0 disables — keep tail only.",
+				"Amount of head content kept inline alongside the tail when a tool result spills to an artifact (middle elision). 0 disables — keep tail only. The Bash tool uses `tools.bashOutputHeadBytes` instead.",
 			options: [
 				{ value: "0", label: "0 KB", description: "Disabled; tail-only truncation" },
 				{ value: "1", label: "1 KB", description: "~250 tokens" },
@@ -1141,6 +1176,45 @@ export const SETTINGS_SCHEMA = {
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 				{ value: "100", label: "100 KB", description: "~25K tokens" },
 				{ value: "200", label: "200 KB", description: "~50K tokens" },
+			],
+		},
+	},
+	"tools.bashOutputTailBytes": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "tools",
+			label: "Bash output tail size (KB)",
+			description:
+				"Tail window the Bash tool keeps inline from command output; the full stream is saved as an artifact when storage is available. Deliberately small so callers prefer focused commands and the search/find tools.",
+			options: [
+				{ value: "1", label: "1 KB", description: "Default; ~250 tokens" },
+				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "200", label: "200 KB", description: "~50K tokens" },
+			],
+		},
+	},
+	"tools.bashOutputHeadBytes": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Bash output head size (KB)",
+			description:
+				"Head window the Bash tool keeps inline alongside the tail (middle elision) so the start of long command output stays visible. 0 keeps the tail only.",
+			options: [
+				{ value: "0", label: "0 KB", description: "Default; tail-only truncation" },
+				{ value: "1", label: "1 KB", description: "~250 tokens" },
+				{ value: "2.5", label: "2.5 KB", description: "~625 tokens" },
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
 			],
 		},
 	},
@@ -1384,6 +1458,10 @@ export const SETTINGS_SCHEMA = {
 
 	// Sampling
 	temperature: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1402,6 +1480,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1420,6 +1502,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	topK: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1437,6 +1523,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	minP: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1453,6 +1543,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	presencePenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1470,6 +1564,10 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	repetitionPenalty: {
+		application: {
+			kind: "next-run",
+			reason: "New agent runs capture effective sampling; an in-flight run keeps its snapshot.",
+		},
 		type: "number",
 		default: -1,
 		ui: {
@@ -1599,6 +1697,16 @@ export const SETTINGS_SCHEMA = {
 	"fallback.circuitMaxCooldownMs": {
 		type: "number",
 		default: 30 * 60 * 1000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	// Concurrency saturation (a typed 429 such as `session_limit_reached`: the
+	// account already runs its maximum number of parallel requests) is a wait,
+	// not a failure. A managed chain retries the same entry for up to this long
+	// per request, without spending fallback attempts or opening the circuit,
+	// before treating it as an ordinary rate limit. 0 disables the wait.
+	"fallback.concurrencyWaitMs": {
+		type: "number",
+		default: 5 * 60 * 1000,
 		validate: (value: number) => Number.isFinite(value) && value >= 0,
 	},
 
@@ -1810,7 +1918,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Prompt Suggestions",
 			description:
-				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+				"Predict your likely next message after each completed turn (one extra call to the session model with the full conversation) and show it as ghost text; Tab accepts, Esc dismisses",
 		},
 	},
 
@@ -4084,6 +4192,7 @@ export const SETTINGS_SCHEMA = {
 			"synthetic",
 			"parallel",
 			"searxng",
+			"keenable",
 		] as const,
 		default: "auto",
 		ui: {
@@ -4141,6 +4250,11 @@ export const SETTINGS_SCHEMA = {
 				{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 				{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
 				{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
+				{
+					value: "keenable",
+					label: "Keenable",
+					description: "Keyless; optional KEENABLE_API_KEY raises rate limits",
+				},
 			],
 		},
 	},
@@ -4455,6 +4569,20 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 }
 
 /**
+ * Identity and destination fields adopted from the notification config file.
+ * `config.patch` must not rewrite them; local provider commands still do.
+ */
+const NOTIFICATION_BINDING_PATCH_PATHS = new Set<SettingPath>([
+	"notifications.telegram.chatId",
+	"notifications.discord.applicationId",
+	"notifications.discord.guildId",
+	"notifications.discord.parentChannelId",
+	"notifications.slack.workspaceId",
+	"notifications.slack.channelId",
+	"notifications.slack.authorizedUserId",
+]);
+
+/**
  * Validate an external (SDK `config.patch`) path/value set against the
  * settings schema before any durable write. Dotted sub-paths of record
  * settings (e.g. `modelRoles.default`) are validated against the record's
@@ -4465,11 +4593,32 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 	const issues: Array<{ path: string; detail: string }> = [];
 	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
 	for (const [path, value] of Object.entries(patch)) {
-		// Keep the legacy projection writable until every durable writer uses ownership CAS.
+		if (path === "modelProfile.default") {
+			issues.push({
+				path,
+				detail: "Model-profile defaults must be changed through profile selection, not config.patch.",
+			});
+			continue;
+		}
 		if (path === "modelProfile.ownership") {
 			issues.push({
 				path,
 				detail: "The versioned model-profile ownership record is internal and cannot be patched generically.",
+			});
+			continue;
+		}
+		if (path === "session.ownership" || path.startsWith("session.ownership.")) {
+			issues.push({
+				path,
+				detail:
+					"Session ownership settings need operator consent: use gjc config set or the config file, not config.patch.",
+			});
+			continue;
+		}
+		if (NOTIFICATION_BINDING_PATCH_PATHS.has(path as SettingPath)) {
+			issues.push({
+				path,
+				detail: "Notification binding fields cannot be changed through config.patch.",
 			});
 			continue;
 		}

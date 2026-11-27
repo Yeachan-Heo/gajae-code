@@ -10,7 +10,7 @@ import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead } from "../session/streaming-output";
-import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import {
@@ -22,6 +22,7 @@ import {
 import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
+import { renderGroupedFileTree } from "./grouped-file-tree";
 import { formatMatchLine } from "./match-line-format";
 import { formatFullOutputReference, type OutputMeta } from "./output-meta";
 import { resolveReadPath, resolveToolSearchScope } from "./path-utils";
@@ -285,6 +286,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		const deadlineAt = Date.now() + timeoutMs;
 		const timeoutSignal = AbortSignal.timeout(timeoutMs);
 		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+		let targetTimedOut = false;
 		const throwIfSearchCancelled = (): void => {
 			signal?.throwIfAborted();
 			if (Date.now() >= deadlineAt) throw new Error("Aborted: Timeout");
@@ -395,6 +397,25 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								}))
 							: (multiTargets ?? []);
 						for (const target of targets) {
+							throwIfSearchCancelled();
+							// Calculate remaining timeout for this target and create a fresh signal
+							// to avoid reusing the original combinedSignal across multiple grep calls.
+							// issue #7892: multi-path grep hangs in SDK session host when signals are
+							// reused across multiple native grep calls.
+							const remainingMs = Math.max(0, deadlineAt - Date.now());
+							if (remainingMs <= 0) throw new Error("Aborted: Timeout");
+							// Create a fresh signal for each target to prevent signal reuse issues.
+							// This avoids potential deadlocks when the same signal is shared across
+							// multiple native grep invocations in SDK session host mode.
+							const targetTimeoutSignal = AbortSignal.timeout(remainingMs);
+							targetTimeoutSignal.addEventListener(
+								"abort",
+								() => {
+									targetTimedOut = true;
+								},
+								{ once: true },
+							);
+							const targetSignal = signal ? AbortSignal.any([signal, targetTimeoutSignal]) : targetTimeoutSignal;
 							const targetResult = await grep(
 								{
 									pattern: normalizedPattern,
@@ -410,8 +431,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
-									signal: combinedSignal,
-									timeoutMs,
+									signal: targetSignal,
+									timeoutMs: remainingMs,
 								},
 								undefined,
 							);
@@ -692,7 +713,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			return completedResult;
 		} catch (error) {
 			const nativeTimedOut = error instanceof Error && error.message === "Aborted: Timeout";
-			if ((timeoutSignal.aborted || nativeTimedOut) && !signal?.aborted) {
+			if ((timeoutSignal.aborted || targetTimedOut || nativeTimedOut) && !signal?.aborted) {
 				const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
 				throw new ToolError(`Search timed out after ${seconds}s; increase timeout or narrow paths/pattern`);
 			}
@@ -835,54 +856,14 @@ export const searchToolRenderer = {
 			() => options.expanded,
 			width => {
 				const collapsedMatchLineBudget = Math.max(COLLAPSED_TEXT_LIMIT - extraLines.length, 0);
-				const searchBase = details?.searchPath;
-				const matchLines = renderTreeList(
-					{
-						items: matchGroups,
-						expanded: options.expanded,
-						maxCollapsed: matchGroups.length,
-						maxCollapsedLines: collapsedMatchLineBudget,
-						itemType: "match",
-						renderItem: group => {
-							// Track directory context within a group for ## file headers.
-							// `# foo/` is a directory header; `# foo.ts` is a root-level file
-							// from formatGroupedFiles (single-# when directory is `.`).
-							let contextDir = searchBase ?? "";
-							return group.map(line => {
-								if (line.startsWith("## ")) {
-									// Strip optional ` (suffix)` like ` (3 replacements)` before resolving.
-									const fileName = line
-										.slice(3)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const absPath = contextDir && fileName ? path.join(contextDir, fileName) : undefined;
-									const styled = uiTheme.fg("dim", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								if (line.startsWith("# ")) {
-									const raw = line
-										.slice(2)
-										.trimEnd()
-										.replace(/\s+\([^)]*\)\s*$/, "");
-									const isDirectory = raw.endsWith("/");
-									const name = raw.replace(/\/$/, "");
-									if (isDirectory) {
-										if (searchBase) {
-											contextDir = name === "." ? searchBase : path.join(searchBase, name);
-										}
-										return uiTheme.fg("accent", line);
-									}
-									// Root-level file emitted by formatGroupedFiles when the directory is `.`.
-									const absPath = searchBase && name ? path.join(searchBase, name) : undefined;
-									const styled = uiTheme.fg("accent", line);
-									return absPath ? fileHyperlink(absPath, styled) : styled;
-								}
-								return uiTheme.fg("toolOutput", line);
-							});
-						},
-					},
+				const matchLines = renderGroupedFileTree({
+					groups: matchGroups,
+					expanded: options.expanded,
+					maxCollapsedLines: collapsedMatchLineBudget,
+					itemType: "match",
 					uiTheme,
-				);
+					searchPath: details?.searchPath,
+				});
 				return [header, ...matchLines, ...extraLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
 			},
 		);

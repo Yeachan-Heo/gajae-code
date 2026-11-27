@@ -122,7 +122,7 @@ GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `
 - Keep source-bundled skills/agents in sync with tests/gates; do not rely on committed `.gjc` copies.
 - Planning workflows (`deep-interview`, `ralplan`) never execute implementation without explicit user approval; artifacts stay `pending approval` until then. `autoresearch` is a research workflow: it produces findings and a verdict, never an implementation.
 - Subagent await timeouts are observation windows, not failure signals; inspect before cancelling.
-- GitHub comment `/re-review` on PRs re-requests reviews from those with pending `CHANGES_REQUESTED` or `COMMENTED` feedback.
+- GitHub comment `/re-review` on PRs re-requests reviews from those with pending `CHANGES_REQUESTED` or `COMMENTED` feedback. `/re-review` must be the entire first line of the comment; put any notes on later lines.
 
 ## Code quality
 
@@ -174,6 +174,8 @@ For UI/dashboard/TUI visual work, follow `docs/ui-design-visual-qa.md` before br
 Test externally observable contracts: behavior, output shape, state transitions, error mapping, regression-prone parsing boundaries.
 
 Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicated coverage, long-lived global mutations, and `mock.module()`. Prefer `vi.spyOn(...)` with cleanup. Compile-time guarantees belong in type checks, not runtime tests.
+
+- Under `bun test`, `process.env.HOME` (what children see) may differ from `os.homedir()` (what in-process code uses). Build in-process expectations from `os.homedir()`, and pass `env.HOME` explicitly to give a child a specific home.
 
 ## Commit, changelog, release
 
