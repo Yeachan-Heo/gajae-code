@@ -210,11 +210,12 @@ describe("SessionSelectorComponent resume consent", () => {
 			released: false,
 			release: vi.fn(),
 		} as const;
-		const outcomes: SessionHandoverOutcome[] = [
-			{ kind: "refused", message: SESSION_HANDOVER_BUSY_MESSAGE },
-			{ kind: "closed", claim },
+		const closing = Promise.withResolvers<SessionHandoverOutcome>();
+		const outcomes: Promise<SessionHandoverOutcome>[] = [
+			Promise.resolve({ kind: "refused", message: SESSION_HANDOVER_BUSY_MESSAGE }),
+			closing.promise,
 		];
-		const handOver = vi.fn(async () => outcomes.shift()!);
+		const handOver = vi.fn(() => outcomes.shift()!);
 		const component = selector(inspect, results);
 		component.setHeldSessions(new Map([["one", error]]), async () => ({ error, handOver }));
 
@@ -237,6 +238,13 @@ describe("SessionSelectorComponent resume consent", () => {
 		component.handleInput("y");
 		await Bun.sleep(0);
 		expect(handOver).toHaveBeenCalledTimes(2);
+		// The handover cannot be interrupted: Escape and Ctrl+C while it runs settle nothing.
+		expect(text(component)).toContain("Handing the session over");
+		component.handleInput("\x1b");
+		component.handleInput("\x03");
+		expect(results).toEqual([]);
+		closing.resolve({ kind: "closed", claim });
+		await Bun.sleep(0);
 		// The tail is read again under the claim before the selection settles.
 		expect(inspect).toHaveBeenCalledTimes(3);
 		expect(results).toEqual([

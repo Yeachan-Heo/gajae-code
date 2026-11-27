@@ -377,6 +377,8 @@ export class SessionSelectorComponent extends Container {
 		this.#settle({ kind: "cancelled" });
 	}
 	#exit(): void {
+		// A handover cannot be interrupted (it is bounded); Ctrl+C is ignored until it settles.
+		if (this.#state.kind === "handing-over") return;
 		if (this.#state.kind !== "settled") this.#nextToken++;
 		this.#state = { kind: "settled" };
 		this.#sessionList.setInputFrozen(true);
@@ -457,7 +459,6 @@ export class SessionSelectorComponent extends Container {
 		this.#showError(error instanceof Error ? error.message : String(error));
 		this.#requestRender();
 	}
-	/** Continue here: hand the session over, then resume it as one nobody else holds. */
 	/**
 	 * Continue here: the read-only inspection and the resume confirmation come first, so nothing is
 	 * closed before the user's final yes; then the handover, which cannot be cancelled.
@@ -503,18 +504,28 @@ export class SessionSelectorComponent extends Container {
 		this.#messageContainer.clear();
 		this.#messageContainer.addChild(new Text(theme.fg("muted", "Handing the session over…"), 1, 0));
 		this.#requestRender();
+		// Still this handover: nothing settled the picker meanwhile.
+		const current = () => this.#state.kind === "handing-over" && this.#state.token === token;
 		let claim: SessionOwnerClaim | undefined;
 		try {
 			const outcome = await held.handOver();
+			if (outcome.kind === "closed") claim = outcome.claim;
+			if (!current()) {
+				claim?.release();
+				return;
+			}
 			if (outcome.kind === "refused") {
 				this.#clearError();
 				this.#showHeldWarning(session, token, held, outcome.message);
 				return;
 			}
-			claim = outcome.claim;
 			this.#sessionList.setHeldMarker(session.id, undefined);
 			// Read the tail again under the claim: the host may have finished a turn since the first read.
 			const inspection = await inspector(session.path);
+			if (!current()) {
+				claim?.release();
+				return;
+			}
 			if (inspection.kind === "error") throw new Error(`Unable to inspect session (${inspection.reason}).`);
 			const settled = { kind: "selected", path: session.path, identity: inspection.identity } as const;
 			this.#settle({
@@ -523,8 +534,9 @@ export class SessionSelectorComponent extends Container {
 				...(claim ? { admission: claim } : {}),
 			});
 		} catch (error) {
-			// Never back to the list while holding the session.
+			// Never back to the list while holding the session, and never on a picker that closed.
 			claim?.release();
+			if (!current()) return;
 			this.#state = { kind: "checking", session, token };
 			this.#failCheck(token, error);
 		}
