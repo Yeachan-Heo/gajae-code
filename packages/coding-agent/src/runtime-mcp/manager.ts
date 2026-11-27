@@ -859,7 +859,11 @@ export class MCPManager {
 					this.#pendingExactControlServers.has(name)
 				)
 					return;
-				void this.reconnectServer(name);
+				void this.reconnectServer(name).catch(error => {
+					if (!(error instanceof MCPExpectedFailure)) {
+						logger.error("MCP automatic reconnect failed", { path: `mcp:${name}`, error });
+					}
+				});
 			}),
 		);
 	}
