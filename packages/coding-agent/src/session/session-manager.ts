@@ -8220,6 +8220,8 @@ export class SessionManager {
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
 	#commitGen = 0;
+	/** Set only while `forkFrom` builds a fork whose caller switches to it next: no breadcrumb yet. */
+	#deferForkBreadcrumb = false;
 	/** Failed staged persistence retains its exact writer and temporary pathname for retryable cleanup. */
 	/** Candidate-owned session publication state; set only by staged factories. */
 	#stagedPublication:
@@ -10650,6 +10652,7 @@ export class SessionManager {
 
 	#writeTerminalBreadcrumb(sessionFile: string): void {
 		if (this.#stagedPublication && !this.#stagedPublication.committed) return;
+		if (this.#deferForkBreadcrumb) return;
 		writeTerminalBreadcrumb(this.cwd, sessionFile);
 	}
 
@@ -23868,7 +23871,7 @@ export class SessionManager {
 				}
 			}
 			await this.#initSessionFile(fresh.sessionFile);
-			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			if (!this.#deferForkBreadcrumb) writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
 		} catch (error) {
 			try {
@@ -24076,12 +24079,20 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		ownership?: SessionOwnershipDecision,
+		options: {
+			/**
+			 * `false` when the caller switches to the fork next: the switch moves the terminal
+			 * breadcrumb once it lands, so an abandoned fork never becomes `--continue`'s target.
+			 */
+			readonly writeBreadcrumb?: boolean;
+		} = {},
 	): Promise<SessionManager> {
 		const owner = resolveSessionOwnership(ownership);
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, owner, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
+		manager.#deferForkBreadcrumb = options.writeBreadcrumb === false;
 		let managedSourcePath = sourcePath;
 		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
 			const resolvedSource = path.resolve(sourcePath);
@@ -24141,8 +24152,10 @@ export class SessionManager {
 				if (
 					inspected.ok &&
 					(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
-				)
+				) {
+					manager.#deferForkBreadcrumb = false;
 					return manager;
+				}
 			}
 			if (manager.#boundedManagedSource && sourceSize <= eagerHydrationMaxBytes()) {
 				const boundedSource = manager.#boundedManagedSource;
@@ -24191,7 +24204,7 @@ export class SessionManager {
 		manager.#applyFreshSessionMetadata(fresh);
 		manager.#commitResidentTextStoreTransition(transition);
 		manager.#retireEphemeralArtifacts();
-		if (fresh.sessionFile) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
+		if (fresh.sessionFile && !manager.#deferForkBreadcrumb) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (manager.#ownershipClaims.claiming) await manager.#ownershipClaims.claim(fresh.sessionId);
 		try {
@@ -24201,6 +24214,7 @@ export class SessionManager {
 			manager.#ownershipClaims.releaseAll();
 			throw error;
 		}
+		manager.#deferForkBreadcrumb = false;
 		return manager;
 	}
 

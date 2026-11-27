@@ -72,9 +72,14 @@ function createContext(session: { switchSession: (path: string, options?: unknow
 describe("resume of a session another process holds (design §1 row 3)", () => {
 	it("warns before anything else: Cancel stays here, Fork switches to a copy under the copy's claim", async () => {
 		const error = new SessionHeldError("01a21a7f-82ff-7332-bee3-31b605a15de0", { surface: "terminal", pid: 4242 });
-		const switchSession = vi.fn(async () => true);
+		let current = "/tmp/own.jsonl";
+		const switchSession = vi.fn(async (file: string) => {
+			current = file;
+			return true;
+		});
 		const { context, ui } = createContext({ switchSession });
 		const released = vi.fn();
+		const dropSession = vi.fn(async () => undefined);
 		const forkClose = vi.fn(async () => undefined);
 		const forkFrom = vi.spyOn(SessionManager, "forkFrom").mockResolvedValue({
 			getSessionFile: () => "/tmp/fork.jsonl",
@@ -84,6 +89,8 @@ describe("resume of a session another process holds (design §1 row 3)", () => {
 			switchTargetAdmission: (file: string) =>
 				file === "/tmp/held.jsonl" ? Promise.reject(error) : Promise.resolve({ release: released }),
 			getDestinationForFork: () => ({ kind: "explicit", directory: "/tmp" }),
+			getSessionFile: () => current,
+			dropSession,
 		});
 		const { title, options } = heldSessionWarningDialog(error);
 		const answers = [options[1], options[0]];
@@ -102,6 +109,8 @@ describe("resume of a session another process holds (design §1 row 3)", () => {
 			// The forking manager closes before the switch; the copy's admission claim covers the gap.
 			expect(forkClose.mock.invocationCallOrder[0]).toBeLessThan(switchSession.mock.invocationCallOrder[0]!);
 			expect(released).toHaveBeenCalledTimes(1);
+			// The switch landed on the copy, so nothing is deleted.
+			expect(dropSession).not.toHaveBeenCalled();
 			expect(context.showStatus).toHaveBeenLastCalledWith(
 				"Forked into a new session. The original stays with another terminal (pid 4242).",
 			);

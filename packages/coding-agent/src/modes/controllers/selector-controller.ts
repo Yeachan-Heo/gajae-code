@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
@@ -2558,6 +2559,8 @@ export class SelectorController {
 		// guard and silently disable every later resume.
 		let progressLease: ResumeProgressLease | undefined;
 		let admission: SessionOwnerClaim | undefined;
+		/** The copy a Fork made; deleted below unless the switch landed on it. */
+		let forkedPath: string | undefined;
 		let resumedStatus = "Resumed session";
 		try {
 			// Under enforce the target is claimed first (design §1 row 3), before the spinner and before
@@ -2572,6 +2575,7 @@ export class SelectorController {
 					const forked = await this.#forkHeldSession(sessionPath, error);
 					if (!forked) return;
 					({ sessionPath, admission } = forked);
+					forkedPath = sessionPath;
 					resumedStatus = sessionHeldForkedNotice(error);
 				}
 				if (this.ctx.isStopped?.()) return;
@@ -2666,10 +2670,29 @@ export class SelectorController {
 			this.ctx.showStatus(resumedStatus);
 			this.#maybePromptResumeModelChoice();
 		} finally {
+			// A cancelled, busy, stopped or failed switch leaves the Fork's copy unused: delete it while
+			// its admission claim still holds, so it never becomes the newest session.
+			if (forkedPath && !this.#isCurrentSessionFile(forkedPath)) await this.#discardForkCopy(forkedPath);
 			admission?.release();
 			progressLease?.clear();
 			this.#resumeInFlight = false;
 			releaseActivityIndicator();
+		}
+	}
+
+	#isCurrentSessionFile(sessionPath: string): boolean {
+		const current = this.ctx.sessionManager.getSessionFile();
+		return current !== undefined && path.resolve(current) === path.resolve(sessionPath);
+	}
+
+	/** Delete a Fork copy the switch never landed on, through the picker's delete path; never throws. */
+	async #discardForkCopy(sessionPath: string): Promise<void> {
+		try {
+			await this.#deleteSession(sessionPath);
+		} catch (error) {
+			logger.warn("Could not delete an unused fork of a held session", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	}
 
@@ -2706,6 +2729,9 @@ export class SelectorController {
 			undefined,
 			migrationPolicy,
 			this.ctx.settings?.get("sessionMemory.mode"),
+			undefined,
+			// The switch moves the breadcrumb once it lands; an abandoned copy is deleted.
+			{ writeBreadcrumb: false },
 		);
 		const forkPath = forked.getSessionFile();
 		let admission: SessionOwnerClaim | undefined;

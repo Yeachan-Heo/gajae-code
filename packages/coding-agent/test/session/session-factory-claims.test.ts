@@ -5,17 +5,22 @@
  * file pins the rules they cannot see: sync factories, refusal-free outcomes, a fork's legacy
  * source, the successor claim before the artifact copy, and subagent and staged children.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
-import { getAgentDir } from "@gajae-code/utils";
+import { Container, TUI } from "@gajae-code/tui";
+import { getAgentDir, getTerminalSessionsDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 import type { Args } from "../../src/cli/args";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { createSessionManager, operatorFacingSessionOpenMessage, SessionResumeCancelledError } from "../../src/main";
-import type { HeldSessionChoice } from "../../src/modes/components/session-held-warning";
+import { type HeldSessionChoice, heldSessionWarningDialog } from "../../src/modes/components/session-held-warning";
+import { SelectorController } from "../../src/modes/controllers/selector-controller";
+import { initTheme } from "../../src/modes/theme/theme";
+import type { InteractiveModeContext } from "../../src/modes/types";
 import { createAgentSession, probeSessionOwners } from "../../src/sdk";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { probeHeldSessions, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
@@ -37,6 +42,8 @@ import { FileSessionStorage } from "../../src/session/session-storage";
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
 const managers: SessionManager[] = [];
+
+beforeAll(() => initTheme());
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
@@ -560,6 +567,78 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		await expect(
 			SessionManager.probeHeldTranscript(target.file, { ...observe, mode: "enforce" }),
 		).resolves.toBeInstanceOf(SessionHeldError);
+	});
+
+	it("/resume Fork whose switch a hook cancels deletes the copy; breadcrumb, session and source stay as they were", async () => {
+		const place = await workspace();
+		const source = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		await holdInAnotherProcess(source.id);
+		const previousTerminal = process.env.KITTY_WINDOW_ID;
+		process.env.KITTY_WINDOW_ID = "held-fork-test";
+		const breadcrumb = path.join(getTerminalSessionsDir(), "kitty-held-fork-test");
+		const { session } = await createAgentSession({
+			cwd: place.cwd,
+			agentDir: path.join(place.root, "agent"),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => ({ cancel: true }));
+				},
+			],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		});
+		const ui = new TUI(new VirtualTerminal(80, 12));
+		try {
+			session.sessionManager.appendMessage(user("own"));
+			await session.sessionManager.ensureOnDisk();
+			await session.sessionManager.flush();
+			await Bun.write(breadcrumb, "before\n");
+			const own = session.sessionManager.getSessionId();
+			const sourceBytes = await Bun.file(source.file).bytes();
+			const transcripts = async () =>
+				(await fs.readdir(path.dirname(source.file))).filter(name => name.endsWith(".jsonl")).sort();
+			const before = await transcripts();
+			const statuses: string[] = [];
+			const fork = heldSessionWarningDialog(new SessionHeldError(source.id)).options[0];
+			const context = {
+				ui,
+				statusContainer: new Container(),
+				pendingMessagesContainer: new Container(),
+				compactionQueuedMessages: [],
+				pendingTools: new Map(),
+				session,
+				sessionManager: session.sessionManager,
+				settings: { get: () => undefined },
+				showHookSelector: async () => fork,
+				showStatus: (message: string) => statuses.push(message),
+				resetIrcSidebarSession: () => {},
+				resetAssistantTextPresentation: () => {},
+				updateEditorBorderColor: () => {},
+				rebuildInitialMessages: () => {},
+				reloadTodos: async () => undefined,
+			} as unknown as InteractiveModeContext;
+			await new SelectorController(context).handleResumeSession(source.file);
+
+			expect(await transcripts()).toEqual(before);
+			expect(await Bun.file(breadcrumb).text()).toBe("before\n");
+			expect(session.sessionManager.getSessionId()).toBe(own);
+			expect(await Bun.file(source.file).bytes()).toEqual(sourceBytes);
+			expect(statuses).not.toContain("Resumed session");
+		} finally {
+			ui.stop();
+			if (previousTerminal === undefined) delete process.env.KITTY_WINDOW_ID;
+			else process.env.KITTY_WINDOW_ID = previousTerminal;
+			await session.dispose();
+		}
 	});
 
 	it("a failed claim refuses too, but a fork reads a source it cannot claim in place", async () => {
