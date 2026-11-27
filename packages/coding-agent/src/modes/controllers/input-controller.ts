@@ -384,7 +384,9 @@ export class InputController {
 	 * editor during that wait, so Enter reaches `submitText` with the same text; the submission that
 	 * holds the claim is the only one allowed to send it.
 	 */
-	#followUpClaim: { draft: string; pendingImages: InteractiveModeContext["pendingImages"] } | undefined;
+	#followUpClaim:
+		| { draft: string; pendingImages: InteractiveModeContext["pendingImages"]; sessionId: string }
+		| undefined;
 
 	#resetEscapeGestures(): void {
 		this.ctx.lastEscapeTime = 0;
@@ -1073,7 +1075,14 @@ export class InputController {
 		// Any submission supersedes a pending or shown next-prompt suggestion.
 		if (text) this.ctx.promptSuggestion?.clear();
 		const claim = this.#followUpClaim;
-		if (claim && text === claim.draft && this.ctx.pendingImages === claim.pendingImages) {
+		// A claim from another session is stale: New Session leaves the extension call running,
+		// so the successor session must not be refused because of it.
+		if (
+			claim &&
+			claim.sessionId === this.ctx.sessionManager.getSessionId() &&
+			text === claim.draft &&
+			this.ctx.pendingImages === claim.pendingImages
+		) {
 			// The follow-up submission still owns this draft. The editor emptied its buffer before
 			// calling us, so put the text back for the user and let the claim holder send it once.
 			if (this.#canModifyComposer(composer) && this.ctx.editor.getText().trim().length === 0) {
@@ -1889,15 +1898,15 @@ export class InputController {
 		// Same input-extension pass Enter runs, so Alt+Enter cannot send an image an extension
 		// would have replaced or refused, and a compaction-queued message is the transformed text.
 		const pendingImages = this.ctx.pendingImages;
-		if (this.#followUpClaim) {
-			this.ctx.showStatus("A queued follow-up is already being prepared.");
-			return;
-		}
-		const claim = { draft, pendingImages };
-		this.#followUpClaim = claim;
 		// New Session aborts the run but not a pending input extension, and it reuses this
 		// AgentSession, so bind the submission to the session it was made in.
 		const submittedSessionId = this.ctx.sessionManager.getSessionId();
+		if (this.#followUpClaim?.sessionId === submittedSessionId) {
+			this.ctx.showStatus("A queued follow-up is already being prepared.");
+			return;
+		}
+		const claim = { draft, pendingImages, sessionId: submittedSessionId };
+		this.#followUpClaim = claim;
 		let extensionResult: InputExtensionResult;
 		try {
 			extensionResult = await this.#applyInputExtensions(draft, pendingImages);

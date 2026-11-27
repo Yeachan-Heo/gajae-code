@@ -811,4 +811,68 @@ describe("InputController skill command images", () => {
 		expect(stub.ctx.editor.getText()).toBe("old session draft");
 		expect(stub.prompts).toHaveLength(0);
 	});
+
+	it("does not refuse the same text in the successor session while the old follow-up is still pending", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async (text: string) => {
+				if (text === "same draft" && stub.sessionId.current === "session-a") await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({
+			skillCommands,
+			pendingImages: [],
+			streaming: true,
+			realEditor: true,
+			extensionRunner,
+		});
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		stub.ctx.editor.setText("same draft");
+		const oldFollowUp = controller.handleFollowUp();
+		// /new: the session changes while the old extension is still waiting.
+		stub.sessionId.current = "session-b";
+		stub.ctx.editor.setText("");
+		await stub.editor.onSubmit?.("same draft");
+
+		expect(stub.prompts.map(prompt => prompt.text)).toEqual(["same draft"]);
+		expect(stub.ctx.showStatus).not.toHaveBeenCalledWith("The queued follow-up is still being prepared.");
+		release.resolve();
+		await oldFollowUp;
+		// The stale follow-up is dropped, so the draft is sent exactly once, into the successor.
+		expect(stub.prompts).toHaveLength(1);
+	});
+
+	it("does not refuse a new Alt+Enter in the successor session while the old one is still pending", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				if (stub.sessionId.current === "session-a") await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({
+			skillCommands,
+			pendingImages: [],
+			streaming: true,
+			realEditor: true,
+			extensionRunner,
+		});
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("old session draft");
+		const oldFollowUp = controller.handleFollowUp();
+		stub.sessionId.current = "session-b";
+		stub.ctx.editor.setText("new session draft");
+		await controller.handleFollowUp();
+
+		expect(stub.prompts.map(prompt => prompt.text)).toEqual(["new session draft"]);
+		release.resolve();
+		await oldFollowUp;
+		expect(stub.prompts.map(prompt => prompt.text)).toEqual(["new session draft"]);
+	});
 });
