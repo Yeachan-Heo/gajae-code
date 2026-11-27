@@ -1,8 +1,18 @@
 import * as path from "node:path";
-import { ProcessTerminal, TUI } from "@gajae-code/tui";
+import { ProcessTerminal, Spacer, TUI } from "@gajae-code/tui";
 import { pathIsWithin } from "@gajae-code/utils";
-import { type SessionSelectionResult, SessionSelectorComponent } from "../modes/components/session-selector";
+import {
+	createHeldSessionWarning,
+	type HeldSessionChoice,
+	type HeldSessionWarningOptions,
+} from "../modes/components/session-held-warning";
+import {
+	type HeldSessionCheck,
+	type SessionSelectionResult,
+	SessionSelectorComponent,
+} from "../modes/components/session-selector";
 import { type SessionInfo, SessionManager } from "../session/session-manager";
+import type { SessionHeldError } from "../session/session-ownership";
 import { FileSessionStorage } from "../session/session-storage";
 
 export async function deleteSessionPickerCandidate(sessionPath: string, explicitSessionDir?: string): Promise<void> {
@@ -17,10 +27,46 @@ export async function deleteSessionPickerCandidate(sessionPath: string, explicit
 	await new FileSessionStorage().deleteSessionWithArtifacts(target);
 }
 
-/** Show the session picker and return the user's resume consent intent. */
+/**
+ * The held-session warning before the TUI starts (design §3.1), as a one-shot TUI like the picker:
+ * resolves once Fork, Continue here or Cancel is chosen and the terminal is handed back.
+ */
+export async function promptHeldSession(
+	error: SessionHeldError,
+	options: HeldSessionWarningOptions = {},
+): Promise<HeldSessionChoice> {
+	const { promise, resolve } = Promise.withResolvers<HeldSessionChoice>();
+	const ui = new TUI(new ProcessTerminal());
+	let settled = false;
+	const warning = createHeldSessionWarning(
+		error,
+		choice => {
+			if (settled) return;
+			settled = true;
+			// As in `selectSession`: finish the stdin dispatch before detaching, then resolve.
+			setImmediate(() => {
+				ui.stop();
+				resolve(choice);
+			});
+		},
+		options,
+	);
+	// As the picker does: one blank row first, so the frame starts below the launch's `> ` line.
+	ui.addChild(new Spacer(1));
+	ui.addChild(warning);
+	ui.setFocus(warning);
+	ui.start();
+	return promise;
+}
+
+/**
+ * Show the session picker and return the user's resume consent intent. Under enforce, `held` marks
+ * the rows other processes hold and choosing one shows the held-session warning (design §1 row 2).
+ */
 export async function selectSession(
 	sessions: SessionInfo[],
 	explicitSessionDir?: string,
+	held?: { readonly sessions: ReadonlyMap<string, SessionHeldError>; readonly check: HeldSessionCheck },
 ): Promise<SessionSelectionResult> {
 	const { promise, resolve } = Promise.withResolvers<SessionSelectionResult>();
 	const ui = new TUI(new ProcessTerminal());
@@ -52,6 +98,7 @@ export async function selectSession(
 		(session, starred) => SessionManager.setSessionStarredForPicker(session, starred, explicitSessionDir),
 	);
 	selector.setOnRequestRender(() => ui.requestRender());
+	if (held) selector.setHeldSessions(held.sessions, held.check);
 	ui.addChild(selector);
 	ui.setFocus(selector);
 	ui.start();

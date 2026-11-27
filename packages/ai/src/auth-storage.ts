@@ -552,12 +552,34 @@ export interface AuthCredentialStore {
 		targets: readonly CredentialRemovalTarget[],
 	): AuthCredentialHardRemovalResult;
 	updateAuthCredential(id: number, credential: AuthCredential): void;
+	/**
+	 * Atomically adds a display name to the active OAuth row `id` when it belongs to `organizationId` and has no name.
+	 * Every other stored field, tokens included, is left as the row currently holds it.
+	 * Returns the credential as stored after the write, or `undefined` when the condition does not hold.
+	 * A store with refresh lease hooks but without this writer does not carry a duplicate's name on refresh: the
+	 * refreshed row stays authoritative and the duplicate is pruned.
+	 */
+	setOAuthOrganizationNameIfUnset?(
+		id: number,
+		organizationId: string,
+		organizationName: string,
+	): AuthCredential | undefined;
+	/**
+	 * Soft-deletes row `id`; a no-op for an already-disabled row. Throws when the write fails. A remote store always
+	 * throws: it is read-only on the client.
+	 */
 	deleteAuthCredential(id: number, disabledCause: string): void;
+	/**
+	 * Local stores return `false` only when no active row matched and throw when the write fails. A remote store
+	 * cannot disable synchronously and always returns `false`; callers reach the broker via `disableAuthCredentialRemote`.
+	 */
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
+	/** Returns `false` only when no active row matched; throws when the write fails. Absent on remote stores. */
 	tryDisableAuthCredentialIfRevision?(id: number, expectedRevision: number, disabledCause: string): boolean;
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[];
 	upsertAuthCredentialForProvider(provider: string, credential: AuthCredential): StoredAuthCredential[];
 	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult;
+	/** Soft-deletes every active row of `provider`. Throws when the write fails; a remote store always throws. */
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
@@ -3176,6 +3198,34 @@ export class AuthStorage {
 		return deduped.reverse();
 	}
 
+	/**
+	 * A refresh that establishes a legacy row's organization keeps that row and prunes any other row of the same
+	 * identity (see {@link AuthStorage.#pruneDuplicateStoredCredentials}). The pruned row may be a newer login that
+	 * carries the organization's display name, which refresh responses do not always return (OpenAI Codex looks the
+	 * workspace name up only at login). Carry that name over so the surviving row keeps its label and stays
+	 * selectable by `org:<name>`.
+	 */
+	#withDuplicateOrganizationName<T extends AuthCredential>(
+		provider: string,
+		entries: readonly StoredCredential[],
+		targetId: number,
+		credential: T,
+	): T {
+		if (credential.type !== "oauth" || credential.organizationName?.trim() || !credential.organizationId?.trim()) {
+			return credential;
+		}
+		const identityKey = this.#resolveOAuthDedupeIdentityKey(provider, credential);
+		if (!identityKey) return credential;
+		for (const entry of entries) {
+			if (entry.id === targetId || entry.credential.type !== "oauth") continue;
+			const organizationName = entry.credential.organizationName?.trim();
+			if (!organizationName) continue;
+			if (this.#resolveOAuthDedupeIdentityKey(provider, entry.credential) !== identityKey) continue;
+			return { ...credential, organizationName };
+		}
+		return credential;
+	}
+
 	#pruneDuplicateStoredCredentials(
 		provider: string,
 		entries: StoredCredential[],
@@ -3201,14 +3251,31 @@ export class AuthStorage {
 			if (identityKey && !selectedIds.has(entry.id)) removed.push(entry);
 			else kept.push(entry);
 		}
-		if (removed.length > 0) {
-			for (const entry of removed) {
+		if (removed.length === 0) return kept;
+		// A remote store's snapshot is the broker's truth and its synchronous delete can only throw: the broker owns
+		// deduplication, so this client keeps the rows as served instead of failing (and warning) on every reload.
+		if (this.#store.disableAuthCredentialRemote) return entries;
+		// A duplicate whose delete failed is still active on disk, so it stays in memory too: this process never
+		// publishes a pruned view that a reload would contradict.
+		const stillActive = new Set<number>();
+		for (const entry of removed) {
+			try {
 				this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
+			} catch (error) {
+				stillActive.add(entry.id);
+				logger.warn("Could not retire a deduplicated credential; keeping it", {
+					provider,
+					credentialId: entry.id,
+					error: String(error),
+				});
 			}
-			this.#clearSelectorsForRemovedCredential(provider, new Set(removed.map(entry => entry.id)), entries);
-			this.#resetProviderAssignments(provider);
 		}
-		return kept;
+		const pruned = removed.filter(entry => !stillActive.has(entry.id));
+		if (pruned.length === 0) return entries;
+		const prunedIds = new Set(pruned.map(entry => entry.id));
+		this.#clearSelectorsForRemovedCredential(provider, prunedIds, entries);
+		this.#resetProviderAssignments(provider);
+		return stillActive.size > 0 ? entries.filter(entry => !prunedIds.has(entry.id)) : kept;
 	}
 
 	/** Returns all credentials for a provider as an array */
@@ -3792,25 +3859,49 @@ export class AuthStorage {
 		}
 	}
 
-	/** Updates a credential at index after OAuth token refresh. */
-	#replaceCredentialAt(
+	/**
+	 * Updates a credential at index after OAuth token refresh. Returns the credential actually stored, which may
+	 * carry an organization name over from a pruned duplicate; callers that compare against or hand out the
+	 * refreshed credential must use the returned value.
+	 */
+	#replaceCredentialAt<T extends AuthCredential>(
 		provider: string,
 		index: number,
-		credential: AuthCredential,
+		credential: T,
 		persist = true,
 		expectedId?: number,
-	): void {
+	): T {
 		const entries = this.#getStoredCredentials(provider);
-		if (index < 0 || index >= entries.length) return;
+		if (index < 0 || index >= entries.length) return credential;
 		const target = entries[index];
 		if (expectedId !== undefined && target.id !== expectedId) {
 			throw new Error("Credential authority changed during refresh");
 		}
-		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
+		let named = this.#withDuplicateOrganizationName(provider, entries, target.id, credential);
+		let pruneDuplicates = true;
+		if (!this.#store.refreshSnapshot) {
+			if (persist) {
+				this.#store.updateAuthCredential(target.id, named);
+			} else if (named !== credential && named.type === "oauth" && named.organizationId && named.organizationName) {
+				const carried = this.#persistCarriedOrganizationName(
+					provider,
+					target.id,
+					credential,
+					named.organizationId,
+					named.organizationName,
+				);
+				named = carried.credential;
+				pruneDuplicates = carried.pruneDuplicates;
+			}
+		}
+		credential = named;
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
-		this.#setStoredCredentials(provider, this.#pruneDuplicateStoredCredentials(provider, updated, target.id));
+		this.#setStoredCredentials(
+			provider,
+			pruneDuplicates ? this.#pruneDuplicateStoredCredentials(provider, updated, target.id) : updated,
+		);
 		// Callers use the refresh generation to discount configuration bumps caused by a refresh, so it only
 		// advances when this refresh bumped configuration; token rotation for a known account does not.
 		if (
@@ -3827,6 +3918,62 @@ export class AuthStorage {
 				storageProvider,
 				this.getProviderOAuthRefreshGeneration(storageProvider) + 1,
 			);
+		}
+		return credential;
+	}
+
+	/**
+	 * Adds a name carried over from a duplicate row to a row whose refresh lease already persisted the tokens. A peer
+	 * may have rotated those tokens since, so only the name is written, conditionally on the row as it is now.
+	 *
+	 * Returns the credential to cache and return to the refresh caller, and whether the duplicate rows of its identity
+	 * may be pruned. Whenever the row could be read, the credential is the row as stored, so a peer's newer tokens are
+	 * never replaced by this refresh's snapshot:
+	 * - written: the row as stored with the carried name, prune.
+	 * - condition lost because a peer named the row first or changed its workspace: the row as stored now, prune.
+	 * - condition lost because the row is no longer active: the refreshed credential, and keep the duplicate, since
+	 *   pruning it would leave no active row for the identity.
+	 * - store has no name-only writer, or the write failed: the refreshed credential without the carried name, prune.
+	 *   The row holding the lease-committed tokens stays authoritative: a kept duplicate would win the next reload's
+	 *   dedupe (it keeps the later row) with its older, possibly rotated-out tokens. The name is then lost as it was
+	 *   before names were carried, and the refresh itself succeeds.
+	 * - condition lost and the row cannot be re-read: the refreshed credential, and keep the duplicate, since the row
+	 *   may no longer be active.
+	 */
+	#persistCarriedOrganizationName<T extends AuthCredential>(
+		provider: string,
+		id: number,
+		credential: T,
+		organizationId: string,
+		carriedName: string,
+	): { credential: T; pruneDuplicates: boolean } {
+		if (!this.#store.setOAuthOrganizationNameIfUnset) return { credential, pruneDuplicates: true };
+		let written: AuthCredential | undefined;
+		try {
+			written = this.#store.setOAuthOrganizationNameIfUnset(id, organizationId, carriedName);
+		} catch (error) {
+			logger.warn("OAuth refresh could not persist the workspace name carried from a duplicate credential", {
+				provider,
+				credentialId: id,
+				error: String(error),
+			});
+			return { credential, pruneDuplicates: true };
+		}
+		// The writer only updates an active OAuth row, the same row and credential type as `credential`.
+		if (written) return { credential: written as T, pruneDuplicates: true };
+		try {
+			const current = this.#store.listAuthCredentials(provider).find(entry => entry.id === id)?.credential;
+			if (current?.type !== credential.type) return { credential, pruneDuplicates: false };
+			return { credential: current as T, pruneDuplicates: true };
+		} catch (error) {
+			// The conditional write lost and the row cannot be read back, so it may no longer be active: keep the
+			// duplicate rather than risk leaving the identity without an active row.
+			logger.warn("OAuth refresh could not re-read a credential after its workspace name write lost", {
+				provider,
+				credentialId: id,
+				error: String(error),
+			});
+			return { credential, pruneDuplicates: false };
 		}
 	}
 
@@ -3876,7 +4023,8 @@ export class AuthStorage {
 	/**
 	 * Soft-deletes a row by id, bypassing the data-equality CAS. Only safe when the
 	 * caller has confirmed the row still holds the credential it attempted to
-	 * refresh, so no peer rotation can be clobbered.
+	 * refresh, so no peer rotation can be clobbered. The store write runs first:
+	 * when it throws, memory, selectors, and listeners are left untouched.
 	 */
 	#disableCredentialById(provider: string, credentialId: number, disabledCause: string): void {
 		this.#store.deleteAuthCredential(credentialId, disabledCause);
@@ -4112,6 +4260,7 @@ export class AuthStorage {
 
 	/**
 	 * Remove credential for a provider.
+	 * Throws when the store write fails; memory is cleared only after it succeeds.
 	 */
 	async remove(provider: string): Promise<void> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
@@ -4157,6 +4306,7 @@ export class AuthStorage {
 		return false;
 	}
 
+	/** Returns `false` for a lost revision check or an unknown row; throws when the store write fails. */
 	disableCredentialByIdIfRevision(id: number, expectedRevision: number, disabledCause: string): boolean {
 		const cause = normalizeDisabledCause(disabledCause);
 		if (this.#store.tryDisableAuthCredentialIfRevision?.(id, expectedRevision, cause) !== true) return false;
@@ -6640,8 +6790,7 @@ export class AuthStorage {
 						type: "oauth",
 					};
 					if (!this.#reconcileOAuthCredentialSelection(provider, candidate.selection)) return;
-					candidate.selection.credential = updated;
-					this.#replaceCredentialAt(
+					candidate.selection.credential = this.#replaceCredentialAt(
 						provider,
 						candidate.selection.index,
 						updated,
@@ -7147,7 +7296,7 @@ export class AuthStorage {
 				result = await getOAuthApiKey(provider as OAuthProvider, oauthCreds);
 			}
 			if (!result) return undefined;
-			const updated: OAuthCredential = {
+			const refreshedCredential: OAuthCredential = {
 				type: "oauth",
 				access: result.newCredentials.access,
 				refresh: result.newCredentials.refresh,
@@ -7161,10 +7310,10 @@ export class AuthStorage {
 				organizationName: result.newCredentials.organizationName ?? selection.credential.organizationName,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
-			this.#replaceCredentialAt(
+			const updated = this.#replaceCredentialAt(
 				provider,
 				selection.index,
-				updated,
+				refreshedCredential,
 				!refreshedAuthority.persistedByLease,
 				selectionCredentialId,
 			);
@@ -7192,8 +7341,32 @@ export class AuthStorage {
 			}
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
+			// A peer may have rotated the row after this refresh's lease committed; `updated` is then the stored row
+			// and the key must come from its tokens, not from this refresh's snapshot. A stored row that is already
+			// expired, or whose key cannot be derived, is left to the next resolution, which refreshes it normally;
+			// its errors must not reach the refresh-failure classification below.
+			let apiKey = result.apiKey;
+			if (updated.access !== refreshedCredential.access) {
+				if (Date.now() >= updated.expires) return undefined;
+				try {
+					if (customProvider) {
+						apiKey = customProvider.getApiKey ? customProvider.getApiKey(updated) : updated.access;
+					} else {
+						const current = await getOAuthApiKey(provider as OAuthProvider, { [provider]: updated });
+						if (!current || current.newCredentials.access !== updated.access) return undefined;
+						apiKey = current.apiKey;
+					}
+				} catch (error) {
+					logger.warn("OAuth request could not derive a key from a credential a peer rotated", {
+						provider,
+						credentialId: selection.id,
+						error: String(error),
+					});
+					return undefined;
+				}
+			}
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
-			return { apiKey: result.apiKey, credential: updated, credentialRowId: selection.id };
+			return { apiKey, credential: updated, credentialRowId: selection.id };
 		} catch (error) {
 			if (options?.signal?.aborted) throw error;
 			if (isSqliteError(error)) throw error;
@@ -7272,13 +7445,31 @@ export class AuthStorage {
 				// Use a CAS-style disable conditioned on the row still containing the stale credential
 				// we tried to refresh, so a peer rotation that lands between the pre-check above and
 				// this disable doesn't soft-delete the freshly-rotated row.
-				const disabled = this.#tryDisableCredentialAtIfMatches(
-					provider,
-					selection.index,
-					selection.credential,
-					`oauth refresh failed: ${errorMsg}`,
-					attemptedCredentialId,
-				);
+				let disabled: boolean;
+				try {
+					disabled = this.#tryDisableCredentialAtIfMatches(
+						provider,
+						selection.index,
+						selection.credential,
+						`oauth refresh failed: ${errorMsg}`,
+						attemptedCredentialId,
+					);
+				} catch (disableError) {
+					// A failed store write is not a lost CAS: the row is still active on disk,
+					// so keep it in memory and surface the original authentication failure.
+					logger.warn("OAuth refresh disable failed in the store", {
+						provider,
+						credentialId: attemptedCredentialId,
+						error: String(disableError),
+					});
+					if (sessionSelector && sessionId) {
+						this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
+					}
+					// Keep other sessions in this process off the revoked credential until a
+					// later disable succeeds.
+					this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
+					throw error;
+				}
 				if (sessionSelector && sessionId) {
 					this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
 				}
@@ -7333,7 +7524,19 @@ export class AuthStorage {
 								throw error;
 							}
 						} else {
-							this.#disableCredentialById(provider, attemptedCredentialId, disabledCause);
+							try {
+								this.#disableCredentialById(provider, attemptedCredentialId, disabledCause);
+							} catch (disableError) {
+								// Same contract as the remote branch: the store write failed, the row
+								// stays active and in memory, and the original failure is reported.
+								logger.warn("OAuth refresh disable by id failed in the store", {
+									provider,
+									credentialId: attemptedCredentialId,
+									error: String(disableError),
+								});
+								this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
+								throw error;
+							}
 						}
 					} else {
 						logger.debug("OAuth refresh disable lost CAS; reloading after peer rotation", {
@@ -7982,13 +8185,13 @@ export class AuthStorage {
 				organizationName: refreshed.organizationName ?? target.credential.organizationName,
 				mcpBinding: refreshed.mcpBinding,
 			};
-			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
+			const stored = this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease, id);
 			const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === id);
 			return {
 				id,
 				provider,
-				credential: { ...updated, refresh: REMOTE_REFRESH_SENTINEL },
-				identityKey: resolveCredentialIdentityKey(provider, updated),
+				credential: { ...stored, refresh: REMOTE_REFRESH_SENTINEL },
+				identityKey: resolveCredentialIdentityKey(provider, stored),
 				...(persisted?.revision === undefined ? {} : { revision: persisted.revision }),
 			};
 		}
@@ -7999,6 +8202,9 @@ export class AuthStorage {
 	 * Disable the credential with the given id and emit a
 	 * {@link CredentialDisabledEvent}. Used by the auth-broker server to honour
 	 * `POST /v1/credential/:id/disable`. Returns `false` when no such row exists.
+	 * Throws when the store write fails; memory, selectors, and listeners are
+	 * updated only after it succeeds. A row a peer already disabled on disk is
+	 * left as the peer wrote it and is dropped from memory (returns `true`).
 	 */
 	disableCredentialById(id: number, disabledCause: string): boolean {
 		const cause = normalizeDisabledCause(disabledCause);
@@ -8362,7 +8568,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
 		this.#deleteStmt = this.#prepareOwnedStatement(
-			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
+			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND disabled_cause IS NULL`,
 		);
 		this.#deleteIfMatchesStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
@@ -9113,48 +9319,69 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
+	setOAuthOrganizationNameIfUnset(
+		id: number,
+		organizationId: string,
+		organizationName: string,
+	): AuthCredential | undefined {
+		const update = this.#db.transaction(() => {
+			const row = this.#withStatement(
+				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				statement => statement.get(id) as AuthRow | undefined,
+			);
+			if (!row) return undefined;
+			const credential = deserializeCredential(row);
+			if (
+				credential?.type !== "oauth" ||
+				credential.organizationId !== organizationId ||
+				credential.organizationName?.trim()
+			) {
+				return undefined;
+			}
+			const named: AuthCredential = { ...credential, organizationName };
+			const serialized = serializeCredential(row.provider, named);
+			if (!serialized) return undefined;
+			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
+			return named;
+		});
+		return update.immediate();
+	}
+
+	/**
+	 * Soft-deletes one row. Throws when the write fails, so no caller treats a row
+	 * that is still active on disk as disabled. A row that is already disabled is
+	 * left unchanged (it keeps its first `disabled_cause` and revision), and the
+	 * call still succeeds because the row is not active.
+	 */
 	deleteAuthCredential(id: number, disabledCause: string): void {
-		try {
-			this.#deleteStmt.run(normalizeDisabledCause(disabledCause), id);
-		} catch {
-			// Ignore delete failures
-		}
+		this.#deleteStmt.run(normalizeDisabledCause(disabledCause), id);
 	}
 
 	/**
 	 * CAS-style disable: only soft-deletes the row when its `data` column still
 	 * matches `expectedData` and the row has not already been disabled. Used by
 	 * the OAuth refresh-failure path to avoid clobbering a peer that rotated the
-	 * row between our pre-check and the disable.
+	 * row between our pre-check and the disable. Returns `false` only when no row
+	 * matched the predicate; a failed write throws.
 	 */
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean {
-		try {
-			const result = this.#deleteIfMatchesStmt.run(normalizeDisabledCause(disabledCause), id, expectedData) as {
-				changes: number;
-			};
-			return result.changes === 1;
-		} catch {
-			return false;
-		}
+		const result = this.#deleteIfMatchesStmt.run(normalizeDisabledCause(disabledCause), id, expectedData) as {
+			changes: number;
+		};
+		return result.changes === 1;
 	}
 
+	/** Revision-checked disable. Returns `false` only when no row matched; a failed write throws. */
 	tryDisableAuthCredentialIfRevision(id: number, expectedRevision: number, disabledCause: string): boolean {
-		try {
-			const result = this.#deleteIfRevisionStmt.run(normalizeDisabledCause(disabledCause), id, expectedRevision) as {
-				changes: number;
-			};
-			return result.changes === 1;
-		} catch {
-			return false;
-		}
+		const result = this.#deleteIfRevisionStmt.run(normalizeDisabledCause(disabledCause), id, expectedRevision) as {
+			changes: number;
+		};
+		return result.changes === 1;
 	}
 
+	/** Soft-deletes every active row of a provider. Throws when the write fails. */
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
-		try {
-			this.#deleteByProviderStmt.run(normalizeDisabledCause(disabledCause), provider);
-		} catch {
-			// Ignore delete failures
-		}
+		this.#deleteByProviderStmt.run(normalizeDisabledCause(disabledCause), provider);
 	}
 
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null {

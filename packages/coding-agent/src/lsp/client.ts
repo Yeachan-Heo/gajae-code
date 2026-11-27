@@ -690,9 +690,9 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 
 /**
  * Open documents no gjc operation has used for this long are closed before the next
- * document opens. A server keeps the project of every open document loaded (for
- * tsserver, the whole tsconfig program), and drops a project once all of its
- * documents are closed, when it handles the next open.
+ * document opens. What a server releases on `didClose` is server-dependent; tsserver
+ * keeps the whole tsconfig program of every open document loaded and drops a project
+ * once all of its documents are closed, when it handles the next open.
  */
 export const OPEN_FILE_IDLE_MS = 5 * 60 * 1000;
 
@@ -712,8 +712,8 @@ export async function closeDocument(client: LspClient, uri: string): Promise<voi
 /**
  * Close documents no gjc operation has used within {@link OPEN_FILE_IDLE_MS}.
  * Documents with an in-flight open, sync or refresh stay open. Called before a
- * didOpen, so the closes reach the server ahead of the open that lets it unload
- * their projects. Concurrent opens each run this; an entry another call already
+ * didOpen, so the closes reach the server ahead of that open (tsserver unloads
+ * projects with no open documents while handling it). Concurrent opens each run this; an entry another call already
  * closed (or reopened) while this one awaited a send is skipped.
  */
 async function closeIdleDocuments(client: LspClient): Promise<void> {

@@ -36,6 +36,8 @@ export function recordSessionOwnershipCounts(
 		([name, count]) => COUNTER_NAME.test(name) && Number.isSafeInteger(count) && count > 0,
 	);
 	if (rows.length === 0) return;
+	// Statements here come from `db.query`, which `close()` finalizes. A `db.prepare` statement keeps
+	// the connection, and on Windows the file, open after `close()` until it is garbage collected.
 	const db = new Database(dbPath, { create: true });
 	try {
 		db.exec(`PRAGMA busy_timeout = ${SESSION_OWNERSHIP_WRITE_BUSY_TIMEOUT_MS}`);
@@ -50,7 +52,7 @@ export function recordSessionOwnershipCounts(
 				report_id TEXT
 			)`);
 			if (!tableColumns(db).has("report_id")) db.exec(`ALTER TABLE ${TABLE} ADD COLUMN report_id TEXT`);
-			const insert = db.prepare(
+			const insert = db.query(
 				`INSERT INTO ${TABLE} (timestamp, name, count, gjc_version, report_id) VALUES (?, ?, ?, ?, ?)`,
 			);
 			for (const [name, count] of rows) insert.run(meta.timestamp, name, count, meta.gjcVersion, reportId);
@@ -73,7 +75,7 @@ const VALID_ROW = `typeof(timestamp) = 'integer' AND timestamp BETWEEN ?1 AND 86
 const COLUMNS = ["timestamp", "name", "count", "gjc_version"];
 
 function tableColumns(db: Database): Set<string> {
-	return new Set((db.prepare(`PRAGMA table_info(${TABLE})`).all() as { name: string }[]).map(column => column.name));
+	return new Set((db.query(`PRAGMA table_info(${TABLE})`).all() as { name: string }[]).map(column => column.name));
 }
 
 /**
@@ -118,20 +120,20 @@ export function readSessionOwnershipStats(db: Database, cutoff = 0): SessionOwne
 }
 
 function readInSnapshot(db: Database, cutoff: number): SessionOwnershipStats | undefined {
-	if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(TABLE)) return undefined;
+	if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(TABLE)) return undefined;
 	const columns = tableColumns(db);
 	if (!COLUMNS.every(column => columns.has(column))) return undefined;
 	const report = reportKey(columns.has("report_id"));
 	const where = `${VALID_ROW} AND ${report.valid}`;
 	const totals = db
-		.prepare(
+		.query(
 			`SELECT gjc_version AS version, name, SUM(count) AS total FROM ${TABLE}
 				WHERE ${where} GROUP BY gjc_version, name ORDER BY gjc_version, name`,
 		)
 		.all(cutoff) as TotalRow[];
 	if (totals.length === 0) return undefined;
 	const reports = db
-		.prepare(
+		.query(
 			`SELECT gjc_version AS version, COUNT(DISTINCT ${report.key}) AS reports, MIN(timestamp) AS first,
 				MAX(timestamp) AS last FROM ${TABLE} WHERE ${where} GROUP BY gjc_version
 				UNION ALL SELECT NULL, COUNT(DISTINCT ${report.key}), MIN(timestamp), MAX(timestamp)

@@ -5,8 +5,9 @@
  * (the native `FileLock`), so it ends when its holder exits, however it exits. A holder record
  * beside it names the holder for warnings; the lock is the truth and the record only a label.
  *
- * The session factories claim through the claim set (`internal/session-claim-set.ts`); nothing
- * refuses yet, so a held session only logs and counts until enforcement lands.
+ * The session factories claim through the claim set (`internal/session-claim-set.ts`). A held
+ * session is logged and counted; only under mode `enforce` does a factory refuse it, with
+ * {@link SessionHeldError} (`claimRefusal`).
  */
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -344,8 +345,10 @@ interface SessionOwnerRegistry {
 	readonly entries: Map<string, RegistryEntry>;
 	/** Acquires in flight, so a second claim in this process waits instead of contending. */
 	readonly pending: Map<string, Promise<void>>;
-	/** Set once a lock call reports `unavailable`: claims are off for this process. */
+	/** Set once a lock call reports `unavailable` or times out: claims are off for this process. */
 	unavailable: string | undefined;
+	/** Why the latch above was set; added later, so a registry from an older copy may lack it. */
+	latchReason?: "unavailable" | "timed_out";
 	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
 	counters?: Map<SessionOwnershipCounter, number>;
 	/** Counts already written to the stats database, and whether the exit write is armed. */
@@ -372,6 +375,7 @@ function registry(): SessionOwnerRegistry {
 export function resetSessionOwnershipForTests(): void {
 	const current = registry();
 	current.unavailable = undefined;
+	current.latchReason = undefined;
 	current.counters?.clear();
 	current.persisted?.counts.clear();
 	const leaked = [...current.entries.values()];
@@ -464,14 +468,25 @@ export function persistSessionOwnershipCounters(options: { readonly atExit?: boo
 	}
 }
 
-function markUnavailable(code: string | undefined): string {
+function markUnavailable(code: string | undefined, reason: "unavailable" | "timed_out" = "unavailable"): string {
 	const current = registry();
-	const latched = code ?? "unavailable";
+	const latched = code ?? reason;
 	if (current.unavailable === undefined) {
 		current.unavailable = latched;
-		logger.warn("Session ownership is unavailable; claims are off for this process", { code: latched });
+		current.latchReason = reason;
+		logger.warn(
+			reason === "timed_out"
+				? "Session ownership claim timed out; claims are off for this process"
+				: "Session ownership is unavailable; claims are off for this process",
+			{ code: latched },
+		);
 	}
 	return current.unavailable;
+}
+
+/** The fail-open a latched process returns for every later claim. */
+function latchedFailOpen(current: SessionOwnerRegistry): SessionOwnerClaimResult {
+	return failOpen(current.latchReason ?? "unavailable", current.unavailable);
 }
 
 class Claim implements SessionOwnerClaim {
@@ -547,7 +562,7 @@ export async function claimSessionOwner(
 ): Promise<SessionOwnerClaimResult> {
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
-	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
+	if (current.unavailable !== undefined) return latchedFailOpen(current);
 	let directory: RuntimeLockDirectory;
 	try {
 		directory = prepareRuntimeLockDirectory("session-owners", trustedHome());
@@ -566,8 +581,8 @@ export async function claimSessionOwner(
 		if (!pending) break;
 		await pending;
 	}
-	// The acquire waited on may have found the platform unavailable.
-	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
+	// The acquire waited on may have found the platform unavailable, or timed out.
+	if (current.unavailable !== undefined) return latchedFailOpen(current);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
 	try {
@@ -630,9 +645,9 @@ export async function claimSessionOwner(
 			case FileLockAcquireStatus.Unavailable:
 				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
-				// A stall is not a platform property: skip this claim only, and try again next time.
-				logger.warn("Session ownership claim timed out; this claim is skipped", { code: result.code });
-				return failOpen("timed_out", result.code);
+				// A stalled lock filesystem (NFS, for one) would make every later open wait the full native
+				// budget again, so one timeout turns claims off for the rest of this process.
+				return failOpen("timed_out", markUnavailable(result.code ?? "timed_out", "timed_out"));
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}
@@ -832,6 +847,25 @@ const SURFACE_NOUNS: Record<SessionOwnerBaseSurface, string> = {
 	sdk: "an application using the gjc SDK",
 };
 
+/** The holder as a remote client is told it, in a broker lifecycle error: surface and pid only. */
+export interface SessionOwnerHolderSummary {
+	readonly surface: SessionOwnerSurface;
+	readonly pid: number;
+}
+
+/**
+ * {@link SessionOwnerHolderSummary} of `holder`, checked field by field because it may come from
+ * a file another process wrote; `undefined` when it does not name a surface and a positive pid.
+ * A holder on another host keeps its surface and pid; its host name stays out.
+ */
+export function sessionOwnerHolderSummary(holder: unknown): SessionOwnerHolderSummary | undefined {
+	if (typeof holder !== "object" || holder === null) return undefined;
+	const { surface, pid } = holder as { surface?: unknown; pid?: unknown };
+	return isSurface(surface) && typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
+		? { surface, pid }
+		: undefined;
+}
+
 /**
  * How a holder is named to a person (design §3.4). The holder is checked again here, because a
  * caller may build one: anything malformed reads as "another gjc process", never as raw text.
@@ -847,6 +881,81 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	const base = (subagent ? holder.surface.slice(0, -" (subagent)".length) : holder.surface) as SessionOwnerBaseSurface;
 	const noun = SURFACE_NOUNS[base];
 	return subagent ? `a subagent of ${noun} (pid ${holder.pid})` : `${noun} (pid ${holder.pid})`;
+}
+
+/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`, or `a gjc process on build-box, pid 4242` for a remote holder; `undefined` if unverified. */
+function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string | undefined {
+	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface)) return undefined;
+	if (holder.host === undefined) return `${holder.surface}, pid ${holder.pid}`;
+	return SAFE_HOST.test(holder.host) ? `a gjc process on ${holder.host}, pid ${holder.pid}` : undefined;
+}
+
+/**
+ * The CLI command that continues a held session in a copy (design §3.3), for the CLI's refusals
+ * only: the SDK's `operatorMessage` names no command. `undefined` for an id that is not a safe file
+ * name, since any other id may hold any text.
+ */
+export function sessionHeldForkCommand(
+	sessionId: string,
+	options: {
+		readonly print?: boolean;
+		/** The transcript path the session was named by, repeated so the command reads the same file. */
+		readonly source?: string;
+		/** The `--session-dir` the session was found in; an id resolves only there. */
+		readonly sessionDir?: string;
+	} = {},
+): string | undefined {
+	if (!SAFE_ID.test(sessionId)) return undefined;
+	const source = options.source === undefined ? sessionId : shellWord(options.source);
+	const sessionDir = options.sessionDir === undefined ? undefined : shellWord(options.sessionDir);
+	if (source === undefined || (options.sessionDir !== undefined && sessionDir === undefined)) return undefined;
+	const flags = sessionDir === undefined ? "" : `--session-dir ${sessionDir} `;
+	return options.print ? `gjc -p ${flags}--fork ${source} "<message>"` : `gjc ${flags}--fork ${source}`;
+}
+
+/** One shell word for a path in a printed command; `undefined` for text no terminal should print. */
+function shellWord(value: string): string | undefined {
+	if (value === "" || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)) return undefined;
+	return /^[A-Za-z0-9._/:@%+=,-]+$/.test(value) && !value.startsWith("-")
+		? value
+		: `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * The terminal warning for a session another process holds (design §3.1; Fork and Cancel only, the
+ * read-only view and Take over are deferred). Fixed vocabulary, the holder's §3.4 phrase and a safe
+ * short id only: nothing a session or another process wrote reaches the screen.
+ */
+export function sessionHeldWarning(error: SessionHeldError): { readonly heading: string; readonly lines: string[] } {
+	const subject = SAFE_ID.test(error.sessionId) ? `Session ${error.sessionId.slice(0, 8)}` : "This session";
+	return {
+		heading: "This session is open in another process",
+		lines: [
+			`${subject} is open for writing in ${sessionOwnerHolderPhrase(error.holder)}.`,
+			"Only one process can write a session at a time.",
+		],
+	};
+}
+
+/** What a launch or the TUI says after Fork (design §3.1). */
+export function sessionHeldForkedNotice(error: SessionHeldError): string {
+	return `Forked into a new session. The original stays with ${sessionOwnerHolderPhrase(error.holder)}.`;
+}
+
+const SURFACE_MARKERS: Record<SessionOwnerBaseSurface, string> = {
+	app: "in app",
+	terminal: "in terminal",
+	print: "in gjc -p",
+	"sdk-host": "in session host",
+	"acp-host": "in session host",
+	sdk: "in SDK app",
+};
+
+/** The short marker a session list shows on a row another process holds (design §1 row 2): `in terminal`. */
+export function sessionOwnerHolderMarker(holder: SessionOwnerHolder | undefined): string {
+	if (!holder || !isSurface(holder.surface) || holder.host !== undefined) return "in use";
+	if (holder.surface.endsWith(" (subagent)")) return "in subagent";
+	return SURFACE_MARKERS[holder.surface as SessionOwnerBaseSurface];
 }
 
 /**
@@ -866,6 +975,8 @@ export class SessionHeldError extends Error {
 		this.holder = holder;
 		// Only a safe id is quoted, shortened as the CLI shows it; any other id may hold any text.
 		const subject = SAFE_ID.test(sessionId) ? `Session ${sessionId.slice(0, 8)}` : "This session";
-		this.operatorMessage = `${subject} is open for writing in ${sessionOwnerHolderPhrase(holder)}. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
+		const label = sessionOwnerHolderLabel(holder);
+		const where = label ? `another process (${label})` : "another gjc process";
+		this.operatorMessage = `${subject} is open for writing in ${where}. Only one process can write a session at a time.`;
 	}
 }

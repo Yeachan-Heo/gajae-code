@@ -17,7 +17,12 @@ import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 
 export const SESSION_OWNERSHIP_MODES = ["off", "observe", "enforce"] as const;
 export type SessionOwnershipMode = (typeof SESSION_OWNERSHIP_MODES)[number];
-export const DEFAULT_SESSION_OWNERSHIP_MODE: SessionOwnershipMode = "off";
+/**
+ * The mode when the operator set none. It is the effective default: `Settings.getGlobal` returns no
+ * value for an unset key, so the resolver falls back to this, and the schema default only mirrors it
+ * for display (a test keeps the two equal).
+ */
+export const DEFAULT_SESSION_OWNERSHIP_MODE: SessionOwnershipMode = "observe";
 export const SESSION_OWNERSHIP_ENV = "GJC_SESSION_OWNERSHIP";
 
 /** Test-only seams shared by the ownership modules. Code, not environment, so a project `.env` cannot reach them. */
@@ -87,6 +92,20 @@ export function trustedSessionOwnershipOverride(
 }
 
 /**
+ * Remove a project-supplied `GJC_SESSION_OWNERSHIP` from `env` before it reaches a child. A child in
+ * another directory (a `--tmux --worktree` launch runs `--no-env-file` there) checks provenance against
+ * that directory's `.env`, so it would trust this project's value. Called beside the `HERDR_BIN_PATH`
+ * drop, with the same startup snapshot.
+ */
+export function dropProjectSuppliedSessionOwnershipOverride(
+	env: NodeJS.ProcessEnv,
+	snapshot: ProjectEnvSnapshot,
+): void {
+	if (env[SESSION_OWNERSHIP_ENV] === undefined) return;
+	if (trustedCoordinatorEnv(SESSION_OWNERSHIP_ENV, env, snapshot) === undefined) delete env[SESSION_OWNERSHIP_ENV];
+}
+
+/**
  * Bun loads the project `.env` from the launch directory, so provenance is checked there. A launch
  * directory that is already gone leaves no snapshot to check against, and the override is ignored.
  */
@@ -146,11 +165,58 @@ export function sessionOwnershipOverrideWasRead(): boolean {
 	return cachedOverride !== undefined;
 }
 
-let settingSource: (() => unknown) | undefined;
+/** `fresh` asks for the value on disk now, past any cache, where the source has one. */
+export type SessionOwnershipSettingSource = (options?: { readonly fresh?: boolean }) => unknown;
 
-/** Settings supplies the global-only `session.ownership.mode` value. Without a source the default applies. */
-export function setSessionOwnershipSettingSource(source: (() => unknown) | undefined): void {
+let settingSource: SessionOwnershipSettingSource | undefined;
+
+/**
+ * Settings supplies the operator's global `session.ownership.mode` value: the process settings, or,
+ * before `Settings.init`, the agent directory's config file. Without a source the default applies.
+ */
+export function setSessionOwnershipSettingSource(source: SessionOwnershipSettingSource | undefined): void {
 	settingSource = source;
+}
+
+function readSettingSource(options?: { readonly fresh?: boolean }): unknown {
+	try {
+		return settingSource?.(options);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The mode as the operator has it now, for a refusal decision (5a). A refusal needs `enforce` both
+ * here and in the mode its factory read, so this can only lower a decision: `gjc config set
+ * session.ownership.mode off` reaches a running process's next refusal. It rereads the operator's
+ * config file. Only an explicit lower value lowers it: a file that names no mode, or cannot be read
+ * (the source then reports no value), leaves the factory's decision as it was, and so does the
+ * environment override unless it lowers.
+ */
+export function liveSessionOwnershipMode(): SessionOwnershipMode {
+	const forced = sessionOwnershipTestHookSlot().mode;
+	if (forced !== undefined) return forced;
+	const configured = parseMode(readSettingSource({ fresh: true })) ?? "enforce";
+	if (configured === "off") return "off";
+	cachedOverride ??= readOverride();
+	return resolveSessionOwnershipMode(configured, cachedOverride.value);
+}
+
+const MODE_RANK: Readonly<Record<SessionOwnershipMode, number>> = { off: 0, observe: 1, enforce: 2 };
+
+/**
+ * The mode for a decision a running process makes now: `processMode` (the mode its process or
+ * factory read), lowered by {@link liveSessionOwnershipMode}. Only an explicit lower value in the
+ * operator's config file (or a lowering environment override) lowers it, and nothing raises it, so
+ * `gjc config set session.ownership.mode off` reaches a running process's next decision.
+ */
+export function liveSessionOwnershipModeFor(
+	processMode: SessionOwnershipMode = sessionOwnershipMode(),
+): SessionOwnershipMode {
+	if (processMode === "off") return "off";
+	const live = liveSessionOwnershipMode();
+	return MODE_RANK[live] < MODE_RANK[processMode] ? live : processMode;
 }
 
 /**
@@ -158,27 +224,25 @@ export function setSessionOwnershipSettingSource(source: (() => unknown) | undef
  * so `off` does no work beyond reading the setting.
  */
 export function sessionOwnershipMode(): SessionOwnershipMode {
-	let setting: unknown;
-	try {
-		setting = settingSource?.();
-	} catch {
-		setting = undefined;
-	}
-	return sessionOwnershipModeFor(setting);
+	return sessionOwnershipModeFor(undefined);
 }
 
 /**
  * The mode for a `session.ownership.mode` value read from settings other than the global instance
  * (a launch that opens its session before `Settings.init`, or a scoped load), with the same override.
+ * A missing or invalid value, as from settings that never loaded the operator's config file (an
+ * embedding's `Settings.isolated()`), falls back to the setting source, so the operator's `off` still
+ * applies. A valid explicit value wins.
  */
 export function sessionOwnershipModeFor(setting: unknown): SessionOwnershipMode {
 	const forced = sessionOwnershipTestHookSlot().mode;
 	if (forced !== undefined) return forced;
-	const configured = resolveSessionOwnershipMode(setting, undefined);
+	const value = parseMode(setting) === undefined ? readSettingSource() : setting;
+	const configured = resolveSessionOwnershipMode(value, undefined);
 	// `off` is the kill switch: it returns before the environment is read at all.
 	if (configured === "off") return "off";
 	cachedOverride ??= readOverride();
-	const effective = resolveSessionOwnershipMode(setting, cachedOverride.value);
+	const effective = resolveSessionOwnershipMode(value, cachedOverride.value);
 	reportIgnoredOverride(cachedOverride, configured, effective);
 	return effective;
 }

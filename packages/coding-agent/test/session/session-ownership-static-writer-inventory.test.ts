@@ -8,8 +8,8 @@
  * write path. The factory claims its id before its first write (single-owner design §2.4): each
  * write to a transcript must follow a detector call for that transcript's own session id (the
  * write ledger), no detector call may find the id unclaimed, none may go unanswered for want of a
- * bound id, and the returned manager holds its own id until close. With claims failing open, the
- * detector still catches each publish. In `off`, with the strict seam on, the same scenarios count
+ * bound id, and the returned manager holds its own id until close. With claims not taken (the session
+ * held elsewhere), the detector still catches each publish. In `off`, with the strict seam on, the same scenarios count
  * and log nothing. Writers covered elsewhere are listed with where.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
@@ -33,9 +33,12 @@ import { expectStrictDetections, outsideStrictSeam, useStrictWriteDetection } fr
 import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
-/** Every claim times out, so factories go on without one and the detector alone guards the writes. */
-const FAIL_OPEN_LOCKS = {
-	tryAcquire: async () => ({ status: FileLockAcquireStatus.TimedOut, code: "timed_out" }),
+/**
+ * Every claim finds the session held elsewhere, so factories go on without one and the detector alone
+ * guards the writes. Not a fail-open answer: the detector is quiet for a claim that failed open.
+ */
+const UNCLAIMED_LOCKS = {
+	tryAcquire: async () => ({ status: FileLockAcquireStatus.Held }),
 	probe: async () => ({ state: FileLockProbeState.Free }),
 };
 const roots: string[] = [];
@@ -367,6 +370,9 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Run> = {
 	inMemory: async f => SessionManager.inMemory(f.cwd),
 	captureTranscriptStrict: async f => identity(f.existing),
 	inspectSessionTailReadOnly: f => SessionManager.inspectSessionTailReadOnly(f.existing),
+	// A header read and a probe, never a claim; under enforce it still writes nothing.
+	probeHeldTranscript: async f =>
+		SessionManager.probeHeldTranscript(f.existing, { surface: "terminal", mode: "enforce" }),
 	openReadOnlySnapshot: f => SessionManager.openReadOnlySnapshot(f.existing),
 	readSessionRecapReadOnly: async f => {
 		const stat = await fs.stat(f.existing, { bigint: true });
@@ -569,10 +575,10 @@ describe.if(supported)("session ownership static writer inventory", () => {
 		};
 		for (const [name, { run, site }] of Object.entries(publishes)) {
 			for (const kind of ["managed", "explicit"] as const) {
-				it(`${name} (${kind}), its claim failing open, is refused before it publishes`, async () => {
+				it(`${name} (${kind}), its claim not taken, is refused before it publishes`, async () => {
 					const f = await outsideStrictSeam(() => fixture(kind));
 					const before = await transcripts(f.root);
-					SessionOwnershipTestHooks.lockBackend = FAIL_OPEN_LOCKS;
+					SessionOwnershipTestHooks.lockBackend = UNCLAIMED_LOCKS;
 					writes.reset();
 					await expect(run(f).then(keep)).rejects.toMatchObject({
 						name: "SessionWriteWithoutClaimError",
