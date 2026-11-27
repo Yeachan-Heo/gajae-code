@@ -22,9 +22,6 @@ export async function seedScenarioWorkdir(workdir: string, scenarioId: ScenarioI
 		case "bash-discipline":
 			await write(path.join(ws, "src", "secret.ts"), "export const SECRET = 'LIVE_SECRET_7319';\n");
 			break;
-		case "read-edit-hashline":
-			await write(path.join(ws, "src", "foo.ts"), "export const greeting = 'hello-old';\n");
-			break;
 		case "three-turn-tools":
 			await write(path.join(ws, "src", "a.ts"), "export const TARGET_MARKER = 'pending';\n");
 			await write(path.join(ws, "src", "b.ts"), "// secondary\n");

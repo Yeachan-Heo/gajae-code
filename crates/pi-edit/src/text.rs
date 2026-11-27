@@ -4,8 +4,7 @@
 //! JS-compatible trimming, indentation profiling, and the fuzzy-comparison
 //! normalizers.
 //!
-//! Ports `packages/hashline/src/normalize.ts` and
-//! `packages/coding-agent/src/edit/normalize.ts`.
+//! Ports `packages/coding-agent/src/edit/normalize.ts`.
 
 use xutf::IntoUnicodeNormalized;
 

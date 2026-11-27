@@ -305,7 +305,7 @@ Notes: ...
 
 ## Notes
 - `readSchema` examples include `https://example.com:L1-L40`, but URL selector parsing in `packages/coding-agent/src/tools/fetch.ts` does not accept `L` prefixes.
-- Hashline anchors are suppressed for raw reads and immutable internal resources because there is no editable backing target for later `edit` consumption.
+- Raw reads omit line anchors to preserve verbatim content.
 - `splitPathAndSel()` intentionally treats unknown trailing `:...` as part of the path so `archive.zip:inner/file` and `db.sqlite:table:key` still work.
 - `resolveReadPath()` contains macOS-specific filename fallbacks for screenshot timestamps, NFD Unicode normalization, and curly apostrophes.
 - A bare `/` resolves to the session cwd, not the filesystem root.

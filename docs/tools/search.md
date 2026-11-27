@@ -31,8 +31,7 @@
 The tool returns a single text block in `content[0].text` plus structured `details`.
 
 - Match lines are formatted by `formatMatchLine()` as `*<anchor>|<line>` for matches and ` <anchor>|<line>` for context.
-  - Hashline mode: `*5th|content`, ` 9x}|content`.
-  - Plain mode: `*5|content`, ` 9|content`.
+  - Line anchors are line numbers: `*5|content`, ` 9|content`.
 - Directory results are grouped by file, with `# <path>` headings and blank lines between groups.
 - `details` may include:
   - `scopePath` — formatted search scope.

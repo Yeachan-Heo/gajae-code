@@ -190,7 +190,7 @@ describe("composer-evidence report", () => {
 		expect(report.ladderMaxClaim).toBe("L3");
 		expect(report.l3RefusalReasons).toEqual([]);
 		expect(report.min_k_per_scenario_role).toBe(3);
-		expect(report.role_counts).toEqual({ candidate: 54, baseline: 54 });
+		expect(report.role_counts).toEqual({ candidate: 51, baseline: 51 });
 		expect(report.planned_records).toBe(108);
 		expect(report.captured_records).toBe(108);
 		expect(report.trace_sha256).toBe("trace-hash");
@@ -317,10 +317,10 @@ describe("composer-evidence report", () => {
 		expect(payload.disclaimer).toContain("frozen trace corpora");
 		expect(payload.disclaimer).toContain("same versioned Composer scenario prompts");
 		expect(payload.disclaimer).not.toContain("composer-scenarios-v1");
-		expect(payload.arm_a.scenario_coverage_ratio).toBe("1/13");
+		expect(payload.arm_a.scenario_coverage_ratio).toBe("1/12");
 		expect(payload.arm_a.composer_scenarios_version).toBe("v1");
 		expect(payload.arm_b.composer_scenarios_version).toBe("v1");
-		expect(payload.arm_b.scenario_coverage_ratio).toBe("1/13");
+		expect(payload.arm_b.scenario_coverage_ratio).toBe("1/12");
 		expect(payloadText).not.toContain("ab-arm-a");
 		expect(payloadText).not.toContain("ab-arm-b");
 	});

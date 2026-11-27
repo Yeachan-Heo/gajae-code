@@ -3,10 +3,9 @@
 // Swift and Emacs Lisp tests on full-langs.
 //! Resolve the syntactic block that begins on a given source line.
 //!
-//! Powers the hashline `replace block N:` operator: given a 1-indexed line,
-//! parse the source with tree-sitter and return the line span of the outermost
-//! named node that *begins* on that line (excluding the whole-file root). Brace
-//! languages anchor a construct's block to its opening line, so pointing at the
+//! Parses the source with tree-sitter and returns the line span of the outermost
+//! named node that *begins* on that line (1-indexed, excluding the whole-file root).
+//! Brace languages anchor a construct's block to its opening line, so pointing at the
 //! line that opens an `if` / `function` / `struct` resolves to that construct's
 //! full span; pointing at a continuation line or a lone closing delimiter
 //! resolves to nothing.
@@ -890,9 +889,9 @@ mod tests {
 	// ── prune equivalence ─────────────────────────────────────────────────────
 	//
 	// `collect_boundaries` skips subtrees whose raw line span holds no visible
-	// line. That is argued to be exact, but the output feeds hashline block
-	// resolution, so a silently dropped line corrupts edits rather than just
-	// degrading display. The argument is therefore backed by a differential
+	// line. That is argued to be exact, but the output feeds edit block recovery,
+	// so a silently dropped line corrupts edits rather than just degrading display.
+	// The argument is therefore backed by a differential
 	// against the pre-prune traversal over the repository's own sources, not by
 	// hand-written expectations.
 
