@@ -2636,6 +2636,18 @@ function isOwnershipWriteRefusal(error: unknown): error is SessionHeldError | Se
 	return error instanceof SessionHeldError || error instanceof SessionOwnershipError;
 }
 
+const HEADER_FIELDS = ["cwd", "title", "titleSource", "starred"] as const;
+type HeaderField = (typeof HEADER_FIELDS)[number];
+interface HeaderFieldValue {
+	readonly present: boolean;
+	readonly value: unknown;
+}
+/** A header's committed field values, and the last applied patch per field group (title and titleSource are one). */
+interface HeaderPatchState {
+	readonly committed: Map<HeaderField, HeaderFieldValue>;
+	readonly lastApplied: Map<"cwd" | "title" | "starred", symbol>;
+}
+
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;
 	readonly entryId: string;
@@ -8053,6 +8065,8 @@ export class SessionManager {
 	#sessionId: string = "";
 	/** The session claims this manager holds (design §2.5), under the decision its factory made. */
 	readonly #ownershipClaims: SessionClaimSet;
+	/** Per header object: what its transcript last received, for rolling back a refused header patch. */
+	readonly #headerPatchStates = new WeakMap<SessionHeader, HeaderPatchState>();
 	#committedIdentityGeneration = 0;
 	#committedIdentity: { id: string; file: string | undefined } | undefined;
 	#titleMutationRevision = 0;
@@ -19402,14 +19416,38 @@ export class SessionManager {
 			await this.#appendHeaderPatch({ starred });
 			return true;
 		} catch (error) {
-			// Only while the header still holds this patch's value: a later star patch owns it otherwise.
-			if (header.starred === starred) {
-				if (previous === undefined) delete header.starred;
-				else header.starred = previous;
-				this.#headerExportRevision++;
-			}
+			// An ownership refusal was already undone by #appendHeaderPatch, against the committed value.
+			if (!isOwnershipWriteRefusal(error))
+				this.#restoreHeaderFields(header, [["starred", { present: previous !== undefined, value: previous }]]);
 			throw error;
 		}
+	}
+
+	/** Set header fields to the given values (`present: false` removes the field). */
+	#restoreHeaderFields(header: SessionHeader, values: readonly (readonly [HeaderField, HeaderFieldValue])[]): void {
+		const restored = header as unknown as Record<string, unknown>;
+		for (const [field, { present, value }] of values) {
+			if (present) restored[field] = value;
+			else delete restored[field];
+		}
+		this.#headerExportRevision++;
+	}
+
+	/**
+	 * What the transcript last received for each header field, and which queued patch last set each
+	 * field group in memory; seeded from the header the first time it is patched.
+	 */
+	#headerPatchState(header: SessionHeader): HeaderPatchState {
+		let state = this.#headerPatchStates.get(header);
+		if (!state) {
+			const read = (field: HeaderField): HeaderFieldValue => ({
+				present: Object.hasOwn(header, field),
+				value: header[field],
+			});
+			state = { committed: new Map(HEADER_FIELDS.map(field => [field, read(field)])), lastApplied: new Map() };
+			this.#headerPatchStates.set(header, state);
+		}
+		return state;
 	}
 
 	async setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
@@ -19530,6 +19568,7 @@ export class SessionManager {
 					if (!liveHeader) throw new Error("Selected session identity changed. Reopen the session picker.");
 					liveHeader.starredPatchVersion = 1;
 					applyHeaderPatch(liveHeader, { starred });
+					this.#headerPatchStates.get(liveHeader)?.committed.set("starred", { present: true, value: starred });
 					this.#headerExportRevision++;
 					if (this.destination.kind === "managed") {
 						this.#adoptManagedPersistIdentity(sessionFile);
@@ -19955,6 +19994,9 @@ export class SessionManager {
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) {
 					applyHeaderPatch(header, patch);
+					const state = this.#headerPatchStates.get(header);
+					for (const field of ["title", "titleSource"] as const)
+						if (patch[field] !== undefined) state?.committed.set(field, { present: true, value: patch[field] });
 					this.#headerExportRevision++;
 				}
 				this.#sessionName = sanitized;
@@ -20009,39 +20051,46 @@ export class SessionManager {
 		} else this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header) return;
-		// The fields this patch sets, with what they held before; other patches may be applied (and
-		// persisted) around it, so a refusal undoes only these, and only where they still hold its value.
-		const fields = (["cwd", "title", "titleSource", "starred"] as const).filter(
+		// Patches apply in memory now and write later, in queue order. Each field group remembers the
+		// last patch applied to it, and the header remembers what its transcript last received.
+		const state = this.#headerPatchState(header);
+		const token = Symbol("header patch");
+		const fields = HEADER_FIELDS.filter(
 			field => patch[field] !== undefined && (field !== "starred" || header.starredPatchVersion === 1),
 		);
-		const previous = fields.map(field => [field, Object.hasOwn(header, field), header[field]] as const);
+		const group = (field: HeaderField) => (field === "titleSource" ? "title" : field);
+		for (const field of fields) state.lastApplied.set(group(field), token);
 		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
-		const records: HeaderPatchRecord[] =
+		// The star companion record is built at write time, from what the transcript holds then.
+		const records = (): HeaderPatchRecord[] =>
 			header.starredPatchVersion === 1 && patch.starred === undefined
 				? [
-						{ type: "header_patch", patch: { starred: header.starred === true } },
+						{ type: "header_patch", patch: { starred: state.committed.get("starred")?.value === true } },
 						{ type: "header_patch", patch },
 					]
 				: [{ type: "header_patch", patch }];
+		const committed = (): void => {
+			for (const field of fields) state.committed.set(field, { present: true, value: patch[field] });
+		};
 		try {
 			await this.#persistPatches(
 				records,
 				options?.onPersistenceStart,
 				options?.onPersistenceCheck,
 				options?.isPersistenceOwner,
+				committed,
 			);
 		} catch (error) {
-			// Enforce's write gate refused the patch before anything was written: undo it in memory, so
-			// no later full rewrite writes a header the transcript never received.
+			// Enforce's write gate refused the patch before anything was written. Where no later patch has
+			// set the field since, put back what the transcript holds, so no later full rewrite writes a
+			// header the transcript never received; a later patch's own write or refusal settles the rest.
 			if (isOwnershipWriteRefusal(error) && this.#fileEntries.includes(header)) {
-				const restored = header as unknown as Record<string, unknown>;
-				for (const [field, present, value] of previous) {
-					if (restored[field] !== patch[field]) continue;
-					if (present) restored[field] = value;
-					else delete restored[field];
-				}
-				this.#headerExportRevision++;
+				const owned = fields.filter(field => state.lastApplied.get(group(field)) === token);
+				this.#restoreHeaderFields(
+					header,
+					owned.map(field => [field, state.committed.get(field) ?? { present: false, value: undefined }] as const),
+				);
 			}
 			throw error;
 		}
@@ -20077,14 +20126,17 @@ export class SessionManager {
 		});
 	}
 
+	/** `records` may be built at write time; `onCommitted` runs in queue order once they are on disk. */
 	async #persistPatches(
-		records: readonly SessionPatchRecord[],
+		recordsOrBuild: readonly SessionPatchRecord[] | (() => readonly SessionPatchRecord[]),
 		onPersistenceStart?: () => void,
 		onPersistenceCheck?: () => void,
 		isPersistenceOwner?: () => boolean,
+		onCommitted?: () => void,
 	): Promise<void> {
 		this.assertLegacyMutationAllowed("persist patches");
-		if (records.length === 0) return;
+		const recordsNow = () => (typeof recordsOrBuild === "function" ? recordsOrBuild() : recordsOrBuild);
+		if (recordsNow().length === 0) return;
 		try {
 			this.#refreshManagedTranscriptRelocation();
 		} catch (error) {
@@ -20093,6 +20145,8 @@ export class SessionManager {
 		}
 		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) {
 			if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+			// Nothing on disk yet: the transcript is written from memory, patch included.
+			onCommitted?.();
 			return;
 		}
 		let sessionFile = this.#sessionFile;
@@ -20119,12 +20173,13 @@ export class SessionManager {
 						(header?.version ?? 1) < CURRENT_SESSION_VERSION
 					) {
 						await this.#rewriteFileContents({ check: onPersistenceCheck, start: markPersistenceStart });
+						onCommitted?.();
 						sessionFile = this.#sessionFile!;
 						if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
 						this.#readOnlyResume = false;
 						return;
 					}
-					const persistedRecords = records.map(record =>
+					const persistedRecords = recordsNow().map(record =>
 						record.type === "entry_patch"
 							? (prepareEntryForPersistenceSync(
 									materializeResidentEntryForPersistenceSync(
@@ -20166,6 +20221,7 @@ export class SessionManager {
 							persisted = true;
 							sessionFile = this.#sessionFile!;
 						}
+						if (persisted) onCommitted?.();
 						if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
 						if (persisted) this.#readOnlyResume = false;
 						return;
