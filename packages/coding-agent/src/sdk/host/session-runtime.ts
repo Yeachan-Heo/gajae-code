@@ -5392,10 +5392,11 @@ function trustedHostRegistrationHoldDirectory(): string | undefined {
 
 /**
  * Test seam: while `<dir>/<sessionId>.hold` exists, defer this host's broker registration (at
- * most 60 s), so a multi-process test can hold an interactive TUI in the window where it holds the
- * session claim but has no endpoint in the index.
+ * most 60 s), so a multi-process test can hold an interactive TUI, or a broker-launched host (its
+ * notifications runtime registers through this too), in the window where it holds the session
+ * claim but has no endpoint in the index.
  */
-async function awaitHostRegistrationTestHold(sessionId: string): Promise<void> {
+export async function awaitHostRegistrationTestHold(sessionId: string): Promise<void> {
 	const directory = trustedHostRegistrationHoldDirectory();
 	if (!directory) return;
 	const hold = path.join(directory, `${sessionId}.hold`);
