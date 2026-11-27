@@ -2206,6 +2206,8 @@ export function reconcileUncertainAppend(input: AppendReconciliationInput): Appe
  */
 function classifyAppendFailure(error: unknown): DurableAppendOutcome {
 	if (error instanceof ManagedAppendIdentityMismatchError) return { kind: "not_committed", error };
+	// Enforce's write gate refuses before writing, and the entry is rolled back.
+	if (isOwnershipWriteRefusal(error)) return { kind: "not_committed", error };
 	if (error instanceof SessionAppendPersistenceError) {
 		if (error.phase === "prior_failure") return { kind: "not_committed", error };
 		return { kind: "unknown", id: error.entryId, error };
@@ -2625,6 +2627,14 @@ export const SESSION_LIMIT_RECOVERY_ACTIONS =
  */
 export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
 	"The selected session transcript is too large to resume safely. Resume a different session, or remove/archive this transcript after confirming its content is no longer needed.";
+
+/**
+ * Enforce's write gate refused a write before it wrote anything (another process holds the session,
+ * or its claim failed): not a persistence failure, and nothing to keep in memory.
+ */
+function isOwnershipWriteRefusal(error: unknown): error is SessionHeldError | SessionOwnershipError {
+	return error instanceof SessionHeldError || error instanceof SessionOwnershipError;
+}
 
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;
@@ -13324,7 +13334,7 @@ export class SessionManager {
 		const normalized = toError(err);
 		// Enforce's write gate refused the write before it wrote anything: not a persistence failure,
 		// so nothing latches and the next write is judged on its own.
-		if (normalized instanceof SessionHeldError) return normalized;
+		if (isOwnershipWriteRefusal(normalized)) return normalized;
 		if (!this.#persistError) this.#persistError = normalized;
 		if (!this.#persistErrorReported) {
 			this.#persistErrorReported = true;
@@ -13416,7 +13426,7 @@ export class SessionManager {
 		}
 		if (this.#persistWriter && this.#persistWriterPath === this.#sessionFile) {
 			// Every append through an open writer, not only its open, passes enforce's write gate.
-			this.#ownershipClaims.refuseWriteIfHeld();
+			this.#ownershipClaims.refuseWriteIfRefused();
 			if (this.#persistWriter.isOpen()) return this.#persistWriter;
 			// Cached writer for the current file is mid-close (queued
 			// `#closePersistWriterInternal` has flipped `#closing` but not yet
@@ -19753,7 +19763,10 @@ export class SessionManager {
 				// persistence lane had started: the identity fence refused before writing, so
 				// the transcript never received this title. Leaving it applied would make the
 				// opener show a title the shared transcript does not carry.
-				const definitelyNotCommitted = !persistenceStarted || error instanceof ManagedAppendIdentityMismatchError;
+				const definitelyNotCommitted =
+					!persistenceStarted ||
+					error instanceof ManagedAppendIdentityMismatchError ||
+					isOwnershipWriteRefusal(error);
 				if (
 					definitelyNotCommitted &&
 					this.#titleMutationRevision === revision &&
@@ -19993,6 +20006,8 @@ export class SessionManager {
 		} else this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header) return;
+		const fields = ["cwd", "title", "titleSource", "starred"] as const;
+		const previous = fields.map(field => [field, Object.hasOwn(header, field), header[field]] as const);
 		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
 		const records: HeaderPatchRecord[] =
@@ -20002,12 +20017,26 @@ export class SessionManager {
 						{ type: "header_patch", patch },
 					]
 				: [{ type: "header_patch", patch }];
-		await this.#persistPatches(
-			records,
-			options?.onPersistenceStart,
-			options?.onPersistenceCheck,
-			options?.isPersistenceOwner,
-		);
+		try {
+			await this.#persistPatches(
+				records,
+				options?.onPersistenceStart,
+				options?.onPersistenceCheck,
+				options?.isPersistenceOwner,
+			);
+		} catch (error) {
+			// Enforce's write gate refused the patch before anything was written: undo it in memory, so
+			// no later full rewrite writes a header the transcript never received.
+			if (isOwnershipWriteRefusal(error) && this.#fileEntries.includes(header)) {
+				const restored = header as unknown as Record<string, unknown>;
+				for (const [field, present, value] of previous) {
+					if (present) restored[field] = value;
+					else delete restored[field];
+				}
+				this.#headerExportRevision++;
+			}
+			throw error;
+		}
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
@@ -20455,8 +20484,9 @@ export class SessionManager {
 			// append. Preserve its type after rolling back the rejected entry.
 			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
 			if (error instanceof SharedAppendRewriteRequiredError) throw error;
-			// So is enforce's write gate: another process holds the session (nothing was written).
-			if (error instanceof SessionHeldError) throw error;
+			// So is enforce's write gate: another process holds the session, or its claim failed
+			// (nothing was written).
+			if (isOwnershipWriteRefusal(error)) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,

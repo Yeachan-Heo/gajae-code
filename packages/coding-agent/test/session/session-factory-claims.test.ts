@@ -1221,6 +1221,11 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 			written = error;
 		}
 		expect(written).toBeInstanceOf(SessionHeldError);
+		// A refused header patch (a rename, an auto-title) is undone in memory too, so no later rewrite
+		// writes it.
+		const name = manager.getSessionName();
+		await expect(manager.setSessionName("renamed while held", "user")).rejects.toBeInstanceOf(SessionHeldError);
+		expect([manager.getSessionName(), manager.getHeader()?.title]).toEqual([name, name]);
 		expect(await fs.readFile(file)).toEqual(before);
 		// A held session is checked at every turn (no backoff), and the TUI routes the refusal.
 		const refused: unknown[] = [];
@@ -1239,44 +1244,123 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		);
 		expect([refused.length, refused[0] instanceof SessionHeldError, errors, turns()]).toEqual([1, true, [], 0]);
 
-		// The TUI's warning is /resume's flow for the session's own file, Fork and Cancel only. Cancel
-		// keeps the session here, unsent; Fork continues in a copy and leaves the original to its holder.
-		const offered: string[][] = [];
-		const statuses: string[] = [];
-		let choose = (options: string[]) => options.at(-1);
-		const ui = new TUI(new VirtualTerminal(80, 12));
-		try {
-			const controller = new SelectorController({
-				ui,
-				statusContainer: new Container(),
-				pendingMessagesContainer: new Container(),
-				compactionQueuedMessages: [],
-				pendingTools: new Map(),
-				session,
-				sessionManager: manager,
-				settings: { get: () => undefined, getAgentDir },
-				showHookSelector: async (_title: string, options: string[]) => {
-					offered.push(options);
-					return choose(options);
-				},
-				showStatus: (message: string) => statuses.push(message),
-				resetIrcSidebarSession: () => {},
-				resetAssistantTextPresentation: () => {},
-				updateEditorBorderColor: () => {},
-				rebuildInitialMessages: () => {},
-				reloadTodos: async () => undefined,
-			} as unknown as InteractiveModeContext);
-			await controller.handleResumeSession(file, { cancelledStatus: "Not sent", continueHere: false });
-			expect([offered[0].length, statuses.at(-1), manager.getSessionId()]).toEqual([2, "Not sent", id]);
-			choose = options => options[0];
-			await controller.handleResumeSession(file, { continueHere: false });
-		} finally {
-			ui.stop();
-		}
+		// The TUI's warning is /resume's flow for the session's own file, Fork and Cancel only; Cancel
+		// keeps the session here, unsent.
+		const heldWarning = await resumeOwnFile(session, manager, file, "cancel");
+		expect([heldWarning.offered, heldWarning.status, manager.getSessionId()]).toEqual([2, "Not sent", id]);
+		expect(await fs.readFile(file)).toEqual(before);
+
+		// The holder gone, the next enforce turn claims (no backoff), and the write gate lifts.
+		await stopHolder();
+		await session.prompt("after the holder exited");
+		expect([turns(), await ownedHere(id)]).toEqual([1, true]);
+		manager.appendCustomEntry("reclaim-test", { note: "claimed now" });
+		await manager.flush();
+		expect(await fs.readFile(file, "utf8")).toContain("claimed now");
+	});
+
+	it("enforce: Fork from a refused turn continues in a copy and leaves the original to its holder", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const { session, turns } = await turnSession(manager);
+		stall.on = false;
+		await holdInAnotherProcess(id);
+		const before = await fs.readFile(file);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("refused")).rejects.toBeInstanceOf(SessionHeldError);
+
+		expect((await resumeOwnFile(session, manager, file, "fork")).offered).toBe(2);
 		const forkId = manager.getSessionId();
 		expect(forkId).not.toBe(id);
 		await session.prompt("in the fork");
 		expect([turns(), await ownedHere(forkId), await ownedHere(id)]).toEqual([1, true, false]);
 		expect(await fs.readFile(file)).toEqual(before);
 	});
+
+	it("enforce: an append through an already-open transcript writer is refused once another process holds the session", async () => {
+		const place = await workspace();
+		const directory = path.join(place.root, "explicit");
+		const destination = SessionManager.explicitDestination(directory);
+		SessionOwnershipTestHooks.mode = "off";
+		const seed = SessionManager.create(place.cwd, destination);
+		seed.appendMessage(user("question"));
+		await seed.ensureOnDisk();
+		await seed.flush();
+		const file = seed.getSessionFile()!;
+		const id = seed.getSessionId();
+		await seed.close();
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, destination));
+		const { session, turns } = await turnSession(manager);
+		// The unclaimed turn after the stalled open opens the transcript writer.
+		await session.prompt("opens the writer");
+		await manager.flush();
+		expect(turns()).toBe(1);
+		stall.on = false;
+		const pid = await holdInAnotherProcess(id);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("refused")).rejects.toMatchObject({ code: "session_held", holder: { pid } });
+		const before = await fs.readFile(file);
+		let written: unknown;
+		try {
+			manager.appendCustomEntry("reclaim-test", { note: "through the open writer" });
+		} catch (error) {
+			written = error;
+		}
+		expect(written).toBeInstanceOf(SessionHeldError);
+		await manager.flush();
+		expect(await fs.readFile(file)).toEqual(before);
+
+		// A refused write re-attempts in the background, so once the holder exits the gate lifts
+		// without a turn.
+		await stopHolder();
+		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
+		expect(() => manager.appendCustomEntry("reclaim-test", { note: "stale held" })).toThrow();
+		await Bun.sleep(0);
+		expect(await sessionClaimSetOf(manager).settled()).toBe("claimed");
+		manager.appendCustomEntry("reclaim-test", { note: "after the gate lifted" });
+		await manager.flush();
+		expect(await fs.readFile(file, "utf8")).toContain("after the gate lifted");
+	});
 });
+
+/** `/resume`'s flow for the session's own file, choosing Fork or Cancel on the held-session warning. */
+async function resumeOwnFile(session: AgentSession, manager: SessionManager, file: string, choice: "fork" | "cancel") {
+	let offered = 0;
+	let status: string | undefined;
+	const ui = new TUI(new VirtualTerminal(80, 12));
+	try {
+		const controller = new SelectorController({
+			ui,
+			statusContainer: new Container(),
+			pendingMessagesContainer: new Container(),
+			compactionQueuedMessages: [],
+			pendingTools: new Map(),
+			session,
+			sessionManager: manager,
+			settings: { get: () => undefined, getAgentDir },
+			showHookSelector: async (_title: string, options: string[]) => {
+				offered = options.length;
+				return choice === "fork" ? options[0] : options.at(-1);
+			},
+			showStatus: (message: string) => {
+				status = message;
+			},
+			resetIrcSidebarSession: () => {},
+			resetAssistantTextPresentation: () => {},
+			updateEditorBorderColor: () => {},
+			rebuildInitialMessages: () => {},
+			reloadTodos: async () => undefined,
+		} as unknown as InteractiveModeContext);
+		await controller.handleResumeSession(file, { cancelledStatus: "Not sent", continueHere: false });
+	} finally {
+		ui.stop();
+	}
+	return { offered, status };
+}

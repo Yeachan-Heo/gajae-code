@@ -277,6 +277,8 @@ export class SessionClaimSet {
 	readonly #reported = new Set<string>();
 	/** Turn start's re-attempts per id since its last claim: how many, and when the next may run. */
 	readonly #reclaims = new Map<string, { readonly attempts: number; readonly notBefore: number }>();
+	/** Ids a refused write queued a background re-attempt for. */
+	readonly #reclaimQueued = new Set<string>();
 
 	constructor(ownership: ResolvedSessionOwnership = resolveSessionOwnership()) {
 		this.#ownership = ownership;
@@ -470,13 +472,17 @@ export class SessionClaimSet {
 		if (sessionId === undefined || this.#mode === "off" || this.#closed || this.#transitions > 0) return undefined;
 		if (this.#claims.has(sessionId)) return undefined;
 		const inFlight = this.#pending.get(sessionId);
-		if (inFlight) return this.#mode === "enforce" ? this.#joinReclaim(sessionId, inFlight) : undefined;
 		const outcome = this.#outcomes.get(sessionId);
-		if (outcome === undefined || outcome.status === "claimed") return undefined;
-		if (outcome.status === "none" && outcome.skipped !== "timed_out") return undefined;
+		if (!inFlight) {
+			if (outcome === undefined || outcome.status === "claimed") return undefined;
+			if (outcome.status === "none" && outcome.skipped !== "timed_out") return undefined;
+		}
 		const live = liveSessionOwnershipModeFor(this.#mode);
 		if (live === "off") return undefined;
 		const enforced = this.#mode === "enforce" && live === "enforce";
+		// A claim in flight already covers the writes; only enforce's turn waits for its outcome.
+		if (inFlight) return enforced ? this.#joinReclaim(sessionId, inFlight) : undefined;
+		if (outcome === undefined) return undefined;
 		// What enforce refuses (another holder, a failed claim) is checked at every turn: a backoff
 		// would let the turns inside it through, writing.
 		const checksEveryTurn = enforced && (outcome.status === "held" || outcome.status === "failed");
@@ -514,19 +520,36 @@ export class SessionClaimSet {
 	}
 
 	/**
-	 * Enforce's write gate (design §2.5, §13.1): a write to an id whose recorded outcome is `held` (a
-	 * turn-start re-attempt found another holder, or a transition landed held) is refused with that
-	 * holder's {@link SessionHeldError}, so no writer outside a turn (a title, a rename, a compaction,
-	 * an extension's entry, an SDK append) writes over the holder. It reads only the recorded outcome
-	 * (no lock call); the turn gate is what finds the holder. Inside a transition nothing is refused.
+	 * Enforce's write gate (design §2.5, §13.1): a write to an id whose recorded outcome enforce
+	 * refuses (`held`: a turn-start re-attempt found another holder, or a transition landed held;
+	 * `failed`: the claim failed, fail-closed) is refused with {@link claimRefusal}'s error, so no
+	 * writer outside a turn (a title, a rename, a compaction, an extension's entry, an SDK append)
+	 * writes over a holder. It reads only the recorded outcome and makes no lock call; the turn gate is
+	 * what finds the holder. A refusal starts a background re-attempt (within the backoff), so the gate
+	 * lifts on its own soon after the holder exits. Inside a transition nothing is refused.
 	 */
-	refuseWriteIfHeld(sessionId: string | undefined = this.#current): void {
+	refuseWriteIfRefused(sessionId: string | undefined = this.#current): void {
 		if (sessionId === undefined || this.#mode !== "enforce" || this.#transitions > 0) return;
 		if (this.#claims.has(sessionId)) return;
 		const outcome = this.#outcomes.get(sessionId);
-		if (outcome?.status !== "held") return;
+		if (outcome?.status !== "held" && outcome?.status !== "failed") return;
 		const refusal = claimRefusal(this.#ownership, sessionId, outcome);
-		if (refusal) throw refusal;
+		if (!refusal) return;
+		this.#reclaimSoon(sessionId);
+		throw refusal;
+	}
+
+	/** A background re-attempt of `sessionId` after this write returns, unless one is in flight or backing off. */
+	#reclaimSoon(sessionId: string): void {
+		if (this.#reclaimQueued.has(sessionId)) return;
+		this.#reclaimQueued.add(sessionId);
+		queueMicrotask(() => {
+			this.#reclaimQueued.delete(sessionId);
+			const backoff = this.#reclaims.get(sessionId);
+			if (this.#closed || this.#pending.has(sessionId) || this.#claims.has(sessionId)) return;
+			if (backoff !== undefined && Date.now() < backoff.notBefore) return;
+			void this.#reclaim(sessionId);
+		});
 	}
 
 	/**
@@ -541,7 +564,7 @@ export class SessionClaimSet {
 	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
 		if (sessionId === undefined) return;
 		if (this.#mode === "off" || this.#claims.has(sessionId)) return;
-		this.refuseWriteIfHeld(sessionId);
+		this.refuseWriteIfRefused(sessionId);
 		// The claim for this id failed open (`none` while claiming) or failed: nothing to detect, and
 		// counting it would make every Windows or stalled-filesystem process report writes.
 		const outcome = this.#outcomes.get(sessionId)?.status;
