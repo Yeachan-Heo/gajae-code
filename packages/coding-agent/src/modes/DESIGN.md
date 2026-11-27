@@ -520,3 +520,35 @@ at `80x24/ascii-no-color`, `compact-collapsed-mixed/48x36/unicode-color`, and
 the viewport is captured once (`top`); an overflowing entry is captured at
 `top`, `middle`, and `bottom` so no tail is hidden. Every capture has
 `terminal.txt`, `terminal-ansi.txt`, `terminal.html`, and `metadata.json`.
+
+## Held-session warning and picker marker
+
+Source: `components/session-held-warning.ts` (the dialog), `components/session-selector.ts`
+(the marker), session single-owner design §3.1. This section extends the confirmation
+grammar above; it adds no tokens and no new component class (`session-held-warning.ts` is a
+factory over `HookSelectorComponent`).
+
+- **Anatomy:** a `HookSelectorComponent`, the same frame as "Resume this session?": border,
+  a bold heading `This session is open in another process`, one line naming the session by
+  its short id and the holder by its fixed phrase (`another terminal (pid N)`), one line
+  `Only one process can write a session at a time.`, then the options `Fork into a new
+  session — copy the conversation and continue there` (focused) and `Cancel`, the standard
+  dim key hint, border. At launch and in the picker, `f` and `c` are accelerators; the
+  `/resume` hook selector has none.
+- **Where it appears:** before the TUI starts (a one-shot TUI after one blank row, as the
+  picker does), appended under the `--resume` picker like the resume confirmation, and as
+  the TUI's hook selector for `/resume`. Escape is Cancel everywhere.
+- **States:** focused Fork (default); Cancel returns where the user was (exits at launch,
+  back to the list in the picker, stays in the session for `/resume`); Fork opens the copy
+  idle and a status message (at launch, a startup notice) says `Forked into a new session.
+  The original stays with <holder>.`
+- **Marker:** a session list row another process holds ends with
+  `<format.bullet> in terminal` (or `in app`, `in gjc -p`, `in session host`, `in SDK app`,
+  `in subagent`, `in use`) in `warning`. The title is truncated first so the marker stays
+  visible. The marker carries a word, not only a symbol and a color.
+- **Content safety:** only fixed copy, the holder phrase (validated surface and pid) and a
+  safe short id reach the dialog; no title, path or record text another process wrote.
+- **Responsive:** at 80 columns the heading, the options and a terminal holder's line fit; a
+  longer holder phrase (`an application using the gjc SDK (pid N)`) wraps. At 60 columns the
+  holder line and the Fork label wrap inside the frame. The copy is English only, with no CJK
+  text.

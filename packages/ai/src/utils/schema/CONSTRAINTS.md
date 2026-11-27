@@ -138,7 +138,7 @@ If any remain, schema is incompatible.
 
 ## 4) Practical provider mapping
 
-- **OpenAI-compatible strict paths** (`openai-completions`, `openai-responses`, `openai-code-responses`):
+- **OpenAI-compatible strict paths** (`openai-completions`, `openai-responses`, `openai-codex-responses`):
   - Use `adaptSchemaForStrict`.
   - Emit `strict: true` only when effective strict enforcement succeeded.
 

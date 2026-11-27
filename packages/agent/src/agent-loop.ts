@@ -837,6 +837,9 @@ function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
 }
 
 function managedRetryableFailure(failure: unknown, transaction?: ManagedAttemptTransaction): boolean {
+	// The provider already executed tool calls in this attempt; a replay would
+	// repeat their side effects, and the attempt was published live.
+	if (transaction?.providerExecuted || managedMessageHasProviderResolvedToolCall(failure)) return false;
 	const hasObservableOutput =
 		transaction?.hasObservableAssistantOutput(failure) ?? managedAssistantMessageHasContent(failure);
 	if (
@@ -1652,12 +1655,36 @@ const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
  * a per-code-point JS loop. This keeps the walk-based oracles at native
  * `JSON.stringify` cost for ordinary payloads instead of paying the slow
  * path on every streaming delta.
+ *
+ * Any other well-formed string — one with a quote, a backslash, a control
+ * character such as a newline, or a non-ASCII character, so every multi-line
+ * or non-English reply — is its UTF-8 length plus the extra bytes of each
+ * JSON escape. The length is charged first, so a string that crosses the
+ * limit by itself stops there; the escapes are then counted in one loop and
+ * charged once, instead of one charge per code point. A string with a lone
+ * surrogate keeps the per-code-point loop: JSON escapes the surrogate, UTF-8
+ * replaces it.
  */
 const MANAGED_PLAIN_ASCII = /[^\x20-\x21\x23-\x5b\x5d-\x7e]/;
 function managedChargeStringBytes(text: string, add: (bytes: number) => void): void {
 	add(1);
 	if (!MANAGED_PLAIN_ASCII.test(text)) {
 		add(text.length);
+		add(1);
+		return;
+	}
+	if (text.isWellFormed()) {
+		add(Buffer.byteLength(text, "utf8"));
+		let escapeBytes = 0;
+		for (let index = 0; index < text.length; index++) {
+			const code = text.charCodeAt(index);
+			// JSON escapes only `"`, `\` and the C0 controls; nothing above `\` is escaped.
+			if (code > 0x5c) continue;
+			// `\"`, `\\`, `\b`, `\t`, `\n`, `\f`, `\r` add one byte; every other control is `\u00XX` and adds five.
+			if (code === 0x22 || code === 0x5c) escapeBytes += 1;
+			else if (code < 0x20) escapeBytes += code >= 0x08 && code <= 0x0d && code !== 0x0b ? 1 : 5;
+		}
+		add(escapeBytes);
 		add(1);
 		return;
 	}
@@ -1783,7 +1810,7 @@ function managedJsonByteLengthWithin(value: unknown, limit: number): number | un
  * would exceed `limit` bytes WITHOUT materializing the full JSON string or
  * cloning the value. Walks the JSON surface directly and charges every
  * token, including quotes, escapes, separators, delimiters, nulls, and
- * array holes. Strings are charged by code point, so a large string never
+ * array holes. Strings are charged in place, so a large string never
  * needs a second full-size escaped copy just to measure it.
  *
  * Returns "over" when the limit would be exceeded, "under" when it
@@ -2760,9 +2787,28 @@ function isSupersededStreamingDelta(item: ManagedAttemptBatchItem): boolean {
 	return MANAGED_SUPERSEDED_DELTA_EVENT_TYPES.has(item.event.assistantMessageEvent.type);
 }
 
+/**
+ * True when the live assistant message already carries a tool call the provider
+ * executed itself (an agent-in-a-call provider such as Devin ACP). Its side
+ * effects happened outside this process, so the attempt can no longer be
+ * discarded and replayed invisibly.
+ */
+function managedMessageHasProviderResolvedToolCall(message: unknown): boolean {
+	const content = managedProperty(message, "content");
+	if (!Array.isArray(content)) return false;
+	return content.some(block => typeof block === "object" && block !== null && isProviderResolvedToolCall(block));
+}
+
 class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
 	#hasObservableAssistantOutput = false;
+	/**
+	 * Set once the provider reports a tool call it already executed. From then on
+	 * the attempt is published live instead of staged: hiding it would not undo
+	 * the side effects, a replay would repeat them, and staging an agent run that
+	 * lasts hours grows without bound.
+	 */
+	#providerExecuted = false;
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
 	/** Caps for this transaction, read once from the operator env knobs. */
@@ -2786,6 +2832,15 @@ class ManagedAttemptTransaction {
 	) {}
 
 	push(event: AgentEvent): void {
+		if (
+			!this.#committed &&
+			!this.#discarded &&
+			"message" in event &&
+			managedMessageHasProviderResolvedToolCall(event.message)
+		) {
+			this.#providerExecuted = true;
+			this.flush();
+		}
 		if (this.#committed) {
 			if (event.type === "message_end" || event.type === "turn_end") {
 				this.#retain({ type: "event", event });
@@ -2802,6 +2857,10 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
+		if (!this.#committed && !this.#discarded && managedMessageHasProviderResolvedToolCall(message)) {
+			this.#providerExecuted = true;
+			this.flush();
+		}
 		if (this.#committed) {
 			// Already published: nothing is retained, so the live pair can go
 			// straight to the consumer without a staging measurement. One
@@ -2846,10 +2905,14 @@ class ManagedAttemptTransaction {
 				// Report the POST-compaction remaining budget + 1 (a valid lower
 				// bound for the live pair's size, and arithmetically consistent
 				// with the post-compaction retained shape #overflowShape reports).
+				// Read BEFORE discard() zeroes the counters: reading after it
+				// fabricated the constant `maxStagedBytes + 1`, which made every
+				// accumulated overflow look like a single cap-sized event.
+				const incomingBytes = this.#maxStagedBytes - this.#stagedBytes + 1;
 				this.discard();
 				throw new ManagedAttemptBufferOverflowError(
 					"overflow.staged",
-					this.#overflowShape("overflow.staged", this.#maxStagedBytes - this.#stagedBytes + 1),
+					this.#overflowShape("overflow.staged", incomingBytes),
 				);
 			}
 		}
@@ -2899,6 +2962,11 @@ class ManagedAttemptTransaction {
 		});
 		this.#stagedEventCount += 1;
 		this.#stagedBytes += retainedBytes;
+	}
+
+	/** Whether the provider executed tool calls during this attempt (see `#providerExecuted`). */
+	get providerExecuted(): boolean {
+		return this.#providerExecuted;
 	}
 
 	hasObservableAssistantOutput(terminalMessage?: unknown): boolean {
@@ -3896,6 +3964,7 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the reasoning-content replay
 	// breaker below (DeepSeek "reasoning_content ... must be passed back").
 	let reasoningContentRepairAttempted = false;
+	let retriedMalformedVeniceCall = false;
 	// Consecutive resamples spent on the current turn because its tool arguments
 	// arrived `\uXXXX`-escaped. Reset once a turn gets past the check, so every
 	// turn is judged on its own wire bytes.
@@ -3934,6 +4003,14 @@ async function runLoopBody(
 			scope,
 		);
 		stream.end(newMessages);
+	};
+	const drainPublishedEvents = async (): Promise<void> => {
+		if (!config.canonicalEventAcknowledgment || !stream.hasActiveConsumer || loopSignal.aborted) return;
+		try {
+			await stream.waitForConsumerDrain(loopSignal);
+		} catch (error) {
+			if (!loopSignal.aborted) throw error;
+		}
 	};
 	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
 		for (const message of messages) {
@@ -3988,6 +4065,13 @@ async function runLoopBody(
 			// rewritten, so end the run WITHOUT the lossy agent_end finalization;
 			// the maintenance owner resumes the run on the rewritten context.
 			// "not-needed" falls through to the model call.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) {
+					finishCancelled(attemptScope);
+					return;
+				}
+			}
 			if (config.maintainContext && modelHasResponded && !loopSignal.aborted) {
 				const lifecycle = {
 					signal: loopSignal,
@@ -4034,6 +4118,14 @@ async function runLoopBody(
 				}
 			}
 
+			// Maintenance may have published its own events before the provider boundary.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+				if (loopSignal.aborted) {
+					finishCancelled(attemptScope);
+					return;
+				}
+			}
 			// Refresh prompt/tool context from live state before each model call
 			if (config.syncContextBeforeModelCall) {
 				await config.syncContextBeforeModelCall(currentContext);
@@ -4055,9 +4147,14 @@ async function runLoopBody(
 			const wasEscapedNonAsciiRecoveryAttempt = recoveryAttempt?.kind === "escaped-nonascii";
 			try {
 				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
-					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
-					escapedNonAsciiToolChoice = config.getToolChoice?.();
-					escapedNonAsciiToolChoiceCaptured = true;
+					if (!escapedNonAsciiToolChoiceCaptured) {
+						escapedNonAsciiToolChoice = config.getToolChoice?.();
+						escapedNonAsciiToolChoiceCaptured = true;
+					}
+					const effectiveChoice = escapedNonAsciiToolChoice ?? config.toolChoice;
+					if (retriedMalformedVeniceCall && (!effectiveChoice || effectiveChoice === "auto")) {
+						return "required";
+					}
 					return escapedNonAsciiToolChoice;
 				};
 				const attemptConfig = attemptTransaction
@@ -4199,6 +4296,28 @@ async function runLoopBody(
 					continue;
 				}
 			}
+			// Retry only the rejected completion, never a turn that offered a call
+			// for dispatch. Remove the rejected assistant tail before sending again.
+			if (
+				!retriedMalformedVeniceCall &&
+				!config.fallbackManaged &&
+				escapedToolTransaction &&
+				!escapedToolTransaction.committed &&
+				!escapedToolTransaction.rejected &&
+				(escapedNonAsciiToolChoice ?? config.toolChoice) !== "none" &&
+				!loopSignal.aborted &&
+				message.provider === "venice" &&
+				message.stopReason === "error" &&
+				message.errorCode === "venice_deepseek_malformed_tool_call" &&
+				!message.content.some(block => block.type === "toolCall") &&
+				currentContext.messages.at(-1) === message
+			) {
+				retriedMalformedVeniceCall = true;
+				escapedToolTransaction.discard();
+				currentContext.messages.pop();
+				continue;
+			}
+			retriedMalformedVeniceCall = false;
 			// Session-level invalid_prompt circuit breaker (bounded, neutralize-only).
 			// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is
 			// a deterministic content fault: re-sending the same history re-triggers it,
@@ -4439,6 +4558,8 @@ async function runLoopBody(
 			}
 
 			// One provider invocation is committed before any tool can run.
+			// The provider outcome decides fallback acceptance; a later consumer abort does not.
+			const providerAccepted = message.stopReason !== "error" && message.stopReason !== "aborted";
 			if (escapedToolTransaction) {
 				const acceptedMessage = escapedToolTransaction.acceptedAssistantSnapshot(message);
 				const contextIndex = currentContext.messages.lastIndexOf(message);
@@ -4453,7 +4574,11 @@ async function runLoopBody(
 				// can then abort the run before any tool execute() is entered.
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
 					if (loopSignal.aborted) message.stopReason = "aborted";
-					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
+					if (config.canonicalEventAcknowledgment) {
+						await drainPublishedEvents();
+					} else if (stream.hasActiveConsumer) {
+						await stream.waitForConsumerDrain(new AbortController().signal);
+					}
 					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
 				if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -4461,10 +4586,38 @@ async function runLoopBody(
 				}
 				escapedToolTransaction.replacePendingAssistantMessage(message);
 				escapedToolTransaction.flush();
+			} else if (attemptTransaction) {
+				// A managed attempt stages every update until it is accepted, so stream
+				// guards (TTSR, streaming edit guards) first see the updates here, after
+				// the provider already finished. Publish and drain them before the
+				// terminal message so an abort they raise still marks this message
+				// aborted and keeps its tool calls from executing, as an unmanaged
+				// stream would.
+				attemptTransaction.flushNonTerminal();
+				if (providerAccepted) {
+					// Only an acknowledging consumer is awaited, and the wait ends on abort.
+					await drainPublishedEvents();
+					if (loopSignal.aborted) {
+						message.stopReason = "aborted";
+						// The staged terminal snapshots still say the provider outcome; publish a
+						// detached aborted copy so the dispatched message stays private to the loop,
+						// keeping the markers of calls the provider already executed.
+						attemptTransaction.replacePendingAssistantMessage({
+							...structuredClone({ ...message, content: [] }),
+							content: cloneContentPreservingProviderResolved(message.content),
+						});
+					}
+				}
+				attemptTransaction.flush();
 			} else {
 				transaction?.flush();
 			}
-			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			// The accepted terminal is a distinct emission from the loop's context copy.
+			// Its consumer must finish the canonical append before tool or retry effects.
+			if (config.canonicalEventAcknowledgment) {
+				await drainPublishedEvents();
+			}
+			if (config.fallbackManaged && providerAccepted) {
 				await config.onManagedAttemptAccepted?.();
 			}
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -4661,6 +4814,13 @@ async function runLoopBody(
 				);
 				stream.end(newMessages);
 				return;
+			}
+			// Step boundary: the loop is about to call the model again for this turn,
+			// so asynchronous results queued meanwhile ride along now instead of
+			// forcing an extra iteration after the final answer.
+			if (hasMoreToolCalls && config.getStepBoundaryMessages) {
+				const boundaryMessages = config.getStepBoundaryMessages();
+				if (boundaryMessages.length > 0) pendingMessages = boundaryMessages;
 			}
 		}
 
@@ -5202,7 +5362,11 @@ async function streamAssistantResponse(
 								// tool arguments. Publication does not accept or execute tools:
 								// terminal validation and the consumer drain still precede dispatch.
 								// A published escaped call is rejected rather than silently resampled.
-								provisionalToolTransaction?.commitCallbacksAndUpdates();
+								// Venice DeepSeek can reject a text-bearing attempt at EOF. Keep it
+								// staged until that decision; the transaction's size cap still applies.
+								if (!(config.model.provider === "venice" && /deepseek/i.test(config.model.id))) {
+									provisionalToolTransaction?.commitCallbacksAndUpdates();
+								}
 							}
 							break;
 
@@ -5417,9 +5581,24 @@ async function executeToolCalls(
 		steeringCheck = (async () => {
 			const steering = await getSteeringMessages();
 			if (steering.length > 0) {
-				steeringMessages = steering;
-				interruptState.triggered = true;
-				steeringAbortController.abort();
+				// Check if all steering messages are IRC-sourced.
+				// If so, defer them to the next tool boundary instead of interrupting immediately.
+				const allIrcSourced = steering.every(msg => {
+					const ircPeer = extractIrcSourceIfPresent(msg);
+					return ircPeer !== undefined;
+				});
+
+				if (allIrcSourced && config.requeueSteeringMessages) {
+					// IRC-sourced steering: defer to next tool boundary
+					// Requeue the messages so they're processed after current tools complete
+					config.requeueSteeringMessages(steering);
+					// Don't interrupt: let tools continue and finish naturally
+				} else {
+					// Real user steering or mixed: interrupt immediately
+					steeringMessages = steering;
+					interruptState.triggered = true;
+					steeringAbortController.abort();
+				}
 			}
 		})().finally(() => {
 			steeringCheck = null;
@@ -5729,6 +5908,10 @@ async function executeToolCalls(
 						throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
 					}
 				}
+				// Non-abortable tools must also be fenced after asynchronous dispatch waits.
+				if (toolSignal?.aborted || record.skipped || interruptState.triggered) {
+					throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
+				}
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.
 				record.args = effectiveArgs;
 
@@ -5810,7 +5993,8 @@ async function executeToolCalls(
 		const interrupted = interruptState.triggered;
 		if (interrupted) {
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(), true);
+			const steeringSource = steeringMessages ? determineSteeringSource(steeringMessages) : "user";
+			emitToolResult(record, createSkippedToolResult(steeringSource), true);
 		} else {
 			emitToolResult(record, result, isError);
 		}
@@ -5838,6 +6022,8 @@ async function executeToolCalls(
 		await checkSteering();
 	};
 
+	let drainFailure: unknown;
+	let hasDrainFailure = false;
 	let lastExclusive: Promise<void> = Promise.resolve();
 	let sharedTasks: Promise<void>[] = [];
 	const tasks: Promise<void>[] = [];
@@ -5866,7 +6052,25 @@ async function executeToolCalls(
 			continue;
 		}
 		const task = start
-			.then(() => runTool(record, index))
+			.then(async () => {
+				// Exclusive and later dispatches cannot overtake an earlier published result.
+				if (config.canonicalEventAcknowledgment && stream.hasActiveConsumer && !toolSignal?.aborted) {
+					try {
+						await stream.waitForConsumerDrain(toolSignal ?? new AbortController().signal);
+					} catch (error) {
+						if (!toolSignal?.aborted) {
+							drainFailure = error;
+							hasDrainFailure = true;
+							throw error;
+						}
+					}
+				}
+				if (toolSignal?.aborted) {
+					record.skipped = true;
+					return;
+				}
+				await runTool(record, index);
+			})
 			.finally(() => {
 				if (!record.toolResultMessage) {
 					record.skipped = true;
@@ -5875,7 +6079,9 @@ async function executeToolCalls(
 						toolName: record.toolCall.name,
 						status: "skipped",
 					});
-					emitToolResult(record, createSkippedToolResult(), true);
+					const skipSource =
+						interruptState.triggered && steeringMessages ? determineSteeringSource(steeringMessages) : undefined;
+					emitToolResult(record, createSkippedToolResult(skipSource), true);
 				}
 			});
 		if (reservation?.ok) {
@@ -5897,12 +6103,17 @@ async function executeToolCalls(
 	const allTasks = Promise.allSettled(tasks);
 	if (!signal) {
 		await allTasks;
+		if (hasDrainFailure) throw drainFailure;
 	} else {
 		const abortPromise = Promise.withResolvers<boolean>();
 		const onAbort = () => abortPromise.resolve(true);
 		signal.addEventListener("abort", onAbort, { once: true });
 		try {
 			const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
+			if (!aborted) {
+				await allTasks;
+				if (hasDrainFailure) throw drainFailure;
+			}
 			if (aborted) {
 				for (const record of records) {
 					if (record.toolResultMessage) continue;
@@ -5923,7 +6134,9 @@ async function executeToolCalls(
 				toolName: record.toolCall.name,
 				status: "skipped",
 			});
-			emitToolResult(record, createSkippedToolResult(), true);
+			const skipSource =
+				interruptState.triggered && steeringMessages ? determineSteeringSource(steeringMessages) : undefined;
+			emitToolResult(record, createSkippedToolResult(skipSource), true);
 		}
 	}
 
@@ -5993,9 +6206,43 @@ function createAbortedToolResult(
 	return toolResultMessage;
 }
 
-function createSkippedToolResult(): AgentToolResult<any> {
+/**
+ * Detect if a message is an IRC-sourced custom message and extract the peer name.
+ * Returns the peer name if IRC-sourced, or undefined for user messages.
+ */
+function extractIrcSourceIfPresent(message: AgentMessage): string | undefined {
+	if (message.role !== "custom") return undefined;
+	const customMsg = message as any; // CustomMessage
+	const customType = customMsg.customType;
+	// IRC custom messages have customType starting with "irc:"
+	if (typeof customType === "string" && (customType === "irc:incoming" || customType === "irc:autoreply")) {
+		const details = customMsg.details as any;
+		if (details && typeof details.from === "string") {
+			return details.from;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Determine the source of steering messages (IRC peer name or "user").
+ * If any message in the batch is IRC-sourced, returns the peer name.
+ * Otherwise returns "user" indicating genuine user steering.
+ */
+function determineSteeringSource(messages: AgentMessage[]): string {
+	for (const msg of messages) {
+		const ircPeer = extractIrcSourceIfPresent(msg);
+		if (ircPeer) {
+			return ircPeer;
+		}
+	}
+	return "user";
+}
+
+function createSkippedToolResult(source?: string): AgentToolResult<any> {
+	const sourceLabel = source === "user" ? "user message" : `incoming IRC message from ${source}`;
 	return {
-		content: [{ type: "text", text: "Skipped due to queued user message." }],
+		content: [{ type: "text", text: `Skipped due to queued ${sourceLabel}.` }],
 		details: {},
 	};
 }

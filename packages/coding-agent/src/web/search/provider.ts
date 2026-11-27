@@ -83,6 +83,11 @@ const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
 		label: "SearXNG",
 		load: async () => new (await import("./providers/searxng")).SearXNGProvider(),
 	},
+	keenable: {
+		id: "keenable",
+		label: "Keenable",
+		load: async () => new (await import("./providers/keenable")).KeenableProvider(),
+	},
 	duckduckgo: {
 		id: "duckduckgo",
 		label: "DuckDuckGo",
@@ -134,6 +139,7 @@ export const SEARCH_PROVIDER_ORDER: SearchProviderId[] = [
 	"kagi",
 	"synthetic",
 	"searxng",
+	"keenable",
 ];
 
 const MODEL_PROVIDER_TO_SEARCH: Record<string, SearchProviderId> = {

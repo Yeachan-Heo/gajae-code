@@ -51,6 +51,11 @@ export interface HealedToolCall {
 	 */
 	readonly escapedNonAsciiArguments: boolean;
 	readonly escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
+	/**
+	 * Whether the invocation was finalized while a parameter was still open.
+	 * Incomplete calls should be rejected downstream rather than executed.
+	 */
+	readonly incomplete?: boolean;
 }
 
 /**
@@ -80,6 +85,7 @@ export class ToolCallHealer {
 	 * held back until the next chunk arrives or {@link flushPending} is
 	 * called.
 	 */
+
 	feed(text: string): string {
 		if (text.length === 0) return "";
 		this.#compact();
@@ -279,6 +285,378 @@ export class ToolCallHealer {
 		this.#pendingId = "";
 		this.#pendingArgs = "";
 	}
+}
+
+/**
+ * Upper bound for a recognized-but-unterminated DSML tag. Real tags carry only
+ * a short name plus `name="..."`/`string="..."` attributes.
+ */
+const MAX_DSML_TAG_HOLD = 512;
+
+const DSML_TAG_PREFIXES = [
+	{ prefix: "</｜DSML｜", closing: true },
+	{ prefix: "</|DSML|", closing: true },
+	{ prefix: "<｜DSML｜", closing: false },
+	{ prefix: "<|DSML|", closing: false },
+] as const;
+
+type DsmlTagKind = "invoke" | "parameter" | "wrapper" | "unknown";
+
+interface DsmlTag {
+	readonly length: number;
+	readonly kind: DsmlTagKind;
+	readonly closing: boolean;
+	readonly name?: string;
+	readonly string?: boolean;
+}
+
+/**
+ * Streaming-safe recovery for DeepSeek DSML tool-call markup leaked into
+ * `delta.content` by hosts whose server-side parser did not recognize it.
+ * One instance per stream; completed calls use deterministic per-stream IDs.
+ */
+export class DsmlToolCallHealer {
+	#buffer = "";
+	#offset = 0;
+	#inWrapper = false;
+	#inCall = false;
+	#nestingDepth = 0;
+	#inParameter = false;
+	#incomplete = false;
+	#pendingName = "";
+	#pendingInvokeString: boolean | undefined;
+	#pendingParameterName = "";
+	#pendingParameterString = true;
+	#pendingValue = "";
+	#pendingArguments: string[] = [];
+	#nextId = 1;
+	readonly #idPrefix: string;
+	readonly #stripOrphanParameterClose: boolean;
+	#literalParameterClose: string | undefined;
+	readonly #completed: HealedToolCall[] = [];
+
+	/**
+	 * `idPrefix` keeps recovered ids distinct across streams: conversation-level
+	 * consumers index tool calls by id, so two turns both starting at `dsml_1`
+	 * would overwrite each other.
+	 */
+	constructor(idPrefix = "dsml", stripOrphanParameterClose = false) {
+		this.#idPrefix = idPrefix;
+		this.#stripOrphanParameterClose = stripOrphanParameterClose;
+	}
+
+	/**
+	 * Drop whatever invocation is in progress. Used when the provider also sent a
+	 * structured call for the same chunk: the structured payload is the source of
+	 * truth, and a half-consumed invocation left active would otherwise be re-emitted
+	 * from the closing tag in a later content-only delta under a synthesized id.
+	 */
+	#abandonCall(): void {
+		this.#inCall = false;
+		this.#nestingDepth = 0;
+		this.#inParameter = false;
+		this.#incomplete = false;
+		this.#pendingName = "";
+		this.#pendingInvokeString = undefined;
+		this.#pendingParameterName = "";
+		this.#pendingParameterString = true;
+		this.#pendingValue = "";
+		this.#pendingArguments = [];
+	}
+
+	feed(text: string): string {
+		if (text.length === 0) return "";
+		this.#compact();
+		this.#buffer += text;
+		return this.#consume();
+	}
+
+	drainCompleted(): HealedToolCall[] {
+		if (this.#completed.length === 0) return [];
+		return this.#completed.splice(0, this.#completed.length);
+	}
+
+	flushPending(): string {
+		const tail = this.#remaining();
+		this.#buffer = "";
+		this.#offset = 0;
+		if (this.#inCall) return "";
+		return tail;
+	}
+
+	#remaining(): string {
+		return this.#offset === 0 ? this.#buffer : this.#buffer.slice(this.#offset);
+	}
+
+	#compact(): void {
+		if (this.#offset === 0) return;
+		this.#buffer = this.#buffer.slice(this.#offset);
+		this.#offset = 0;
+	}
+
+	#consume(): string {
+		let clean = "";
+
+		while (this.#offset < this.#buffer.length) {
+			if (this.#buffer[this.#offset] === "<") {
+				const tag = this.#parseTag();
+				if (tag === "partial") {
+					// A recognized DSML prefix may legitimately span chunks, but its tag
+					// body is short; an unterminated one must not hide the rest of the
+					// stream. Past the bound, outside an invocation the '<' is prose;
+					// inside one the call is malformed and must not execute.
+					const limit = this.#isRecognizedPrefix() ? MAX_DSML_TAG_HOLD : MAX_PARTIAL_HOLD;
+					if (this.#remaining().length <= limit) break;
+					const ch = this.#buffer[this.#offset]!;
+					this.#offset += 1;
+					if (this.#inCall) {
+						this.#incomplete = true;
+						this.#pendingValue += ch;
+					} else {
+						clean += ch;
+					}
+					continue;
+				}
+				if (tag !== undefined) {
+					// Outside the function-calls wrapper, DSML markup is prose (for example
+					// quoted by the model) and stays visible text.
+					if (!this.#inWrapper && tag.kind !== "wrapper") {
+						const rawTag = this.#buffer.slice(this.#offset, this.#offset + tag.length);
+						if (rawTag === '<｜DSML｜ invoke name="_i" string="true">') {
+							this.#literalParameterClose = "</｜DSML｜ parameter>";
+						} else if (rawTag === '<|DSML| invoke name="_i" string="true">') {
+							this.#literalParameterClose = "</|DSML| parameter>";
+						}
+						const literalClose = rawTag === this.#literalParameterClose;
+						if (literalClose) this.#literalParameterClose = undefined;
+						if (
+							literalClose ||
+							!this.#stripOrphanParameterClose ||
+							(rawTag !== "</｜DSML｜ parameter>" && rawTag !== "</|DSML| parameter>")
+						) {
+							clean += rawTag;
+						}
+						this.#offset += tag.length;
+						continue;
+					}
+					this.#offset += tag.length;
+					this.#handleTag(tag);
+					continue;
+				}
+			}
+
+			const ch = this.#buffer[this.#offset]!;
+			this.#offset += 1;
+			if (this.#inCall) {
+				this.#pendingValue += ch;
+			} else {
+				clean += ch;
+			}
+		}
+
+		return clean;
+	}
+
+	#isRecognizedPrefix(): boolean {
+		const remaining = this.#remaining();
+		return DSML_TAG_PREFIXES.some(candidate => remaining.startsWith(candidate.prefix));
+	}
+
+	/** Returns "partial" when the remaining bytes could still become a DSML tag. */
+	#parseTag(): DsmlTag | "partial" | undefined {
+		const remaining = this.#remaining();
+		let matched: (typeof DSML_TAG_PREFIXES)[number] | undefined;
+		for (const candidate of DSML_TAG_PREFIXES) {
+			if (remaining.startsWith(candidate.prefix)) {
+				matched = candidate;
+				break;
+			}
+		}
+		if (!matched) {
+			for (const candidate of DSML_TAG_PREFIXES) {
+				if (candidate.prefix.startsWith(remaining)) return "partial";
+			}
+			return undefined;
+		}
+
+		const end = remaining.indexOf(">", matched.prefix.length);
+		if (end < 0) return "partial";
+
+		const body = remaining.slice(matched.prefix.length, end).trim();
+		const length = end + 1;
+		const match = /^([A-Za-z_][\w-]*)(?:\s+([\s\S]*))?$/.exec(body);
+		if (!match) return { length, kind: "unknown", closing: matched.closing };
+
+		const tagName = match[1];
+		if (tagName === "calls" || tagName === "tool_calls") {
+			return { length, kind: "wrapper", closing: matched.closing };
+		}
+		if (tagName !== "invoke" && tagName !== "parameter") {
+			return { length, kind: "unknown", closing: matched.closing };
+		}
+		if (matched.closing) return { length, kind: tagName, closing: true };
+
+		const attributes = match[2] ?? "";
+		const stringAttribute = readDsmlAttribute(attributes, "string");
+		return {
+			length,
+			kind: tagName,
+			closing: false,
+			name: readDsmlAttribute(attributes, "name"),
+			string: stringAttribute === undefined ? undefined : stringAttribute !== "false",
+		};
+	}
+
+	#handleTag(tag: DsmlTag): void {
+		if (tag.kind === "wrapper") {
+			if (tag.closing) {
+				// Closing wrapper: finalize any pending call and reset wrapper state.
+				if (this.#inCall) {
+					// Invoke is still open when wrapper closes: mark incomplete because the
+					// invoke tag itself is not properly terminated.
+					this.#incomplete = true;
+					this.#finalizeCall();
+				}
+				this.#inWrapper = false;
+			} else {
+				// Opening wrapper inside an invocation is malformed: the altered parameter
+				// text must not execute silently. Mark incomplete but don't activate wrapper.
+				if (this.#inCall) {
+					this.#incomplete = true;
+					return;
+				}
+				// Opening wrapper: begin accepting invoke tags.
+				this.#inWrapper = true;
+			}
+			return;
+		}
+
+		if (tag.kind === "invoke") {
+			if (tag.closing) {
+				if (this.#inCall) {
+					if (this.#nestingDepth > 0) {
+						// Closing a nested invocation: decrement depth without finalizing.
+						this.#nestingDepth--;
+					} else {
+						// Closing the outermost invocation: finalize it.
+						// Parse failures and nested invocations already marked the call.
+						this.#incomplete = this.#incomplete || this.#inParameter;
+						this.#rejectUnassignedText();
+						this.#finalizeCall();
+					}
+				}
+				return;
+			}
+			// Reject nested invocations: track nesting depth and mark incomplete.
+			if (this.#inCall) {
+				this.#nestingDepth++;
+				this.#incomplete = true;
+				return;
+			}
+			this.#inCall = true;
+			this.#nestingDepth = 0;
+			this.#inParameter = false;
+			this.#pendingName = tag.name?.trim() ?? "";
+			this.#pendingInvokeString = tag.string;
+			this.#pendingParameterName = "";
+			this.#pendingParameterString = true;
+			this.#pendingValue = "";
+			this.#pendingArguments = [];
+			this.#incomplete = false;
+			return;
+		}
+
+		if (tag.kind === "unknown") {
+			// Unknown DSML markup inside an invocation would otherwise vanish and splice
+			// the surrounding argument text; the altered call must not execute.
+			if (this.#inCall) this.#incomplete = true;
+			return;
+		}
+		if (!this.#inCall) return;
+		if (!tag.closing) {
+			// A parameter opening inside another is malformed: the call must not execute.
+			if (this.#inParameter) this.#incomplete = true;
+			else this.#rejectUnassignedText();
+			this.#inParameter = true;
+			this.#pendingParameterName = tag.name ?? "";
+			this.#pendingParameterString = tag.string !== false;
+			this.#pendingValue = "";
+			return;
+		}
+
+		if (this.#inParameter) {
+			this.#addArgument(this.#pendingParameterName, this.#pendingValue, this.#pendingParameterString);
+		} else if (this.#pendingInvokeString !== undefined) {
+			// An observed Venice deviation closes the invoke's direct value as a
+			// parameter. Its invoke attributes describe that first parameter too.
+			this.#addArgument(this.#pendingName, this.#pendingValue, this.#pendingInvokeString);
+		} else {
+			// A close with no open parameter is malformed regardless of payload.
+			this.#incomplete = true;
+			this.#rejectUnassignedText();
+		}
+		this.#inParameter = false;
+		this.#pendingParameterName = "";
+		this.#pendingParameterString = true;
+		this.#pendingValue = "";
+	}
+
+	/**
+	 * Invocation text outside any parameter carries no argument slot. Dropping it
+	 * would execute the call without the input it represented, so non-whitespace
+	 * leftovers mark the call incomplete; formatting whitespace stays harmless.
+	 */
+	#rejectUnassignedText(): void {
+		if (this.#pendingValue.trim().length > 0) this.#incomplete = true;
+		this.#pendingValue = "";
+	}
+
+	#addArgument(name: string, value: string, isString: boolean): void {
+		let rawJson: string;
+		if (isString) {
+			rawJson = JSON.stringify(value);
+		} else {
+			const candidate = value.trim();
+			try {
+				parseJsonWithRepair<unknown>(candidate);
+				rawJson = candidate;
+			} catch {
+				// A JSON-typed value that does not parse is malformed, not a string.
+				this.#incomplete = true;
+				return;
+			}
+		}
+		this.#pendingArguments.push(`${JSON.stringify(name)}:${rawJson}`);
+	}
+
+	#finalizeCall(): void {
+		const rawArgs = this.#pendingArguments.length === 0 ? "{}" : `{${this.#pendingArguments.join(",")}}`;
+		const escapedUnicodeArgumentEvidence = collectUnsafeUnicodeEscapeEvidence(rawArgs);
+		const escapedNonAsciiArguments = escapedUnicodeArgumentEvidence !== undefined;
+
+		let argsJson = rawArgs;
+		try {
+			argsJson = JSON.stringify(parseJsonWithRepair<unknown>(rawArgs));
+		} catch {
+			// Leave raw; downstream parseStreamingJson absorbs the failure.
+		}
+
+		const completed: HealedToolCall = {
+			id: `${this.#idPrefix}_${this.#nextId++}`,
+			name: this.#pendingName,
+			arguments: argsJson,
+			escapedNonAsciiArguments,
+			...(this.#incomplete ? { incomplete: true } : {}),
+		};
+		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
+		this.#completed.push(completed);
+		this.#abandonCall();
+	}
+}
+
+function readDsmlAttribute(attributes: string, name: "name" | "string"): string | undefined {
+	const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(attributes);
+	return match?.[1] ?? match?.[2];
 }
 
 /**

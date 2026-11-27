@@ -1,3 +1,5 @@
+import { type SessionRecapRecord, validateSessionRecap } from "./session-recap";
+
 export type SessionListPageRecord = Record<string, unknown>;
 
 export type SessionListSavedSessionOmissionReason =
@@ -47,6 +49,41 @@ export interface SessionListSavedSessionOmission {
 	readonly detailCode?: SessionListSavedSessionOmissionDetailCode;
 	readonly candidateCount?: number;
 	readonly missingIdentityFields?: readonly ("nlink" | "ctimeNs")[];
+}
+
+/** Exact-lookup recap attached to a savedSession; same shape as the persisted-session recap record. */
+export type SessionListSavedSessionRecap = SessionRecapRecord;
+
+const SAVED_SESSION_RECAP_KEYS = [
+	"schemaVersion",
+	"source",
+	"text",
+	"sourceEntryId",
+	"requestEntryId",
+	"model",
+	"generatedAt",
+	"entryId",
+] as const;
+const SAVED_SESSION_RECAP_ENTRY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** Strictly validates a savedSession recap; returns a detached copy or undefined. Never repairs values. */
+export function sessionListSavedSessionRecap(value: unknown): SessionListSavedSessionRecap | undefined {
+	const input = record(value);
+	if (!input) return undefined;
+	const proto = Object.getPrototypeOf(input);
+	if (proto !== Object.prototype && proto !== null) return undefined;
+	const keys = Object.keys(input);
+	if (
+		keys.length !== SAVED_SESSION_RECAP_KEYS.length ||
+		!SAVED_SESSION_RECAP_KEYS.every(key => Object.hasOwn(input, key))
+	)
+		return undefined;
+	if (input.source !== "model") return undefined;
+	if (typeof input.entryId !== "string" || !SAVED_SESSION_RECAP_ENTRY_ID.test(input.entryId)) return undefined;
+	const { source: _source, entryId, ...payload } = input;
+	const recap = validateSessionRecap(payload);
+	if (!recap) return undefined;
+	return { ...recap, source: "model", entryId };
 }
 
 export type SessionListTraversalErrorKind = "malformed_page" | "repeated_cursor" | "page_budget_exceeded";

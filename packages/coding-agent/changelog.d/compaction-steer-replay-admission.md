@@ -1,0 +1,2 @@
+### Fixed
+- A message typed while auto-compaction runs before an idle prompt is now delivered after compaction ends. Before this fix it could stay forever as a `Steer:` chip. Session event subscribers inherited the admission context of the prompt that triggered compaction, so the replay was refused as same-session reentrancy whenever that prompt was still in preflight. The message was put back in the compaction queue and never retried.

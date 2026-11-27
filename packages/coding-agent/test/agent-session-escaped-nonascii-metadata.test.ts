@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -10,6 +10,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { identityConverter } from "../../agent/test/helpers";
 import { terminalOnlyStream } from "./helpers/terminal-only-stream";
 
 const QUESTION = "마지막 병목";
@@ -25,12 +26,6 @@ const usage = {
 	server: { webSearch: 2, webFetch: 1 },
 	cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
 };
-
-function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	) as Message[];
-}
 
 function turn(id: string, escaped: boolean) {
 	return {

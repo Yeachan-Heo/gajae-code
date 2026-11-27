@@ -72,4 +72,12 @@ describe("CLI root flag parity", () => {
 			fileArgs: ["prompt.md"],
 		});
 	});
+
+	it("rejects the removed --smol/--slow model-role override flags", () => {
+		for (const flag of ["--smol", "--slow"]) {
+			expect(() => parseArgs([flag, "prov/model"])).toThrow(`Unknown option: ${flag}`);
+			expect(() => parseArgs([`${flag}=prov/model`])).toThrow(`Unknown option: ${flag}`);
+			expect(ROOT_LAUNCH_FLAGS).not.toHaveProperty(flag.slice(2));
+		}
+	});
 });

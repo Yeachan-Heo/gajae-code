@@ -1,5 +1,11 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentQueuedRunStartDecision,
+	type AgentTool,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { ImageContent, SimpleStreamOptions } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
@@ -7,6 +13,122 @@ import { logger } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("preserves a real missing-model refusal when the start-decision observer throws", async () => {
+		const observerError = new Error("start observer failed");
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		let providerCalls = 0;
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const agent = new Agent({
+				initialState: { model: undefined, messages: [createAssistantMessage([])] },
+				streamFn: () => {
+					providerCalls += 1;
+					throw new Error("unexpected provider call");
+				},
+				onQueuedRunStartDecision: decision => {
+					decisions.push(decision);
+					throw observerError;
+				},
+			});
+			agent.followUp({ role: "user", content: "queued", timestamp: 1 });
+			let refusal: unknown;
+			try {
+				await agent.continue();
+			} catch (error) {
+				refusal = error;
+			}
+			expect(refusal).toBeInstanceOf(Error);
+			expect(refusal).toMatchObject({ message: "No model configured" });
+			expect(decisions).toEqual([expect.objectContaining({ disposition: "not-started", error: refusal })]);
+			expect(refusal).not.toBe(observerError);
+			expect(providerCalls).toBe(0);
+			expect(warn).toHaveBeenCalledWith("Queued run start decision callback failed", { error: observerError });
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("reports the exact consumed batch and original missing-model refusal after asynchronous promotion", async () => {
+		const promoted = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage([])] },
+			followUpMode: "all",
+			streamFn: () => {
+				providerCalls += 1;
+				throw new Error("unexpected provider call");
+			},
+			onFollowUpConsumed: async () => {
+				promoted.resolve();
+				await release.promise;
+			},
+			onQueuedRunStartDecision: decision => decisions.push(decision),
+		});
+		const first: AgentMessage = { role: "user", content: "same text", timestamp: 1 };
+		const second: AgentMessage = { role: "user", content: "same text", timestamp: 2 };
+		agent.followUp(first);
+		agent.followUp(second);
+		const continuing = agent.continue();
+		await promoted.promise;
+		expect(decisions).toEqual([]);
+		agent.setModel(undefined);
+		release.resolve();
+		let refusal: unknown;
+		try {
+			await continuing;
+		} catch (error) {
+			refusal = error;
+		}
+		if (!(refusal instanceof Error)) throw new Error("Expected queued model-guard refusal", { cause: refusal });
+		expect(decisions).toEqual([
+			{ disposition: "not-started", consumedQueuedMessages: [first, second], error: refusal },
+		]);
+		expect(decisions[0]?.consumedQueuedMessages[0]).toBe(first);
+		expect(decisions[0]?.consumedQueuedMessages[1]).toBe(second);
+		expect(providerCalls).toBe(0);
+	});
+
+	it("acceptance closes the queued failure channel even for identical post-start error text", async () => {
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage([])] },
+			onQueuedRunStartDecision: decision => decisions.push(decision),
+			streamFn: () => {
+				providerCalls += 1;
+				throw new Error("No model configured");
+			},
+		});
+		const queued: AgentMessage = { role: "user", content: "queued", timestamp: 1 };
+		agent.followUp(queued);
+		await agent.continue({ fallbackManaged: true });
+		expect(providerCalls).toBe(1);
+		expect(decisions).toEqual([{ disposition: "accepted", consumedQueuedMessages: [queued] }]);
+		await agent.prompt("unrelated", { fallbackManaged: true });
+		expect(decisions).toHaveLength(1);
+	});
+
+	it("reports positive resource-domain refusal without accepting the queued batch", async () => {
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		const agent = new Agent({
+			initialState: { messages: [createAssistantMessage([])] },
+			onQueuedRunStartDecision: decision => decisions.push(decision),
+		});
+		const queued: AgentMessage = { role: "user", content: "queued", timestamp: 1 };
+		agent.followUp(queued);
+		const open = spyOn(agent.resourceLedger, "open").mockReturnValue(undefined);
+		try {
+			await expect(agent.continue()).rejects.toThrow("Prompt resource cancellation domain is unavailable");
+			expect(decisions).toHaveLength(1);
+			expect(decisions[0]?.disposition).toBe("not-started");
+			expect(decisions[0]?.consumedQueuedMessages).toEqual([queued]);
+		} finally {
+			open.mockRestore();
+		}
+	});
+
 	it("sanitizes provider details before publishing agent_failed", async () => {
 		const secret = "provider-token=super-secret request-body-password=hunter2";
 		const agent = new Agent({
@@ -366,7 +488,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				systemPrompt: ["prompt-one"],
 				tools: [alphaTool],
 				messages: [],
@@ -426,7 +548,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				tools: [alphaTool],
 				messages: [],
 			},
@@ -474,7 +596,7 @@ describe("Agent", () => {
 
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				thinkingLevel: ThinkingLevel.Low,
 				tools: [alphaTool],
 				messages: [],
@@ -495,6 +617,231 @@ describe("Agent", () => {
 
 		const reasoningPerCall: Array<SimpleStreamOptions["reasoning"]> = mock.calls.map(call => call.options?.reasoning);
 		expect(reasoningPerCall).toEqual([ThinkingLevel.Low, ThinkingLevel.High]);
+	});
+
+	it("waits for each canonical emission but not an asynchronous observer before dispatch", async () => {
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const completion = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const observer = Promise.withResolvers<void>();
+		const dispatched: string[] = [];
+		const tool: AgentTool = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe",
+			parameters: z.object({}),
+			execute: async () => {
+				dispatched.push("tool");
+				return { content: [{ type: "text", text: "ok" }], details: {} };
+			},
+		};
+		const agent = new Agent({ initialState: { model: mock, tools: [tool] }, streamFn: mock.stream });
+		agent.subscribeCanonicalEvents(event => {
+			if (event.type === "message_end" && event.message.role === "assistant" && dispatched.length === 0) {
+				entered.resolve();
+				return completion.promise;
+			}
+		});
+		agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") return observer.promise;
+		});
+		const run = agent.prompt("run");
+		await entered.promise;
+		expect(dispatched).toEqual([]);
+		expect(mock.calls).toHaveLength(1);
+		completion.resolve();
+		await run;
+		expect(dispatched).toEqual(["tool"]);
+		expect(mock.calls).toHaveLength(2);
+		observer.resolve();
+	});
+
+	it("stops tool and provider progression when canonical publication rejects", async () => {
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] },
+				{ content: ["must not request"] },
+			],
+		});
+		const entered = Promise.withResolvers<void>();
+		const completion = Promise.withResolvers<void>();
+		let dispatches = 0;
+		const tool: AgentTool = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe",
+			parameters: z.object({}),
+			execute: async () => {
+				dispatches++;
+				return { content: [{ type: "text", text: "must not execute" }], details: {} };
+			},
+		};
+		const agent = new Agent({ initialState: { model: mock, tools: [tool] }, streamFn: mock.stream });
+		agent.subscribeCanonicalEvents(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some(block => block.type === "toolCall")
+			) {
+				entered.resolve();
+				return completion.promise;
+			}
+		});
+		const run = agent.prompt("run");
+		await entered.promise;
+		completion.reject(new Error("canonical publication refused"));
+		await run;
+		expect(dispatches).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+		expect(
+			agent.state.messages.some(
+				message =>
+					message.role === "toolResult" &&
+					message.content.some(
+						block => block.type === "text" && block.text.includes("canonical publication refused"),
+					),
+			),
+		).toBe(false);
+	});
+
+	it("logs the underlying cause when canonical publication aborts the run", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const failure = new Error("Shared session mutation requires transaction admission: append entry");
+			const mock = createMockModel({ responses: [{ content: ["must not continue"] }] });
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event =>
+				event.type === "message_end" && event.message.role === "assistant" ? Promise.reject(failure) : undefined,
+			);
+			await agent.prompt("run");
+			const call = warn.mock.calls.find(([message]) => message === "Agent run aborted with an underlying failure");
+			expect(call).toBeDefined();
+			expect(call?.[1]).toMatchObject({ code: "aborted", cause: expect.stringContaining(failure.message) });
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not log a run failure for a deliberate cancellation", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const mock = createMockModel({ responses: [{ content: ["cancelled"] }] });
+			const entered = Promise.withResolvers<void>();
+			const completion = Promise.withResolvers<void>();
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					entered.resolve();
+					return completion.promise;
+				}
+			});
+			const run = agent.prompt("run");
+			await entered.promise;
+			agent.abort();
+			completion.resolve();
+			await run;
+			const messages = warn.mock.calls.map(([message]) => message);
+			expect(messages).not.toContain("Agent run failed");
+			expect(messages).not.toContain("Agent run aborted with an underlying failure");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not report a forced abort as a run failure", async () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const mock = createMockModel({ responses: [{ content: ["forced"] }] });
+			const entered = Promise.withResolvers<void>();
+			const completion = Promise.withResolvers<void>();
+			const agent = new Agent({ initialState: { model: mock, tools: [] }, streamFn: mock.stream });
+			agent.subscribeCanonicalEvents(event => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					entered.resolve();
+					return completion.promise;
+				}
+			});
+			const run = agent.prompt("run");
+			await entered.promise;
+			agent.forceAbort("Force aborted");
+			completion.resolve();
+			await run;
+			const messages = warn.mock.calls.map(([message]) => message);
+			expect(messages).not.toContain("Agent run failed");
+			expect(messages).not.toContain("Agent run aborted with an underlying failure");
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not dispatch non-abortable tools after cancellation during canonical admission", async () => {
+		const mock = createMockModel({
+			responses: [{ content: [{ type: "toolCall", id: "one", name: "probe", arguments: {} }] }],
+		});
+		const entered = Promise.withResolvers<void>();
+		const completion = Promise.withResolvers<void>();
+		let dispatches = 0;
+		const agent = new Agent({
+			initialState: {
+				model: mock,
+				tools: [
+					{
+						name: "probe",
+						label: "Probe",
+						description: "Probe",
+						parameters: z.object({}),
+						nonAbortable: true,
+						execute: async () => {
+							dispatches++;
+							return { content: [], details: {} };
+						},
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		agent.subscribeCanonicalEvents(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				entered.resolve();
+				return completion.promise;
+			}
+		});
+		const run = agent.prompt("run");
+		await entered.promise;
+		agent.abort();
+		completion.resolve();
+		await run;
+		expect(dispatches).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("keeps unsubscribed external publication synchronous and admissions distinct for duplicate emissions", async () => {
+		const agent = new Agent();
+		const message: AgentMessage = { role: "user", content: "duplicate", timestamp: 1 };
+		const observed: AgentMessage[] = [];
+		agent.subscribe(event => {
+			if (event.type === "message_end") observed.push(event.message);
+		});
+		agent.emitExternalEvent({ type: "message_end", message });
+		expect(observed).toEqual([message]);
+		expect(agent.state.messages).toEqual([message]);
+		const completions = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		let index = 0;
+		agent.subscribeCanonicalEvents(event =>
+			event.type === "message_end" ? completions[index++].promise : undefined,
+		);
+		agent.emitExternalEvent({ type: "message_end", message });
+		agent.emitExternalEvent({ type: "message_end", message });
+		expect(index).toBe(2);
+		expect(agent.state.messages).toEqual([message, message, message]);
+		completions[0].resolve();
+		completions[1].resolve();
+		await Promise.all(completions.map(item => item.promise));
 	});
 
 	it("returns static metadata via the plain setter", () => {
@@ -561,7 +908,7 @@ describe("Agent", () => {
 			const streamFn = async () => {
 				throw Object.assign(new Error("transport failed"), { [property]: status });
 			};
-			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+			const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 			await agent.prompt("hello");
 
@@ -577,7 +924,7 @@ describe("Agent", () => {
 		const streamFn = async () => {
 			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
 		};
-		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+		const agent = new Agent({ initialState: { model: mock }, streamFn });
 
 		await agent.prompt("hello");
 

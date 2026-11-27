@@ -92,4 +92,29 @@ describe.skipIf(isWindows)("search across unrelated filesystem trees", () => {
 		// second on every supported platform.
 		expect(durationMs).toBeLessThan(5000);
 	});
+
+	it("multi-path search with generous timeout completes without hanging (issue #7892)", async () => {
+		const tools = await createTools(createTestSession(cwd));
+		const tool = tools.find(entry => entry.name === "search");
+		if (!tool) throw new Error("Missing search tool");
+
+		const start = performance.now();
+		const result = await tool.execute("search-timeout-test", {
+			pattern: "shared-needle",
+			paths: [dirA, dirB],
+			timeout: 30, // 30 seconds — well above typical grep time
+		});
+		const durationMs = performance.now() - start;
+
+		const text = getText(result);
+		const details = result.details as { fileCount?: number; matchCount?: number } | undefined;
+
+		// Verify both directories were searched and both matches were found
+		expect(text).toContain("shared-needle alpha");
+		expect(text).toContain("shared-needle beta");
+		expect(details?.fileCount).toBe(2);
+		expect(details?.matchCount).toBe(2);
+		// Should not hang; complete reasonably quickly
+		expect(durationMs).toBeLessThan(10000);
+	});
 });

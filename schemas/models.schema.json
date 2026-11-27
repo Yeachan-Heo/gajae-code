@@ -25,6 +25,10 @@
 						"type": "string",
 						"minLength": 1
 					},
+					"credential": {
+						"type": "string",
+						"const": "store"
+					},
 					"api": {
 						"type": "string",
 						"enum": [
@@ -39,7 +43,8 @@
 							"google-gemini-cli",
 							"ollama-chat",
 							"cursor-agent",
-							"devin-acp"
+							"devin-acp",
+							"kiro-codewhisperer-stream"
 						]
 					},
 					"headers": {
@@ -268,6 +273,7 @@
 									"llama.cpp",
 									"lm-studio",
 									"omlx",
+									"rapid-mlx",
 									"vllm",
 									"sglang",
 									"openai-models-list",
@@ -291,6 +297,22 @@
 							"modelsDevProvider": {
 								"type": "string",
 								"minLength": 1
+							},
+							"outputModalities": {
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
+							},
+							"inputModalities": {
+								"minItems": 1,
+								"type": "array",
+								"items": {
+									"type": "string",
+									"minLength": 1
+								}
 							}
 						},
 						"required": [
@@ -367,7 +389,8 @@
 										"google-gemini-cli",
 										"ollama-chat",
 										"cursor-agent",
-										"devin-acp"
+										"devin-acp",
+										"kiro-codewhisperer-stream"
 									]
 								},
 								"baseUrl": {

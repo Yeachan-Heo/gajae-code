@@ -8,6 +8,7 @@ import { logger } from "@gajae-code/utils";
 import type { ExtensionActions, ExtensionAPI } from "../src/extensibility/extensions/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
+import { closeSocket } from "./helpers/close-socket";
 
 /**
  * A provider failure reaches this extension as an `agent_end` carrying an error
@@ -28,15 +29,6 @@ afterEach(async () => {
 	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
 	for (const dir of dirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
-
-async function closeSocket(socket: WebSocket): Promise<void> {
-	if (socket.readyState === WebSocket.CLOSED) return;
-	const { promise, resolve } = Promise.withResolvers<void>();
-	socket.addEventListener("close", () => resolve(), { once: true });
-	socket.close();
-	await Promise.race([promise, Bun.sleep(500)]);
-}
-
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	const deadline = Date.now() + 60_000;
 	while (!predicate()) {

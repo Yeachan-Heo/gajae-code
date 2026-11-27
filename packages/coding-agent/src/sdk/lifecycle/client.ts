@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "@gajae-code/utils";
 import {
 	isValidReadinessTimeoutMs,
 	lifecycleRequestTimeoutMs,
@@ -19,10 +20,6 @@ export type ExternalSessionCreateTarget =
 	| { readonly kind: "existing_path"; readonly path: string }
 	| { readonly kind: "worktree"; readonly repo: string; readonly branch: string }
 	| { readonly kind: "plain_dir"; readonly path: string };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 const EXTERNAL_SESSION_PREFIX_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 

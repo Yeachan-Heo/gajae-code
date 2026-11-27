@@ -236,6 +236,23 @@ describe("builtin session Python tool", () => {
 		return dir.path();
 	}
 
+	function interceptTranscriptWrite(intercept: (filePath: string, write: () => Promise<void>) => Promise<void>): void {
+		const realOpen = fs.open.bind(fs);
+		vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+			const handle = await realOpen(...args);
+			const filePath = String(args[0]);
+			if (!filePath.endsWith("transcript.jsonl")) return handle;
+
+			const realWriteFile = handle.writeFile.bind(handle);
+			vi.spyOn(handle, "writeFile").mockImplementation(async (...writeArgs) => {
+				await intercept(filePath, async () => {
+					await realWriteFile(...writeArgs);
+				});
+			});
+			return handle;
+		});
+	}
+
 	afterEach(async () => {
 		for (const cleanup of sessionCleanups.splice(0)) await cleanup();
 		await pyExecutor.disposeAllKernelSessions();
@@ -379,18 +396,14 @@ describe("builtin session Python tool", () => {
 		sessionFixture = await createAgentSessionFixture({ cwd, toolRegistry: new Map([[PYTHON_TOOL_NAME, tool]]) });
 		sessionCleanups.push(sessionFixture.cleanup);
 
-		const realAppendFile = fs.appendFile.bind(fs);
-		vi.spyOn(fs, "appendFile").mockImplementation(async (filePath, data, options) => {
-			const result = await realAppendFile(filePath, data, options);
-			const targetSessionId = ([TEST_SESSION_ID, foreignSessionId] as const).find(
-				sessionId =>
-					String(filePath).startsWith(sessionIpykernelsDir(cwd, sessionId)) &&
-					String(filePath).endsWith("transcript.jsonl"),
+		interceptTranscriptWrite(async (filePath, write) => {
+			const targetSessionId = ([TEST_SESSION_ID, foreignSessionId] as const).find(sessionId =>
+				filePath.startsWith(sessionIpykernelsDir(cwd, sessionId)),
 			);
-			if (targetSessionId === undefined) return result;
+			await write();
+			if (targetSessionId === undefined) return;
 			appendStarted[targetSessionId].resolve();
 			await releaseAppend[targetSessionId].promise;
-			return result;
 		});
 
 		try {
@@ -545,17 +558,14 @@ describe("builtin session Python tool", () => {
 				},
 			});
 		});
-		const realAppendFile = fs.appendFile.bind(fs);
-		vi.spyOn(fs, "appendFile").mockImplementation(async (filePath, data, options) => {
-			const result = await realAppendFile(filePath, data, options);
-			if (
-				String(filePath).startsWith(sessionIpykernelsDir(cwdA, managerA.getSessionId())) &&
-				String(filePath).endsWith("transcript.jsonl")
-			) {
+		interceptTranscriptWrite(async (filePath, write) => {
+			if (filePath.startsWith(sessionIpykernelsDir(cwdA, managerA.getSessionId()))) {
+				await write();
 				appendStarted.resolve();
 				await releaseAppend.promise;
+				return;
 			}
-			return result;
+			await write();
 		});
 		let sessionForCleanup: PythonToolSessionFixture | undefined;
 		let executionForCleanup: Promise<AgentToolResult> | undefined;
@@ -900,9 +910,10 @@ describe("builtin session Python tool", () => {
 			options?.onKernelStart?.("k1");
 			return pythonResult({ output: "execution output" });
 		});
-		const appendSpy = vi.spyOn(fs, "appendFile").mockImplementation(async filePath => {
-			if (String(filePath).endsWith("transcript.jsonl")) throw new Error("simulated transcript disk failure");
-			return undefined;
+		let transcriptWriteAttempted = false;
+		interceptTranscriptWrite(async (_filePath, _write) => {
+			transcriptWriteAttempted = true;
+			throw new Error("simulated transcript disk failure");
 		});
 		const tool = await loadPythonTool({ cwd });
 
@@ -910,7 +921,7 @@ describe("builtin session Python tool", () => {
 		expect(result.isError).toBeUndefined();
 		expect(textOf(result)).toContain("execution output");
 		expect(textOf(result)).toContain("[transcript append failed: simulated transcript disk failure]");
-		expect(appendSpy).toHaveBeenCalled();
+		expect(transcriptWriteAttempted).toBe(true);
 	});
 
 	it("re-arms transition cleanup for each AgentSession identity and roots successor transcripts in its new session", async () => {

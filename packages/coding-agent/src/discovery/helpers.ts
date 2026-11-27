@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
+import { directoryCaseSensitive, type FileType as FileTypeEnum, type glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
@@ -12,6 +12,7 @@ import {
 	logger,
 	normalizePathForComparison,
 	parseFrontmatter,
+	pathIsWithin,
 	tryParseJson,
 } from "@gajae-code/utils";
 import type { ExtensionModule } from "../capability/extension-module";
@@ -1535,6 +1536,25 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
+/** Directory that owns a resolved project registry, or "" when there is none. */
+function projectPluginRegistryAnchor(resolvedProjectPath: string | null): string {
+	if (!resolvedProjectPath) return "";
+	return path.dirname(path.dirname(path.dirname(resolvedProjectPath)));
+}
+
+/**
+ * Ordinary loads cache by home, registry files, and project anchor. Two trees can
+ * share one canonical registry file and still need different inside-anchor results.
+ */
+function pluginRootsCacheKey(
+	canonicalHome: string,
+	gjcRegistryPath: string | undefined,
+	projectRegistryPath: string | undefined,
+	projectAnchor: string,
+): string {
+	return `${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}:${projectAnchor}`;
+}
+
 /** Invalidate the exact user/project registry pair and their resolved-root cache entry. */
 export async function invalidateClaudePluginRoots(home: string, cwd?: string, isolatedHome = false): Promise<void> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
@@ -1552,7 +1572,14 @@ export async function invalidateClaudePluginRoots(home: string, cwd?: string, is
 	])) {
 		if (registryPath) invalidateFsCache(registryPath);
 	}
-	pluginRootsCache.delete(`${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`);
+	pluginRootsCache.delete(
+		pluginRootsCacheKey(
+			canonicalHome,
+			gjcRegistryPath,
+			projectRegistryPath,
+			projectPluginRegistryAnchor(resolvedProjectPath),
+		),
+	);
 }
 
 async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
@@ -1639,6 +1666,68 @@ async function resolveIsolatedPluginPath(home: string, value: string): Promise<s
  * must reject, and reusing that result would cross the home boundary.
  */
 
+/** Reject install paths inside the registry owner's tree. Windows components use the parent directory's case rule. */
+export function projectRegistryInstallPathIsInsideAnchor(
+	projectAnchor: string,
+	installPath: string,
+	options?: { platform?: NodeJS.Platform; sensitivity?: (directory: string) => boolean },
+): boolean {
+	if (projectAnchor.trim() === "" || installPath.trim() === "") return true;
+	const platform = options?.platform ?? process.platform;
+	if (platform !== "win32") return pathIsWithin(projectAnchor, installPath);
+	const sensitivity = options?.sensitivity ?? windowsDirectoryIsCaseSensitive;
+	return win32PathIsWithin(projectAnchor, installPath, sensitivity);
+}
+
+function windowsDirectoryIsCaseSensitive(directory: string): boolean {
+	let current = directory;
+	while (true) {
+		try {
+			fs.statSync(current);
+			return directoryCaseSensitive(current) === true;
+		} catch {
+			const parent = path.win32.dirname(current);
+			if (parent === current) return false;
+			current = parent;
+		}
+	}
+}
+
+function win32PathIsWithin(root: string, candidate: string, sensitivity: (directory: string) => boolean): boolean {
+	const spell = (input: string) => {
+		const resolved = path.win32.resolve(input);
+		if (process.platform !== "win32") return resolved;
+		try {
+			return fs.realpathSync(resolved);
+		} catch {
+			return resolved;
+		}
+	};
+	const split = (input: string) => {
+		const parsed = path.win32.parse(input);
+		return {
+			volume: parsed.root,
+			parts: input
+				.slice(parsed.root.length)
+				.split(/[\\/]+/)
+				.filter(Boolean),
+		};
+	};
+	const anchor = split(spell(root));
+	const target = split(spell(candidate));
+	if (anchor.volume.toLowerCase() !== target.volume.toLowerCase()) return false;
+	for (let index = 0; index < anchor.parts.length; index++) {
+		const part = target.parts[index];
+		if (part === undefined) return false;
+		const parent = index === 0 ? anchor.volume : path.win32.join(anchor.volume, ...anchor.parts.slice(0, index));
+		const same = sensitivity(parent)
+			? anchor.parts[index] === part
+			: anchor.parts[index].toLowerCase() === part.toLowerCase();
+		if (!same) return false;
+	}
+	return true;
+}
+
 export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
@@ -1652,7 +1741,8 @@ export async function listClaudePluginRoots(
 	const projectRegistryPath = resolvedProjectPath
 		? await canonicalizePluginRegistryPath(canonicalHome, resolvedProjectPath, isolatedHome)
 		: undefined;
-	const cacheKey = `${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`;
+	const projectAnchor = projectPluginRegistryAnchor(resolvedProjectPath);
+	const cacheKey = pluginRootsCacheKey(canonicalHome, gjcRegistryPath, projectRegistryPath, projectAnchor);
 	if (!isolatedHome) {
 		const cached = pluginRootsCache.get(cacheKey);
 		if (cached) return cached;
@@ -1761,6 +1851,12 @@ export async function listClaudePluginRoots(
 							: entry.installPath;
 						if (!installPath) {
 							warnings.push(`Plugin ${pluginId} installPath escapes the isolated home`);
+							continue;
+						}
+						if (projectRegistryInstallPathIsInsideAnchor(projectAnchor, installPath)) {
+							warnings.push(
+								`Ignoring project plugin ${pluginId} installPath inside the project tree: ${installPath}`,
+							);
 							continue;
 						}
 						projectRoots.push({

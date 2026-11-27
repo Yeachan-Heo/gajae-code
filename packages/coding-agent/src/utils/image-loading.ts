@@ -2,9 +2,9 @@ import * as fs from "node:fs/promises";
 import type { ImageContent } from "@gajae-code/ai/core";
 import { formatBytes, readImageMetadata, SUPPORTED_IMAGE_MIME_TYPES } from "@gajae-code/utils";
 import { resolveReadPath } from "../tools/path-utils";
+import { MAX_IMAGE_INPUT_BYTES } from "./image-limits";
 import { formatDimensionNote, resizeImageBuffer } from "./image-resize";
 
-export const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
 export const SUPPORTED_INPUT_IMAGE_MIME_TYPES = SUPPORTED_IMAGE_MIME_TYPES;
 
 const SVG_MIME_TYPE = "image/svg+xml";

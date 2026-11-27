@@ -5,7 +5,14 @@ import { PROBE_OUTPUT_LIMIT_BYTES } from "./probe-types";
 const loaders = {
 	native: () => import("./native-probe"),
 	projection: () => import("./projection-probe"),
+	"session-owners": () => import("./session-owners-probe"),
 };
+
+async function collect(kind: DoctorProbeKind): Promise<DoctorProbeReceipt> {
+	if (kind === "native") return (await loaders.native()).collectNativeProbe();
+	if (kind === "projection") return (await loaders.projection()).collectProjectionProbe();
+	return (await loaders["session-owners"]()).collectSessionOwnersProbe();
+}
 
 /** Only the fixed product probes are executable; no caller-provided program or module path. */
 export async function runDoctorProbe(kind: DoctorProbeKind): Promise<void> {
@@ -16,16 +23,13 @@ export async function runDoctorProbe(kind: DoctorProbeKind): Promise<void> {
 	logger.setTransports({ console: false, file: false });
 	let receipt: DoctorProbeReceipt;
 	try {
-		receipt =
-			kind === "native"
-				? await (await loaders.native()).collectNativeProbe()
-				: await (await loaders.projection()).collectProjectionProbe();
+		receipt = await collect(kind);
 	} catch {
 		receipt = {
 			schemaVersion: 1,
 			kind,
 			status: "failed",
-			reasonCode: kind === "native" ? "native_load_failed" : "projection_load_failed",
+			reasonCode: `${kind.replace("-", "_")}_load_failed`,
 			checks: [],
 		};
 	}

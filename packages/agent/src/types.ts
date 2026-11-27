@@ -146,7 +146,8 @@ export interface RunResourceLedger {
 	pending(resourceRunId: string): RunResourceEntry[];
 	/** Seal a run after terminal event publication; only sealed empty runs settle. */
 	seal(resourceRunId: string): void;
-	waitForSettlement(resourceRunId: string, options: { graceMs: number }): Promise<RunSettlementProof>;
+	/** A null grace period waits for settlement or quarantine without a deadline timer. */
+	waitForSettlement(resourceRunId: string, options: { graceMs: number | null }): Promise<RunSettlementProof>;
 	/** Terminally detach a run; its bounded tombstone remains unfenced forever. */
 	quarantine(resourceRunId: string): RunResourceEntry[];
 }
@@ -237,6 +238,8 @@ export function isContinuingMidRunMaintenanceOutcome(outcome: unknown): boolean 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	/** Session policy owns context overflow; successful empty stops remain terminal. */
 	contextOverflowManaged?: boolean;
+	/** The event consumer awaits canonical message admission before requesting its next event. */
+	canonicalEventAcknowledgment?: boolean;
 	model: Model;
 	/**
 	 * Supplies a fresh opaque token at each concrete managed transport invocation.
@@ -421,6 +424,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * immediately before polling follow-up messages.
 	 */
 	onBeforeYield?: () => Promise<void> | void;
+
+	/**
+	 * Returns queued asynchronous messages (for example background job results)
+	 * to deliver at a step boundary of the current turn.
+	 *
+	 * Polled once after a completed tool step that continues the loop anyway, after
+	 * steering, abort and {@link shouldPause} have been checked, so it never adds
+	 * a model call, never interrupts running tools and never bypasses a pause.
+	 * Returned messages are added to the context before the next LLM call. Not
+	 * polled after a final answer: entries still queued then are left for
+	 * {@link onBeforeYield}.
+	 */
+	getStepBoundaryMessages?: () => AgentMessage[];
 
 	/**
 	 * Provides tool execution context, resolved per tool call.

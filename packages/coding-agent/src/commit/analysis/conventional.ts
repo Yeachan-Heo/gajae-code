@@ -51,10 +51,12 @@ export async function generateConventionalAnalysis({
 				: undefined,
 		user_context: userContext,
 		types_description: typesDescription,
-		recent_commits: recentCommits?.join("\n"),
-		scope_candidates: scopeCandidates,
-		stat,
-		diff,
+		recent_commits: recentCommits
+			?.map(subject => escapePromptMetadata(subject, { preserveNewlines: true }))
+			.join("\n"),
+		scope_candidates: escapePromptMetadata(scopeCandidates, { preserveNewlines: true }),
+		stat: escapePromptMetadata(stat, { preserveNewlines: true }),
+		diff: escapePromptMetadata(diff, { preserveNewlines: true }),
 	});
 
 	const response = await completeSimple(

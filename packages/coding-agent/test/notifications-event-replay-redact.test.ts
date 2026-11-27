@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
@@ -16,19 +17,9 @@ import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
 
 const MARKER = "PLAINTEXT_REPLAY_MARKER";
-// The session broker resolves hardware identity with ioreg, which lives in /usr/sbin.
-if (!process.env.PATH?.split(":").includes("/usr/sbin")) {
-	process.env.PATH = `${process.env.PATH ?? ""}:/usr/sbin`;
-}
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-async function waitFor(pred: () => boolean, ms: number, label: string): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await sleep(25);
-	}
-	throw new Error(`timeout waiting for ${label}`);
-}
+const waitFor = (pred: () => boolean, ms: number, label: string): Promise<void> =>
+	waitForCondition(pred, ms, { intervalMs: 25, label, sleep });
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = {

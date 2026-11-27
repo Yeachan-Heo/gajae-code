@@ -32,7 +32,7 @@ interface RunState {
 
 interface SettlementWaiter {
 	resolve: (proof: RunSettlementProof) => void;
-	timer: NodeJS.Timeout;
+	timer?: NodeJS.Timeout;
 }
 
 function copyEntries(entries: readonly RunResourceEntry[]): RunResourceEntry[] {
@@ -105,7 +105,7 @@ export function createRunResourceLedger(): RunResourceLedger {
 		const proof = settlementProof(state);
 		if (proof) {
 			for (const waiter of [...state.waiters]) {
-				clearTimeout(waiter.timer);
+				if (waiter.timer !== undefined) clearTimeout(waiter.timer);
 				state.waiters.delete(waiter);
 				waiter.resolve(
 					proof.status === "settled"
@@ -316,10 +316,9 @@ export function createRunResourceLedger(): RunResourceLedger {
 			const immediate = settlementProof(state);
 			if (immediate) return Promise.resolve(immediate);
 			const { promise, resolve } = Promise.withResolvers<RunSettlementProof>();
-			let waiter!: SettlementWaiter;
-			waiter = {
-				resolve,
-				timer: setTimeout(
+			const waiter: SettlementWaiter = { resolve };
+			if (graceMs !== null) {
+				waiter.timer = setTimeout(
 					() => {
 						state.waiters.delete(waiter);
 						const settled = settlementProof(state);
@@ -332,8 +331,8 @@ export function createRunResourceLedger(): RunResourceLedger {
 						);
 					},
 					Math.max(0, graceMs),
-				),
-			};
+				);
+			}
 			state.waiters.add(waiter);
 			return promise;
 		},

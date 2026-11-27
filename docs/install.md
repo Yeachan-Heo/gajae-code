@@ -92,6 +92,38 @@ GJC's shell tool requires a bash-compatible shell on Windows. After a binary ins
 
 Native Windows `gjc --tmux` needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux. See [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
 
+### Windows DACL and ACL requirements
+
+When `gjc update` fails with an ACL error on Windows, the executable at `%LOCALAPPDATA%\gjc\gjc.exe` has inherited or custom access control entries (ACEs) that grant write access to principals other than:
+- The current user
+- `BUILTIN\Administrators`
+- `NT AUTHORITY\SYSTEM`
+
+This can occur when `%LOCALAPPDATA%` has been granted access to a sandbox boundary (e.g. Codex CLI's `CodexSandboxUsers` group) or has non-inherited custom ACEs. GJC's update mechanism cannot proceed because the binary might be modified or replaced by an untrusted principal.
+
+To fix this:
+
+1. **Disable inheritance** on `%LOCALAPPDATA%\gjc` (the directory, not the file):
+   ```powershell
+   icacls "$env:LOCALAPPDATA\gjc" /inheritance:d
+   ```
+
+2. **Remove the offending principal** using the account name or SID shown in the error:
+   ```powershell
+   # For a named principal (e.g., "CodexSandboxUsers")
+   icacls "$env:LOCALAPPDATA\gjc" /remove "BUILTIN\CodexSandboxUsers"
+   
+   # Or use the numeric SID if the account cannot be resolved; replace the example with the SID from the error and keep the leading *
+   icacls "$env:LOCALAPPDATA\gjc" /remove "*S-1-5-21-..."
+   ```
+
+3. **Re-run the update**:
+   ```powershell
+   gjc update
+   ```
+
+If you need the inherited ACL (e.g., for your sandboxed development environment), consider granting access only at the level where it is required, or use a dedicated directory outside `%LOCALAPPDATA%` for GJC (set via `%GJC_INSTALL_DIR%` before installation).
+
 ## Shell completion
 
 GJC can generate a Fig/withfig-compatible spec for [Microsoft inshellisense](https://github.com/microsoft/inshellisense):
@@ -108,6 +140,7 @@ Interactive startup checks GitHub releases for a newer GJC version in the backgr
 
 - Standalone binary or former Bun/npm install on a supported platform → `gjc update` installs the matching GitHub release binary. Existing standalone binaries are atomically replaced. Package-manager installs migrate to a separate user binary path, even at the same version; shims are neither overwritten nor uninstalled. A target that already passes release-checksum, version, and smoke-test verification is reused without downloading the binary again (unless `--force` is set).
 - Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
+- Project dependency install (`<project>/node_modules/.bin/gjc`, including the real `.exe` that Windows dependency installs place there) → update the dependency, not the file: `gjc update` refuses with package-manager instructions because that file belongs to the project's lockfile, and replacing it fails on Windows ACLs (#6842).
 - Unsupported platform or unknown target → rerun the documented platform installer.
 
 Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
@@ -136,38 +169,9 @@ gjc --version
 
 A stale Bash command hash can retain the Bun shim even when `type -a gjc` lists the standalone binary first. Clearing that hash can activate the standalone binary without any PATH edit. Only if resolution still selects another install should you check aliases/functions and ensure the standalone directory precedes the shim directory on PATH. On PowerShell, inspect `Get-Command gjc -All` and `where.exe gjc`, and invoke the printed binary path with `& 'path/to/gjc.exe'`. No shim removal is required.
 
-## Optional macOS community app
-
-After a successful macOS binary install or update, GJC may offer:
-
-```text
-Install Gajae Code App (experimental, community-built)? [y/N]
-```
-
-The default is **No**. This optional, third-party app is experimental, separately
-licensed, and community-maintained at <https://github.com/devswha/gajae-code-app>;
-it is not an official first-party support offering. The shared installer skips
-existing verified app bundles in user-local or system Applications locations.
-Only interactive terminals are eligible: CI, pipes, automation, non-macOS hosts,
-and `gjc update --check` never prompt. Set `GJC_NO_COMMUNITY_APP=1` to suppress the
-offer for unattended or repeated installs.
-The fresh-install offer requires Bash job ownership (including macOS `/bin/sh`);
-other shells skip only the optional offer and leave the successful GJC installation intact.
-Piped installer input is preserved rather than replaced with `/dev/tty`.
-
-An accepted offer uses only a canonical published GitHub Release DMG and its
-SHA-256 checksum. If no canonical release exists, installation fails closed;
-there is no fallback to Actions artifacts, source execution, or raw builds.
-GJC verifies the bundle identity, architecture, and pinned Developer ID signature,
-copies to a writable Applications location, launches with macOS `open`, and safely
-detaches the image during cleanup. It never implicitly uses `sudo`, disables Gatekeeper, removes
-quarantine, or bypasses licensing or signature checks. App-specific failures are
-reported with the community repository URL and do not fail the successful GJC
-install or update.
-
 ## Retry configuration
 
-Provider retry budgets live in `~/.gjc/config.yml`:
+Provider retry budgets live in `~/.gjc/agent/config.yml`:
 
 ```yaml
 retry:

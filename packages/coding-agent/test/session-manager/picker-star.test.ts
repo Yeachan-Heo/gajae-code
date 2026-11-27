@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { CURRENT_SESSION_VERSION } from "../../src/sdk/session-readonly/format";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import {
-	CURRENT_SESSION_VERSION,
 	parseSessionEntries,
 	type SessionInfo,
 	SessionManager,

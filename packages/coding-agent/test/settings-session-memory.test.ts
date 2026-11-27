@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getDefaultTabWidth, onDefaultTabWidthChange, setDefaultTabWidth } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { readFile as readCachedFile } from "../src/capability/fs";
 import type { Settings as SettingsCapabilityItem } from "../src/capability/settings";
 import { Settings } from "../src/config/settings";
 import {
@@ -131,8 +132,9 @@ describe("Settings.snapshotForCwd", () => {
 			const parent = await Settings.loadReadonly({ cwd: parentCwd, agentDir });
 			expect(parent.getGlobal("ask.timeout")).toBe(30);
 			expect(parent.get("ask.timeout")).toBe(15);
-			expect(getDefaultTabWidth()).toBe(parentTabWidth);
-			observedTabWidths.length = 0;
+			expect(parent.get("display.tabWidth")).toBe(parentTabWidth);
+			expect(getDefaultTabWidth()).toBe(originalTabWidth);
+			expect(observedTabWidths).toEqual([]);
 			const changedPaths: string[] = [];
 			const unsubscribe = parent.onChanged(settingPath => changedPaths.push(settingPath));
 			try {
@@ -144,7 +146,7 @@ describe("Settings.snapshotForCwd", () => {
 				expect(parent.getCwd()).toBe(parentCwd);
 				expect(parent.get("ask.timeout")).toBe(15);
 				expect(observedTabWidths).toEqual([]);
-				expect(getDefaultTabWidth()).toBe(parentTabWidth);
+				expect(getDefaultTabWidth()).toBe(originalTabWidth);
 				expect(changedPaths).toEqual([]);
 
 				parent.override("ask.timeout", 45);
@@ -158,7 +160,7 @@ describe("Settings.snapshotForCwd", () => {
 				expect(parent.getCwd()).toBe(parentCwd);
 				expect(changedPaths).toHaveLength(changeCount);
 				expect(observedTabWidths).toEqual([]);
-				expect(getDefaultTabWidth()).toBe(parentTabWidth);
+				expect(getDefaultTabWidth()).toBe(originalTabWidth);
 			} finally {
 				unsubscribe();
 			}
@@ -194,7 +196,12 @@ describe("Settings.snapshotForCwd", () => {
 		const itemB = firstB.items.find(item => item.level === "project" && item.path === projectSettingsPath(targetB));
 		expect(itemB?.data.ask).toEqual({ timeout: 120_000 });
 
+		// Project discovery uses contained reads, which deliberately bypass the shared
+		// lexical cache. Prime that cache explicitly to exercise a genuinely stale entry.
+		const cachedSettingsA = await readCachedFile(settingsAPath);
+		expect(cachedSettingsA).toBe(JSON.stringify({ ask: { timeout: 30_000 } }));
 		await writeProjectSettings(targetA, { ask: { timeout: 60_000 } });
+		expect(await readCachedFile(settingsAPath)).toBe(cachedSettingsA);
 		const ordinaryReload = await loadCapability<SettingsCapabilityItem>("settings", {
 			cwd: targetA,
 			includeDisabledProviders: true,

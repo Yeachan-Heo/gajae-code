@@ -1,3 +1,5 @@
+import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
+
 const RELOAD_COMPONENTS = new Set(["config", "models", "skills", "extensions", "tools"]);
 const SERVICE_TIERS = new Set([
 	"none",
@@ -16,6 +18,11 @@ type Input = Record<string, unknown>;
 type SecretInputError = { code: "secret_field_forbidden"; message: string };
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 
+/** Shared conservative key classification for configuration display and patch boundaries. */
+export function isSecretConfigKey(key: string): boolean {
+	return SECRET_FIELD.test(key);
+}
+
 type UltrafastRestrictionError = { code: "ultrafast_tier_forbidden"; message: string };
 
 function containsUltrafastServiceTier(value: unknown): boolean {
@@ -28,10 +35,15 @@ function containsUltrafastServiceTier(value: unknown): boolean {
 	);
 }
 
-function containsSecretField(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsSecretField);
+/** True when a patch contains any secret-shaped key, recursively; cyclic input is safe. */
+export function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
 	if (!value || typeof value !== "object") return false;
-	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
+	if (seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
+	return Object.entries(value as Record<string, unknown>).some(
+		([key, nested]) => isSecretConfigKey(key) || containsSecretConfigKey(nested, seen),
+	);
 }
 
 /** Rejects secret-bearing and ultrafast-tier config patches from model-facing adapter inputs. */
@@ -40,7 +52,7 @@ export function validateAdapterSecretFields(
 	input: Input,
 ): SecretInputError | UltrafastRestrictionError | undefined {
 	if (operation === "config.patch") {
-		if (containsSecretField(input)) {
+		if (containsSecretConfigKey(input)) {
 			return {
 				code: "secret_field_forbidden",
 				message: "config.patch secret fields are not available through this adapter.",
@@ -73,10 +85,35 @@ function hasUsablePromptImage(value: unknown): boolean {
 	);
 }
 
+function hasValidStagedPromptImages(value: unknown): boolean {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_STAGED_PROMPT_IMAGES) return false;
+	const ids = new Set<string>();
+	return value.every(descriptor => {
+		if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) return false;
+		const image = descriptor as Record<string, unknown>;
+		if (Object.keys(image).some(key => key !== "id") || typeof image.id !== "string" || image.id.trim().length === 0)
+			return false;
+		if (ids.has(image.id)) return false;
+		ids.add(image.id);
+		return true;
+	});
+}
+
 /** Rejects instruction-bearing controls before correlation or provider work. */
 export function validateRequiredPromptText(operation: string, input: Input): AdapterValidationError | undefined {
+	if (operation === "turn.prompt" && input.stagedImages !== undefined) {
+		if (input.images !== undefined)
+			return { code: "invalid_input", message: "Direct and staged images cannot be mixed." };
+		if (!hasValidStagedPromptImages(input.stagedImages))
+			return {
+				code: "invalid_input",
+				message: `stagedImages must contain 1–${MAX_STAGED_PROMPT_IMAGES} valid image IDs.`,
+			};
+	}
 	const hasUsableImage =
-		operation === "turn.prompt" && Array.isArray(input.images) && input.images.some(hasUsablePromptImage);
+		operation === "turn.prompt" &&
+		((Array.isArray(input.images) && input.images.some(hasUsablePromptImage)) ||
+			hasValidStagedPromptImages(input.stagedImages));
 	if (
 		PROMPT_OPERATIONS.has(operation) &&
 		(typeof input.text !== "string" || (input.text.trim().length === 0 && !hasUsableImage))

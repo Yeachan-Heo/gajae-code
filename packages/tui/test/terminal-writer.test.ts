@@ -46,3 +46,50 @@ process.exit(0);
 		expect(result.stdout).toEqual(Buffer.from(payload, "utf8"));
 	});
 });
+
+describe("Windows console code page restore (#7760)", () => {
+	it("re-asserts the console code pages before every frame on Windows only", () => {
+		// The native module is replaced inside a child process only, so no other
+		// test in this process can observe the stub.
+		const writerUrl = pathToFileURL(path.join(import.meta.dir, "../src/terminal-writer.ts")).href;
+		const script = `
+const calls = [];
+Bun.plugin({
+	setup(build) {
+		build.module("@gajae-code/natives", () => ({
+			exports: { restoreConsoleCodePagesForRender: () => calls.push("restore") },
+			loader: "object",
+		}));
+	},
+});
+process.stdout.write = data => {
+	calls.push("write:" + data);
+	return true;
+};
+const { writeTerminalOutput } = await import(${JSON.stringify(writerUrl)});
+const platform = Object.getOwnPropertyDescriptor(process, "platform");
+Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+writeTerminalOutput("frame-1");
+writeTerminalOutput("frame-2");
+Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+writeTerminalOutput("frame-3");
+Object.defineProperty(process, "platform", platform);
+console.error(JSON.stringify(calls));
+`;
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, "--eval", script],
+			env: { ...process.env, NODE_ENV: "test" },
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const stderr = result.stderr.toString();
+		expect(result.exitCode, stderr).toBe(0);
+		expect(JSON.parse(stderr.trim().split("\n").at(-1) ?? "null")).toEqual([
+			"restore",
+			"write:frame-1",
+			"restore",
+			"write:frame-2",
+			"write:frame-3",
+		]);
+	});
+});

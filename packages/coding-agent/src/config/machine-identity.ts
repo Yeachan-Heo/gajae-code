@@ -35,6 +35,30 @@ export function parseMacPlatformUuid(output: string): string | undefined {
 		: undefined;
 }
 
+/**
+ * Configuration directory creation failed. Thrown when the config root directory
+ * (usually ~/.gjc) cannot be created due to filesystem permissions or other issues.
+ * The error includes an operator message explaining the failure and suggesting fixes.
+ */
+export class ConfigDirectoryError extends Error {
+	readonly code = "config_directory_io";
+	readonly errno: string | undefined;
+	readonly operatorMessage: string;
+
+	constructor(directory: string, errno: string | undefined, originalError: unknown) {
+		super(`Failed to create config directory: ${directory}`);
+		this.name = "ConfigDirectoryError";
+		this.errno = errno;
+		// Provide a path-free operator message that mentions the environment override
+		this.operatorMessage =
+			`gjc could not create or write to the configuration directory. ` +
+			`Check that your home directory is writable, or set the GJC_CONFIG_DIR environment variable ` +
+			`to override the default location. ` +
+			`Error: ${errno === "EPERM" || errno === "EACCES" ? "Permission denied" : String(errno ?? originalError)}`;
+		this.cause = originalError;
+	}
+}
+
 async function loadInstallationSecret(deps: MachineIdentityDeps): Promise<string> {
 	const directory = deps.configRootDir ?? getConfigRootDir();
 	const file = path.join(directory, "machine-identity.secret");
@@ -58,8 +82,13 @@ async function loadInstallationSecret(deps: MachineIdentityDeps): Promise<string
 			await handle.close();
 		}
 	};
-	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-	await fs.chmod(directory, 0o700);
+	try {
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		await fs.chmod(directory, 0o700);
+	} catch (error: unknown) {
+		const errno = (error as { code?: unknown } | undefined)?.code;
+		throw new ConfigDirectoryError(directory, typeof errno === "string" ? errno : undefined, error);
+	}
 	let unsettledReads = 0;
 	for (;;) {
 		try {
@@ -135,7 +164,7 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 	const runCommand =
 		deps.runCommand ??
 		((command: string, args: readonly string[]) =>
-			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore" }));
+			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore", windowsHide: true }));
 
 	let rawId: string | undefined;
 	if (platform === "linux") {
@@ -153,8 +182,12 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 		const result = runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
 		if (result.exitCode === 0) rawId = parseWindowsMachineGuid(new TextDecoder().decode(result.stdout));
 	} else if (platform === "darwin") {
-		const result = runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
-		if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
+		try {
+			const result = runCommand("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
+			if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	} else {
 		throw new Error(`machine-local identity is unsupported on ${platform}`);
 	}

@@ -912,19 +912,8 @@ describe("online-if-uncached model refresh", () => {
 			provenanceA,
 		);
 
-		const fetchControl: {
-			started: () => void;
-			resume: (value: readonly Model<Api>[] | null) => void;
-		} = {
-			started() {},
-			resume() {},
-		};
-		const fetchStartedGate = new Promise<void>(resolve => {
-			fetchControl.started = resolve;
-		});
-		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-			fetchControl.resume = resolve;
-		});
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 		const pending = resolveProviderModels<Api>(
 			{
 				providerId,
@@ -933,14 +922,14 @@ describe("online-if-uncached model refresh", () => {
 				cacheDynamicModelProvenance: provenanceA,
 				now: () => now,
 				fetchDynamicModels: async () => {
-					fetchControl.started();
-					return fetchResumeGate;
+					fetchStarted.resolve();
+					return fetchResume.promise;
 				},
 			},
 			"online",
 		);
 
-		await fetchStartedGate;
+		await fetchStarted.promise;
 		writeModelCache(
 			providerId,
 			now + 1,
@@ -951,7 +940,7 @@ describe("online-if-uncached model refresh", () => {
 			["dynamic-b"],
 			provenanceB,
 		);
-		fetchControl.resume(null);
+		fetchResume.resolve(null);
 
 		const result = await pending;
 		expect(result.models.map(entry => entry.id)).not.toContain("dynamic-b");
@@ -1151,19 +1140,8 @@ describe("online-if-uncached model refresh", () => {
 				provenanceA,
 			);
 
-			const fetchControl: {
-				started: () => void;
-				resume: (value: readonly Model<Api>[] | null) => void;
-			} = {
-				started() {},
-				resume() {},
-			};
-			const fetchStartedGate = new Promise<void>(resolve => {
-				fetchControl.started = resolve;
-			});
-			const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
-				fetchControl.resume = resolve;
-			});
+			const fetchStarted = Promise.withResolvers<void>();
+			const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
 			const pending = resolveProviderModels<Api>(
 				{
 					providerId,
@@ -1172,14 +1150,14 @@ describe("online-if-uncached model refresh", () => {
 					cacheDynamicModelProvenance: provenanceA,
 					now: () => now,
 					fetchDynamicModels: async () => {
-						fetchControl.started();
-						return fetchResumeGate;
+						fetchStarted.resolve();
+						return fetchResume.promise;
 					},
 				},
 				"online",
 			);
 
-			await fetchStartedGate;
+			await fetchStarted.promise;
 			writeModelCache(
 				providerId,
 				now + 1,
@@ -1190,7 +1168,7 @@ describe("online-if-uncached model refresh", () => {
 				inconsistentIds,
 				provenanceA,
 			);
-			fetchControl.resume(null);
+			fetchResume.resolve(null);
 
 			const result = await pending;
 			expect(result.models.map(entry => entry.id)).not.toContain("inconsistent");
@@ -1318,5 +1296,439 @@ describe("online-if-uncached model refresh", () => {
 				},
 			}),
 		);
+	});
+
+	// #7748: concurrent writer protection with provenance mismatch and models.dev
+	test("does not overwrite concurrent cache row when models.dev succeeds with provenance mismatch", async () => {
+		const providerId = "cache-provenance-mismatch-concurrent-writer";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "auth-a\u0000endpoint-a";
+		const provenanceB = "auth-b\u0000endpoint-b";
+		const modelsA = [...staticModels, model(providerId, "dynamic-a")];
+		const modelsB = [...staticModels, model(providerId, "dynamic-b")];
+
+		// Write initial cache with provenanceA
+		writeModelCache(
+			providerId,
+			now,
+			modelsA,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-a"],
+			provenanceA,
+		);
+
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
+
+		// Start a request with provenanceB that has models.dev but a pending dynamic fetch
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenanceB,
+				fetchDynamicModels: async () => {
+					fetchStarted.resolve();
+					return fetchResume.promise;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStarted.promise;
+
+		// While that request's fetch is pending, another context writes a newer row with provenanceB
+		writeModelCache(
+			providerId,
+			now + 1,
+			modelsB,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-b"],
+			provenanceB,
+		);
+
+		// Fail the dynamic fetch (as if it timed out)
+		fetchResume.resolve(null);
+
+		const result = await pending;
+
+		// Result should include models.dev since that succeeded
+		expect(result.models.map(m => m.id)).toContain("from-dev");
+
+		// The CAS will fail because the row was changed by concurrent writer (from provenanceA to provenanceB),
+		// so cacheModels is cleared. But the cache should still contain the newer row from the concurrent writer.
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		// Row should still be from concurrent writer (provenanceB with dynamic-b)
+		expect(cachedAfter?.dynamicModelProvenance).toBe(provenanceB);
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic-b");
+		// Not overwritten with stale from-dev models
+		expect(cachedAfter?.models.map(m => m.id)).not.toContain("from-dev");
+	});
+
+	// #7748: provenance mismatch should trigger cache rewrite when models.dev is fetched
+	test("updates cache when models.dev fetch succeeds despite provenance mismatch", async () => {
+		const providerId = "cache-provenance-mismatch-update";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "auth-a\u0000endpoint-a";
+		const provenanceB = "auth-b\u0000endpoint-b";
+
+		// First, write a cache row with provenanceA and an empty dynamic_model_ids
+		const cachedModels = [...staticModels, model(providerId, "old-dynamic")];
+		writeModelCache(
+			providerId,
+			now,
+			cachedModels,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			[], // dynamic_model_ids is empty
+			provenanceA, // provenance from old context
+		);
+
+		// Verify the cache row exists with the old provenance
+		const cachedBefore = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedBefore).toBeDefined();
+		expect(cachedBefore?.dynamicModelProvenance).toBe(provenanceA);
+		expect(cachedBefore?.dynamicModelIds).toEqual([]);
+
+		// Now fetch with provenanceB and models.dev results
+		const modelsDevResults = [model(providerId, "new-from-dev")];
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000,
+				// No dynamicFetcher, but with cacheDynamicModelProvenance (like anthropic)
+				cacheDynamicModelProvenance: provenanceB,
+				// Return models from models.dev
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => modelsDevResults,
+				},
+			},
+			"online",
+		);
+
+		// Verify that the result includes the models from models.dev
+		expect(result.models.map(m => m.id)).toContain("new-from-dev");
+
+		// Most importantly: verify the cache was updated with the new provenance
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now + 1000, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.dynamicModelProvenance).toBe(provenanceB); // Should be updated to new provenance
+		expect(cachedAfter?.models.map(m => m.id)).toContain("new-from-dev"); // Should contain new models
+	});
+
+	// #7748: provenance mismatch with both dynamicFetcher and modelsDev
+	test("prioritizes dynamicFetcher over models.dev but updates cache with new provenance", async () => {
+		const providerId = "cache-provenance-dynamic-and-dev";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "auth-a\u0000endpoint-a";
+		const provenanceB = "auth-b\u0000endpoint-b";
+
+		// First, write a cache row with provenanceA
+		const cachedModels = [...staticModels, model(providerId, "old-dynamic")];
+		writeModelCache(
+			providerId,
+			now,
+			cachedModels,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			[], // dynamic_model_ids is empty
+			provenanceA,
+		);
+
+		// Fetch with provenanceB, both models.dev and dynamicFetcher
+		const modelsDevResults = [model(providerId, "from-dev")];
+		const dynamicResults = [model(providerId, "from-dynamic")];
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000,
+				cacheDynamicModelProvenance: provenanceB,
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => modelsDevResults,
+				},
+				fetchDynamicModels: async () => dynamicResults,
+			},
+			"online",
+		);
+
+		// Should include both models.dev and dynamic models
+		expect(result.models.map(m => m.id)).toContain("from-dev");
+		expect(result.models.map(m => m.id)).toContain("from-dynamic");
+
+		// Cache should be updated with new provenance
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now + 1000, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.dynamicModelProvenance).toBe(provenanceB);
+		expect(cachedAfter?.dynamicModelIds).toEqual(["from-dynamic"]); // Dynamic IDs should be recorded
+		expect(cachedAfter?.models.map(m => m.id)).toContain("from-dynamic");
+		expect(cachedAfter?.models.map(m => m.id)).toContain("from-dev");
+	});
+
+	// #7748: authority-only concurrent update with identical models/IDs/provenance
+	test("does not overwrite concurrent authoritative flag change with identical content", async () => {
+		const providerId = "cache-authority-only-update";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "auth\u0000endpoint";
+		const modelsWithDynamic = [...staticModels, model(providerId, "dynamic")];
+
+		// Seed: row with identical content but authoritative=false
+		writeModelCache(
+			providerId,
+			now,
+			modelsWithDynamic,
+			false, // not authoritative
+			fingerprint(staticModels),
+			cacheDbPath,
+			[], // empty IDs
+			provenance,
+		);
+
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
+
+		// Request with matching provenance, gated dynamic fetch
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					fetchStarted.resolve();
+					return fetchResume.promise;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStarted.promise;
+
+		// While pending, concurrent writer updates ONLY authoritative flag (same timestamp, same models, same IDs)
+		writeModelCache(
+			providerId,
+			now, // same timestamp
+			modelsWithDynamic, // identical models
+			true, // authority changed: false -> true (this is the only change)
+			fingerprint(staticModels), // same fingerprint
+			cacheDbPath,
+			[], // same empty IDs
+			provenance, // same provenance
+		);
+
+		// Fetch fails
+		fetchResume.resolve(null);
+
+		const result = await pending;
+
+		// Should return models.dev
+		expect(result.models.map(m => m.id)).toContain("from-dev");
+
+		// Cache should still have concurrent writer's authoritative flag=true (only change)
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.authoritative).toBe(true); // From concurrent writer, should be preserved
+		expect(cachedAfter?.dynamicModelIds).toEqual([]); // Same as before
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic"); // Same as before
+	});
+
+	// #7748: metadata-only concurrent update (IDs changed) with same models
+	test("does not overwrite concurrent IDs update with identical models and authority", async () => {
+		const providerId = "cache-ids-only-update";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "auth\u0000endpoint";
+		const modelsWithDynamic = [...staticModels, model(providerId, "dynamic")];
+
+		// Seed: row with models but IDs=[]
+		writeModelCache(
+			providerId,
+			now,
+			modelsWithDynamic,
+			false,
+			fingerprint(staticModels),
+			cacheDbPath,
+			[], // empty IDs
+			provenance,
+		);
+
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
+
+		// Request with matching provenance
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					fetchStarted.resolve();
+					return fetchResume.promise;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStarted.promise;
+
+		// While pending, concurrent writer updates ONLY IDs (same timestamp, same models, same authority)
+		writeModelCache(
+			providerId,
+			now, // same timestamp
+			modelsWithDynamic, // same models
+			false, // same authority
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic"], // IDs changed: [] -> ["dynamic"]
+			provenance, // same provenance
+		);
+
+		// Fetch fails
+		fetchResume.resolve(null);
+
+		const result = await pending;
+
+		// Should return models.dev
+		expect(result.models.map(m => m.id)).toContain("from-dev");
+
+		// Cache should still have concurrent writer's IDs
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.dynamicModelIds).toEqual(["dynamic"]); // From concurrent writer
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic"); // Same models preserved
+	});
+
+	// #7748: cold-start race - concurrent insert while models.dev is pending
+	test("does not overwrite concurrent insert when starting from empty cache with models.dev", async () => {
+		const providerId = "cache-cold-start-concurrent-insert";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "auth-a\u0000endpoint-a";
+		const provenanceB = "auth-b\u0000endpoint-b";
+		const modelsB = [...staticModels, model(providerId, "dynamic-b")];
+
+		// Start with no cache row
+		const fetchStarted = Promise.withResolvers<void>();
+		const fetchResume = Promise.withResolvers<readonly Model<Api>[] | null>();
+
+		// Request A starts with provenanceA, no initial cache
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenanceA,
+				fetchDynamicModels: async () => {
+					fetchStarted.resolve();
+					return fetchResume.promise;
+				},
+				modelsDev: {
+					fetch: async () => ({}),
+					map: () => [model(providerId, "from-dev-a")],
+				},
+			},
+			"online",
+		);
+
+		await fetchStarted.promise;
+
+		// While A's fetch is pending, request B (different context) inserts a row with provenanceB
+		writeModelCache(
+			providerId,
+			now + 1,
+			modelsB,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-b"],
+			provenanceB,
+		);
+
+		// A's dynamic fetch fails
+		fetchResume.resolve(null);
+
+		const result = await pending;
+
+		// A should return models.dev since that succeeded
+		expect(result.models.map(m => m.id)).toContain("from-dev-a");
+
+		// But cache should still be B's row, not overwritten by A's non-authoritative data
+		const cachedAfter = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath);
+		expect(cachedAfter).toBeDefined();
+		expect(cachedAfter?.dynamicModelProvenance).toBe(provenanceB);
+		expect(cachedAfter?.models.map(m => m.id)).toContain("dynamic-b");
+		// Not overwritten with A's models.dev
+		expect(cachedAfter?.models.map(m => m.id)).not.toContain("from-dev-a");
+	});
+
+	// #7748: test error handling when models.dev fetch fails with provenance mismatch
+	test("preserves static models when models.dev fetch fails despite provenance mismatch", async () => {
+		const providerId = "cache-provenance-dev-fetch-fails";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "auth-a\u0000endpoint-a";
+		const provenanceB = "auth-b\u0000endpoint-b";
+
+		// Write a cache row with provenanceA
+		const cachedModels = [...staticModels, model(providerId, "old-model")];
+		writeModelCache(providerId, now, cachedModels, true, fingerprint(staticModels), cacheDbPath, [], provenanceA);
+
+		// Fetch with provenanceB, but models.dev fails
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000,
+				cacheDynamicModelProvenance: provenanceB,
+				modelsDev: {
+					fetch: async () => {
+						throw new Error("models.dev fetch failed");
+					},
+					map: () => [],
+				},
+			},
+			"online",
+		);
+
+		// Should at least have static models
+		expect(result.models.map(m => m.id)).toContain("static");
+		// Old cached model should not be served due to provenance mismatch
+		expect(result.models.map(m => m.id)).not.toContain("old-model");
+		// With no dynamicFetcher and failed models.dev, we still have static models
+		expect(result.models.length).toBeGreaterThanOrEqual(1);
 	});
 });

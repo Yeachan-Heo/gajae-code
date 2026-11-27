@@ -16,6 +16,7 @@ import {
 	resolveSdkPromptMaxRuntimeMs,
 	SETTINGS_SCHEMA,
 } from "@gajae-code/coding-agent/config/settings-schema";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import type { ExtensionAPI, ExtensionContext, ExtensionEvent } from "../src/extensibility/extensions";
 import type { ExtensionActions } from "../src/extensibility/extensions/types";
 import { createNotificationsExtension } from "../src/sdk/bus";
@@ -171,13 +172,8 @@ function armedLeaseMs(delayMs: number): number {
 /** Captured before any spy so re-entry always reaches the real timer. */
 const realSetTimeout = globalThis.setTimeout;
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(10);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10, label });
 
 /**
  * Record every deadline-sized arm scheduled while `body` runs, then restore the

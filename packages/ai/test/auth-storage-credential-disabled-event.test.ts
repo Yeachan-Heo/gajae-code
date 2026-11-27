@@ -47,7 +47,8 @@ class MemoryAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	deleteAuthCredential(id: number, disabledCause: string): void {
-		const row = this.#rows.find(entry => entry.id === id);
+		// Matches the SQLite store: an already-disabled row keeps its first cause.
+		const row = this.#rows.find(entry => entry.id === id && entry.disabledCause === null);
 		if (row) row.disabledCause = disabledCause;
 	}
 

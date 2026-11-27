@@ -60,7 +60,7 @@ describe("BtwPanelComponent retained rendering", () => {
 		const panel = new BtwPanelComponent({ question: "Only?", tui });
 		panel.setAnswer("Done");
 		panel.markComplete();
-		expect(renderTree(panel)).toContain("Type a follow-up · Esc return to main chat");
+		expect(renderTree(panel)).toContain("Type a follow-up · /btw-handoff send to main · Esc return to main chat");
 
 		panel.close();
 		panel.appendText("should be ignored");

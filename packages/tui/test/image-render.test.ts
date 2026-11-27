@@ -386,8 +386,9 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		// Property-style sweep: the per-frame budget depends on the header length, so
 		// chunk boundaries must stay valid for every payload size, not just the one
 		// fixed example above.
+		// Payloads are standard base64: the encoder rejects anything outside RFC 4648.
 		for (let length = 1; length <= 12_000; length = length < 64 ? length + 1 : Math.ceil(length * 1.7)) {
-			const payload = "AB".repeat(Math.ceil(length / 2)).slice(0, length);
+			const payload = Buffer.from(new Uint8Array(length)).toString("base64");
 			const chunks = encodeKittyTransmit(payload, 42).split("\x1b\\").filter(Boolean);
 			const data = chunks.map(chunk => chunk.slice(chunk.indexOf(";") + 1));
 			expect(data.join("")).toBe(payload);
@@ -414,7 +415,7 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		// may carry the header, and every continuation frame must be a 4-byte quantum.
 		for (const header of ["a=t", "a=t,f=100,q=2,i=42", "a=t,f=100,q=2,i=42,c=80,r=24,C=1,Y=12", "i=1"]) {
 			for (let length = 1; length <= 9_000; length = length < 32 ? length + 1 : Math.ceil(length * 2.3)) {
-				const payload = "AB".repeat(Math.ceil(length / 2)).slice(0, length);
+				const payload = Buffer.from(new Uint8Array(length)).toString("base64");
 				const chunks = encodeKittyTransmission(header, payload).split("\x1b\\").filter(Boolean);
 				const data = chunks.map(chunk => chunk.slice(chunk.indexOf(";") + 1));
 				expect(data.join(""), `${header}/${length}`).toBe(payload);

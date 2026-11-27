@@ -1,5 +1,8 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
+import { GJC_DIR } from "./session-layout";
 
 export {
 	assertGjcTmuxMutationAuthoritySync,
@@ -32,6 +35,24 @@ export const GJC_TMUX_OWNER_SERVER_KEY_OPTION = "@gjc-owner-server-key";
 
 export const GJC_TMUX_VERSION_OPTION = "@gjc-version";
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
+
+/**
+ * tmux lets a client write UTF-8 only when it was started with `-u`, runs inside tmux
+ * (`$TMUX`), or the first set of LC_ALL/LC_CTYPE/LANG names UTF-8. Any other client gets
+ * every byte outside printable ASCII replaced with `_`, including tab separators and
+ * non-ASCII names and paths in parsed replies. A detached Broker or harness start inherits
+ * its launcher's locale, and launchd or a service manager provides none, so the managed-session
+ * clients and the harness owner's private-socket clients request UTF-8 output instead of
+ * depending on the caller's environment. The flag precedes the subcommand, so the Linux
+ * owner-isolation server proof inherits it from the new-session control prefix. psmux has its
+ * own client flags and never receives it. Interactive attach is deliberately excluded: its
+ * output goes to the user's terminal, whose locale is authoritative.
+ */
+const NATIVE_TMUX_UTF8_CLIENT_FLAG = "-u";
+
+export function tmuxClientFlags(isPsmux: boolean): string[] {
+	return isPsmux ? [] : [NATIVE_TMUX_UTF8_CLIENT_FLAG];
+}
 
 export interface GjcTmuxProfileCommand {
 	description: string;
@@ -312,4 +333,29 @@ export function normalizeTmuxCreatedAt(raw: string): string {
 	const seconds = Number.parseInt(raw, 10);
 	if (!Number.isFinite(seconds) || seconds <= 0) return raw;
 	return new Date(seconds * 1000).toISOString();
+}
+
+/**
+ * A derived managed state file named through its canonical trusted anchor: the
+ * workspace, or its `.gjc` directory when that exists, is resolved once so a
+ * workspace or `.gjc` reached through a symlink has one spelling that lifecycle
+ * preparation, verification, supervision and admission all share. The private
+ * `_session-*` tail below `.gjc` stays lexical, so a link inside managed storage
+ * still fails the no-follow verification. A path outside `<cwd>/.gjc` or an
+ * unresolvable anchor is returned unchanged and fails closed later.
+ */
+export function canonicalManagedStateFile(cwd: string, file: string): string {
+	const lexicalAnchor = path.join(path.resolve(cwd), GJC_DIR);
+	const tail = path.relative(lexicalAnchor, path.resolve(file));
+	if (tail === "" || tail.startsWith("..") || path.isAbsolute(tail)) return file;
+	try {
+		return path.join(fs.realpathSync.native(lexicalAnchor), tail);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return file;
+	}
+	try {
+		return path.join(fs.realpathSync.native(path.resolve(cwd)), GJC_DIR, tail);
+	} catch {
+		return file;
+	}
 }

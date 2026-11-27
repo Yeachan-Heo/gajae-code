@@ -331,6 +331,7 @@ export class ExtensionRunner {
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
+	#getSdkClientControlOperationsFn: ExtensionContextActions["getSdkClientControlOperations"] = undefined;
 	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
 	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
 
@@ -489,6 +490,7 @@ export class ExtensionRunner {
 		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#onSessionEventFn = contextActions.onSessionEvent;
 		this.#sdkControlFn = contextActions.sdkControl;
+		this.#getSdkClientControlOperationsFn = contextActions.getSdkClientControlOperations;
 		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
 		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
 
@@ -551,6 +553,11 @@ export class ExtensionRunner {
 
 	getUIContext(): ExtensionUIContext {
 		return this.#uiContext;
+	}
+
+	/** Bind fresh UI for future contexts without rerunning initialization or changing captured contexts. */
+	setUIContext(uiContext: ExtensionUIContext): void {
+		this.#uiContext = uiContext;
 	}
 
 	hasUI(): boolean {
@@ -837,7 +844,7 @@ export class ExtensionRunner {
 				(await this.#setDefaultModelProfileFn?.(name, options)) ?? { changed: false, id: name },
 			getActiveModelProfile: () => this.#getActiveModelProfileFn?.(),
 			withSdkControlMutation: body => this.#withSdkControlMutationFn?.(body) ?? body(),
-			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
+			cycleThinkingLevel: async () => await this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
 			invokeSkill: async (name, args, options) => await this.#invokeSkillFn?.(name, args, options),
 
@@ -856,6 +863,9 @@ export class ExtensionRunner {
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
+			...(this.#getSdkClientControlOperationsFn
+				? { getSdkClientControlOperations: this.#getSdkClientControlOperationsFn }
+				: {}),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),
 			sdkBindings: () => [
@@ -875,6 +885,7 @@ export class ExtensionRunner {
 				...(this.#getProjectProgressFn ? ["getProjectProgress"] : []),
 				...(this.#onJobFoldFn ? ["onJobFold"] : []),
 				...(this.#sdkControlFn ? ["sdkControl"] : []),
+				...(this.#setSdkPermissionProviderFn ? ["setSdkPermissionProvider"] : []),
 				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
 				...(this.#setPlanModeFn ? ["setPlanMode"] : []),
 				...(this.#operateGoalFn ? ["operateGoal"] : []),

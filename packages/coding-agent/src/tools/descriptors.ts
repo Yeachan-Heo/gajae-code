@@ -18,7 +18,7 @@ import {
 	taskParametersForSession,
 } from "./session-descriptions";
 import { TOOL_CATALOG, type ToolCatalogEntry } from "./tool-catalog.generated";
-import { ToolError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 
 export interface ToolDescriptorMetadata {
 	readonly name: string;
@@ -160,6 +160,16 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	 */
 	readonly materialize = async (): Promise<AgentTool<any, any, any>> => await this.#get();
 
+	/**
+	 * The implementation a facade dispatches to, loaded if needed; any other value
+	 * is returned unchanged. The private brand decides what a facade is, so a
+	 * look-alike cannot name an implementation it does not run, which the
+	 * overridable `materialize` property could.
+	 */
+	static async implementationOf(tool: unknown): Promise<unknown> {
+		return typeof tool === "object" && tool !== null && #loadGeneration in tool ? await tool.#get() : tool;
+	}
+
 	get name(): string {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
 	}
@@ -262,6 +272,9 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 
 	readonly execute: AgentTool<any, any, any>["execute"] = async (...args) => {
 		const tool = await this.#get();
+		// Lazy loading can await; a call cancelled meanwhile must not start the tool.
+		const signal = args[2];
+		if (signal?.aborted) throw new ToolAbortError();
 		return tool.execute.call(tool, ...args);
 	};
 }
@@ -303,6 +316,7 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "lsp") return (context.enableLsp ?? true) && Boolean(session.settings.get("lsp.enabled"));
 	if (name === "eval") return context.allowEval ?? true;
 	if (name === "debug") return Boolean(session.settings.get("debug.enabled"));
+	if (name === "report_metric") return context.includeYield === true;
 	if (name === "todo_write") return !context.includeYield && Boolean(session.settings.get("todo.enabled"));
 	if (name === "find") return Boolean(session.settings.get("find.enabled"));
 	if (name === "search") return Boolean(session.settings.get("search.enabled"));
@@ -434,6 +448,8 @@ const loaders: Record<string, Loader> = {
 		cached("report_issue", () => import("./report-issue")).then(module => new module.ReportIssueTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
+	report_metric: _session =>
+		cached("report_metric", () => import("./report-metric")).then(module => module.reportMetricTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
 };
 
@@ -587,7 +603,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = Object.f
 	builtins.map(descriptorValue => [descriptorValue.metadata.name, descriptorValue]),
 );
 
-const hidden = ["yield", "report_finding", "resolve"].map(name =>
+const hidden = ["yield", "report_finding", "report_metric", "resolve"].map(name =>
 	descriptor({ name, label: name, hidden: true, strict: true, loader: loaders[name] }),
 );
 

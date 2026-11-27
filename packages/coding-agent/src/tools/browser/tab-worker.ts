@@ -3,7 +3,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { untilAborted } from "@gajae-code/utils/abortable";
-import { Snowflake } from "@gajae-code/utils/snowflake";
 import type { HTMLElement } from "linkedom";
 import type {
 	Browser,
@@ -412,6 +411,31 @@ interface ActiveRun {
 	displays: RunResultOk["displays"];
 	screenshots: ScreenshotResult[];
 	pendingTools: Map<string, { resolve(value: unknown): void; reject(error: Error): void }>;
+}
+
+async function writePrivateScreenshot(bytes: Uint8Array): Promise<string> {
+	// Random directory plus an exclusive create: a preexisting symlink under the
+	// shared temp directory is not opened, and the screenshot is not left world-readable.
+	// Create the temp root first: base created it with a recursive mkdir, and
+	// mkdtemp fails when that root does not exist yet. Do not change the root's mode.
+	const root = os.tmpdir();
+	await fs.promises.mkdir(root, { recursive: true });
+	const tempDir = await fs.promises.mkdtemp(path.join(root, "gjc-sshots-"));
+	try {
+		if (process.platform !== "win32") await fs.promises.chmod(tempDir, 0o700);
+		const dest = path.join(tempDir, "screenshot.png");
+		const handle = await fs.promises.open(dest, "wx", 0o600);
+		try {
+			await handle.writeFile(bytes);
+		} finally {
+			await handle.close();
+		}
+		if (process.platform !== "win32") await fs.promises.chmod(dest, 0o600);
+		return dest;
+	} catch (error) {
+		await fs.promises.rm(tempDir, { recursive: true, force: true });
+		throw error;
+	}
 }
 
 export class WorkerCore {
@@ -852,20 +876,22 @@ export class WorkerCore {
 			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70 },
 		);
 		const explicitPath = opts.save ? resolveTabWorkerPath(opts.save, session.cwd) : undefined;
-
-		const dest =
-			explicitPath ??
-			(session.browserScreenshotDir
-				? path.join(
-						session.browserScreenshotDir,
-						`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.png`,
-					)
-				: path.join(os.tmpdir(), `gjc-sshots-${Snowflake.next()}.png`));
-		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-		const saveFullRes = !!(explicitPath || session.browserScreenshotDir);
+		const configuredDir = session.browserScreenshotDir;
+		const saveFullRes = !!(explicitPath || configuredDir);
 		const savedBuffer = saveFullRes ? buffer : resized.buffer;
 		const savedMimeType = saveFullRes ? "image/png" : resized.mimeType;
-		await Bun.write(dest, savedBuffer);
+		// Caller-chosen destinations stay as they were. Only the shared temp
+		// fallback is an exclusive private file: a preexisting symlink at the old
+		// predictable name is not opened, and the bytes are not left world-readable.
+		const dest = explicitPath
+			? explicitPath
+			: configuredDir
+				? path.join(configuredDir, `screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.png`)
+				: await writePrivateScreenshot(savedBuffer);
+		if (explicitPath || configuredDir) {
+			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+			await Bun.write(dest, savedBuffer);
+		}
 		const info: ScreenshotResult = {
 			dest,
 			mimeType: savedMimeType,

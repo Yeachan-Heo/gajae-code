@@ -22,7 +22,9 @@ plan to that read-only report without performing it.
 
 Check groups: `runtime`, `config`, `permissions`, `installation`, `link`,
 `credentials`, `mcp`, `service`, `plugin`, plus the internal diagnostic probes
-`native` and `projection`, which report state but have no repair action. A
+`native`, `projection` and `session` (session ownership: held claims whose holder
+is gone, and the sidecar count, a warning only above 100,000 because sidecar pruning is not
+implemented yet and the sidecars are harmless), which report state but have no repair action. A
 specific check id from the report also works as a selector
 (`--check config.user.skills.enabled`); an id that does not exist is a usage
 error.

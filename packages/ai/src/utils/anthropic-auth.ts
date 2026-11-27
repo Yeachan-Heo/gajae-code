@@ -8,10 +8,10 @@
  * `authStorage.getApiKey("anthropic", sessionId)` first, then pass the result
  * through {@link buildAnthropicAuthConfig} for header/URL shaping.
  */
-import { $credentialEnv } from "@gajae-code/utils";
+import { assertEndpointConfiguration, type EndpointConfiguration, readEndpointConfiguration } from "@gajae-code/utils";
 import {
+	buildAnthropicMessagesUrl,
 	buildAnthropicHeaders as buildProviderAnthropicHeaders,
-	normalizeAnthropicBaseUrl,
 } from "../providers/anthropic";
 import { isFoundryEnabled } from "./foundry";
 
@@ -26,7 +26,15 @@ const DEFAULT_BASE_URL = "https://api.anthropic.com";
 
 function normalizeBaseUrl(baseUrl: string | undefined): string | undefined {
 	const trimmed = baseUrl?.trim();
-	return trimmed ? trimmed.replace(/\/+$/, "") : undefined;
+	if (!trimmed) {
+		return undefined;
+	}
+	// Trim slashes from the path only: a slash inside a signed query is data.
+	const suffixStart = trimmed.search(/[?#]/);
+	if (suffixStart === -1) {
+		return trimmed.replace(/\/+$/, "");
+	}
+	return `${trimmed.slice(0, suffixStart).replace(/\/+$/, "")}${trimmed.slice(suffixStart)}`;
 }
 
 /**
@@ -37,12 +45,12 @@ function normalizeBaseUrl(baseUrl: string | undefined): string | undefined {
  * authenticated traffic. `$env` merges the caller's `cwd/.env`, so reading it
  * there would let repository content choose where credentials are sent.
  */
-export function resolveAnthropicBaseUrlFromEnv(): string | undefined {
-	if (isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
+export function resolveAnthropicBaseUrlFromEnv(endpointConfiguration?: EndpointConfiguration): string | undefined {
+	if (isFoundryEnabled(endpointConfiguration)) {
+		const foundryBaseUrl = normalizeBaseUrl(readEndpointConfiguration(endpointConfiguration, "FOUNDRY_BASE_URL"));
 		if (foundryBaseUrl) return foundryBaseUrl;
 	}
-	const anthropicBaseUrl = normalizeBaseUrl($credentialEnv("ANTHROPIC_BASE_URL"));
+	const anthropicBaseUrl = normalizeBaseUrl(readEndpointConfiguration(endpointConfiguration, "ANTHROPIC_BASE_URL"));
 	return anthropicBaseUrl || undefined;
 }
 
@@ -64,10 +72,15 @@ export function isOAuthToken(apiKey: string): boolean {
  * `isOAuth` is derived from the token prefix so the helper stays pure: callers
  * never have to thread the OAuth flag through their own resolution logic.
  */
-export function buildAnthropicAuthConfig(apiKey: string, baseUrl?: string): AnthropicAuthConfig {
+export function buildAnthropicAuthConfig(
+	apiKey: string,
+	baseUrl?: string,
+	endpointConfiguration?: EndpointConfiguration,
+): AnthropicAuthConfig {
+	assertEndpointConfiguration(endpointConfiguration);
 	return {
 		apiKey,
-		baseUrl: normalizeBaseUrl(baseUrl) ?? resolveAnthropicBaseUrlFromEnv() ?? DEFAULT_BASE_URL,
+		baseUrl: normalizeBaseUrl(baseUrl) ?? resolveAnthropicBaseUrlFromEnv(endpointConfiguration) ?? DEFAULT_BASE_URL,
 		isOAuth: isOAuthToken(apiKey),
 	};
 }
@@ -89,7 +102,5 @@ export function buildAnthropicSearchHeaders(auth: AnthropicAuthConfig): Record<s
  * Builds the full API URL for Anthropic messages endpoint.
  */
 export function buildAnthropicUrl(auth: AnthropicAuthConfig): string {
-	const normalizedBaseUrl = normalizeAnthropicBaseUrl(auth.baseUrl);
-	const base = `${normalizedBaseUrl}/v1/messages`;
-	return `${base}?beta=true`;
+	return buildAnthropicMessagesUrl(auth.baseUrl, "beta=true");
 }

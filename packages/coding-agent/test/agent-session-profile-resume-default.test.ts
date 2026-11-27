@@ -262,7 +262,7 @@ describe("AgentSession profile resume defaults", () => {
 
 		// Role-only selection (selector-controller non-default role path).
 		session.markUserModelSelection();
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: new Map([["executor", roleSelector]]),
@@ -311,7 +311,7 @@ describe("AgentSession profile resume defaults", () => {
 		});
 		session.setConfiguredModelChain("default", [baseSelector], "startup-override", undefined, true);
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: new Map([["executor", `${profileMain.provider}/${profileMain.id}`]]),

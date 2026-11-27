@@ -14,25 +14,23 @@ The canonical runtime behavior is described here; the field-by-field model refer
 ```yaml
 providers:
   my-local:
-    name: My Local Runtime
     baseUrl: http://127.0.0.1:8000/v1
     api: openai-completions
     auth: none
     models:
-      my-model:
+      - id: my-model
         name: My Model
         contextWindow: 128000
         maxTokens: 32000
 ```
 
-Ollama, llama.cpp, LM Studio, oMLX, vLLM, and SGLang are discovered implicitly when running — you usually do not need a manual entry for them. For other runtimes, `discovery.type: openai-models-list` auto-populates the model list.
+Ollama, llama.cpp, LM Studio, oMLX, Rapid-MLX, vLLM, and SGLang are discovered implicitly when running — you usually do not need a manual entry for them. For other runtimes, `discovery.type: openai-models-list` auto-populates the model list.
 
 ### Hosted proxy with an env-based key
 
 ```yaml
 providers:
   hosted:
-    name: Hosted Proxy
     baseUrl: https://proxy.example.com/v1
     api: openai-completions
     apiKey: MY_PROXY_KEY        # env-name-or-literal semantics
@@ -106,17 +104,20 @@ gjc accounts pin anthropic id:42 --persistent
 gjc accounts pin anthropic --clear --persistent
 gjc accounts prefer anthropic low-cost@example.com shared@example.com=75
 gjc accounts prefer anthropic --clear
+gjc accounts prefer openai-codex 'org:Acme Team' org:Personal
 gjc accounts logout anthropic --account me@example.com
 gjc accounts logout anthropic --all
 ```
 
 - `list` shows stored OAuth rows and configured API-key sources, with safe identity/source/health/usage-freshness fields. It does not probe.
 - `check` performs the explicit sequential checker. `--json` emits safe machine-readable rows; a failed probe sets a non-zero exit status.
-- `pin` requires `--persistent`. `<selector>` is a bare email, `id:<positive-row-id>`, `email:<email>`, or `account:<account-id>`. The command validates an active OAuth row and writes the canonical `id:<row-id>` selector to global configuration. `--clear` removes the provider's persistent pin.
-- `prefer` writes the provider's ordered preference list (see `auth.credentialPreferences` below). Accounts are given in order; append `=<percent>` to cap one. Each account accepts the same selectors as `pin`; the command checks that it names exactly one active OAuth row and stores that row's email (as `email:<address>` when the bare text would not read back as that address, for example one with `:` in its local part or one starting with `account:` or `email:`), or its account id when another row shares the email, so the file never holds a store-bound row id and every written list is read back by startup. A cap is the text after the last `=` that follows the account, so `user=2@example.com` is an account and `user=2@example.com=75` caps it at 75%. Nothing is written when any account is missing, ambiguous, duplicated, or has an invalid cap. `--clear` removes the provider's list. The change applies to new sessions.
+- `pin` requires `--persistent`. `<selector>` is a bare email, `id:<positive-row-id>`, `email:<email>`, `account:<account-id>`, or `org:<organization id or name>`. The command validates an active OAuth row and writes the canonical `id:<row-id>` selector to global configuration. `--clear` removes the provider's persistent pin.
+- `prefer` writes the provider's ordered preference list (see `auth.credentialPreferences` below). Accounts are given in order; append `=<percent>` to cap one. Each account accepts the same selectors as `pin`; the command checks that it names exactly one active OAuth row and stores that row's email (as `email:<address>` when the bare text would not read back as that address, for example one with `:` in its local part or one starting with `account:` or `email:`), its account id when another row shares the email, or its organization id as `org:<organization-id>` when one login holds a row per organization so both email and account id are shared (the input may name the organization by id or display name, for example `gjc accounts prefer anthropic 'org:Acme Team' org:org-personal`; an `org:` entry is always written as the organization id, never the display name), so the file never holds a store-bound row id and every written list is read back by startup. A cap is the text after the last `=` that follows the account, so `user=2@example.com` is an account and `user=2@example.com=75` caps it at 75%. Nothing is written when any account is missing, ambiguous, duplicated, or has an invalid cap. `--clear` removes the provider's list. The change applies to new sessions.
 - `logout` requires exactly one of `--account <id|email>` or `--all`; it removes only OAuth rows from the local store. It never removes API-key source rows, and it refuses to mutate a broker-backed store.
 
 API-key rows remain visible and checkable so operators can see which source is selected, but they are not part of OAuth account pooling, cannot be pinned by `gjc accounts pin`, and cannot be removed by `gjc accounts logout`.
+
+One login can hold several OAuth rows, one per organization, with the same email. For Anthropic the organization is the Claude organization the login was bound to. For OpenAI Codex it is the ChatGPT workspace: run `/login` (or the device login) once per workspace and choose that workspace on the OpenAI sign-in page. Each row records the workspace id (`chatgpt_account_id`) as its organization id, so re-logging in to a workspace, or importing a Codex CLI `auth.json`, replaces only that workspace's row, and each row reports its own usage limits. At login gjc also looks up the workspace name (`Personal` for the personal workspace) and lists the row as `email (workspace name)`; the lookup is best-effort and is not repeated on token refresh, so a row whose lookup failed, or that was stored or imported without one, lists by email only and is chosen with `org:<workspace-id>` until the next login to that workspace. An exception: when such a row is refreshed while a named row for the same account and workspace exists, the refreshed row takes over that name as the duplicate is removed (the built-in SQLite store writes it; if the name cannot be written, the refreshed row is kept without it). Choose or order the rows with `org:<id or name>`. `gjc accounts prefer` follows the rule above: with one Codex row it stores the email, and when several workspaces share the email it stores the workspace's `account:<workspace-id>` (the workspace id is also the account id).
 
 ### `gjc accounts --json` output and failure contract
 
@@ -148,7 +149,7 @@ auth:
 - `auth.credentialPins` is a global-only record of provider → selector. Project-scoped pins are ignored; do not place this record in project settings.
 - Numeric `id:<positive-row-id>` pins are bound to the credential-store authority fingerprint (`broker:<normalized-url>` or `local:<absolute-agent-db-path>`). Changing broker URL or local database invalidates those numeric pins instead of retargeting a row with the same number; `email:` and `account:` selectors remain portable.
 - `auth.credentialPinStoreIdentity` is managed alongside persistent pins and contains no credential material. Numeric pins are applied only when this value exactly matches the current store authority; missing or mismatched metadata invalidates the numeric pin rather than retargeting a same-number row. Email/account selectors remain portable across store changes.
-- `auth.credentialPreferences` is a global-only record of provider → ordered soft preference list. `gjc accounts prefer` writes it; hand edits use the same shape. A value is one account or a list. Each entry is an account (`me@example.com`, `email:me@example.com`, or `account:<account-id>`) or an account with a usage cap in percent (`me@example.com: 75`, greater than 0 and at most 100). Numeric `id:` selectors are rejected because a preference has no store-identity binding. An invalid entry or an account listed twice fails startup closed rather than silently changing the order; this includes two entries that name the same stored account through different selectors (for example `me@example.com` and `account:<its account id>`), which startup detects once the credential store is loaded. If a later login makes two entries name one account during a running session, that provider's list is ignored and its accounts are ranked normally until the list is fixed.
+- `auth.credentialPreferences` is a global-only record of provider → ordered soft preference list. `gjc accounts prefer` writes it; hand edits use the same shape. A value is one account or a list. Each entry is an account (`me@example.com`, `email:me@example.com`, `account:<account-id>`, or `org:<organization-id>` for one organization of a login signed in to several; it matches the organization id only, never a display name, and designates nothing while no active OAuth row or more than one active OAuth row holds that organization) or an account with a usage cap in percent (`me@example.com: 75`, greater than 0 and at most 100). Numeric `id:` selectors are rejected because a preference has no store-identity binding. An invalid entry or an account listed twice fails startup closed rather than silently changing the order; this includes two entries that name the same stored account through different selectors (for example `me@example.com` and `account:<its account id>`), which startup detects once the credential store is loaded. If a later login makes two entries name one account during a running session, that provider's list is ignored and its accounts are ranked normally until the list is fixed.
 - Selection walks the list in order and uses the first account that is usable and under its cap. An uncapped account stays first until a quota or rate-limit failure blocks it. A capped account counts as full once its most-used known usage window (for example Claude 5h or 7d, or Codex primary/secondary) reaches the cap; unknown usage never counts as full. When every listed account is blocked or full, the unlisted accounts are ranked normally, and full listed accounts are used only after those. Unlike a pin, a preference never blocks the provider.
 - Literal dotted root keys such as `auth.broker.url: ...`, `auth.credentialRankingMode: ...`, or `auth.credentialPins: ...` are rejected. Startup reports the keys and prints manual rewrite guidance. Rewrite `config.yml` by hand using the nested shape above; there is no automatic migration, and secret values must not be copied into command output.
 

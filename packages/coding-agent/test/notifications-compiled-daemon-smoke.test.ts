@@ -174,6 +174,55 @@ describe("compiled daemon smoke coverage", () => {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
+	test("missing or invalid daemon owner ids are usage errors without crash records", async () => {
+		const sandbox = tempDir("gjc-daemon-owner-usage-");
+		const home = path.join(sandbox, "home");
+		const tmp = path.join(sandbox, "tmp");
+		const agentDir = path.join(sandbox, "agent");
+		fs.mkdirSync(home);
+		fs.mkdirSync(tmp);
+		fs.mkdirSync(agentDir);
+		const env = {
+			PATH: process.env.PATH ?? "",
+			HOME: home,
+			TMPDIR: tmp,
+			GJC_CODING_AGENT_DIR: agentDir,
+		};
+		const invocations = [
+			{ argv: ["notify", "daemon-internal"], message: "Missing required flag: --owner-id" },
+			{
+				argv: ["notify", "daemon-internal", "--owner-id", "--agent-dir", agentDir],
+				message: "Missing required flag: --owner-id",
+			},
+			{
+				argv: ["notify", "daemon-internal", "--owner-id", "-invalid"],
+				message: "Invalid value for --owner-id",
+			},
+			{ argv: ["daemon", "discord-internal"], message: "Missing required flag: --owner-id" },
+			{
+				argv: ["daemon", "slack-internal", "--owner-id", "x".repeat(1025)],
+				message: "Invalid value for --owner-id",
+			},
+		];
+		try {
+			for (const invocation of invocations) {
+				const result = await runWithTimeout(
+					[process.execPath, cliEntrypoint, ...invocation.argv],
+					{ cwd: sandbox, env },
+					10_000,
+				);
+				expect(result.timedOut).toBe(false);
+				expect(result.exitCode).toBe(2);
+				expect(result.stdout).toBe("");
+				expect(result.stderr).toContain(invocation.message);
+				expect(result.stderr).not.toContain("[Uncaught Exception]");
+				expect(fs.existsSync(path.join(agentDir, "gjc-crash.log"))).toBe(false);
+				expect(fs.existsSync(path.join(home, ".gjc", "agent", "gjc-crash.log"))).toBe(false);
+			}
+		} finally {
+			fs.rmSync(sandbox, { recursive: true, force: true });
+		}
+	});
 	test("compiled binary preserves the shipped chat worker entrypoint", async () => {
 		const temp = tempDir("gjc-compiled-daemon-binary-");
 		const binaryPath = path.join(temp, `gjc-repro${executableSuffix}`);
@@ -231,6 +280,22 @@ describe("compiled daemon smoke coverage", () => {
 		expect(runtime.mode).toBe("compiled");
 		expect(runtime.reloadPicksUpSourceEdits).toBe(false);
 		expect(runtime.warning).toContain("Rebuild");
+	});
+	test("source and compiled daemon spawners pass owner ids to private entrypoints", () => {
+		const ownerId = "daemon-owner-1";
+		const spawns = [
+			buildTelegramDaemonSpawnArgs({ execPath: "/usr/local/bin/bun", ownerId, agentDir: "/tmp/agent" }),
+			buildTelegramDaemonSpawnArgs({ execPath: "/opt/gjc/gjc", ownerId, agentDir: "/tmp/agent" }),
+			...(["discord", "slack"] as const).flatMap(kind => [
+				buildChatDaemonSpawnArgs({ kind, execPath: "/usr/local/bin/bun", ownerId, agentDir: "/tmp/agent" }),
+				buildChatDaemonSpawnArgs({ kind, execPath: "/opt/gjc/gjc", ownerId, agentDir: "/tmp/agent" }),
+			]),
+		];
+		for (const { args } of spawns) {
+			const ownerFlagIndex = args.indexOf("--owner-id");
+			expect(ownerFlagIndex).toBeGreaterThanOrEqual(0);
+			expect(args[ownerFlagIndex + 1]).toBe(ownerId);
+		}
 	});
 
 	test("compiled chat spawn self-invokes daemon internal workers without a source entrypoint", () => {

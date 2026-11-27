@@ -6,6 +6,7 @@
  */
 
 import { readJsonl, Snowflake } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { type OwnedProcess, spawnOwnedProcess } from "../../runtime/process-lifecycle";
 import type {
 	JsonRpcError,
@@ -182,7 +183,7 @@ export class StdioTransport implements MCPTransport {
 		const env = this.config.noInheritEnv
 			? buildMinimalStdioEnv(this.config.env)
 			: {
-					...Bun.env,
+					...projectSafeSpawnEnv(),
 					...this.config.env,
 				};
 		try {

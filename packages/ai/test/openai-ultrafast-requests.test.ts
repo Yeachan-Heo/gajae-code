@@ -74,10 +74,14 @@ function completionsResponseEvents(serviceTier?: string, modelId = "gpt-6-astra"
 	];
 }
 
+const capturedHeaders: Headers[] = [];
+
 function captureRequests(events: unknown[]): Record<string, unknown>[] {
 	const bodies: Record<string, unknown>[] = [];
+	capturedHeaders.length = 0;
 	const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
 		bodies.push(typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {});
+		capturedHeaders.push(new Headers(init?.headers));
 		return createSseResponse(events);
 	});
 	global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
@@ -357,5 +361,34 @@ describe("ultrafast request serialization for bundled models", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(bodies[0]?.service_tier).toBeUndefined();
 		expect(result.serviceTier).toBeUndefined();
+	});
+
+	it("sends the Codex routing hint with the tier actually requested", async () => {
+		const supported = {
+			...(getBundledModel("openai-codex", "gpt-6.2-sol") as Model<"openai-codex-responses">),
+			preferWebsockets: false,
+		};
+		const fastOnly = {
+			...(getBundledModel("openai-codex", "gpt-5.6-sol") as Model<"openai-codex-responses">),
+			preferWebsockets: false,
+		};
+		const cases = [
+			{ model: supported, tier: undefined, hint: "model=gpt-6.2-sol" },
+			{ model: supported, tier: "priority", hint: "model=gpt-6.2-sol;tier=priority" },
+			{ model: supported, tier: "ultrafast", hint: "model=gpt-6.2-sol;tier=ultrafast" },
+			{ model: fastOnly, tier: "ultrafast", hint: "model=gpt-5.6-sol" },
+		] as const;
+		for (const { model, tier, hint } of cases) {
+			const bodies = captureRequests(completedResponseEvents());
+			const result = await streamOpenAICodexResponses(model, testContext, {
+				apiKey: codexTestToken(),
+				serviceTier: tier,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+			expect(capturedHeaders[0]?.get("x-codex-routing-hint")).toBe(hint);
+			expect(Object.keys(bodies[0] ?? {}).indexOf("model")).toBeLessThan(
+				Object.keys(bodies[0] ?? {}).indexOf("input"),
+			);
+		}
 	});
 });

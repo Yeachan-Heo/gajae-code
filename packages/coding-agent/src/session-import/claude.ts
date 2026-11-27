@@ -15,6 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isRecord } from "@gajae-code/utils";
 import { redactImportedText } from "./redact";
 import type { ImportedConversation, ImportedMessage, ImportQuarantineRecord, SessionImportCounts } from "./types";
 
@@ -30,10 +31,6 @@ export interface ClaudeParseResult {
 const MAX_EVIDENCE_LINE_CHARS = 400;
 const MAX_EVIDENCE_LINES = 100;
 const MAX_EVIDENCE_BYTES = 8 * 1024;
-
-function isRecord(value: unknown): value is JsonRecord {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function sha256Hex(text: string): string {
 	return createHash("sha256").update(text, "utf8").digest("hex");

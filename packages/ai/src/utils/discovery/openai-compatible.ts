@@ -1,8 +1,11 @@
-import * as net from "node:net";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import type { Api, FetchImpl, Model, Provider } from "../../types";
 import { toNumber } from "../../utils";
+import { isLoopbackHost } from "../loopback-transport";
+
+export type { LoopbackDirectFetchInit } from "../loopback-transport";
+export { fetchLoopbackDirect } from "../loopback-transport";
 
 const MODELS_PATH = "/models";
 
@@ -16,40 +19,6 @@ const MODELS_PATH = "/models";
 export const MODELS_LIST_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_MODELS_RESPONSE_BYTES = 1_000_000;
 const MAX_CATALOG_MODEL_ID_LENGTH = 200;
-
-function parseIpv6Hextets(host: string): number[] | undefined {
-	if (net.isIP(host) !== 6) return undefined;
-	const doubleColon = host.indexOf("::");
-	if (doubleColon !== host.lastIndexOf("::")) return undefined;
-	const parseSide = (value: string): number[] | undefined => {
-		if (!value) return [];
-		const parts = value.split(":");
-		if (parts.some(part => !/^[0-9a-f]{1,4}$/i.test(part))) return undefined;
-		return parts.map(part => Number.parseInt(part, 16));
-	};
-	if (doubleColon < 0) {
-		const hextets = parseSide(host);
-		return hextets?.length === 8 ? hextets : undefined;
-	}
-	const left = parseSide(host.slice(0, doubleColon));
-	const right = parseSide(host.slice(doubleColon + 2));
-	if (!left || !right) return undefined;
-	const missing = 8 - left.length - right.length;
-	if (missing < 1) return undefined;
-	return [...left, ...new Array<number>(missing).fill(0), ...right];
-}
-
-function isLoopbackHost(hostname: string): boolean {
-	const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-	if (host === "localhost") return true;
-	if (net.isIP(host) === 4) return host.split(".", 1)[0] === "127";
-	const hextets = parseIpv6Hextets(host);
-	if (!hextets) return false;
-	const isIpv6Loopback = hextets.slice(0, 7).every(part => part === 0) && hextets[7] === 1;
-	const isIpv4MappedLoopback =
-		hextets.slice(0, 5).every(part => part === 0) && hextets[5] === 0xffff && hextets[6]! >> 8 === 0x7f;
-	return isIpv6Loopback || isIpv4MappedLoopback;
-}
 
 /** Catalog identities are rendered and used for routing; unsafe values are dropped, never rewritten. */
 export function isSafeCatalogModelId(value: unknown): value is string {

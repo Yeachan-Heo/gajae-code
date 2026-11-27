@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as timers from "node:timers/promises";
 import { logger, untilAborted } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import { type OwnedProcess, spawnOwnedProcess } from "../runtime/process-lifecycle";
 import { DapClient } from "./client";
@@ -1070,7 +1071,7 @@ export class DapSessionManager {
 					cwd,
 					stdin: "ignore",
 					env: {
-						...Bun.env,
+						...projectSafeSpawnEnv(),
 						...NON_INTERACTIVE_ENV,
 						...env,
 					},

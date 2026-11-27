@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -34,6 +34,127 @@ describe("run resource ledger", () => {
 
 		ledger.seal("pre-registered");
 		expect(await settlement).toEqual({ status: "settled" });
+	});
+
+	test("zero grace expires while null waits through seal, producer discovery, and late settlement", async () => {
+		const ledger = createRunResourceLedger();
+		const domain = ledger.open("definitive");
+		const producer = ledger.reserveProducer("definitive", domain, "post_prompt", "discovery");
+		if (!producer.ok) throw new Error("Expected producer reservation");
+		const late = Promise.withResolvers<void>();
+		const settlement = ledger.waitForSettlement("definitive", { graceMs: null });
+		let completed = false;
+		void settlement.then(() => {
+			completed = true;
+		});
+
+		expect(await ledger.waitForSettlement("definitive", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "run_not_sealed",
+		});
+		expect(completed).toBe(false);
+		ledger.seal("definitive");
+		expect(await ledger.waitForSettlement("definitive", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "resources_pending",
+			pending: [{ label: "discovery" }],
+		});
+		expect(completed).toBe(false);
+		expect(ledger.lookupDomain("definitive")).toBe(domain);
+		expect(producer.lease.track("post_prompt", "late work", late.promise)).toBe(true);
+		producer.lease.closeDiscovery();
+		await Promise.resolve();
+		expect(completed).toBe(false);
+		expect(ledger.pending("definitive")).toMatchObject([{ label: "late work" }]);
+		expect(ledger.lookupDomain("definitive")).toBe(domain);
+
+		late.resolve();
+		expect(await settlement).toEqual({ status: "settled" });
+		expect(ledger.pending("definitive")).toEqual([]);
+		expect(ledger.lookupDomain("definitive")).toBeUndefined();
+		expect(ledger.open("definitive")).toBeUndefined();
+	});
+
+	test("null grace allocates and clears no deadline timer", async () => {
+		const ledger = createRunResourceLedger();
+		const work = Promise.withResolvers<void>();
+		ledger.open("timerless");
+		ledger.track("timerless", "tool", "work", work.promise);
+		const setTimer = spyOn(globalThis, "setTimeout");
+		const clearTimer = spyOn(globalThis, "clearTimeout");
+		try {
+			const settlement = ledger.waitForSettlement("timerless", { graceMs: null });
+			expect(setTimer).not.toHaveBeenCalled();
+			ledger.seal("timerless");
+			work.resolve();
+			expect(await settlement).toEqual({ status: "settled" });
+			expect(setTimer).not.toHaveBeenCalled();
+			expect(clearTimer).not.toHaveBeenCalled();
+		} finally {
+			setTimer.mockRestore();
+			clearTimer.mockRestore();
+		}
+	});
+
+	test("quarantine removes a null-grace waiter and its proof never becomes settled", async () => {
+		const ledger = createRunResourceLedger();
+		const work = Promise.withResolvers<void>();
+		const domain = ledger.open("quarantined-waiter");
+		ledger.track("quarantined-waiter", "tool", "late tool", work.promise);
+		const settlement = ledger.waitForSettlement("quarantined-waiter", { graceMs: null });
+		const deleteWaiter = spyOn(Set.prototype, "delete");
+		try {
+			ledger.quarantine("quarantined-waiter");
+			expect(deleteWaiter).toHaveBeenCalledTimes(1);
+			const waiter = deleteWaiter.mock.calls[0][0];
+			const proof = await settlement;
+			expect(proof).toMatchObject({
+				status: "unfenced",
+				reason: "quarantined",
+				pending: [{ kind: "tool", label: "late tool" }],
+			});
+			expect(domain?.signal.aborted).toBe(true);
+			expect(ledger.lookupDomain("quarantined-waiter")).toBeUndefined();
+			work.resolve();
+			await Promise.resolve();
+			ledger.quarantine("quarantined-waiter");
+			expect(deleteWaiter.mock.calls.filter(([entry]) => entry === waiter)).toHaveLength(1);
+			expect(await ledger.waitForSettlement("quarantined-waiter", { graceMs: null })).toEqual(proof);
+			expect(proof).toMatchObject({
+				status: "unfenced",
+				reason: "quarantined",
+				pending: [{ kind: "tool", label: "late tool" }],
+			});
+		} finally {
+			deleteWaiter.mockRestore();
+		}
+	});
+
+	test("unknown and terminal runs return immediate proofs for zero and null grace without timers", async () => {
+		const ledger = createRunResourceLedger();
+		ledger.open("already-settled");
+		ledger.seal("already-settled");
+		ledger.open("already-quarantined");
+		ledger.quarantine("already-quarantined");
+		const setTimer = spyOn(globalThis, "setTimeout");
+		try {
+			for (const graceMs of [0, null]) {
+				expect(await ledger.waitForSettlement("unknown", { graceMs })).toEqual({
+					status: "unfenced",
+					reason: "unknown_run",
+					pending: [],
+				});
+				expect(await ledger.waitForSettlement("already-settled", { graceMs })).toEqual({ status: "settled" });
+				expect(await ledger.waitForSettlement("already-quarantined", { graceMs })).toEqual({
+					status: "unfenced",
+					reason: "quarantined",
+					pending: [],
+				});
+			}
+			expect(setTimer).not.toHaveBeenCalled();
+		} finally {
+			setTimer.mockRestore();
+		}
 	});
 
 	test("waits for every tracked resource, including rejected resources", async () => {

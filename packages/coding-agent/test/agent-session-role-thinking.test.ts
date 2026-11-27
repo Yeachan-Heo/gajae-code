@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentOptions } from "@gajae-code/agent-core";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import {
+	commitDurableModelProfileOwnership,
+	readDurableModelProfileOwnership,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { ModelSelectorValue } from "@gajae-code/coding-agent/config/model-selector-value";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -41,7 +46,7 @@ describe("AgentSession role model thinking behavior", () => {
 	async function createSession(options: {
 		initialModelId: string;
 		initialThinkingLevel: Effort;
-		modelRoles: Record<string, string>;
+		modelRoles: Record<string, ModelSelectorValue>;
 	}) {
 		const model = getAnthropicModelOrThrow(options.initialModelId);
 		const agent = new Agent({
@@ -220,6 +225,105 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
 
+	it.each([false, true])("preserves cycle roles and chains with durable profile=%s", async durableProfile => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const slowModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const fallbackModel = getAnthropicModelOrThrow("claude-opus-4-5");
+		const defaultChain = [
+			`${defaultModel.provider}/${defaultModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}:low`,
+		];
+		const slowChain = [
+			`${slowModel.provider}/${slowModel.id}:off`,
+			`${fallbackModel.provider}/${fallbackModel.id}:high`,
+		];
+		const roles = { default: defaultChain, slow: slowChain };
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: roles,
+		});
+		if (durableProfile) {
+			await commitDurableModelProfileOwnership(sessionSettings, { kind: "profile", profile: "cycle-profile" });
+			session.setActiveModelProfile("cycle-profile", true);
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([defaultModel, slowModel, fallbackModel]);
+			sessionSettings.override("modelRoles", {
+				default: [defaultModel.id, `${fallbackModel.id}:low`],
+				slow: [`${slowModel.id}:off`, `${fallbackModel.id}:high`],
+			});
+		}
+		const owner = readDurableModelProfileOwnership(sessionSettings);
+
+		const toSlow = await session.cycleRoleModels(["default", "slow"]);
+		expect(toSlow).toMatchObject({ role: "slow", model: { id: slowModel.id }, thinkingLevel: "off" });
+		expect(sessionSettings.getGlobal("modelRoles")).toEqual(roles);
+		expect(sessionSettings.get("modelRoles")).toEqual(roles);
+		expect(session.sessionManager.getLastModelChangeRole()).toBe("slow");
+		expect(session.sessionManager.buildSessionContext().models.default).toBe(`${slowModel.provider}/${slowModel.id}`);
+		expect(session.getConfiguredModelChain("default")).toEqual(slowChain);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(readDurableModelProfileOwnership(sessionSettings)).toMatchObject({
+			version: owner.version + (durableProfile ? 1 : 0),
+			marker: { kind: durableProfile ? "cleared" : "inherit" },
+		});
+
+		session.setThinkingLevel(Effort.Minimal);
+		const toDefault = await session.cycleRoleModels(["default", "slow"]);
+		expect(toDefault).toMatchObject({
+			role: "default",
+			model: { id: defaultModel.id },
+			thinkingLevel: Effort.Minimal,
+		});
+		expect(session.sessionManager.getLastModelChangeRole()).toBe("default");
+		expect(session.getConfiguredModelChain("default")).toEqual(defaultChain);
+		expect(sessionSettings.get("modelRoles")).toEqual(roles);
+		expect(sessionSettings.getGlobal("modelRoles")).toEqual(roles);
+
+		const backToSlow = await session.cycleRoleModels(["default", "slow"]);
+		expect(backToSlow).toMatchObject({ role: "slow", model: { id: slowModel.id }, thinkingLevel: "off" });
+		expect(session.getConfiguredModelChain("default")).toEqual(slowChain);
+		expect(readDurableModelProfileOwnership(sessionSettings).version).toBe(owner.version + (durableProfile ? 1 : 0));
+	});
+
+	it("rejects a role cycle when a newer durable profile wins during credential lookup", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const slowModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const roles = {
+			default: `${defaultModel.provider}/${defaultModel.id}`,
+			slow: `${slowModel.provider}/${slowModel.id}:off`,
+		};
+		await createSession({ initialModelId: defaultModel.id, initialThinkingLevel: Effort.High, modelRoles: roles });
+		await commitDurableModelProfileOwnership(sessionSettings, { kind: "profile", profile: "cycle-profile" });
+		session.setActiveModelProfile("cycle-profile", true);
+		session.setThinkingLevel(Effort.High);
+		const before = session.sessionManager.buildSessionContext();
+		const credentialRequested = Promise.withResolvers<void>();
+		const credential = Promise.withResolvers<string>();
+		const apiKey = vi.spyOn(modelRegistry, "getApiKey").mockImplementationOnce(() => {
+			credentialRequested.resolve();
+			return credential.promise;
+		});
+		try {
+			const cycle = session.cycleRoleModels(["default", "slow"]);
+			await credentialRequested.promise;
+			const winner = await commitDurableModelProfileOwnership(sessionSettings, {
+				kind: "profile",
+				profile: "newer-profile",
+			});
+			credential.resolve("test-key");
+			await expect(cycle).rejects.toMatchObject({ code: "model_profile_ownership_conflict" });
+			expect(readDurableModelProfileOwnership(sessionSettings)).toEqual(winner);
+			expect(sessionSettings.getGlobal("modelRoles")).toEqual(roles);
+			expect(session.sessionManager.buildSessionContext()).toEqual(before);
+			expect(session.model?.id).toBe(defaultModel.id);
+			expect(session.thinkingLevel).toBe(Effort.High);
+			expect(session.getActiveModelProfile()).toBe("cycle-profile");
+		} finally {
+			credential.resolve("test-key");
+			apiKey.mockRestore();
+		}
+	});
+
 	it("applies slow role thinking even when plan shares the same model", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const smolModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
@@ -285,6 +389,53 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBe(Effort.High);
 		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}:high`);
 		expect(session.agent.state.thinkingLevel).toBe(Effort.High);
+	});
+
+	it("treats an inherited level on the default role as no explicit level", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const nonReasoningModel = getAnthropicModelOrThrow("claude-3-haiku-20240307");
+		expect(nonReasoningModel.reasoning).toBe(false);
+
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+
+		session.setThinkingLevel(Effort.High);
+		// The model selector reports `inherit` when the chosen model cannot keep the current level.
+		await session.setModel(nonReasoningModel, "default", {
+			selector: `${nonReasoningModel.provider}/${nonReasoningModel.id}`,
+			thinkingLevel: ThinkingLevel.Inherit,
+		});
+
+		expect(session.model?.id).toBe(nonReasoningModel.id);
+		expect(session.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(sessionSettings.getModelRole("default")).toBe(`${nonReasoningModel.provider}/${nonReasoningModel.id}`);
+	});
+
+	it("resolves an inherited default-role level to the selected reasoning model's level", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+
+		session.setThinkingLevel(Effort.High);
+		expect(session.thinkingLevel).toBe(Effort.High);
+		await session.setModel(selectedModel, "default", {
+			selector: `${selectedModel.provider}/${selectedModel.id}`,
+			thinkingLevel: ThinkingLevel.Inherit,
+		});
+
+		expect(session.model?.id).toBe(selectedModel.id);
+		// No explicit level: the session keeps its current level when the new model supports it.
+		expect(selectedModel.thinking?.defaultLevel).toBeUndefined();
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}`);
 	});
 
 	it("resolves subagent model assignments from task.agentModelOverrides", async () => {
@@ -363,9 +514,9 @@ describe("AgentSession role model thinking behavior", () => {
 			modelRegistry,
 		});
 
-		expect(session.cycleThinkingLevel()).toBe("off");
+		expect(await session.cycleThinkingLevel()).toBe("off");
 		expect(session.thinkingLevel).toBe("off");
-		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
+		expect(await session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
 	it("keeps a session thinking override across a suffixed default-chain re-resolution", async () => {
@@ -461,7 +612,7 @@ describe("AgentSession role model thinking behavior", () => {
 			initialThinkingLevel: Effort.High,
 			modelRoles: {},
 		});
-		const cycled = session.cycleThinkingLevel();
+		const cycled = await session.cycleThinkingLevel();
 		expect(cycled).toBeDefined();
 		expect(session.getThinkingScopeForControl()).toBe("session");
 	});

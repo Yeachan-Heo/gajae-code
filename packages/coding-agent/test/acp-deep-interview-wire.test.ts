@@ -12,6 +12,7 @@ import {
 	type RequestPermissionResponse,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { resolveSessionLocator, type SessionLocatorV2 } from "../src/sdk/broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
@@ -89,14 +90,8 @@ function chunk(delta: Record<string, unknown>, finishReason: string | null): Rec
 	};
 }
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 15_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-	throw new Error(`Timed out waiting for ${label}`);
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 15_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10, label });
 
 async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000): Promise<T> {
 	const { promise: timeout, reject } = Promise.withResolvers<never>();

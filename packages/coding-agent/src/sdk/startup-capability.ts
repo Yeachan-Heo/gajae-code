@@ -3,7 +3,22 @@ import {
 	type ModelProfileErrorCode,
 	type ModelProfileErrorDetails,
 } from "../config/model-profile-contract";
+import {
+	SessionHeldError,
+	type SessionOwnerHolderSummary,
+	sessionOwnerHolderSummary,
+} from "../session/session-ownership";
 export type SdkStartupPhase = "registration" | "startup";
+
+/**
+ * A lifecycle host refused to open its session because another process holds it (single-owner,
+ * `enforce`). The broker reports it as the same `live_session` outcome its resume wait ends in.
+ */
+export const SDK_STARTUP_SESSION_HELD_CODE = "session_held";
+
+export interface SdkStartupSessionHeldDetails {
+	holder?: SessionOwnerHolderSummary;
+}
 
 export type SdkStartupReason =
 	| "disabled"
@@ -18,8 +33,8 @@ export interface SdkStartupFailure {
 	phase: SdkStartupPhase;
 	reason: SdkStartupReason;
 	message: string;
-	code?: ModelProfileErrorCode;
-	details?: ModelProfileErrorDetails;
+	code?: ModelProfileErrorCode | typeof SDK_STARTUP_SESSION_HELD_CODE;
+	details?: ModelProfileErrorDetails | SdkStartupSessionHeldDetails;
 }
 
 export type SdkStartupResult = { status: "started" } | { status: "failed"; failure: SdkStartupFailure };
@@ -155,6 +170,16 @@ export function normalizeSdkStartupFailure(
 							: reason === "pending"
 								? "SDK startup did not complete before readiness cutoff."
 								: FALLBACK_MESSAGE;
+	if (error instanceof SessionHeldError) {
+		const holder = sessionOwnerHolderSummary(error.holder);
+		return {
+			phase,
+			reason,
+			message: sanitizeSdkStartupMessage(error.operatorMessage, knownSecrets),
+			code: SDK_STARTUP_SESSION_HELD_CODE,
+			details: holder ? { holder } : {},
+		};
+	}
 	const message = sanitizeSdkStartupMessage(error, knownSecrets);
 	const profileError = isModelProfileError(error) ? { code: error.code, details: error.details } : {};
 	return { phase, reason, message: message === FALLBACK_MESSAGE ? fallback : message, ...profileError };

@@ -1,7 +1,7 @@
 import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
-import { logger, TempDir } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../../package.json" with { type: "json" };
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
@@ -13,6 +13,9 @@ import {
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
+import { trackTempDirs } from "../helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 setDefaultTimeout(75_000);
 
@@ -104,7 +107,7 @@ export function createFixture(
 	} = {},
 ): Promise<Fixture> {
 	return (async () => {
-		const tempDir = TempDir.createSync("@acp-cancel-settlement-");
+		const tempDir = trackedTemp.tempDirSync("@acp-cancel-settlement-");
 		const agentDir = path.join(tempDir.path(), "agent");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const token = "acp-cancel-settlement-token";
@@ -775,6 +778,37 @@ test("a pre-admission no_active_turn abort is retried after prompt acknowledgeme
 		await bounded(admittedAbortIssued.promise, "terminal abort after prompt acknowledgement");
 		expect(abortCalls).toBe(2);
 		expect(await bounded(pending, "acknowledged cancellation settlement")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("an uncertain pre-admission abort is retried after prompt acknowledgement", async () => {
+	let abortCalls = 0;
+	const admittedAbortIssued = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		deferPromptAcknowledgement: true,
+		abortAcknowledgement: () => {
+			abortCalls++;
+			if (abortCalls === 1) return { ok: true, selection: "turn", turn: "uncertain" };
+			admittedAbortIssued.resolve();
+			return { ok: true, selection: "turn", turn: "stopped", terminal: "terminal_no_effect" };
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel before uncertain prompt acknowledgement");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		expect(fixture.hasPendingPromptAcknowledgement()).toBe(true);
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		expect(abortCalls).toBe(1);
+
+		fixture.acknowledgePendingPrompt();
+		await bounded(admittedAbortIssued.promise, "abort retry after uncertain pre-admission result");
+		expect(abortCalls).toBe(2);
+		expect(await bounded(pending, "settled uncertain cancellation")).toEqual({ stopReason: "cancelled" });
 	} finally {
 		fixture.dispose();
 	}

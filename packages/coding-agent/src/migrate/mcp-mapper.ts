@@ -6,16 +6,14 @@
  * `skipped_unmappable`), and failed (F, `failed_invalid_source`). Secret-indirection
  * fields are always omitted-with-warning; their values are never read or emitted.
  */
+
+import { isRecord } from "@gajae-code/utils";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import type { MigrateSource } from "./types";
 
 export type McpMapOutcome =
 	| { ok: true; config: MCPServerConfig; warnings: string[] }
 	| { ok: false; status: "skipped_unmappable" | "failed_invalid_source"; reason: string };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function asStringArray(value: unknown): string[] | undefined | "invalid" {
 	if (value === undefined) return undefined;

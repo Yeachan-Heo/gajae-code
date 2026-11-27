@@ -10,8 +10,6 @@ export type RootThinkingLevel = (typeof ROOT_THINKING_LEVELS)[number];
 /** Public launch flags shared by root help, completion, and the launch command. */
 export const ROOT_LAUNCH_FLAGS = {
 	model: Flags.string({ description: 'Model to use (fuzzy match: "opus", "gpt-5.2", or "openai/gpt-5.2")' }),
-	smol: Flags.string({ description: "Smol/fast model for lightweight tasks (or GJC_SMOL_MODEL env)" }),
-	slow: Flags.string({ description: "Slow/reasoning model for thorough analysis (or GJC_SLOW_MODEL env)" }),
 	plan: Flags.string({ description: "Plan model for architectural planning (or GJC_PLAN_MODEL env)" }),
 	mpreset: Flags.string({ description: "Model profile preset to activate for this session" }),
 	default: Flags.boolean({ description: "Persist --mpreset as the default model profile" }),
