@@ -294,6 +294,8 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
+	// Keep the absence guard scheduled for deletion or isolated resurrection.
+	"scripts/release-simplified.ts": ["scripts/release-policy.test.ts"],
 	"scripts/test-preload.ts": ["scripts/test-home-isolation.test.ts"],
 	"scripts/test-home-isolation.ts": ["scripts/test-home-isolation.test.ts"],
 	"scripts/test-home-isolation.test.ts": ["scripts/test-home-isolation.test.ts"],
