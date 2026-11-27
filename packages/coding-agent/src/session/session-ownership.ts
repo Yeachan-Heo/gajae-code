@@ -345,9 +345,12 @@ interface SessionOwnerRegistry {
 	readonly entries: Map<string, RegistryEntry>;
 	/** Acquires in flight, so a second claim in this process waits instead of contending. */
 	readonly pending: Map<string, Promise<void>>;
-	/** Set once a lock call reports `unavailable` or times out: claims are off for this process. */
+	/**
+	 * Set once a lock call reports `unavailable` (no usable lock on this platform): claims are off for
+	 * this process. A timeout never sets it (design §2.7): it skips that one call.
+	 */
 	unavailable: string | undefined;
-	/** Why the latch above was set; added later, so a registry from an older copy may lack it. */
+	/** Why the latch above was set; an older copy of this module may still latch `timed_out` here. */
 	latchReason?: "unavailable" | "timed_out";
 	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
 	counters?: Map<SessionOwnershipCounter, number>;
@@ -468,23 +471,18 @@ export function persistSessionOwnershipCounters(options: { readonly atExit?: boo
 	}
 }
 
-function markUnavailable(code: string | undefined, reason: "unavailable" | "timed_out" = "unavailable"): string {
+function markUnavailable(code: string | undefined): string {
 	const current = registry();
-	const latched = code ?? reason;
+	const latched = code ?? "unavailable";
 	if (current.unavailable === undefined) {
 		current.unavailable = latched;
-		current.latchReason = reason;
-		logger.warn(
-			reason === "timed_out"
-				? "Session ownership claim timed out; claims are off for this process"
-				: "Session ownership is unavailable; claims are off for this process",
-			{ code: latched },
-		);
+		current.latchReason = "unavailable";
+		logger.warn("Session ownership is unavailable; claims are off for this process", { code: latched });
 	}
 	return current.unavailable;
 }
 
-/** The fail-open a latched process returns for every later claim. */
+/** The fail-open a latched process returns for every later claim (`timed_out` only from an older copy). */
 function latchedFailOpen(current: SessionOwnerRegistry): SessionOwnerClaimResult {
 	return failOpen(current.latchReason ?? "unavailable", current.unavailable);
 }
@@ -546,8 +544,12 @@ function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
 // Claim and probe
 // =============================================================================
 
-function failOpen(reason: "unavailable" | "timed_out", code: string | undefined): SessionOwnerClaimResult {
-	countSessionOwnershipEvent("fail_open");
+function failOpen(
+	reason: "unavailable" | "timed_out",
+	code: string | undefined,
+	counted = true,
+): SessionOwnerClaimResult {
+	if (counted) countSessionOwnershipEvent("fail_open");
 	return { status: "skipped", reason, code };
 }
 
@@ -555,10 +557,14 @@ function failOpen(reason: "unavailable" | "timed_out", code: string | undefined)
  * Claim `sessionId` for this process. A session this process already holds is shared (design D10).
  * Throws `SessionOwnershipError` when the owners directory or the lock fails in a way that must
  * refuse the session; only `unavailable` and `timed_out` fail open (design §2.7).
+ *
+ * `repeat` names the outcome the caller's previous attempt of this id had (a turn-start
+ * re-attempt): the same outcome again is neither counted nor logged again, so the counters count
+ * episodes, not turns.
  */
 export async function claimSessionOwner(
 	sessionId: string,
-	request: { readonly surface: SessionOwnerSurface },
+	request: { readonly surface: SessionOwnerSurface; readonly repeat?: "held" | "timed_out" },
 ): Promise<SessionOwnerClaimResult> {
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
@@ -581,7 +587,7 @@ export async function claimSessionOwner(
 		if (!pending) break;
 		await pending;
 	}
-	// The acquire waited on may have found the platform unavailable, or timed out.
+	// The acquire waited on may have found the platform unavailable.
 	if (current.unavailable !== undefined) return latchedFailOpen(current);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
@@ -637,7 +643,7 @@ export async function claimSessionOwner(
 				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
 			}
 			case FileLockAcquireStatus.Held:
-				countSessionOwnershipEvent("claim_conflict");
+				if (request.repeat !== "held") countSessionOwnershipEvent("claim_conflict");
 				return {
 					status: "held",
 					holder: verifiedHolder(readRecord(path.join(owners, `${key}${RECORD_SUFFIX}`)), sessionId),
@@ -645,9 +651,12 @@ export async function claimSessionOwner(
 			case FileLockAcquireStatus.Unavailable:
 				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
-				// A stalled lock filesystem (NFS, for one) would make every later open wait the full native
-				// budget again, so one timeout turns claims off for the rest of this process.
-				return failOpen("timed_out", markUnavailable(result.code ?? "timed_out", "timed_out"));
+				// A stall skips this call only (design §2.7): latching it would leave a long-lived writer
+				// unclaimed, and so invisible to other processes, for the rest of its life. Turn start
+				// re-attempts the current session, with backoff (`SessionClaimSet.reclaimCurrent`).
+				if (request.repeat !== "timed_out")
+					logger.warn("Session ownership claim timed out; this claim was skipped", { code: result.code });
+				return failOpen("timed_out", result.code ?? "timed_out", request.repeat !== "timed_out");
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}

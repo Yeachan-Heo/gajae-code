@@ -622,7 +622,16 @@ Under `enforce`, a session open for writing in another process is refused before
 - An owners directory that fails its safety checks refuses the session too (`SessionOwnershipError`), as the append lock does.
 - Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. If a launched host's open is refused anyway (another process claimed the session after the broker checked), the broker reports the same `live_session` outcome as the resume wait above.
 
-A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. One lock timeout (a stalled network filesystem, for example) turns claims off for the rest of that process, so later opens never wait for the lock again.
+A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. A lock timeout (a stalled network filesystem, for example) skips that one claim only: the next claim tries again.
+
+A session whose claim was not taken when it opened (another process held it, or the lock timed out or failed) is claimed again when a turn starts, so a terminal that opened a session its holder later let go of becomes the session's owner at a later prompt. The re-attempt backs off from the open: at most once every 5 seconds for a held session, and from 10 seconds doubling to 5 minutes after a timeout or failure. A re-attempt that finds the same outcome again is not counted again. Under `observe` the re-attempt runs beside the turn and the turn never waits for it. Under `enforce`, the turn waits for it, and a held or failed claim is re-attempted at every turn:
+
+- If another process now holds the session, the turn is not started and the holder keeps the session. The TUI shows the held-session warning with **Fork** and **Cancel**, and the unsent message goes back to the editor. `-p` and the SDK get `SessionHeldError`, and a session host or ACP client gets the operator message with the generic `internal` code.
+- From then on, every other write to that session from this process is refused with `SessionHeldError` before it is written: a title, a rename, a compaction, an extension's entry or an SDK append. Nothing of the refused write is kept in memory. A refused write re-attempts the claim in the background (within the backoff), so writes resume on their own soon after the holder exits; a switch, fork or new session still works.
+- A claim that fails (an owners-directory error) refuses the turn, as at open, and every other write, with `SessionOwnershipError`.
+- A re-attempt that times out lets that turn run without a claim and shows a warning.
+
+Subagent sessions never claim. With `off`, nothing is re-attempted.
 
 Operator notes:
 

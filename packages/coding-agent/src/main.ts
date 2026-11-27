@@ -403,7 +403,8 @@ export async function submitInteractiveInput(
 		| "showError"
 		| "checkShutdownRequested"
 		| "waitForAgentEnd"
-	>,
+	> &
+		Partial<Pick<InteractiveMode, "handleRefusedSessionTurn">>,
 	session: Pick<AgentSession, "prompt" | "promptCustomMessage"> & {
 		continuePersistedHistory?: AgentSession["continuePersistedHistory"];
 	},
@@ -412,6 +413,13 @@ export async function submitInteractiveInput(
 	if (input.cancelled) {
 		return;
 	}
+	// A turn enforce refused (another process holds the session, or gjc could not check) restores
+	// the draft; a held session gets the held warning.
+	const reportFailure = (error: unknown): void => {
+		const refused = error instanceof SessionHeldError || error instanceof SessionOwnershipError;
+		if (refused && mode.handleRefusedSessionTurn) mode.handleRefusedSessionTurn(error, input);
+		else mode.showError(operatorErrorMessage(error));
+	};
 
 	try {
 		if (input.started) {
@@ -442,20 +450,15 @@ export async function submitInteractiveInput(
 				agentEnd.promise.then(() => ({ type: "agent_end" as const })),
 			]);
 			if (result.type === "error") {
-				const errorMessage = operatorErrorMessage(result.error);
-				mode.showError(errorMessage);
+				reportFailure(result.error);
 			} else if (result.type === "agent_end") {
-				void prompt.catch((error: unknown) => {
-					const errorMessage = operatorErrorMessage(error);
-					mode.showError(errorMessage);
-				});
+				void prompt.catch(reportFailure);
 			}
 		} finally {
 			agentEnd.dispose();
 		}
 	} catch (error: unknown) {
-		const errorMessage = operatorErrorMessage(error);
-		mode.showError(errorMessage);
+		reportFailure(error);
 	} finally {
 		mode.finishPendingSubmission(input);
 		await mode.checkShutdownRequested();
@@ -1235,14 +1238,20 @@ export async function runInteractiveMode(
 	let deferredInitialImages: ImageContent[] | undefined;
 	const deferredInitialMessages: string[] = [];
 
+	// A startup turn enforce refused goes the way a typed one does (`submitInteractiveInput`).
+	const reportStartupFailure = (error: unknown, text = "", images?: ImageContent[]): void => {
+		if (error instanceof SessionHeldError || error instanceof SessionOwnershipError)
+			mode.handleRefusedSessionTurn(error, { text, images, cancelled: false, started: true });
+		else mode.showError(operatorErrorMessage(error));
+	};
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
 			try {
 				await session.continuePersistedHistory();
 			} catch (error: unknown) {
-				const errorMessage = operatorErrorMessage(error);
-				mode.showError(errorMessage);
+				reportStartupFailure(error);
 			}
 		}
 
@@ -1259,8 +1268,7 @@ export async function runInteractiveMode(
 					maybeGenerateStartupTitle(initialMessage, initialImages);
 					await session.prompt(initialMessage, { images: initialImages });
 				} catch (error: unknown) {
-					const errorMessage = operatorErrorMessage(error);
-					mode.showError(errorMessage);
+					reportStartupFailure(error, initialMessage, initialImages);
 				}
 			}
 		}

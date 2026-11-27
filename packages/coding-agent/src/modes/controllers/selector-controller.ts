@@ -2551,7 +2551,14 @@ export class SelectorController {
 	 */
 	#resumeInFlight = false;
 
-	async handleResumeSession(sessionPath: string): Promise<void> {
+	/**
+	 * `cancelledStatus`: what Cancel on the held-session warning says (default `Resume cancelled`);
+	 * `continueHere: false` offers Fork and Cancel only.
+	 */
+	async handleResumeSession(
+		sessionPath: string,
+		options?: { readonly cancelledStatus?: string; readonly continueHere?: boolean },
+	): Promise<void> {
 		this.ctx.promptSuggestion?.clear();
 		if (this.#resumeInFlight) {
 			this.ctx.showStatus("Resume already in progress");
@@ -2577,7 +2584,7 @@ export class SelectorController {
 					admission = await admitting;
 				} catch (error) {
 					if (!(error instanceof SessionHeldError)) throw error;
-					const forked = await this.#forkHeldSession(sessionPath, error);
+					const forked = await this.#forkHeldSession(sessionPath, error, options);
 					if (!forked) return;
 					if (forked.kind === "continued") admission = forked.admission;
 					else {
@@ -2714,6 +2721,7 @@ export class SelectorController {
 	async #forkHeldSession(
 		sessionPath: string,
 		probed: SessionHeldError,
+		warning?: { readonly cancelledStatus?: string; readonly continueHere?: boolean },
 	): Promise<
 		| {
 				readonly kind: "forked";
@@ -2727,19 +2735,22 @@ export class SelectorController {
 	> {
 		// The session's own agent dir and claim decision, as the launch and this switch's admission use.
 		const agentDir = this.ctx.settings.getAgentDir();
-		// Waiting for a launched host to publish shows in the status line; quitting ends the wait.
-		const stop = new AbortController();
-		const offStop = this.ctx.onStop?.(() => stop.abort());
-		let check: SessionHandoverCheck;
-		try {
-			check = await checkSessionHandover(probed, agentDir, {
-				signal: stop.signal,
-				onWaiting: () => this.ctx.showStatus(SESSION_HOST_WAITING_MESSAGE),
-			});
-		} finally {
-			offStop?.();
+		// A refused turn on the current session offers Fork and Cancel only, so it looks up no handover.
+		let check: SessionHandoverCheck = { error: probed, target: undefined };
+		if (warning?.continueHere !== false) {
+			// Waiting for a launched host to publish shows in the status line; quitting ends the wait.
+			const stop = new AbortController();
+			const offStop = this.ctx.onStop?.(() => stop.abort());
+			try {
+				check = await checkSessionHandover(probed, agentDir, {
+					signal: stop.signal,
+					onWaiting: () => this.ctx.showStatus(SESSION_HOST_WAITING_MESSAGE),
+				});
+			} finally {
+				offStop?.();
+			}
+			if (this.ctx.isStopped?.()) return undefined;
 		}
-		if (this.ctx.isStopped?.()) return undefined;
 		// The holder let go while the warning waited: take the switch's admission claim as for an unheld session.
 		if (!check.error)
 			return { kind: "continued", admission: await this.ctx.sessionManager.switchTargetAdmission(sessionPath) };
@@ -2762,7 +2773,7 @@ export class SelectorController {
 					continue;
 				}
 				case "cancel":
-					this.ctx.showStatus("Resume cancelled");
+					this.ctx.showStatus(warning?.cancelledStatus ?? "Resume cancelled");
 					return undefined;
 				default: {
 					const unknown: never = choice;
