@@ -53,7 +53,14 @@ const worker = path.join(import.meta.dirname, "fixtures", "shared-session-append
 function spawnWorker(cwd: string, agentDir: string, file: string, label: string, signals: string, timeout?: string) {
 	const args = [process.execPath, worker, cwd, agentDir, file, label, "3", signals];
 	if (timeout !== undefined) args.push(timeout);
-	const child = Bun.spawn(args, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	// Two writers on one session exist only below the default `enforce`; these workers cover the
+	// shared-publication layer `observe` still runs (single-owner step 10 retargets them).
+	const child = Bun.spawn(args, {
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, GJC_SESSION_OWNERSHIP: "observe" },
+	});
 	children.push(child);
 	const stdout = new Response(child.stdout).text();
 	const stderr = new Response(child.stderr).text();

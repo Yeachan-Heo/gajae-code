@@ -1248,6 +1248,43 @@ test("ACP projects a direct prompt_failed request rejection with retryability", 
 	}
 });
 
+test("ACP names the holder when the host refuses a turn on a session another process holds", async () => {
+	// The control response a session host sends when its turn gate finds the session held (enforce).
+	const message = "Session held-ses is open for writing in another process (terminal, pid 4242).";
+	const fixture = await createFixture({
+		promptAcknowledgementError: {
+			code: "live_session",
+			message,
+			holder: { surface: "terminal", pid: 4242 },
+		} as { code: string; message: string },
+	});
+	try {
+		const pending = prompt(fixture, "held prompt");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const rejection = await bounded(
+			pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+			"held prompt rejection",
+		);
+		const failure = acpRequestFailure(rejection) as RequestError;
+		expect(failure).toBeInstanceOf(RequestError);
+		expect(failure.code).toBe(-32603);
+		expect(failure.data).toMatchObject({
+			code: "live_session",
+			details: message,
+			holder: { surface: "terminal", pid: 4242 },
+		});
+		// A refusal is terminal for that prompt: no retry is sent, and the session is not failed.
+		await Bun.sleep(50);
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		expect(JSON.stringify(fixture.updates)).not.toContain("session_closed");
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP preserves classifier fields on a direct prompt_failed request rejection", async () => {
 	const fixture = await createFixture({
 		promptAcknowledgementError: {

@@ -282,6 +282,10 @@ function startTui(options: {
 		GJC_CODING_AGENT_DIR: options.agent,
 		GJC_AUTOMATION: "1",
 		GJC_NOTIFY: "off",
+		// Two writers on one session exist only below the default `enforce`, which gives the second
+		// TUI the held-session warning instead. These cases cover the shared-publication layer that
+		// `observe` still runs (single-owner step 10 retargets them), so they lower the mode.
+		GJC_SESSION_OWNERSHIP: "observe",
 	};
 	const pty = new PtySession();
 	let raw = "";

@@ -95,7 +95,15 @@ type Tui = {
 	received: () => number;
 };
 
-function startTui(options: { cli: string; cwd: string; root: string; agent: string; extra?: string[] }): Tui {
+function startTui(options: {
+	cli: string;
+	cwd: string;
+	root: string;
+	agent: string;
+	extra?: string[];
+	/** Lowers session ownership for this process (the env override can only lower it). */
+	ownership?: "observe" | "off";
+}): Tui {
 	const env: Record<string, string> = {
 		PATH: process.env.PATH ?? "/usr/bin:/bin",
 		LANG: process.env.LANG ?? "en_US.UTF-8",
@@ -105,6 +113,7 @@ function startTui(options: { cli: string; cwd: string; root: string; agent: stri
 		GJC_CODING_AGENT_DIR: options.agent,
 		GJC_AUTOMATION: "1",
 		GJC_NOTIFY: "off",
+		...(options.ownership ? { GJC_SESSION_OWNERSHIP: options.ownership } : {}),
 	};
 	const pty = new PtySession();
 	let raw = "";
@@ -539,13 +548,15 @@ describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI
 	it("never writes the shared transcript when /fork runs beside a peer TUI", async () => {
 		const { root, cwd, agent, sessions, cli, model } = await fixture();
 		try {
-			const a = startTui({ cli, cwd, root, agent });
+			// Two writers on one session exist only below the default `enforce`, which gives the
+			// second TUI the held-session warning instead; this case covers the shared layer.
+			const a = startTui({ cli, cwd, root, agent, ownership: "observe" });
 			await ready(a);
 			a.pty.write("fork-a1\r");
 			const shared = await only(sessions);
 			await replied(shared, "fork-a1");
 			const sessionId = (await readTranscript(shared)).header.id;
-			const b = startTui({ cli, cwd, root, agent, extra: ["--resume", sessionId] });
+			const b = startTui({ cli, cwd, root, agent, extra: ["--resume", sessionId], ownership: "observe" });
 			await ready(b);
 			b.pty.write("fork-b1\r");
 			await replied(shared, "fork-b1");

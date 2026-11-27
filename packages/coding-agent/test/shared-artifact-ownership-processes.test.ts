@@ -50,6 +50,9 @@ it.skipIf(process.platform === "win32")(
 			XDG_CACHE_HOME: path.join(root, "cache"),
 			XDG_RUNTIME_DIR: path.join(root, "run"),
 			GJC_CODING_AGENT_DIR: agentDir,
+			// Two writers on one session exist only below the default `enforce`; these workers cover the
+			// shared-publication layer `observe` still runs (single-owner step 10 retargets them).
+			GJC_SESSION_OWNERSHIP: "observe",
 			PI_CODING_AGENT_DIR: agentDir,
 			NO_COLOR: "1",
 			PI_NO_TITLE: "1",
