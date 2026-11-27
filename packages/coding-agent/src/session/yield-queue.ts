@@ -11,6 +11,12 @@ export interface YieldDispatcher<P> {
 	 * another origin (review thread P2).
 	 */
 	groupKey?(entry: P): string;
+	/**
+	 * Whether the entry may be delivered at a step boundary of a running turn
+	 * (see {@link YieldQueue.drainStepBoundary}). Entries without this predicate,
+	 * or for which it returns false, keep the before-yield and idle paths.
+	 */
+	deliverAtStepBoundary?(entry: P): boolean;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 }
@@ -52,6 +58,7 @@ type YieldFlushMode = "streaming" | "idle";
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
 	groupKey?: (entry: unknown) => string;
+	deliverAtStepBoundary?: (entry: unknown) => boolean;
 	build: (survivors: unknown[]) => AgentMessage | null;
 }
 
@@ -74,6 +81,9 @@ export class YieldQueue {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
 			...(dispatcher.groupKey ? { groupKey: entry => dispatcher.groupKey?.(entry as P) ?? "default" } : {}),
+			...(dispatcher.deliverAtStepBoundary
+				? { deliverAtStepBoundary: entry => dispatcher.deliverAtStepBoundary?.(entry as P) ?? false }
+				: {}),
 			build: survivors => dispatcher.build(survivors as P[]),
 		};
 		this.#dispatchers.set(kind, stored);
@@ -137,6 +147,39 @@ export class YieldQueue {
 			return;
 		}
 		await this.#flushEntries(mode, signal);
+	}
+
+	/**
+	 * Drain and build every entry whose dispatcher allows step-boundary delivery,
+	 * returning the messages for the running turn to consume directly. Ineligible
+	 * entries stay queued in order for the before-yield or idle flush, so each
+	 * entry is delivered by exactly one path.
+	 */
+	drainStepBoundary(): AgentMessage[] {
+		const messages: AgentMessage[] = [];
+		for (const [kind, dispatcher] of this.#dispatchers) {
+			const predicate = dispatcher.deliverAtStepBoundary;
+			if (!predicate) continue;
+			const entries = this.#entries.get(kind);
+			if (!entries || entries.length === 0) continue;
+			const eligible: unknown[] = [];
+			const retained: unknown[] = [];
+			for (const entry of entries) {
+				let deliverNow: boolean;
+				try {
+					deliverNow = predicate(entry);
+				} catch (error) {
+					logger.warn("Yield queue step-boundary check failed", { kind, error: formatError(error) });
+					deliverNow = false;
+				}
+				(deliverNow ? eligible : retained).push(entry);
+			}
+			if (eligible.length === 0) continue;
+			if (retained.length > 0) this.#entries.set(kind, retained);
+			else this.#entries.delete(kind);
+			messages.push(...(this.#build(kind, dispatcher, eligible) ?? []));
+		}
+		return messages;
 	}
 
 	async #flushEntries(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {

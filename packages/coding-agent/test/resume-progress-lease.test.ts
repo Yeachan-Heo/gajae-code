@@ -50,6 +50,7 @@ describe("resume progress lease", () => {
 			sessionManager: {
 				getSessionId: () => currentSessionId,
 				isManagedDestination: () => false,
+				switchTargetAdmission: () => undefined,
 				getSessionName: () => undefined,
 				getCwd: () => "/tmp",
 			},
@@ -113,6 +114,7 @@ describe("resume progress lease", () => {
 			sessionManager: {
 				getSessionId: () => "before",
 				isManagedDestination: () => false,
+				switchTargetAdmission: () => undefined,
 				getSessionName: () => undefined,
 				getCwd: () => "/tmp",
 			},

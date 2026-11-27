@@ -569,6 +569,7 @@ import {
 	FoldCoordinator,
 	type ForegroundFoldOutcome,
 } from "./fold-coordinator";
+import { sessionClaimSetOf } from "./internal/session-claim-set";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -2682,6 +2683,9 @@ const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
  */
 const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
 const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
+// A shared custom-message append refused as `stale/transcript_moved` committed nothing and is published again
+// against the relocated transcript; bounded so repeated relocations cannot loop.
+const SHARED_CUSTOM_APPEND_RELOCATION_RETRIES = 2;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -4509,6 +4513,12 @@ export class AgentSession {
 		message: BashExecutionMessage;
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
+		/**
+		 * Set to `#deferredRefusalSequence` when this row's own save was refused (and
+		 * reported), so a transition drops it without a retry. In practice only lease
+		 * contention under shared publication refuses one.
+		 */
+		refusedAt?: number;
 	}> = [];
 	/**
 	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
@@ -4581,6 +4591,7 @@ export class AgentSession {
 							job,
 							durationMs: undefined,
 							ownedCompletion,
+							foldReceipt: true,
 						});
 					} finally {
 						manager?.clearParkedDelivery(job.generation);
@@ -4669,7 +4680,17 @@ export class AgentSession {
 		message: PythonExecutionMessage;
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
+		/**
+		 * Set to `#deferredRefusalSequence` when this row's own save was refused (and
+		 * reported), so a transition drops it without a retry. In practice only lease
+		 * contention under shared publication refuses one.
+		 */
+		refusedAt?: number;
 	}> = [];
+	/** Counts refused deferred command-result saves; see `refusedAt`. */
+	#deferredRefusalSequence = 0;
+	/** `#deferredRefusalSequence` when the current session transition began. */
+	#transitionRefusalFloor = 0;
 	/** The one in-flight deferred command-result drain; later drains join it first. */
 	#executionMessageDrain: Promise<void> | undefined;
 	#activeEvalExecutions = new Set<Promise<unknown>>();
@@ -4928,6 +4949,13 @@ export class AgentSession {
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
+	/**
+	 * SDK terminal of a run a TTSR interrupt aborted, held for the resume that continues it.
+	 * Reserved by the agent_end handler while the resume is pending; the owning resume either
+	 * hands it to its continuation or releases it, so the original terminal publishes when no
+	 * continuation runs.
+	 */
+	#ttsrResumeAgentEndHold: { hold: symbol; sdkOwnership: SdkContinuationOwnership } | undefined = undefined;
 
 	/** One-shot flag set in InteractiveMode.#approvePlan(compactBeforeExecute=true)
 	 *  before the plan-mode → compaction transition. Consumed inside
@@ -5278,6 +5306,13 @@ export class AgentSession {
 		error: unknown;
 	}> = [];
 	#sessionTransitionCommitted = false;
+	/**
+	 * The claim-set transition this session transition holds open (single-owner design §2.5): no claim
+	 * is released until it ends, so the predecessor stays claimed until the switch commits, and a
+	 * rollback or hook cancel releases the target instead. Kept as a handle, not looked up at the end,
+	 * because a bounded fork swaps the manager inside the transition.
+	 */
+	#sessionClaimTransition: Disposable | undefined;
 	#sessionTransitionCompletion: Promise<void> = Promise.resolve();
 	#resolveSessionTransitionCompletion: (() => void) | undefined;
 	#queuedDeliveryPendingWhileTransition = false;
@@ -5357,6 +5392,8 @@ export class AgentSession {
 				{ code: "busy" },
 			);
 		}
+		// First fallible step, before any side effect: a throw here leaves no transition half begun.
+		const claimTransition = sessionClaimSetOf(this.sessionManager).transition();
 		if (["new-session", "switch-session", "clear-context", "fork", "branch", "navigate-tree"].includes(kind)) {
 			for (const controller of this.#configurationReloadControllers) controller.abort();
 		}
@@ -5366,6 +5403,9 @@ export class AgentSession {
 		this.#btwPrefixScopes = new WeakMap();
 		this.#sessionTransitionCommitted = false;
 		this.#sessionTransitionKind = kind;
+		this.#sessionClaimTransition = claimTransition;
+		// Refusals after this point (the transition's own abort included) bound its settle.
+		this.#transitionRefusalFloor = this.#deferredRefusalSequence;
 		const completion = Promise.withResolvers<void>();
 		this.#sessionTransitionCompletion = completion.promise;
 		this.#resolveSessionTransitionCompletion = completion.resolve;
@@ -5384,6 +5424,80 @@ export class AgentSession {
 		// predecessor history/identity mutation. A bounded failure retains the real
 		// work owner and leaves the predecessor generation valid.
 		await awaitBtwSettlement(this.#joinBtwTurns());
+	}
+
+	/**
+	 * Settle the predecessor before a history transition mutates its history or
+	 * identity: its deferred command results, then its /btw turns. Call only after the
+	 * main-agent abort. `/clear` keeps its own background-publication join.
+	 */
+	async #settlePredecessorForSessionTransition(): Promise<void> {
+		await this.#settlePredecessorPublicationsForTransition();
+		await this.#settleBtwForSessionTransition();
+	}
+
+	/**
+	 * Save the predecessor's deferred `!`/`$` results to the predecessor before a
+	 * transition replaces its history or session. The abort only waits for them while
+	 * the turn is live; once it has ended, its drain can still be publishing through
+	 * the shared lease and would append its later rows to the successor's agent state
+	 * and transcript. Join that whole flush (it is one tracked background publication,
+	 * both kinds), then publish every queued row whose own save has not been refused,
+	 * so each result lands once where it was typed.
+	 *
+	 * Nothing unsaved stays queued past this point, whether or not the transition then
+	 * commits, so no refused row is re-appended behind rows saved now. A row whose own
+	 * save was refused showed its notice and is dropped without a retry. A kind refused
+	 * since the transition began (by its own abort's flush, or by the drain joined here)
+	 * is not attempted again: under a lease
+	 * another writer keeps holding, each attempt costs a full lock-wait budget, so this
+	 * bounds the settle at one budget per kind. Every other row left unsaved is dropped
+	 * with a notice of its own.
+	 */
+	async #settlePredecessorPublicationsForTransition(): Promise<void> {
+		await this.#joinBackgroundPublications();
+		const blocked = "an earlier command result could not be saved";
+		const keepUnrefused = <T extends { refusedAt?: number }>(queue: T[]): void => {
+			const refusedSinceTransition = queue.some(pending => (pending.refusedAt ?? 0) > this.#transitionRefusalFloor);
+			const kept = queue.filter(pending => {
+				if (pending.refusedAt !== undefined) return false;
+				if (refusedSinceTransition) this.#reportBackgroundRefusal("deferred command result", blocked);
+				return !refusedSinceTransition;
+			});
+			queue.splice(0, queue.length, ...kept);
+		};
+		keepUnrefused(this.#pendingBashMessages);
+		keepUnrefused(this.#pendingPythonMessages);
+		try {
+			await this.#flushPendingPromptMessages();
+		} catch (error) {
+			logger.warn("Deferred command results were not saved before the session transition", {
+				error: String(error),
+			});
+		} finally {
+			// Rows queued behind a row refused just now were never attempted: report them too.
+			for (const pending of [...this.#pendingBashMessages, ...this.#pendingPythonMessages]) {
+				if (pending.refusedAt === undefined) this.#reportBackgroundRefusal("deferred command result", blocked);
+			}
+			this.#pendingBashMessages.length = 0;
+			this.#pendingPythonMessages.length = 0;
+		}
+	}
+
+	/**
+	 * At a transition's commit, drop deferred results still queued for the
+	 * predecessor, each with its notice. The settle leaves nothing queued; this only
+	 * catches a result recorded between the settle and the commit (an auto-triggered
+	 * handoff's prompt lifecycle), which the next prompt would otherwise append to the
+	 * successor.
+	 */
+	#dropUnsavedDeferredResultsAtCommit(): void {
+		const unsaved = this.#pendingBashMessages.length + this.#pendingPythonMessages.length;
+		for (let row = 0; row < unsaved; row++) {
+			this.#reportBackgroundRefusal("deferred command result", "the session changed before it could be saved");
+		}
+		this.#pendingBashMessages.length = 0;
+		this.#pendingPythonMessages.length = 0;
 	}
 
 	#commitSessionTransition(): void {
@@ -5427,6 +5541,14 @@ export class AgentSession {
 	}
 
 	#endSessionTransition(): void {
+		const claimTransition = this.#sessionClaimTransition;
+		this.#sessionClaimTransition = undefined;
+		try {
+			claimTransition?.[Symbol.dispose]();
+		} catch (error) {
+			// A failed unlock must not keep the transition lease busy.
+			logger.warn("Session claim settle failed at transition end", { error: String(error) });
+		}
 		this.#sessionTransitionKind = undefined;
 		this.#sessionTransitionCommitted = false;
 		const resolveCompletion = this.#resolveSessionTransitionCompletion;
@@ -6301,7 +6423,16 @@ export class AgentSession {
 		return false;
 	}
 
-	async #flushPendingPromptMessages(): Promise<void> {
+	/**
+	 * The whole flush is one tracked background publication, so
+	 * {@link #joinBackgroundPublications} covers rows its drain has not reached yet,
+	 * not only the row currently at the lease.
+	 */
+	#flushPendingPromptMessages(): Promise<void> {
+		return this.#trackBackgroundPublication(this.#drainPendingPromptMessages());
+	}
+
+	async #drainPendingPromptMessages(): Promise<void> {
 		const errors: unknown[] = [];
 		try {
 			await this.#flushPendingBashMessages();
@@ -6988,6 +7119,26 @@ export class AgentSession {
 			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Step-boundary delivery: eligible entries (ordinary async results, MCP
+		// notifications) reach the running turn at its next tool step instead of
+		// waiting for before-yield, which would force an extra iteration after the
+		// final answer. Entries whose ownership classifies "fresh" or "drop" and
+		// fold receipts are ineligible by their dispatcher and keep the
+		// before-yield/idle path above. Transitions, abort unwinds and disposal
+		// leave the queue untouched.
+		this.agent.setStepBoundaryMessageProvider(() => {
+			if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return [];
+			if (this.#abortUnwind !== undefined || this.#isDisposed || this.#sessionAdmissionClosing) return [];
+			const messages = this.yieldQueue.drainStepBoundary();
+			// This is the delivery boundary for these messages (the loop commits
+			// them synchronously), so settle their terminal owned registrations as
+			// onFollowUpConsumed does; unsettled tuples would fill the bounded
+			// registry until later owned aborts fail closed. No SDK run token or
+			// fresh lineage applies: these entries were never queued as SDK input
+			// and "fresh" entries are not eligible here.
+			this.#settleDeliveredOwnedRegistrations(messages);
+			return messages;
+		});
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
 		// to the folded turn instead of pausing everything that follows. The
@@ -8296,6 +8447,7 @@ export class AgentSession {
 		lease: OwnerSubagentShutdownLease,
 		ownerId: string,
 		predecessorEndpointId: string,
+		predecessorSessionId: string,
 	): void {
 		const finalization = (async () => {
 			while (!this.#isDisposed) {
@@ -8327,6 +8479,9 @@ export class AgentSession {
 		})();
 		this.#deferredOwnerShutdownFinalizations.add(finalization);
 		void finalization.finally(() => this.#deferredOwnerShutdownFinalizations.delete(finalization));
+		// The predecessor's claim waits for this finalization, at most the cap (design §2.5). Scheduled
+		// inside the switch's open claim-set transition, so the claim is still in the set to hold.
+		sessionClaimSetOf(this.sessionManager).holdUntil(predecessorSessionId, finalization);
 	}
 
 	#suppressOwnAsyncJobDeliveries(): void {
@@ -8350,13 +8505,21 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
+	/**
+	 * Emit an event to all listeners without letting one subscriber poison lifecycle settlement.
+	 * Subscribers run outside this session's admission context: an event emitted inside an
+	 * admitted turn (auto_compaction_end from pre-prompt maintenance) must not hand that turn's
+	 * admission ownership to subscriber continuations, or a UI replay of input queued during
+	 * compaction is refused as same-session reentrancy and stranded.
+	 */
 	#emit(event: AgentSessionEvent): void {
-		for (const listener of this.#eventListenerSnapshot) {
-			deliverSessionEvent(listener, event, error => {
-				logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
-			});
-		}
+		this.#sessionAdmissionContext.exit(() => {
+			for (const listener of this.#eventListenerSnapshot) {
+				deliverSessionEvent(listener, event, error => {
+					logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
+				});
+			}
+		});
 	}
 
 	/** Notify UI projections after a committed session-identity transition. */
@@ -9468,6 +9631,20 @@ export class AgentSession {
 		}
 
 		await this.#emitSessionEvent(displayEvent, eventLease);
+		// A TTSR interrupt ended this SDK run only to resume it. Hold its terminal for that resume,
+		// like the other continuations, so the SDK prompt is not settled as cancelled while the
+		// agent continues. The owning resume hands the hold to its continuation or releases it.
+		if (
+			event.type === "agent_end" &&
+			ttsrResumePendingAtTerminal &&
+			this.#ttsrAbortPending &&
+			event.stopReason === "cancelled" &&
+			terminalSdkOwnership
+		) {
+			this.#releaseTtsrResumeAgentEndHold();
+			const hold = this.#reserveDeferredAgentEndForContinuation(attemptScope);
+			if (hold) this.#ttsrResumeAgentEndHold = { hold, sdkOwnership: terminalSdkOwnership };
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
@@ -9829,7 +10006,15 @@ export class AgentSession {
 				msg.provider === "github-copilot" &&
 				msg.errorMessage?.includes("GitHub Copilot authentication failed")
 			) {
-				await this.#modelRegistry.authStorage.remove("github-copilot");
+				try {
+					await this.#modelRegistry.authStorage.remove("github-copilot");
+				} catch (error) {
+					// The credential is still stored; the next authentication failure retries the
+					// invalidation. Post-turn handling must still run.
+					logger.warn("Failed to invalidate GitHub Copilot credentials after an auth failure", {
+						error: String(error),
+					});
+				}
 			}
 
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
@@ -10151,6 +10336,19 @@ export class AgentSession {
 		this.#ttsrResumeResolve();
 		this.#ttsrResumeResolve = undefined;
 		this.#ttsrResumePromise = undefined;
+	}
+
+	/** Take the held interrupted SDK terminal for the resume that continues it. */
+	#takeTtsrResumeAgentEndHold(): { hold: symbol; sdkOwnership: SdkContinuationOwnership } | undefined {
+		const held = this.#ttsrResumeAgentEndHold;
+		this.#ttsrResumeAgentEndHold = undefined;
+		return held;
+	}
+
+	/** A TTSR resume that will not continue publishes the interrupted terminal it held. */
+	#releaseTtsrResumeAgentEndHold(): void {
+		const held = this.#takeTtsrResumeAgentEndHold();
+		if (held) this.#releaseDeferredAgentEndContinuation(held.hold);
 	}
 
 	/**
@@ -11581,8 +11779,25 @@ export class AgentSession {
 		// The resume continues this request. Captured by identity so that whichever way the resume ends, a
 		// late cleanup can only end the request it was scheduled for, never a newer admission's.
 		const recapRequest = this.#recapRequest;
+		// A throw before the continuation takes over (for example a failed injection marker append)
+		// must not strand the held SDK terminal or leave the interrupt pending.
+		const releaseOnThrow =
+			(task: (signal: AbortSignal) => Promise<void>) =>
+			async (signal: AbortSignal): Promise<void> => {
+				try {
+					await task(signal);
+				} catch (error) {
+					if (this.#ttsrRetryToken === retryToken) {
+						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
+						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
+					}
+					throw error;
+				}
+			};
 		this.#schedulePostPromptTask(
-			async signal => {
+			releaseOnThrow(async signal => {
 				if (this.#ttsrRetryToken !== retryToken) {
 					// A newer interrupt owns the resume (and the same request); leave the request to it.
 					this.#resolveTtsrResume();
@@ -11592,6 +11807,7 @@ export class AgentSession {
 					this.#ttsrAbortPending = false;
 					this.#pendingTtsrInjections = [];
 					this.#releasePerToolTtsrInjections();
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 					return;
@@ -11707,6 +11923,7 @@ export class AgentSession {
 					if (!ownsRetry()) return;
 					this.#ttsrAbortPending = false;
 					releaseCarriedTtsr();
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 				};
@@ -11868,30 +12085,40 @@ export class AgentSession {
 					// the still-eligible rule when this session is reopened.
 					this.#markTtsrInjected(details.rules, publicationFailure === undefined, ttsrMessageCount);
 				}
+				// The continuation inherits the held SDK terminal and its owner, like overflow retry and
+				// auto-retry: the resumed run settles the SDK prompt, and skip or failure releases the
+				// hold so the interrupted terminal still publishes.
+				const heldTerminal = this.#takeTtsrResumeAgentEndHold();
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
 					generation,
+					predecessorAgentEndHold: heldTerminal?.hold,
+					sdkOwnership: heldTerminal?.sdkOwnership,
 					// Owner-guarded like the outer onSkip: a newer interrupt may own the resume.
 					shouldContinue: () => {
 						if (this.#ttsrRetryToken !== retryToken) return false;
 						this.#ttsrAbortPending = false;
+						// A terminal reserved after the hold was taken has no continuation to inherit it.
+						this.#releaseTtsrResumeAgentEndHold();
 						return true;
 					},
 					onSkip: () => {
 						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					onError: () => {
 						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					resourceRunId: activePromptHandle,
 				});
-			},
+			}),
 			{
 				delayMs: 50,
 				resourceRunId: activePromptHandle,
@@ -11900,6 +12127,7 @@ export class AgentSession {
 				onSkip: () => {
 					if (this.#ttsrRetryToken !== retryToken) return;
 					this.#ttsrAbortPending = false;
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 				},
@@ -13300,6 +13528,7 @@ export class AgentSession {
 		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
+		this.agent.setStepBoundaryMessageProvider(undefined);
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await awaitDisposeStep(
@@ -17622,14 +17851,40 @@ export class AgentSession {
 				observationId,
 			);
 		}
-		const outcome = await this.sessionManager.appendCustomMessageEntrySharingSession(
-			customType,
-			content,
-			display,
-			details,
-			attribution,
-			observationId,
-		);
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const publish = () =>
+			manager.appendCustomMessageEntrySharingSession(
+				customType,
+				content,
+				display,
+				details,
+				attribution,
+				observationId,
+			);
+		let outcome = await publish();
+		// A relocation of this session's transcript (a task child following its parent's session move) between the
+		// append capturing its path and its transaction refuses the append before any write. Nothing was committed, so
+		// it is published again against the relocated transcript; the caller's in-memory message is not touched. Only
+		// for the same manager, session id and identity generation, and outside every session transition: a switch or
+		// copy reports the same reason and must not receive this entry, and while it is being adopted the successor's
+		// transcript can already be in place before the id or generation changes. Every other outcome stays final,
+		// since an `unknown` one may already be committed.
+		for (
+			let retry = 0;
+			retry < SHARED_CUSTOM_APPEND_RELOCATION_RETRIES &&
+			outcome.kind === "stale" &&
+			outcome.reason === "transcript_moved" &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.sessionManager === manager &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionIdentityGeneration() === identityGeneration;
+			retry++
+		) {
+			outcome = await publish();
+		}
 		if (outcome.kind !== "committed") {
 			throw new Error(
 				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
@@ -17842,12 +18097,31 @@ export class AgentSession {
 	 * the attempted id: the caller must never re-append it under a new id.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
+		// Every failed save is reported, so a row the caller drops is never dropped silently.
+		const reportThrown = (error: unknown): never => {
+			this.#reportBackgroundRefusal(label, error instanceof Error ? error.message : String(error));
+			throw error;
+		};
 		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendMessage(message);
+			try {
+				this.sessionManager.appendMessage(message);
+			} catch (error) {
+				reportThrown(error);
+			}
 			return;
 		}
-		const outcome = await this.#trackBackgroundPublication(this.sessionManager.appendMessageSharingSession(message));
-		if (outcome.kind !== "committed") {
+		const outcome = await this.#trackBackgroundPublication(
+			this.sessionManager.appendMessageSharingSession(message),
+		).catch(reportThrown);
+		if (outcome.kind === "unknown") {
+			// The entry may already be durable: do not report it as unsaved.
+			if (!this.#isDisposed)
+				this.emitNotice(
+					"warning",
+					`The ${label} may not have been saved to this session (outcome unknown).`,
+					"session-publication",
+				);
+		} else if (outcome.kind !== "committed") {
 			const cause = describeSharedAppendFailure(outcome);
 			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
 		}
@@ -22422,7 +22696,7 @@ export class AgentSession {
 					await Bun.sleep(10);
 				}
 			}
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 			this.#cancelOwnAsyncJobs();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
@@ -22461,6 +22735,7 @@ export class AgentSession {
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
+			this.#dropUnsavedDeferredResultsAtCommit();
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.#initializeNewSessionState(nextDiscoverySessionNonMCPToolNames, previousSessionFile);
 			if (options?.drop && previousSessionFile) {
@@ -22507,7 +22782,7 @@ export class AgentSession {
 				return false;
 			}
 
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId))) {
 				throw new Error("Owned async deliveries did not settle before session replacement.");
 			}
@@ -22551,6 +22826,7 @@ export class AgentSession {
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
+			this.#dropUnsavedDeferredResultsAtCommit();
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.#initializeNewSessionState(nextDiscoverySessionNonMCPToolNames, previousSessionFile);
 			if (options?.drop && previousSessionFile) {
@@ -22963,7 +23239,7 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flushBeforeLeaving();
@@ -23014,6 +23290,7 @@ export class AgentSession {
 					try {
 						await forkedManager.close();
 					} catch (closeError) {
+						forkedManager.retryCloseInBackground();
 						cleanupErrors.push(closeError);
 						logger.warn("Bounded fork successor close failed after initialization failure", {
 							error: closeError instanceof Error ? closeError.message : String(closeError),
@@ -23042,6 +23319,7 @@ export class AgentSession {
 				try {
 					await previousManager.close();
 				} catch (error) {
+					previousManager.retryCloseInBackground();
 					logger.warn("Previous session close failed after bounded fork adoption", {
 						error: error instanceof Error ? error.message : String(error),
 					});
@@ -28237,7 +28515,7 @@ export class AgentSession {
 			}
 
 			try {
-				await this.#settleBtwForSessionTransition();
+				await this.#settlePredecessorForSessionTransition();
 			} catch (error) {
 				// Retirement can refuse before the transaction owns rollback. Preserve
 				// the generated document without wrapping its unknown-effect error.
@@ -28328,6 +28606,7 @@ export class AgentSession {
 				this.#steeringMessages = [];
 				this.#followUpMessages = [];
 				this.#pendingNextTurnMessages = [];
+				this.#dropUnsavedDeferredResultsAtCommit();
 				this.#scheduledHiddenNextTurnGeneration = undefined;
 				this.#todoReminderCount = 0;
 				this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "handoff" } });
@@ -34211,7 +34490,7 @@ export class AgentSession {
 	 * only what the earlier one left queued, behind the entry that failed.
 	 */
 	async #flushPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean; refusedAt?: number }>,
 		kind: "bash" | "python",
 	): Promise<void> {
 		while (this.#executionMessageDrain) {
@@ -34229,7 +34508,7 @@ export class AgentSession {
 	}
 
 	async #drainPendingExecutionMessages<T extends BashExecutionMessage | PythonExecutionMessage>(
-		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean }>,
+		pendingMessages: Array<{ message: T; onPersisted?: () => void; appendedToAgent: boolean; refusedAt?: number }>,
 		kind: "bash" | "python",
 	): Promise<void> {
 		const total = pendingMessages.length;
@@ -34276,7 +34555,10 @@ export class AgentSession {
 				// session closes below with that receipt instead.
 				if (error instanceof SharedControlPublicationError && error.outcome.kind === "unknown")
 					unconfirmed.push(...error.outcome.ids);
-				else remaining.push(pending);
+				else {
+					pending.refusedAt = ++this.#deferredRefusalSequence;
+					remaining.push(pending);
+				}
 				continue;
 			}
 
@@ -34298,7 +34580,7 @@ export class AgentSession {
 			unconfirmed.length > 0
 				? `Could not confirm ${unconfirmed.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"} (attempted ids: ${unconfirmed.join(", ")}); ${persistedCount} persisted, ${remaining.length} not written; the session was closed to protect its history`
 				: persistenceFailureCount > 0
-					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry`
+					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them`
 					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
@@ -35317,8 +35599,22 @@ export class AgentSession {
 	 * Aborts current operation, loads messages, restores model/thinking.
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
+	 * @throws SessionHeldError under enforce, before any event, for a target another process holds
 	 */
 	async switchSession(
+		sessionPath: string,
+		options?: {
+			transition?: SessionSwitchEvent["transition"];
+			onTransitionMutationStarted?: () => void;
+		},
+	): Promise<boolean> {
+		// The admission claim covers the target until the rotation's own claim lands (design §1 row 9).
+		return this.sessionManager.withSwitchTargetAdmission(sessionPath, () =>
+			this.#switchSessionAdmitted(sessionPath, options),
+		);
+	}
+
+	async #switchSessionAdmitted(
 		sessionPath: string,
 		options?: {
 			transition?: SessionSwitchEvent["transition"];
@@ -35399,7 +35695,7 @@ export class AgentSession {
 				while (this.isCompacting) await Bun.sleep(10);
 			}
 
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flushBeforeLeaving();
 			const previousSessionState = await this.sessionManager.captureRollbackState();
@@ -35793,8 +36089,7 @@ export class AgentSession {
 					// Deferred bash and python rows belong to the predecessor file.
 					// Leaving them queued lets the next prompt append that command
 					// text to the successor transcript.
-					this.#pendingBashMessages.length = 0;
-					this.#pendingPythonMessages.length = 0;
+					this.#dropUnsavedDeferredResultsAtCommit();
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -35814,6 +36109,7 @@ export class AgentSession {
 								ownerShutdownLease,
 								ownerId,
 								predecessorEndpointId,
+								previousSessionState.sessionId,
 							);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
@@ -36171,7 +36467,7 @@ export class AgentSession {
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flushBeforeLeaving();
@@ -36529,7 +36825,11 @@ export class AgentSession {
 			if (!targetEntry) {
 				throw new Error(`Entry ${targetId} not found`);
 			}
-			// Collect entries to summarize (from old leaf to common ancestor).
+			// Collect entries to summarize (from old leaf to common ancestor). Deferred `!`/`$`
+			// rows the settle saves onto this branch later are not in it: the settle must follow
+			// the abort below, which must follow the cancellable `session_before_tree` hook, and
+			// that hook receives these entries and may return its own summary from them, so
+			// collecting again after the abort would split what it saw from what is summarized.
 			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
 				this.sessionManager,
 				oldLeafId,
@@ -36645,7 +36945,7 @@ export class AgentSession {
 				newLeafId = targetId;
 			}
 
-			await this.#settleBtwForSessionTransition();
+			await this.#settlePredecessorForSessionTransition();
 
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch

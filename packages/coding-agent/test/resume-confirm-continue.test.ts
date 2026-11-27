@@ -272,6 +272,7 @@ describe("bare resume startup gating", () => {
 				({
 					getAgentDir: () => agentDir,
 					get: () => "copy-retain",
+					getGlobal: () => undefined,
 				}) as unknown as Settings,
 			listManagedForResumePickerReadOnly: async (_cwd, managedAgentDir) => {
 				listedAgentDir = managedAgentDir;
@@ -301,7 +302,11 @@ describe("bare resume startup gating", () => {
 				throw new Error("explicit picker inventory must not resolve a managed root");
 			},
 			loadSettingsForScope: async () =>
-				({ getAgentDir: () => "/custom-agent", get: () => "copy-retain" }) as unknown as Settings,
+				({
+					getAgentDir: () => "/custom-agent",
+					get: () => "copy-retain",
+					getGlobal: () => undefined,
+				}) as unknown as Settings,
 			listForResumePickerReadOnly: async () => {
 				return [sessionInfo];
 			},
@@ -321,6 +326,7 @@ describe("explicit resume destination authority", () => {
 		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "enabled" : "copy-retain"),
+			getGlobal: (key: SettingPath) => (key === "session.ownership.mode" ? "off" : undefined),
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 		for (const resume of ["/source/session.jsonl", "session.jsonl"]) {
@@ -337,6 +343,7 @@ describe("explicit resume destination authority", () => {
 			undefined,
 			"copy-retain",
 			"enabled",
+			{ surface: "sdk", mode: "off" },
 		);
 		expect(open).toHaveBeenNthCalledWith(
 			2,
@@ -345,6 +352,7 @@ describe("explicit resume destination authority", () => {
 			undefined,
 			"copy-retain",
 			"enabled",
+			{ surface: "sdk", mode: "off" },
 		);
 	});
 
@@ -352,6 +360,7 @@ describe("explicit resume destination authority", () => {
 		const open = vi.spyOn(SessionManager, "open").mockResolvedValue({} as SessionManager);
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "off" : "copy-retain"),
+			getGlobal: (key: SettingPath) => (key === "session.ownership.mode" ? "off" : undefined),
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 
@@ -363,6 +372,7 @@ describe("explicit resume destination authority", () => {
 			undefined,
 			"copy-retain",
 			"off",
+			{ surface: "sdk", mode: "off" },
 		);
 	});
 
@@ -381,6 +391,7 @@ describe("explicit resume destination authority", () => {
 		try {
 			const resumed = await createSessionManager(parseArgs(["--resume", id]), cwd, {
 				get: () => "copy-retain",
+				getGlobal: () => undefined,
 				getAgentDir: () => agentDir,
 			} as unknown as Settings);
 			expect(resumed?.getSessionId()).toBe(id);
@@ -407,6 +418,7 @@ describe("direct fork destination authority", () => {
 		try {
 			const fork = await createSessionManager(parseArgs(["--fork", id]), cwd, {
 				get: () => "copy-retain",
+				getGlobal: () => undefined,
 				getAgentDir: () => agentDir,
 			} as unknown as Settings);
 			expect(fork?.getSessionId()).not.toBe(id);
@@ -434,6 +446,7 @@ describe("normal session startup open errors", () => {
 		using sessionDir = TempDir.createSync("@gjc-session-open-missing-");
 		const activeSettings = {
 			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "off" : "copy-retain"),
+			getGlobal: () => undefined,
 			getAgentDir: () => "/managed-agent",
 		} as unknown as Settings;
 

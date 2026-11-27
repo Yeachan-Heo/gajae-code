@@ -2047,7 +2047,9 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 				expect(append).not.toHaveBeenCalled();
 				expect(replace).not.toHaveBeenCalled();
 				expect(legacyAppend).not.toHaveBeenCalled();
-				expect(sharedAppend.mock.calls.filter(([customType]) => customType === "ttsr-injection")).toHaveLength(1);
+				// The refusal stays `transcript_moved` on every attempt: the first one plus the bounded publications
+				// AgentSession makes again for an append a relocation refused before writing.
+				expect(sharedAppend.mock.calls.filter(([customType]) => customType === "ttsr-injection")).toHaveLength(3);
 				expect(await Bun.file(path.join(tempDir, "managed.ts")).exists()).toBe(false);
 				const persisted = await Bun.file(file).text();
 				expect(persisted).not.toContain('"ttsr_injection"');

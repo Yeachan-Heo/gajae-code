@@ -4,12 +4,13 @@
  * `session-ownership-writer-inventory.test.ts`.
  *
  * Every own property of the SessionManager constructor is classified. Each writer then runs
- * against real transcripts with ownership `observe` and no claim, in each scenario that reaches a
- * different write path. Each write to a transcript must follow a detector call for that
- * transcript's own session id (the write ledger), every changed transcript must have been
- * reported under its id, and no detector call may go unanswered for want of a bound id (a factory
- * writes before its manager binds). In `off`, with the strict seam on, the same scenarios count
- * and log nothing. Writers a later step covers are listed with that step.
+ * against real transcripts with ownership `observe`, in each scenario that reaches a different
+ * write path. The factory claims its id before its first write (single-owner design §2.4): each
+ * write to a transcript must follow a detector call for that transcript's own session id (the
+ * write ledger), no detector call may find the id unclaimed, none may go unanswered for want of a
+ * bound id, and the returned manager holds its own id until close. With claims not taken (the session
+ * held elsewhere), the detector still catches each publish. In `off`, with the strict seam on, the same scenarios count
+ * and log nothing. Writers covered elsewhere are listed with where.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsSync from "node:fs";
@@ -17,7 +18,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
+import { FileLockAcquireStatus, FileLockProbeState } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import type { MemoryGuardSessionManagerCheckpointV1 } from "../../src/session/memory-guard-checkpoint-participant";
 import { type SessionDestination, SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
@@ -30,6 +33,14 @@ import { expectStrictDetections, outsideStrictSeam, useStrictWriteDetection } fr
 import { spyOnTranscriptWrites, type TranscriptWriteLedger } from "./transcript-write-ledger";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
+/**
+ * Every claim finds the session held elsewhere, so factories go on without one and the detector alone
+ * guards the writes. Not a fail-open answer: the detector is quiet for a claim that failed open.
+ */
+const UNCLAIMED_LOCKS = {
+	tryAcquire: async () => ({ status: FileLockAcquireStatus.Held }),
+	probe: async () => ({ state: FileLockProbeState.Free }),
+};
 const roots: string[] = [];
 const managers: SessionManager[] = [];
 let detectorLogs: { site: string; sessionId: string }[] = [];
@@ -56,6 +67,7 @@ afterEach(async () => {
 	} finally {
 		delete SessionOwnershipTestHooks.mode;
 		delete SessionOwnershipTestHooks.strictWriteDetection;
+		delete SessionOwnershipTestHooks.lockBackend;
 		delete SessionManagerTestHooks.eagerHydrationMaxBytesOverride;
 		vi.restoreAllMocks();
 		resetSessionOwnershipForTests();
@@ -218,6 +230,10 @@ async function attribute(kind: Kind, run: Run) {
 	} catch (caught) {
 		error = caught;
 	}
+	/** Ids the returned managers bound without holding their claim. */
+	const unclaimed = managers
+		.filter(manager => !sessionClaimSetOf(manager).has(manager.getSessionId()))
+		.map(manager => manager.getSessionId());
 	// Close may pay rewrite debt an open left behind.
 	await closeManagers();
 	const after = await transcripts(f.root);
@@ -227,8 +243,9 @@ async function attribute(kind: Kind, run: Run) {
 		touched,
 		error,
 		detected: sessionOwnershipCounters().session_write_without_claim - detectedBefore,
-		/** Changed transcripts whose session id the detector never reported. */
-		unreported: touched.filter(id => !reported.has(id)),
+		/** Changed transcripts whose session id the detector reported. */
+		reported: touched.filter(id => reported.has(id)),
+		unclaimed,
 		/** Commits no check for their own session covered, and changes no spied primitive made. */
 		unattributed: [
 			...writes.uncovered,
@@ -353,6 +370,9 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Run> = {
 	inMemory: async f => SessionManager.inMemory(f.cwd),
 	captureTranscriptStrict: async f => identity(f.existing),
 	inspectSessionTailReadOnly: f => SessionManager.inspectSessionTailReadOnly(f.existing),
+	// A header read and a probe, never a claim; under enforce it still writes nothing.
+	probeHeldTranscript: async f =>
+		SessionManager.probeHeldTranscript(f.existing, { surface: "terminal", mode: "enforce" }),
 	openReadOnlySnapshot: f => SessionManager.openReadOnlySnapshot(f.existing),
 	readSessionRecapReadOnly: async f => {
 		const stat = await fs.stat(f.existing, { bigint: true });
@@ -374,15 +394,15 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Run> = {
 		SessionManager.inventorySessionsStrict(f.cwd, { sessionDir: path.dirname(f.existing) }),
 };
 
-/** Writers this step does not cover; the step named in each reason does. Not run here. */
+/** Writers not run here: a later step covers them, or the test named in the reason does. */
 const DEFERRED_WRITERS: Record<string, string> = {
 	setSessionStarredForPicker: "picker write of any session; scoped claims cover picker writes (4d)",
 	deleteManagedCandidate: "deletes a session; delete ownership is the scoped-claim step (4d)",
 	prepareManagedCandidateForWrite:
-		"open-time migration of a candidate from a legacy directory, before any manager exists. Open and continueRecent claim the candidate first (4b); forkFrom's migration of its source is pending a design decision (a scoped claim of the source when free, reading it in place when held)",
-	openNestedManaged: "a child session under its parent's store; children claim their own ids (4b class rules)",
-	stagedNestedManaged: "a staged child; staged sessions claim at commit (4b)",
-	openStagedNestedManaged: "a staged child; staged sessions claim at commit (4b)",
+		"migration of a legacy-directory candidate under a scoped claim, read in place for a held fork source (session-factory-claims.test.ts)",
+	openNestedManaged: "a subagent child: exempt until per-child claims (design §13 L2; session-factory-claims.test.ts)",
+	stagedNestedManaged: "a staged subagent child: exempt until per-child claims (design §13 L2)",
+	openStagedNestedManaged: "a staged subagent child: exempt until per-child claims (design §13 L2)",
 };
 
 /** A memory-guard checkpoint of `source`, taken outside the measured tree. */
@@ -421,7 +441,7 @@ async function checkpointOf(source: string) {
  */
 const STAGED_WRITERS: Record<string, { readonly reason: string; readonly run: Run }> = {
 	openStaged: {
-		reason: "an unpublished staged child below .staging; staged sessions claim at commit (4b)",
+		reason: "an unpublished staged subagent child below .staging; exempt until per-child claims (design §13 L2)",
 		run: f => SessionManager.openStaged(f.missing),
 	},
 	restoreMemoryGuardCheckpoint: {
@@ -456,20 +476,18 @@ describe.if(supported)("session ownership static writer inventory", () => {
 	for (const [name, scenarios] of Object.entries(CHECKED_WRITERS)) {
 		for (const [scenario, run] of Object.entries(scenarios)) {
 			for (const kind of ["managed", "explicit"] as const) {
-				it(`${name} (${scenario}, ${kind}): every transcript write without a claim is detected`, async () => {
+				it(`${name} (${scenario}, ${kind}): claims its id before every transcript write`, async () => {
 					const result = await attribute(kind, run);
 					expect(result.error).toBeUndefined();
-					expect(result.unreported).toEqual([]);
+					// Claimed before any write: no check found its id unclaimed, and the manager keeps it.
+					expect([result.detected, result.reported, result.unclaimed]).toEqual([0, [], []]);
 					// Each write follows a check for its own session; the events are in the failure message.
 					expect({ unattributed: result.unattributed, unbound: result.unbound }).toEqual({
 						unattributed: [],
 						unbound: [],
 						...(result.unattributed.length + result.unbound.length > 0 ? { events: result.events } : {}),
 					});
-					if (result.touched.length > 0) {
-						wrote.add(name);
-						expect(result.detected).toBeGreaterThan(0);
-					}
+					if (result.touched.length > 0) wrote.add(name);
 				});
 			}
 		}
@@ -557,9 +575,10 @@ describe.if(supported)("session ownership static writer inventory", () => {
 		};
 		for (const [name, { run, site }] of Object.entries(publishes)) {
 			for (const kind of ["managed", "explicit"] as const) {
-				it(`${name} (${kind}) is refused before it publishes`, async () => {
+				it(`${name} (${kind}), its claim not taken, is refused before it publishes`, async () => {
 					const f = await outsideStrictSeam(() => fixture(kind));
 					const before = await transcripts(f.root);
+					SessionOwnershipTestHooks.lockBackend = UNCLAIMED_LOCKS;
 					writes.reset();
 					await expect(run(f).then(keep)).rejects.toMatchObject({
 						name: "SessionWriteWithoutClaimError",

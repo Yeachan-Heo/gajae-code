@@ -7225,11 +7225,70 @@ let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
 
-// Session ownership reads its global-only mode from the process settings. Injected, because the
-// session modules sit below config in the import graph.
+/**
+ * The operator's `session.ownership.mode` from the agent directory's config.yml, for a process that
+ * never ran `Settings.init` (an SDK embedding with isolated settings), read once per path. Sync,
+ * because sync session factories resolve the mode. A missing or malformed file reads as unset, as the
+ * loader treats it. Any other read error (EACCES, EMFILE, a directory in the file's place) resolves to
+ * `off`: deliberately more conservative than the loader, so a file that cannot be read never lifts an
+ * `off` the operator may have set in it. That answer is not cached, because the error may be
+ * transient: the next read tries the file again. The warning is logged once per path.
+ *
+ * A `fresh` read (a refusal decision's) bypasses the cache and never writes it, so a refusal never
+ * changes the mode later factories read. It must not drop a refusal it cannot justify, so a read error
+ * there reads as unset (the factory's decision stands), with its own warning, once per path.
+ */
+const operatorOwnershipModes = new Map<string, unknown>();
+const operatorOwnershipUnreadableWarned = new Set<string>();
+const operatorOwnershipRereadWarned = new Set<string>();
+function operatorOwnershipMode(configPath: string, fresh = false): unknown {
+	if (!fresh && operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
+	let mode: unknown;
+	let content: string | undefined;
+	try {
+		content = fs.readFileSync(configPath, "utf8");
+	} catch (error) {
+		if (!isEnoent(error)) {
+			const warned = fresh ? operatorOwnershipRereadWarned : operatorOwnershipUnreadableWarned;
+			if (!warned.has(configPath)) {
+				warned.add(configPath);
+				logger.warn(
+					fresh
+						? "Session ownership kept a refusal: the global config could not be reread"
+						: "Session ownership is off: the global config could not be read",
+					{ configPath, error: error instanceof Error ? error.message : String(error) },
+				);
+			}
+			return fresh ? undefined : "off";
+		}
+	}
+	if (content !== undefined) {
+		try {
+			const parsed: unknown = YAML.parse(content);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+				mode = getByPath(parsed as RawSettings, ["session", "ownership", "mode"]);
+		} catch {
+			// Malformed YAML: the default applies, as it does for the loader.
+		}
+	}
+	if (!fresh) operatorOwnershipModes.set(configPath, mode);
+	return mode;
+}
+
+// Session ownership reads its global-only mode from the process settings or, before they exist, from
+// the agent directory's config file, so the operator's `off` holds in an embedding too. Injected,
+// because the session modules sit below config in the import graph.
 // The global layer only: a project or runtime value, including a null or scalar `session` parent
 // that would replace the user's whole `session` object in the merge, never reaches the mode.
-setSessionOwnershipSettingSource(() => globalInstance?.getGlobal("session.ownership.mode"));
+// A `fresh` read (a refusal decision) rereads the file even under process settings, which do not
+// hot-reload on every platform. Only an explicit `off` or `observe` in it lowers the refusal.
+setSessionOwnershipSettingSource(options => {
+	if (options?.fresh)
+		return operatorOwnershipMode(path.join(globalInstance?.getAgentDir() ?? getAgentDir(), "config.yml"), true);
+	return globalInstance
+		? globalInstance.getGlobal("session.ownership.mode")
+		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml"));
+});
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -7244,6 +7303,9 @@ export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
 	globalInitOptions = null;
+	operatorOwnershipModes.clear();
+	operatorOwnershipUnreadableWarned.clear();
+	operatorOwnershipRereadWarned.clear();
 }
 
 /**

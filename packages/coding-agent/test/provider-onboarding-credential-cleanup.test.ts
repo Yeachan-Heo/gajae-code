@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -444,6 +445,57 @@ describe("custom provider credential cleanup", () => {
 			} finally {
 				reopened.close();
 			}
+		} finally {
+			if (previousEnv === undefined) delete Bun.env[envName];
+			else Bun.env[envName] = previousEnv;
+		}
+	});
+
+	it("reports a refused disable when the real store cannot write", async () => {
+		const envName = "GJC_REFUSED_DISABLE_KEY";
+		const previousEnv = Bun.env[envName];
+		Bun.env[envName] = "sk-refused-env-value";
+		try {
+			await Bun.write(
+				modelsPath,
+				[
+					"providers:",
+					"  refused-provider:",
+					"    baseUrl: https://api.example.com/v1",
+					"    api: openai-completions",
+					"    credential: store",
+					"    models:",
+					"      - id: refused-model",
+					"",
+				].join("\n"),
+			);
+			await authStorage!.set("refused-provider", { type: "api_key", key: "sk-refused" });
+			const admin = new Database(path.join(tempRoot!, "agent", "agent.db"));
+			try {
+				admin.run(
+					"CREATE TRIGGER fail_disable BEFORE UPDATE OF disabled_cause ON auth_credentials WHEN NEW.disabled_cause IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disable rejected by test trigger'); END",
+				);
+			} finally {
+				admin.close();
+			}
+
+			await expect(
+				addApiCompatibleProvider({
+					compatibility: "openai",
+					providerId: "refused-provider",
+					baseUrl: "https://api.example.com/v1",
+					apiKeyEnv: envName,
+					models: ["env-model"],
+					modelsPath,
+					force: true,
+					authStorage: authStorage!,
+				}),
+			).rejects.toThrow(/could not disable its stored API key credentials \(disabled 0 of 1/);
+
+			const provider = await readWrittenProvider("refused-provider");
+			expect(provider.credential).toBe("store");
+			expect(authStorage!.has("refused-provider")).toBe(true);
+			expect(store!.listAuthCredentials("refused-provider")).toHaveLength(1);
 		} finally {
 			if (previousEnv === undefined) delete Bun.env[envName];
 			else Bun.env[envName] = previousEnv;

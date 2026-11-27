@@ -280,6 +280,8 @@ export interface ToolSession {
 	waitForFollowUpQueued?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Changes only when a different session identity or transcript is adopted; a cwd move keeps it. */
+	getSessionIdentityGeneration?: () => number;
 	/**
 	 * Opaque async-job ownership/lookup endpoint key. This is not a workflow or
 	 * path identity: workflow/session consumers must use getSessionId(). Only
@@ -401,6 +403,8 @@ export interface ToolSession {
 	getSdkPermissionProvider?: () => ClientBridge["requestPermission"];
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
+	/** True once the owning session is disposed; background retries stop then. */
+	isSessionDisposed?: () => boolean;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
 	getCompactContext?: () => string;
 	/** Get cached todo phases for this session. */
@@ -453,7 +457,12 @@ export interface ToolSession {
 	 *  tool to dispatch another skill prompt same-turn after recording a handoff. */
 	sendCustomMessage?(
 		message: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			/** Hidden next-turn provenance: "external" (background producer) survives a terminal abort. */
+			origin?: "turn" | "external";
+		},
 	): Promise<void>;
 	/** Get the active OpenTelemetry config so subagent dispatch can forward
 	 *  the parent's tracer/hooks with the subagent's own identity stamped. */

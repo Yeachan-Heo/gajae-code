@@ -39,11 +39,19 @@ function serverConfig(command: string, args: string[] = []): ServerConfig {
 	};
 }
 
-async function writeFakeLspServer(dir: string, options?: { initDelayMs?: number }): Promise<string> {
+/**
+ * `exitOn: "exit"` makes the fake follow the LSP shutdown sequence: it answers
+ * `shutdown` and terminates with status 0 only on the `exit` notification.
+ */
+async function writeFakeLspServer(
+	dir: string,
+	options?: { initDelayMs?: number; exitOn?: "shutdown" | "exit" },
+): Promise<string> {
+	const exitOnShutdown = (options?.exitOn ?? "shutdown") === "shutdown";
 	const script = path.join(dir, "fake-lsp.ts");
 	await Bun.write(
 		script,
-		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nfunction handle(message) {\n  if (message.method === "initialize") {\n    setTimeout(() => {\n      write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n    }, ${options?.initDelayMs ?? 0});\n    return;\n  }\n  if (message.method === "shutdown") {\n    write({ jsonrpc: "2.0", id: message.id, result: null });\n    process.exit(0);\n    return;\n  }\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    handle(message);\n  }\n});\nsetInterval(() => {}, 1000);\n`,
+		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nfunction handle(message) {\n  if (message.method === "initialize") {\n    setTimeout(() => {\n      write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n    }, ${options?.initDelayMs ?? 0});\n    return;\n  }\n  if (message.method === "shutdown") {\n    write({ jsonrpc: "2.0", id: message.id, result: null });\n    if (${exitOnShutdown}) process.exit(0);\n    return;\n  }\n  if (message.method === "exit") process.exit(0);\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    handle(message);\n  }\n});\nsetInterval(() => {}, 1000);\n`,
 	);
 	return script;
 }
@@ -318,6 +326,20 @@ describe("LSP transport write failures", () => {
 
 			expect(first).toBeInstanceOf(Error);
 			expect(second).toBe(first);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("shutdownAll lets a server exit on the exit notification instead of terminating it", async () => {
+		const cwd = await tempDir("gjc-lsp-exit-notification-");
+		try {
+			const script = await writeFakeLspServer(cwd, { exitOn: "exit" });
+			const client = await getOrCreateClient(serverConfig(BUN, [script]), cwd, 5_000);
+
+			await shutdownAll();
+
+			expect(await client.proc.exited).toBe(0);
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}

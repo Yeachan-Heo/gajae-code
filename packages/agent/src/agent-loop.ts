@@ -4815,6 +4815,13 @@ async function runLoopBody(
 				stream.end(newMessages);
 				return;
 			}
+			// Step boundary: the loop is about to call the model again for this turn,
+			// so asynchronous results queued meanwhile ride along now instead of
+			// forcing an extra iteration after the final answer.
+			if (hasMoreToolCalls && config.getStepBoundaryMessages) {
+				const boundaryMessages = config.getStepBoundaryMessages();
+				if (boundaryMessages.length > 0) pendingMessages = boundaryMessages;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.

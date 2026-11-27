@@ -4,6 +4,7 @@ import { type SessionSelectionResult, SessionSelectorComponent } from "../../../
 import { initTheme } from "../../../src/modes/theme/theme";
 import type { ResumeSessionIdentity } from "../../../src/sdk/session-readonly/storage";
 import type { ResumeTailInspection, SessionInfo } from "../../../src/session/session-manager";
+import { SessionHeldError } from "../../../src/session/session-ownership";
 
 beforeAll(() => initTheme());
 
@@ -163,6 +164,36 @@ describe("SessionSelectorComponent resume consent", () => {
 		await Bun.sleep(0);
 		expect(text(component)).toContain("Error: unreadable");
 		expect(results).toEqual([]);
+	});
+
+	it("marks held rows; choosing one warns, Cancel returns to the list and Fork settles a fork", async () => {
+		const holder = { surface: "terminal" as const, pid: 4242 };
+		const error = new SessionHeldError("01a21a7f-82ff-7332-bee3-31b605a15de0", holder);
+		const results: SessionSelectionResult[] = [];
+		const inspect = vi.fn(async () => inspection("one", "resumable"));
+		const component = selector(inspect, results);
+		component.setHeldSessions(new Map([["one", error]]), async () => error);
+		const list = text(component);
+		expect(list).toContain("one  • in terminal");
+		expect(list).not.toContain("two  •");
+
+		component.handleInput("\n");
+		await Bun.sleep(0);
+		const warning = text(component);
+		expect(warning).toContain("This session is open in another process");
+		expect(warning).toContain("Session 01a21a7f is open for writing in another terminal (pid 4242).");
+		expect(warning).toContain("Fork into a new session");
+		expect(warning).not.toContain("Resume this session?");
+		component.handleInput("\x1b");
+		expect(text(component)).not.toContain("This session is open in another process");
+		expect(results).toEqual([]);
+
+		component.handleInput("\n");
+		await Bun.sleep(0);
+		component.handleInput("\n");
+		expect(results).toEqual([{ kind: "fork", path: "/tmp/one.jsonl", error }]);
+		// The held session is never inspected for a resume: a fork opens idle.
+		expect(inspect).not.toHaveBeenCalled();
 	});
 
 	it("observes async onSelect rejections without unhandled rejection (#3804)", async () => {
