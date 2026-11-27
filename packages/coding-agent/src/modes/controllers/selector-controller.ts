@@ -2559,8 +2559,8 @@ export class SelectorController {
 		// guard and silently disable every later resume.
 		let progressLease: ResumeProgressLease | undefined;
 		let admission: SessionOwnerClaim | undefined;
-		/** The copy a Fork made; deleted below unless the switch landed on it. */
-		let forkedPath: string | undefined;
+		/** Only a copy the Fork branch created; deleted below unless the switch landed on it. */
+		let forkCopy: string | undefined;
 		let resumedStatus = "Resumed session";
 		try {
 			// Under enforce the target is claimed first (design §1 row 3), before the spinner and before
@@ -2575,7 +2575,7 @@ export class SelectorController {
 					const forked = await this.#forkHeldSession(sessionPath, error);
 					if (!forked) return;
 					({ sessionPath, admission } = forked);
-					forkedPath = sessionPath;
+					forkCopy = forked.discardIfUnused;
 					resumedStatus = sessionHeldForkedNotice(error);
 				}
 				if (this.ctx.isStopped?.()) return;
@@ -2672,7 +2672,7 @@ export class SelectorController {
 		} finally {
 			// A cancelled, busy, stopped or failed switch leaves the Fork's copy unused: delete it while
 			// its admission claim still holds, so it never becomes the newest session.
-			if (forkedPath && !this.#isCurrentSessionFile(forkedPath)) await this.#discardForkCopy(forkedPath);
+			if (forkCopy) await this.#discardForkCopyIfUnused(forkCopy);
 			admission?.release();
 			progressLease?.clear();
 			this.#resumeInFlight = false;
@@ -2680,14 +2680,14 @@ export class SelectorController {
 		}
 	}
 
-	#isCurrentSessionFile(sessionPath: string): boolean {
-		const current = this.ctx.sessionManager.getSessionFile();
-		return current !== undefined && path.resolve(current) === path.resolve(sessionPath);
-	}
-
-	/** Delete a Fork copy the switch never landed on, through the picker's delete path; never throws. */
-	async #discardForkCopy(sessionPath: string): Promise<void> {
+	/**
+	 * Delete a copy a Fork created unless the session landed on it, through the picker's delete path.
+	 * Never throws, so the caller's claim release and in-flight reset always run after it.
+	 */
+	async #discardForkCopyIfUnused(sessionPath: string): Promise<void> {
 		try {
+			const current = this.ctx.sessionManager.getSessionFile();
+			if (current !== undefined && path.resolve(current) === path.resolve(sessionPath)) return;
 			await this.#deleteSession(sessionPath);
 		} catch (error) {
 			logger.warn("Could not delete an unused fork of a held session", {
@@ -2705,7 +2705,15 @@ export class SelectorController {
 	async #forkHeldSession(
 		sessionPath: string,
 		error: SessionHeldError,
-	): Promise<{ sessionPath: string; admission: SessionOwnerClaim | undefined } | undefined> {
+	): Promise<
+		| {
+				readonly sessionPath: string;
+				readonly admission: SessionOwnerClaim | undefined;
+				/** The copy this Fork created, and only that: the one path the caller may delete. */
+				readonly discardIfUnused: string;
+		  }
+		| undefined
+	> {
 		const { title, options } = heldSessionWarningDialog(error);
 		const choice = heldSessionChoice(await this.ctx.showHookSelector(title, options));
 		switch (choice) {
@@ -2738,10 +2746,17 @@ export class SelectorController {
 		try {
 			if (!forkPath) throw new Error("Fork created no session file");
 			admission = await this.ctx.sessionManager.switchTargetAdmission(forkPath);
-		} finally {
 			await forked.close();
+			return { sessionPath: forkPath, admission, discardIfUnused: forkPath };
+		} catch (failure) {
+			// The copy can't be switched to: close the forking manager, delete the copy (under the
+			// admission claim when one was taken; an unclaimed fresh id is known to no one else), then
+			// release the claim.
+			await forked.close().catch(() => undefined);
+			if (forkPath) await this.#discardForkCopyIfUnused(forkPath);
+			admission?.release();
+			throw failure;
 		}
-		return { sessionPath: forkPath, admission };
 	}
 
 	/**

@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
-import { Container, TUI } from "@gajae-code/tui";
+import { Container, getTerminalId, TUI } from "@gajae-code/tui";
 import { getAgentDir, getTerminalSessionsDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
@@ -574,9 +574,16 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		const source = await committed(place);
 		SessionOwnershipTestHooks.mode = "enforce";
 		await holdInAnotherProcess(source.id);
-		const previousTerminal = process.env.KITTY_WINDOW_ID;
+		// A terminal id, whatever runs the test: tmux and a stdin TTY take precedence over kitty's id,
+		// so clear tmux's and read the breadcrumb path back from the same resolver gjc uses.
+		const terminalEnv = ["TMUX", "TMUX_PANE", "KITTY_WINDOW_ID"].map(key => [key, process.env[key]] as const);
+		delete process.env.TMUX;
+		delete process.env.TMUX_PANE;
 		process.env.KITTY_WINDOW_ID = "held-fork-test";
-		const breadcrumb = path.join(getTerminalSessionsDir(), "kitty-held-fork-test");
+		const terminal = getTerminalId();
+		if (!terminal) throw new Error("expected a terminal id");
+		const breadcrumb = path.join(getTerminalSessionsDir(), terminal);
+		const previousBreadcrumb = (await Bun.file(breadcrumb).exists()) ? await Bun.file(breadcrumb).text() : undefined;
 		const { session } = await createAgentSession({
 			cwd: place.cwd,
 			agentDir: path.join(place.root, "agent"),
@@ -626,17 +633,26 @@ describe.if(supported)("enforce refusals (5a)", () => {
 				rebuildInitialMessages: () => {},
 				reloadTodos: async () => undefined,
 			} as unknown as InteractiveModeContext;
-			await new SelectorController(context).handleResumeSession(source.file);
+			const controller = new SelectorController(context);
+			await controller.handleResumeSession(source.file);
 
 			expect(await transcripts()).toEqual(before);
 			expect(await Bun.file(breadcrumb).text()).toBe("before\n");
 			expect(session.sessionManager.getSessionId()).toBe(own);
 			expect(await Bun.file(source.file).bytes()).toEqual(sourceBytes);
 			expect(statuses).not.toContain("Resumed session");
+			// The guard was released: a second /resume runs (and its copy goes the same way).
+			await controller.handleResumeSession(source.file);
+			expect(statuses).not.toContain("Resume already in progress");
+			expect(await transcripts()).toEqual(before);
 		} finally {
 			ui.stop();
-			if (previousTerminal === undefined) delete process.env.KITTY_WINDOW_ID;
-			else process.env.KITTY_WINDOW_ID = previousTerminal;
+			for (const [key, value] of terminalEnv) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			if (previousBreadcrumb === undefined) await fs.rm(breadcrumb, { force: true });
+			else await Bun.write(breadcrumb, previousBreadcrumb);
 			await session.dispose();
 		}
 	});
