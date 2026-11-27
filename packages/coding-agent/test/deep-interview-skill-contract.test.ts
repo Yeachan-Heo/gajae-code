@@ -301,6 +301,11 @@ describe("deep-interview threshold discoverability at kickoff (#7316)", () => {
 		expect(skill).toContain(
 			"- `flag:--threshold` or any other source: `To change the target: start with a different --threshold <n>.`",
 		);
+		// An active interview keeps its seeded threshold on resume, so the advice must point at a new interview.
+		expect(skill).toContain(
+			"`This applies to a new interview: run /new, then /skill:deep-interview with the new setting.`",
+		);
+		expect(skill).toContain("To use it, run /new, then /skill:deep-interview --<mode> <idea>.");
 	});
 
 	it("suggests a mode only for unconfigured runs without changing the threshold or asking", () => {

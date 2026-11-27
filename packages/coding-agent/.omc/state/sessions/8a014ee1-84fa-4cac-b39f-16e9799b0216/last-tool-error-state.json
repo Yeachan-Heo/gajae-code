@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"grep -n \\\"topologyAskSchema\\\\|postTopologyAskSchema\\\\|AskSchemaStage\\\\|stage ===\\\\|\\\\\\\"topology\\\\\\\"\\\" src/tools/ask-contract.ts | head -20; grep -rn \\\"topologyAskSchema\\\\|askSchemaFor\\\\|re...",
-  "error": "Exit code 1\n144:\tdimension: z.literal(\"topology\"),\n225:\t\t\t\t\tvalue.deepInterview.dimension !== \"topology\")\n298:export const topologyAskSchema = z.object({\n302:export const postTopologyAskSchema = z.object({\n310:export type DeepInterviewAskStage = \"topology\" | \"post-topology\" | undefined;\n314:\t| typeof topologyAskSchema\n315:\t| typeof postTopologyAskSchema;\n318:\tif (stage === \"topology\") return topologyAskSchema;\n319:\tif (stage === \"post-topology\") return postTopologyAskSchema;\n415:\t\tdeepInterview....",
-  "timestamp": "2026-11-26T11:48:20.331Z",
-  "retry_count": 1
-}

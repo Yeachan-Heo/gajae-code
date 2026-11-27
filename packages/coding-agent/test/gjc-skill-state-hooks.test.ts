@@ -469,6 +469,15 @@ describe("GJC native skill-state hooks", () => {
 			expect(modeState.threshold_source).toBe("default");
 		});
 
+		it("keeps the seeded threshold when the skill is re-invoked with a new flag during an active interview", async () => {
+			const root = await cwd();
+			const first = await seedThreshold(root, "session-resume-keeps-threshold", { args: "--deep idea" });
+			const resumed = await seedThreshold(root, "session-resume-keeps-threshold", { args: "--quick idea" });
+			expect(first.threshold_source).toBe("flag:--deep");
+			expect(resumed.threshold).toBeCloseTo(0.35);
+			expect(resumed.threshold_source).toBe("flag:--deep");
+		});
+
 		it("resolves user config from the session's agentDir, not the process-global profile", async () => {
 			const root = await cwd();
 			const agentDir = path.join(root, "session-profile");
