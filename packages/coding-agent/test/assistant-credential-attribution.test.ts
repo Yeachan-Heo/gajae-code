@@ -19,7 +19,7 @@ const API = "assistant-credential-attribution-test" as Api;
 const PROVIDER = "anthropic";
 const tempDirs = trackTempDirs();
 
-type Outcome = "ok" | "quota";
+type Outcome = "ok" | "quota" | "auth";
 
 function providerMessage(model: Model<Api>, outcome: Outcome): AssistantMessage {
 	return {
@@ -42,6 +42,13 @@ function providerMessage(model: Model<Api>, outcome: Outcome): AssistantMessage 
 					errorMessage: "The usage limit has been reached (code=usage_limit_reached)",
 					errorStatus: 429,
 					transportFailure: { kind: "transport" as const, status: 429, providerCode: "usage_limit_reached" },
+				}
+			: {}),
+		...(outcome === "auth"
+			? {
+					errorMessage: "401 invalid_api_key",
+					errorStatus: 401,
+					transportFailure: { kind: "transport" as const, status: 401, providerCode: "invalid_api_key" },
 				}
 			: {}),
 		timestamp: Date.now(),
@@ -216,6 +223,43 @@ describe("assistant message credential attribution through a real session", () =
 			(message): message is AssistantMessage => message.role === "assistant",
 		);
 		expect(live.at(-1)?.credentialId).toBe(rowIdForKey(authStorage, retriedKey));
+	});
+
+	it("attributes an auth-retried turn to the replacement row, not the rejected one", async () => {
+		let rejectedKey: string | undefined;
+		const keys = registerProvider(apiKey => {
+			rejectedKey ??= apiKey;
+			return apiKey === rejectedKey ? "auth" : "ok";
+		});
+		const { authStorage, sessionManager, session } = await setup(["stored-key-a", "stored-key-b"]);
+		// Resolve both rows up front: invalidating the rejected key may retire its row.
+		const rowByKey = new Map(
+			["stored-key-a", "stored-key-b"].map(key => [key, rowIdForKey(authStorage, key)] as const),
+		);
+		const invalidate = vi.spyOn(authStorage, "invalidateCredentialMatching");
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		// The 401 runs the session's onAuthError (invalidate the key, resolve the other row) inside streamSimple.
+		expect(keys).toHaveLength(2);
+		expect(new Set(keys)).toEqual(new Set(["stored-key-a", "stored-key-b"]));
+		const [failedKey, retriedKey] = keys as [string, string];
+		const failedRow = rowByKey.get(failedKey);
+		const retriedRow = rowByKey.get(retriedKey);
+		expect(retriedRow).not.toBe(failedRow);
+		expect(invalidate).toHaveBeenCalledTimes(1);
+		expect(invalidate.mock.calls[0]?.slice(0, 2)).toEqual([PROVIDER, failedKey]);
+		const assistants = await persistedAssistants(sessionManager);
+		// The captured auth failure is retried, not surfaced, so it is never persisted.
+		expect(assistants).toHaveLength(1);
+		expect(assistants[0]?.stopReason).toBe("stop");
+		expect(assistants[0]?.credentialId).toBe(retriedRow);
+		expect(assistants.some(message => message.credentialId === failedRow)).toBe(false);
+		const live = session.agent.state.messages.filter(
+			(message): message is AssistantMessage => message.role === "assistant",
+		);
+		expect(live.map(message => message.credentialId)).toEqual([retriedRow]);
 	});
 
 	it("attributes each managed-fallback attempt to the credential row that served it", async () => {
