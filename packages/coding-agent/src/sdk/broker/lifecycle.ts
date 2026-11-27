@@ -62,7 +62,11 @@ import {
 	sessionOwnerHolderPhrase,
 	sessionOwnerHolderSummary,
 } from "../../session/session-ownership";
-import { liveSessionOwnershipMode } from "../../session/session-ownership-mode";
+import {
+	liveSessionOwnershipMode,
+	type SessionOwnershipMode,
+	sessionOwnershipMode,
+} from "../../session/session-ownership-mode";
 import {
 	FileSessionStorage,
 	SessionDeleteVerificationError,
@@ -1488,14 +1492,28 @@ function hasResumableEndpoint(authority: LiveResumeAuthority, sessionId: string)
 const HELD_SESSION_ENDPOINT_WAIT_MS = 8_000;
 const HELD_SESSION_ENDPOINT_POLL_MS = 100;
 
+const OWNERSHIP_MODE_RANK: Record<SessionOwnershipMode, number> = { off: 0, observe: 1, enforce: 2 };
+
+/**
+ * The broker's ownership mode for one resume: its process mode (default `observe`), lowered by the
+ * operator's config file read afresh, so `gjc config set session.ownership.mode off` (or `observe`)
+ * reaches a running broker at once. Raising the mode still needs a restart, as everywhere else.
+ */
+function resumeOwnershipMode(): SessionOwnershipMode {
+	const configured = sessionOwnershipMode();
+	if (configured === "off") return "off";
+	const live = liveSessionOwnershipMode();
+	return OWNERSHIP_MODE_RANK[live] < OWNERSHIP_MODE_RANK[configured] ? live : configured;
+}
+
 /**
  * Another live process holds the session's claim. Probes, never claims. This process's own claim
  * (an in-process host or test) is not a writer a launched host would race, and `free` or `unknown`
  * (an unsupported platform, a stalled probe) keep resume's behaviour from before ownership, as does
- * the operator's `off`, read afresh for each resume so the kill switch reaches a running broker.
+ * `off`.
  */
 async function foreignSessionClaim(sessionId: string): Promise<{ holder: SessionOwnerHolder | undefined } | undefined> {
-	if (liveSessionOwnershipMode() === "off") return undefined;
+	if (resumeOwnershipMode() === "off") return undefined;
 	try {
 		const probe = await probeSessionOwner(sessionId);
 		return probe.state === "held" && !probe.self ? { holder: probe.holder } : undefined;
@@ -1506,8 +1524,8 @@ async function foreignSessionClaim(sessionId: string): Promise<{ holder: Session
 }
 
 /**
- * The one outcome of a resume refused because another process holds the session and has no
- * endpoint to attach to: the resume wait ran out, or the launched host's own claim was refused.
+ * The one outcome of a resume refused (under `enforce`) because another process holds the session
+ * and has no endpoint to attach to: the resume wait ran out, or the launched host's claim was refused.
  * `live_session` is the code resume already uses for a live session it cannot attach to, and every
  * client already treats it as terminal; `holder` names it by surface and pid only (design §3.4).
  */
@@ -1533,24 +1551,29 @@ function startupFailureHolder(failure: SdkStartupFailure): SessionOwnerHolderSum
 }
 
 /**
- * Resume's attach-or-wait (design §13 H3): a session another process holds is never launched
- * over. Poll the index for up to `waitMs` until the holder's endpoint is live, the holder lets go,
- * or the authority turns ambiguous, and return the authority to continue with. When the wait runs
- * out, return the held outcome.
+ * Resume's attach-or-wait (design §13 H3). Poll the index for up to `waitMs` until the holder's
+ * endpoint is live, the holder lets go, or the authority turns ambiguous, and return the authority
+ * to continue with. When the wait runs out with the holder still there, only `enforce` refuses
+ * with the held outcome; `observe` never refuses, so resume goes on as before ownership (a launch,
+ * whose host counts the conflict).
  */
 async function awaitHeldSessionEndpoint(
 	broker: Broker,
 	sessionId: string,
 	holder: SessionOwnerHolder | undefined,
 	waitMs: number,
+	initial: LiveResumeAuthority,
 ): Promise<{ authority: LiveResumeAuthority; waitedMs: number } | BrokerResponse> {
 	const timing = lifecycleTiming(broker);
 	const startedAt = timing.now();
 	let claim: { holder: SessionOwnerHolder | undefined } | undefined = { holder };
-	let authority: LiveResumeAuthority = { kind: "none" };
+	let authority = initial;
 	while (claim) {
 		const remaining = startedAt + waitMs - timing.now();
-		if (remaining <= 0) return heldSessionResponse(sessionId, claim.holder);
+		if (remaining <= 0) {
+			if (resumeOwnershipMode() === "enforce") return heldSessionResponse(sessionId, claim.holder);
+			break;
+		}
 		await timing.sleep(Math.min(HELD_SESSION_ENDPOINT_POLL_MS, remaining));
 		await broker.index.refreshIfChanged();
 		authority = liveResumeAuthority(broker.index.listSessions().sessions, sessionId);
@@ -7235,7 +7258,8 @@ async function executeLifecycleResponse(
 				: { kind: "none" };
 			// No endpoint to reuse, and another process holds the session: wait for its endpoint
 			// rather than launch a second writer. The admitted pass of a launch re-probes without
-			// waiting, so a holder that claimed while the launch was queued refuses it at once.
+			// waiting, so under `enforce` a holder that claimed while the launch was queued refuses
+			// it at once; `observe` launches.
 			if (
 				requestedSessionId &&
 				authority.kind !== "ambiguous" &&
@@ -7252,6 +7276,7 @@ async function executeLifecycleResponse(
 						requestedSessionId,
 						claim.holder,
 						Math.min(HELD_SESSION_ENDPOINT_WAIT_MS, readiness),
+						authority,
 					);
 					if ("ok" in waited) return waited;
 					authority = waited.authority;

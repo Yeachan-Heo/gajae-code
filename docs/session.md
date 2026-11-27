@@ -593,14 +593,18 @@ Right before the final `fetch` hand-off (after transport transforms such as gzip
 
 A process that opens a persisted session for writing takes a claim on it: a kernel lock on a sidecar under `~/.gjc/runtime/session-owners/`, with a small holder record beside it. The lock ends when the holder exits, however it exits, so a crashed or killed `gjc` leaves no lock behind. The sidecar file itself stays: one `.session-owner` sidecar accumulates per session ever opened, until sidecar pruning lands. The sidecars are empty and harmless; do not delete them by hand while gjc runs, because a deleted sidecar lets a second process lock a new one for the same session. `gjc doctor` warns only above 100,000 of them. Remote clients (ACP editors, `gjc sdk`, the notification daemons) attach to the endpoint of the process that owns the session and never claim. When no process is running the session, the host the broker launches for it is that owner and claims it as `sdk-host`.
 
-The broker never launches a host for a session another process holds. A `session.resume` with no live endpoint to reuse first probes the claim (in `observe` and `enforce`; the probe takes nothing, and the broker rereads the mode for each resume, so `off` turns this off at once). If another process holds it, for example a TUI that is still starting or has just switched to the session, the broker waits up to 8 seconds, and never longer than the request's readiness timeout, for that process's endpoint, then returns it as `reused: true`. If no endpoint appears (a TUI started with `GJC_SDK_DISABLE=1`, an embedding), resume fails with `live_session`, a message naming the holder, and `holder: { surface, pid }`. If the holder lets go while the broker waits, resume launches a host as usual.
+A broker `session.resume` with no live endpoint to reuse first probes the claim, in `observe` and `enforce`. The probe takes nothing, and the broker rereads the mode for each resume, so `off` turns this off at once. If another process holds the session, for example a TUI that is still starting or has just switched to it, the broker waits for that process's endpoint, up to 8 seconds and never longer than the request's readiness timeout, then returns it as `reused: true`. If no endpoint appears (a TUI started with `GJC_SDK_DISABLE=1`, an embedding such as the desktop app):
+- under `observe`, resume goes on as before ownership: it launches a host beside the holder, and that host counts the conflict;
+- under `enforce`, resume fails with `live_session`, a message naming the holder, and `holder: { surface, pid }`, and launches nothing.
+
+If the holder lets go while the broker waits, resume launches a host as usual.
 
 The global setting `session.ownership.mode` decides what claims do:
 
 | Mode | Behaviour |
 | --- | --- |
 | `off` | No claims and no lock calls. The process is invisible to other processes' claims. |
-| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. The one exception is the broker: it does not launch a host over a held session (above). |
+| `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. A broker resume of a held session waits briefly for the holder's endpoint first (above). |
 | `enforce` | Claims as `observe` does, and a session another process holds is not opened for writing (below). Not the default yet. |
 
 Under `enforce`, a session open for writing in another process is refused before anything is written to it:

@@ -29,6 +29,7 @@ const holders: Subprocess<"pipe", "pipe", "pipe">[] = [];
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+	delete SessionOwnershipTestHooks.mode;
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	for (const child of holders.splice(0)) {
 		child.kill("SIGKILL");
@@ -125,7 +126,8 @@ async function brokerWithSavedSession() {
 }
 
 describe.if(supported)("broker session.resume of a session another process holds", () => {
-	it("waits for the holder's endpoint and reuses it, launching nothing", async () => {
+	it("observe: waits for the holder's endpoint and reuses it, launching nothing", async () => {
+		SessionOwnershipTestHooks.mode = "observe";
 		const fixture = await brokerWithSavedSession();
 		const holder = await holdInAnotherProcess(fixture.sessionId);
 
@@ -156,19 +158,37 @@ describe.if(supported)("broker session.resume of a session another process holds
 		expect(fixture.launchAttempts()).toBe(0);
 	});
 
-	it("refuses with live_session naming the holder when no endpoint appears, and launches once it lets go", async () => {
-		const fixture = await brokerWithSavedSession();
-		const holder = await holdInAnotherProcess(fixture.sessionId);
-		// A virtual clock: each poll advances it, so the bound is observed without real waiting.
-		let now = Date.now();
-		const startedAt = now;
-		setLifecycleTimingForTest(fixture.broker, {
-			now: () => now,
+	/** A virtual clock: each poll advances it, so the bound is observed without real waiting. */
+	function virtualClock(broker: Broker) {
+		const clock = { now: Date.now() };
+		setLifecycleTimingForTest(broker, {
+			now: () => clock.now,
 			sleep: async ms => {
-				now += ms;
+				clock.now += ms;
 				await Bun.sleep(1);
 			},
 		});
+		return clock;
+	}
+
+	it("observe: when no endpoint appears it launches as before, after the wait, and never refuses", async () => {
+		SessionOwnershipTestHooks.mode = "observe";
+		const fixture = await brokerWithSavedSession();
+		await holdInAnotherProcess(fixture.sessionId);
+		const clock = virtualClock(fixture.broker);
+		const startedAt = clock.now;
+		const resumed = await fixture.resume();
+		expect(resumed.ok || resumed.error.code !== "live_session").toBe(true);
+		expect(clock.now - startedAt).toBeGreaterThanOrEqual(8_000);
+		expect(fixture.launchAttempts()).toBe(1);
+	});
+
+	it("enforce: refuses with live_session naming the holder when no endpoint appears, and launches once it lets go", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		const holder = await holdInAnotherProcess(fixture.sessionId);
+		const clock = virtualClock(fixture.broker);
+		const startedAt = clock.now;
 
 		const refused = await fixture.resume();
 		expect(refused).toEqual({
@@ -181,13 +201,13 @@ describe.if(supported)("broker session.resume of a session another process holds
 		});
 		// The default bound, 8 s, inside the SDK client's default 10 s request timeout; a shorter
 		// readiness timeout shortens it.
-		expect(now - startedAt).toBe(8_000);
-		const shorter = now;
+		expect(clock.now - startedAt).toBe(8_000);
+		const shorter = clock.now;
 		expect(await fixture.resume({ readinessTimeoutMs: 4_000 })).toMatchObject({
 			ok: false,
 			error: { code: "live_session" },
 		});
-		expect(now - shorter).toBe(4_000);
+		expect(clock.now - shorter).toBe(4_000);
 		expect(fixture.launchAttempts()).toBe(0);
 
 		// Nobody holds it any more: resume launches a host, as before ownership.
