@@ -13,9 +13,11 @@ import type { SessionManager } from "../session-manager";
 import {
 	claimSessionOwner,
 	countSessionOwnershipEvent,
+	probeSessionOwners,
 	SessionHeldError,
 	type SessionOwnerClaim,
 	type SessionOwnerHolder,
+	type SessionOwnerProbe,
 	type SessionOwnerSurface,
 	SessionOwnershipError,
 	sessionOwnerHolderPhrase,
@@ -131,6 +133,40 @@ export function claimRefusal(
 	return outcome.status === "held" ? new SessionHeldError(sessionId, outcome.holder) : outcome.error;
 }
 
+/**
+ * The sessions enforce would refuse because another process holds them, each with the refusal that
+ * names its holder: what the held-session warning and the session list's markers show (design §1
+ * rows 1-3). A probe, never a claim: the claim stays the authority, and a race falls back to its
+ * refusal. `undefined`, with nothing awaited, outside enforce; a probe that fails reads as free.
+ */
+export function probeHeldSessions(
+	ownership: ResolvedSessionOwnership,
+	sessionIds: readonly string[],
+): Promise<Map<string, SessionHeldError>> | undefined {
+	if (ownership === "exempt" || ownership.mode !== "enforce") return undefined;
+	return heldSessionRefusals(ownership, sessionIds);
+}
+
+async function heldSessionRefusals(
+	ownership: ResolvedSessionOwnership,
+	sessionIds: readonly string[],
+): Promise<Map<string, SessionHeldError>> {
+	const held = new Map<string, SessionHeldError>();
+	let probes: Map<string, SessionOwnerProbe>;
+	try {
+		probes = await probeSessionOwners(sessionIds.filter(id => id.length > 0));
+	} catch (error) {
+		logger.debug("Session owner probe failed; sessions read as free", { error: String(error) });
+		return held;
+	}
+	for (const [sessionId, probe] of probes) {
+		if (probe.state !== "held" || probe.self) continue;
+		const refusal = claimRefusal(ownership, sessionId, { status: "held", holder: probe.holder });
+		if (refusal instanceof SessionHeldError) held.set(sessionId, refusal);
+	}
+	return held;
+}
+
 /** How long a deferred owner shutdown may keep its predecessor's claim (design §2.5). */
 export const DEFERRED_RELEASE_CAP_MS = 60_000;
 
@@ -233,7 +269,8 @@ export class SessionClaimSet {
 	 *
 	 * Outside any transition the claim is a factory's, made before the factory's first write and
 	 * before it hands the manager out: there enforce refuses a held or failed outcome by throwing
-	 * {@link claimRefusal}'s error. A transition's claim never refuses (5a leaves switches to PR 6).
+	 * {@link claimRefusal}'s error. A transition's claim never refuses: a switch is refused before its
+	 * transition begins, by the manager's switch-target admission.
 	 */
 	async claim(sessionId: string): Promise<SessionClaimStatus> {
 		if (this.#mode === "off" || this.#closed) return "none";

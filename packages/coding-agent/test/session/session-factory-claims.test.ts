@@ -5,19 +5,25 @@
  * file pins the rules they cannot see: sync factories, refusal-free outcomes, a fork's legacy
  * source, the successor claim before the artifact copy, and subagent and staged children.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
-import { getAgentDir } from "@gajae-code/utils";
+import { Container, getTerminalId, TUI } from "@gajae-code/tui";
+import { getAgentDir, getTerminalSessionsDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 import type { Args } from "../../src/cli/args";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
-import { createSessionManager, operatorFacingSessionOpenMessage } from "../../src/main";
+import { createSessionManager, operatorFacingSessionOpenMessage, SessionResumeCancelledError } from "../../src/main";
+import { type HeldSessionChoice, heldSessionWarningDialog } from "../../src/modes/components/session-held-warning";
+import { SelectorController } from "../../src/modes/controllers/selector-controller";
+import { initTheme } from "../../src/modes/theme/theme";
+import type { InteractiveModeContext } from "../../src/modes/types";
 import { createAgentSession, probeSessionOwners } from "../../src/sdk";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
-import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import { probeHeldSessions, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	inspectSessionOwners,
@@ -36,6 +42,8 @@ import { FileSessionStorage } from "../../src/session/session-storage";
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
 const managers: SessionManager[] = [];
+
+beforeAll(() => initTheme());
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
@@ -484,11 +492,178 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		expect(operatorFacingSessionOpenMessage(new SessionHeldError(id, holder), { print: true })).toBe(
 			`error: session ${id.slice(0, 8)} is open for writing in another terminal (pid ${pid}).\nOnly one process can write a session at a time. Close it there, or continue in a copy:\n  gjc -p --fork ${id} "<message>"`,
 		);
-		// The SDK factory's gate: a manager whose rotation reached the held session (a rotation itself
-		// never refuses in 5a) is refused before createAgentSession's first write.
+		// A standalone rotation onto the held session is refused before it changes anything (design §1
+		// row 9): the manager stays on its own session.
 		const rotated = keep(SessionManager.create(place.cwd, place.destination));
+		const own = rotated.getSessionId();
+		await expect(rotated.setSessionFile(file)).rejects.toMatchObject({ code: "session_held", holder });
+		expect(rotated.getSessionId()).toBe(own);
+		// The SDK factory's gate: a manager whose rotation reached the held session while the live mode
+		// was lowered is refused before createAgentSession's first write once enforce is back.
+		SessionOwnershipTestHooks.mode = "observe";
 		await rotated.setSessionFile(file);
+		SessionOwnershipTestHooks.mode = "enforce";
 		await expect(createAgentSession({ sessionManager: rotated })).rejects.toMatchObject({ code: "session_held" });
+	});
+
+	it("a switch onto a held target is refused before any event; a free target opens and stays claimed (design §1 row 9)", async () => {
+		const place = await workspace();
+		const heldTarget = await committed(place);
+		const freeTarget = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const pid = await holdInAnotherProcess(heldTarget.id);
+		const events: string[] = [];
+		const { session } = await createAgentSession({
+			cwd: place.cwd,
+			agentDir: path.join(place.root, "agent"),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => {
+						events.push("session_before_switch");
+					});
+				},
+			],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		});
+		try {
+			const own = session.sessionManager.getSessionId();
+			await expect(session.switchSession(heldTarget.file)).rejects.toMatchObject({
+				code: "session_held",
+				holder: { surface: "terminal", pid },
+			});
+			expect(events).toEqual([]);
+			expect(session.sessionManager.getSessionId()).toBe(own);
+			// A free target opens; its admission claim is gone once the switch's own claim holds it.
+			expect(await session.switchSession(freeTarget.file)).toBe(true);
+			expect(events).toEqual(["session_before_switch"]);
+			expect(session.sessionManager.getSessionId()).toBe(freeTarget.id);
+			expect(sessionClaimSetOf(session.sessionManager).sessionIds).toEqual([freeTarget.id]);
+		} finally {
+			await session.dispose();
+		}
+		expect((await probeSessionOwners([freeTarget.id])).get(freeTarget.id)).toEqual({ state: "free" });
+	});
+
+	it("observe adds no await: the switch admission and the held probes return undefined at once, even for a held session", async () => {
+		const place = await workspace();
+		const target = await committed(place);
+		await holdInAnotherProcess(target.id);
+		const manager = keep(SessionManager.create(place.cwd, place.destination));
+		const observe = { surface: "terminal" as const, mode: "observe" as const };
+		expect(manager.switchTargetAdmission(target.file)).toBeUndefined();
+		expect(SessionManager.probeHeldTranscript(target.file, observe)).toBeUndefined();
+		expect(probeHeldSessions(observe, [target.id])).toBeUndefined();
+		// The same calls under enforce see the holder.
+		SessionOwnershipTestHooks.mode = "enforce";
+		await expect(
+			SessionManager.probeHeldTranscript(target.file, { ...observe, mode: "enforce" }),
+		).resolves.toBeInstanceOf(SessionHeldError);
+	});
+
+	it("/resume Fork whose switch a hook cancels deletes the copy; breadcrumb, session and source stay as they were", async () => {
+		const place = await workspace();
+		const source = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		await holdInAnotherProcess(source.id);
+		// A terminal id, whatever runs the test: tmux and a stdin TTY take precedence over kitty's id,
+		// so clear tmux's and read the breadcrumb path back from the same resolver gjc uses.
+		const terminalEnv = ["TMUX", "TMUX_PANE", "KITTY_WINDOW_ID"].map(key => [key, process.env[key]] as const);
+		const restoreTerminalEnv = () => {
+			for (const [key, value] of terminalEnv) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		};
+		delete process.env.TMUX;
+		delete process.env.TMUX_PANE;
+		process.env.KITTY_WINDOW_ID = "held-fork-test";
+		const terminal = getTerminalId();
+		const breadcrumb = terminal && path.join(getTerminalSessionsDir(), terminal);
+		if (!breadcrumb) {
+			restoreTerminalEnv();
+			throw new Error("expected a terminal id");
+		}
+		const previousBreadcrumb = (await Bun.file(breadcrumb).exists()) ? await Bun.file(breadcrumb).text() : undefined;
+		const { session } = await createAgentSession({
+			cwd: place.cwd,
+			agentDir: path.join(place.root, "agent"),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => ({ cancel: true }));
+				},
+			],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		}).catch(error => {
+			restoreTerminalEnv();
+			throw error;
+		});
+		const ui = new TUI(new VirtualTerminal(80, 12));
+		try {
+			session.sessionManager.appendMessage(user("own"));
+			await session.sessionManager.ensureOnDisk();
+			await session.sessionManager.flush();
+			await Bun.write(breadcrumb, "before\n");
+			const own = session.sessionManager.getSessionId();
+			const sourceBytes = await Bun.file(source.file).bytes();
+			const transcripts = async () =>
+				(await fs.readdir(path.dirname(source.file))).filter(name => name.endsWith(".jsonl")).sort();
+			const before = await transcripts();
+			const statuses: string[] = [];
+			const fork = heldSessionWarningDialog(new SessionHeldError(source.id)).options[0];
+			const context = {
+				ui,
+				statusContainer: new Container(),
+				pendingMessagesContainer: new Container(),
+				compactionQueuedMessages: [],
+				pendingTools: new Map(),
+				session,
+				sessionManager: session.sessionManager,
+				settings: { get: () => undefined },
+				showHookSelector: async () => fork,
+				showStatus: (message: string) => statuses.push(message),
+				resetIrcSidebarSession: () => {},
+				resetAssistantTextPresentation: () => {},
+				updateEditorBorderColor: () => {},
+				rebuildInitialMessages: () => {},
+				reloadTodos: async () => undefined,
+			} as unknown as InteractiveModeContext;
+			const controller = new SelectorController(context);
+			await controller.handleResumeSession(source.file);
+
+			expect(await transcripts()).toEqual(before);
+			expect(await Bun.file(breadcrumb).text()).toBe("before\n");
+			expect(session.sessionManager.getSessionId()).toBe(own);
+			expect(await Bun.file(source.file).bytes()).toEqual(sourceBytes);
+			expect(statuses).not.toContain("Resumed session");
+			// The guard was released: a second /resume runs (and its copy goes the same way).
+			await controller.handleResumeSession(source.file);
+			expect(statuses).not.toContain("Resume already in progress");
+			expect(await transcripts()).toEqual(before);
+		} finally {
+			ui.stop();
+			restoreTerminalEnv();
+			if (previousBreadcrumb === undefined) await fs.rm(breadcrumb, { force: true });
+			else await Bun.write(breadcrumb, previousBreadcrumb);
+			await session.dispose();
+		}
 	});
 
 	it("a failed claim refuses too, but a fork reads a source it cannot claim in place", async () => {
@@ -561,6 +736,56 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		const args = {} as Args;
 		const auto = keep((await createSessionManager(args, place.cwd, settings, "print", print))!);
 		expect([auto.getSessionId() === newest.id, args.continue, notices.length]).toEqual([false, undefined, 2]);
+	});
+
+	it.each([
+		"id",
+		"path",
+	] as const)("an interactive --resume <%s> of a held session warns before the folder question: Fork copies it, Cancel opens nothing (design §1 row 1)", async form => {
+		const place = await workspace();
+		const settings = Settings.isolated();
+		// The session belongs to another folder, so a free one would get the y/N fork question first.
+		const elsewhere = path.join(place.root, "elsewhere");
+		await fs.mkdir(elsewhere);
+		const destination = SessionManager.managedDestination(elsewhere, settings.getAgentDir());
+		if (destination.kind !== "managed") throw new Error("expected a managed destination");
+		const source = await committed({ ...place, cwd: elsewhere, destination });
+		SessionOwnershipTestHooks.mode = "enforce";
+		const pid = await holdInAnotherProcess(source.id);
+		const bytes = await Bun.file(source.file).bytes();
+		const warned: (number | undefined)[] = [];
+		const forked: string[] = [];
+		const tui = (choice: HeldSessionChoice) => ({
+			interactive: true,
+			notice: () => {},
+			held: {
+				choose: async (error: SessionHeldError) => {
+					warned.push(error.holder?.pid);
+					return choice;
+				},
+				forked: (message: string) => forked.push(message),
+			},
+		});
+		const resume = () => ({ resume: form === "id" ? source.id : source.file }) as Args;
+		await expect(
+			createSessionManager(resume(), place.cwd, settings, "terminal", tui("cancel")),
+		).rejects.toBeInstanceOf(SessionResumeCancelledError);
+		const copy = keep((await createSessionManager(resume(), place.cwd, settings, "terminal", tui("fork")))!);
+		expect([copy.getSessionId() === source.id, copy.getHeader()?.parentSession, copy.getCwd()]).toEqual([
+			false,
+			source.id,
+			place.cwd,
+		]);
+		expect(warned).toEqual([pid, pid]);
+		expect(forked).toEqual([`Forked into a new session. The original stays with another terminal (pid ${pid}).`]);
+		expect(await Bun.file(source.file).bytes()).toEqual(bytes);
+		// Without a terminal to ask on, the open itself refuses, as in 5a.
+		await expect(
+			createSessionManager({ resume: source.file } as Args, place.cwd, settings, "terminal", {
+				interactive: true,
+				notice: () => {},
+			}),
+		).rejects.toMatchObject({ code: "session_held", holder: { pid } });
 	});
 
 	it("continueRecent skips a held bounded candidate it could not continue, and stops at one it could", async () => {

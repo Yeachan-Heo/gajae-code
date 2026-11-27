@@ -104,6 +104,7 @@ function createContext(currentSessionFile: string): {
 			getSessionFile: () => sessionFile,
 			getSessionId: () => sessionId,
 			isManagedDestination: () => managedDestination,
+			switchTargetAdmission: () => undefined,
 			prepareManagedCandidateForStrictAdoption,
 			listForResumePickerReadOnly,
 		},

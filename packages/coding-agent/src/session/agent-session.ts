@@ -4951,6 +4951,13 @@ export class AgentSession {
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
+	/**
+	 * SDK terminal of a run a TTSR interrupt aborted, held for the resume that continues it.
+	 * Reserved by the agent_end handler while the resume is pending; the owning resume either
+	 * hands it to its continuation or releases it, so the original terminal publishes when no
+	 * continuation runs.
+	 */
+	#ttsrResumeAgentEndHold: { hold: symbol; sdkOwnership: SdkContinuationOwnership } | undefined = undefined;
 
 	/** One-shot flag set in InteractiveMode.#approvePlan(compactBeforeExecute=true)
 	 *  before the plan-mode → compaction transition. Consumed inside
@@ -9629,6 +9636,20 @@ export class AgentSession {
 		}
 
 		await this.#emitSessionEvent(displayEvent, eventLease);
+		// A TTSR interrupt ended this SDK run only to resume it. Hold its terminal for that resume,
+		// like the other continuations, so the SDK prompt is not settled as cancelled while the
+		// agent continues. The owning resume hands the hold to its continuation or releases it.
+		if (
+			event.type === "agent_end" &&
+			ttsrResumePendingAtTerminal &&
+			this.#ttsrAbortPending &&
+			event.stopReason === "cancelled" &&
+			terminalSdkOwnership
+		) {
+			this.#releaseTtsrResumeAgentEndHold();
+			const hold = this.#reserveDeferredAgentEndForContinuation(attemptScope);
+			if (hold) this.#ttsrResumeAgentEndHold = { hold, sdkOwnership: terminalSdkOwnership };
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
@@ -10320,6 +10341,19 @@ export class AgentSession {
 		this.#ttsrResumeResolve();
 		this.#ttsrResumeResolve = undefined;
 		this.#ttsrResumePromise = undefined;
+	}
+
+	/** Take the held interrupted SDK terminal for the resume that continues it. */
+	#takeTtsrResumeAgentEndHold(): { hold: symbol; sdkOwnership: SdkContinuationOwnership } | undefined {
+		const held = this.#ttsrResumeAgentEndHold;
+		this.#ttsrResumeAgentEndHold = undefined;
+		return held;
+	}
+
+	/** A TTSR resume that will not continue publishes the interrupted terminal it held. */
+	#releaseTtsrResumeAgentEndHold(): void {
+		const held = this.#takeTtsrResumeAgentEndHold();
+		if (held) this.#releaseDeferredAgentEndContinuation(held.hold);
 	}
 
 	/**
@@ -11750,8 +11784,25 @@ export class AgentSession {
 		// The resume continues this request. Captured by identity so that whichever way the resume ends, a
 		// late cleanup can only end the request it was scheduled for, never a newer admission's.
 		const recapRequest = this.#recapRequest;
+		// A throw before the continuation takes over (for example a failed injection marker append)
+		// must not strand the held SDK terminal or leave the interrupt pending.
+		const releaseOnThrow =
+			(task: (signal: AbortSignal) => Promise<void>) =>
+			async (signal: AbortSignal): Promise<void> => {
+				try {
+					await task(signal);
+				} catch (error) {
+					if (this.#ttsrRetryToken === retryToken) {
+						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
+						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
+					}
+					throw error;
+				}
+			};
 		this.#schedulePostPromptTask(
-			async signal => {
+			releaseOnThrow(async signal => {
 				if (this.#ttsrRetryToken !== retryToken) {
 					// A newer interrupt owns the resume (and the same request); leave the request to it.
 					this.#resolveTtsrResume();
@@ -11761,6 +11812,7 @@ export class AgentSession {
 					this.#ttsrAbortPending = false;
 					this.#pendingTtsrInjections = [];
 					this.#releasePerToolTtsrInjections();
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 					return;
@@ -11876,6 +11928,7 @@ export class AgentSession {
 					if (!ownsRetry()) return;
 					this.#ttsrAbortPending = false;
 					releaseCarriedTtsr();
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 				};
@@ -12037,30 +12090,40 @@ export class AgentSession {
 					// the still-eligible rule when this session is reopened.
 					this.#markTtsrInjected(details.rules, publicationFailure === undefined, ttsrMessageCount);
 				}
+				// The continuation inherits the held SDK terminal and its owner, like overflow retry and
+				// auto-retry: the resumed run settles the SDK prompt, and skip or failure releases the
+				// hold so the interrupted terminal still publishes.
+				const heldTerminal = this.#takeTtsrResumeAgentEndHold();
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
 					generation,
+					predecessorAgentEndHold: heldTerminal?.hold,
+					sdkOwnership: heldTerminal?.sdkOwnership,
 					// Owner-guarded like the outer onSkip: a newer interrupt may own the resume.
 					shouldContinue: () => {
 						if (this.#ttsrRetryToken !== retryToken) return false;
 						this.#ttsrAbortPending = false;
+						// A terminal reserved after the hold was taken has no continuation to inherit it.
+						this.#releaseTtsrResumeAgentEndHold();
 						return true;
 					},
 					onSkip: () => {
 						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					onError: () => {
 						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					resourceRunId: activePromptHandle,
 				});
-			},
+			}),
 			{
 				delayMs: 50,
 				resourceRunId: activePromptHandle,
@@ -12069,6 +12132,7 @@ export class AgentSession {
 				onSkip: () => {
 					if (this.#ttsrRetryToken !== retryToken) return;
 					this.#ttsrAbortPending = false;
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 				},
@@ -35546,8 +35610,22 @@ export class AgentSession {
 	 * Aborts current operation, loads messages, restores model/thinking.
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
+	 * @throws SessionHeldError under enforce, before any event, for a target another process holds
 	 */
 	async switchSession(
+		sessionPath: string,
+		options?: {
+			transition?: SessionSwitchEvent["transition"];
+			onTransitionMutationStarted?: () => void;
+		},
+	): Promise<boolean> {
+		// The admission claim covers the target until the rotation's own claim lands (design §1 row 9).
+		return this.sessionManager.withSwitchTargetAdmission(sessionPath, () =>
+			this.#switchSessionAdmitted(sessionPath, options),
+		);
+	}
+
+	async #switchSessionAdmitted(
 		sessionPath: string,
 		options?: {
 			transition?: SessionSwitchEvent["transition"];
