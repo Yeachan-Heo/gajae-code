@@ -18487,6 +18487,10 @@ export class AgentSession {
 					},
 				};
 				await this.invokeSkill(invocation.skill.name, invocation.args, skillOptions);
+				// Preserve plan-mode enforcement for inline skill invocations (review P2 #7321).
+				if (!options?.synthetic) {
+					await this.#enforcePlanModeToolDecision();
+				}
 				return;
 			}
 		}
@@ -18899,6 +18903,8 @@ export class AgentSession {
 				followUpQueuePolicy: options.followUpQueuePolicy,
 				steerQueuePolicy: options.steerQueuePolicy,
 				onQueuedPromoted: options.onQueuedPromoted,
+				// Carry cancellation through queued skill follow-up (review P2 #7321).
+				preflightSignal: options.preflightSignal,
 			});
 			if (options.promptPrelude?.workflowIntentDiff)
 				this.sessionManager.appendCustomEntry(
