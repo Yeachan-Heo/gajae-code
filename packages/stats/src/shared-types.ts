@@ -203,6 +203,26 @@ export interface DashboardStats {
 	modelPerformanceSeries: ModelPerformancePoint[];
 	costSeries: CostTimeSeriesPoint[];
 	cacheMissAttribution: CacheMissAttribution;
+	/** Local session ownership counters, all-time (not the selected range); absent until one is recorded. */
+	sessionOwnership?: SessionOwnershipStats;
+}
+
+/** Session ownership counter totals (single-owner design §2.9). Local only. */
+export interface SessionOwnershipStats {
+	/** Totals per counter name, in name order. */
+	readonly counters: Readonly<Record<string, number>>;
+	/** First and last time a process recorded counts, in ms since the epoch. */
+	readonly firstAt: number;
+	readonly lastAt: number;
+	/**
+	 * Process reports the totals come from (one per exiting process that counted anything). A counter
+	 * missing from `counters` was not counted by any of them; a missing `sessionOwnership` is not zero.
+	 */
+	readonly reports: number;
+	/** The same per gjc version, so one release's counts can be read apart from another's. */
+	readonly byVersion: Readonly<
+		Record<string, { readonly reports: number; readonly counters: Readonly<Record<string, number>> }>
+	>;
 }
 
 /**

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { Settings } from "../src/config/settings";
 import { autosaveWorktreeOnPromptDeadline, flushWorktreeOnPromptDeadline } from "../src/sdk/prompt-deadline-flush";
 import { PromptDeadlineManager } from "../src/sdk/prompt-deadline-manager";
@@ -26,13 +27,8 @@ afterEach(async () => {
  * The generous bound is deliberate — it exists to turn a genuine hang into a
  * legible timeout, not to police timing, which the assertions still do.
  */
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-		await Bun.sleep(5);
-	}
-}
+const waitFor = (predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 5, label });
 
 async function run(cwd: string, args: string[]): Promise<string> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });

@@ -1,3 +1,0 @@
-### Added
-
-- TTSR rules accept an `astCondition` frontmatter field (string or list of ast-grep patterns), matched before a `write` or `edit` executes against an in-memory digest of introduced source. Write supplies full content; replace, patch, hashline, and apply_patch edits supply only added text per file. Vim edits are not evaluated. Language comes from each file's extension, and only the 18 languages built into the default native build are supported (no grammar downloads); `scope`, `globs`, and repeat gating apply. `interruptMode: "always"` blocks the call and retries with the reminder, leaving the file unchanged; `"never"` folds the reminder into the executed tool's result. AST-only rules are registered as TTSR rules.

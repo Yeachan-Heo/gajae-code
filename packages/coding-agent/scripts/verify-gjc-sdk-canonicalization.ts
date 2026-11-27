@@ -264,7 +264,14 @@ function exportTargetStrings(target: unknown): string[] {
 	return Object.values(target as Record<string, unknown>).flatMap(exportTargetStrings);
 }
 
+/**
+ * The retired ingress package only ever existed in the CLI package. Another package may keep a
+ * retained module that happens to be called `bridge` (the desktop renderer's transport bridge),
+ * so this rule stays scoped to the tree it retired instead of matching every package.
+ */
+const RETIRED_INGRESS_ROOT = "packages/coding-agent/src/";
 function retiredIngressSource(file: string): boolean {
+	if (!file.startsWith(RETIRED_INGRESS_ROOT)) return false;
 	return /\/src\/(?:modes\/(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\/|$)|(?:rpc|bridge|unattended)[A-Za-z0-9_.-]*(?:\/|\.[cm]?[jt]sx?$))/i.test(
 		file,
 	);
@@ -1775,6 +1782,8 @@ function scanPackageExports(contents: string, sourceFiles: readonly string[]): s
 
 function forbiddenMachineModule(file: string): string | undefined {
 	if (file === "packages/coding-agent/src/modes/acp/acp-event-mapper.ts") return undefined;
+	// Import-free error-text helper: it formats operator messages and cannot reach session state.
+	if (file === "packages/coding-agent/src/session/operator-error-message.ts") return undefined;
 	if (file === "packages/coding-agent/src/main.ts" || file === "packages/coding-agent/src/modes/interactive-mode.ts")
 		return "process bootstrap/main session host";
 	if (file === "packages/coding-agent/src/sdk/session.ts") return "direct session mutation module";

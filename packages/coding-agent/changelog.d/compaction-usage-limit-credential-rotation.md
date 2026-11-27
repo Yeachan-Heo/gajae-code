@@ -1,4 +1,0 @@
-### Fixed
-
-- Auto-compaction now moves to another stored credential row when its summarization request hits a provider usage limit, the way a normal turn already does. It used to retry the exhausted row until its retries ran out, and because compaction runs before the next request, a session whose context was full stayed stuck on that row while other rows still had quota. The credential-rotation phase marks every stored row that resolves to a failed key, so duplicate aliases cannot bypass its backoff or cause unbounded same-key rotation; once rotation is exhausted, the existing retry policy applies. A `--credential` pin is still never rotated, and only rows of the session model's provider are marked.
-- A stored API-key row selected under an `apiKeyEnv` override can rotate to another stored row; literal config keys, runtime API keys, and explicit credential pins remain fixed. Resolver failures and expired backoffs no longer prevent trying a later healthy row.

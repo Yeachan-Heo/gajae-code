@@ -86,6 +86,10 @@ describe("isContextOverflow - 400/413 no-body (Cerebras, Mistral, proxy wrappers
 	it("does not classify 429 (rate limit) as overflow", () => {
 		expect(isContextOverflow(createErrorMessage("429 status code (no body)"))).toBe(false);
 	});
+
+	it("does not classify 402 (payment required/rate limit) as overflow", () => {
+		expect(isContextOverflow(createErrorMessage("402 status code (no body)"))).toBe(false);
+	});
 });
 
 describe("isContextOverflow - empty response with low usage (proxy-level overflow)", () => {
@@ -161,6 +165,17 @@ describe("classifyContextOverflow - authoritative transport facts", () => {
 		const message = createErrorMessage("context_length_exceeded: context window exceeded");
 		message.errorStatus = transportFailure.status;
 		expect(classifyContextOverflow(message, { kind: "transport", ...transportFailure })).toBe(false);
+	});
+
+	it("does not classify 402 (payment/rate limit) with 'too many tokens' prose as overflow", () => {
+		const message = createErrorMessage("too many tokens");
+		message.errorStatus = 402;
+		expect(
+			classifyContextOverflow(message, {
+				kind: "transport",
+				status: 402,
+			}),
+		).toBe(false);
 	});
 
 	it("keeps authoritative rate-limit status ahead of a contradictory overflow provider code", () => {

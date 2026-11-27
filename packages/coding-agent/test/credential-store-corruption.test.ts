@@ -6,15 +6,15 @@ import * as path from "node:path";
 import { AuthStorage, isSqliteCorruptionError, SqliteAuthCredentialStore } from "@gajae-code/ai/core";
 import { OAuthSelectorComponent } from "../src/modes/components/oauth-selector";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { setThemeInstance } from "../src/modes/theme/theme";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../src/session/credential-store-errors";
+import { loadTestTheme } from "./helpers/test-theme";
 
 const roots: string[] = [];
 const cliEntry = path.join(import.meta.dir, "../src/cli.ts");
 
 beforeAll(async () => {
-	const testTheme = await getThemeByName("red-claw");
-	if (!testTheme) throw new Error("Failed to load test theme");
+	const testTheme = await loadTestTheme();
 	setThemeInstance(testTheme);
 });
 

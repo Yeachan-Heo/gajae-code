@@ -18,9 +18,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { daemonPaths, markDaemonOwnerStopped, readDaemonState } from "../src/sdk/bus/telegram-daemon";
+import { trackTempDirs } from "./helpers/tracked-temp-dirs";
+
+const trackedTemp = trackTempDirs();
 
 function tempAgentDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tg-postmortem-"));
+	return trackedTemp.mkdtempSync(path.join(os.tmpdir(), "gjc-tg-postmortem-"));
 }
 
 /**

@@ -90,6 +90,57 @@ describe("devin provider surface", () => {
 	);
 
 	test.skipIf(process.platform === "win32")(
+		`treats Devin as credentialless before any discovery sweep (${WINDOWS_SKIP})`,
+		async () => {
+			const restorePath = setEnvForTest("PATH", `${DEVIN_STANDIN_DIR}${path.delimiter}${Bun.env.PATH ?? ""}`);
+			const restorePresetRegistry = setEnvForTest("GJC_MODEL_PRESET_REGISTRY_DISABLED", "true");
+			const restoreCliPath = unsetEnvForTest("GJC_DEVIN_CLI_PATH");
+			try {
+				const parent = new ModelRegistry(authStorage, modelsJsonPath);
+				await parent.refreshProvider("devin", "online");
+				const model = parent.getAll().find(candidate => candidate.provider === "devin");
+				expect(model).toBeDefined();
+
+				// A registry that never runs the discovery sweep (a subagent's own
+				// registry, an offline refresh) must not demand a Devin API key.
+				const child = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(await child.getApiKey(model!)).toBe(kNoAuth);
+				await child.refresh("offline");
+				expect(await child.getApiKey(model!)).toBe(kNoAuth);
+			} finally {
+				restoreCliPath();
+				restorePresetRegistry();
+				restorePath();
+			}
+		},
+	);
+
+	test("keeps the models.yml auth mode for a configured Devin provider", async () => {
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					devin: {
+						api: "devin-acp",
+						baseUrl: "acp://devin-cli",
+						apiKeyEnv: "GJC_TEST_DEVIN_UNSET_KEY",
+						models: [{ id: "adaptive", name: "Adaptive" }],
+					},
+				},
+			}),
+		);
+		const restoreKey = unsetEnvForTest("GJC_TEST_DEVIN_UNSET_KEY");
+		try {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.getAll().find(candidate => candidate.provider === "devin");
+			expect(model).toBeDefined();
+			expect(await registry.getApiKey(model!)).toBeUndefined();
+		} finally {
+			restoreKey();
+		}
+	});
+
+	test.skipIf(process.platform === "win32")(
 		`discovers no Devin models when the CLI is missing (${WINDOWS_SKIP})`,
 		async () => {
 			const missing = path.join(tempDir, "missing-devin");

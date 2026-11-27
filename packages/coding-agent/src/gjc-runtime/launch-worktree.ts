@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { shortenPath } from "../tools/render-utils";
 
 export type GjcLaunchWorktreeMode =
@@ -87,6 +88,7 @@ async function spawnProcessGroup(
 	const [file, ...args] = command;
 	if (!file) throw timeout;
 	const proc = Bun.spawn([file, ...args], {
+		env: projectSafeSpawnEnv(),
 		cwd,
 		stdout: "pipe",
 		stderr: "pipe",
@@ -145,14 +147,14 @@ async function spawnProcessGroup(
 }
 
 function runGit(cwd: string, args: string[]): string {
-	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(["git", ...args], { env: projectSafeSpawnEnv(), cwd, stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode === 0) return result.stdout.toString().trim();
 	const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
 	throw new Error(stderr || `git ${args.join(" ")} failed`);
 }
 
 function tryRunGit(cwd: string, args: string[]): string | null {
-	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(["git", ...args], { env: projectSafeSpawnEnv(), cwd, stdout: "pipe", stderr: "pipe" });
 	return result.exitCode === 0 ? result.stdout.toString().trim() : null;
 }
 
@@ -275,6 +277,7 @@ function ensureRepositoryBucketIgnored(repoRoot: string, bucketPath: string): vo
 	const ignoreProbe = path.join(relativeBucket, ".gjc-worktree-probe");
 	for (const candidate of [relativeBucket, ignoreProbe]) {
 		const result = Bun.spawnSync(["git", "check-ignore", "--quiet", "--", candidate], {
+			env: projectSafeSpawnEnv(),
 			cwd: repoRoot,
 			stdout: "ignore",
 			stderr: "pipe",
@@ -299,6 +302,7 @@ function resolveSourceBranchSlug(repoRoot: string, baseRef: string): string {
 
 function branchExists(repoRoot: string, branchName: string): boolean {
 	const result = Bun.spawnSync(["git", "show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], {
+		env: projectSafeSpawnEnv(),
 		cwd: repoRoot,
 		stdout: "ignore",
 		stderr: "ignore",
@@ -308,6 +312,7 @@ function branchExists(repoRoot: string, branchName: string): boolean {
 
 function validateBranchName(repoRoot: string, branchName: string): void {
 	const result = Bun.spawnSync(["git", "check-ref-format", "--branch", branchName], {
+		env: projectSafeSpawnEnv(),
 		cwd: repoRoot,
 		stdout: "pipe",
 		stderr: "pipe",
@@ -505,6 +510,7 @@ function isWorktreeDirty(worktreePath: string): boolean {
 /** Porcelain status is clean when the only unique state is commits on this detached HEAD. */
 function isCommitAncestor(cwd: string, ancestor: string, descendant: string): boolean {
 	const result = Bun.spawnSync(["git", "merge-base", "--is-ancestor", ancestor, descendant], {
+		env: projectSafeSpawnEnv(),
 		cwd,
 		stdout: "ignore",
 		stderr: "pipe",
@@ -543,6 +549,7 @@ function resolveOptionalWorktreeName(args: string[], index: number): { name: str
 	if (!trimmed || /\s/.test(trimmed)) return { name: null, nextIndex: index };
 	const valid =
 		Bun.spawnSync(["git", "check-ref-format", "--branch", trimmed], {
+			env: projectSafeSpawnEnv(),
 			stdout: "ignore",
 			stderr: "ignore",
 		}).exitCode === 0;
@@ -962,7 +969,12 @@ function ensureLaunchWorktreeSync(
 		const args = buildWorktreeAddArgs(plan, branchAlreadyExisted);
 		const evacuation = evacuatePreWorktreeTarget(plan.worktreePath);
 		try {
-			const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
+			const result = Bun.spawnSync(["git", ...args], {
+				env: projectSafeSpawnEnv(),
+				cwd: plan.repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
 			if (result.exitCode !== 0) {
 				throw classifyWorktreeAddFailure(plan, args, sanitizeWorktreeDiagnostic(result.stderr.toString().trim()));
 			}
@@ -1168,10 +1180,45 @@ function removeLegacySourceNodeModulesLink(sourceRoot: string, worktreePath: str
 	fs.unlinkSync(target);
 }
 
+function isSemverNumericIdentifier(part: string): boolean {
+	return /^(?:0|[1-9][0-9]*)$/.test(part);
+}
+
+function isSemverBuildMetadata(build: string): boolean {
+	return build.length > 0 && /^[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/.test(build);
+}
+
+function isSemverPrerelease(pre: string): boolean {
+	if (pre.length === 0) return false;
+	return pre.split(".").every(id => /^(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)$/.test(id));
+}
+
+/**
+ * Corepack `packageManager` versions are an exact semver with an optional leading `v`.
+ * `bun x name@version` otherwise treats `npm:`, `file:`, and URLs as a package alias.
+ */
+function isExactPackageManagerVersion(version: string): boolean {
+	let rest = version;
+	if (rest.startsWith("v")) rest = rest.slice(1);
+	const plus = rest.indexOf("+");
+	const release = plus < 0 ? rest : rest.slice(0, plus);
+	const build = plus < 0 ? null : rest.slice(plus + 1);
+	if (build !== null && !isSemverBuildMetadata(build)) return false;
+	const dash = release.indexOf("-");
+	const core = dash < 0 ? release : release.slice(0, dash);
+	const pre = dash < 0 ? null : release.slice(dash + 1);
+	if (pre !== null && !isSemverPrerelease(pre)) return false;
+	const parts = core.split(".");
+	return parts.length === 3 && parts.every(isSemverNumericIdentifier);
+}
+
 function workspaceInstallCommand(manager: ResolvedWorkspacePackageManager): string[] {
 	const args = manager.name === "npm" ? ["ci"] : ["install", "--frozen-lockfile"];
 	if (manager.name === "bun" || Bun.which(manager.name) !== null) return [manager.name, ...args];
 	if (manager.version === null) throw new Error(`worktree_dependency_manager_unavailable:${manager.name}`);
+	if (!isExactPackageManagerVersion(manager.version)) {
+		throw new Error(`worktree_dependency_manager_version_invalid:${manager.name}`);
+	}
 	return ["bun", "x", `${manager.name}@${manager.version}`, ...args];
 }
 

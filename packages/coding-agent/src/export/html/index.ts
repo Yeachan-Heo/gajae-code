@@ -2,12 +2,32 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
-import { APP_NAME, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
+import {
+	APP_NAME,
+	isCredentialKey,
+	isEnoent,
+	isFsError,
+	logger,
+	postmortem,
+	redactCrashSecrets,
+} from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
-import { SessionManager } from "../../session/session-manager";
+import {
+	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	RESUME_TRANSCRIPT_MAX_BYTES,
+	SessionManager,
+	SessionSnapshotSourceChangedError,
+	SessionTranscriptBoundedOpenError,
+	SessionTranscriptOversizedError,
+} from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
 import { cssColorOrFallback } from "./css-color";
-import { openHtmlExportDestination } from "./html-export-destination";
+import {
+	createHtmlExportTempFile,
+	openExistingHtmlExportOutput,
+	openHtmlExportDestination,
+	removeHtmlExportTempFile,
+} from "./html-export-destination";
 import { TEMPLATE } from "./template.generated";
 
 export interface ExportOptions {
@@ -205,6 +225,57 @@ async function openHtmlExportDescriptors(
 	}
 }
 
+/**
+ * Like {@link openHtmlExportDescriptors}, but opens a sibling temp file to write instead of the
+ * output, which is only opened (never written) to compare its identity with the source.
+ */
+async function openAtomicHtmlExportDescriptors(
+	sourcePath: string | undefined,
+	outputPath: string,
+): Promise<{ source: number | undefined; temp: { path: string; fd: number } }> {
+	let source: number | undefined;
+	let existing: number | undefined;
+	let temp: { path: string; fd: number } | undefined;
+	try {
+		if (sourcePath) {
+			try {
+				source = syncFs.openSync(sourcePath, HTML_EXPORT_SOURCE_OPEN_FLAGS);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			await assertExportDoesNotAliasSource(sourcePath, outputPath);
+		}
+		existing = openExistingHtmlExportOutput(outputPath);
+		if (source !== undefined && existing !== undefined) {
+			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
+			const existingIdentity = syncFs.fstatSync(existing, { bigint: true });
+			if (sameFileIdentity(sourceIdentity, existingIdentity))
+				throw new Error("HTML export output must not overwrite the source transcript");
+		}
+		temp = createHtmlExportTempFile(outputPath);
+		return { source, temp };
+	} catch (error) {
+		if (temp !== undefined) {
+			syncFs.closeSync(temp.fd);
+			removeHtmlExportTempFile(temp.path);
+		}
+		if (source !== undefined) syncFs.closeSync(source);
+		throw error;
+	} finally {
+		if (existing !== undefined) syncFs.closeSync(existing);
+	}
+}
+
+/** A regular file, or nothing yet: a temp file renamed over it replaces it without side effects. */
+function isRegularOrMissingOutput(outputPath: string): boolean {
+	try {
+		return syncFs.lstatSync(outputPath).isFile();
+	} catch (error) {
+		if (isEnoent(error)) return true;
+		throw error;
+	}
+}
+
 async function writeSessionHtml(
 	sm: SessionManager,
 	state: AgentState | undefined,
@@ -217,14 +288,12 @@ async function writeSessionHtml(
 	const markerOffset = themedTemplate.indexOf(marker);
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
-	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
-	const sink = Bun.file(descriptors.destination).writer();
-	const encoder = new Base64StreamEncoder();
-	const writeEncoded = (value: string): void => {
-		const encoded = encoder.write(value);
-		if (encoded) sink.write(encoded);
-	};
-	try {
+	const writePayload = (sink: Bun.FileSink): void => {
+		const encoder = new Base64StreamEncoder();
+		const writeEncoded = (value: string): void => {
+			const encoded = encoder.write(value);
+			if (encoded) sink.write(encoded);
+		};
 		sink.write(themedTemplate.slice(0, markerOffset));
 		writeEncoded(`{"header":${sessionEmbedJson(sm.getHeader())},"entries":[`);
 		let first = true;
@@ -243,6 +312,18 @@ async function writeSessionHtml(
 		const final = encoder.finish();
 		if (final) sink.write(final);
 		sink.write(themedTemplate.slice(markerOffset + marker.length));
+	};
+	// A bounded snapshot streams its transcript while writing and can fail midway, so it writes a
+	// temp file and renames it over a regular (or missing) output, keeping any previous export.
+	// Every other export writes the output in place, as before.
+	if (sm.isBoundedReadOnlySnapshot() && isRegularOrMissingOutput(outputPath)) {
+		await writeSessionHtmlAtomically(sourcePath, outputPath, writePayload);
+		return;
+	}
+	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
+	const sink = Bun.file(descriptors.destination).writer();
+	try {
+		writePayload(sink);
 		await sink.end();
 	} catch (error) {
 		await sink.end();
@@ -253,40 +334,126 @@ async function writeSessionHtml(
 	}
 }
 
+async function writeSessionHtmlAtomically(
+	sourcePath: string | undefined,
+	outputPath: string,
+	writePayload: (sink: Bun.FileSink) => void,
+): Promise<void> {
+	const descriptors = await openAtomicHtmlExportDescriptors(sourcePath, outputPath);
+	const tempPath = descriptors.temp.path;
+	const unregisterTempCleanup = postmortem.register("html-export-temp", () => {
+		try {
+			removeHtmlExportTempFile(tempPath);
+		} catch (error) {
+			// Shutdown cleanup must not throw; the leftover is an owner-only dot file beside the output.
+			logger.warn("Failed to remove an unfinished HTML export temp file", {
+				code: isFsError(error) ? error.code : "unknown",
+			});
+		}
+	});
+	let tempOpen = true;
+	let published = false;
+	const sink = Bun.file(descriptors.temp.fd).writer();
+	let sinkEnded = false;
+	try {
+		writePayload(sink);
+		sinkEnded = true;
+		await sink.end();
+		tempOpen = false;
+		syncFs.closeSync(descriptors.temp.fd);
+		syncFs.renameSync(tempPath, outputPath);
+		published = true;
+	} catch (error) {
+		if (!sinkEnded) await sink.end();
+		throw error;
+	} finally {
+		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
+		if (tempOpen) syncFs.closeSync(descriptors.temp.fd);
+		if (!published) {
+			try {
+				removeHtmlExportTempFile(tempPath);
+			} catch {
+				// Never mask the export failure; the temp file is an owner-only dot file beside the output.
+			}
+		}
+		unregisterTempCleanup();
+	}
+}
+
 /**
  * Own `__proto__` stays a data property; a normal object would turn that assignment into the prototype.
- * Each field is redacted together with its key. A detached leaf such as `abcdefgh1234` under `password`
- * would otherwise miss the key-aware rule. If that serialized field does not parse, the value is
- * redacted on its own so a quotation mark inside a labeled secret cannot break the export.
+ * Credential keys mask every JSON value, and string values are scrubbed directly so JSON escaping
+ * cannot turn ordinary quote characters into credential-value delimiters.
  */
 function redactJsonValue(value: unknown): unknown {
 	if (typeof value === "string") return redactCrashSecrets(value);
-	if (Array.isArray(value)) return value.map(item => redactJsonValue(item));
+	if (Array.isArray(value)) {
+		const isFlatKeyValueArray =
+			value.length > 0 &&
+			value.length % 2 === 0 &&
+			value.every((item, index) => index % 2 === 1 || typeof item === "string");
+		if (isFlatKeyValueArray) {
+			return value.map((item, index) => {
+				if (index % 2 === 1) {
+					const key = value[index - 1];
+					if (typeof key === "string" && isCredentialKey(key)) return "«redacted»";
+				}
+				return redactJsonValue(item);
+			});
+		}
+		return value.map(item => redactJsonValue(item));
+	}
 	if (value === null || typeof value !== "object") return value;
 	const source = value as Record<string, unknown>;
+	const sourceKeys = Object.keys(source);
+	let hasCredentialHeaderName = false;
+	let hasHeaderValue = false;
+	for (const key of sourceKeys) {
+		const field = key.toLowerCase();
+		if (field === "value" || field === "values") hasHeaderValue = true;
+		if (field !== "name" && field !== "key") continue;
+		const headerName = source[key];
+		if (typeof headerName === "string" && isCredentialKey(headerName)) hasCredentialHeaderName = true;
+	}
+	const redactHeaderValue = hasCredentialHeaderName && hasHeaderValue;
 	const redacted = Object.create(null) as Record<string, unknown>;
-	for (const key of Object.keys(source)) redacted[key] = redactKeyedValue(key, source[key]);
+	const nextSuffixByKey = new Map<string, number>();
+	for (const key of sourceKeys) {
+		const redactedKey = uniqueJsonObjectKey(redacted, redactCrashSecrets(key), nextSuffixByKey);
+		const field = key.toLowerCase();
+		if (redactHeaderValue && (field === "value" || field === "values")) {
+			const headerValue = source[key];
+			redacted[redactedKey] =
+				field === "values" && Array.isArray(headerValue) ? headerValue.map(() => "«redacted»") : "«redacted»";
+		} else {
+			redacted[redactedKey] = redactKeyedValue(key, source[key]);
+		}
+	}
 	return redacted;
 }
 
-const CREDENTIAL_JSON_KEY =
-	/^(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)$/i;
+// Resume after the last collision for this base key rather than rescanning prior suffixes.
+function uniqueJsonObjectKey(
+	target: Record<string, unknown>,
+	key: string,
+	nextSuffixByKey: Map<string, number>,
+): string {
+	if (!Object.hasOwn(target, key)) return key;
+	let suffix = nextSuffixByKey.get(key) ?? 2;
+	let candidate = `${key}#${suffix}`;
+	while (Object.hasOwn(target, candidate)) {
+		suffix += 1;
+		candidate = `${key}#${suffix}`;
+	}
+	nextSuffixByKey.set(key, suffix + 1);
+	return candidate;
+}
 
 function redactKeyedValue(key: string, value: unknown): unknown {
 	// A recognized key is authoritative for every JSON type, including a short
 	// string, a number, an array, or a nested object.
-	if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
-	if (typeof value !== "string") return redactJsonValue(value);
-	const encoded = JSON.stringify({ [key]: value });
-	try {
-		const parsed = JSON.parse(redactCrashSecrets(encoded)) as Record<string, unknown>;
-		if (parsed !== null && typeof parsed === "object" && Object.hasOwn(parsed, key)) return parsed[key];
-	} catch {
-		// A quote inside a credential field can make the redacted JSON invalid.
-		// Mask that field instead of exporting the raw value without its key.
-		if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
-	}
-	return redactCrashSecrets(value);
+	if (isCredentialKey(key)) return "«redacted»";
+	return typeof value === "string" ? redactCrashSecrets(value) : redactJsonValue(value);
 }
 
 function sessionEmbedJson(value: unknown): string {
@@ -314,34 +481,51 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
 	const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
 
-	let sm: SessionManager;
-	const artifactRoot = inputPath.endsWith(".jsonl") ? inputPath.slice(0, -6) : inputPath;
-	const hasExistingSidecars = (
-		await Promise.all(
-			["idx", "tail", "commit"].map(kind =>
-				Bun.file(path.join(artifactRoot, `.session-memory.spill.${kind}`)).exists(),
-			),
-		)
-	).some(Boolean);
 	if (!(await Bun.file(inputPath).exists())) throw new Error(`File not found: ${inputPath}`);
 	await assertExportDoesNotAliasSource(inputPath, outputPath);
 
+	// Another process may be writing this session: export reads a detached snapshot and
+	// never writes to the transcript or its artifact directory. Transcripts above the
+	// eager-load cap stream from sidecars kept in a private cache that close() removes.
+	let sm: SessionManager;
 	try {
-		sm = await SessionManager.open(
-			inputPath,
-			undefined,
-			undefined,
-			"copy-retain",
-			hasExistingSidecars ? "off" : "enabled",
-		);
+		sm = await SessionManager.openReadOnlySnapshot(inputPath);
 	} catch (err) {
 		if (isEnoent(err)) throw new Error(`File not found: ${inputPath}`);
+		if (err instanceof SessionTranscriptOversizedError) {
+			// Windows lacks the owner-only private sidecar cache, so the eager cap is its limit.
+			const limit = process.platform === "win32" ? RESUME_TRANSCRIPT_MAX_BYTES : BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES;
+			throw new Error(
+				`Session transcript is too large to export (${err.size} bytes; limit ${limit} bytes): ${inputPath}`,
+			);
+		}
+		if (err instanceof SessionTranscriptBoundedOpenError) {
+			// A concurrent writer, not the transcript's shape. An unterminated last line may also be
+			// a write a crash cut off, which no retry repairs, so the message names both causes.
+			if (err.reason === "bounded_first_open_descriptor_changed")
+				throw new Error(
+					`Session transcript changed while it was being read (${err.reason}); retry when the session is idle: ${inputPath}`,
+				);
+			if (err.reason === "bounded_scan_unterminated")
+				throw new Error(
+					`Session transcript's last line is incomplete (${err.reason}): it is still being written, so retry when the session is idle, or an earlier write was interrupted, which retrying does not fix: ${inputPath}`,
+				);
+			throw new Error(
+				`Session transcript is too large to export in full (${err.size} bytes; limit ${RESUME_TRANSCRIPT_MAX_BYTES} bytes) and cannot be streamed (${err.reason}); only linear, compacted transcripts without patch records can be: ${inputPath}`,
+			);
+		}
 		throw err;
 	}
 
 	try {
 		await writeSessionHtml(sm, undefined, outputPath, opts.themeName);
 		return outputPath;
+	} catch (err) {
+		if (err instanceof SessionSnapshotSourceChangedError)
+			throw new Error(
+				`Session transcript was replaced or truncated while it was being exported; retry when the session is idle: ${inputPath}`,
+			);
+		throw err;
 	} finally {
 		await sm.close();
 	}

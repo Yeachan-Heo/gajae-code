@@ -12,6 +12,7 @@ import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { AgentSession } from "../session/agent-session";
 import { ManagedAppendIdentityMismatchError } from "../session/internal/managed-session-storage";
 import { isSilentAbort } from "../session/messages";
+import { operatorErrorMessage } from "../session/operator-error-message";
 import { resolveProviderSafetyStopHint } from "../session/provider-safety-stop-hint";
 import { executeLocalHeadlessBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import { initializeExtensions } from "./runtime-init";
@@ -391,7 +392,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	} catch (error) {
 		if (error instanceof ManagedAppendIdentityMismatchError) {
 			process.exitCode = 1;
-			await writeStderrAndQuiesce(`${error.operatorMessage}\n`);
+			await writeStderrAndQuiesce(`${operatorErrorMessage(error)}\n`);
 		} else failures.push(error);
 	} finally {
 		// The JSON subscriber remains live while disposal emits its final events.

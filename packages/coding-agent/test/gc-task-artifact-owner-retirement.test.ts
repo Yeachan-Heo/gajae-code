@@ -7,11 +7,10 @@ import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { collectGcDiskReport, resolveGcDiskPolicy } from "../src/gjc-runtime/gc-runtime";
 import { Broker } from "../src/sdk/broker/broker";
+import { MANAGED_SESSION_BINDING_FILE, type ManagedScope } from "../src/sdk/session-readonly/scope";
 import {
 	bindManagedGcSessionRetirementTarget,
 	discoverManagedGcSessionRetirementReceipts,
-	MANAGED_SESSION_BINDING_FILE,
-	type ManagedScope,
 	managedGcProtocolScopeInspectorForScope,
 	prepareManagedSessionScopeForWriteSync,
 	publishManagedGcSessionRetirementReceipt,
@@ -255,6 +254,26 @@ async function publishArtifactsRemoved(fixture: Fixture) {
 }
 
 describe("owner-aware disk session retirement", () => {
+	it("counts a same-owner sibling transcript whatever its legal .jsonl name", async () => {
+		const fixture = makeFixture();
+		// Append locks live under ~/.gjc/runtime/append-locks, never beside transcripts, so
+		// a copied sibling whose name merely contains `.append-lock.` is still a real transcript.
+		const sibling = path.join(
+			path.dirname(fixture.transcriptPath),
+			`${path.basename(fixture.transcriptPath)}.append-lock.bak`,
+		);
+		fs.copyFileSync(fixture.transcriptPath, sibling);
+		expect(
+			await hasSiblingTaskArtifactOwnerTranscript(
+				new FileSessionStorage(),
+				fixture.transcriptPath,
+				fixture.locator,
+				taskArtifactOwnerStorageContextForScope(fixture.scope),
+				managedGcProtocolScopeInspectorForScope(fixture.scope),
+			),
+		).toBe(true);
+	});
+
 	it.each([
 		"live",
 		"removed",

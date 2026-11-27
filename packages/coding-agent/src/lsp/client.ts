@@ -689,6 +689,44 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 }
 
 /**
+ * Open documents no gjc operation has used for this long are closed before the next
+ * document opens. What a server releases on `didClose` is server-dependent; tsserver
+ * keeps the whole tsconfig program of every open document loaded and drops a project
+ * once all of its documents are closed, when it handles the next open.
+ */
+export const OPEN_FILE_IDLE_MS = 5 * 60 * 1000;
+
+/** Record that a gjc operation is using an open document. */
+function markFileUsed(client: LspClient, uri: string): void {
+	const info = client.openFiles.get(uri);
+	if (info) info.lastUsedAt = Date.now();
+}
+
+/** Send `didClose` for a tracked document and forget it and its diagnostics. */
+export async function closeDocument(client: LspClient, uri: string): Promise<void> {
+	client.openFiles.delete(uri);
+	client.diagnostics.delete(uri);
+	await sendNotification(client, "textDocument/didClose", { textDocument: { uri } });
+}
+
+/**
+ * Close documents no gjc operation has used within {@link OPEN_FILE_IDLE_MS}.
+ * Documents with an in-flight open, sync or refresh stay open. Called before a
+ * didOpen, so the closes reach the server ahead of that open (tsserver unloads
+ * projects with no open documents while handling it). Concurrent opens each run this; an entry another call already
+ * closed (or reopened) while this one awaited a send is skipped.
+ */
+async function closeIdleDocuments(client: LspClient): Promise<void> {
+	const idleBefore = Date.now() - OPEN_FILE_IDLE_MS;
+	for (const [uri, info] of Array.from(client.openFiles)) {
+		if (client.openFiles.get(uri) !== info) continue;
+		if (info.lastUsedAt > idleBefore) continue;
+		if (fileOperationLocks.has(`${client.name}:${uri}`)) continue;
+		await closeDocument(client, uri);
+	}
+}
+
+/**
  * Ensure a file is opened in the LSP client.
  * Sends didOpen notification if the file is not already tracked.
  */
@@ -699,6 +737,7 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 
 	// Check if file is already open
 	if (client.openFiles.has(uri)) {
+		markFileUsed(client, uri);
 		return;
 	}
 
@@ -728,6 +767,7 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 		const languageId = detectLanguageId(filePath);
 		throwIfAborted(signal);
 
+		await closeIdleDocuments(client);
 		await sendNotification(client, "textDocument/didOpen", {
 			textDocument: {
 				uri,
@@ -737,7 +777,7 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 			},
 		});
 
-		client.openFiles.set(uri, { version: 1, languageId });
+		client.openFiles.set(uri, { version: 1, languageId, lastUsedAt: Date.now() });
 		client.lastActivity = Date.now();
 	})();
 
@@ -772,6 +812,7 @@ export async function syncContent(
 	const uri = fileToUri(filePath);
 	const lockKey = `${client.name}:${uri}`;
 	throwIfAborted(signal);
+	markFileUsed(client, uri);
 
 	const existingLock = fileOperationLocks.get(lockKey);
 	if (existingLock) {
@@ -788,6 +829,7 @@ export async function syncContent(
 			// Open file with provided content instead of reading from disk
 			const languageId = detectLanguageId(filePath);
 			throwIfAborted(signal);
+			await closeIdleDocuments(client);
 			await sendNotification(client, "textDocument/didOpen", {
 				textDocument: {
 					uri,
@@ -796,7 +838,7 @@ export async function syncContent(
 					text: content,
 				},
 			});
-			client.openFiles.set(uri, { version: 1, languageId });
+			client.openFiles.set(uri, { version: 1, languageId, lastUsedAt: Date.now() });
 			client.lastActivity = Date.now();
 			return;
 		}
@@ -826,6 +868,7 @@ export async function notifySaved(client: LspClient, filePath: string, signal?: 
 	const uri = fileToUri(filePath);
 	const info = client.openFiles.get(uri);
 	if (!info) return; // File not open, nothing to notify
+	info.lastUsedAt = Date.now();
 
 	throwIfAborted(signal);
 	await sendNotification(client, "textDocument/didSave", {
@@ -842,6 +885,7 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
 	throwIfAborted(signal);
 	const uri = fileToUri(filePath);
 	const lockKey = `${client.name}:${uri}`;
+	markFileUsed(client, uri);
 
 	const existingLock = fileOperationLocks.get(lockKey);
 	if (existingLock) {
@@ -866,8 +910,10 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
 			content = await Bun.file(filePath).text();
 			throwIfAborted(signal);
 		} catch (err) {
-			if (isEnoent(err)) return;
-			throw err;
+			if (!isEnoent(err)) throw err;
+			// Deleted outside the LSP: the server must not keep serving its last text.
+			await closeDocument(client, uri);
+			return;
 		}
 		const version = ++info.version;
 		throwIfAborted(signal);
@@ -901,8 +947,16 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	const err = new Error("LSP client shutdown");
 	rejectPendingRequests(client, err);
 
-	const shutdown = sendRequest(client, "shutdown", null, undefined, 5_000).catch(() => {});
-	await Promise.race([shutdown, Bun.sleep(5_000)]);
+	// LSP shutdown sequence: the `shutdown` request, then the `exit` notification that
+	// tells the server to terminate itself. Process teardown only runs for a server
+	// that has not exited by the deadline.
+	const exited = client.proc.exited.catch(() => undefined);
+	const graceful = (async () => {
+		await sendRequest(client, "shutdown", null, undefined, 5_000);
+		await sendNotification(client, "exit", undefined);
+		await exited;
+	})().catch(() => {});
+	await Promise.race([graceful, Bun.sleep(5_000)]);
 	await client.owner?.dispose();
 	await client.owner?.awaitExit({ timeoutMs: 1_000 });
 	await Promise.race([client.proc.exited.catch(() => undefined), Bun.sleep(1_000)]);

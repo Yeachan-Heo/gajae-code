@@ -1,4 +1,5 @@
 pub mod cancel;
+pub mod console_code_page;
 pub mod fixup;
 pub mod minimizer;
 mod output_decode;

@@ -43,6 +43,122 @@ fn is_trusted_windows_owner_sid(
 		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice())
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_LOCAL_SYSTEM_SID: WindowsSid = WindowsSid([
+	0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+/// Access bits that let a principal change an executable's bytes, metadata, or
+/// security. `SYNCHRONIZE`, `READ_CONTROL`, and the read/execute bits are
+/// deliberately absent: deriving this mask from `FILE_ALL_ACCESS` (which
+/// carries `SYNCHRONIZE`) made every ordinary `(RX)` ACE look write-capable
+/// (#6096). Generic bits are listed explicitly because an ACE may store them
+/// unmapped.
+#[cfg(any(windows, test))]
+const EXECUTABLE_WRITE_CAPABLE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA
+	| 0x0000_0004 // FILE_APPEND_DATA
+	| 0x0000_0010 // FILE_WRITE_EA
+	| 0x0000_0040 // FILE_DELETE_CHILD
+	| 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+	| 0x0001_0000 // DELETE
+	| 0x0004_0000 // WRITE_DAC
+	| 0x0008_0000 // WRITE_OWNER
+	| 0x0200_0000 // MAXIMUM_ALLOWED
+	| 0x1000_0000 // GENERIC_ALL
+	| 0x4000_0000; // GENERIC_WRITE
+
+/// Whether an ACCESS_ALLOWED ACE for `ace_sid` is acceptable on an executable
+/// the updater will publish or retire. Read/execute grants are acceptable for
+/// any principal. Write-capable grants are acceptable only for principals that
+/// already hold full authority over the user's profile: the current user, the
+/// built-in Administrators group, and LocalSystem — exactly what a default
+/// `%LOCALAPPDATA%` DACL inherits. Any other write grant (Users, Authenticated
+/// Users, Everyone, a sandbox capability SID, …) is a shared-write exposure.
+#[cfg(any(windows, test))]
+fn executable_ace_is_safe(
+	mask: u32,
+	mut ace_matches_sid: impl FnMut(&[u8]) -> bool,
+	current_user_sid: &[u8],
+) -> bool {
+	mask & EXECUTABLE_WRITE_CAPABLE_MASK == 0
+		|| is_trusted_windows_owner_sid(&mut ace_matches_sid, current_user_sid)
+		|| ace_matches_sid(WINDOWS_LOCAL_SYSTEM_SID.0.as_slice())
+}
+
+#[cfg(test)]
+mod windows_executable_ace_tests {
+	use super::{
+		WINDOWS_BUILTIN_ADMINISTRATORS_SID, WINDOWS_LOCAL_SYSTEM_SID, executable_ace_is_safe,
+	};
+
+	const CURRENT_USER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00];
+	// S-1-5-32-545 BUILTIN\Users and S-1-1-0 Everyone.
+	const USERS_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x21, 0x02, 0x00,
+		0x00,
+	];
+	const EVERYONE_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+
+	const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+	// What icacls prints as (RX): FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
+	const READ_EXECUTE: u32 = 0x0012_00a9;
+	const MODIFY: u32 = 0x0013_01bf;
+	const GENERIC_READ_EXECUTE: u32 = 0x8000_0000 | 0x2000_0000;
+	const GENERIC_WRITE: u32 = 0x4000_0000;
+	const GENERIC_ALL: u32 = 0x1000_0000;
+
+	fn safe_for(mask: u32, ace_sid: &[u8]) -> bool {
+		executable_ace_is_safe(mask, |trusted| trusted == ace_sid, &CURRENT_USER_SID)
+	}
+
+	#[test]
+	fn read_execute_grants_are_safe_for_any_principal() {
+		// #6096: SYNCHRONIZE inside (RX) must not make a read-only ACE write-capable.
+		for sid in [USERS_SID.as_slice(), EVERYONE_SID.as_slice()] {
+			assert!(safe_for(READ_EXECUTE, sid));
+			assert!(safe_for(GENERIC_READ_EXECUTE, sid));
+			assert!(safe_for(0x0010_0000, sid), "SYNCHRONIZE alone is not a write grant");
+			assert!(safe_for(0x0002_0000, sid), "READ_CONTROL alone is not a write grant");
+		}
+	}
+
+	#[test]
+	fn default_profile_full_control_principals_are_trusted() {
+		// A default %LOCALAPPDATA% DACL inherits SYSTEM:(F) and Administrators:(F).
+		for sid in [
+			CURRENT_USER_SID.as_slice(),
+			WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice(),
+			WINDOWS_LOCAL_SYSTEM_SID.0.as_slice(),
+		] {
+			assert!(safe_for(FILE_ALL_ACCESS, sid));
+			assert!(safe_for(GENERIC_ALL, sid));
+		}
+	}
+
+	#[test]
+	fn write_grants_to_other_principals_stay_refused() {
+		for mask in [
+			FILE_ALL_ACCESS,
+			MODIFY,
+			GENERIC_WRITE,
+			GENERIC_ALL,
+			0x0000_0002, // FILE_WRITE_DATA
+			0x0000_0004, // FILE_APPEND_DATA
+			0x0000_0010, // FILE_WRITE_EA
+			0x0000_0100, // FILE_WRITE_ATTRIBUTES
+			0x0001_0000, // DELETE
+			0x0004_0000, // WRITE_DAC
+			0x0008_0000, // WRITE_OWNER
+			READ_EXECUTE | 0x0000_0002,
+		] {
+			assert!(!safe_for(mask, &USERS_SID), "0x{mask:08X} for Users must be refused");
+			assert!(!safe_for(mask, &EVERYONE_SID), "0x{mask:08X} for Everyone must be refused");
+		}
+	}
+}
+
 #[cfg(test)]
 mod windows_owner_sid_tests {
 	use super::{WINDOWS_BUILTIN_ADMINISTRATORS_SID, is_trusted_windows_owner_sid};
@@ -547,6 +663,18 @@ pub struct NativeExactUnlinkResult {
 	/// always absent on success, on non-Windows platforms, and after any
 	/// namespace mutation.
 	pub windows_error_code: Option<String>,
+	/// ACL failure details: offending principal (account name or SID string).
+	/// Present only when code is `acl_present` on Windows exact-replace
+	/// pre-mutation failures.
+	pub acl_failure_principal: Option<String>,
+	/// ACL failure detail: whether the offending ACE is inherited from a parent
+	/// directory. Present only when code is `acl_present` on Windows
+	/// exact-replace pre-mutation failures.
+	pub acl_failure_inherited: Option<bool>,
+	/// ACL failure detail: identifies which path failed ACL validation
+	/// (`source` or `destination`). Present only when code is `acl_present` on
+	/// Windows exact-replace pre-mutation failures.
+	pub acl_failure_side: Option<String>,
 }
 
 /// Bounded, path-free evidence for one publish operation.
@@ -742,6 +870,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -755,6 +886,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -768,6 +902,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -782,6 +919,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -800,6 +940,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -818,6 +961,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -837,6 +983,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -868,6 +1017,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -882,6 +1034,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -896,6 +1051,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -910,6 +1068,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -924,6 +1085,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -937,6 +1101,9 @@ impl NativeExactUnlinkResult {
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
 			windows_error_code: None,
+			acl_failure_principal: None,
+			acl_failure_inherited: None,
+			acl_failure_side: None,
 		}
 	}
 
@@ -946,6 +1113,30 @@ impl NativeExactUnlinkResult {
 	/// post-mutation failure already carries its detached/retained paths.
 	fn with_windows_error_code(mut self, windows_error_code: String) -> Self {
 		self.windows_error_code = Some(windows_error_code);
+		self
+	}
+
+	#[cfg(windows)]
+	/// Attach the offending ACL principal (DOMAIN\name or SID string) when code
+	/// is "acl_present".
+	fn with_acl_failure_principal(mut self, principal: String) -> Self {
+		self.acl_failure_principal = Some(principal);
+		self
+	}
+
+	#[cfg(windows)]
+	/// Attach the inherited flag (true if ACE is inherited from parent) when
+	/// code is "acl_present".
+	fn with_acl_failure_inherited(mut self, inherited: bool) -> Self {
+		self.acl_failure_inherited = Some(inherited);
+		self
+	}
+
+	#[cfg(windows)]
+	/// Attach the failing side ("source" or "destination") when code is
+	/// "acl_present".
+	fn with_acl_failure_side(mut self, side: String) -> Self {
+		self.acl_failure_side = Some(side);
 		self
 	}
 }
@@ -960,10 +1151,17 @@ impl NativeExactUnlinkResult {
 const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 
 #[cfg(any(windows, test))]
-/// `STATUS_ACCESS_DENIED`, kept distinct from owner-identity failures because
-/// Windows replacement opens and renames can fail before mutation while a
-/// handle denies the requested sharing or delete access.
+/// `STATUS_ACCESS_DENIED`: the requested access or a rename was refused. On
+/// Windows this is routinely transient contention, not an owner-identity
+/// failure: renaming a directory fails with it while any handle is open on a
+/// child, even one opened with full sharing. It is reported as
+/// `access_denied`; only the owner-only security APIs keep their historical
+/// `owner_mismatch` contract (see [`owner_only_open_status_code`]).
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
+
+#[cfg(any(windows, test))]
+/// `STATUS_FILE_IS_A_DIRECTORY`: a non-directory open named a directory.
+const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xc000_00bau32 as i32;
 
 #[cfg(any(windows, test))]
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -990,7 +1188,7 @@ fn ntstatus_code(status: i32) -> &'static str {
 		0xc000_0034 | 0xc000_003a => "not_found",
 		0xc000_0035 => "quarantine_collision",
 		0xc000_0043 => "sharing_violation",
-		0xc000_0022 => "owner_mismatch",
+		0xc000_0022 => "access_denied",
 		0xc000_050b => "reparse_point",
 		0xc000_00d4 => "atomic_unavailable",
 		_ => "io_error",
@@ -998,32 +1196,31 @@ fn ntstatus_code(status: i32) -> &'static str {
 }
 
 #[cfg(any(windows, test))]
-fn publication_rename_error_code(code: &'static str) -> &'static str {
-	match code {
-		// Preserve the existing owner-only security contract everywhere else. A
-		// denied Windows publication syscall is not an owner-identity failure.
-		"owner_mismatch" => "access_denied",
-		other => other,
+/// Code for a denied open inside the owner-only security APIs (apply, verify,
+/// and repair of owner-only path/fd security). Their callers route
+/// `owner_mismatch` to repair or skip another user's owner-only directory,
+/// whose protected DACL denies this user's `READ_CONTROL`/`FILE_TRAVERSE`
+/// opens. Every other path-identity operation reports the denial as
+/// `access_denied` through [`ntstatus_code`].
+fn owner_only_open_status_code(status: i32) -> &'static str {
+	if status == STATUS_ACCESS_DENIED {
+		"owner_mismatch"
+	} else {
+		ntstatus_code(status)
 	}
 }
 
 #[cfg(any(windows, test))]
-fn retained_replace_error_code(status: i32) -> &'static str {
-	publication_rename_error_code(ntstatus_code(status))
-}
-
-#[cfg(any(windows, test))]
-/// Publication code for a held-path open that already mapped its NTSTATUS
-/// through [`ntstatus_code`]. Exact-replace and no-replace publication open the
-/// staged source and the destination (or its parent) before any rename, so a
-/// denied open is a pre-mutation publication failure, not an owner-identity
-/// one (#6760). Left as `owner_mismatch`, a no-replace file-lock publication
-/// was reported as an unclassified, possibly committed outcome.
-fn exact_replace_open_error_code(code: Option<&str>) -> &str {
-	match code {
-		Some("owner_mismatch") => "access_denied",
-		Some(code) => code,
-		None => "io_error",
+/// Status to report when a tree-snapshot child failed both its file open and
+/// its directory reopen. The file open is attempted first, so its status
+/// describes the real object (a sharing violation, a denial, a delete-pending
+/// child) unless it only said the child is a directory; then the directory
+/// open's status is the one about the object.
+const fn snapshot_child_open_failure(file_status: i32, directory_status: i32) -> i32 {
+	if file_status == STATUS_FILE_IS_A_DIRECTORY {
+		directory_status
+	} else {
+		file_status
 	}
 }
 
@@ -1115,10 +1312,10 @@ fn native_windows_error_code(status: i32) -> String {
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
 		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, NativeExactUnlinkResult,
-		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, exact_replace_open_error_code,
+		STATUS_ACCESS_DENIED, STATUS_FILE_IS_A_DIRECTORY, STATUS_SHARING_VIOLATION,
 		is_retryable_exact_replace_rename_status, is_retryable_exact_replace_status,
 		native_windows_error_code, ntstatus_code, open_with_transient_retry,
-		publication_rename_error_code, rename_with_transient_retry, retained_replace_error_code,
+		owner_only_open_status_code, rename_with_transient_retry, snapshot_child_open_failure,
 		windows_error_code,
 	};
 
@@ -1176,34 +1373,44 @@ mod exact_replace_windows_retry_policy_tests {
 
 	#[test]
 	fn status_access_denied_is_distinct_from_owner_mismatch() {
+		// A child handle held open makes a directory rename fail with
+		// STATUS_ACCESS_DENIED; reporting it as `owner_mismatch` made file-lock
+		// callers treat transient contention as a permanent identity failure.
 		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED), "0xC0000022");
-		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "owner_mismatch");
-		assert_eq!(
-			publication_rename_error_code(ntstatus_code(STATUS_ACCESS_DENIED)),
-			"access_denied"
-		);
+		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "access_denied");
 		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
 	}
 
 	#[test]
-	fn exact_replace_denied_open_is_access_denied_not_owner_mismatch() {
-		// #6760: a denied open of the staged source or the live destination
-		// surfaced as `owner_mismatch` and aborted `gjc update` on Windows.
-		assert_eq!(
-			exact_replace_open_error_code(Some(ntstatus_code(STATUS_ACCESS_DENIED))),
-			"access_denied"
-		);
-		assert_eq!(
-			exact_replace_open_error_code(Some(ntstatus_code(STATUS_SHARING_VIOLATION))),
-			"sharing_violation"
-		);
-		assert_eq!(exact_replace_open_error_code(Some("reparse_point")), "reparse_point");
-		assert_eq!(exact_replace_open_error_code(None), "io_error");
+	fn owner_only_security_opens_keep_the_owner_mismatch_contract() {
+		// Another user's owner-only directory denies this user's READ_CONTROL and
+		// traversal opens; managed-session repair routing and the tmux foreign-owner
+		// skip depend on that denial reading as `owner_mismatch`.
+		assert_eq!(owner_only_open_status_code(STATUS_ACCESS_DENIED), "owner_mismatch");
+		assert_eq!(owner_only_open_status_code(STATUS_SHARING_VIOLATION), "sharing_violation");
+		assert_eq!(owner_only_open_status_code(0xc000_0034u32 as i32), "not_found");
+		assert_eq!(owner_only_open_status_code(0xc000_050bu32 as i32), "reparse_point");
+		assert_eq!(owner_only_open_status_code(0xc000_007fu32 as i32), "io_error");
 	}
 
 	#[test]
-	fn retained_replace_access_denied_is_not_an_owner_mismatch() {
-		assert_eq!(retained_replace_error_code(STATUS_ACCESS_DENIED), "access_denied");
+	fn snapshot_child_open_reports_the_first_failure() {
+		const STATUS_NOT_A_DIRECTORY: i32 = 0xc000_0103u32 as i32;
+		// A file child that is held or denied must not be reported as the
+		// directory reopen's "not a directory" io_error.
+		for status in [STATUS_SHARING_VIOLATION, STATUS_ACCESS_DENIED, 0xc000_0056u32 as i32] {
+			assert_eq!(snapshot_child_open_failure(status, STATUS_NOT_A_DIRECTORY), status);
+		}
+		// A directory child fails the file open only because it is a directory;
+		// the directory open's status describes the object.
+		assert_eq!(
+			snapshot_child_open_failure(STATUS_FILE_IS_A_DIRECTORY, STATUS_ACCESS_DENIED),
+			STATUS_ACCESS_DENIED
+		);
+		assert_eq!(
+			ntstatus_code(snapshot_child_open_failure(STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY)),
+			"access_denied"
+		);
 	}
 
 	#[test]
@@ -1267,7 +1474,7 @@ mod exact_replace_windows_retry_policy_tests {
 			// Retry eligibility must not determine the terminal publication category.
 			let result = opened
 				.map_err(|status| {
-					NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+					NativeExactUnlinkResult::failure(ntstatus_code(status))
 						.with_windows_error_code(native_windows_error_code(status))
 				})
 				.unwrap_err();
@@ -1783,6 +1990,52 @@ pub fn apply_owner_only_path_security(path: String, kind: String) -> NativeOwner
 		return NativeOwnerOnlySecurityResult::failure("io_error");
 	}
 	platform::apply_owner_only_path_security(Path::new(&path), &kind)
+}
+
+/// Bounded, read-only owner-private file bytes. Failures never contain paths or
+/// bytes.
+#[napi(object)]
+pub struct NativeOwnerOnlyFileReadResult {
+	pub ok:   bool,
+	pub data: Option<Uint8Array>,
+	pub code: Option<String>,
+}
+
+/// Read a private regular file under a private lifecycle directory on
+/// macOS/Linux.
+///
+/// `max_bytes` must be an integer in 1..=65536. Both
+/// same-descriptor reads are bounded; no path, digest, descriptor, or partial
+/// bytes are returned on failure.
+#[napi]
+pub fn read_owner_only_file(path: String, max_bytes: f64) -> NativeOwnerOnlyFileReadResult {
+	let result: Result<Vec<u8>, &'static str> = if !max_bytes.is_finite()
+		|| max_bytes.fract() != 0.0
+		|| !(1.0..=65536.0).contains(&max_bytes)
+	{
+		Err("invalid_limit")
+	} else if path.is_empty() || path.contains('\0') {
+		Err("invalid_path")
+	} else {
+		#[cfg(any(target_os = "linux", target_os = "macos"))]
+		{
+			platform::read_owner_only_file(Path::new(&path), max_bytes as usize)
+		}
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		{
+			Err("unsupported_platform")
+		}
+	};
+	match result {
+		Ok(bytes) => NativeOwnerOnlyFileReadResult {
+			ok:   true,
+			data: Some(Uint8Array::new(bytes)),
+			code: None,
+		},
+		Err(code) => {
+			NativeOwnerOnlyFileReadResult { ok: false, data: None, code: Some(code.to_owned()) }
+		},
+	}
 }
 
 #[napi]
@@ -3516,6 +3769,483 @@ pub(crate) mod platform {
 		Ok(actual)
 	}
 
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn read_stat_unchanged(before: &libc::stat, after: &libc::stat) -> bool {
+		stat_same_object(before, after)
+			&& before.st_mode == after.st_mode
+			&& before.st_gid == after.st_gid
+			&& before.st_nlink == after.st_nlink
+			&& before.st_size == after.st_size
+			&& stat_mtime_ns(before) == stat_mtime_ns(after)
+			&& stat_ctime_ns(before) == stat_ctime_ns(after)
+	}
+
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	type OwnerReadHook = Box<dyn FnMut(&str, &CheckedPathAuthority) -> Result<(), &'static str>>;
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	thread_local! {
+		static OWNER_READ_HOOK: std::cell::RefCell<Option<OwnerReadHook>> = const { std::cell::RefCell::new(None) };
+		static OWNER_READ_DENIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	fn owner_read_hook(stage: &str, authority: &CheckedPathAuthority) -> Result<(), &'static str> {
+		OWNER_READ_HOOK.with(|hook| match hook.borrow_mut().as_mut() {
+			Some(hook) => hook(stage, authority),
+			None => Ok(()),
+		})
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn read_private_snapshot(
+		authority: &CheckedPathAuthority,
+		max_bytes: usize,
+	) -> Result<usize, &'static str> {
+		let file = revalidate_authority(authority).map_err(|_| "authority_changed")?;
+		let parent = fstat(authority.parent.as_raw_fd()).map_err(|_| "io_error")?;
+		if !read_stat_unchanged(&authority.initial, &file)
+			|| !read_stat_unchanged(&authority.parent_initial, &parent)
+		{
+			return Err("metadata_changed");
+		}
+		if file.st_nlink != 1 {
+			return Err("unsafe_file");
+		}
+		if file.st_mode & 0o7000 != 0
+			|| parent.st_mode & 0o7000 != 0
+			|| !verify_file_security(&authority.file, &file, "file").ok
+			|| !verify_file_security(&authority.parent, &parent, "directory").ok
+		{
+			return Err("unsafe_security");
+		}
+		let size = usize::try_from(file.st_size).map_err(|_| "invalid_size")?;
+		if size == 0 || size > max_bytes {
+			return Err("invalid_size");
+		}
+		Ok(size)
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	fn read_private_bytes(file: &File, size: usize) -> Result<Vec<u8>, &'static str> {
+		use std::os::unix::fs::FileExt;
+		let mut bytes = vec![0; size];
+		let mut offset = 0;
+		let mut interrupts = 0;
+		while offset < size {
+			#[cfg(test)]
+			let denied = OWNER_READ_DENIED.with(|fault| fault.replace(false));
+			#[cfg(not(test))]
+			let denied = false;
+			let result = if denied {
+				Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+			} else {
+				file.read_at(&mut bytes[offset..], offset as u64)
+			};
+			match result {
+				Ok(0) => return Err("content_changed"),
+				Ok(count) => offset += count,
+				Err(error)
+					if error.kind() == std::io::ErrorKind::Interrupted
+						&& interrupts < EINTR_RETRY_LIMIT =>
+				{
+					interrupts += 1;
+				},
+				Err(_) => return Err("read_failed"),
+			}
+		}
+		Ok(bytes)
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	pub(super) fn read_owner_only_file(
+		path: &Path,
+		max_bytes: usize,
+	) -> Result<Vec<u8>, &'static str> {
+		if max_bytes == 0 || max_bytes > 65536 {
+			return Err("invalid_limit");
+		}
+		// The read-denial write retry exists only on macOS; elsewhere the repair
+		// policy acquires exactly as read-only would.
+		#[cfg(target_os = "macos")]
+		let policy = AcquisitionPolicy::ReadOnly;
+		#[cfg(not(target_os = "macos"))]
+		let policy = AcquisitionPolicy::RepairableWrite;
+		let authority = checked_file_with_policy(path, "file", policy).map_err(|_| "unsafe_path")?;
+		#[cfg(test)]
+		owner_read_hook("acquired", &authority)?;
+		let size = read_private_snapshot(&authority, max_bytes)?;
+		#[cfg(test)]
+		owner_read_hook("before_read", &authority)?;
+		let bytes = read_private_bytes(&authority.file, size)?;
+		#[cfg(test)]
+		owner_read_hook("after_read", &authority)?;
+		read_private_snapshot(&authority, max_bytes)?;
+		#[cfg(test)]
+		owner_read_hook("before_verify", &authority)?;
+		let verification = read_private_bytes(&authority.file, size)?;
+		#[cfg(test)]
+		owner_read_hook("after_verify", &authority)?;
+		if bytes != verification {
+			return Err("content_changed");
+		}
+		read_private_snapshot(&authority, max_bytes)?;
+		// ACL queries also take time: finish with named-edge and metadata checks.
+		let final_file = revalidate_authority(&authority).map_err(|_| "authority_changed")?;
+		let final_parent = fstat(authority.parent.as_raw_fd()).map_err(|_| "io_error")?;
+		if !read_stat_unchanged(&authority.initial, &final_file)
+			|| !read_stat_unchanged(&authority.parent_initial, &final_parent)
+		{
+			return Err("metadata_changed");
+		}
+		Ok(bytes)
+	}
+
+	#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+	mod owner_only_read_tests {
+		use std::{
+			cell::RefCell,
+			os::unix::fs::PermissionsExt,
+			path::PathBuf,
+			rc::Rc,
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::*;
+
+		static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+		struct Fixture(PathBuf);
+		impl Fixture {
+			fn new() -> Self {
+				let root = std::env::temp_dir().join(format!(
+					"gjc-private-read-{}-{}",
+					std::process::id(),
+					NEXT_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				fs::create_dir(&root).expect("create fixture");
+				fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
+				let fixture = Self(root);
+				fixture.write(b"binding");
+				fixture
+			}
+
+			fn path(&self) -> PathBuf {
+				self.0.join("binding")
+			}
+
+			fn write(&self, bytes: &[u8]) {
+				fs::write(self.path(), bytes).expect("write fixture");
+				fs::set_permissions(self.path(), fs::Permissions::from_mode(0o600))
+					.expect("private file");
+			}
+		}
+		impl Drop for Fixture {
+			fn drop(&mut self) {
+				OWNER_READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+				OWNER_READ_DENIED.with(|fault| fault.set(false));
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+
+		#[test]
+		fn owner_only_read_bounds_and_read_only_descriptors() {
+			let fixture = Fixture::new();
+			OWNER_READ_HOOK.with(|hook| {
+				*hook.borrow_mut() = Some(Box::new(|_, authority| {
+					// SAFETY: the hook only inspects a retained live descriptor.
+					let flags = unsafe { libc::fcntl(authority.file.as_raw_fd(), libc::F_GETFL) };
+					assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+					Ok(())
+				}));
+			});
+			for size in [1, 65536] {
+				let bytes = vec![42; size];
+				fixture.write(&bytes);
+				assert_eq!(read_owner_only_file(&fixture.path(), 65536), Ok(bytes));
+			}
+			for size in [0, 65537] {
+				fixture.write(&vec![42; size]);
+				assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("invalid_size"));
+			}
+			fixture.write(b"1234");
+			assert_eq!(read_owner_only_file(&fixture.path(), 3), Err("invalid_size"));
+		}
+
+		#[test]
+		fn owner_only_read_rejects_content_metadata_and_namespace_races() {
+			for stage in ["before_read", "after_read", "after_verify"] {
+				let content_change = if stage == "after_read" {
+					"content"
+				} else {
+					"observable_content"
+				};
+				for change in [
+					content_change,
+					"truncate",
+					"grow",
+					"mode",
+					"parent_mode",
+					"hardlink",
+					"leaf",
+					"parent",
+				] {
+					let fixture = Fixture::new();
+					let root = fixture.0.clone();
+					OWNER_READ_HOOK.with(|hook| {
+						*hook.borrow_mut() = Some(Box::new(move |at, authority| {
+							if at != stage {
+								return Ok(());
+							}
+							let path = root.join("binding");
+							match change {
+								"content" => fs::write(path, b"changed").expect("same-size change"),
+								"observable_content" => {
+									let modified = authority
+										.file
+										.metadata()
+										.expect("file metadata")
+										.modified()
+										.expect("file mtime");
+									fs::write(path, b"changed").expect("same-size change");
+									// before_read is after the metadata snapshot, but before either
+									// byte read. Both reads can see coherent new bytes, so rejection
+									// requires observable metadata, as does a write after_verify.
+									// A fast write need not advance
+									// filesystem timestamps; force a change without waiting for a tick.
+									authority
+										.file
+										.set_modified(modified + std::time::Duration::from_secs(2))
+										.expect("advance mtime");
+									let changed =
+										fstat(authority.file.as_raw_fd()).unwrap_or_else(|result| {
+											panic!("changed metadata: {:?}", result.code)
+										});
+									assert_ne!(stat_mtime_ns(&authority.initial), stat_mtime_ns(&changed));
+								},
+								"truncate" => fs::write(path, b"").expect("truncate"),
+								"grow" => fs::write(path, vec![0; 65537]).expect("grow beyond bound"),
+								"mode" => fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+									.expect("change mode"),
+								"parent_mode" => {
+									fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+										.expect("change parent mode");
+								},
+								"hardlink" => fs::hard_link(path, root.join("alias")).expect("add link"),
+								"leaf" => {
+									fs::rename(&path, root.join("old")).expect("detach leaf");
+									fs::write(path, b"binding").expect("replace leaf");
+								},
+								"parent" => {
+									let moved = root.with_extension("moved");
+									fs::rename(&root, &moved).expect("detach parent");
+									fs::create_dir(&root).expect("replace parent");
+									fs::rename(&moved, root.join("old")).expect("retain cleanup ownership");
+								},
+								_ => unreachable!(),
+							}
+							Ok(())
+						}));
+					});
+					assert!(read_owner_only_file(&fixture.path(), 65536).is_err(), "{stage}/{change}");
+				}
+			}
+		}
+
+		#[test]
+		fn owner_only_read_rejects_between_read_content_mismatch_without_timestamp_assistance() {
+			let fixture = Fixture::new();
+			let path = fixture.path();
+			OWNER_READ_HOOK.with(|hook| {
+				*hook.borrow_mut() = Some(Box::new(move |stage, _| {
+					if stage == "before_verify" {
+						// After the intervening metadata check, change only the bytes.
+						// The comparison must reject before any further metadata check,
+						// whether or not this filesystem advances timestamps on write.
+						fs::write(&path, b"changed").expect("same-size change between reads");
+					}
+					Ok(())
+				}));
+			});
+			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("content_changed"));
+		}
+
+		#[test]
+		fn owner_only_read_closes_every_retained_descriptor_on_success_and_faults() {
+			const CHILD_ENV: &str = "GJC_NATIVE_OWNER_READ_FD_TEST_CHILD";
+			if std::env::var_os(CHILD_ENV).is_none() {
+				// Released fd numbers are probed for EBADF, so no other test may
+				// allocate them meanwhile: run alone in an isolated child.
+				use std::process::Command;
+				let output = Command::new(std::env::current_exe().expect("native test executable"))
+					.arg("--exact")
+					.arg("path_identity::platform::owner_only_read_tests::owner_only_read_closes_every_retained_descriptor_on_success_and_faults")
+					.arg("--nocapture")
+					.arg("--test-threads=1")
+					.env(CHILD_ENV, "1")
+					.output()
+					.expect("run isolated descriptor regression");
+				let stdout = String::from_utf8_lossy(&output.stdout);
+				assert!(
+					output.status.success(),
+					"{stdout}\n{}",
+					String::from_utf8_lossy(&output.stderr)
+				);
+				assert!(stdout.contains("1 passed"), "child did not run the regression: {stdout}");
+				return;
+			}
+			for failure_stage in [
+				"none",
+				"acquired",
+				"before_read",
+				"after_read",
+				"before_verify",
+				"after_verify",
+				"read_denied",
+				"verify_denied",
+				"unsafe_security",
+				"invalid_size",
+				"unsafe_file",
+			] {
+				let fixture = Fixture::new();
+				match failure_stage {
+					"unsafe_security" => {
+						fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o640))
+							.expect("unsafe mode");
+					},
+					"invalid_size" => fixture.write(b""),
+					"unsafe_file" => {
+						fs::hard_link(fixture.path(), fixture.0.join("alias")).expect("hardlink");
+					},
+					_ => {},
+				}
+				let descriptors = Rc::new(RefCell::new(Vec::new()));
+				let captured = Rc::clone(&descriptors);
+				OWNER_READ_HOOK.with(|hook| {
+					*hook.borrow_mut() = Some(Box::new(move |stage, authority| {
+						if stage == "acquired" {
+							let mut fds = captured.borrow_mut();
+							fds.extend([authority.file.as_raw_fd(), authority.parent.as_raw_fd()]);
+							for edge in &authority.edges {
+								fds.extend([edge.parent.as_raw_fd(), edge.child.as_raw_fd()]);
+							}
+						}
+						if (failure_stage == "read_denied" && stage == "before_read")
+							|| (failure_stage == "verify_denied" && stage == "after_read")
+						{
+							OWNER_READ_DENIED.with(|fault| fault.set(true));
+						}
+						if stage == failure_stage {
+							Err("read_failed")
+						} else {
+							Ok(())
+						}
+					}));
+				});
+				let result = read_owner_only_file(&fixture.path(), 65536);
+				assert_eq!(result.is_ok(), failure_stage == "none");
+				for fd in descriptors.borrow().iter() {
+					// SAFETY: F_GETFD probes without taking ownership or changing descriptor state.
+					assert_eq!(unsafe { libc::fcntl(*fd, libc::F_GETFD) }, -1);
+					assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+				}
+			}
+		}
+
+		#[test]
+		fn owner_only_read_rejects_fifo_without_opening_or_blocking() {
+			let fixture = Fixture::new();
+			fs::remove_file(fixture.path()).expect("remove leaf");
+			let name = CString::new(fixture.path().as_os_str().as_bytes()).expect("path");
+			// SAFETY: name is NUL terminated and names a test-owned absent leaf.
+			assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("unsafe_path"));
+		}
+
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn owner_only_read_macos_system_aliases_are_component_exact() {
+			for alias in ["var", "tmp", "etc"] {
+				let accepted = PathBuf::from(format!("/{alias}/binding"));
+				assert_eq!(
+					descriptor_walk_path(&accepted).as_ref(),
+					Path::new(&format!("/private/{alias}/binding"))
+				);
+				let rejected = PathBuf::from(format!("/{alias}-alias/binding"));
+				assert_eq!(descriptor_walk_path(&rejected).as_ref(), rejected.as_path());
+			}
+		}
+
+		#[cfg(target_os = "macos")]
+		#[test]
+		fn owner_only_read_macos_acl_denial_never_retries_or_repairs() {
+			let fixture = Fixture::new();
+			for (target, acl) in
+				[(fixture.path(), "everyone deny read"), (fixture.0.clone(), "everyone allow read")]
+			{
+				assert!(
+					std::process::Command::new("/bin/chmod")
+						.args(["+a", acl])
+						.arg(&target)
+						.status()
+						.expect("install ACL")
+						.success()
+				);
+				let result = read_owner_only_file(&fixture.path(), 65536);
+				let security = super::verify_owner_only_path_security(
+					&target,
+					if target == fixture.0 {
+						"directory"
+					} else {
+						"file"
+					},
+				);
+				assert!(
+					std::process::Command::new("/bin/chmod")
+						.arg("-N")
+						.arg(&target)
+						.status()
+						.expect("remove ACL")
+						.success()
+				);
+				assert!(result.is_err());
+				assert_eq!(security.code.as_deref(), Some("acl_verify_failed"));
+			}
+			assert_eq!(fs::read(fixture.path()).expect("unchanged bytes"), b"binding");
+		}
+
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn owner_only_read_linux_rejects_parent_default_acl_without_repair() {
+			let fixture = Fixture::new();
+			let directory = File::open(&fixture.0).expect("open directory");
+			// Linux POSIX ACL xattr v2: owner rwx, group ---, other ---.
+			// Even this restrictive default ACL must not be present on the lifecycle root.
+			let mut acl = 2_u32.to_le_bytes().to_vec();
+			for (tag, permissions) in [(1_u16, 7_u16), (4, 0), (32, 0)] {
+				acl.extend(tag.to_le_bytes());
+				acl.extend(permissions.to_le_bytes());
+				acl.extend(u32::MAX.to_le_bytes());
+			}
+			let name = c"system.posix_acl_default";
+			// SAFETY: fd and byte storage are live, name is NUL terminated.
+			let stored = unsafe {
+				libc::fsetxattr(directory.as_raw_fd(), name.as_ptr(), acl.as_ptr().cast(), acl.len(), 0)
+			};
+			if stored != 0 {
+				let error = std::io::Error::last_os_error();
+				// A filesystem without POSIX ACL storage (for example mounted `noacl`)
+				// cannot carry the ACL under test; the reader accepts that storage.
+				assert_eq!(
+					error.raw_os_error(),
+					Some(libc::EOPNOTSUPP),
+					"unexpected ACL fixture failure: {error}"
+				);
+				assert!(read_owner_only_file(&fixture.path(), 65536).is_ok());
+				return;
+			}
+			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("unsafe_security"));
+			assert!(!super::verify_owner_only_path_security(&fixture.0, "directory").ok);
+		}
+	}
+
 	#[cfg(target_os = "linux")]
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 	enum AclAttribute {
@@ -4416,6 +5146,25 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return result,
 		};
+		let result = verify_file_security(&authority.file, &metadata, kind);
+		if !result.ok {
+			return result;
+		}
+		#[cfg(all(test, target_os = "macos"))]
+		pause_after_owner_only_acl_query_for_test();
+		match revalidate_authority(authority) {
+			Ok(_) => result,
+			Err(result) => result,
+		}
+	}
+
+	fn verify_file_security(
+		file: &File,
+		metadata: &libc::stat,
+		kind: &str,
+	) -> NativeOwnerOnlySecurityResult {
+		#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+		let _ = file;
 		let expected = if kind == "directory" { 0o700 } else { 0o600 };
 		// SAFETY: geteuid has no preconditions and only reads the process effective
 		// user identity.
@@ -4427,37 +5176,23 @@ pub(crate) mod platform {
 		}
 		#[cfg(target_os = "linux")]
 		{
-			let access_query = match query_extended_acl(&authority.file, AclAttribute::Access) {
+			let access_query = match query_extended_acl(file, AclAttribute::Access) {
 				Ok(evidence) => evidence,
 				Err(result) => return result,
 			};
 			let default_query = if kind == "directory" {
-				match query_extended_acl(&authority.file, AclAttribute::Default) {
+				match query_extended_acl(file, AclAttribute::Default) {
 					Ok(evidence) => Some(evidence),
 					Err(result) => return result,
 				}
 			} else {
 				None
 			};
-			match revalidate_authority(authority) {
-				Ok(_) => NativeOwnerOnlySecurityResult::linux_verified_success(
-					kind,
-					access_query,
-					default_query,
-				),
-				Err(result) => result,
-			}
+			NativeOwnerOnlySecurityResult::linux_verified_success(kind, access_query, default_query)
 		}
 		#[cfg(target_os = "macos")]
-		match has_extended_acl(&authority.file) {
-			Ok(false) => {
-				#[cfg(test)]
-				pause_after_owner_only_acl_query_for_test();
-				match revalidate_authority(authority) {
-					Ok(_) => NativeOwnerOnlySecurityResult::success(),
-					Err(result) => result,
-				}
-			},
+		match has_extended_acl(file) {
+			Ok(false) => NativeOwnerOnlySecurityResult::success(),
 			Ok(true) => NativeOwnerOnlySecurityResult::failure("acl_verify_failed"),
 			Err(result) => result,
 		}
@@ -11182,10 +11917,12 @@ mod platform {
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
 			AclSizeInformation, AddAccessAllowedAceEx,
-			Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
+			Authorization::{
+				ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+			},
 			DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-			GetTokenInformation, InitializeAcl, IsValidSid, OWNER_SECURITY_INFORMATION,
-			PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+			GetTokenInformation, INHERITED_ACE, InitializeAcl, IsValidSid, LookupAccountSidW,
+			OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
 		},
 		Storage::FileSystem::{
 			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -11205,10 +11942,9 @@ mod platform {
 		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
 		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		directory_tree_transition_name, exact_replace_open_error_code, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
-		rename_with_transient_retry, retained_replace_error_code, sha256,
-		volume_case_sensitivity_from_flags,
+		directory_tree_transition_name, native_windows_error_code, ntstatus_code,
+		open_with_transient_retry, owner_only_open_status_code, rename_with_transient_retry, sha256,
+		snapshot_child_open_failure, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -11648,9 +12384,9 @@ mod platform {
 			.map_err(ntstatus_code)
 	}
 
-	/// Status-returning variant of [`open_relative_with_share`] used by the
-	/// exact-replace destination open so the raw NTSTATUS survives for
-	/// transient-sharing-violation classification and path-free diagnostics.
+	/// Status-returning variant of [`open_relative_with_share`] that keeps the
+	/// raw NTSTATUS so each caller classifies the refusal for its own
+	/// operation.
 	fn open_relative_with_share_status(
 		parent: HANDLE,
 		name: &std::ffi::OsStr,
@@ -11735,6 +12471,18 @@ mod platform {
 		desired_access: u32,
 		final_share_access: u32,
 	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
+		open_exact_mapped(path, kind, desired_access, final_share_access, ntstatus_code)
+	}
+
+	/// Exact open whose NTSTATUS failures (every component after the volume
+	/// root) are reported through `status_code`.
+	fn open_exact_mapped(
+		path: &Path,
+		kind: &str,
+		desired_access: u32,
+		final_share_access: u32,
+		status_code: fn(i32) -> &'static str,
+	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
 		}
@@ -11766,8 +12514,8 @@ mod platform {
 		for (index, name) in names.iter().enumerate() {
 			let final_component = index + 1 == names.len();
 			let parent = *ancestors.last().expect("volume root retained");
-			let handle = match if final_component {
-				open_relative_with_share(
+			let opened = if final_component {
+				open_relative_with_share_status(
 					parent,
 					name,
 					desired_access | FILE_READ_ATTRIBUTES,
@@ -11778,8 +12526,15 @@ mod platform {
 				// This retained directory becomes RootDirectory for the next
 				// descriptor-relative NtCreateFile, which requires traversal
 				// authority as well as attribute inspection.
-				open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true)
-			} {
+				open_relative_with_share_status(
+					parent,
+					name,
+					FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+					true,
+					FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				)
+			};
+			let handle = match opened.map_err(status_code) {
 				Ok(handle) => handle,
 				Err(code) => {
 					close_retained(&mut ancestors);
@@ -11830,6 +12585,24 @@ mod platform {
 			kind,
 			desired_access,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		)
+	}
+
+	/// Exact open for the owner-only security APIs. A denied component open
+	/// keeps their `owner_mismatch` contract (see
+	/// [`owner_only_open_status_code`]); the Win32 volume-root open and every
+	/// other failure are reported unchanged.
+	fn open_owner_only_exact(
+		path: &Path,
+		kind: &str,
+		desired_access: u32,
+	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
+		open_exact_mapped(
+			path,
+			kind,
+			desired_access,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			owner_only_open_status_code,
 		)
 	}
 
@@ -11993,7 +12766,7 @@ mod platform {
 	}
 
 	fn retained_replace_rename_failure(status: i32) -> NativeExactUnlinkResult {
-		NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+		NativeExactUnlinkResult::failure(ntstatus_code(status))
 			.with_windows_error_code(native_windows_error_code(status))
 	}
 
@@ -12115,9 +12888,7 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
-					result.code.as_deref(),
-				));
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -12178,7 +12949,7 @@ mod platform {
 		}) {
 			Ok(handle) => handle,
 			Err(status) => {
-				return NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+				return NativeExactUnlinkResult::failure(ntstatus_code(status))
 					.with_windows_error_code(native_windows_error_code(status));
 			},
 		};
@@ -12303,6 +13074,73 @@ mod platform {
 		}
 	}
 
+	fn resolve_sid_to_principal(ace_sid: &[u8]) -> String {
+		if valid_sid(ace_sid).is_none() {
+			return String::new();
+		}
+		let sid = ace_sid.as_ptr().cast_mut().cast();
+		let mut name_length = 0;
+		let mut domain_length = 0;
+		let mut sid_use = 0;
+		// SAFETY: sid is validated and live; null buffers request the required sizes.
+		unsafe {
+			LookupAccountSidW(
+				null(),
+				sid,
+				null_mut(),
+				&mut name_length,
+				null_mut(),
+				&mut domain_length,
+				&mut sid_use,
+			);
+		}
+		if name_length > 0 {
+			let mut name = vec![0u16; name_length as usize];
+			let mut domain = vec![0u16; domain_length as usize];
+			// SAFETY: both writable buffers have the capacities supplied to the API.
+			if unsafe {
+				LookupAccountSidW(
+					null(),
+					sid,
+					name.as_mut_ptr(),
+					&mut name_length,
+					domain.as_mut_ptr(),
+					&mut domain_length,
+					&mut sid_use,
+				)
+			} != 0
+			{
+				let name = String::from_utf16_lossy(&name[..name_length as usize]);
+				let domain = String::from_utf16_lossy(&domain[..domain_length as usize]);
+				return if domain.is_empty() {
+					name
+				} else {
+					format!("{domain}\\{name}")
+				};
+			}
+		}
+		let mut string_sid = null_mut();
+		// SAFETY: sid is validated and string_sid is writable output storage.
+		if unsafe { ConvertSidToStringSidW(sid, &mut string_sid) } == 0 {
+			return String::new();
+		}
+		// SAFETY: successful conversion returns a NUL-terminated LocalAlloc string,
+		// owned here until it is released after copying into the Rust String.
+		unsafe {
+			let mut length = 0;
+			while *string_sid.add(length) != 0 {
+				length += 1;
+			}
+			let principal = String::from_utf16_lossy(std::slice::from_raw_parts(string_sid, length));
+			LocalFree(string_sid.cast());
+			principal
+		}
+	}
+
+	fn ace_header_has_inherited_flag(header: ACE_HEADER) -> bool {
+		u32::from(header.AceFlags) & INHERITED_ACE != 0
+	}
+
 	/// Owner/no-shared-write ACL check for an executable-file candidate.
 	/// Unlike the owner-only DACL this module applies to config files (a single
 	/// protected ACE granting the owner exactly
@@ -12311,25 +13149,13 @@ mod platform {
 	/// mismatch, or any ACCESS_ALLOWED ACE that grants a write-capable right to
 	/// a principal other than the verified owner. Read/execute-only ACEs for
 	/// other principals are accepted.
-	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), &'static str> {
-		const FILE_WRITE_DATA: u32 = 0x0000_0002;
-		const FILE_APPEND_DATA: u32 = 0x0000_0004;
-		const FILE_WRITE_EA: u32 = 0x0000_0010;
-		const DELETE: u32 = 0x0001_0000;
-		const GENERIC_WRITE: u32 = 0x4000_0000;
-		const WRITE_CAPABLE_MASK: u32 = FILE_WRITE_DATA
-			| FILE_APPEND_DATA
-			| FILE_WRITE_EA
-			| FILE_WRITE_ATTRIBUTES
-			| WRITE_DAC
-			| WRITE_OWNER
-			| DELETE
-			| GENERIC_WRITE
-			| GENERIC_ALL
-			| FILE_ALL_ACCESS;
+	fn verify_executable_ownership_no_shared_write(
+		handle: HANDLE,
+		side: Option<&str>,
+	) -> Result<(), NativeExactUnlinkResult> {
 		let sid = match current_user_sid() {
 			Ok(sid) => sid,
-			Err(()) => return Err("acl_unavailable"),
+			Err(()) => return Err(NativeExactUnlinkResult::failure("acl_unavailable")),
 		};
 		let mut owner = null_mut();
 		let mut dacl = null_mut();
@@ -12354,15 +13180,25 @@ mod platform {
 				// by this function on the error path.
 				unsafe { LocalFree(descriptor) };
 			}
-			return Err("acl_unavailable");
+			return Err(NativeExactUnlinkResult::failure("acl_unavailable"));
 		}
+		let mut acl_failure = None;
 		let result = (|| {
 			if owner.is_null() {
 				return Err("acl_unavailable");
 			}
-			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor; sid is a validated current-user SID.
-			if unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
+			// An elevated token's default owner is BUILTIN\Administrators, so an
+			// elevated install and every candidate it downloads are Administrators-owned
+			// (#6916); accept the same trusted owners as managed roots (#6420).
+			let owner_trusted = super::is_trusted_windows_owner_sid(
+				|trusted_sid| {
+					// SAFETY: `owner` is inside the live descriptor; `trusted_sid` is the
+					// validated current-user SID or the fixed Administrators SID.
+					unsafe { EqualSid(owner, trusted_sid.as_ptr().cast_mut().cast()) != 0 }
+				},
+				&sid,
+			);
+			if !owner_trusted {
 				return Err("owner_mismatch");
 			}
 			if dacl.is_null() {
@@ -12418,9 +13254,6 @@ mod platform {
 				// live ACE.
 				let mask =
 					unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(mask_offset).cast::<u32>()) };
-				if mask & WRITE_CAPABLE_MASK == 0 {
-					continue;
-				}
 				// SAFETY: structural validation proved the SID range lies inside the
 				// live ACE.
 				let ace_sid = unsafe {
@@ -12429,12 +13262,23 @@ mod platform {
 				if valid_sid(ace_sid).is_none() {
 					return Err("acl_malformed");
 				}
-				// SAFETY: both pointers identify complete validated SIDs that remain live
-				// through comparison.
-				let grants_owner = unsafe {
-					EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
-				} != 0;
-				if !grants_owner {
+				let safe = super::executable_ace_is_safe(
+					mask,
+					|trusted_sid| {
+						// SAFETY: both pointers identify complete validated SIDs that remain
+						// live through comparison.
+						unsafe {
+							EqualSid(
+								ace_sid.as_ptr().cast_mut().cast(),
+								trusted_sid.as_ptr().cast_mut().cast(),
+							) != 0
+						}
+					},
+					&sid,
+				);
+				if !safe {
+					acl_failure =
+						Some((resolve_sid_to_principal(ace_sid), ace_header_has_inherited_flag(header)));
 					return Err("acl_present");
 				}
 			}
@@ -12443,7 +13287,21 @@ mod platform {
 		// SAFETY: GetSecurityInfo allocated descriptor with LocalAlloc and it is
 		// released exactly once after all reads have completed.
 		unsafe { LocalFree(descriptor) };
-		result
+		result.map_err(|code| {
+			let mut failure = NativeExactUnlinkResult::failure(code);
+			match acl_failure {
+				Some((principal, inherited)) if !principal.is_empty() => {
+					failure = failure
+						.with_acl_failure_principal(principal)
+						.with_acl_failure_inherited(inherited);
+					if let Some(s) = side {
+						failure = failure.with_acl_failure_side(s.to_owned());
+					}
+					failure
+				},
+				_ => failure,
+			}
+		})
 	}
 
 	/// D4-safe in-place replacement mirroring [`exact_replace_path`]'s validated
@@ -12515,9 +13373,7 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
-					result.code.as_deref(),
-				));
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -12532,8 +13388,10 @@ mod platform {
 		if source_information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(code) = verify_executable_ownership_no_shared_write(source.target) {
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(failure) =
+			verify_executable_ownership_no_shared_write(source.target, Some("source"))
+		{
+			return failure;
 		}
 		let Some(parent_handle) = source.parent() else {
 			return NativeExactUnlinkResult::failure("io_error");
@@ -12580,7 +13438,7 @@ mod platform {
 		}) {
 			Ok(handle) => handle,
 			Err(status) => {
-				return NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+				return NativeExactUnlinkResult::failure(ntstatus_code(status))
 					.with_windows_error_code(native_windows_error_code(status));
 			},
 		};
@@ -12601,8 +13459,10 @@ mod platform {
 		if information.nNumberOfLinks != 1 {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
-		if let Err(code) = verify_executable_ownership_no_shared_write(destination.target) {
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(failure) =
+			verify_executable_ownership_no_shared_write(destination.target, Some("destination"))
+		{
+			return failure;
 		}
 		match handles_same_object_checked(source.target, destination.target) {
 			Ok(true) => return NativeExactUnlinkResult::failure("identity_mismatch"),
@@ -12680,7 +13540,7 @@ mod platform {
 		match publish_retained_source_once(source.target, parent_handle, &destination_name_wide) {
 			Ok(()) => NativeExactUnlinkResult::detached(backup_path_string),
 			Err(status) => {
-				let code = retained_replace_error_code(status);
+				let code = ntstatus_code(status);
 				// The source publish is attempted once after retirement: waiting here
 				// would leave the public name vacant. Restore the predecessor
 				// immediately with an exact no-replace rename, never overwriting a
@@ -12703,6 +13563,9 @@ mod platform {
 						retained_placeholder_path: None,
 						retained_unknown_path: Some(destination_path.to_string_lossy().into_owned()),
 						windows_error_code: None,
+						acl_failure_principal: None,
+						acl_failure_inherited: None,
+						acl_failure_side: None,
 					}
 				}
 			},
@@ -12869,9 +13732,7 @@ mod platform {
 		let source = match open_exact(&source_path, source_kind, FILE_READ_ATTRIBUTES | 0x0001_0000) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
-					result.code.as_deref(),
-				));
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
 			},
 		};
 		let Some(destination_parent_path) = destination_path.parent() else {
@@ -12883,13 +13744,13 @@ mod platform {
 		let destination_parent = match open_directory_exact(destination_parent_path) {
 			Ok(handle) => handle,
 			Err(code) => {
-				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(Some(&code)));
+				return NativeExactUnlinkResult::failure(&code);
 			},
 		};
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
 		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
 			Ok(()) => NativeExactUnlinkResult::success(),
-			Err(code) => NativeExactUnlinkResult::failure(publication_rename_error_code(code)),
+			Err(code) => NativeExactUnlinkResult::failure(code),
 		}
 	}
 	pub(super) fn exact_unlink(
@@ -12930,6 +13791,9 @@ mod platform {
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
 					windows_error_code: None,
+					acl_failure_principal: None,
+					acl_failure_inherited: None,
+					acl_failure_side: None,
 				};
 			},
 		};
@@ -13147,6 +14011,9 @@ mod platform {
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
 					windows_error_code: None,
+					acl_failure_principal: None,
+					acl_failure_inherited: None,
+					acl_failure_side: None,
 				};
 			},
 		};
@@ -13606,7 +14473,7 @@ mod platform {
 		path: &Path,
 		kind: &str,
 	) -> NativeOwnerOnlySecurityResult {
-		let mut handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
+		let mut handle = match open_owner_only_exact(path, kind, WRITE_DAC | READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13624,10 +14491,11 @@ mod platform {
 			Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
 		};
 		if repair_owner {
-			let owner_handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
-				Ok(handle) => handle,
-				Err(result) => return result,
-			};
+			let owner_handle =
+				match open_owner_only_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
+					Ok(handle) => handle,
+					Err(result) => return result,
+				};
 			match same_file_identity(handle.target, owner_handle.target) {
 				Ok(true) => handle = owner_handle,
 				Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
@@ -13639,7 +14507,7 @@ mod platform {
 			return applied;
 		}
 		let verified = verify_owner_only_handle(handle.target, kind);
-		let reopened = match open_exact(path, kind, READ_CONTROL) {
+		let reopened = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13663,7 +14531,7 @@ mod platform {
 		path: &Path,
 		kind: &str,
 	) -> NativeOwnerOnlySecurityResult {
-		let handle = match open_exact(path, kind, READ_CONTROL) {
+		let handle = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13675,7 +14543,7 @@ mod platform {
 		expected_dev: u64,
 		expected_ino: u64,
 	) -> NativeOwnerOnlySecurityResult {
-		let handle = match open_exact(path, kind, READ_CONTROL) {
+		let handle = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13696,7 +14564,7 @@ mod platform {
 		if !expected_handle_identity_matches(&final_information, expected_dev, expected_ino) {
 			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
 		}
-		let reopened = match open_exact(path, kind, READ_CONTROL) {
+		let reopened = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13726,7 +14594,7 @@ mod platform {
 		expected_dev: u64,
 		expected_ino: u64,
 	) -> NativeOwnerOnlySecurityResult {
-		let mut handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
+		let mut handle = match open_owner_only_exact(path, kind, WRITE_DAC | READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13751,10 +14619,11 @@ mod platform {
 			Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
 		};
 		if repair_owner {
-			let owner_handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
-				Ok(handle) => handle,
-				Err(result) => return result,
-			};
+			let owner_handle =
+				match open_owner_only_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
+					Ok(handle) => handle,
+					Err(result) => return result,
+				};
 			let mut owner_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 			if unsafe { GetFileInformationByHandle(owner_handle.target, &mut owner_information) } == 0
 			{
@@ -13779,7 +14648,7 @@ mod platform {
 			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
 		}
 		let verified = verify_owner_only_handle(handle.target, kind);
-		let reopened = match open_exact(path, kind, READ_CONTROL) {
+		let reopened = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13857,7 +14726,7 @@ mod platform {
 		desired_access: u32,
 	) -> Result<(HeldExact, HeldExact), NativeOwnerOnlySecurityResult> {
 		let caller = retained_caller_handle(caller_fd)?;
-		let path_handle = open_exact(path, kind, desired_access)?;
+		let path_handle = open_owner_only_exact(path, kind, desired_access)?;
 		if !same_file_identity(path_handle.target, caller.target)? {
 			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
 		}
@@ -13889,10 +14758,11 @@ mod platform {
 				Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
 			};
 		if repair_owner {
-			let owner_handle = match open_exact(path, kind, READ_CONTROL | WRITE_DAC | WRITE_OWNER) {
-				Ok(handle) => handle,
-				Err(result) => return result,
-			};
+			let owner_handle =
+				match open_owner_only_exact(path, kind, READ_CONTROL | WRITE_DAC | WRITE_OWNER) {
+					Ok(handle) => handle,
+					Err(result) => return result,
+				};
 			match same_file_identity(owner_handle.target, caller.target) {
 				Ok(true) => path_handle = owner_handle,
 				Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
@@ -13910,7 +14780,7 @@ mod platform {
 			Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
 			Err(result) => return result,
 		}
-		let reopened = match open_exact(path, kind, READ_CONTROL) {
+		let reopened = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13936,7 +14806,7 @@ mod platform {
 			Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
 			Err(result) => return result,
 		}
-		let reopened = match open_exact(path, kind, READ_CONTROL) {
+		let reopened = match open_owner_only_exact(path, kind, READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -13954,11 +14824,59 @@ mod platform {
 		};
 
 		use super::{
-			FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, exact_remove_directory_tree_with_mode,
-			owner_only_ace_mask_is_safe, snapshot_directory_tree,
+			ACE_HEADER, FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, INHERITED_ACE,
+			ace_header_has_inherited_flag, exact_remove_directory_tree_with_mode,
+			owner_only_ace_mask_is_safe, resolve_sid_to_principal, snapshot_directory_tree,
 		};
 
 		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		#[test]
+		fn sid_to_principal_resolves_local_system_account() {
+			let principal =
+				resolve_sid_to_principal(super::super::WINDOWS_LOCAL_SYSTEM_SID.0.as_slice());
+			// Account names are localized, but the resolved domain/name shape is stable.
+			let (domain, name) = principal.split_once('\\').expect("resolved DOMAIN\\name");
+			assert!(!domain.is_empty());
+			assert!(!name.is_empty());
+			assert!(!principal.starts_with("S-1-"));
+		}
+
+		#[test]
+		fn sid_to_principal_falls_back_to_unmapped_sid_string() {
+			let mut sid = vec![1, 5, 0, 0, 0, 0, 0, 5];
+			for sub_authority in [21u32, u32::MAX, u32::MAX, u32::MAX, u32::MAX - 1] {
+				sid.extend_from_slice(&sub_authority.to_le_bytes());
+			}
+			assert_eq!(
+				resolve_sid_to_principal(&sid),
+				"S-1-5-21-4294967295-4294967295-4294967295-4294967294"
+			);
+		}
+
+		#[test]
+		fn sid_to_principal_rejects_truncated_sid_without_calling_windows() {
+			assert!(resolve_sid_to_principal(&[]).is_empty());
+			assert!(resolve_sid_to_principal(&[1, 1, 0, 0, 0, 0, 0, 5]).is_empty());
+		}
+
+		#[test]
+		fn inherited_flag_distinguishes_inheritance_from_audit_and_propagation_flags() {
+			for (flags, expected) in
+				[(0, false), (0x0f, false), (0x80, false), (0x10, true), (0x9f, true)]
+			{
+				assert_eq!(
+					ace_header_has_inherited_flag(ACE_HEADER {
+						AceType:  0,
+						AceFlags: flags,
+						AceSize:  4,
+					}),
+					expected,
+					"ACE flags {flags:#x}"
+				);
+			}
+			assert_eq!(INHERITED_ACE, 0x10);
+		}
 
 		struct TempDir(PathBuf);
 
@@ -14188,6 +15106,57 @@ mod platform {
 		})
 	}
 
+	/// Closes one Win32 handle on every return, including `?` error paths.
+	/// Tree snapshot and removal used to `CloseHandle` only after a later
+	/// check. A sharing violation or hard-link rejection then leaked the child
+	/// handle inside this process, so the same staging directory stayed
+	/// undeletable (`sharing_violation`) and unrenameable (`access_denied`).
+	struct CloseOnDrop(HANDLE);
+
+	impl Drop for CloseOnDrop {
+		fn drop(&mut self) {
+			if !self.0.is_null() {
+				// SAFETY: the handle was opened by this module and is not used
+				// again after this guard drops.
+				unsafe { CloseHandle(self.0) };
+			}
+		}
+	}
+
+	impl CloseOnDrop {
+		const fn get(&self) -> HANDLE {
+			self.0
+		}
+	}
+
+	/// Open one snapshot child, first as a file and then as a directory. When
+	/// both opens fail, the reported code comes from
+	/// [`snapshot_child_open_failure`], so a held, denied, or delete-pending
+	/// file child is not misreported as the directory reopen's failure.
+	fn open_snapshot_child(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+	) -> Result<(CloseOnDrop, &'static str), &'static str> {
+		let access = FILE_READ_ATTRIBUTES | FILE_READ_DATA;
+		let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+		let (child, kind) = match open_relative_with_share_status(parent, name, access, false, share)
+		{
+			Ok(child) => (child, "file"),
+			Err(file_status) => {
+				match open_relative_with_share_status(parent, name, access, true, share) {
+					Ok(child) => (child, "directory"),
+					Err(directory_status) => {
+						return Err(ntstatus_code(snapshot_child_open_failure(
+							file_status,
+							directory_status,
+						)));
+					},
+				}
+			},
+		};
+		Ok((CloseOnDrop(child), kind))
+	}
+
 	fn snapshot_tree_handle(
 		handle: HANDLE,
 		relative: &str,
@@ -14202,31 +15171,17 @@ mod platform {
 			} else {
 				format!("{relative}/{name}")
 			};
-			let file = open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, false);
-			let (child, kind) = match file {
-				Ok(child) => (child, "file"),
-				Err(_) => (
-					open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, true)?,
-					"directory",
-				),
-			};
-			let attributes = match handle_attributes(child) {
-				Ok(value) => value,
-				Err(code) => {
-					unsafe { CloseHandle(child) };
-					return Err(code);
-				},
-			};
-			let result = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-				Err("reparse_point")
-			} else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-				snapshot_tree_handle(child, &child_relative, entries)
+			// `CloseOnDrop` closes the child on every exit, including `?`.
+			let (child, kind) = open_snapshot_child(handle, &name_os)?;
+			let attributes = handle_attributes(child.get())?;
+			if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+				return Err("reparse_point");
+			}
+			if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+				snapshot_tree_handle(child.get(), &child_relative, entries)?;
 			} else {
-				entries.push(tree_entry(child, child_relative, kind)?);
-				Ok(())
-			};
-			unsafe { CloseHandle(child) };
-			result?;
+				entries.push(tree_entry(child.get(), child_relative, kind)?);
+			}
 		}
 		Ok(())
 	}
@@ -14361,6 +15316,22 @@ mod platform {
 		rename_handle(handle, parent, &name, false)
 	}
 
+	/// Opens a directory with DELETE for its own quarantine or delete. Sharing
+	/// only READ denies concurrent DELETE/WRITE, matching the file child
+	/// opens, so the identity proven on this handle is the object removed.
+	fn open_directory_for_delete(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+	) -> Result<HANDLE, &'static str> {
+		open_relative_with_share(
+			parent,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			true,
+			FILE_SHARE_READ,
+		)
+	}
+
 	fn set_handle_attributes(handle: HANDLE, attributes: u32) -> Result<(), &'static str> {
 		let mut basic = FILE_BASIC_INFO {
 			CreationTime:   0,
@@ -14437,16 +15408,19 @@ mod platform {
 				return Err("identity_mismatch");
 			}
 			let directory = expected_child.kind == "directory";
-			let child =
-				open_relative(handle, &name_os, FILE_READ_ATTRIBUTES | FILE_READ_DATA, directory)?;
-			let result = if !tree_entry_matches(child, expected_child)? {
+			let child = CloseOnDrop(open_relative(
+				handle,
+				&name_os,
+				FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+				directory,
+			)?);
+			let result = if !tree_entry_matches(child.get(), expected_child)? {
 				Err("identity_mismatch")
 			} else if directory {
-				validate_tree_handle(child, &expected_child.relative_path, expected)
+				validate_tree_handle(child.get(), &expected_child.relative_path, expected)
 			} else {
 				Ok(())
 			};
-			unsafe { CloseHandle(child) };
 			result?;
 		}
 		Ok(())
@@ -14473,42 +15447,64 @@ mod platform {
 				return Err("identity_mismatch");
 			}
 			let directory = expected_child.kind == "directory";
-			let child = if directory {
-				open_relative(
-					handle,
-					&name_os,
-					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-					true,
-				)?
-			} else {
-				open_relative_with_share(
+			let quarantine_name = tree_quarantine_name(expected_child);
+			let already_quarantined = name == quarantine_name;
+			if !directory {
+				let child = CloseOnDrop(open_relative_with_share(
 					handle,
 					&name_os,
 					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
 					false,
 					FILE_SHARE_READ,
-				)?
-			};
-			if !tree_entry_matches(child, expected_child)? {
-				unsafe { CloseHandle(child) };
-				return Err("identity_mismatch");
+				)?);
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				if !already_quarantined {
+					quarantine_tree_child(child.get(), handle, expected_child)?;
+				}
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				delete_handle(child.get())?;
+				continue;
 			}
-			let already_quarantined = name == tree_quarantine_name(expected_child);
+			// A rename inside a directory makes the I/O manager open that directory
+			// as the rename target without FILE_SHARE_DELETE. Holding the same
+			// directory with DELETE access therefore makes every child quarantine
+			// fail with a sharing violation. Only hold DELETE while renaming or
+			// deleting the directory itself, and traverse it through a handle
+			// without DELETE; each reopen is identity-checked by dev/ino.
+			// DELETE handles deny external DELETE so the object cannot be renamed
+			// away and substituted between the identity check and the delete.
+			let quarantine_os = std::ffi::OsString::from(quarantine_name.as_str());
 			if !already_quarantined {
-				quarantine_tree_child(child, handle, expected_child)?;
+				let child = CloseOnDrop(open_directory_for_delete(handle, &name_os)?);
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				quarantine_tree_child(child.get(), handle, expected_child)?;
+				if !tree_entry_matches(child.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
 			}
-			if !tree_entry_matches(child, expected_child)? {
-				unsafe { CloseHandle(child) };
+			{
+				let traversal = CloseOnDrop(open_relative(
+					handle,
+					&quarantine_os,
+					FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+					true,
+				)?);
+				if !tree_entry_matches(traversal.get(), expected_child)? {
+					return Err("identity_mismatch");
+				}
+				remove_tree_handle(traversal.get(), &expected_child.relative_path, expected)?;
+			}
+			let child = CloseOnDrop(open_directory_for_delete(handle, &quarantine_os)?);
+			if !tree_entry_matches(child.get(), expected_child)? {
 				return Err("identity_mismatch");
 			}
-			let result = if directory {
-				remove_tree_handle(child, &expected_child.relative_path, expected)
-					.and_then(|()| delete_handle(child))
-			} else {
-				delete_handle(child)
-			};
-			unsafe { CloseHandle(child) };
-			result?;
+			delete_handle(child.get())?;
 		}
 		Ok(())
 	}
@@ -14615,46 +15611,59 @@ mod platform {
 		final_candidate.set_file_name(&final_component);
 		let final_path = final_candidate.to_string_lossy().into_owned();
 		let input_is_final = planned_path.ends_with(".removing");
-		let (root, retained_path, already_final) = match open_exact(
-			path,
-			"directory",
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-		) {
-			Ok(root) => (root, planned_path.clone(), input_is_final),
-			Err(result) if !input_is_final && result.code.as_deref() == Some("not_found") => {
-				match open_exact(
-					&final_candidate,
-					"directory",
-					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-				) {
-					Ok(root) => (root, final_path.clone(), true),
-					Err(result) => {
-						return NativeExactUnlinkResult {
-							ok: false,
-							code: result.code,
-							payload_durable: None,
-							detached_path: None,
-							retained_successor_path: None,
-							retained_placeholder_path: None,
-							retained_unknown_path: None,
-							windows_error_code: None,
-						};
-					},
-				}
-			},
-			Err(result) => {
-				return NativeExactUnlinkResult {
-					ok: false,
-					code: result.code,
-					payload_durable: None,
-					detached_path: None,
-					retained_successor_path: None,
-					retained_placeholder_path: None,
-					retained_unknown_path: None,
-					windows_error_code: None,
-				};
-			},
-		};
+		// Detach renames the root itself and needs DELETE on it. Full removal
+		// quarantines children inside the root first; holding DELETE on the root
+		// there conflicts with the rename target open (no FILE_SHARE_DELETE) and
+		// fails every non-empty removal with `sharing_violation`. The root is
+		// reopened with DELETE only after its children are gone.
+		let root_access = FILE_READ_ATTRIBUTES
+			| FILE_READ_DATA
+			| FILE_WRITE_ATTRIBUTES
+			| if detach_only { 0x0001_0000 } else { 0 };
+		let (root, retained_path, already_final, root_name) =
+			match open_exact(path, "directory", root_access) {
+				Ok(root) => (
+					root,
+					planned_path.clone(),
+					input_is_final,
+					path.file_name().map(std::ffi::OsStr::to_os_string),
+				),
+				Err(result) if !input_is_final && result.code.as_deref() == Some("not_found") => {
+					match open_exact(&final_candidate, "directory", root_access) {
+						Ok(root) => (root, final_path.clone(), true, Some(final_component.clone())),
+						Err(result) => {
+							return NativeExactUnlinkResult {
+								ok: false,
+								code: result.code,
+								payload_durable: None,
+								detached_path: None,
+								retained_successor_path: None,
+								retained_placeholder_path: None,
+								retained_unknown_path: None,
+								windows_error_code: None,
+								acl_failure_principal: None,
+								acl_failure_inherited: None,
+								acl_failure_side: None,
+							};
+						},
+					}
+				},
+				Err(result) => {
+					return NativeExactUnlinkResult {
+						ok: false,
+						code: result.code,
+						payload_durable: None,
+						detached_path: None,
+						retained_successor_path: None,
+						retained_placeholder_path: None,
+						retained_unknown_path: None,
+						windows_error_code: None,
+						acl_failure_principal: None,
+						acl_failure_inherited: None,
+						acl_failure_side: None,
+					};
+				},
+			};
 		let root_entry = match tree_entry(root.target, String::new(), "directory") {
 			Ok(entry) => entry,
 			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
@@ -14726,11 +15735,25 @@ mod platform {
 			},
 			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
 		}
-		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) => match delete_handle(root.target) {
-				Ok(()) => NativeExactUnlinkResult::success(),
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
+		if let Err(code) = remove_tree_handle(root.target, "", &expected.entries) {
+			return NativeExactUnlinkResult::detached_failure(code, retained_path);
+		}
+		let Some(root_name) = root_name else {
+			return NativeExactUnlinkResult::detached_failure("io_error", retained_path);
+		};
+		let deletable = match open_directory_for_delete(parent, &root_name) {
+			Ok(handle) => CloseOnDrop(handle),
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		};
+		match tree_entry(deletable.get(), String::new(), "directory") {
+			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},
+			Ok(_) => {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 			},
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+		match delete_handle(deletable.get()) {
+			Ok(()) => NativeExactUnlinkResult::success(),
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 		}
 	}

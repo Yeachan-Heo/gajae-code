@@ -28,6 +28,7 @@ export type {
 	ModelPerformancePoint,
 	ModelStats,
 	ModelTimeSeriesPoint,
+	SessionOwnershipStats,
 	TimeSeriesPoint,
 } from "./types";
 

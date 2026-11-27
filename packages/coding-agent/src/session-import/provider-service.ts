@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { canContinuePersistedHistory } from "@gajae-code/agent-core";
+import { sessionClaimSetOf } from "../session/internal/session-claim-set";
 import { type SessionDestinationInput, SessionManager } from "../session/session-manager";
 import { parseClaudeCodeTranscript, parseClaudeExport } from "./claude";
 import { detectSessionImportFormat } from "./detect";
@@ -374,6 +375,13 @@ export async function materializeExternalSessionImport(
 	}
 	const importedAt = (options.now?.() ?? new Date()).toISOString();
 	const manager = SessionManager.create(options.cwd, options.destination);
+	// The import's claim gate: enforce refuses a failed claim of the new id here, before any write.
+	const claims = sessionClaimSetOf(manager);
+	const refusal = claims.claiming ? await claims.refusal() : undefined;
+	if (refusal) {
+		await manager.close().catch(() => {});
+		throw new SessionImportError("io_failed", "persist", refusal.operatorMessage);
+	}
 	const destination = manager.getDestinationForFork();
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) {
@@ -392,6 +400,10 @@ export async function materializeExternalSessionImport(
 			importedAt,
 		};
 		manager.appendCustomEntry(EXTERNAL_IMPORT_PROVENANCE_CUSTOM_TYPE, provenance);
+		// Shared-append admission cannot be latched on this manager: it was created for a new
+		// session above and has never taken a shared publication, and the import publishes its
+		// whole resident graph through the title/ensureOnDisk path immediately after these
+		// appends. The legacy appends are therefore admitted by construction.
 		manager.appendCustomMessageEntry(
 			EXTERNAL_IMPORT_CONTEXT_CUSTOM_TYPE,
 			prepared.contextText,

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { replaceTabs } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
-import { getThemeByName } from "../../src/modes/theme/theme";
+import { mulberry32 } from "../../../utils/test/helpers/prng";
 import { astEditToolRenderer } from "../../src/tools/ast-edit";
 import { astGrepToolRenderer } from "../../src/tools/ast-grep";
 import { findToolRenderer } from "../../src/tools/find";
 import { renderTreeList } from "../../src/tui/tree-list";
+import { loadTestTheme } from "../helpers/test-theme";
 
 const ESC = "\u001b";
 const BEL = "\u0007";
@@ -30,7 +31,7 @@ function assertNoOsc(text: string): void {
 
 describe("tool tree render controls", () => {
 	it("hides osc controls in ast grep, ast edit, and find results", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const opts = { expanded: true, isPartial: false };
@@ -86,7 +87,7 @@ describe("tool tree render controls", () => {
 	});
 
 	it("keeps ordinary ast grep, ast edit, and find result text", async () => {
-		const theme = await getThemeByName("red-claw");
+		const theme = await loadTestTheme();
 		expect(theme).toBeDefined();
 		const uiTheme = theme!;
 		const opts = { expanded: true, isPartial: false };
@@ -133,14 +134,7 @@ describe("tool tree render controls", () => {
 	});
 
 	it("property: tree list display lines match sanitizeText, seed 446, 64 inputs", () => {
-		const seed = 446;
-		let state = seed >>> 0;
-		const next = () => {
-			state = (state + 0x6d2b79f5) | 0;
-			let t = Math.imul(state ^ (state >>> 15), 1 | state);
-			t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-			return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-		};
+		const next = mulberry32(446);
 		const alphabet = "abcDEF012 ._-:/";
 		const injections = [
 			`${ESC}]0;TITLE${BEL}`,

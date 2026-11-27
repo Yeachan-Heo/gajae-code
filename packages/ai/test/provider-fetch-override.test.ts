@@ -8,6 +8,7 @@ import { getBundledModel } from "../src/models";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Context, Model } from "../src/types";
+import { createSseResponse } from "./openai-tool-choice-test-helpers";
 
 const originalFetch = global.fetch;
 const tempDirs: string[] = [];
@@ -123,15 +124,6 @@ function baseContext(): Context {
 		messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 	};
 }
-
-function createSseResponse(events: unknown[]): Response {
-	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
-	return new Response(payload, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 function rejectingGlobalFetch(): typeof fetch {
 	const reject = async (): Promise<never> => {
 		throw new Error("global fetch must not be used when an override is provided");

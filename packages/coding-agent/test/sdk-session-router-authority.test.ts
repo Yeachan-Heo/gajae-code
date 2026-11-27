@@ -706,6 +706,38 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("preserves ordinary model-choice command results for attachment and notification consumers", async () => {
+		const frames: Record<string, unknown>[] = [];
+		const notifications: Record<string, unknown>[] = [];
+		const fixture = await routerFixture({
+			onFrame: (_attachment, frame) => {
+				frames.push(frame.body);
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				notifications.push(frame.body);
+			},
+		});
+		try {
+			const result = {
+				type: "control_command_result",
+				requestId: "telegram-model-list",
+				sessionId: fixture.sessionId,
+				status: "ok",
+				modelChoices: [{ selector: "test/model", label: "Test model" }],
+			};
+			const settled = { type: "delivery-settled", sessionId: fixture.sessionId };
+			fixture.clients[0]!.emit(result);
+			fixture.clients[0]!.emit({ type: "control_response", id: "uncorrelated-control", ok: true });
+			fixture.clients[0]!.emit({ type: "query_response", id: "uncorrelated-query", ok: true });
+			fixture.clients[0]!.emit(settled);
+			await waitFor(() => notifications.includes(settled), "Notification delivery did not settle.");
+			expect(frames).toEqual([result, settled]);
+			expect(notifications).toEqual([result, settled]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
 	test("contains synchronous notification admission failure without revoking core attachment", async () => {
 		const fixture = await routerFixture({
 			onNotificationSubscription: () => {

@@ -9,6 +9,7 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { assertEditableFile, assertEditableFileContent } from "@gajae-code/coding-agent/tools/auto-generated-guard";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
+import { lcgUnit } from "../../../utils/test/helpers/prng";
 
 let tempDir: string;
 
@@ -19,14 +20,6 @@ beforeAll(async () => {
 });
 
 const testSettings = (): Settings => Settings.instance;
-
-function seededRandom(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-		return state / 0x1_0000_0000;
-	};
-}
 
 function toggleAsciiCase(value: string): string {
 	return value.replace(/[a-z]/gi, character =>
@@ -167,7 +160,7 @@ describe("assertEditableFile", () => {
 	});
 
 	it("matches seeded anchored generated names across POSIX and Windows path separators", async () => {
-		const random = seededRandom(0x6850_304);
+		const random = lcgUnit(0x6850_304);
 		const randomInt = (max: number): number => Math.floor(random() * max);
 		const generatedExtensions = ["go", "ts", "js", "py"];
 

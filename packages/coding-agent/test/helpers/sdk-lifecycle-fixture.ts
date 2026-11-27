@@ -247,26 +247,16 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 		stateRoot,
 		async invokeScenario(global, conflictCode = "idempotency_conflict") {
 			const created = success(
-				await global(
-					"session.create",
-					{ cwd: repo, target: { path: repo }, stateRoot, body: "create" },
-					"create-key",
-				),
+				await global("session.create", { cwd: repo, target: { path: repo }, stateRoot }, "create-key"),
 			);
 			const createdId = String(created.sessionId);
 			expect(
-				success(
-					await global(
-						"session.create",
-						{ cwd: repo, target: { path: repo }, stateRoot, body: "create" },
-						"create-key",
-					),
-				),
+				success(await global("session.create", { cwd: repo, target: { path: repo }, stateRoot }, "create-key")),
 			).toEqual(created);
 			expect(
 				await global(
 					"session.create",
-					{ cwd: repo, target: { path: repo }, stateRoot, body: "changed" },
+					{ cwd: repo, target: { path: repo }, stateRoot, model: "changed" },
 					"create-key",
 				),
 			).toMatchObject({ ok: false, error: { code: conflictCode } });
@@ -276,7 +266,10 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			await assertClosed(agentDir, stateRoot, createdId, createdEndpoint);
 			expect(
 				await global("session.close", { sessionId: createdId, body: "changed" }, "close-created-key"),
-			).toMatchObject({ ok: false, error: { code: conflictCode } });
+			).toMatchObject({
+				ok: false,
+				error: { code: conflictCode === "operation_failed" ? "operation_failed" : "invalid_input" },
+			});
 			expect(success(await global("session.close", { sessionId: createdId }, "close-created-key"))).toEqual(
 				createdClosed,
 			);
@@ -331,7 +324,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 						stateRoot,
 						sessionId: sourceId,
 						sessionPath: sourcePath,
-						body: "changed",
+						model: "changed",
 					},
 					"resume-key",
 				),
@@ -378,7 +371,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 						stateRoot,
 						sourceSessionId: sourceId,
 						sourceSessionPath: sourcePath,
-						body: "changed",
+						model: "changed",
 					},
 					"fork-key",
 				),

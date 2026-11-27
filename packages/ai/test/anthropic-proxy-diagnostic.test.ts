@@ -165,7 +165,8 @@ describe("Anthropic proxy-injected context-management diagnostic (#4380)", () =>
 		const capturePath = /raw-http-request=(.+)$/m.exec(result.errorMessage ?? "")?.[1];
 		expect(capturePath).toBeDefined();
 		const capture = JSON.parse(await fs.readFile(capturePath ?? "", "utf8")) as Record<string, unknown>;
-		expect(capture.url).toBe("https://proxy.example.test/anthropic");
+		// The capture records the real request path; the signed query stays redacted.
+		expect(capture.url).toBe("https://proxy.example.test/anthropic/v1/messages");
 		expect(capture.body).not.toHaveProperty("thinking");
 		expect(capture.body).not.toHaveProperty("context_management");
 		expect(capture.diagnostics).toMatchObject({

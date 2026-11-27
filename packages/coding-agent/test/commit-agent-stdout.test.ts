@@ -7,6 +7,7 @@ import { Settings } from "../src/config/settings";
 import { initTheme } from "../src/modes/theme/theme";
 import type { CreateAgentSessionResult } from "../src/sdk";
 import * as sdkModule from "../src/sdk";
+import { mulberry32 } from "./helpers/seeded-random";
 
 const SEED = 349;
 const PROPERTY_INPUTS = 64;
@@ -14,17 +15,6 @@ const PREVIEW = "hi\x1b[2A\x1b]0;PWN\x07X";
 const HOSTILE = "hello\x1b[2A\x1b]0;PWNED_TITLE\x07\x1b]8;;https://evil.example\x1b\\click\x1b]8;;\x1b\\\x07";
 
 type Emit = (event: Record<string, unknown>) => void;
-
-function mulberry32(seed: number): () => number {
-	let state = seed >>> 0;
-	return () => {
-		state = (state + 0x6d2b79f5) | 0;
-		let t = Math.imul(state ^ (state >>> 15), 1 | state);
-		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-	};
-}
-
 function propertyInputs(): string[] {
 	const rand = mulberry32(SEED);
 	const alphabet = "abc ./_\n\t\x00\x07\x1b[";

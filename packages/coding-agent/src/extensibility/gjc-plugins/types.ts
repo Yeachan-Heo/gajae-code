@@ -537,6 +537,12 @@ export interface GjcInstallResult {
 	summary: GjcBundleSummary;
 }
 
+/** A resolved install that was deliberately not performed. */
+export interface GjcInstallPreview {
+	status: "would-install";
+	summary: GjcBundleSummary;
+}
+
 /** A resolved uninstall that was deliberately not performed. */
 export interface GjcUninstallPreview {
 	status: "would-uninstall";

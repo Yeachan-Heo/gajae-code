@@ -286,7 +286,13 @@ describe("AgentSession startup continuation lifecycle", () => {
 			if (event.type === "agent_start") started.resolve();
 		});
 		const continuation = session!.continuePersistedHistory();
-		await started.promise;
+		// Abort only once the agent loop is blocked in `next()` on the provider stream,
+		// so this covers the pending-read abort race rather than the pre-consumption check.
+		const deadline = Date.now() + 1_000;
+		while (!(pending.hasActiveConsumer && session!.isStreaming)) {
+			if (Date.now() >= deadline) throw new Error("Timed out waiting for provider stream consumption");
+			await Bun.sleep(1);
+		}
 
 		await session!.abort();
 		await continuation;
@@ -294,7 +300,7 @@ describe("AgentSession startup continuation lifecycle", () => {
 
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
-		expect(session!.isStreaming).toBe(false);
+		expect(Boolean(session!.isStreaming)).toBe(false);
 	});
 
 	it("rejects promptly when aborted before the startup continuation creates a run controller", async () => {

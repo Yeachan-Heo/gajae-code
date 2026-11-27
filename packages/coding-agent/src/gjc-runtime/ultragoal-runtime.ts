@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -407,6 +408,11 @@ export async function appendLedger(
 		cwd,
 		audit: { category: "ledger", verb: "append", owner: "gjc-runtime", sessionId: resolvedSessionId },
 	});
+	// Implicit session resolution (`gjc state doctor` without a session id) reads
+	// this marker, so a state command whose row landed but whose marker did not
+	// must fail rather than report success with a stale marker. Callers that can
+	// prove the row committed (ask settlement reads it back by event id) decide
+	// for themselves whether the marker failure is fatal.
 	await writeSessionActivityMarker(cwd, resolvedSessionId, { writer: "ultragoal-runtime", path: paths.ledgerPath });
 	return entry;
 }
@@ -568,6 +574,130 @@ export async function recordUltragoalNudgeIfBudgetRemaining(input: {
 			} as const;
 		},
 		{ cwd },
+	);
+}
+
+export const HUMAN_BLOCKED_ASK_RESERVED_EVENT = "human_blocked_ask_reserved";
+export const HUMAN_BLOCKED_ASK_RELEASED_EVENT = "human_blocked_ask_released";
+export const HUMAN_BLOCKED_ASK_ANSWERED_EVENT = "human_blocked_ask_answered";
+
+interface HumanBlockedAskReceipt {
+	cwd: string;
+	sessionId: string;
+	classificationEventId: string;
+}
+
+function latestHumanBlockedAskEvent(
+	ledger: readonly UltragoalLedgerEvent[],
+	classificationEventId: string,
+): string | undefined {
+	for (let index = ledger.length - 1; index >= 0; index--) {
+		const event = ledger[index];
+		if (event.classificationEventId !== classificationEventId) continue;
+		if (
+			event.event === HUMAN_BLOCKED_ASK_RESERVED_EVENT ||
+			event.event === HUMAN_BLOCKED_ASK_RELEASED_EVENT ||
+			event.event === HUMAN_BLOCKED_ASK_ANSWERED_EVENT
+		) {
+			return event.event;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Pure: whether the single ask of one `human_blocked` classification is spent.
+ * A reservation spends it from the moment the question opens; only a release
+ * (the question ended without an answer) hands it back.
+ */
+export function isUltragoalHumanBlockedAskSpent(
+	ledger: readonly UltragoalLedgerEvent[],
+	classificationEventId: string,
+): boolean {
+	const latest = latestHumanBlockedAskEvent(ledger, classificationEventId);
+	return latest !== undefined && latest !== HUMAN_BLOCKED_ASK_RELEASED_EVENT;
+}
+
+type HumanBlockedAskDecision<T> = { event: string; result: T } | { result: T };
+
+async function appendHumanBlockedAskEvent<T>(
+	input: HumanBlockedAskReceipt,
+	decide: (
+		ledger: readonly UltragoalLedgerEvent[],
+	) => HumanBlockedAskDecision<T> | Promise<HumanBlockedAskDecision<T>>,
+): Promise<T> {
+	const { cwd, sessionId, classificationEventId } = input;
+	return withWorkflowStateLock(
+		getUltragoalPaths(cwd, sessionId).ledgerPath,
+		async () => {
+			const decision = await decide(await readUltragoalLedger(cwd, sessionId));
+			if ("event" in decision) {
+				const eventId = crypto.randomUUID();
+				try {
+					await appendLedger(cwd, { eventId, event: decision.event, classificationEventId }, sessionId);
+				} catch (error) {
+					// The audit entry is written after the row, so a failure can leave the
+					// row behind. The row is what every later decision reads: when it is
+					// there, report the decision it committed, or the caller would act on
+					// the opposite of the durable state (a reservation it believes it
+					// does not hold, a release it believes was not recorded).
+					// This includes an activity-marker failure after the row: settlement
+					// is keyed by the session id it already holds, not by the marker.
+					const committed = await readUltragoalLedger(cwd, sessionId).then(
+						ledger => ledger.some(row => row.eventId === eventId),
+						() => false,
+					);
+					if (!committed) throw error;
+					logger.warn(
+						`ultragoal-runtime: ${decision.event} was written but its append reported a failure: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
+			return decision.result;
+		},
+		{ cwd },
+	);
+}
+
+/**
+ * Durably reserve the single `ask` a verified human-only blocker admits, before
+ * the question opens. Returns `false` when the admission is already spent. The
+ * reservation survives a restart, so an answer that could not be recorded still
+ * cannot be asked again. `stillAdmissible` re-derives the receipt under the
+ * plan and ledger locks, which plan writes, blocker classifications and critic
+ * verdicts also take, so a receipt superseded after the guard ran is refused. Rows carry no `goalId`, which keeps them out of every
+ * completion-receipt freshness base.
+ */
+export function recordUltragoalHumanBlockedAskReserved(
+	input: HumanBlockedAskReceipt,
+	stillAdmissible: () => Promise<boolean>,
+): Promise<boolean> {
+	// The receipt is also stale after a required-goal change, so the recheck holds
+	// the plan lock too, taken before the ledger lock (the established order).
+	return withUltragoalPlanOwnership(input.cwd, input.sessionId, () =>
+		appendHumanBlockedAskEvent(input, async ledger =>
+			!isUltragoalHumanBlockedAskSpent(ledger, input.classificationEventId) && (await stillAdmissible())
+				? { event: HUMAN_BLOCKED_ASK_RESERVED_EVENT, result: true }
+				: { result: false },
+		),
+	);
+}
+
+/** Hand a reservation back after its question ended without an answer. */
+export function recordUltragoalHumanBlockedAskReleased(input: HumanBlockedAskReceipt): Promise<void> {
+	return appendHumanBlockedAskEvent(input, ledger =>
+		latestHumanBlockedAskEvent(ledger, input.classificationEventId) === HUMAN_BLOCKED_ASK_RESERVED_EVENT
+			? { event: HUMAN_BLOCKED_ASK_RELEASED_EVENT, result: undefined }
+			: { result: undefined },
+	);
+}
+
+/** Record that the reserved question returned an answer. */
+export function recordUltragoalHumanBlockedAskAnswered(input: HumanBlockedAskReceipt): Promise<void> {
+	return appendHumanBlockedAskEvent(input, ledger =>
+		latestHumanBlockedAskEvent(ledger, input.classificationEventId) === HUMAN_BLOCKED_ASK_ANSWERED_EVENT
+			? { result: undefined }
+			: { event: HUMAN_BLOCKED_ASK_ANSWERED_EVENT, result: undefined },
 	);
 }
 
@@ -4314,12 +4444,26 @@ export async function recordUltragoalBlockerClassification(input: {
 	if (input.classification !== "human_blocked" && input.classification !== "resolvable") {
 		throw new Error('classify-blocker --classification must be "human_blocked" or "resolvable"');
 	}
-	return appendLedger(input.cwd, {
-		event: "blocker_classified",
-		classification: input.classification,
-		...(input.goalId?.trim() ? { goalId: input.goalId.trim() } : {}),
-		evidence,
-	});
+	const resolvedSessionId = resolveGjcSessionForWrite(input.cwd, {
+		envSessionId: process.env.GJC_SESSION_ID,
+	}).gjcSessionId;
+	// Serialized with the human-blocked ask reservation, which revalidates the
+	// latest classification under this lock.
+	return withWorkflowStateLock(
+		getUltragoalPaths(input.cwd, resolvedSessionId).ledgerPath,
+		() =>
+			appendLedger(
+				input.cwd,
+				{
+					event: "blocker_classified",
+					classification: input.classification,
+					...(input.goalId?.trim() ? { goalId: input.goalId.trim() } : {}),
+					evidence,
+				},
+				resolvedSessionId,
+			),
+		{ cwd: input.cwd },
+	);
 }
 
 export async function recordUltragoalCriticVerdict(input: {

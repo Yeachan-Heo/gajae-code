@@ -8,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getReportsDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { createReportBundle } from "../src/debug/report-bundle";
 
 const FIXED_ISO = "2026-01-02T03:04:05.006Z";
@@ -26,7 +27,7 @@ async function symlinkSupported(): Promise<boolean> {
 		if (code === "EPERM" || code === "EACCES") return false;
 		throw error;
 	} finally {
-		await fs.rm(dir, { recursive: true, force: true });
+		await safeRm(dir, { recursive: true, force: true });
 	}
 }
 
@@ -73,9 +74,9 @@ async function withReports<T>(run: (reportsDir: string) => Promise<T>): Promise<
 		setAgentDir(originalAgent);
 		restoreVar("USERPROFILE", originalProfile);
 		restoreVar("HOME", originalHome);
-		await fs.rm(agent, { recursive: true, force: true });
-		await fs.rm(logs, { recursive: true, force: true });
-		await fs.rm(home, { recursive: true, force: true });
+		await safeRm(agent, { recursive: true, force: true });
+		await safeRm(logs, { recursive: true, force: true });
+		await safeRm(home, { recursive: true, force: true });
 	}
 }
 

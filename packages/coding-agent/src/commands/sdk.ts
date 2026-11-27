@@ -52,6 +52,7 @@ import {
 	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
+	removeSessionLifecycleStartupCommit,
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
 	sessionHostAttachedClients,
@@ -59,13 +60,21 @@ import {
 	startBrokerDeadRegistrationSweep,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
+	writeSessionLifecycleStartupCommit,
 } from "../sdk/broker/lifecycle";
+import { type BrokerLockRefusalCode, BrokerLockRefusedError } from "../sdk/broker/lock-refusal";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand } from "../sdk/broker/runtime";
-import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
+import { type BrokerStartupFailure, writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
+import {
+	attestationAgentDir,
+	renderSpawnAnchorAttestation,
+	runSpawnAnchorAttestation,
+	spawnAnchorAttestationRestartNotice,
+} from "../sdk/cli/spawn-anchor-attestation-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
 	type CreateLifecycleAgentSessionResult,
@@ -73,6 +82,7 @@ import {
 	type SdkLifecycleStartupOwner,
 } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
+import type { ResumeSessionIdentity } from "../sdk/session-readonly/storage";
 import {
 	SdkStartupCapability,
 	type SdkStartupFailure,
@@ -82,11 +92,9 @@ import {
 } from "../sdk/startup-capability";
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
-import {
-	type CapturedSessionTranscriptSnapshot,
-	type ResumeSessionIdentity,
-	SessionManager,
-} from "../session/session-manager";
+import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
+import { setSessionOwnerSurface } from "../session/session-ownership";
+import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
@@ -130,13 +138,16 @@ export async function lifecycleArgs(
  * How long a session host tolerates losing the broker it was launched under
  * before treating itself as orphaned.
  *
- * A host is reachable only through its own broker: routing lives in the broker
- * process and a replacement broker never adopts hosts from an earlier
- * incarnation, so a host that outlives its broker is stranded no matter how
- * healthy the agent directory looks afterwards. The grace still has to outlast
- * a restart-shaped gap, because a broker that is merely slow to republish must
- * never cost a live host — but it must stay finite, or every crashed or
- * torn-down broker leaks a detached multi-hundred-megabyte host forever.
+ * Brokers route through the agent directory's session index and the host's
+ * endpoint file, not through per-broker state, so a replacement broker for the
+ * same agent directory reaches a host its predecessor launched. The window
+ * therefore only runs while no live broker is published at all. It still has to
+ * outlast a restart-shaped gap, because a broker that is merely slow to
+ * republish must never cost a live host, but it must stay finite for an idle
+ * host, or every broker that is gone for good leaks a detached
+ * multi-hundred-megabyte host. A host holding its session-work lease is the one
+ * exception: it never exits on broker absence, so a turn that never settles keeps
+ * the host alive until it is closed or signalled.
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
@@ -145,7 +156,7 @@ const BROKER_STARTUP_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
 
 async function writeBrokerStartupFailureMarkerBounded(
 	agentDir: string,
-	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
+	failure: BrokerStartupFailure,
 ): Promise<boolean> {
 	const settled = Promise.withResolvers<boolean>();
 	const abortController = new AbortController();
@@ -200,54 +211,56 @@ async function waitForBrokerStartupTestGate(gateFile: string): Promise<void> {
 }
 
 /**
- * Identity of the broker incarnation an observation describes, or `null` when
- * it carries no usable identity.
- *
- * Two observations with different identities are two different brokers, never
- * the same broker seen twice: `incarnation` is start-time derived, so it
- * separates a genuine survivor from a successor that merely reused the pid.
+ * Whether a discovery observation identifies a broker at all (owner id, pid or
+ * incarnation). Which broker it is does not matter to a session host: any live
+ * broker for the agent directory can route to it.
  */
-function brokerPublicationIdentity(observation: unknown): string | null {
-	if (!observation || typeof observation !== "object") return null;
+function isIdentifiedBrokerPublication(observation: unknown): boolean {
+	if (!observation || typeof observation !== "object") return false;
 	const { ownerId, pid, incarnation } = observation as {
 		ownerId?: unknown;
 		pid?: unknown;
 		incarnation?: unknown;
 	};
-	const parts = [
-		typeof ownerId === "string" ? ownerId : "",
-		Number.isSafeInteger(pid) ? String(pid) : "",
-		typeof incarnation === "string" ? incarnation : "",
-	];
-	return parts.some(part => part !== "") ? parts.join(":") : null;
+	return (
+		(typeof ownerId === "string" && ownerId !== "") ||
+		Number.isSafeInteger(pid) ||
+		(typeof incarnation === "string" && incarnation !== "")
+	);
 }
 
 /**
- * Resolves only once the broker this host was launched under has been
- * unobservable for the full grace window.
+ * Resolves only once no live broker has been published for the agent directory
+ * for the full grace window, and the host is not doing session work.
  *
- * The first identifiable publication pins that broker. A later publication from
- * a different incarnation is a replacement, and a replacement cannot route to
- * this host — observing one is evidence of being stranded, not of being alive —
- * so it accrues against the bound instead of resetting it. Only the pinned
- * broker reappearing resets the window. An unreadable or unidentifiable
+ * Any identifiable publication resets the window, including one from a
+ * replacement incarnation: the replacement routes through the shared session
+ * index, so it can still reach this host. An unreadable or unidentifiable
  * publication is not proof of orphanhood but accrues against the same bound.
+ *
+ * `readWorkLease` reports whether the host's session-work lease is held. It
+ * defaults to the lease the host's SDK runtime publishes (the AgentSession's
+ * `sessionWorkLease`, registered by the notifications bus at host startup). A
+ * turn in flight is never cut short by broker absence: the window keeps
+ * accruing, but the host only exits once the lease is released. If the bound was
+ * crossed during the turn, the host exits on the first poll after the turn ends.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
 	agentDir: string;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	readDiscovery?: (agentDir: string) => Promise<unknown>;
+	readWorkLease?: () => boolean;
 	graceMs?: number;
 	pollMs?: number;
 }): Promise<void> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
 	const readDiscovery = deps.readDiscovery ?? readBrokerDiscovery;
+	const readWorkLease = deps.readWorkLease ?? sessionHostWorkLeaseActive;
 	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
 	let absentSince: number | null = null;
-	let ownBroker: string | null = null;
 	for (;;) {
 		let live: unknown = null;
 		try {
@@ -255,13 +268,11 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} catch {
 			// Transient read failures are ambiguity, not proof of orphanhood.
 		}
-		const identity = brokerPublicationIdentity(live);
-		if (identity !== null && (ownBroker === null || identity === ownBroker)) {
-			ownBroker ??= identity;
+		if (isIdentifiedBrokerPublication(live)) {
 			absentSince = null;
 		} else {
 			absentSince ??= now();
-			if (now() - absentSince >= graceMs) return;
+			if (now() - absentSince >= graceMs && !readWorkLease()) return;
 		}
 		await sleep(pollMs);
 	}
@@ -472,22 +483,41 @@ type OwnedMcpConfigDirectory = {
 	snapshot?: NativeDirectoryTreeSnapshot;
 };
 
-/** Opens lifecycle-authorized history without letting replacement content reach readiness. */
+/** Opens lifecycle-authorized history; prompt edits use the live session.revise path. */
 export async function openLifecycleSessionManager(
 	request: SessionLifecycleLaunchRequest,
 	cwd: string,
 	agentDir: string,
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
+	if ("body" in request && request.body !== undefined)
+		throw new Error("Lifecycle launch body is unsupported; use session.revise for prompt edits.");
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
+	// A broker-launched host claims as `sdk-host`, with the mode from the settings it opens under.
+	const ownership = {
+		surface: "sdk-host" as const,
+		mode: sessionOwnershipModeFor(lifecycleSettings.getGlobal("session.ownership.mode")),
+	};
 	let sessionManager: SessionManager | undefined;
 	let result: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
 	let operationError: unknown;
 	try {
 		const migrationPolicy =
 			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		// Reject ephemeral flag on non-create operations
+		if (
+			(request.operation === "session.resume" || request.operation === "session.fork") &&
+			request.ephemeral !== undefined
+		) {
+			throw new Error(`Ephemeral sessions cannot be created via ${request.operation} operations.`);
+		}
 		if (request.operation === "session.create") {
-			sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+			if (request.ephemeral === true) {
+				// Ephemeral sessions keep transcripts in memory only
+				sessionManager = SessionManager.inMemory(cwd);
+			} else {
+				sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings, ownership.surface);
+			}
 		} else {
 			const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
 			if (request.operation === "session.resume") {
@@ -497,6 +527,7 @@ export async function openLifecycleSessionManager(
 					undefined,
 					migrationPolicy,
 					lifecycleSettings.get("sessionMemory.mode"),
+					ownership,
 				);
 				if (opened.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host opened it.");
@@ -509,6 +540,8 @@ export async function openLifecycleSessionManager(
 					SessionManager.managedDestination(cwd, agentDir),
 					migrationPolicy,
 					lifecycleSettings.get("sessionMemory.mode"),
+					request.sourceEntryId,
+					ownership,
 				);
 				if (forked.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host forked it.");
@@ -634,9 +667,12 @@ export async function runSessionHost(
 		openLifecycleSessionManager?: typeof openLifecycleSessionManager;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
+		writeSessionLifecycleStartupCommit?: typeof writeSessionLifecycleStartupCommit;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
 	} = {},
 ): Promise<void> {
+	// Factories this host runs without a decision (`createAgentSession`'s lifecycle create) claim as `sdk-host`.
+	setSessionOwnerSurface("sdk-host");
 	const now = timing.now ?? Date.now;
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
@@ -646,6 +682,7 @@ export async function runSessionHost(
 	const openLifecycleSession = timing.openLifecycleSessionManager ?? openLifecycleSessionManager;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
+	const writeStartupCommit = timing.writeSessionLifecycleStartupCommit ?? writeSessionLifecycleStartupCommit;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
 	let constructionCleanupComplete = true;
@@ -884,6 +921,7 @@ export async function runSessionHost(
 	let sessionManagerTransferred = false;
 	let created: CreateLifecycleAgentSessionResult | undefined;
 	let mcpConfigDirectory: OwnedMcpConfigDirectory | undefined;
+	let mcpCleanupInFlight: Promise<void> | undefined;
 	let openedSessionManagerClosed = false;
 	const closeSessionManager = async (manager: SessionManager | undefined): Promise<void> => {
 		if (!manager || (manager === opened?.sessionManager && openedSessionManagerClosed)) return;
@@ -895,9 +933,10 @@ export async function runSessionHost(
 	};
 	const removeMcpConfigDirectory = async (): Promise<void> => {
 		const directory = mcpConfigDirectory;
-		if (!directory) return;
+		if (!directory || mcpCleanupInFlight) return;
 		let cleanupFailure: { error: unknown } | undefined;
-		const cleanupComplete = await runBoundedStartupCleanup(async () => {
+		let cleanupTimedOut = false;
+		const cleanup = Promise.resolve().then(async () => {
 			try {
 				const identity = directory.directoryIdentity;
 				const parentIdentity = directory.parentIdentity;
@@ -988,12 +1027,24 @@ export async function runSessionHost(
 			} catch (error) {
 				constructionCleanupComplete = false;
 				cleanupFailure = { error };
+				if (cleanupTimedOut) logger.warn("Deferred lifecycle MCP configuration cleanup failed.");
 				throw error;
 			}
 		});
+		mcpCleanupInFlight = cleanup;
+		void cleanup.then(
+			() => {
+				mcpCleanupInFlight = undefined;
+			},
+			() => {
+				mcpCleanupInFlight = undefined;
+			},
+		);
+		const cleanupComplete = await runBoundedStartupCleanup(() => cleanup);
 		if (!cleanupComplete) {
 			if (cleanupFailure) throw cleanupFailure.error;
-			throw new Error("Lifecycle MCP configuration cleanup did not complete.");
+			cleanupTimedOut = true;
+			logger.warn("Lifecycle MCP configuration cleanup is continuing in the background.");
 		}
 	};
 	const captureMcpConfigDirectoryIdentity = async (
@@ -1209,12 +1260,13 @@ export async function runSessionHost(
 		created = await beforeCutoff(
 			async () => {
 				sessionManagerTransferred = true;
-				const result = await createLifecycleSession(
+				return await createLifecycleSession(
 					{
 						cwd,
 						agentDir,
+						ephemeral: request.ephemeral,
 						sessionManager: opened?.sessionManager,
-						...(mcpConfigPath ? { mcpConfigPath } : {}),
+						...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),
@@ -1222,8 +1274,6 @@ export async function runSessionHost(
 					},
 					startupOwner,
 				);
-				if (mcpConfigDirectory) await removeMcpConfigDirectory();
-				return result;
 			},
 			async late => {
 				if ("failure" in late) {
@@ -1403,9 +1453,17 @@ export async function runSessionHost(
 	};
 	let unregisterHostPostmortem: (() => void) | undefined;
 	let sessionDisposalExit: Promise<void> | undefined;
+	let startupCommitWrite: Promise<void> | undefined;
 	const exitAfterSessionDisposal = async (reason?: "detached_idle", exitProcess = true): Promise<void> => {
 		let failure: SdkStartupFailure | undefined;
 		let ownsEndpoint = false;
+		if (startupCommitWrite) {
+			// Withdraw the commit only after it landed, so a stop that races the
+			// write cannot leave a record behind for a host that is going away.
+			await startupCommitWrite;
+			if (!removeSessionLifecycleStartupCommit(request.stateRoot, request.sessionId, effectMarker))
+				logger.warn("SDK host startup commit could not be withdrawn", { sessionId: request.sessionId });
+		}
 		const endpointCleanup = (async (): Promise<boolean> => {
 			let complete = await removeOwnedSessionEndpoint();
 			for (let attempt = 0; !complete && attempt < 20; attempt += 1) {
@@ -1581,6 +1639,17 @@ export async function runSessionHost(
 		}
 		throw error;
 	}
+	// Startup is committed: with `startupComplete` set, every startup rollback
+	// path is a no-op. Only now may the host say so durably. The broker requires
+	// this record before it admits a child it observed after the semantic
+	// deadline, because the readiness marker alone can still be revoked.
+	startupCommitWrite = writeStartupCommit(request.stateRoot, request.sessionId, effectMarker).catch(error => {
+		logger.warn("SDK host startup commit could not be published", {
+			sessionId: request.sessionId,
+			error: String(error),
+		});
+	});
+	await startupCommitWrite;
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and
 	// its failure must never take the session down.
@@ -1688,6 +1757,25 @@ export default class Sdk extends Command {
 			if (flags["attach-only"] === true) process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 			const operation = scan.descriptor.command[1];
 			if (operation === "broker") {
+				if (scan.descriptor.command[2] === "attest-spawn-anchors") {
+					const result = await runSpawnAnchorAttestation({
+						agentDir: flags["agent-dir"] as string | undefined,
+						evidence: flags.evidence as string[],
+						write: flags.write === true,
+					});
+					try {
+						process.stdout.write(renderSpawnAnchorAttestation(result, flags.json === true));
+						if (flags.json && result.written)
+							process.stderr.write(`${spawnAnchorAttestationRestartNotice(attestationAgentDir(result))}\n`);
+					} catch {
+						throw new PublicCommandFailure({
+							kind: "operation_failed",
+							proof: result.written ? "completed" : "pre-effect",
+							diagnostics: ["spawn_anchor_output_failed"],
+						});
+					}
+					return;
+				}
 				const brokerAgentDir = path.resolve((flags["agent-dir"] as string | undefined) ?? getAgentDir());
 				if (!isSafeSdkInternalAgentDir(brokerAgentDir))
 					throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
@@ -1741,6 +1829,7 @@ export default class Sdk extends Command {
 					timeoutMs,
 					strict: Boolean(flags.strict),
 					untilIdle: Boolean(flags["until-idle"]),
+					ifIdle: Boolean(flags["if-idle"]),
 					allEvents: Boolean(flags["all-events"]),
 					page: Boolean(flags.page),
 					limit: flags.limit as number | undefined,
@@ -1883,7 +1972,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 	if (internal.action === "broker-internal" || internal.action === "session-host-internal")
 		usePostmortemSignalExitAuthority();
 	if (internal.action === "session-host-internal") {
-		await runSessionHost();
+		try {
+			await runSessionHost();
+		} catch {
+			// runSessionHost publishes its startup failure receipt when it has authority.
+			// The private SDK dispatcher does not have the public command error boundary.
+			logger.error("SDK session host failed.");
+			process.stderr.write("SDK session host failed.\n");
+			process.exitCode = 1;
+		}
 		return;
 	}
 	if (internal.action === "stderr-drain-internal") {
@@ -1891,6 +1988,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		return;
 	}
 	const agentDir = path.resolve(internal.agentDir);
+	const spawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 	let broker: Broker | undefined;
 	let runningBroker: Broker | undefined;
 	let stopSweep: (() => void) | undefined;
@@ -1921,6 +2019,8 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		signal: "SIGTERM" | "SIGINT" | null,
 		timeoutMs?: number,
 		blockingLockPath?: string,
+		refusalCode?: BrokerLockRefusalCode,
+		spawnAttemptNonce?: string,
 	): BrokerStartupExitRecord & Record<string, unknown> => ({
 		version: 1,
 		reason,
@@ -1934,6 +2034,8 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		timeoutMs: timeoutMs ?? null,
 		writtenAt: Date.now(),
 		...(blockingLockPath === undefined ? {} : { blockingLockPath }),
+		...(refusalCode === undefined ? {} : { refusalCode }),
+		...(spawnAttemptNonce === undefined ? {} : { spawnAttemptNonce }),
 	});
 	const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
 		const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
@@ -1975,21 +2077,33 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		signal: "SIGTERM" | "SIGINT" | null,
 		timeoutMs?: number,
 		blockingLockPath?: string,
+		refusalCode?: BrokerLockRefusalCode,
+		spawnAttemptNonce?: string,
 	): Promise<boolean> => {
 		// The first startup exit cause owns both the persisted reason and the process exit code.
 		if (startupExitTask) return startupExitReason === reason ? startupExitTask : Promise.resolve(false);
 		if (startupExitRequested) return Promise.resolve(false);
 		startupExitRequested = true;
 		startupExitReason = reason;
-		const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs, blockingLockPath);
+		const exitRecord = makeStartupExitRecord(
+			reason,
+			exitCode,
+			signal,
+			timeoutMs,
+			blockingLockPath,
+			refusalCode,
+			spawnAttemptNonce,
+		);
 		const message =
 			reason === "startup-lock-blocked" && blockingLockPath
 				? `SDK broker startup blocked by retained removal transition ${blockingLockPath}.`
-				: reason === "startup-lock-unavailable"
-					? `SDK broker startup could not acquire ${blockingLockPath ?? "a required lock"}.`
-					: reason === "startup-deadline"
-						? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
-						: `SDK broker startup interrupted by ${signal} before readiness.`;
+				: reason === "startup-lock-refused"
+					? `SDK broker startup refused existing lock ${blockingLockPath} (${refusalCode}).`
+					: reason === "startup-lock-unavailable"
+						? `SDK broker startup could not acquire ${blockingLockPath ?? "a required lock"}.`
+						: reason === "startup-deadline"
+							? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
+							: `SDK broker startup interrupted by ${signal} before readiness.`;
 		writeStartupExitLog(exitRecord, message);
 		startupExitTask = (async () => {
 			const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
@@ -2032,7 +2146,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			return;
 		}
 		startupAbortController.abort();
-		await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+		await exitDuringStartup(
+			"startup-signal",
+			startupSignalExitCode(signal),
+			signal,
+			undefined,
+			undefined,
+			undefined,
+			spawnAttemptNonce,
+		);
 		// Startup may remain blocked in awaited I/O after abort. Bound best-effort
 		// rollback so shared postmortem can exit with the original signal status.
 		await waitForStartupAbortCleanup();
@@ -2040,7 +2162,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 	const finishPendingStartupSignal = async (): Promise<boolean> => {
 		const signal = pendingShutdownSignal;
 		if (!signal) return false;
-		await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+		await exitDuringStartup(
+			"startup-signal",
+			startupSignalExitCode(signal),
+			signal,
+			undefined,
+			undefined,
+			undefined,
+			spawnAttemptNonce,
+		);
 		return true;
 	};
 	let startupFenceAcquired = false;
@@ -2103,7 +2233,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			const armStartupWatchdog = (): NodeJS.Timeout =>
 				setTimeout(() => {
 					startupAbortController.abort();
-					void exitDuringStartup("startup-deadline", 1, null, effectiveWatchdogMs).then(async started => {
+					void exitDuringStartup(
+						"startup-deadline",
+						1,
+						null,
+						effectiveWatchdogMs,
+						undefined,
+						undefined,
+						spawnAttemptNonce,
+					).then(async started => {
 						if (!started) {
 							// A prior startup signal owns the exit cause; its postmortem callback
 							// returns after bounded cleanup and preserves the signal status.
@@ -2307,10 +2445,32 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				null,
 				BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
 				error.orphanPath,
+				undefined,
+				spawnAttemptNonce,
 			);
 		} else if (error instanceof FileLockAcquireError) {
 			// Nested lock failures or non-orphan-transition errors
-			await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.orphanPath ?? error.lockPath);
+			await exitDuringStartup(
+				"startup-lock-unavailable",
+				1,
+				null,
+				undefined,
+				error.orphanPath ?? error.lockPath,
+				undefined,
+				spawnAttemptNonce,
+			);
+		} else if (error instanceof BrokerLockRefusedError) {
+			// A live, foreign-host or host-unqualified broker.lock is never displaced; the
+			// typed record lets the spawning client report the refusal instead of a bare exit.
+			await exitDuringStartup(
+				"startup-lock-refused",
+				1,
+				null,
+				undefined,
+				error.lockPath,
+				error.code,
+				spawnAttemptNonce,
+			);
 		}
 		if (broker) {
 			try {
@@ -2329,6 +2489,8 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			signal: null,
 			pid: process.pid,
 			...(startupFailureIncarnation === undefined ? {} : { incarnation: startupFailureIncarnation }),
+			...(error instanceof BrokerLockRefusedError ? { lockRefusalCode: error.code } : {}),
+			...(spawnAttemptNonce === undefined ? {} : { spawnAttemptNonce }),
 		});
 		logger.error("sdk broker: startup failed", {
 			reason: "startup-failure",
@@ -2337,6 +2499,19 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			markerWritten,
 		});
 		unregisterPostmortem();
+		if (error instanceof BrokerLockRefusedError) {
+			// An operator condition, not a crash: report the lock on stderr, with no uncaught-exception record.
+			process.stderr.write(brokerLockRefusalReport(error));
+			// `gjc sdk broker run` keeps failing through the public failure boundary like every other startup failure.
+			if (publicBrokerRun)
+				throw new PublicCommandFailure({
+					kind: "broker_unavailable",
+					proof: "pre-effect",
+					diagnostics: ["lock_refused"],
+				});
+			process.exitCode = 1;
+			return;
+		}
 		throw error;
 	}
 	if (!broker) {
@@ -2360,12 +2535,14 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		// Record why so a caller polling for a winner that never appears can
 		// diagnose the loss instead of seeing only a bare exit code.
 		const losingIncarnation = processIncarnation(process.pid);
+		const losingSpawnAttemptNonce = process.env.GJC_SDK_BROKER_SPAWN_ATTEMPT_NONCE;
 		await writeBrokerStartupFailureMarkerBounded(agentDir, {
 			reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
 			exitCode: publicBrokerRun ? 1 : 0,
 			signal: null,
 			pid: process.pid,
 			...(losingIncarnation === undefined ? {} : { incarnation: losingIncarnation }),
+			...(losingSpawnAttemptNonce === undefined ? {} : { spawnAttemptNonce: losingSpawnAttemptNonce }),
 		});
 		unregisterPostmortem();
 		if (publicBrokerRun) failPublicBrokerRun(agentDir);
@@ -2399,4 +2576,15 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 function failPublicBrokerRun(agentDir: string): void {
 	process.stderr.write(`gjc sdk broker run: another SDK broker already owns ${agentDir}.\n`);
 	process.exitCode = 1;
+}
+
+/** Operator report for a refused `broker.lock`: the lock, the refusal code, and a recovery step that never displaces the lock. */
+function brokerLockRefusalReport(error: BrokerLockRefusedError): string {
+	const recovery =
+		error.code === "host_unqualified"
+			? "follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks after every broker using this agent directory has stopped."
+			: error.code === "foreign_host"
+				? "stop the broker on the host that owns this lock; its liveness cannot be verified from this host."
+				: `wait for broker pid ${error.ownerPid} to publish discovery, or stop it, then retry.`;
+	return `SDK broker startup refused an existing lock.\nLock: ${error.lockPath}\nCode: ${error.code}\nRecovery: ${recovery}\n`;
 }

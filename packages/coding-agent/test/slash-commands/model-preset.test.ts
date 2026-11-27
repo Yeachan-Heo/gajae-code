@@ -97,8 +97,17 @@ function createRuntime() {
 		},
 		getAvailableModels: () => [availableModel],
 		setConfiguredModelChain: () => {},
-		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
+		async setModel(
+			model: { provider: string; id: string },
+			_role: "default",
+			options?: Parameters<AgentSession["setModel"]>[2],
+		) {
+			// Model selection owns persistence; profile/ownership behavior uses real-session tests.
+			const selector = options?.assignments?.get("default");
+			if (!selector) throw new Error("Expected DEFAULT assignment in the session transaction");
+			settings.setModelRole("default", selector);
 			this.model = model;
+			this.thinkingLevel = options?.thinkingLevel;
 		},
 		setThinkingLevel(thinkingLevel: string) {
 			this.thinkingLevel = thinkingLevel;
@@ -110,6 +119,7 @@ function createRuntime() {
 			activeModelProfile = name;
 		},
 	};
+	const setModel = spyOn(session, "setModel");
 	const sessionManager = {
 		getSessionId: () => "session-1",
 		getSessionFile: () => undefined,
@@ -125,6 +135,7 @@ function createRuntime() {
 		output,
 		settings,
 		session,
+		setModel,
 		knownProfiles,
 		runtime: {
 			session: session as unknown as AgentSession,
@@ -213,13 +224,28 @@ describe("/model <preset> activation", () => {
 	});
 
 	test("/model default <preset-name> does NOT activate a preset — it assigns the default model", async () => {
-		const { output, runtime, session } = createRuntime();
+		const { output, runtime, session, settings, setModel } = createRuntime();
 		session.getAvailableModels = () => [{ provider: "anthropic", id: "codex-medium", contextWindow: 200_000 }];
+		const setModelRole = spyOn(settings, "setModelRole");
+		const commit = spyOn(settings, "commitAtomicBatchWithCurrent");
 
 		const result = await executeAcpBuiltinSlashCommand("/model default codex-medium", runtime);
 
 		expect(result).toEqual({ consumed: true });
 		expect(activateSpy).not.toHaveBeenCalled();
+		expect(setModel).toHaveBeenCalledTimes(1);
+		expect(setModel).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: "anthropic", id: "codex-medium" }),
+			"default",
+			expect.objectContaining({
+				selector: "anthropic/codex-medium",
+				thinkingLevel: undefined,
+				cause: "user-selection",
+				assignments: new Map([["default", "anthropic/codex-medium"]]),
+			}),
+		);
+		expect(setModelRole.mock.calls).toEqual([["default", "anthropic/codex-medium"]]);
+		expect(commit).not.toHaveBeenCalled();
 		expect(session.model).toMatchObject({ provider: "anthropic", id: "codex-medium" });
 		expect(runtime.settings.getModelRole("default")).toBe("anthropic/codex-medium");
 		expect(output[0]).toContain("Default model set to anthropic/codex-medium");
@@ -236,12 +262,29 @@ describe("/model <preset> activation", () => {
 	});
 
 	test("/model <provider>/<model> still resolves as a model even with profiles present", async () => {
-		const { output, runtime } = createRuntime();
+		const { output, runtime, session, settings, setModel } = createRuntime();
+		const setModelRole = spyOn(settings, "setModelRole");
+		const commit = spyOn(settings, "commitAtomicBatchWithCurrent");
 
 		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-3-5-sonnet", runtime);
 
 		expect(result).toEqual({ consumed: true });
 		expect(activateSpy).not.toHaveBeenCalled();
+		expect(setModel).toHaveBeenCalledTimes(1);
+		expect(setModel).toHaveBeenCalledWith(
+			expect.objectContaining({ provider: "anthropic", id: "claude-3-5-sonnet" }),
+			"default",
+			expect.objectContaining({
+				selector: "anthropic/claude-3-5-sonnet",
+				thinkingLevel: undefined,
+				cause: "user-selection",
+				assignments: new Map([["default", "anthropic/claude-3-5-sonnet"]]),
+			}),
+		);
+		expect(setModelRole.mock.calls).toEqual([["default", "anthropic/claude-3-5-sonnet"]]);
+		expect(commit).not.toHaveBeenCalled();
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet");
+		expect(session.model).toMatchObject({ provider: "anthropic", id: "claude-3-5-sonnet" });
 		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet");
 	});
 });

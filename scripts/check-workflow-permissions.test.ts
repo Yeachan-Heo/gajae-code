@@ -415,6 +415,17 @@ describe("workflow permission policy", () => {
 		};
 		expect(await executeAuthorizationStep(github, unrelatedPrefixContext)).toBe("no-match");
 		expect(pullRequestLookups).toBe(1);
+		const withBody = (body: string) => ({
+			...context,
+			payload: { ...context.payload, comment: { ...context.payload.comment, body } },
+		});
+		// Notes below the command still re-request; the command must lead the comment.
+		expect(await executeAuthorizationStep(github, withBody("\n/re-review\r\nAddressed the P1: see 1a2b3c."))).toBe(
+			"authorized",
+		);
+		expect(await executeAuthorizationStep(github, withBody("Addressed the P1.\n/re-review"))).toBe("no-match");
+		expect(await executeAuthorizationStep(github, withBody("/re-review please\nthanks"))).toBe("no-match");
+		expect(pullRequestLookups).toBe(2);
 
 		collaboratorError = Object.assign(new Error("Not Found"), { status: 404 });
 		expect(await executeAuthorizationStep(github, context)).toBe("unauthorized");

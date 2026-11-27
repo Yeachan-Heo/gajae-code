@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { waitForCondition } from "../../utils/test/helpers/wait-for";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import type { UsageLimit, UsageProvider, UsageReport } from "../src/usage";
 import * as oauthUtils from "../src/utils/oauth";
@@ -103,15 +104,8 @@ function createCredential(accountId: string, email: string): OAuthCredentials {
 	};
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(10);
-	}
-
-	throw new Error("Timed out waiting for condition");
-}
+const waitFor = (predicate: () => boolean, timeoutMs = 500): Promise<void> =>
+	waitForCondition(predicate, timeoutMs, { intervalMs: 10 });
 
 describe("AuthStorage codex oauth ranking", () => {
 	let tempDir = "";
