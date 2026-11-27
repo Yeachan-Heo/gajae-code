@@ -626,6 +626,11 @@ function listedCandidate(
  * Hashes a listed candidate and returns it with that digest only when the hashed
  * file object still has the listed header and stat identity. Returns `undefined`
  * when the file changed or can no longer be read, so a caller fails closed.
+ *
+ * A listing has no digest, so ctime is the only field that catches a same-inode,
+ * same-size rewrite with mtime restored. A metadata-only change (chmod, xattr,
+ * link count) is therefore refused too: list again right before binding rather
+ * than holding a listed candidate.
  */
 export function bindManagedCandidateDigest(candidate: ListedManagedCandidate): ManagedCandidate | undefined {
 	const inspected = inspectCandidate(candidate.path, candidate.provenance);

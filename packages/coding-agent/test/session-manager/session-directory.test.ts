@@ -2495,6 +2495,42 @@ describe("managed session write protocol", () => {
 			}
 		}
 	});
+	it("refuses a held listed candidate after a metadata-only change because ctime is its only content proof", async () => {
+		// A listing carries no digest, so ctime is what catches the mtime-restored rewrite
+		// above. A metadata-only change is refused the same way; callers re-list first.
+		if (process.platform === "win32") return;
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		for (const action of ["open", "delete"] as const) {
+			const sourcePath = path.join(legacy, `chmod-${action}.jsonl`);
+			await fs.writeFile(sourcePath, transcript(`chmod-${action}`, cwd, "a".repeat(512)));
+			const listed = listManagedCandidates(scope);
+			if (listed.kind !== "complete") throw new Error("Missing candidates");
+			const candidate = listed.owned.find(value => value.path === sourcePath);
+			if (!candidate) throw new Error("Missing chmod candidate");
+			const before = await fs.readFile(sourcePath);
+			const { mode } = await fs.stat(sourcePath);
+			await new Promise(resolve => setTimeout(resolve, 20));
+			await fs.chmod(sourcePath, mode);
+			const result =
+				action === "open"
+					? await openManagedCandidateForWrite(scope, candidate)
+					: await deleteManagedSessionCandidate(scope, candidate);
+			expect(result).toMatchObject({ kind: "error", code: "source_changed" });
+			expect(await fs.readFile(sourcePath)).toEqual(before);
+
+			const relisted = listManagedCandidates(scope);
+			if (relisted.kind !== "complete") throw new Error("Missing candidates");
+			const fresh = relisted.owned.find(value => value.path === sourcePath);
+			if (!fresh) throw new Error("Missing re-listed chmod candidate");
+			const retried =
+				action === "open"
+					? await openManagedCandidateForWrite(scope, fresh)
+					: await deleteManagedSessionCandidate(scope, fresh);
+			expect(retried.kind).toBe(action === "open" ? "opened" : "deleted");
+		}
+	});
 	it("reads only the header of foreign and owned candidates while listing", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const foreignCwd = path.join(path.dirname(cwd), "foreign-workspace");

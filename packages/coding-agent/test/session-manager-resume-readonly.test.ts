@@ -1224,6 +1224,47 @@ describe("active managed picker root", () => {
 		const managed = await manager.listForResumePickerReadOnly();
 		expect(managed.map(session => session.path)).toEqual(expect.arrayContaining([currentPath, legacyPath]));
 	});
+	it("resumes a picked legacy candidate whose metadata changed while the picker was open", async () => {
+		if (process.platform === "win32") return;
+		const root = makeTempDir();
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const legacyDirectory = path.join(
+			agentDir,
+			"sessions",
+			`--${path
+				.resolve(cwd)
+				.replace(/^[/\\]/, "")
+				.replace(/[/\\:]/g, "-")}--`,
+		);
+		const legacyPath = path.join(legacyDirectory, "legacy.jsonl");
+		fs.mkdirSync(cwd, { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		fs.mkdirSync(legacyDirectory, { recursive: true });
+		fs.writeFileSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
+		const bytes = fs.readFileSync(legacyPath);
+
+		// The picker lists, then a metadata-only change lands before the user picks.
+		const listed = await manager.listForResumePickerReadOnly();
+		expect(listed.map(session => session.path)).toContain(legacyPath);
+		const ctimeBefore = fs.statSync(legacyPath, { bigint: true }).ctimeNs;
+		await new Promise(resolve => setTimeout(resolve, 20));
+		fs.chmodSync(legacyPath, fs.statSync(legacyPath).mode);
+		expect(fs.statSync(legacyPath, { bigint: true }).ctimeNs).not.toBe(ctimeBefore);
+
+		// The pick runs the same sequence as the interactive selector.
+		const inspection = await SessionManager.inspectSessionTailReadOnly(legacyPath);
+		if (inspection.kind === "error") throw new Error("Expected legacy inspection");
+		const preparedPath = await manager.prepareManagedCandidateForStrictAdoption(
+			legacyPath,
+			"copy-retain",
+			inspection.identity,
+		);
+		expect(fs.readFileSync(preparedPath)).toEqual(bytes);
+		await manager.setSessionFile(preparedPath);
+		expect(manager.getSessionFile()).toBe(preparedPath);
+		await manager.close();
+	});
 	it("rejects a replacement after managed preparation before strict adoption", async () => {
 		const root = makeTempDir();
 		const cwd = path.join(root, "workspace");
