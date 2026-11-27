@@ -658,7 +658,7 @@ describe.skipIf(process.platform === "win32")("single-TUI control matrix", () =>
 			const m1Reply = messagesWith(branched, "fork-m1-reply")[0]!;
 			const m2 = messagesWith(branched, "fork-m2")[0]!;
 			const byId = new Map(branched.map(entry => [entry.id, entry]));
-			const ancestors: string[] = [];
+			const ancestors: (string | undefined)[] = [];
 			for (let at = messagesWith(branched, "fork-m3")[0]?.parentId; at; at = byId.get(at)?.parentId)
 				ancestors.push(at);
 			expect(ancestors).toContain(m1Reply.id);
