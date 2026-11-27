@@ -1374,6 +1374,87 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		}
 	});
 
+	it("enforce: a legacy-starred header upgraded for a star that is then refused stays unstarred, and a later title writes no star", async () => {
+		const place = await workspace();
+		const directory = path.join(place.root, "explicit");
+		const destination = SessionManager.explicitDestination(directory);
+		SessionOwnershipTestHooks.mode = "off";
+		const seed = SessionManager.create(place.cwd, destination);
+		seed.appendMessage(user("question"));
+		await seed.ensureOnDisk();
+		await seed.flush();
+		const file = seed.getSessionFile()!;
+		const id = seed.getSessionId();
+		await seed.close();
+		// A legacy header: `starred` in the header line, no star patch version.
+		const lines = (await fs.readFile(file, "utf8")).split("\n");
+		const legacy = JSON.parse(lines[0]) as Record<string, unknown>;
+		delete legacy.starredPatchVersion;
+		legacy.starred = true;
+		lines[0] = JSON.stringify(legacy);
+		await Bun.write(file, lines.join("\n"));
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = stallingLocks({ on: true });
+		const manager = keep(await SessionManager.open(file, destination));
+		const claims = sessionClaimSetOf(manager);
+		await manager.setSessionName("first title", "user");
+		try {
+			// The star's upgrade rewrites the file without the legacy `starred`; then the star patch itself
+			// meets a held session.
+			SessionManagerTestHooks.beforePersistPatchFence = () => claims.noteOutcome(id, { status: "held" });
+			await expect(manager.setSessionStarred(true)).rejects.toBeInstanceOf(SessionHeldError);
+		} finally {
+			delete SessionManagerTestHooks.beforePersistPatchFence;
+		}
+		expect([manager.isSessionStarred(), manager.getHeader()?.starred]).toEqual([false, undefined]);
+		expect((await transcriptHeader(file)).starred).toBe(false);
+		// The gate lifts; the next title's star companion comes from what the transcript holds.
+		claims.noteOutcome(id, { status: "none", skipped: "timed_out" });
+		await manager.setSessionName("second title", "user");
+		await manager.flush();
+		expect(await transcriptHeader(file)).toMatchObject({ title: "second title", starred: false });
+		expect(manager.isSessionStarred()).toBe(false);
+	});
+
+	it("a failure on the first of three queued star toggles leaves the third's value until its own outcome", async () => {
+		const place = await workspace();
+		const { file } = await committed(place);
+		// No ownership here: the latched write failure keeps close() from releasing a claim.
+		SessionOwnershipTestHooks.mode = "off";
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const titleWaits = Promise.withResolvers<void>();
+		let fences = 0;
+		let atFirstFailure: boolean | undefined;
+		SessionManagerTestHooks.beforeTitlePatchPersistence = () => titleWaits.promise;
+		SessionManagerTestHooks.beforePersistPatchFence = () => {
+			fences += 1;
+			if (fences === 2) throw new Error("injected write failure");
+		};
+		try {
+			const blocker = manager.setSessionName("blocker", "user");
+			const toggles: Promise<unknown>[] = [];
+			for (const starred of [true, false, true]) {
+				await Bun.sleep(10);
+				const toggle = manager.setSessionStarred(starred);
+				if (toggles.length === 0)
+					toggle.catch(() => {
+						atFirstFailure = manager.isSessionStarred();
+					});
+				toggles.push(toggle);
+			}
+			await Bun.sleep(10);
+			titleWaits.resolve();
+			const outcomes = await Promise.allSettled([blocker, ...toggles]);
+			expect(outcomes.map(outcome => outcome.status)).toEqual(["fulfilled", "rejected", "rejected", "rejected"]);
+		} finally {
+			delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+			delete SessionManagerTestHooks.beforePersistPatchFence;
+		}
+		// The first's failure left the third's value; the failures that followed settled the rest.
+		expect(atFirstFailure).toBe(true);
+		expect(manager.isSessionStarred()).toBe((await transcriptHeader(file)).starred);
+	});
+
 	it("enforce: Fork from a refused turn continues in a copy and leaves the original to its holder", async () => {
 		const place = await workspace();
 		const { file, id } = await committed(place);
@@ -1444,6 +1525,17 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		expect(await fs.readFile(file, "utf8")).toContain("after the gate lifted");
 	});
 });
+
+/** The header as a transcript records it: the header line with its header patches applied. */
+async function transcriptHeader(file: string) {
+	const records = (await fs.readFile(file, "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as Record<string, unknown>);
+	const header = { ...records[0] } as { title?: string; titleSource?: string; starred?: boolean };
+	for (const record of records) if (record.type === "header_patch") Object.assign(header, record.patch as object);
+	return { title: header.title, titleSource: header.titleSource, starred: header.starred === true };
+}
 
 /** `/resume`'s flow for the session's own file, choosing Fork or Cancel on the held-session warning. */
 async function resumeOwnFile(session: AgentSession, manager: SessionManager, file: string, choice: "fork" | "cancel") {
