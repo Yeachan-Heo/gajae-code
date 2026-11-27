@@ -7867,15 +7867,49 @@ export class ModelRegistry {
 				signal: options.signal,
 			}),
 		);
-		if (
-			this.#runtimeProviderAuthHeaders.get(provider) === true ||
-			this.#customProviderAuthHeaders.get(provider) === true
-		) {
-			for (const model of this.#models) {
-				if (model.provider === provider) this.#applyEffectiveAuthHeader(model, apiKey);
-			}
-		}
+		this.#applyProviderAuthHeaders(provider, apiKey);
 		return apiKey;
+	}
+
+	/** Get a provider API key together with the stored row that resolved it, when any. */
+	async getApiKeyForProviderWithCredentialRowId(
+		provider: string,
+		sessionId?: string,
+		baseUrl?: string,
+		options: {
+			credentialSelector?: AuthCredentialSelector;
+			preferredCredentialSelector?: AuthCredentialSelector;
+			signal?: AbortSignal;
+		} = {},
+	): Promise<{ apiKey: string | undefined; credentialRowId: number | undefined }> {
+		this.#refreshRotatingConfigApiKey(provider);
+		let credentialRowId: number | undefined;
+		const apiKey = await this.#getApiKeyOrNoAuth(provider, async () => {
+			const resolved = await this.authStorage.getApiKeyWithCredentialRowId(provider, sessionId, {
+				baseUrl,
+				credentialSelector: options.credentialSelector,
+				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
+				signal: options.signal,
+			});
+			credentialRowId = isVllmNoAuthToken(provider, resolved.apiKey) ? undefined : resolved.credentialRowId;
+			return resolved.apiKey;
+		});
+		if (apiKey === kNoAuth) credentialRowId = undefined;
+		this.#applyProviderAuthHeaders(provider, apiKey);
+		return { apiKey, credentialRowId };
+	}
+
+	#applyProviderAuthHeaders(provider: string, apiKey: string | undefined): void {
+		if (
+			this.#runtimeProviderAuthHeaders.get(provider) !== true &&
+			this.#customProviderAuthHeaders.get(provider) !== true
+		) {
+			return;
+		}
+		for (const model of this.#models) {
+			if (model.provider === provider) this.#applyEffectiveAuthHeader(model, apiKey);
+		}
 	}
 
 	/** Check credential availability without resolving keys or refreshing OAuth tokens. */

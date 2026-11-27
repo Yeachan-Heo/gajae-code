@@ -762,6 +762,7 @@ export function streamSimple<TApi extends Api>(
 		const onAuthError = options!.onAuthError!;
 		const runAttempt = async (
 			apiKey: string,
+			credentialId: number | undefined,
 			captureAuthFailure: boolean,
 			onStreamCreated?: () => void,
 		): Promise<AuthRetryFailure | undefined> => {
@@ -782,6 +783,7 @@ export function streamSimple<TApi extends Api>(
 				const inner = streamSimple(model, context, {
 					...options,
 					apiKey,
+					credentialId,
 					onAuthError: undefined,
 					onStreamCreated: markAdmission,
 					signal: requestSignal,
@@ -838,7 +840,10 @@ export function streamSimple<TApi extends Api>(
 		};
 
 		void (async () => {
-			const failure = await runAttempt(retryApiKey, true, options?.onStreamCreated);
+			// The caller's credential id describes `options.apiKey` only; an env
+			// fallback key is never a stored row.
+			const initialCredentialId = options?.apiKey === retryApiKey ? options?.credentialId : undefined;
+			const failure = await runAttempt(retryApiKey, initialCredentialId, true, options?.onStreamCreated);
 			if (!failure) return;
 			let nextCredential: string | AuthRetryCredential | undefined;
 			try {
@@ -853,11 +858,75 @@ export function streamSimple<TApi extends Api>(
 				emitFailure(failure);
 				return;
 			}
-			await runAttempt(retryCredential.apiKey, false, retryCredential.onStreamCreated);
+			await runAttempt(retryCredential.apiKey, retryCredential.credentialId, false, retryCredential.onStreamCreated);
 		})();
 		return outer;
 	}
 
+	const credentialId = attributableCredentialId(model, options);
+	if (credentialId === undefined) return dispatchStreamSimple(model, context, options);
+	return streamWithCredentialAttribution(model, context, options ?? {}, credentialId);
+}
+
+/**
+ * Stored credential row to record on this request's messages, if any.
+ *
+ * The id only describes `options.apiKey`: without that key the request falls
+ * back to env/ADC credentials, and a pi-native gateway bearer authenticates to
+ * the gateway rather than to the upstream account that serves the turn.
+ */
+function attributableCredentialId(model: Model<Api>, options: SimpleStreamOptions | undefined): number | undefined {
+	const credentialId = options?.credentialId;
+	if (credentialId === undefined || !options?.apiKey || model.transport === "pi-native") return undefined;
+	return Number.isSafeInteger(credentialId) ? credentialId : undefined;
+}
+
+function stampCredentialId(event: AssistantMessageEvent, credentialId: number): void {
+	if (event.type === "done") event.message.credentialId = credentialId;
+	else if (event.type === "error") event.error.credentialId = credentialId;
+	else if ("partial" in event) event.partial.credentialId = credentialId;
+}
+
+/**
+ * Dispatch one request and record its stored credential row on every partial,
+ * terminal, and result message, so the persisted turn names the account that
+ * produced it.
+ */
+function streamWithCredentialAttribution<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options: SimpleStreamOptions,
+	credentialId: number,
+): AssistantMessageEventStream {
+	const consumerAbortController = new AbortController();
+	const signal = options.signal
+		? AbortSignal.any([options.signal, consumerAbortController.signal])
+		: consumerAbortController.signal;
+	const inner = dispatchStreamSimple(model, context, { ...options, signal });
+	const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
+	void (async () => {
+		try {
+			for await (const event of inner) {
+				stampCredentialId(event, credentialId);
+				outer.push(event);
+				if (outer.done) return;
+			}
+			if (outer.done) return;
+			const result = await inner.result();
+			result.credentialId = credentialId;
+			outer.end(result);
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+	return outer;
+}
+
+function dispatchStreamSimple<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
 	// Pi-native transport short-circuits the per-provider dispatch entirely:
 	// the gateway resolves provider + credential server-side, so we don't
 	// need an `apiKey` from `getEnvApiKey` here — `options.apiKey` carries
