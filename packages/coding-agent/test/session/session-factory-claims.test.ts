@@ -1176,6 +1176,32 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 			{ text: "refused again", cancelled: false, started: false },
 		);
 		expect([warned.map(error => error.sessionId), errors, turns()]).toEqual([[id], [], 0]);
+		// The TUI's warning is /resume's flow for the session's own file; Cancel keeps it here, unsent.
+		const titles: string[] = [];
+		const statuses: string[] = [];
+		const ui = new TUI(new VirtualTerminal(80, 12));
+		try {
+			const controller = new SelectorController({
+				ui,
+				statusContainer: new Container(),
+				pendingMessagesContainer: new Container(),
+				compactionQueuedMessages: [],
+				pendingTools: new Map(),
+				session,
+				sessionManager: manager,
+				settings: { get: () => undefined, getAgentDir },
+				showHookSelector: async (title: string, options: string[]) => {
+					titles.push(title);
+					return options.at(-1);
+				},
+				showStatus: (message: string) => statuses.push(message),
+			} as unknown as InteractiveModeContext);
+			await controller.handleResumeSession(file, { cancelledStatus: "Not sent" });
+		} finally {
+			ui.stop();
+		}
+		expect([titles.length, statuses.at(-1), manager.getSessionId()]).toEqual([1, "Not sent", id]);
+		expect(titles[0]).toContain(`(pid ${pid})`);
 		expect(await fs.readFile(file)).toEqual(before);
 
 		// Enforce checks a held session at every turn, with no backoff: the holder gone, the next turn claims.
