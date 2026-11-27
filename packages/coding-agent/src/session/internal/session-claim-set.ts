@@ -414,7 +414,7 @@ export class SessionClaimSet {
 	 * open did not claim becomes visible once it can. `undefined`, with nothing awaited, when there is
 	 * nothing to re-attempt: off, exempt, closed, inside a transition, already claimed or in flight, a
 	 * permanent fail-open (no usable lock), a live mode lowered to off, or inside the backoff. Under
-	 * enforce a held session is re-attempted at every turn, so no turn passes it unchecked. Never rejects:
+	 * enforce a held or failed claim is re-attempted at every turn, so no turn passes it unchecked. Never rejects:
 	 * enforce's refusal comes back as a value, and the session is never taken from its holder.
 	 */
 	reclaimCurrent(): Promise<SessionReclaim> | undefined {
@@ -424,7 +424,9 @@ export class SessionClaimSet {
 		const outcome = this.#outcomes.get(sessionId);
 		if (outcome === undefined || outcome.status === "claimed") return undefined;
 		if (outcome.status === "none" && outcome.skipped !== "timed_out") return undefined;
-		const checksEveryTurn = outcome.status === "held" && this.#mode === "enforce";
+		// What enforce refuses (another holder, a failed claim) is checked at every turn: a backoff
+		// would let the turns inside it through, writing.
+		const checksEveryTurn = (outcome.status === "held" || outcome.status === "failed") && this.#mode === "enforce";
 		const backoff = this.#reclaims.get(sessionId);
 		if (!checksEveryTurn && backoff !== undefined && Date.now() < backoff.notBefore) return undefined;
 		if (liveSessionOwnershipModeFor(this.#mode) === "off") return undefined;

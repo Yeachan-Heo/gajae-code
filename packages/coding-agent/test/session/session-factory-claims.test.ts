@@ -1137,7 +1137,13 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		stall.on = false;
 		await session.prompt("inside the backoff");
 		expect([turns(), notices.length, await ownedHere(id)]).toEqual([2, 1, false]);
+		// A re-attempt that fails is refused as at open, at every turn: no backoff lets a turn through.
+		SessionOwnershipTestHooks.lockBackend = failingFor(id);
 		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("failed")).rejects.toBeInstanceOf(SessionOwnershipError);
+		await expect(session.prompt("failed again")).rejects.toBeInstanceOf(SessionOwnershipError);
+		expect(turns()).toBe(2);
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
 		await session.prompt("after the stall");
 		expect([turns(), notices.length, await ownedHere(id)]).toEqual([3, 1, true]);
 	});

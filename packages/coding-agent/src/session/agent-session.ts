@@ -7076,9 +7076,13 @@ export class AgentSession {
 						await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
 						if (settleIfDisposing()) return;
 					}
-					// An idle delivery starts a turn without #promptWithMessage: the same ownership gate.
+					// An idle delivery starts a turn without #promptWithMessage: the same ownership gate. A
+					// refusal rejects to the yield queue, which logs it; the delivery is dropped.
 					const ownershipGate = this.#sessionOwnershipTurnGate();
-					if (ownershipGate) await ownershipGate;
+					if (ownershipGate) {
+						await ownershipGate;
+						if (settleIfDisposing()) return;
+					}
 					if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 						this.#resumeFromOwnedCompletion();
 					if (survivors.length === 1) {
