@@ -2214,13 +2214,19 @@ export class AcpAgent implements Agent {
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
+		// A session re-attaching in place is still this connection's: the close wins. Advancing the
+		// epoch makes the re-attach fail without restoring its record; the close then runs after it.
+		const reattaching = this.#reattachingSessions.get(params.sessionId);
+		if (reattaching) this.#advanceSessionEpoch(params.sessionId);
 		// ACP close has no cwd. Broker lifecycle control stays owner-only, but a live
 		// local attachment is always released: a CLI-primary session the client closed
 		// must not keep its adapter, lease heartbeat, subscriptions and pending prompt.
-		if (!this.#ownedSessionIds.has(params.sessionId) && record === undefined) return Promise.resolve({});
+		if (!this.#ownedSessionIds.has(params.sessionId) && record === undefined && !reattaching)
+			return Promise.resolve({});
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		if (!cwd) return Promise.resolve({});
 		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
+			await reattaching;
 			// A preceding delete in the same lifecycle chain already completed the terminal operation.
 			if (!this.#ownedSessionIds.has(params.sessionId) && !this.#sessions.has(params.sessionId)) return {};
 			return this.#closeOwnedSession(params.sessionId);
@@ -3253,6 +3259,12 @@ export class AcpAgent implements Agent {
 
 	async cancel(params: CancelNotification): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
+		// A session re-attaching in place is still there: cancel whatever prompt it carries once it settles.
+		const reattaching = record ? undefined : this.#reattachingSessions.get(params.sessionId);
+		if (reattaching) {
+			await reattaching;
+			if (this.#sessions.has(params.sessionId)) return await this.cancel(params);
+		}
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
@@ -4687,27 +4699,35 @@ export class AcpAgent implements Agent {
 			const current = this.#sessions.get(id);
 			if (current) void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
 		} catch (attachError) {
-			const detail = attachError instanceof Error ? attachError.message : String(attachError);
-			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
-			if (!this.#sessions.has(id) && this.#knownSessionCwds.get(id) === cwd)
-				this.#unrecoverableSessions.set(
-					id,
-					new AcpSdkAdapterError(
-						"session_closed",
-						`ACP session ${id} lost its SDK session host and could not be reattached (${detail}). ` +
-							"Load it again with session/load or start a new session.",
-					),
-				);
-			try {
-				await this.#connection.sessionUpdate({
-					sessionId: id,
-					update: {
-						sessionUpdate: "session_info_update",
-						_meta: { gjcRecoverFailed: true, gjcRecoverError: detail },
-					},
-				});
-			} catch {}
+			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${String(attachError)}`);
+			await this.#reportReattachFailed(id, cwd, attachError);
 		}
+	}
+
+	/**
+	 * The session lost its host and cannot be re-established: later prompts report `session_closed`
+	 * with the session/load guidance, and the client is told through `gjcRecoverFailed`.
+	 */
+	async #reportReattachFailed(id: string, cwd: string, attachError: unknown): Promise<void> {
+		const detail = attachError instanceof Error ? attachError.message : String(attachError);
+		if (!this.#sessions.has(id) && this.#knownSessionCwds.get(id) === cwd)
+			this.#unrecoverableSessions.set(
+				id,
+				new AcpSdkAdapterError(
+					"session_closed",
+					`ACP session ${id} lost its SDK session host and could not be reattached (${detail}). ` +
+						"Load it again with session/load or start a new session.",
+				),
+			);
+		try {
+			await this.#connection.sessionUpdate({
+				sessionId: id,
+				update: {
+					sessionUpdate: "session_info_update",
+					_meta: { gjcRecoverFailed: true, gjcRecoverError: detail },
+				},
+			});
+		} catch {}
 	}
 
 	async #discardNewSession(id: string): Promise<void> {
@@ -4942,12 +4962,24 @@ export class AcpAgent implements Agent {
 				return true;
 			}
 			// A close, delete or disposal that ran meanwhile owns the session now: never resurrect it.
-			if (this.#disposed || this.#tearingDown.has(id) || this.#sessionEpoch(id) !== epoch) {
+			const closing = this.#disposed || this.#tearingDown.has(id) || this.#sessionEpoch(id) !== epoch;
+			// The saved session is gone or out of this cwd's scope: retrying would only fail again, so
+			// it is reported closed with the session/load guidance, as after a lost transport.
+			const permanent =
+				error instanceof AcpSdkAdapterError && (error.code === "not_found" || error.code === "conflict");
+			if (closing || permanent) {
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
 				await record.adapter.close().catch(() => undefined);
+				// A close queued behind this re-attach still needs the session's cwd and ownership.
+				if (!this.#disposed && !this.#tearingDown.has(id)) {
+					this.#knownSessionCwds.set(id, cwd);
+					if (owned) this.#ownedSessionIds.add(id);
+				}
+				if (permanent && !closing) await this.#reportReattachFailed(id, cwd, error);
 				return false;
 			}
+			// Anything else (the new owner still starting, a busy index) is transient: keep the session.
 			this.#sessions.set(id, record);
 			this.#knownSessionCwds.set(id, cwd);
 			if (mcpServers) this.#knownSessionMcpServers.set(id, mcpServers);
