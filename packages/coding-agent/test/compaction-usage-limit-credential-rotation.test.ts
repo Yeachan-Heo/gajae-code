@@ -128,11 +128,16 @@ describe("auto-compaction usage limit rotates the session credential", () => {
 			'Summarization failed: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for this model.","details":{"error_code":"credits_required","disabled_reason":"org_level_disabled"}}}',
 		);
 
+		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached");
+
 		await session.runIdleCompaction();
 
 		const keys = compactSpy.mock.calls.map(call => call[2]);
 		expect(keys).toHaveLength(2);
 		expect(keys[1]).not.toBe(keys[0]);
+		// The gate is per model: the backoff must stay scoped so the account keeps serving other models.
+		expect(markUsageLimitReached).toHaveBeenCalledTimes(1);
+		expect(markUsageLimitReached.mock.calls[0]?.[2]?.modelId).toBe(compactSpy.mock.calls[0]?.[1]?.id);
 		expect(ends).toHaveLength(1);
 		expect(ends[0]?.errorMessage).toBeUndefined();
 	});
