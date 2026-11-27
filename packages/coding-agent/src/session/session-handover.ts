@@ -8,7 +8,12 @@ import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex, type SessionLocatorV2 } from "../sdk/broker/session-index";
+import {
+	isTransientSessionIndexLockError,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionLocatorV2,
+} from "../sdk/broker/session-index";
 import { createBrokerSessionLifecycleService } from "../sdk/lifecycle/broker-client";
 import { attemptSessionClaim, claimRefusal, type ResolvedSessionOwnership } from "./internal/session-claim-set";
 import type { SessionHeldError, SessionOwnerClaim } from "./session-ownership";
@@ -33,6 +38,8 @@ export type SessionHandoverOutcome =
 export const SESSION_HANDOVER_BUSY_MESSAGE = "The session is running a turn; try again when it finishes.";
 
 const HANDOVER_ACTOR = { id: "gjc-continue-here", namespace: "session:handover" } as const;
+/** As many tries as a direct-session registration gets on index-lock contention. */
+const FENCE_WITHDRAW_ATTEMPTS = 3;
 
 /** This process's generation-0 index row for the session while it takes it over. */
 interface FenceRow {
@@ -100,26 +107,46 @@ export async function handOverSession(
 	if (!target) return await claimHandedOver(error.sessionId, ownership);
 	const index = new SessionIndex(agentDir);
 	const incarnation = processIncarnation(process.pid);
+	// Set before the append: an append can reject after its row is durable, so a row that was only
+	// attempted is withdrawn too.
 	let fence: FenceRow | undefined;
 	try {
-		const row: FenceRow = {
+		fence = {
 			sessionId: target.sessionId,
 			locator: await resolveSessionLocator(target.cwd, agentDir),
 			endpointGeneration: 0,
 			pid: process.pid,
 			...(incarnation ? { processIncarnation: incarnation } : {}),
 		};
-		await index.append({ type: "host_registered", ...row });
-		fence = row;
-		return (await closeIdleHost(target)) ?? (await claimHandedOver(target.sessionId, ownership));
+		await index.append({ type: "host_registered", ...fence });
 	} catch (failure) {
 		logger.warn("Continue here could not fence the session handover", { error: String(failure) });
+		if (fence) await withdrawFence(index, fence);
 		return { kind: "refused", message: "The session index could not be updated to hand the session over." };
+	}
+	try {
+		return (await closeIdleHost(target)) ?? (await claimHandedOver(target.sessionId, ownership));
+	} catch (failure) {
+		logger.warn("Continue here could not claim the session", { error: String(failure) });
+		return { kind: "refused", message: "The session host closed, but this terminal could not claim the session." };
 	} finally {
-		if (fence)
-			await index.append({ type: "host_unregistered", ...fence }).catch(failure => {
+		await withdrawFence(index, fence);
+	}
+}
+
+/** Withdraw the fence row, retrying lock contention as the direct-session registration does. */
+async function withdrawFence(index: SessionIndex, fence: FenceRow): Promise<void> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await index.append({ type: "host_unregistered", ...fence });
+			return;
+		} catch (failure) {
+			if (!isTransientSessionIndexLockError(failure) || attempt >= FENCE_WITHDRAW_ATTEMPTS) {
 				logger.warn("Could not withdraw the Continue here fence row", { error: String(failure) });
-			});
+				return;
+			}
+			await Bun.sleep(50 * attempt);
+		}
 	}
 }
 

@@ -82,6 +82,7 @@ import {
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import {
+	isTransientSessionIndexLockError,
 	newMasterAttestationEpoch,
 	resolveSessionLocator,
 	SessionIndex,
@@ -2145,16 +2146,8 @@ export async function registerDirectSession(
 				// Only lock contention self-heals. A refused release is an identity
 				// verdict; retrying it would mask a committed registration whose lock
 				// generation no longer matches.
-				const code = (error as NodeJS.ErrnoException | undefined)?.code;
-				const transient =
-					code === "sharing_violation" ||
-					code === "access_denied" ||
-					code === "EBUSY" ||
-					code === "EPERM" ||
-					code === "EACCES" ||
-					code === "ENOTEMPTY" ||
-					code === "removal_record_busy";
-				if (!transient || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) throw error;
+				if (!isTransientSessionIndexLockError(error) || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS)
+					throw error;
 				await Bun.sleep(50 * attempt);
 			}
 		}
