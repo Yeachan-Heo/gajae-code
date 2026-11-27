@@ -16571,6 +16571,7 @@ export class AgentSession {
 		await this.#awaitPromptPreflight(generation, preflightSignal, this.#awaitStartupTurnBarrier(preflightSignal));
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		await this.#withSessionAdmission("prompt", async () => {}, preflightSignal);
+		this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;

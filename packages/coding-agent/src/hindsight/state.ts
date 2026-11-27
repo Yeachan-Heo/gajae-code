@@ -201,6 +201,10 @@ export class HindsightSessionState {
 	missionsSet: Set<string>;
 	lastRetainedTurn: number;
 	hasRecalledForFirstTurn: boolean;
+	/** Epoch counter for fencing stale recalls. Incremented on resetConversationTracking. */
+	#conversationEpoch = 0;
+	/** Pending recall attempt generation counter, used to invalidate stale recalls. */
+	#recallAttemptGeneration = 0;
 	lastRecallSnippet?: string;
 	lastInjectedRecallSnippetHash?: string;
 	/** Cached `<mental_models>` block injected into developer instructions. */
@@ -219,10 +223,6 @@ export class HindsightSessionState {
 	/** One auto-retain may run at a time; one later agent_end is coalesced. */
 	#autoRetainInFlight?: Promise<void>;
 	#autoRetainPending = false;
-	/** Conversation epoch incremented on resetConversationTracking; fences concurrent recall operations. */
-	#conversationEpoch = 0;
-	/** Recall attempt generation incremented on invalidateOutstandingRecall; fences preflight cancellations. */
-	#recallAttemptGeneration = 0;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -250,11 +250,13 @@ export class HindsightSessionState {
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 		this.lastInjectedRecallSnippetHash = undefined;
+		// Increment epoch to fence any pending stale recalls from this epoch
 		this.#conversationEpoch++;
 	}
 
-	/** Invalidate any outstanding recall attempt, e.g. when a preflight is cancelled. */
+	/** Invalidate the outstanding recall so it cannot write state. */
 	invalidateOutstandingRecall(): void {
+		// Increment the generation counter to invalidate any pending recall attempt
 		this.#recallAttemptGeneration++;
 	}
 
@@ -409,10 +411,9 @@ export class HindsightSessionState {
 
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
-		// Capture the conversation epoch and recall attempt generation to fence against
-		// concurrent session transitions and preflight cancellations.
+		// Capture the current epoch to fence stale recalls
 		const epoch = this.#conversationEpoch;
-		const generation = this.#recallAttemptGeneration;
+		const generation = ++this.#recallAttemptGeneration;
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(m => m.role === "user");
 		if (!lastUser) return;
@@ -422,12 +423,10 @@ export class HindsightSessionState {
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return;
 
-		// Fence: only write state if the conversation epoch and recall generation haven't changed.
-		// A session transition via resetConversationTracking increments the epoch,
-		// so stale recalls from a previous session will not pollute the current session's state.
-		// A preflight cancellation via invalidateOutstandingRecall increments the generation,
-		// so cancelled recalls will not commit state into the next prompt.
-		if (this.#conversationEpoch !== epoch || this.#recallAttemptGeneration !== generation) return;
+		// Fence check: if epoch changed, this recall is stale (session was reset)
+		if (this.#conversationEpoch !== epoch) return;
+		// Invalidation check: if a newer generation was started, this recall was invalidated
+		if (this.#recallAttemptGeneration !== generation) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;

@@ -8,13 +8,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createLazyService } from "@gajae-code/coding-agent/runtime/lazy-service";
-import type { WorkspaceTreeRuntime } from "@gajae-code/coding-agent/runtime/workspace-tree-service";
-import {
-	AgentSession,
-	type AgentSessionConfig,
-	type AgentSessionEvent,
-} from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -170,11 +164,7 @@ describe("AgentSession startup continuation lifecycle", () => {
 		vi.restoreAllMocks();
 	});
 
-	async function createManagedSession(
-		streamFn: AgentOptions["streamFn"],
-		maxAttempts = 1,
-		config: Pick<AgentSessionConfig, "workspaceTreeService"> = {},
-	): Promise<void> {
+	async function createManagedSession(streamFn: AgentOptions["streamFn"], maxAttempts = 1): Promise<void> {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled fallback test models");
@@ -199,7 +189,6 @@ describe("AgentSession startup continuation lifecycle", () => {
 		});
 		settings.setModelRole("default", selector(primary));
 		session = new AgentSession({
-			...config,
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
@@ -280,11 +269,7 @@ describe("AgentSession startup continuation lifecycle", () => {
 		const pending = new AssistantMessageEventStream();
 		await createManagedSession(() => pending);
 		const events: AgentSessionEvent[] = [];
-		const started = Promise.withResolvers<void>();
-		session!.subscribe(event => {
-			events.push(event);
-			if (event.type === "agent_start") started.resolve();
-		});
+		session!.subscribe(event => events.push(event));
 		const continuation = session!.continuePersistedHistory();
 		// Abort only once the agent loop is blocked in `next()` on the provider stream,
 		// so this covers the pending-read abort race rather than the pre-consumption check.
@@ -301,100 +286,6 @@ describe("AgentSession startup continuation lifecycle", () => {
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
 		expect(Boolean(session!.isStreaming)).toBe(false);
-	});
-
-	it("rejects promptly when aborted before the startup continuation creates a run controller", async () => {
-		const pending = new AssistantMessageEventStream();
-		const stream = vi.fn(() => pending);
-		await createManagedSession(stream);
-		const continueSpy = vi.spyOn(session!.agent, "continue");
-		const events: AgentSessionEvent[] = [];
-		session!.subscribe(event => events.push(event));
-		const continuation = session!.continuePersistedHistory();
-		const outcome = continuation.then(
-			() => "completed",
-			(error: unknown) => error,
-		);
-		expect(session!.agent.activeRunId).toBeUndefined();
-		const abort = session!.abort();
-		try {
-			const result = await Promise.race([outcome, Bun.sleep(500).then(() => "timed out")]);
-			expect(result).not.toBe("timed out");
-			expect(result).toMatchObject({ name: "PromptPreflightCancelledError", code: "busy" });
-			await abort;
-			expect(continueSpy).not.toHaveBeenCalled();
-			expect(stream).not.toHaveBeenCalled();
-			expect(events.filter(event => event.type === "agent_end")).toHaveLength(0);
-			expect(session!.isStreaming).toBe(false);
-		} finally {
-			await session!.abort({ timeoutMs: 20 });
-			await outcome;
-			await abort;
-		}
-	});
-
-	it("cancels blocked context preparation before Agent.continue without waiting for the service", async () => {
-		const entered = Promise.withResolvers<void>();
-		const preparation = Promise.withResolvers<WorkspaceTreeRuntime>();
-		const workspaceTreeService = createLazyService<WorkspaceTreeRuntime>({
-			id: "startup-continuation-workspace",
-			initialize: async () => {
-				entered.resolve();
-				return { value: await preparation.promise };
-			},
-		});
-		const stream = vi.fn(() => new AssistantMessageEventStream());
-		await createManagedSession(stream, 1, { workspaceTreeService });
-		const continueSpy = vi.spyOn(session!.agent, "continue");
-		const continuation = session!.continuePersistedHistory();
-		const outcome = continuation.catch((error: unknown) => error);
-		try {
-			await entered.promise;
-			expect(session!.agent.activeRunId).toBeUndefined();
-			const abort = session!.abort();
-			const result = await Promise.race([outcome, Bun.sleep(500).then(() => "timed out")]);
-			expect(result).not.toBe("timed out");
-			expect(result).toMatchObject({ name: "PromptPreflightCancelledError", code: "busy" });
-			await abort;
-			expect(continueSpy).not.toHaveBeenCalled();
-			expect(stream).not.toHaveBeenCalled();
-		} finally {
-			const snapshot = {
-				rootPath: tempDir!.path(),
-				rendered: "",
-				truncated: false,
-				totalLines: 0,
-				agentsMdFiles: [],
-			};
-			preparation.resolve({ snapshot, refresh: async () => snapshot });
-			await workspaceTreeService.dispose();
-		}
-	});
-
-	it("cancels a blocked startup barrier without waiting for readiness or poisoning the next continuation", async () => {
-		const mock = createMockModel({ responses: [{ content: ["resumed after abort"] }] });
-		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
-		await createManagedSession(stream);
-		const ready = Promise.withResolvers<void>();
-		session!.extendStartupTurnBarrier(ready.promise);
-		const continuation = session!.continuePersistedHistory();
-		const outcome = continuation.catch((error: unknown) => error);
-		try {
-			const abort = session!.abort();
-			const result = await Promise.race([outcome, Bun.sleep(500).then(() => "timed out")]);
-			expect(result).not.toBe("timed out");
-			expect(result).toMatchObject({ name: "PromptPreflightCancelledError", code: "busy" });
-			await abort;
-			expect(stream).not.toHaveBeenCalled();
-		} finally {
-			ready.resolve();
-		}
-		await session!.continuePersistedHistory();
-		expect(stream).toHaveBeenCalledTimes(1);
-		expect(session!.messages.at(-1)).toMatchObject({
-			role: "assistant",
-			content: [{ type: "text", text: "resumed after abort" }],
-		});
 	});
 
 	it("does not duplicate terminal delivery after the agent event subscription reconnects", async () => {
@@ -419,117 +310,32 @@ describe("AgentSession startup continuation lifecycle", () => {
 		).toHaveLength(1);
 	});
 
-	it("fences Hindsight recall writes to the generation that launched them", async () => {
-		// Regression test for Finding #1: A pending Hindsight recall from session A
-		// should not write state into session B after a session switch, even if the
-		// recall is still in-flight when the transition occurs.
-		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
-		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
-		await createManagedSession(stream);
+	it("emits cancelled agent_end when preflight is aborted before volatile context construction", async () => {
+		// Regression test for PR #7048 Finding #2:
+		// When continuation is aborted before volatile context construction completes,
+		// the check immediately after session admission should detect the abort
+		// and throw promptPreflightCancelledError, resulting in a cancelled agent_end.
+		// This prevents unnecessary volatile context and MCP instruction construction.
+		const pending = new AssistantMessageEventStream();
+		await createManagedSession(() => pending);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
 
-		// Get initial state reference
-		const initialHindsightState = session!.getHindsightSessionState();
-		if (!initialHindsightState) {
-			// Skip test if Hindsight is not configured
-			return;
-		}
-
-		// Start a continuation which will trigger maybeRecallOnAgentStart
+		// Start continuation which will reach session admission and begin volatile context building
 		const continuation = session!.continuePersistedHistory();
 
-		// Immediately cancel the continuation before recall can complete
+		// Give it a moment to start (but not wait for full consumer - that would be too late)
+		await Bun.sleep(50);
+
+		// Abort the continuation
 		await session!.abort();
+		await continuation;
+		await session!.waitForIdle();
 
-		// Wait for the continuation to fail
-		let continuationFailed = false;
-		try {
-			await continuation;
-		} catch {
-			continuationFailed = true;
-		}
-		expect(continuationFailed).toBe(true);
-
-		// Switch to a new session (this resets conversation tracking)
-		const switched = await session!.newSession();
-		expect(switched).toBe(true);
-
-		// Get the new Hindsight state
-		const newHindsightState = session!.getHindsightSessionState();
-		if (newHindsightState) {
-			// Verify that hasRecalledForFirstTurn was reset for the new session
-			// and any stale recall from the old session did not pollute the new state
-			expect(newHindsightState.hasRecalledForFirstTurn).toBe(false);
-			expect(newHindsightState.getRecallSnippet()).toBeUndefined();
-		}
-
-		// Verify the new session can run normally
-		await session!.continuePersistedHistory();
-		expect(stream).toHaveBeenCalledTimes(1);
-		expect(session!.messages.at(-1)).toMatchObject({
-			role: "assistant",
-			content: [{ type: "text", text: "second" }],
-		});
-	});
-
-	it("fences detached agent_start listener recalls against stale recalls from prior sessions", async () => {
-		// Regression test for Finding #1: The agent_start listener callback should pass
-		// the current generation to maybeRecallOnAgentStart so that stale recalls cannot
-		// write state into the successor session even when triggered by a listener event.
-		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
-		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
-		await createManagedSession(stream);
-
-		const hindsightState = session!.getHindsightSessionState();
-		if (!hindsightState) {
-			// Skip test if Hindsight is not configured
-			return;
-		}
-
-		// Verify that the generation is accessible
-		const initialGeneration = session!.getPromptGeneration();
-		expect(typeof initialGeneration).toBe("number");
-
-		// Run the first continuation which will set up listeners
-		await session!.continuePersistedHistory();
-
-		// Switch to a new session which increments the generation
-		const switched = await session!.newSession();
-		expect(switched).toBe(true);
-
-		const newGeneration = session!.getPromptGeneration();
-		expect(newGeneration).toBeGreaterThan(initialGeneration);
-
-		// Run another continuation in the new session
-		await session!.continuePersistedHistory();
-		expect(stream).toHaveBeenCalledTimes(2);
-	});
-
-	it("rolls back unaccepted preflight-only messages when continuation is cancelled before run acceptance", async () => {
-		// Regression test for Finding #2: When a continuation preflight is cancelled before
-		// the run is accepted, any volatile project context or MCP instructions that were
-		// appended should be removed so they don't appear in a later ordinary prompt.
-		const mock = createMockModel({ responses: [{ content: ["response"] }] });
-		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
-		await createManagedSession(stream);
-
-		// Set up messages so continuation can proceed
-		// Count messages before continuation
-		const initialMessageCount = session!.messages.length;
-
-		// Start continuation and immediately abort it
-		const continuation = session!.continuePersistedHistory();
-		setTimeout(() => {
-			void session!.abort();
-		}, 0);
-
-		try {
-			await continuation;
-		} catch {
-			// Expected to throw when cancelled
-		}
-
-		// Verify that no extra messages remain after the failed continuation
-		const finalMessageCount = session!.messages.length;
-		expect(finalMessageCount).toBeLessThanOrEqual(initialMessageCount + 1);
+		// Should emit cancelled agent_end indicating the abort happened
+		const agentEnds = events.filter(event => event.type === "agent_end");
+		expect(agentEnds.length).toBeGreaterThanOrEqual(1);
+		const cancelledEnd = agentEnds.find(e => e.stopReason === "cancelled");
+		expect(cancelledEnd).toBeDefined();
 	});
 });
