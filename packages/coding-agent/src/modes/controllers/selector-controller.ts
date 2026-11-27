@@ -15,7 +15,7 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
-import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, getProjectDir, logger, VERSION } from "@gajae-code/utils";
 import type { AutoroutingSetup } from "../../config/autorouting-contract";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
@@ -85,6 +85,7 @@ import {
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { probeHeldSessions, resolveSessionOwnership } from "../../session/internal/session-claim-set";
 import { operatorErrorMessage } from "../../session/operator-error-message";
+import { findSessionHandoverTarget, handOverSession } from "../../session/session-handover";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import {
@@ -2574,9 +2575,12 @@ export class SelectorController {
 					if (!(error instanceof SessionHeldError)) throw error;
 					const forked = await this.#forkHeldSession(sessionPath, error);
 					if (!forked) return;
-					({ sessionPath, admission } = forked);
-					forkCopy = forked.discardIfUnused;
-					resumedStatus = sessionHeldForkedNotice(error);
+					if (forked.kind === "continued") admission = forked.admission;
+					else {
+						({ sessionPath, admission } = forked);
+						forkCopy = forked.discardIfUnused;
+						resumedStatus = sessionHeldForkedNotice(error);
+					}
 				}
 				if (this.ctx.isStopped?.()) return;
 			}
@@ -2699,33 +2703,48 @@ export class SelectorController {
 	/**
 	 * The held-session warning for `/resume` (design §3.1). On Fork, copy the held session into this
 	 * session's store, reading it in place, and return the copy to switch to, with an admission claim
-	 * that covers it once the forking manager closes. `undefined` on Cancel: the current session
-	 * stays as it was, still claimed.
+	 * that covers it once the forking manager closes. On Continue here (a broker-launched holder,
+	 * design §13 L1), close the holder and return the admission claim of the session itself, with no
+	 * copy to delete. `undefined` on Cancel: the current session stays as it was, still claimed.
 	 */
 	async #forkHeldSession(
 		sessionPath: string,
 		error: SessionHeldError,
 	): Promise<
 		| {
+				readonly kind: "forked";
 				readonly sessionPath: string;
 				readonly admission: SessionOwnerClaim | undefined;
 				/** The copy this Fork created, and only that: the one path the caller may delete. */
 				readonly discardIfUnused: string;
 		  }
+		| { readonly kind: "continued"; readonly admission: SessionOwnerClaim | undefined }
 		| undefined
 	> {
-		const { title, options } = heldSessionWarningDialog(error);
-		const choice = heldSessionChoice(await this.ctx.showHookSelector(title, options));
-		switch (choice) {
-			case "fork":
-				break;
-			case "cancel":
-				this.ctx.showStatus("Resume cancelled");
-				return undefined;
-			default: {
-				const unknown: never = choice;
-				throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+		const handover = await findSessionHandoverTarget(error, getAgentDir());
+		let note: string | undefined;
+		for (;;) {
+			const { title, options } = heldSessionWarningDialog(error, { continueHere: handover !== undefined, note });
+			const choice = heldSessionChoice(await this.ctx.showHookSelector(title, options));
+			switch (choice) {
+				case "fork":
+					break;
+				case "continue": {
+					if (!handover || this.ctx.isStopped?.()) return undefined;
+					const outcome = await handOverSession(handover, resolveSessionOwnership());
+					if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
+					note = outcome.message;
+					continue;
+				}
+				case "cancel":
+					this.ctx.showStatus("Resume cancelled");
+					return undefined;
+				default: {
+					const unknown: never = choice;
+					throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+				}
 			}
+			break;
 		}
 		if (this.ctx.isStopped?.()) return undefined;
 		const migrationPolicy =
@@ -2747,7 +2766,7 @@ export class SelectorController {
 			if (!forkPath) throw new Error("Fork created no session file");
 			admission = await this.ctx.sessionManager.switchTargetAdmission(forkPath);
 			await forked.close();
-			return { sessionPath: forkPath, admission, discardIfUnused: forkPath };
+			return { kind: "forked", sessionPath: forkPath, admission, discardIfUnused: forkPath };
 		} catch (failure) {
 			// The copy can't be switched to: close the forking manager, delete the copy (under the
 			// admission claim when one was taken; an unclaimed fresh id is known to no one else), then

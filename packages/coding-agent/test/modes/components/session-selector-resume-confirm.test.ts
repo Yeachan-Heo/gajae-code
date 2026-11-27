@@ -3,6 +3,7 @@ import { HookSelectorComponent } from "../../../src/modes/components/hook-select
 import { type SessionSelectionResult, SessionSelectorComponent } from "../../../src/modes/components/session-selector";
 import { initTheme } from "../../../src/modes/theme/theme";
 import type { ResumeSessionIdentity } from "../../../src/sdk/session-readonly/storage";
+import { SESSION_HANDOVER_BUSY_MESSAGE, type SessionHandoverOutcome } from "../../../src/session/session-handover";
 import type { ResumeTailInspection, SessionInfo } from "../../../src/session/session-manager";
 import { SessionHeldError } from "../../../src/session/session-ownership";
 
@@ -172,7 +173,7 @@ describe("SessionSelectorComponent resume consent", () => {
 		const results: SessionSelectionResult[] = [];
 		const inspect = vi.fn(async () => inspection("one", "resumable"));
 		const component = selector(inspect, results);
-		component.setHeldSessions(new Map([["one", error]]), async () => error);
+		component.setHeldSessions(new Map([["one", error]]), async () => ({ error }));
 		const list = text(component);
 		expect(list).toContain("one  • in terminal");
 		expect(list).not.toContain("two  •");
@@ -194,6 +195,39 @@ describe("SessionSelectorComponent resume consent", () => {
 		expect(results).toEqual([{ kind: "fork", path: "/tmp/one.jsonl", error }]);
 		// The held session is never inspected for a resume: a fork opens idle.
 		expect(inspect).not.toHaveBeenCalled();
+		// Not a broker-launched holder: no Continue here.
+		expect(warning).not.toContain("Continue here");
+	});
+
+	it("Continue here hands over, then resumes through the inspection; a refusal warns again with its reason", async () => {
+		const error = new SessionHeldError("01a21a7f-82ff-7332-bee3-31b605a15de0", { surface: "sdk-host", pid: 4242 });
+		const results: SessionSelectionResult[] = [];
+		const inspect = vi.fn(async () => inspection("one", "resumable"));
+		const outcomes: SessionHandoverOutcome[] = [
+			{ kind: "refused", message: SESSION_HANDOVER_BUSY_MESSAGE },
+			{ kind: "closed", claim: undefined },
+		];
+		const handOver = vi.fn(async () => outcomes.shift()!);
+		const component = selector(inspect, results);
+		component.setHeldSessions(new Map([["one", error]]), async () => ({ error, handOver }));
+
+		component.handleInput("\n");
+		await Bun.sleep(0);
+		expect(text(component)).toContain("Continue here");
+		component.handleInput("h");
+		await Bun.sleep(0);
+		const refused = text(component);
+		expect(refused).toContain("This session is open in another process");
+		expect(refused).toContain(SESSION_HANDOVER_BUSY_MESSAGE);
+		expect(inspect).not.toHaveBeenCalled();
+
+		component.handleInput("h");
+		await Bun.sleep(0);
+		expect(handOver).toHaveBeenCalledTimes(2);
+		expect(inspect).toHaveBeenCalledTimes(1);
+		expect(text(component)).toContain("Resume this session?");
+		component.handleInput("y");
+		expect(results).toEqual([expect.objectContaining({ kind: "selected", path: "/tmp/one.jsonl" })]);
 	});
 
 	it("observes async onSelect rejections without unhandled rejection (#3804)", async () => {

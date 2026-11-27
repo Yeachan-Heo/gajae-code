@@ -1,0 +1,133 @@
+/**
+ * Continue here (session single-owner design §12 "hand over to the TUI", §13 L1): a session held by
+ * a broker-launched host is closed through the broker, between turns, and claimed by this process,
+ * so this process becomes its one writer. Remote clients attached to the host (ACP bridges, chat
+ * daemons) re-attach to this process's endpoint through the broker; they never block the close.
+ */
+import { randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
+import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
+import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { resolveSessionLocator, SessionIndex } from "../sdk/broker/session-index";
+import { createBrokerSessionLifecycleService } from "../sdk/lifecycle/broker-client";
+import { attemptSessionClaim, claimRefusal, type ResolvedSessionOwnership } from "./internal/session-claim-set";
+import type { SessionHeldError, SessionOwnerClaim } from "./session-ownership";
+
+/** The host Continue here closes: its index row's endpoint authority, and where remote clients look for it. */
+export interface SessionHandoverTarget {
+	readonly sessionId: string;
+	readonly agentDir: string;
+	readonly cwd: string;
+	readonly endpointGeneration: number;
+	readonly endpointIncarnation: string;
+}
+
+/**
+ * `closed`: the host exited and this process holds the claim (`undefined` only when claims fail
+ * open); the caller keeps it until its own open or switch has claimed, then releases it.
+ */
+export type SessionHandoverOutcome =
+	| { readonly kind: "closed"; readonly claim: SessionOwnerClaim | undefined }
+	| { readonly kind: "refused"; readonly message: string };
+
+export const SESSION_HANDOVER_BUSY_MESSAGE = "The session is running a turn; try again when it finishes.";
+
+const HANDOVER_ACTOR = { id: "gjc-continue-here", namespace: "session:handover" } as const;
+/** An idle close waits up to three bounded teardown windows (graceful, SIGTERM, SIGKILL) before it answers. */
+const HANDOVER_CLOSE_TIMEOUT_MS = 30_000;
+
+/**
+ * The host Continue here can close for `error`, or `undefined` when it is not offered: the holder
+ * must be the live, broker-launched host in the session index (its row carries a
+ * `lifecycleRequestId`, design §13 L1), not a terminal, the app or an embedding. The surface label
+ * in the holder record does not decide it.
+ */
+export async function findSessionHandoverTarget(
+	error: SessionHeldError,
+	agentDir: string,
+): Promise<SessionHandoverTarget | undefined> {
+	const holder = error.holder;
+	if (!holder || holder.host !== undefined) return undefined;
+	try {
+		const index = new SessionIndex(agentDir);
+		await index.refresh();
+		const row = index
+			.listSessions(undefined, new Set([error.sessionId]))
+			.sessions.find(session => session.sessionId === error.sessionId);
+		if (!row?.live || row.lifecycleRequestId === undefined || row.pid !== holder.pid) return undefined;
+		const incarnation = endpointIncarnation(row, error.sessionId);
+		if (!incarnation) return undefined;
+		return {
+			sessionId: error.sessionId,
+			agentDir,
+			cwd: row.locator.cwd,
+			endpointGeneration: row.endpointGeneration,
+			endpointIncarnation: incarnation,
+		};
+	} catch (failure) {
+		logger.warn("Could not read the session index for Continue here", { error: String(failure) });
+		return undefined;
+	}
+}
+
+/**
+ * Hand the session over to this process (design §13 L1):
+ * 1. A generation-0 row for this process fences the gap, so a remote resume after the host exits
+ *    sees the session live and waits instead of launching another host.
+ * 2. The broker closes the host only between turns (`ifIdle`, atomic in the host); a running turn
+ *    or work lease answers `busy`. It answers once the host process has exited.
+ * 3. This process claims the session. From here the broker's resume waits on the claim until this
+ *    process publishes its endpoint, so the fence row is withdrawn on every outcome.
+ */
+export async function handOverSession(
+	target: SessionHandoverTarget,
+	ownership: ResolvedSessionOwnership,
+): Promise<SessionHandoverOutcome> {
+	const index = new SessionIndex(target.agentDir);
+	const incarnation = processIncarnation(process.pid);
+	const fence = {
+		sessionId: target.sessionId,
+		locator: await resolveSessionLocator(target.cwd, target.agentDir),
+		endpointGeneration: 0,
+		pid: process.pid,
+		...(incarnation ? { processIncarnation: incarnation } : {}),
+	};
+	await index.append({ type: "host_registered", ...fence });
+	try {
+		const refused = await closeIdleHost(target);
+		if (refused) return refused;
+		const attempt = await attemptSessionClaim(ownership, target.sessionId);
+		const refusal = claimRefusal(ownership, target.sessionId, attempt);
+		if (refusal) return { kind: "refused", message: refusal.operatorMessage };
+		return { kind: "closed", claim: attempt.status === "claimed" ? attempt.claim : undefined };
+	} finally {
+		await index.append({ type: "host_unregistered", ...fence }).catch(failure => {
+			logger.warn("Could not withdraw the Continue here fence row", { error: String(failure) });
+		});
+	}
+}
+
+async function closeIdleHost(target: SessionHandoverTarget): Promise<SessionHandoverOutcome | undefined> {
+	try {
+		const outcome = await createBrokerSessionLifecycleService(target.agentDir).close({
+			actor: HANDOVER_ACTOR,
+			capability: "session.close",
+			// A fresh key per attempt: the broker replays a recorded refusal for a reused one.
+			requestKey: `continue-here:${target.sessionId}:${randomUUID()}`,
+			target: {
+				sessionId: target.sessionId,
+				endpointGeneration: target.endpointGeneration,
+				endpointIncarnation: target.endpointIncarnation,
+				ifIdle: true,
+			},
+			timeoutMs: HANDOVER_CLOSE_TIMEOUT_MS,
+		});
+		if (outcome.ok) return undefined;
+		if (outcome.error.code === "busy") return { kind: "refused", message: SESSION_HANDOVER_BUSY_MESSAGE };
+		logger.warn("Continue here: the broker did not close the session host", { code: outcome.error.code });
+		return { kind: "refused", message: `The session host could not be closed (${outcome.error.code}).` };
+	} catch (failure) {
+		logger.warn("Continue here: the session close request failed", { error: String(failure) });
+		return { kind: "refused", message: "The session host could not be reached to close it." };
+	}
+}

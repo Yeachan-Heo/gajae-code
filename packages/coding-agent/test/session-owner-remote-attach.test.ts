@@ -420,7 +420,14 @@ async function startFixture(mode: "observe" | "enforce", holds: readonly string[
 }
 
 /** A real interactive TUI in a PTY. `exec` keeps the printed pid the TUI's own. */
-function startTui(fixture: Fixture, args: readonly string[], extraEnv: Record<string, string> = {}) {
+interface Tui {
+	readonly pty: PtySession;
+	readonly done: Promise<PtyRunResult>;
+	screen(): string;
+	pid(): Promise<number>;
+}
+
+function startTui(fixture: Fixture, args: readonly string[], extraEnv: Record<string, string> = {}): Tui {
 	const tuiEnv: Record<string, string> = {
 		...fixture.env,
 		TERM: "xterm-256color",
@@ -811,5 +818,156 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 
 		tui.pty.write("/quit\r");
 		expect(await withTimeout(tui.done, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
+	}, 300_000);
+
+	// Design §12 "hand over to the TUI" and §13 H1/L1, the phone-to-PC flow: a long-lived `gjc acp`
+	// (the Gajae Mobile bridge) creates S, so a broker-launched host holds it. `gjc --resume S` warns
+	// with Continue here. While the host runs a turn, Continue here is refused and the TUI says so;
+	// once the turn ends it closes the host, and the bridge's next prompt, sent with no session/load,
+	// runs in the TUI and lands in S's one transcript.
+	it("enforce: Continue here takes a broker-hosted session over and the ACP client follows it", async () => {
+		const FIRST_PROMPT = "attach-acp-one";
+		const BUSY_PROMPT = "attach-acp-busy";
+		const AFTER_PROMPT = "attach-acp-after";
+		const fixture = await startFixture("enforce", [BUSY_PROMPT]);
+		const { env, agentDir, workspace, model, cleanup, started } = fixture;
+
+		// --- The bridge: `gjc acp`, session/new S, one prompt. A broker-launched host runs S.
+		const acp = startAcp(fixture);
+		let tuiPid: number | undefined;
+		let sessionId = "";
+		const launchedHosts: LaunchedHost[] = [];
+		registerFixtureRuntime(cleanup, {
+			key: "launched-hosts",
+			requiredOwner: "runtime-and-broker",
+			shutdown: async () => {
+				if (sessionId) await closeLaunchedHosts(started.discovery, sessionId, tuiPid ?? -1, launchedHosts);
+			},
+		});
+		const rowsForS = async () => (await brokerRows(started.discovery)).filter(row => row.sessionId === sessionId);
+		let tui: Tui | undefined;
+		try {
+			await withTimeout(
+				acp.connection.initialize({ protocolVersion: 1, clientCapabilities: {} }),
+				60_000,
+				"ACP initialize",
+			);
+			sessionId = (
+				await withTimeout(acp.connection.newSession({ cwd: workspace, mcpServers: [] }), 60_000, "ACP session/new")
+			).sessionId;
+			const first = await withTimeout(
+				acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: FIRST_PROMPT }] }),
+				60_000,
+				"the first ACP prompt",
+			);
+			expect(first.stopReason).toBe("end_turn");
+			const hostRow = (await rowsForS()).find(row => row.live === true);
+			const hostPid = Number(hostRow?.pid);
+			expect(hostPid).toBeGreaterThan(0);
+			launchedHosts.push({ pid: hostPid });
+			expect(
+				(await sessionOwners(env, workspace)).map(owner => ({
+					sessionId: owner.sessionId,
+					pid: owner.holder?.pid,
+				})),
+			).toEqual([{ sessionId, pid: hostPid }]);
+			const sessions = SessionManager.getDefaultSessionDirReadOnly(workspace, agentDir);
+			const files = await transcriptFiles(sessions);
+			expect(files).toHaveLength(1);
+			const transcript = files[0]!;
+
+			// --- A turn is running in the host: the bridge's second prompt is held at the model.
+			const busy = acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: BUSY_PROMPT }] });
+			busy.catch(() => undefined);
+			await withTimeout(model.reached(BUSY_PROMPT), 60_000, "the busy prompt at the model");
+
+			// --- `gjc --resume S` in a terminal: the warning offers Continue here beside Fork and Cancel.
+			tui = startTui(fixture, ["--resume", sessionId]);
+			const view = tui;
+			tuiPid = await view.pid();
+			await waitFor(() => view.screen().includes("Continue here"), 60_000, "the held-session warning");
+			expect(view.screen()).toContain("Fork into a new session");
+			const beforeBusy = view.screen().length;
+			view.pty.write("h");
+			await waitFor(() => view.screen().slice(beforeBusy).includes("running a turn"), 60_000, "the busy refusal");
+			// Refused before anything changed: the host still holds S and the broker still routes to it.
+			expect(processAlive(hostPid)).toBe(true);
+			expect((await rowsForS()).map(row => row.pid)).toEqual([hostPid]);
+			expect(
+				(await sessionOwners(env, workspace)).map(owner => ({
+					sessionId: owner.sessionId,
+					pid: owner.holder?.pid,
+				})),
+			).toEqual([{ sessionId, pid: hostPid }]);
+
+			// --- The turn ends; Continue here again closes the host and the TUI owns S.
+			model.release(BUSY_PROMPT);
+			expect((await withTimeout(busy, 60_000, "the busy ACP prompt")).stopReason).toBe("end_turn");
+			await waitFor(() => view.screen().slice(beforeBusy).includes("Continue here"), 30_000, "the warning again");
+			view.pty.write("h");
+			await waitFor(
+				async () =>
+					(await sessionOwners(env, workspace)).some(
+						owner => owner.sessionId === sessionId && owner.holder?.pid === tuiPid,
+					),
+				60_000,
+				"the TUI's claim on S",
+			);
+			await waitFor(() => !processAlive(hostPid), 30_000, "the session host to exit");
+
+			// --- The bridge sends its next prompt with no session/load: it runs in the TUI.
+			const after = await withTimeout(
+				acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: AFTER_PROMPT }] }),
+				90_000,
+				"the ACP prompt after the handover",
+			);
+			expect(after.stopReason).toBe("end_turn");
+			expect(acp.client.assistantText()).toContain(`${AFTER_PROMPT}-reply`);
+			await waitFor(() => view.screen().includes(`${AFTER_PROMPT}-reply`), 30_000, "the reply in the TUI");
+
+			// One transcript, S, with every prompt exactly once; the broker routes S to the TUI alone.
+			expect(await transcriptFiles(sessions)).toEqual([transcript]);
+			const merged = await readTranscript(transcript);
+			expect(merged.header.id).toBe(sessionId);
+			for (const text of [FIRST_PROMPT, BUSY_PROMPT, AFTER_PROMPT]) {
+				expect(messageEntries(merged.entries, text)).toHaveLength(1);
+				expect(messageEntries(merged.entries, `${text}-reply`)).toHaveLength(1);
+			}
+			expect((await rowsForS()).map(row => row.pid)).toEqual([tuiPid]);
+			expect(
+				(await sessionOwners(env, workspace)).map(owner => ({
+					sessionId: owner.sessionId,
+					pid: owner.holder?.pid,
+				})),
+			).toEqual([{ sessionId, pid: tuiPid }]);
+		} catch (error) {
+			model.releaseAll();
+			const rows = JSON.stringify(await rowsForS().catch(() => "unavailable"));
+			const data = JSON.stringify((error as { data?: unknown }).data ?? null);
+			const events = (
+				await Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl"))
+					.text()
+					.catch(() => "")
+			)
+				.split("\n")
+				.filter(line => line.includes(sessionId))
+				.map(line => {
+					const event = JSON.parse(line) as Record<string, unknown>;
+					return `${event.indexSeq} ${event.type} gen=${event.endpointGeneration} pid=${event.pid} root=${String((event.locator as { stateRoot?: string } | undefined)?.stateRoot).slice(-12)}`;
+				})
+				.join("\n");
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)} ${data}\n[events]\n${events}\n[rows]\n${rows}\n[tui]\n${tui?.screen().slice(-4000) ?? ""}\n[acp stderr]\n${acp.stderr()}`,
+			);
+		}
+		acp.acp.stdin.end();
+		expect(await withTimeout(acp.acp.exited, 20_000, "ACP did not exit after stdin closed")).toBe(0);
+		// The bridge created S, but its exit leaves S with the TUI, which still serves it.
+		expect(
+			(await sessionOwners(env, workspace)).map(owner => ({ sessionId: owner.sessionId, pid: owner.holder?.pid })),
+		).toEqual([{ sessionId, pid: tuiPid }]);
+		expect((await rowsForS()).map(row => ({ pid: row.pid, live: row.live }))).toEqual([{ pid: tuiPid, live: true }]);
+		tui?.pty.write("/quit\r");
+		expect(await withTimeout(tui!.done, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
 	}, 300_000);
 });
