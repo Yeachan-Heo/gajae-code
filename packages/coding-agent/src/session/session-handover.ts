@@ -9,6 +9,7 @@ import { logger } from "@gajae-code/utils";
 import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import {
+	DIRECT_SESSION_REGISTRATION_ATTEMPTS,
 	isTransientSessionIndexLockError,
 	resolveSessionLocator,
 	SessionIndex,
@@ -38,9 +39,6 @@ export type SessionHandoverOutcome =
 export const SESSION_HANDOVER_BUSY_MESSAGE = "The session is running a turn; try again when it finishes.";
 
 const HANDOVER_ACTOR = { id: "gjc-continue-here", namespace: "session:handover" } as const;
-/** As many tries as a direct-session registration gets on index-lock contention. */
-const FENCE_WITHDRAW_ATTEMPTS = 3;
-
 /** This process's generation-0 index row for the session while it takes it over. */
 interface FenceRow {
 	readonly sessionId: string;
@@ -141,7 +139,7 @@ async function withdrawFence(index: SessionIndex, fence: FenceRow): Promise<void
 			await index.append({ type: "host_unregistered", ...fence });
 			return;
 		} catch (failure) {
-			if (!isTransientSessionIndexLockError(failure) || attempt >= FENCE_WITHDRAW_ATTEMPTS) {
+			if (!isTransientSessionIndexLockError(failure) || attempt >= DIRECT_SESSION_REGISTRATION_ATTEMPTS) {
 				logger.warn("Could not withdraw the Continue here fence row", { error: String(failure) });
 				return;
 			}

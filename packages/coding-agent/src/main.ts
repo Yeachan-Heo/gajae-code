@@ -82,6 +82,7 @@ import {
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import {
+	DIRECT_SESSION_REGISTRATION_ATTEMPTS,
 	isTransientSessionIndexLockError,
 	newMasterAttestationEpoch,
 	resolveSessionLocator,
@@ -2006,13 +2007,6 @@ export interface DirectSessionRegistration {
 }
 
 const NOOP_DIRECT_SESSION_REGISTRATION: DirectSessionRegistration = { syncIdentity: async () => {} };
-
-/**
- * Appends allowed for one successor registration before the switch gives up and
- * keeps the predecessor registered. `SessionIndex.append` takes the shared index
- * lock independently per append, so a peer holding it is a transient failure.
- */
-const DIRECT_SESSION_REGISTRATION_ATTEMPTS = 3;
 
 /** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
 export async function registerDirectSession(

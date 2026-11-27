@@ -818,6 +818,13 @@ const SESSION_INDEX_STARTUP_LOCK_WAIT_MS =
 	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS + SESSION_INDEX_LOCK_OPTIONS.retryDelayMs * 2;
 
 /**
+ * Appends allowed for one direct-session registration, or its withdrawal, before giving up.
+ * `SessionIndex.append` takes the shared index lock independently per append, so a peer holding
+ * it is a transient failure.
+ */
+export const DIRECT_SESSION_REGISTRATION_ATTEMPTS = 3;
+
+/**
  * An index append that failed on lock contention, which a short retry heals. A refused lock
  * release is an identity verdict, not contention, and is never retried.
  */
