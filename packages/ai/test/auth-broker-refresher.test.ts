@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -144,6 +145,51 @@ describe("AuthBrokerRefresher", () => {
 		expect(disableEvents[0]).toMatch(/invalid_grant/);
 		// The active row is now disabled; storage.exportSnapshot reflects it.
 		expect(storage.exportSnapshot().credentials).toHaveLength(0);
+	});
+
+	test("keeps a definitively failed credential when the disable write fails, and the next sweep retries", async () => {
+		const now = 1_700_000_000_000;
+		store!.saveOAuth("anthropic", {
+			access: "old",
+			refresh: "old-refresh",
+			expires: now + 60_000,
+			accountId: "a",
+		});
+		const refreshSpy = vi.spyOn(oauthUtils, "refreshOAuthToken").mockRejectedValue(new Error("invalid_grant"));
+		// A second connection installs a trigger that rejects every disabling UPDATE, so
+		// only the soft-delete fails while refresh leases keep working.
+		const admin = new Database(path.join(tempDir, "agent.db"));
+		admin.run(
+			"CREATE TRIGGER fail_disable BEFORE UPDATE OF disabled_cause ON auth_credentials WHEN NEW.disabled_cause IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disable rejected by test trigger'); END",
+		);
+
+		storage = new AuthStorage(store!);
+		const disableEvents: string[] = [];
+		storage.onCredentialDisabled(event => {
+			disableEvents.push(event.disabledCause);
+		});
+		await storage.reload();
+		const refresher = new AuthBrokerRefresher({
+			storage,
+			refreshSkewMs: 5 * 60_000,
+			now: () => now,
+		});
+		try {
+			await refresher.tick();
+
+			expect(disableEvents).toEqual([]);
+			expect(storage.exportSnapshot().credentials).toHaveLength(1);
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(1);
+
+			admin.run("DROP TRIGGER fail_disable");
+			await refresher.tick();
+
+			expect(refreshSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+			expect(disableEvents).toHaveLength(1);
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(0);
+		} finally {
+			admin.close();
+		}
 	});
 
 	test("keeps credentials on transient failures (timeout/network)", async () => {
