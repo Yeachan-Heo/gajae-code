@@ -173,7 +173,7 @@ export interface AutoresearchClearReceipt {
 	ok: true;
 	cleared: boolean;
 	missionPath: string;
-	ledgerEvent: AutoresearchLedgerEvent;
+	ledgerEvent?: AutoresearchLedgerEvent;
 	/** Where the retired mission's artifacts were quarantined, when one existed. */
 	retiredTo?: string;
 }
