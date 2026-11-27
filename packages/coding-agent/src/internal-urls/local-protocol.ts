@@ -410,7 +410,7 @@ async function captureLegacyManifest(
 		);
 		for (const entry of entries) {
 			const entryPath = path.join(directoryPath, entry.name);
-			const entryRelativePath = path.join(relativePath, entry.name);
+			const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
 			if (entry.name === LEGACY_MIGRATION_MARKER) throw new Error("Unsafe legacy local:// migration source");
 			if (entry.isDirectory()) await captureDirectory(entryPath, entryRelativePath);
 			else {
