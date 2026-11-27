@@ -2,7 +2,13 @@ import { afterAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildCompileArgs, devDefineFlags, releaseDefineFlags } from "../scripts/compile-args";
+import {
+	buildCompileArgs,
+	buildDevCompileArgs,
+	buildReleaseCompileArgs,
+	devDefineFlags,
+	releaseDefineFlags,
+} from "../scripts/compile-args";
 
 // `bun build --compile` inlines `process.env.NODE_ENV` as the literal "development"
 // unless the build defines it. A shipped binary then ran every development/test-only
@@ -13,6 +19,12 @@ describe("compiled binary NODE_ENV", () => {
 
 	afterAll(async () => {
 		await Promise.all(tempRoots.map(root => fs.rm(root, { recursive: true, force: true })));
+	});
+
+	it("passes the runtime NODE_ENV define to the real release and dev build args", () => {
+		const define = "process.env.NODE_ENV=Bun.env.NODE_ENV";
+		expect(buildReleaseCompileArgs("bun-linux-x64-baseline", "binaries/gjc")).toContain(define);
+		expect(buildDevCompileArgs()).toContain(define);
 	});
 
 	for (const [channel, defines] of [
@@ -65,6 +77,7 @@ describe("compiled binary NODE_ENV", () => {
 			expect(run(undefined)).toEqual({ nodeEnv: null, devOnly: false });
 			expect(run("production")).toEqual({ nodeEnv: "production", devOnly: false });
 			expect(run("development")).toEqual({ nodeEnv: "development", devOnly: true });
+			expect(run("test")).toEqual({ nodeEnv: "test", devOnly: true });
 		}, 60_000);
 	}
 });
