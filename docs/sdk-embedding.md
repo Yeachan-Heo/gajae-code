@@ -325,6 +325,27 @@ const listed = await SessionManager.list(process.cwd());
 const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
 ```
 
+### Sessions open in another process
+
+A process that opens a session for writing claims it (see [Session ownership](session.md#session-ownership-single-owner-claims)). Under the operator's `session.ownership.mode: enforce`, the factories (`SessionManager.open`, `openExistingStrict`, `continueRecent`) and `createAgentSession` refuse a session another live process holds by throwing `SessionHeldError`, before writing anything. Catch it and fork instead, or ask the user; never retry it in a loop.
+
+```ts
+import { createAgentSession, probeSessionOwners, SessionHeldError, SessionManager } from "@gajae-code/coding-agent";
+
+const probe = (await probeSessionOwners([sessionId])).get(sessionId); // { state: "free" | "held" | "unknown", ... }
+try {
+	const sessionManager = await SessionManager.open(sessionPath, undefined, undefined, undefined, undefined, { surface: "app" });
+	await createAgentSession({ sessionManager, owner: { surface: "app" } });
+} catch (error) {
+	if (!(error instanceof SessionHeldError)) throw error;
+	console.error(error.operatorMessage); // names error.holder: its surface and pid
+}
+```
+
+- `owner: { surface }` names this process to others while it holds the session `createAgentSession` creates (default `sdk`). For a supplied manager, pass the same `{ surface }` as the factory's last argument.
+- `probeSessionOwners` never takes a claim and never creates files. A held session it reports as `self: true` is one this process holds; opening it again shares that claim.
+- Remote control does not open a second writer: ACP `session/load` and `gjc sdk session send` attach to the holder's endpoint.
+
 ## Model and auth wiring
 
 `createAgentSession()` uses `ModelRegistry` + `AuthStorage` for model selection and API key resolution.

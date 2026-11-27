@@ -14,7 +14,7 @@ import type { Subprocess } from "bun";
 import type { Args } from "../../src/cli/args";
 import { Settings } from "../../src/config/settings";
 import { createSessionManager, operatorFacingSessionOpenMessage } from "../../src/main";
-import { createAgentSession } from "../../src/sdk";
+import { createAgentSession, probeSessionOwners } from "../../src/sdk";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
@@ -541,5 +541,34 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		const args = {} as Args;
 		const auto = keep((await createSessionManager(args, place.cwd, settings, "print", print))!);
 		expect([auto.getSessionId() === newest.id, args.continue, notices.length]).toEqual([false, undefined, 2]);
+	});
+
+	it("createAgentSession's owner option names the holder other processes see", async () => {
+		const place = await workspace();
+		const { session } = await createAgentSession({
+			cwd: place.cwd,
+			agentDir: path.join(place.root, "agent"),
+			settings: Settings.isolated(),
+			owner: { surface: "app" },
+			disableExtensionDiscovery: true,
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		});
+		try {
+			const id = session.sessionManager.getSessionId();
+			expect((await probeSessionOwners([id])).get(id)).toMatchObject({
+				state: "held",
+				self: true,
+				holder: { surface: "app", pid: process.pid },
+			});
+		} finally {
+			await session.dispose();
+		}
 	});
 });

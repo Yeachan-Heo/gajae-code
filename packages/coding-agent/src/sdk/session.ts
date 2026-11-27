@@ -197,7 +197,7 @@ import { sessionClaimSetOf } from "../session/internal/session-claim-set";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
-import { sessionOwnerSurface } from "../session/session-ownership";
+import { type SessionOwnerSurface, sessionOwnerSurface } from "../session/session-ownership";
 import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
 import {
 	parsePersistedCredentialSelector,
@@ -686,6 +686,15 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+
+	/**
+	 * How this process is named to others while it holds the session it creates (design §3.4).
+	 * Default: `sdk`. A supplied `sessionManager` keeps the surface its factory claimed under; pass
+	 * the same `{ surface }` as that factory's ownership argument. When the session is open for
+	 * writing in another process, under `session.ownership.mode: enforce`, the factories and this
+	 * function throw `SessionHeldError`.
+	 */
+	owner?: { readonly surface: SessionOwnerSurface };
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -2096,7 +2105,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// The mode comes from this session's settings, like createSessionManager's: a broker-launched
 				// host or an embedding may have no global Settings.
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir), undefined, {
-					surface: sessionOwnerSurface(),
+					surface: options.owner?.surface ?? sessionOwnerSurface(),
 					mode: sessionOwnershipModeFor(settings.getGlobal("session.ownership.mode")),
 				});
 			}));
