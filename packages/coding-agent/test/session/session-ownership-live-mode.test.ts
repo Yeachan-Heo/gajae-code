@@ -63,10 +63,10 @@ describe("liveSessionOwnershipModeFor", () => {
 		expect(liveSessionOwnershipModeFor()).toBe("enforce");
 		source.fileValue = "off";
 		expect(liveSessionOwnershipModeFor()).toBe("off");
-		// With no mode in the settings the process runs the default, `observe`, and a file naming
+		// With no mode in the settings the process runs the default, `enforce`, and a file naming
 		// none leaves it there.
 		source.processValue = undefined;
 		source.fileValue = undefined;
-		expect(liveSessionOwnershipModeFor()).toBe("observe");
+		expect(liveSessionOwnershipModeFor()).toBe("enforce");
 	});
 });

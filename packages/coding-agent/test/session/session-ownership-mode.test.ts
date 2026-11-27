@@ -53,10 +53,11 @@ afterEach(async () => {
 describe("resolveSessionOwnershipMode", () => {
 	it("takes the setting, and lets the override only lower it", () => {
 		const cases: [unknown, string | undefined, SessionOwnershipMode][] = [
-			// Unset: the default, which the override can lower to off.
-			[undefined, undefined, "observe"],
+			// Unset: the default, which the override can lower to observe or off.
+			[undefined, undefined, "enforce"],
 			[undefined, "off", "off"],
-			[undefined, "enforce", "observe"],
+			[undefined, "observe", "observe"],
+			[undefined, "enforce", "enforce"],
 			["observe", undefined, "observe"],
 			["enforce", undefined, "enforce"],
 			["enforce", "observe", "observe"],
@@ -66,8 +67,9 @@ describe("resolveSessionOwnershipMode", () => {
 			["off", "enforce", "off"],
 			["observe", "enforce", "observe"],
 			// An invalid setting reads as the default; an invalid override is ignored.
-			["on", undefined, "observe"],
-			[true, "enforce", "observe"],
+			["on", undefined, "enforce"],
+			[true, "observe", "observe"],
+			[true, "enforce", "enforce"],
 			["enforce", "disabled", "enforce"],
 		];
 		for (const [setting, override, expected] of cases)
@@ -120,12 +122,17 @@ describe("the session.ownership.mode setting", () => {
 	}
 	const userEnforce = { session: { ownership: { mode: "enforce" } } };
 
-	it("defaults to observe, with or without process settings", async () => {
+	it("defaults to enforce, with or without process settings", async () => {
 		expect(sessionOwnershipTestHookSlot().mode).toBeUndefined();
-		expect(sessionOwnershipMode()).toBe("observe");
+		expect(sessionOwnershipMode()).toBe("enforce");
 		const settings = await initSettings({}, {});
-		expect(settings.get("session.ownership.mode")).toBe("observe");
+		expect(settings.get("session.ownership.mode")).toBe("enforce");
 		expect(settings.getGlobal("session.ownership.mode")).toBeUndefined();
+		expect(sessionOwnershipMode()).toBe("enforce");
+	});
+
+	it("an operator observe in the global config lowers the default", async () => {
+		await initSettings({ session: { ownership: { mode: "observe" } } }, {});
 		expect(sessionOwnershipMode()).toBe("observe");
 	});
 
@@ -268,9 +275,20 @@ describe("the session.ownership.mode setting", () => {
 		expect(sessionOwnershipMode()).toBe("off");
 	});
 
-	it("cannot be raised from a project file when the user left it at the default", async () => {
-		await initSettings({}, { session: { ownership: { mode: "enforce" } } });
+	it("cannot be raised from a project file when the user set it to observe", async () => {
+		await initSettings(
+			{ session: { ownership: { mode: "observe" } } },
+			{ session: { ownership: { mode: "enforce" } } },
+		);
 		expect(sessionOwnershipMode()).toBe("observe");
+	});
+
+	it("cannot be lowered from a project file when the user left it at the default", async () => {
+		for (const mode of ["off", "observe"] as const) {
+			await initSettings({}, { session: { ownership: { mode } } });
+			expect([mode, sessionOwnershipMode()]).toEqual([mode, "enforce"]);
+			resetSettingsForTest();
+		}
 	});
 });
 

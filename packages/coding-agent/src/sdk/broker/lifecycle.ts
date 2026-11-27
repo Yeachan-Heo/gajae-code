@@ -1489,7 +1489,7 @@ function hasResumableEndpoint(authority: LiveResumeAuthority, sessionId: string)
  */
 const ENFORCE_HELD_ENDPOINT_WAIT_MS = 8_000;
 /**
- * Longest a resume under the default `observe` waits. `observe` never refuses: after the wait it goes
+ * Longest a resume under `observe` waits. `observe` never refuses: after the wait it goes
  * on as before ownership, so for a holder that never publishes an endpoint (an embedding such as the
  * desktop app) the wait is pure latency added to every resume, and it shortens a later launch's
  * admission window. 2 s covers the measured TUI startup gap several times over and keeps both small.
