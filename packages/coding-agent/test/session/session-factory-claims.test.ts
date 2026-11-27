@@ -513,6 +513,16 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			}),
 		);
 		expect([opened.getSessionId(), await sessionClaimSetOf(opened).settled()]).toEqual([id, "held"]);
+		await opened.close();
+		// Only an explicit lower mode lowers it: this process's config names none, so a factory that
+		// read enforce from its own settings (another agent directory, say) still refuses.
+		delete SessionOwnershipTestHooks.mode;
+		await expect(
+			SessionManager.open(file, place.destination, undefined, undefined, undefined, {
+				surface: "app",
+				mode: "enforce",
+			}),
+		).rejects.toBeInstanceOf(SessionHeldError);
 	});
 
 	it("--continue and autoResume start fresh with the notice when the newest session is held; -p --continue refuses", async () => {
@@ -541,6 +551,60 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		const args = {} as Args;
 		const auto = keep((await createSessionManager(args, place.cwd, settings, "print", print))!);
 		expect([auto.getSessionId() === newest.id, args.continue, notices.length]).toEqual([false, undefined, 2]);
+	});
+
+	it("continueRecent skips a held bounded candidate it could not continue, and stops at one it could", async () => {
+		const place = await workspace();
+		/** A linear, compacted transcript, as the bounded loader serves; `reply` ends it on an assistant turn. */
+		const compacted = async (reply: boolean): Promise<string> => {
+			SessionOwnershipTestHooks.mode = "off";
+			const manager = SessionManager.create(place.cwd, place.destination);
+			const kept = manager.appendMessage(user("question"));
+			if (reply)
+				manager.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: "answer" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+			manager.appendCompaction("summary", "short", kept, 10);
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const id = manager.getSessionId();
+			await manager.close();
+			SessionOwnershipTestHooks.mode = "enforce";
+			return id;
+		};
+		const older = { id: await compacted(false) };
+		// The newest ends on an assistant reply: today's bounded rule does not continue it.
+		const finishedId = await compacted(true);
+		await holdInAnotherProcess(finishedId);
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 64;
+		try {
+			const continued = keep(
+				await SessionManager.continueRecent(place.cwd, place.destination, undefined, undefined, "enabled"),
+			);
+			expect(continued.getSessionId()).toBe(older.id);
+			await continued.close();
+			// Held and continuable: the search ends there, refused.
+			await holdInAnotherProcess(older.id);
+			await expect(
+				SessionManager.continueRecent(place.cwd, place.destination, undefined, undefined, "enabled"),
+			).rejects.toMatchObject({ code: "session_held", sessionId: older.id });
+		} finally {
+			delete SessionManagerTestHooks.eagerHydrationMaxBytesOverride;
+		}
 	});
 
 	it("createAgentSession's owner option names the holder other processes see", async () => {
