@@ -28,7 +28,7 @@ export interface GeneratedToolCatalogEntry {
 }
 
 /** Host platform the committed catalog renders platform-dependent tool descriptions for. */
-export const TOOL_CATALOG_RENDER_PLATFORM: NodeJS.Platform = "linux";
+const TOOL_CATALOG_RENDER_PLATFORM: NodeJS.Platform = "linux";
 
 export interface ToolCatalogGenerationOptions {
 	platform?: NodeJS.Platform;
