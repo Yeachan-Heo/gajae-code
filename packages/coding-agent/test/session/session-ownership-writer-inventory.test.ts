@@ -358,9 +358,11 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
 
 /** Writers this step does not cover; the step named in each reason does. Not run here. */
 const DEFERRED_WRITERS: Record<string, string> = {
-	discardUncommittedSession: "deletes a never-committed session; delete ownership is the scoped-claim step",
-	dropSession: "deletes a session under a scoped claim of its id (4d; session-factory-claims.test.ts)",
-	deleteSessionVerified: "verified delete; delete ownership is the scoped-claim step",
+	discardUncommittedSession: "a never-committed successor: its id was never public, so no other process can hold it",
+	dropSession:
+		"deletes a session under a scoped claim of its id (4d; session-factory-claims.test.ts); a transcript with an unreadable header is deleted without one, and a live holder always has a valid header",
+	deleteSessionVerified:
+		"broker `session.delete` (and gc retirement): ownership is on the step-8 pre-flip list; gc is deferred (§13 L2)",
 	setSessionStarredForPicker:
 		"picker write of any session, under a scoped claim of its id (4d; session-factory-claims.test.ts)",
 	remapStagedArtifactReferences: "staged child artifact references; staged sessions claim at commit",
