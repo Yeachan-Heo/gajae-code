@@ -1913,6 +1913,22 @@ export class AcpAgent implements Agent {
 			deps: {
 				onAttachment: attachment => {
 					const record = this.#sessions.get(attachment.sessionId);
+					if (record && this.#ownerEndpointChanged(record, attachment)) {
+						// A new endpoint generation can be another process: a terminal that took the
+						// session over with Continue here (session single-owner design §13 H1). The
+						// record's provenance (lifecycle ownership, reverse providers) belongs to the
+						// old host, so re-establish the session through the broker instead of rebinding.
+						void this.#failAndReattachSession(
+							attachment.sessionId,
+							record.adapter,
+							record.cwd,
+							new AcpSdkAdapterError(
+								"session_closed",
+								`ACP session ${attachment.sessionId} changed its SDK host.`,
+							),
+						);
+						return;
+					}
 					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
 					if (!adapter) return;
 					if (record) record.attachment = attachment;
@@ -1920,6 +1936,7 @@ export class AcpAgent implements Agent {
 				},
 				onAttachmentReady: async attachment => {
 					const record = this.#sessions.get(attachment.sessionId);
+					if (record && this.#ownerEndpointChanged(record, attachment)) return;
 					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
 					if (!adapter) return;
 					if (record) record.attachment = attachment;
@@ -2374,7 +2391,12 @@ export class AcpAgent implements Agent {
 		return { configOptions: state.configOptions ?? [] };
 	}
 
-	async prompt(params: PromptRequest, rebound = false): Promise<PromptResponse> {
+	async prompt(params: PromptRequest): Promise<PromptResponse> {
+		return await this.#prompt(params, false);
+	}
+
+	/** `rebound`: this prompt already re-attached its session once and is not re-attached again. */
+	async #prompt(params: PromptRequest, rebound: boolean): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		// An unknown session must still report not_found; the retry loop only guards a
 		// live session's first turn against a startup readiness race (issue #5574).
@@ -2382,25 +2404,30 @@ export class AcpAgent implements Agent {
 			const reattaching = this.#reattachingSessions.get(params.sessionId);
 			if (reattaching) {
 				await reattaching;
-				return await this.prompt(params, rebound);
+				return await this.#prompt(params, rebound);
 			}
 			// A session whose host attachment could not be restored reports its typed failure.
 			const unrecoverable = this.#unrecoverableSessions.get(params.sessionId);
 			if (unrecoverable) throw unrecoverable;
 			return await this.#submitPrompt(params, true);
 		}
-		// The host closed between turns, as Continue here closes a broker-launched host for the
-		// terminal taking the session over (session single-owner design §13 H1), and the Router has
-		// not attached a successor yet. Nothing was sent: reattach the session to its current owner
-		// through the broker, which waits for that owner's endpoint, then submit there.
-		if (!rebound && !record.activePrompt && !record.pendingPromptAdmission && !record.attachment.isCurrent()) {
-			await this.#failAndReattachSession(
-				params.sessionId,
-				record.adapter,
-				record.cwd,
-				new AcpSdkAdapterError("session_closed", `ACP session ${params.sessionId} lost its SDK session host.`),
-			);
-			return await this.prompt(params, true);
+		// The host may have closed between turns, as Continue here closes a broker-launched host for
+		// the terminal taking the session over (session single-owner design §13 H1). Reconcile first,
+		// so the Router learns of it before anything is dispatched; with no successor attached yet,
+		// reattach the session to its current owner through the broker, which waits for that owner's
+		// endpoint, then submit there.
+		if (!rebound && !record.activePrompt && !record.pendingPromptAdmission) {
+			await this.#router.reconcile({ waitForReplay: false }).catch(() => undefined);
+			if (this.#sessions.get(params.sessionId) !== record) return await this.#prompt(params, true);
+			if (!record.activePrompt && !record.pendingPromptAdmission && !record.attachment.isCurrent()) {
+				await this.#failAndReattachSession(
+					params.sessionId,
+					record.adapter,
+					record.cwd,
+					new AcpSdkAdapterError("session_closed", `ACP session ${params.sessionId} lost its SDK session host.`),
+				);
+				return await this.#prompt(params, true);
+			}
 		}
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
 		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
@@ -4868,6 +4895,20 @@ export class AcpAgent implements Agent {
 		try {
 			await record.attachment.retire?.();
 		} catch {}
+	}
+
+	/**
+	 * The Router attached a new endpoint generation for an idle session: possibly another process,
+	 * whose lifecycle ownership and provider rules the record does not know. A prompt in flight keeps
+	 * the old rebind, so its own settlement and recovery paths stay as they are.
+	 */
+	#ownerEndpointChanged(record: SessionRecord, attachment: SessionAttachment): boolean {
+		return (
+			attachment.generation !== record.attachment.generation &&
+			!record.activePrompt &&
+			!record.pendingPromptAdmission &&
+			!this.#reattachingSessions.has(attachment.sessionId)
+		);
 	}
 
 	async #brokerAdapter(): Promise<AcpSdkAdapter> {

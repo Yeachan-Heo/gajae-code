@@ -824,27 +824,42 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 	// (the Gajae Mobile bridge) creates S, so a broker-launched host holds it. `gjc --resume S` warns
 	// with Continue here. While the host runs a turn, Continue here is refused and the TUI says so;
 	// once the turn ends it closes the host, and the bridge's next prompt, sent with no session/load,
-	// runs in the TUI and lands in S's one transcript.
+	// runs in the TUI and lands in S's one transcript. Then `/resume` takes the bridge's second
+	// session S2 over the same way; the bridge stays idle until the Router has rebound it, and its
+	// prompt and session/close afterwards reach the TUI without closing it.
 	it("enforce: Continue here takes a broker-hosted session over and the ACP client follows it", async () => {
 		const FIRST_PROMPT = "attach-acp-one";
 		const BUSY_PROMPT = "attach-acp-busy";
 		const AFTER_PROMPT = "attach-acp-after";
+		const SECOND_PROMPT = "attach-acp-second";
+		const LATER_PROMPT = "attach-acp-later";
 		const fixture = await startFixture("enforce", [BUSY_PROMPT]);
 		const { env, agentDir, workspace, model, cleanup, started } = fixture;
 
-		// --- The bridge: `gjc acp`, session/new S, one prompt. A broker-launched host runs S.
+		// --- The bridge: `gjc acp`, session/new S and S2, one prompt each. Broker-launched hosts run them.
 		const acp = startAcp(fixture);
 		let tuiPid: number | undefined;
 		let sessionId = "";
+		let secondId = "";
 		const launchedHosts: LaunchedHost[] = [];
 		registerFixtureRuntime(cleanup, {
 			key: "launched-hosts",
 			requiredOwner: "runtime-and-broker",
 			shutdown: async () => {
-				if (sessionId) await closeLaunchedHosts(started.discovery, sessionId, tuiPid ?? -1, launchedHosts);
+				for (const id of [sessionId, secondId])
+					if (id) await closeLaunchedHosts(started.discovery, id, tuiPid ?? -1, launchedHosts);
 			},
 		});
-		const rowsForS = async () => (await brokerRows(started.discovery)).filter(row => row.sessionId === sessionId);
+		const rowsOf = async (id: string) => (await brokerRows(started.discovery)).filter(row => row.sessionId === id);
+		const rowsForS = () => rowsOf(sessionId);
+		const holderOf = async (id: string) =>
+			(await sessionOwners(env, workspace)).find(owner => owner.sessionId === id)?.holder?.pid;
+		const sessions = SessionManager.getDefaultSessionDirReadOnly(workspace, agentDir);
+		const transcriptOf = async (id: string) => {
+			for (const file of await transcriptFiles(sessions))
+				if ((await readTranscript(file)).header.id === id) return file;
+			throw new Error(`no transcript for ${id}`);
+		};
 		let tui: Tui | undefined;
 		try {
 			await withTimeout(
@@ -852,29 +867,32 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 				60_000,
 				"ACP initialize",
 			);
-			sessionId = (
-				await withTimeout(acp.connection.newSession({ cwd: workspace, mcpServers: [] }), 60_000, "ACP session/new")
-			).sessionId;
-			const first = await withTimeout(
-				acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: FIRST_PROMPT }] }),
-				60_000,
-				"the first ACP prompt",
-			);
-			expect(first.stopReason).toBe("end_turn");
-			const hostRow = (await rowsForS()).find(row => row.live === true);
-			const hostPid = Number(hostRow?.pid);
-			expect(hostPid).toBeGreaterThan(0);
-			launchedHosts.push({ pid: hostPid });
-			expect(
-				(await sessionOwners(env, workspace)).map(owner => ({
-					sessionId: owner.sessionId,
-					pid: owner.holder?.pid,
-				})),
-			).toEqual([{ sessionId, pid: hostPid }]);
-			const sessions = SessionManager.getDefaultSessionDirReadOnly(workspace, agentDir);
-			const files = await transcriptFiles(sessions);
-			expect(files).toHaveLength(1);
-			const transcript = files[0]!;
+			const create = async (text: string) => {
+				const id = (
+					await withTimeout(
+						acp.connection.newSession({ cwd: workspace, mcpServers: [] }),
+						60_000,
+						"ACP session/new",
+					)
+				).sessionId;
+				const reply = await withTimeout(
+					acp.connection.prompt({ sessionId: id, prompt: [{ type: "text", text }] }),
+					60_000,
+					`the ACP prompt ${text}`,
+				);
+				expect(reply.stopReason).toBe("end_turn");
+				const pid = Number((await rowsOf(id)).find(row => row.live === true)?.pid);
+				expect(pid).toBeGreaterThan(0);
+				expect(await holderOf(id)).toBe(pid);
+				launchedHosts.push({ pid });
+				return { id, pid };
+			};
+			const firstHost = await create(FIRST_PROMPT);
+			sessionId = firstHost.id;
+			const hostPid = firstHost.pid;
+			const secondHost = await create(SECOND_PROMPT);
+			secondId = secondHost.id;
+			const transcript = await transcriptOf(sessionId);
 
 			// --- A turn is running in the host: the bridge's second prompt is held at the model.
 			const busy = acp.connection.prompt({ sessionId, prompt: [{ type: "text", text: BUSY_PROMPT }] });
@@ -893,23 +911,24 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			// Refused before anything changed: the host still holds S and the broker still routes to it.
 			expect(processAlive(hostPid)).toBe(true);
 			expect((await rowsForS()).map(row => row.pid)).toEqual([hostPid]);
-			expect(
-				(await sessionOwners(env, workspace)).map(owner => ({
-					sessionId: owner.sessionId,
-					pid: owner.holder?.pid,
-				})),
-			).toEqual([{ sessionId, pid: hostPid }]);
+			expect(await holderOf(sessionId)).toBe(hostPid);
 
-			// --- The turn ends; Continue here again closes the host and the TUI owns S.
+			// --- The turn ends; Continue here again closes the host and the TUI owns S. The host can stay
+			// busy for a moment after the prompt settles, so a fresh refusal is answered with another try.
 			model.release(BUSY_PROMPT);
 			expect((await withTimeout(busy, 60_000, "the busy ACP prompt")).stopReason).toBe("end_turn");
-			await waitFor(() => view.screen().slice(beforeBusy).includes("Continue here"), 30_000, "the warning again");
+			let attempt = view.screen().length;
 			view.pty.write("h");
 			await waitFor(
-				async () =>
-					(await sessionOwners(env, workspace)).some(
-						owner => owner.sessionId === sessionId && owner.holder?.pid === tuiPid,
-					),
+				async () => {
+					if ((await holderOf(sessionId)) === tuiPid) return true;
+					const since = view.screen().slice(attempt);
+					if (since.includes("running a turn") && since.includes("Continue here")) {
+						attempt = view.screen().length;
+						view.pty.write("h");
+					}
+					return false;
+				},
 				60_000,
 				"the TUI's claim on S",
 			);
@@ -925,21 +944,60 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			expect(acp.client.assistantText()).toContain(`${AFTER_PROMPT}-reply`);
 			await waitFor(() => view.screen().includes(`${AFTER_PROMPT}-reply`), 30_000, "the reply in the TUI");
 
-			// One transcript, S, with every prompt exactly once; the broker routes S to the TUI alone.
-			expect(await transcriptFiles(sessions)).toEqual([transcript]);
+			// S's one transcript holds every prompt exactly once; the broker routes S to the TUI alone.
 			const merged = await readTranscript(transcript);
-			expect(merged.header.id).toBe(sessionId);
 			for (const text of [FIRST_PROMPT, BUSY_PROMPT, AFTER_PROMPT]) {
 				expect(messageEntries(merged.entries, text)).toHaveLength(1);
 				expect(messageEntries(merged.entries, `${text}-reply`)).toHaveLength(1);
 			}
 			expect((await rowsForS()).map(row => row.pid)).toEqual([tuiPid]);
-			expect(
-				(await sessionOwners(env, workspace)).map(owner => ({
-					sessionId: owner.sessionId,
-					pid: owner.holder?.pid,
-				})),
-			).toEqual([{ sessionId, pid: tuiPid }]);
+			expect(await holderOf(sessionId)).toBe(tuiPid);
+
+			// --- `/resume` onto S2, which the bridge's other host holds: Continue here from the TUI's own
+			// selector (no accelerators there: down to the second option).
+			const beforeResume = view.screen().length;
+			view.pty.write("/resume\r");
+			await waitFor(() => view.screen().slice(beforeResume).includes(SECOND_PROMPT), 30_000, "the /resume list");
+			view.pty.write(SECOND_PROMPT);
+			await Bun.sleep(300);
+			view.pty.write("\r");
+			await waitFor(
+				() => view.screen().slice(beforeResume).includes("Continue here"),
+				30_000,
+				"the /resume warning",
+			);
+			view.pty.write("\x1b[B");
+			await Bun.sleep(200);
+			view.pty.write("\r");
+			await waitFor(async () => (await holderOf(secondId)) === tuiPid, 60_000, "the TUI's claim on S2");
+			await waitFor(() => !processAlive(secondHost.pid), 30_000, "S2's session host to exit");
+			// The bridge stays idle until S2's endpoint is live and the Router's 2 s reconcile has rebound it.
+			await waitFor(
+				async () =>
+					(await rowsOf(secondId)).some(
+						row => row.pid === tuiPid && row.live === true && Number(row.endpointGeneration) > 0,
+					),
+				30_000,
+				"the TUI's endpoint for S2",
+			);
+			await Bun.sleep(3_000);
+			const later = await withTimeout(
+				acp.connection.prompt({ sessionId: secondId, prompt: [{ type: "text", text: LATER_PROMPT }] }),
+				90_000,
+				"the ACP prompt on S2 after /resume",
+			);
+			expect(later.stopReason).toBe("end_turn");
+			await waitFor(() => view.screen().includes(`${LATER_PROMPT}-reply`), 30_000, "the S2 reply in the TUI");
+			const second = await readTranscript(await transcriptOf(secondId));
+			for (const text of [SECOND_PROMPT, LATER_PROMPT])
+				expect(messageEntries(second.entries, `${text}-reply`)).toHaveLength(1);
+			// The bridge created S2, but closing it there only detaches: the TUI keeps and serves it.
+			await withTimeout(acp.connection.closeSession({ sessionId: secondId }), 30_000, "ACP session/close");
+			expect(processAlive(tuiPid)).toBe(true);
+			expect(await holderOf(secondId)).toBe(tuiPid);
+			expect((await rowsOf(secondId)).map(row => ({ pid: row.pid, live: row.live }))).toEqual([
+				{ pid: tuiPid, live: true },
+			]);
 		} catch (error) {
 			model.releaseAll();
 			const rows = JSON.stringify(await rowsForS().catch(() => "unavailable"));
@@ -962,11 +1020,13 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 		}
 		acp.acp.stdin.end();
 		expect(await withTimeout(acp.acp.exited, 20_000, "ACP did not exit after stdin closed")).toBe(0);
-		// The bridge created S, but its exit leaves S with the TUI, which still serves it.
+		// The bridge's exit leaves S2 with the TUI, which still serves it; S was released by /resume.
 		expect(
 			(await sessionOwners(env, workspace)).map(owner => ({ sessionId: owner.sessionId, pid: owner.holder?.pid })),
-		).toEqual([{ sessionId, pid: tuiPid }]);
-		expect((await rowsForS()).map(row => ({ pid: row.pid, live: row.live }))).toEqual([{ pid: tuiPid, live: true }]);
+		).toEqual([{ sessionId: secondId, pid: tuiPid }]);
+		expect((await rowsOf(secondId)).map(row => ({ pid: row.pid, live: row.live }))).toEqual([
+			{ pid: tuiPid, live: true },
+		]);
 		tui?.pty.write("/quit\r");
 		expect(await withTimeout(tui!.done, 30_000, "TUI did not exit after /quit")).toMatchObject({ exitCode: 0 });
 	}, 300_000);
