@@ -5,10 +5,13 @@
  * file pins the rules they cannot see: sync factories, refusal-free outcomes, a fork's legacy
  * source, the successor claim before the artifact copy, and subagent and staged children.
  */
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
 import { Container, getTerminalId, TUI } from "@gajae-code/tui";
 import { getAgentDir, getTerminalSessionsDir } from "@gajae-code/utils";
@@ -16,15 +19,28 @@ import type { Subprocess } from "bun";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 import type { Args } from "../../src/cli/args";
 import { deleteSessionPickerCandidate } from "../../src/cli/session-picker";
+import { ModelRegistry } from "../../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
-import { createSessionManager, operatorFacingSessionOpenMessage, SessionResumeCancelledError } from "../../src/main";
+import {
+	createSessionManager,
+	operatorFacingSessionOpenMessage,
+	SessionResumeCancelledError,
+	submitInteractiveInput,
+} from "../../src/main";
 import { type HeldSessionChoice, heldSessionWarningDialog } from "../../src/modes/components/session-held-warning";
 import { SelectorController } from "../../src/modes/controllers/selector-controller";
 import { initTheme } from "../../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../../src/modes/types";
 import { createAgentSession, probeSessionOwners } from "../../src/sdk";
+import { AgentSession, type AgentSessionEvent } from "../../src/session/agent-session";
+import { AuthStorage } from "../../src/session/auth-storage";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
-import { probeHeldSessions, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import {
+	probeHeldSessions,
+	RECLAIM_BACKOFF_BASE_MS,
+	RECLAIM_HELD_FLOOR_MS,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	inspectSessionOwners,
@@ -39,6 +55,7 @@ import {
 } from "../../src/session/session-ownership";
 import { liveSessionOwnershipMode, sessionOwnershipMode } from "../../src/session/session-ownership-mode";
 import { FileSessionStorage } from "../../src/session/session-storage";
+import { createAssistantMessage } from "../helpers/agent-session-setup";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
@@ -52,6 +69,9 @@ beforeEach(() => {
 
 afterEach(async () => {
 	try {
+		setSystemTime();
+		for (const session of turnSessions.splice(0)) await session.dispose();
+		for (const auth of authStores.splice(0)) auth.close();
 		for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
 		for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 	} finally {
@@ -1017,5 +1037,150 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+});
+
+const turnSessions: AgentSession[] = [];
+const authStores: AuthStorage[] = [];
+
+/** An AgentSession on `manager` whose model answers every turn, counting the turns that reach it. */
+async function turnSession(manager: SessionManager) {
+	const auth = await AuthStorage.create(path.join(roots.at(-1)!, `auth-${authStores.length}.db`));
+	authStores.push(auth);
+	auth.setRuntimeApiKey("anthropic", "test-key");
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("expected a bundled model");
+	let turns = 0;
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+		streamFn: () => {
+			turns += 1;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = { ...createAssistantMessage("ok"), timestamp: Date.now() };
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		},
+	});
+	const session = new AgentSession({
+		agent,
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: new ModelRegistry(auth, path.join(roots.at(-1)!, "models.yml")),
+	});
+	turnSessions.push(session);
+	const notices: string[] = [];
+	session.subscribe((event: AgentSessionEvent) => {
+		if (event.type === "notice" && event.source === "session-ownership") notices.push(event.message);
+	});
+	return { session, notices, turns: () => turns };
+}
+
+/** The native locks, except that every claim times out while `stall.on` is set. */
+function stallingLocks(stall: { on: boolean }): SessionOwnerLockBackend {
+	return {
+		tryAcquire: (sidecar, timeoutMs) =>
+			stall.on
+				? Promise.resolve({ status: FileLockAcquireStatus.TimedOut, code: "timed_out" })
+				: tryAcquireFileLock(sidecar, timeoutMs),
+		probe: probeFileLock,
+	};
+}
+
+async function stopHolder(): Promise<void> {
+	const child = holders.at(-1);
+	if (!child) throw new Error("no holder to stop");
+	child.kill("SIGKILL");
+	await child.exited;
+}
+
+const ownedHere = async (sessionId: string) =>
+	(await inspectSessionOwners()).held.some(sidecar => sidecar.sessionId === sessionId && sidecar.self);
+
+// Design §2.7 and §13.1 (timeout-latch policy): turn start re-attempts a claim the open did not take.
+describe.if(supported)("turn start re-attempts the current session's claim", () => {
+	it("observe: a session held at open runs unclaimed; once the holder exits, the next turn after the backoff claims it", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		await holdInAnotherProcess(id);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		expect(await sessionClaimSetOf(manager).settled()).toBe("held");
+		const { session, turns } = await turnSession(manager);
+
+		await session.prompt("while held");
+		expect([turns(), await ownedHere(id)]).toEqual([1, false]);
+		await stopHolder();
+		// Within the backoff no lock call is made: the turn runs unclaimed, as observe never refuses.
+		await session.prompt("inside the backoff");
+		expect([turns(), await ownedHere(id)]).toEqual([2, false]);
+		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
+		await session.prompt("after the holder exited");
+		expect([turns(), await ownedHere(id)]).toEqual([3, true]);
+		expect(await fs.readFile(file, "utf8")).toContain("after the holder exited");
+	});
+
+	it("enforce: a claim that timed out at open leaves claims on; the turn runs with a notice, and a later turn claims", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		expect(await sessionClaimSetOf(manager).settled()).toBe("none");
+		const { session, notices, turns } = await turnSession(manager);
+
+		await session.prompt("while stalled");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([1, 1, false]);
+		stall.on = false;
+		await session.prompt("inside the backoff");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([2, 1, false]);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await session.prompt("after the stall");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([3, 1, true]);
+	});
+
+	it("enforce: a turn on a session another process now holds is refused before it writes, and the TUI shows the held warning", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const { session, turns } = await turnSession(manager);
+		stall.on = false;
+		// Unclaimed after the stall, so another process could claim it.
+		const pid = await holdInAnotherProcess(id);
+		const before = await fs.readFile(file);
+
+		await expect(session.prompt("refused")).rejects.toMatchObject({
+			code: "session_held",
+			holder: { surface: "terminal", pid },
+		});
+		expect(turns()).toBe(0);
+		expect(await fs.readFile(file)).toEqual(before);
+		const warned: SessionHeldError[] = [];
+		const errors: string[] = [];
+		await submitInteractiveInput(
+			{
+				markPendingSubmissionStarted: () => true,
+				finishPendingSubmission: () => {},
+				showError: message => errors.push(message),
+				checkShutdownRequested: async () => {},
+				waitForAgentEnd: () => ({ promise: Promise.withResolvers<void>().promise, dispose: () => {} }),
+				handleHeldSessionTurn: error => warned.push(error),
+			},
+			session,
+			{ text: "refused again", cancelled: false, started: false },
+		);
+		expect([warned.map(error => error.sessionId), errors, turns()]).toEqual([[id], [], 0]);
+		expect(await fs.readFile(file)).toEqual(before);
+
+		// Enforce checks a held session at every turn, with no backoff: the holder gone, the next turn claims.
+		await stopHolder();
+		await session.prompt("after the holder exited");
+		expect([turns(), await ownedHere(id)]).toEqual([1, true]);
 	});
 });

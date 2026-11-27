@@ -2547,7 +2547,8 @@ export class SelectorController {
 	 */
 	#resumeInFlight = false;
 
-	async handleResumeSession(sessionPath: string): Promise<void> {
+	/** `cancelledStatus`: what Cancel on the held-session warning says (default `Resume cancelled`). */
+	async handleResumeSession(sessionPath: string, options?: { readonly cancelledStatus?: string }): Promise<void> {
 		this.ctx.promptSuggestion?.clear();
 		if (this.#resumeInFlight) {
 			this.ctx.showStatus("Resume already in progress");
@@ -2573,7 +2574,7 @@ export class SelectorController {
 					admission = await admitting;
 				} catch (error) {
 					if (!(error instanceof SessionHeldError)) throw error;
-					const forked = await this.#forkHeldSession(sessionPath, error);
+					const forked = await this.#forkHeldSession(sessionPath, error, options?.cancelledStatus);
 					if (!forked) return;
 					if (forked.kind === "continued") admission = forked.admission;
 					else {
@@ -2710,6 +2711,7 @@ export class SelectorController {
 	async #forkHeldSession(
 		sessionPath: string,
 		error: SessionHeldError,
+		cancelledStatus = "Resume cancelled",
 	): Promise<
 		| {
 				readonly kind: "forked";
@@ -2741,7 +2743,7 @@ export class SelectorController {
 					continue;
 				}
 				case "cancel":
-					this.ctx.showStatus("Resume cancelled");
+					this.ctx.showStatus(cancelledStatus);
 					return undefined;
 				default: {
 					const unknown: never = choice;

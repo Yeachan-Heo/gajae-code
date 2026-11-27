@@ -644,7 +644,8 @@ export async function claimSessionOwner(
 				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
 				// A stall skips this call only (design §2.7): latching it would leave a long-lived writer
-				// unclaimed, and so invisible to other processes, for the rest of its life.
+				// unclaimed, and so invisible to other processes, for the rest of its life. Turn start
+				// re-attempts the current session, with backoff (`SessionClaimSet.reclaimCurrent`).
 				logger.warn("Session ownership claim timed out; this claim was skipped", { code: result.code });
 				return failOpen("timed_out", result.code ?? "timed_out");
 			default:

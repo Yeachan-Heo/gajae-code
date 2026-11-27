@@ -399,7 +399,8 @@ export async function submitInteractiveInput(
 		| "showError"
 		| "checkShutdownRequested"
 		| "waitForAgentEnd"
-	>,
+	> &
+		Partial<Pick<InteractiveMode, "handleHeldSessionTurn">>,
 	session: Pick<AgentSession, "prompt" | "promptCustomMessage"> & {
 		continuePersistedHistory?: AgentSession["continuePersistedHistory"];
 	},
@@ -408,6 +409,11 @@ export async function submitInteractiveInput(
 	if (input.cancelled) {
 		return;
 	}
+	// A turn enforce refused because another process holds the session gets the held warning.
+	const reportFailure = (error: unknown): void => {
+		if (error instanceof SessionHeldError && mode.handleHeldSessionTurn) mode.handleHeldSessionTurn(error, input);
+		else mode.showError(operatorErrorMessage(error));
+	};
 
 	try {
 		if (input.started) {
@@ -438,20 +444,15 @@ export async function submitInteractiveInput(
 				agentEnd.promise.then(() => ({ type: "agent_end" as const })),
 			]);
 			if (result.type === "error") {
-				const errorMessage = operatorErrorMessage(result.error);
-				mode.showError(errorMessage);
+				reportFailure(result.error);
 			} else if (result.type === "agent_end") {
-				void prompt.catch((error: unknown) => {
-					const errorMessage = operatorErrorMessage(error);
-					mode.showError(errorMessage);
-				});
+				void prompt.catch(reportFailure);
 			}
 		} finally {
 			agentEnd.dispose();
 		}
 	} catch (error: unknown) {
-		const errorMessage = operatorErrorMessage(error);
-		mode.showError(errorMessage);
+		reportFailure(error);
 	} finally {
 		mode.finishPendingSubmission(input);
 		await mode.checkShutdownRequested();

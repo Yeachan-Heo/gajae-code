@@ -58,8 +58,10 @@ import {
 	isSessionDisposalIncompleteError,
 } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
+import { operatorErrorMessage } from "../session/operator-error-message";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
+import type { SessionHeldError } from "../session/session-ownership";
 import { createDefaultPaseoAnnounceDependencies, startPaseoAnnouncement } from "../setup/paseo/announce";
 import type { LspStartupServerInfo } from "../tools";
 import { formatPhaseDisplayName } from "../tools/todo-write";
@@ -2779,10 +2781,34 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showSessionSelector();
 	}
 
-	handleResumeSession(sessionPath: string): Promise<void> {
+	handleResumeSession(sessionPath: string, options?: { readonly cancelledStatus?: string }): Promise<void> {
 		this.#btwController.dispose();
 		this.resetObserverRegistry();
-		return this.#selectorController.handleResumeSession(sessionPath);
+		return this.#selectorController.handleResumeSession(sessionPath, options);
+	}
+
+	/**
+	 * A turn refused because another process now holds this session (enforce; single-owner design
+	 * §2.7, §3.1): nothing was sent, so the draft goes back to the editor, and the held-session warning
+	 * offers Fork, Continue here (for a broker-launched holder) or Cancel, through `/resume`'s flow for
+	 * this session's own file. A refusal for any other session is shown as an error.
+	 */
+	handleHeldSessionTurn(error: SessionHeldError, input: SubmittedUserInput): void {
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (error.sessionId !== this.sessionManager.getSessionId() || !sessionFile) {
+			this.showError(operatorErrorMessage(error));
+			return;
+		}
+		if (!input.customType) {
+			this.rebuildChatFromMessages("reconcile-same-transcript");
+			if (this.editor.getText().length === 0) {
+				this.editor.setText(input.text);
+				this.pendingImages = input.images ? [...input.images] : [];
+			}
+		}
+		void this.handleResumeSession(sessionFile, {
+			cancelledStatus: "Not sent: this session is open in another process",
+		}).catch(failure => this.showError(operatorErrorMessage(failure)));
 	}
 
 	handleSessionDeleteCommand(): Promise<void> {

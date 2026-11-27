@@ -569,7 +569,7 @@ import {
 	FoldCoordinator,
 	type ForegroundFoldOutcome,
 } from "./fold-coordinator";
-import { sessionClaimSetOf } from "./internal/session-claim-set";
+import { reclaimCurrentSession, sessionClaimSetOf } from "./internal/session-claim-set";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -7076,6 +7076,9 @@ export class AgentSession {
 						await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
 						if (settleIfDisposing()) return;
 					}
+					// An idle delivery starts a turn without #promptWithMessage: the same ownership gate.
+					const ownershipGate = this.#sessionOwnershipTurnGate();
+					if (ownershipGate) await ownershipGate;
 					if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
 						this.#resumeFromOwnedCompletion();
 					if (survivors.length === 1) {
@@ -8549,6 +8552,28 @@ export class AgentSession {
 	 */
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void {
 		this.#emit({ type: "notice", level, message, source });
+	}
+
+	/**
+	 * Turn start's ownership gate (single-owner design §2.7, §13.1), before the turn writes anything:
+	 * a current session whose claim was not taken (another process held it, or the lock timed out or
+	 * failed) is claimed again, with backoff. Under enforce, a turn on a session another process now
+	 * holds is refused with its `SessionHeldError`, and the holder keeps the session; a lock that times
+	 * out again lets this one turn run unclaimed, with a notice. `undefined`, with nothing awaited, when
+	 * there is nothing to re-attempt (off, an exempt child, a claimed session), so ordering is unchanged.
+	 */
+	#sessionOwnershipTurnGate(): Promise<void> | undefined {
+		const reclaim = reclaimCurrentSession(this.sessionManager);
+		return reclaim?.then(result => {
+			if (result.refusal) throw result.refusal;
+			const ownership = this.sessionManager.ownershipDecision;
+			if (result.status === "timed_out" && ownership !== "exempt" && ownership.mode === "enforce")
+				this.emitNotice(
+					"warning",
+					"gjc could not check whether another process has this session open (the lock timed out), so this turn runs without a claim. It tries again on a later turn.",
+					"session-ownership",
+				);
+		});
 	}
 
 	#queuedExtensionEvents: Promise<void> = Promise.resolve();
@@ -16560,6 +16585,8 @@ export class AgentSession {
 		await this.#awaitStartupTurnBarrier();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		await this.#withSessionAdmission("prompt", async () => {});
+		const ownershipGate = this.#sessionOwnershipTurnGate();
+		if (ownershipGate) await ownershipGate;
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
@@ -18874,6 +18901,11 @@ export class AgentSession {
 		this.#assertNoHandoffTransition();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
+		const ownershipGate = this.#sessionOwnershipTurnGate();
+		if (ownershipGate) {
+			await ownershipGate;
+			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		}
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
