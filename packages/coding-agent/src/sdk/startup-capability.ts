@@ -7,7 +7,7 @@ import {
 	SessionHeldError,
 	type SessionOwnerHolderSummary,
 	sessionOwnerHolderSummary,
-} from "../session/session-ownership";
+} from "../session/session-owner-holder";
 export type SdkStartupPhase = "registration" | "startup";
 
 /**
