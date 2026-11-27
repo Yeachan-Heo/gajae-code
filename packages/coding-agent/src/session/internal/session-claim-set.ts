@@ -14,6 +14,7 @@ import {
 	claimSessionOwner,
 	countSessionOwnershipEvent,
 	probeSessionOwners,
+	releaseSessionAdmissions,
 	SessionHeldError,
 	type SessionOwnerClaim,
 	type SessionOwnerHolder,
@@ -88,12 +89,14 @@ function outcomeOf(attempt: SessionClaimAttempt): SessionClaimOutcome {
  * One claim attempt under `ownership`, never throwing (design §13 M2). A held session (counted
  * `claim_conflict`) and an owners-directory failure (counted `claim_failed`) are logged and returned;
  * {@link claimRefusal} decides whether enforce refuses them. `previous`, the outcome a re-attempt
- * repeats, keeps the same outcome again from being counted or logged again.
+ * repeats, keeps the same outcome again from being counted or logged again. `admission` marks an
+ * open's or a switch's cover, which the opener's own claim releases when it lands.
  */
 export async function attemptSessionClaim(
 	ownership: ResolvedSessionOwnership,
 	sessionId: string,
 	previous?: SessionClaimOutcome,
+	options?: { readonly admission?: boolean },
 ): Promise<SessionClaimAttempt> {
 	if (ownership === "exempt" || ownership.mode === "off") return { status: "none" };
 	const repeat =
@@ -103,7 +106,11 @@ export async function attemptSessionClaim(
 				? "timed_out"
 				: undefined;
 	try {
-		const result = await claimSessionOwner(sessionId, { surface: ownership.surface, repeat });
+		const result = await claimSessionOwner(sessionId, {
+			surface: ownership.surface,
+			repeat,
+			admission: options?.admission,
+		});
 		if (result.status === "claimed") return result;
 		if (result.status === "held") {
 			if (repeat !== "held")
@@ -627,6 +634,9 @@ export class SessionClaimSet {
 			return;
 		}
 		this.#claims.set(claim.sessionId, claim);
+		// The opener's own claim has landed: the covers its open or switch took go now, not when the
+		// caller's flow settles, so they are never a second holder of the open session.
+		releaseSessionAdmissions(claim);
 		// A new claim of the id is a new open of it: its route is decided again.
 		this.#soleOwnerRoute.delete(claim.sessionId);
 		// A target staged outside the transition that rotates to it is exposed to any unrelated

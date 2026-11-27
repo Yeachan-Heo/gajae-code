@@ -13,6 +13,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { FileLockAcquireStatus, probeFileLock } from "@gajae-code/natives";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
 import { AgentSession } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
@@ -72,7 +73,12 @@ async function manager(cwd: string, destination: SessionDestinationInput, mode: 
 }
 
 /** A root (or plain) AgentSession on `sessionManager` whose model answers every turn with "ok". */
-async function rootSession(sessionManager: SessionManager, root: string, rootInteractiveSharedAppend = true) {
+async function rootSession(
+	sessionManager: SessionManager,
+	root: string,
+	rootInteractiveSharedAppend = true,
+	extensionRunner?: ExtensionRunner,
+) {
 	const auth = await AuthStorage.create(path.join(root, `auth-${sessions.length}.db`));
 	stores.push(auth);
 	auth.setRuntimeApiKey("anthropic", "test-key");
@@ -96,6 +102,7 @@ async function rootSession(sessionManager: SessionManager, root: string, rootInt
 		settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
 		modelRegistry: new ModelRegistry(auth),
 		rootInteractiveSharedAppend,
+		extensionRunner,
 	});
 	sessions.push(session);
 	return session;
@@ -254,7 +261,65 @@ describe.skipIf(!supported)("isSoleOwnerRoute", () => {
 		expect(sessionClaimSetOf(sessionManager).has(firstId)).toBe(false);
 		expect(sessionManager.isSoleOwnerRoute()).toBe(false);
 	});
+
+	it("enforce: a session_switch handler that writes during /resume keeps the switched-to session sole", async () => {
+		const place = await workspace();
+		SessionOwnershipTestHooks.mode = "enforce";
+		// The /resume target: a committed session no one holds.
+		const target = await manager(place.cwd, place.managed, "enforce");
+		target.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+		await target.ensureOnDisk();
+		await target.flush();
+		const targetFile = target.getSessionFile()!;
+		await target.close();
+
+		const sessionManager = await manager(place.cwd, place.managed, "enforce");
+		const seen: { shared: boolean; holders: number | undefined }[] = [];
+		let session: AgentSession | undefined;
+		const extensionRunner = {
+			hasHandlers: () => false,
+			emit: async (event: { type: string }) => {
+				if (event.type !== "session_switch" || !session) return;
+				await session.appendCustomEntryForSession("switch-hook", { wrote: true });
+				seen.push({
+					shared: session.usesSharedControlPublication(),
+					holders: (await claimSessionOwnerHolders(sessionManager.getSessionId())) - 1,
+				});
+			},
+		} as unknown as ExtensionRunner;
+		session = await rootSession(sessionManager, place.root, true, extensionRunner);
+		// The picker's own admission of the target, held until its flow settles, as /resume does.
+		const admission = await sessionManager.switchTargetAdmission(targetFile);
+		expect(admission?.holders).toBe(1);
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+		const switched = await session.switchSession(targetFile);
+		expect(notices).toEqual([]);
+		expect(switched).toBe(true);
+		// The rotation's own claim released both covers when it landed, before the hook wrote.
+		expect(admission?.released).toBe(true);
+		expect(seen).toEqual([{ shared: false, holders: 1 }]);
+		expect(sessionManager.requiresSharedMutationAdmission()).toBe(false);
+		admission?.release();
+		const [row] = (await sessionManager.listForResumePickerReadOnly()).filter(
+			candidate => candidate.path === targetFile,
+		);
+		await sessionManager.setSessionStarredForPicker(row!, true);
+		expect(sessionManager.isSessionStarred()).toBe(true);
+		expect(await Bun.file(targetFile).text()).toContain('"customType":"switch-hook"');
+	});
 });
+
+/** How many claims in this process share `sessionId`'s lock, counting one taken (and released) here. */
+async function claimSessionOwnerHolders(sessionId: string): Promise<number> {
+	const probe = await claimSessionOwner(sessionId, { surface: "terminal" });
+	if (probe.status !== "claimed") throw new Error(`expected a shared claim, got ${probe.status}`);
+	const holders = probe.claim.holders;
+	probe.claim.release();
+	return holders;
+}
 
 describe.skipIf(!supported)("a root session's controls after its first messages", () => {
 	async function prompted(mode: SessionOwnershipMode, failOpen?: FileLockAcquireStatus.Unavailable) {

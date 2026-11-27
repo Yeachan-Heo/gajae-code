@@ -24896,7 +24896,7 @@ export class SessionManager {
 		});
 		if (!header.ok) return undefined;
 		const sessionId = header.inspection.sessionId;
-		const attempt = await attemptSessionClaim(owner, sessionId);
+		const attempt = await attemptSessionClaim(owner, sessionId, undefined, { admission: true });
 		const refusal = claimRefusal(owner, sessionId, attempt);
 		if (refusal) throw refusal;
 		return attempt.status === "claimed" ? attempt.claim : undefined;
@@ -24910,9 +24910,11 @@ export class SessionManager {
 	/**
 	 * Enforce's admission of a switch target (design §1 rows 3 and 9): `open`'s pre-claim of the
 	 * target's header id, taken before the switch emits any event or begins its transition. It throws
-	 * {@link SessionHeldError} for a session another process holds; otherwise the caller keeps the
-	 * returned claim until the rotation's own claim of the target has landed, and then releases it.
-	 * `undefined`, with nothing awaited, outside enforce, so other modes keep their ordering.
+	 * {@link SessionHeldError} for a session another process holds. The returned claim is an
+	 * admission: the rotation's own claim of the target releases it when it lands, so the switched-to
+	 * session never has it as a second holder; the caller still releases it on every path (a no-op
+	 * by then), which covers a switch that ends before it claims. `undefined`, with nothing awaited,
+	 * outside enforce, so other modes keep their ordering.
 	 */
 	switchTargetAdmission(sessionFile: string): Promise<SessionOwnerClaim | undefined> | undefined {
 		const owner = this.#ownershipClaims.ownership;
