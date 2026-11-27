@@ -2374,7 +2374,7 @@ export class AcpAgent implements Agent {
 		return { configOptions: state.configOptions ?? [] };
 	}
 
-	async prompt(params: PromptRequest): Promise<PromptResponse> {
+	async prompt(params: PromptRequest, rebound = false): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		// An unknown session must still report not_found; the retry loop only guards a
 		// live session's first turn against a startup readiness race (issue #5574).
@@ -2382,12 +2382,25 @@ export class AcpAgent implements Agent {
 			const reattaching = this.#reattachingSessions.get(params.sessionId);
 			if (reattaching) {
 				await reattaching;
-				return await this.prompt(params);
+				return await this.prompt(params, rebound);
 			}
 			// A session whose host attachment could not be restored reports its typed failure.
 			const unrecoverable = this.#unrecoverableSessions.get(params.sessionId);
 			if (unrecoverable) throw unrecoverable;
 			return await this.#submitPrompt(params, true);
+		}
+		// The host closed between turns, as Continue here closes a broker-launched host for the
+		// terminal taking the session over (session single-owner design §13 H1), and the Router has
+		// not attached a successor yet. Nothing was sent: reattach the session to its current owner
+		// through the broker, which waits for that owner's endpoint, then submit there.
+		if (!rebound && !record.activePrompt && !record.pendingPromptAdmission && !record.attachment.isCurrent()) {
+			await this.#failAndReattachSession(
+				params.sessionId,
+				record.adapter,
+				record.cwd,
+				new AcpSdkAdapterError("session_closed", `ACP session ${params.sessionId} lost its SDK session host.`),
+			);
+			return await this.prompt(params, true);
 		}
 		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
 		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
