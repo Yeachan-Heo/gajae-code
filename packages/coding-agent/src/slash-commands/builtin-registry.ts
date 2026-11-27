@@ -299,7 +299,7 @@ function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
-		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, runcrate, cheaper-inference, standardcompute, uberllm, and requesty.",
+		"Aliases include minimax, zai, alibaba, cline, command-code, goat, ionet, runcrate, cheaper-inference, standardcompute, uberllm, requesty, and llmtr.",
 		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
 		"Credential status: /provider status",

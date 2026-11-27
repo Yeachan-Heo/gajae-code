@@ -322,6 +322,7 @@ describe("/provider preset CLI surface", () => {
 			"cloudgpu",
 			"ionet",
 			"litellm",
+			"llmtr",
 			"openai-compatible-proxy",
 			"requesty",
 			"runcrate",
