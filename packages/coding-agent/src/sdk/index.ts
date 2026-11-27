@@ -33,6 +33,16 @@ export type {
 	TrackedSendUserMessageOptions,
 } from "../session/agent-session";
 export { getSessionMessageEntryId } from "../session/session-manager";
+// Session ownership (design §2.6, §3.3): who holds a session for writing, and the refusal enforce raises.
+export {
+	probeSessionOwners,
+	SessionHeldError,
+	type SessionOwnerBaseSurface,
+	type SessionOwnerHolder,
+	type SessionOwnerProbe,
+	type SessionOwnerSurface,
+	type SessionOwnerUnknownReason,
+} from "../session/session-ownership";
 export { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 export type { SlashCommandResult, SlashCommandRuntime } from "../slash-commands/types";
 export * from "./activity-controls";

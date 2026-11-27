@@ -5,8 +5,9 @@
  * (the native `FileLock`), so it ends when its holder exits, however it exits. A holder record
  * beside it names the holder for warnings; the lock is the truth and the record only a label.
  *
- * The session factories claim through the claim set (`internal/session-claim-set.ts`); nothing
- * refuses yet, so a held session only logs and counts until enforcement lands.
+ * The session factories claim through the claim set (`internal/session-claim-set.ts`). A held
+ * session is logged and counted; only under mode `enforce` does a factory refuse it, with
+ * {@link SessionHeldError} (`claimRefusal`).
  */
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -344,8 +345,10 @@ interface SessionOwnerRegistry {
 	readonly entries: Map<string, RegistryEntry>;
 	/** Acquires in flight, so a second claim in this process waits instead of contending. */
 	readonly pending: Map<string, Promise<void>>;
-	/** Set once a lock call reports `unavailable`: claims are off for this process. */
+	/** Set once a lock call reports `unavailable` or times out: claims are off for this process. */
 	unavailable: string | undefined;
+	/** Why the latch above was set; added later, so a registry from an older copy may lack it. */
+	latchReason?: "unavailable" | "timed_out";
 	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
 	counters?: Map<SessionOwnershipCounter, number>;
 	/** Counts already written to the stats database, and whether the exit write is armed. */
@@ -372,6 +375,7 @@ function registry(): SessionOwnerRegistry {
 export function resetSessionOwnershipForTests(): void {
 	const current = registry();
 	current.unavailable = undefined;
+	current.latchReason = undefined;
 	current.counters?.clear();
 	current.persisted?.counts.clear();
 	const leaked = [...current.entries.values()];
@@ -464,14 +468,25 @@ export function persistSessionOwnershipCounters(options: { readonly atExit?: boo
 	}
 }
 
-function markUnavailable(code: string | undefined): string {
+function markUnavailable(code: string | undefined, reason: "unavailable" | "timed_out" = "unavailable"): string {
 	const current = registry();
-	const latched = code ?? "unavailable";
+	const latched = code ?? reason;
 	if (current.unavailable === undefined) {
 		current.unavailable = latched;
-		logger.warn("Session ownership is unavailable; claims are off for this process", { code: latched });
+		current.latchReason = reason;
+		logger.warn(
+			reason === "timed_out"
+				? "Session ownership claim timed out; claims are off for this process"
+				: "Session ownership is unavailable; claims are off for this process",
+			{ code: latched },
+		);
 	}
 	return current.unavailable;
+}
+
+/** The fail-open a latched process returns for every later claim. */
+function latchedFailOpen(current: SessionOwnerRegistry): SessionOwnerClaimResult {
+	return failOpen(current.latchReason ?? "unavailable", current.unavailable);
 }
 
 class Claim implements SessionOwnerClaim {
@@ -547,7 +562,7 @@ export async function claimSessionOwner(
 ): Promise<SessionOwnerClaimResult> {
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
-	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
+	if (current.unavailable !== undefined) return latchedFailOpen(current);
 	let directory: RuntimeLockDirectory;
 	try {
 		directory = prepareRuntimeLockDirectory("session-owners", trustedHome());
@@ -566,8 +581,8 @@ export async function claimSessionOwner(
 		if (!pending) break;
 		await pending;
 	}
-	// The acquire waited on may have found the platform unavailable.
-	if (current.unavailable !== undefined) return failOpen("unavailable", current.unavailable);
+	// The acquire waited on may have found the platform unavailable, or timed out.
+	if (current.unavailable !== undefined) return latchedFailOpen(current);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
 	try {
@@ -630,9 +645,9 @@ export async function claimSessionOwner(
 			case FileLockAcquireStatus.Unavailable:
 				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
-				// A stall is not a platform property: skip this claim only, and try again next time.
-				logger.warn("Session ownership claim timed out; this claim is skipped", { code: result.code });
-				return failOpen("timed_out", result.code);
+				// A stalled lock filesystem (NFS, for one) would make every later open wait the full native
+				// budget again, so one timeout turns claims off for the rest of this process.
+				return failOpen("timed_out", markUnavailable(result.code ?? "timed_out", "timed_out"));
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}
@@ -849,6 +864,26 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	return subagent ? `a subagent of ${noun} (pid ${holder.pid})` : `${noun} (pid ${holder.pid})`;
 }
 
+/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`; `undefined` if unverified. */
+function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string | undefined {
+	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface)) return undefined;
+	if (holder.host === undefined) return `${holder.surface}, pid ${holder.pid}`;
+	return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host}, pid ${holder.pid}` : undefined;
+}
+
+/**
+ * The CLI command that continues a held session in a copy (design §3.3), for the CLI's refusals
+ * only: the SDK's `operatorMessage` names no command. `undefined` for an id that is not a safe file
+ * name, since any other id may hold any text.
+ */
+export function sessionHeldForkCommand(
+	sessionId: string,
+	options: { readonly print?: boolean } = {},
+): string | undefined {
+	if (!SAFE_ID.test(sessionId)) return undefined;
+	return options.print ? `gjc -p --fork ${sessionId} "<message>"` : `gjc --fork ${sessionId}`;
+}
+
 /**
  * A session another live process holds for writing. `message` is the stable machine code; the
  * fixed, path-free `operatorMessage` is what a person sees.
@@ -866,6 +901,8 @@ export class SessionHeldError extends Error {
 		this.holder = holder;
 		// Only a safe id is quoted, shortened as the CLI shows it; any other id may hold any text.
 		const subject = SAFE_ID.test(sessionId) ? `Session ${sessionId.slice(0, 8)}` : "This session";
-		this.operatorMessage = `${subject} is open for writing in ${sessionOwnerHolderPhrase(holder)}. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
+		const label = sessionOwnerHolderLabel(holder);
+		const where = label ? `another process (${label})` : "another gjc process";
+		this.operatorMessage = `${subject} is open for writing in ${where}. Only one process can write a session at a time.`;
 	}
 }

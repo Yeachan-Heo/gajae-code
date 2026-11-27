@@ -2696,6 +2696,9 @@ const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
  */
 const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
 const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
+// A shared custom-message append refused as `stale/transcript_moved` committed nothing and is published again
+// against the relocated transcript; bounded so repeated relocations cannot loop.
+const SHARED_CUSTOM_APPEND_RELOCATION_RETRIES = 2;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -4606,6 +4609,7 @@ export class AgentSession {
 							job,
 							durationMs: undefined,
 							ownedCompletion,
+							foldReceipt: true,
 						});
 					} finally {
 						manager?.clearParkedDelivery(job.generation);
@@ -7126,6 +7130,26 @@ export class AgentSession {
 			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Step-boundary delivery: eligible entries (ordinary async results, MCP
+		// notifications) reach the running turn at its next tool step instead of
+		// waiting for before-yield, which would force an extra iteration after the
+		// final answer. Entries whose ownership classifies "fresh" or "drop" and
+		// fold receipts are ineligible by their dispatcher and keep the
+		// before-yield/idle path above. Transitions, abort unwinds and disposal
+		// leave the queue untouched.
+		this.agent.setStepBoundaryMessageProvider(() => {
+			if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) return [];
+			if (this.#abortUnwind !== undefined || this.#isDisposed || this.#sessionAdmissionClosing) return [];
+			const messages = this.yieldQueue.drainStepBoundary();
+			// This is the delivery boundary for these messages (the loop commits
+			// them synchronously), so settle their terminal owned registrations as
+			// onFollowUpConsumed does; unsettled tuples would fill the bounded
+			// registry until later owned aborts fail closed. No SDK run token or
+			// fresh lineage applies: these entries were never queued as SDK input
+			// and "fresh" entries are not eligible here.
+			this.#settleDeliveredOwnedRegistrations(messages);
+			return messages;
+		});
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
 		// to the folded turn instead of pausing everything that follows. The
@@ -8492,13 +8516,21 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
+	/**
+	 * Emit an event to all listeners without letting one subscriber poison lifecycle settlement.
+	 * Subscribers run outside this session's admission context: an event emitted inside an
+	 * admitted turn (auto_compaction_end from pre-prompt maintenance) must not hand that turn's
+	 * admission ownership to subscriber continuations, or a UI replay of input queued during
+	 * compaction is refused as same-session reentrancy and stranded.
+	 */
 	#emit(event: AgentSessionEvent): void {
-		for (const listener of this.#eventListenerSnapshot) {
-			deliverSessionEvent(listener, event, error => {
-				logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
-			});
-		}
+		this.#sessionAdmissionContext.exit(() => {
+			for (const listener of this.#eventListenerSnapshot) {
+				deliverSessionEvent(listener, event, error => {
+					logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
+				});
+			}
+		});
 	}
 
 	/** Notify UI projections after a committed session-identity transition. */
@@ -13449,6 +13481,7 @@ export class AgentSession {
 		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
+		this.agent.setStepBoundaryMessageProvider(undefined);
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await awaitDisposeStep(
@@ -17771,14 +17804,40 @@ export class AgentSession {
 				observationId,
 			);
 		}
-		const outcome = await this.sessionManager.appendCustomMessageEntrySharingSession(
-			customType,
-			content,
-			display,
-			details,
-			attribution,
-			observationId,
-		);
+		const manager = this.sessionManager;
+		const sessionId = manager.getSessionId();
+		const identityGeneration = manager.getSessionIdentityGeneration();
+		const publish = () =>
+			manager.appendCustomMessageEntrySharingSession(
+				customType,
+				content,
+				display,
+				details,
+				attribution,
+				observationId,
+			);
+		let outcome = await publish();
+		// A relocation of this session's transcript (a task child following its parent's session move) between the
+		// append capturing its path and its transaction refuses the append before any write. Nothing was committed, so
+		// it is published again against the relocated transcript; the caller's in-memory message is not touched. Only
+		// for the same manager, session id and identity generation, and outside every session transition: a switch or
+		// copy reports the same reason and must not receive this entry, and while it is being adopted the successor's
+		// transcript can already be in place before the id or generation changes. Every other outcome stays final,
+		// since an `unknown` one may already be committed.
+		for (
+			let retry = 0;
+			retry < SHARED_CUSTOM_APPEND_RELOCATION_RETRIES &&
+			outcome.kind === "stale" &&
+			outcome.reason === "transcript_moved" &&
+			this.#sessionTransitionKind === undefined &&
+			!this.#handoffTransitionActive &&
+			this.sessionManager === manager &&
+			manager.getSessionId() === sessionId &&
+			manager.getSessionIdentityGeneration() === identityGeneration;
+			retry++
+		) {
+			outcome = await publish();
+		}
 		if (outcome.kind !== "committed") {
 			throw new Error(
 				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
