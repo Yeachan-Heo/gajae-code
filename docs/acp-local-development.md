@@ -182,4 +182,6 @@ the complete client/daemon/process lifecycle. At minimum:
 - `packages/coding-agent/test/acp-*.test.ts`
 - `packages/coding-agent/test/acp/`
 - `packages/coding-agent/test/sdk-acp-*.test.ts`
-- `bun run conformance:run` — pinned `acp-core-v1` corpus
+- `bun run conformance:run` — pinned `acp-core-v1` corpus. The agent command runs
+  under a temporary HOME that is removed afterwards, so a local run leaves no state in
+  your `~/.gjc`; set `GJC_ACP_CONFORMANCE_HOME` to run it under a HOME you choose.
