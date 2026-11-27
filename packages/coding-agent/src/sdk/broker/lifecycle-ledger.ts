@@ -1239,15 +1239,17 @@ export class LifecycleLedger {
 		if (prior.state === "accepted") return { kind: "new", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
-	/** A runtime busy refusal proves no close effect; retain key binding, not a terminal result. */
-	async retryCloseRefusal(identity: string): Promise<void> {
+	/**
+	 * A refusal that proves no effect keeps its key binding, not a terminal result: a runtime busy
+	 * close, or a delete refused while its row is still `accepted` (a live or held session, `unavailable`).
+	 */
+	async retryRefusal(identity: string): Promise<void> {
 		await this.#mutate(async () => {
 			const previous = this.#byIdentity.get(identity);
-			if (
-				!previous?.operationKey?.startsWith("session.close\u0000") ||
-				(previous.state !== "accepted" && previous.state !== "effect_started")
-			)
-				throw new Error("Cannot retry a settled or non-close lifecycle operation");
+			const retryable = previous?.operationKey?.startsWith("session.close\u0000")
+				? previous.state === "accepted" || previous.state === "effect_started"
+				: previous?.operationKey?.startsWith("session.delete\u0000") === true && previous.state === "accepted";
+			if (!previous || !retryable) throw new Error("Cannot retry a settled lifecycle operation or one with effects");
 			await this.#compact({
 				version: previous.version,
 				identity,

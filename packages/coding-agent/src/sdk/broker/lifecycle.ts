@@ -58,6 +58,7 @@ import {
 } from "../../session/internal/task-artifact-owner-transcript";
 import {
 	probeSessionOwner,
+	SessionHeldError,
 	type SessionOwnerHolder,
 	type SessionOwnerHolderSummary,
 	sessionOwnerHolderPhrase,
@@ -8243,8 +8244,11 @@ async function executeLifecycleResponse(
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
 		// Scoped claim (single-owner design §1 row 17), held for the whole delete: under enforce a session
 		// another process holds without a live row (a `-p` run, an embedding, a TUI without the SDK) is
-		// refused with the live-row refusal's code, before any cleanup phase is recorded. `id` is the
-		// header's id: only the managed candidate whose header names it is deleted. A host this broker
+		// refused with the live-row refusal's code, before this request records any cleanup phase. `id` is the
+		// requested id: the header id on a fresh delete (only the managed candidate whose header names it
+		// is deleted) and `cleanup.sessionId` on a replay. Both refusals leave the key retryable
+		// (broker.ts `isRetryableDeleteRefusal`). Lifecycle- and metadata-phase cleanup replays return from
+		// `executeLifecycle` before this point and run without a claim. A host this broker
 		// launched is never the holder here: its live row is refused above, and close waits for its exit.
 		const ownership = resolveSessionOwnership();
 		if (!underDeleteClaim && claimsUnder(ownership)) {
@@ -8255,9 +8259,16 @@ async function executeLifecycleResponse(
 					return executeLifecycleResponse(broker, operation, input, identity, cleanup, onIdleHostExited, true);
 				});
 			} catch (error) {
-				// Only the claim's refusal is thrown before the delete is admitted.
+				// Only the claim's refusal is thrown before the delete is admitted. A real hold is the
+				// live-row refusal, naming the holder; a claim that could not be checked has nothing to
+				// close, so it is the retryable `unavailable`.
 				if (admitted || !(error instanceof Error)) throw error;
-				return fail("live_session", error.message);
+				if (!(error.cause instanceof SessionHeldError)) return fail("unavailable", error.message);
+				const holder = sessionOwnerHolderSummary(error.cause.holder);
+				return {
+					ok: false,
+					error: { code: "live_session", message: error.message, ...(holder ? { holder } : {}) },
+				};
 			}
 		}
 		if (cleanup === undefined) {
