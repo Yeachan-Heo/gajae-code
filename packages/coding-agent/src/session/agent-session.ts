@@ -22674,6 +22674,8 @@ export class AgentSession {
 		if (options?.drop) {
 			try {
 				this.sessionManager.assertLegacyMutationAllowed("drop session");
+				// On the legacy route, a transcript another process changed is not this opener's to delete.
+				this.sessionManager.assertTranscriptUnchanged();
 			} catch (error) {
 				return Promise.reject(error);
 			}

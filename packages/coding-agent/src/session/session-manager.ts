@@ -11417,8 +11417,14 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
-			// The committed route records the source id; the legacy route keeps the path.
-			parentSession: route === "committed" ? sourceId : this.persist ? this.#sessionFile : undefined,
+			// A managed source is named by its id (design decision 4), on either route: a root TUI that
+			// owns its session alone branches on the legacy route. An explicit source keeps its path.
+			parentSession:
+				route === "committed" || (this.persist && this.destination.kind === "managed")
+					? sourceId
+					: this.persist
+						? this.#sessionFile
+						: undefined,
 		};
 		const pathWithoutLabels = branchPath.filter(entry => entry.type !== "label");
 		const pathEntryIds = new Set(pathWithoutLabels.map(entry => entry.id));
@@ -21029,6 +21035,29 @@ export class SessionManager {
 		if (this.#ownershipClaims.isSoleOwnerRoute(sessionId)) return true;
 		if (this.destination.kind !== "managed" || this.#publishedSharedSession(sessionId)) return false;
 		return this.#ownershipClaims.enterSoleOwnerRoute(sessionId);
+	}
+
+	/**
+	 * Refuse, with {@link ManagedAppendIdentityMismatchError}, a destructive control (`/drop`) on a
+	 * managed transcript that is no longer the one this manager last wrote or bound: a writer it
+	 * cannot see (ownership off, an older binary) changed it, and its entries would go with it.
+	 */
+	assertTranscriptUnchanged(): void {
+		if (this.#persistError instanceof ManagedAppendIdentityMismatchError) throw this.#persistError;
+		const expected = this.#managedPersistExpectedIdentity;
+		const sessionFile = this.#sessionFile;
+		if (this.destination.kind !== "managed" || !expected || !sessionFile) return;
+		const relativePath = path.basename(sessionFile);
+		const observed = this.#managedTranscriptStore(sessionFile).captureBoundedAppendExpectation(relativePath);
+		if (!observed) return;
+		if (
+			observed.dev !== expected.dev.toString() ||
+			observed.ino !== expected.ino.toString() ||
+			observed.nlink !== expected.nlink.toString() ||
+			observed.size !== String(expected.size) ||
+			(expected.sha256 !== undefined && observed.sha256 !== expected.sha256)
+		)
+			throw new ManagedAppendIdentityMismatchError(relativePath);
 	}
 
 	/** Refuse before caller-side agent, UI, settings, or external effects. */

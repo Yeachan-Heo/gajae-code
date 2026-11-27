@@ -269,7 +269,7 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		const forked = await session.branch(users[0]!.entryId);
 		expect(forked.cancelled).toBe(false);
 		expect(sessionManager.getSessionId()).not.toBe(sourceId);
-		expect(sessionManager.getHeader()?.parentSession).toContain(sourceId);
+		expect(sessionManager.getHeader()?.parentSession).toBe(sourceId);
 		await sessionClaimSetOf(sessionManager).settled();
 		expect(sessionManager.isSoleOwnerRoute()).toBe(true);
 		expect(session.usesSharedControlPublication()).toBe(false);
@@ -308,6 +308,20 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		await expect(sessionManager.rewriteEntries()).rejects.toThrow(/identity_mismatch/);
 		expect(await Bun.file(file).text()).toBe(before);
 		expect(before).toContain("peer entry");
+	});
+
+	it("enforce, sole owner: /drop refuses a transcript a peer appended to, before it switches; /drop works otherwise", async () => {
+		const { sessionManager, session, file } = await prompted("enforce");
+		await peerAppends(file, "peer entry");
+		const sourceId = sessionManager.getSessionId();
+		await expect(session.newSession({ drop: true })).rejects.toThrow("managed_append_identity_mismatch");
+		expect(sessionManager.getSessionId()).toBe(sourceId);
+		expect(await Bun.file(file).text()).toContain("peer entry");
+
+		const other = await prompted("enforce");
+		await other.session.newSession({ drop: true });
+		expect(other.sessionManager.getSessionId()).not.toBe(sourceId);
+		expect(await Bun.file(other.file).exists()).toBe(false);
 	});
 
 	it.each([
