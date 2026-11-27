@@ -111,6 +111,10 @@ export interface EmitGateOptions {
 /** SDK-native surface for emitting a workflow gate and awaiting its answer. */
 export interface WorkflowGateEmitter {
 	supportsRemoteGateAnswers(): boolean;
+	/** Returns whether a remote gate responder is currently connected and ready to answer gates. */
+	hasRemoteGateAnswerChannel?(): boolean;
+	/** Register a remote gate responder channel. Returns a disposer. */
+	registerRemoteGateAnswerChannel?(): () => void;
 	/** Opens a gate and awaits its answer. Revocation through `options.signal` is required. */
 	emitGate(input: OpenGateInput, options: EmitGateOptions): Promise<unknown>;
 	onGateEmitted?(listener: (gate: WorkflowGate) => void): () => void;
@@ -167,6 +171,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	readonly #store: GateStore;
 	readonly #emitterHooks: Pick<BrokerHooks, "advance">;
 	#runtimeTurnProvider: (() => string | undefined) | undefined;
+	#remoteGateAnswerChannelCount = 0;
 
 	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance" | "continuationLost"> = {}) {
 		this.#runId = runId;
@@ -187,6 +192,18 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	supportsRemoteGateAnswers(): boolean {
 		return true;
 	}
+
+	hasRemoteGateAnswerChannel(): boolean {
+		return this.#remoteGateAnswerChannelCount > 0;
+	}
+
+	registerRemoteGateAnswerChannel(): () => void {
+		this.#remoteGateAnswerChannelCount += 1;
+		return () => {
+			this.#remoteGateAnswerChannelCount = Math.max(0, this.#remoteGateAnswerChannelCount - 1);
+		};
+	}
+
 	setRuntimeTurnProvider(provider: (() => string | undefined) | null): void {
 		this.#runtimeTurnProvider = provider ?? undefined;
 	}

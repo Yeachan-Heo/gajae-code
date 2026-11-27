@@ -521,8 +521,20 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		{ event: "mission_cleared", slug: existing?.slug ?? "" },
 		resolvedSessionId,
 	);
-	const retiredTo = existing ? await retireAutoresearchMissionArtifacts(paths, existing.slug) : undefined;
-	const deleted = existing !== null;
+	let retiredTo: string | undefined;
+	let deleted = existing !== null;
+	if (existing) {
+		retiredTo = await retireAutoresearchMissionArtifacts(paths, existing.slug);
+	} else {
+		// If mission.json is missing but other artifacts remain, it means a prior clear
+		// was interrupted mid-move. Retry moving any remaining artifacts to recovery.
+		// Use a generic slug for the recovery directory since mission metadata is unavailable.
+		const hasArtifacts = await checkHasAnyArtifacts(paths);
+		if (hasArtifacts) {
+			retiredTo = await retireAutoresearchMissionArtifacts(paths, "recovered");
+			deleted = true; // Artifacts were recovered even though mission.json was missing
+		}
+	}
 	await reconcileAutoresearchState(cwd, existing, resolvedSessionId, { active: false, phase: "complete" });
 	return {
 		ok: true,
@@ -598,6 +610,29 @@ async function moveIfPresent(from: string, to: string): Promise<void> {
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
+}
+
+/**
+ * Check if any autoresearch mission artifacts remain in the working directory.
+ * Used to detect incomplete retirement when mission.json has already been moved.
+ */
+async function checkHasAnyArtifacts(paths: AutoresearchPaths): Promise<boolean> {
+	for (const name of AUTORESEARCH_MISSION_ARTIFACTS) {
+		try {
+			await fs.stat(path.join(paths.dir, name));
+			return true; // Found at least one artifact
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+	// Also check for the runs subdirectory
+	try {
+		await fs.stat(path.join(paths.dir, AUTORESEARCH_RUNS_SUBDIR));
+		return true; // Found the runs directory
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	return false; // No artifacts found
 }
 
 /* ---------------------------- spec intake ---------------------------- */

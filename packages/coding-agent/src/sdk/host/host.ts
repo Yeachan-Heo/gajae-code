@@ -137,6 +137,12 @@ export const TURN_STREAM_CAPABILITY = "turn_stream";
  */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 /**
+ * Capability required by SDK clients that can answer workflow gates (autoresearch asks,
+ * ralplan approvals, etc.). Passive clients that only poll `turn.result` or similar
+ * query endpoints must not negotiate this capability.
+ */
+export const GATE_RESPONDER_CAPABILITY = "gate_responder_v1";
+/**
  * Opts notification adapters into positioned-only delivery for matching live
  * effects: the host excludes a negotiating connection from the raw native leg
  * of every frame its positioned envelope already reached.
