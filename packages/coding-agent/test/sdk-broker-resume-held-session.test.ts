@@ -24,7 +24,12 @@ import {
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
-import { claimSessionOwner, SessionHeldError, SessionOwnershipTestHooks } from "../src/session/session-ownership";
+import {
+	claimSessionOwner,
+	probeSessionOwner,
+	SessionHeldError,
+	SessionOwnershipTestHooks,
+} from "../src/session/session-ownership";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const holderScript = path.join(import.meta.dir, "session", "session-ownership-holder-child.ts");
@@ -140,6 +145,7 @@ async function brokerWithSavedSession(
 		agentDir,
 		stateRoot,
 		sessionId,
+		sessionPath,
 		broker,
 		launchAttempts: () => launchAttempts,
 		/** The broker clock when the first launch was resolved. */
@@ -151,6 +157,15 @@ async function brokerWithSavedSession(
 				"session.resume",
 				{ cwd: root, stateRoot, sessionId, sessionPath, ...extra },
 				`held-resume-${keys}`,
+			);
+		},
+		/** One delete as ACP sends it, under `key` or a fresh idempotency key. */
+		delete: (key?: string): Promise<BrokerResponse> => {
+			keys += 1;
+			return broker.handleRequest(
+				"session.delete",
+				{ cwd: root, sessionId, sessionPath },
+				key ?? `held-delete-${keys}`,
 			);
 		},
 	};
@@ -312,6 +327,53 @@ describe.if(supported)("broker session.resume of a session another process holds
 		setLifecycleTimingForTest(fixture.broker, undefined);
 		await fixture.resume();
 		expect(fixture.launchAttempts()).toBe(1);
+	});
+});
+
+/** The session directory's entries: equal listings mean the delete detached nothing. */
+async function listing(sessionPath: string): Promise<string[]> {
+	return (await fs.readdir(path.dirname(sessionPath), { recursive: true })).sort();
+}
+
+// The holder has no live index row: a `-p` run, an SDK embedding, a TUI without the SDK. Only its
+// claim tells the broker another process is writing the session.
+describe.if(supported)("broker session.delete of a session another process holds", () => {
+	it("enforce: refuses with live_session before touching the transcript; the holder keeps the session", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		const holder = await holdInAnotherProcess(fixture.sessionId);
+		const bytes = await fs.readFile(fixture.sessionPath);
+		const entries = await listing(fixture.sessionPath);
+
+		expect(await fixture.delete()).toEqual({
+			ok: false,
+			error: {
+				code: "live_session",
+				message: `Can't delete this session: it is open in another terminal (pid ${holder.pid}).`,
+			},
+		});
+		expect(await fs.readFile(fixture.sessionPath)).toEqual(bytes);
+		expect(await listing(fixture.sessionPath)).toEqual(entries);
+		expect(await probeSessionOwner(fixture.sessionId)).toMatchObject({
+			state: "held",
+			self: false,
+			holder: { pid: holder.pid },
+		});
+		await holder.release();
+
+		// Once it lets go, a delete goes ahead, and releases the broker's claim when done.
+		expect(await fixture.delete()).toEqual({ ok: true, result: { sessionId: fixture.sessionId } });
+		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
+		expect(await probeSessionOwner(fixture.sessionId)).toEqual({ state: "free" });
+	});
+
+	it("observe: deletes as before ownership", async () => {
+		SessionOwnershipTestHooks.mode = "observe";
+		const fixture = await brokerWithSavedSession();
+		await holdInAnotherProcess(fixture.sessionId);
+
+		expect(await fixture.delete()).toEqual({ ok: true, result: { sessionId: fixture.sessionId } });
+		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
 	});
 });
 
