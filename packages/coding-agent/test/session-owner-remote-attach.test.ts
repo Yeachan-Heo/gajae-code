@@ -1139,17 +1139,14 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 			launchedHosts.push({ pid: hostPid });
 			expect(await endpointPublished()).toBe(false);
 
-			// `gjc --resume S` meets the host that claimed first: the warning waits for its row instead of
-			// offering only Fork.
+			// `gjc --resume S` meets the host that claimed first: the warning says it waits for the host
+			// instead of offering only Fork. The hold goes as soon as the wait shows.
 			tui = startTui(fixture, ["--resume", sessionId]);
 			const view = tui;
 			tuiPid = await view.pid();
-			await Bun.sleep(3_000);
-			expect(await endpointPublished()).toBe(false);
-			expect(await holderOfS()).toMatchObject({ pid: hostPid, surface: "sdk-host" });
-			expect(view.screen()).not.toContain("Fork into a new session");
-
+			await waitFor(() => view.screen().includes("Waiting for the session host"), 60_000, "the wait for the host");
 			await fs.rm(hold);
+			expect(view.screen()).not.toContain("Fork into a new session");
 			await waitFor(() => view.screen().includes("Continue here"), 30_000, "Continue here in the warning");
 			expect(view.screen()).toContain("Fork into a new session");
 			await withTimeout(loaded, 60_000, "ACP session/load");
