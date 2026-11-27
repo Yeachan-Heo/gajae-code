@@ -43,10 +43,12 @@ import {
 } from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
+	claimSessionOwner,
 	inspectSessionOwners,
 	probeSessionOwner,
 	resetSessionOwnershipForTests,
 	SessionHeldError,
+	type SessionOwnerClaim,
 	type SessionOwnerLockBackend,
 	SessionOwnershipError,
 	SessionOwnershipTestHooks,
@@ -1257,6 +1259,69 @@ describe.if(supported)("turn start re-attempts the current session's claim", () 
 		manager.appendCustomEntry("reclaim-test", { note: "claimed now" });
 		await manager.flush();
 		expect(await fs.readFile(file, "utf8")).toContain("claimed now");
+	});
+
+	it("enforce: a title and a star patch queued together leave memory matching the transcript, refused or with the gate lifting between them", async () => {
+		/** The header as the transcript records it: the header line with its patches applied. */
+		const diskHeader = async (file: string) => {
+			const records = (await fs.readFile(file, "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			const header = { ...records[0] } as { title?: string; starred?: boolean };
+			for (const record of records)
+				if (record.type === "header_patch") Object.assign(header, record.patch as object);
+			return { title: header.title, starred: header.starred === true };
+		};
+		try {
+			for (const lift of [false, true]) {
+				const place = await workspace();
+				const { file, id } = await committed(place);
+				SessionOwnershipTestHooks.mode = "enforce";
+				const stall = { on: true };
+				SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+				const manager = keep(await SessionManager.open(file, place.destination));
+				const { session } = await turnSession(manager);
+				stall.on = false;
+				await holdInAnotherProcess(id);
+				setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+				await expect(session.prompt("refused")).rejects.toBeInstanceOf(SessionHeldError);
+				const before = { title: manager.getSessionName(), starred: manager.isSessionStarred() };
+				expect(await diskHeader(file)).toEqual(before);
+				// With `lift`, the holder exits and this process claims the session between the two patches.
+				let lifted: SessionOwnerClaim | undefined;
+				if (lift) {
+					await stopHolder();
+					const taken = await claimSessionOwner(id, { surface: "terminal" });
+					if (taken.status !== "claimed") throw new Error(`expected a claim, got ${taken.status}`);
+					lifted = taken.claim;
+				}
+				const titleWaits = Promise.withResolvers<void>();
+				SessionManagerTestHooks.beforeTitlePatchPersistence = () => titleWaits.promise;
+				let fences = 0;
+				SessionManagerTestHooks.beforePersistPatchFence = () => {
+					fences += 1;
+					if (fences === 2 && lifted) sessionClaimSetOf(manager).add(lifted);
+				};
+				const title = manager.setSessionName("queued title", "user");
+				await Bun.sleep(10);
+				const star = manager.setSessionStarred(true);
+				await Bun.sleep(10);
+				// Both are applied in memory while the title's persistence waits in the queue.
+				expect([manager.getSessionName(), manager.isSessionStarred()]).toEqual(["queued title", true]);
+				titleWaits.resolve();
+				const [titled, starred] = await Promise.allSettled([title, star]);
+				expect([titled.status, starred.status]).toEqual(["rejected", lift ? "fulfilled" : "rejected"]);
+				const memory = { title: manager.getSessionName(), starred: manager.isSessionStarred() };
+				expect(memory).toEqual({ title: before.title, starred: lift });
+				expect(await diskHeader(file)).toEqual(memory);
+				delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+				delete SessionManagerTestHooks.beforePersistPatchFence;
+			}
+		} finally {
+			delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+			delete SessionManagerTestHooks.beforePersistPatchFence;
+		}
 	});
 
 	it("enforce: Fork from a refused turn continues in a copy and leaves the original to its holder", async () => {

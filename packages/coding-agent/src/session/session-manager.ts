@@ -19402,9 +19402,12 @@ export class SessionManager {
 			await this.#appendHeaderPatch({ starred });
 			return true;
 		} catch (error) {
-			if (previous === undefined) delete header.starred;
-			else header.starred = previous;
-			this.#headerExportRevision++;
+			// Only while the header still holds this patch's value: a later star patch owns it otherwise.
+			if (header.starred === starred) {
+				if (previous === undefined) delete header.starred;
+				else header.starred = previous;
+				this.#headerExportRevision++;
+			}
 			throw error;
 		}
 	}
@@ -20006,7 +20009,11 @@ export class SessionManager {
 		} else this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header) return;
-		const fields = ["cwd", "title", "titleSource", "starred"] as const;
+		// The fields this patch sets, with what they held before; other patches may be applied (and
+		// persisted) around it, so a refusal undoes only these, and only where they still hold its value.
+		const fields = (["cwd", "title", "titleSource", "starred"] as const).filter(
+			field => patch[field] !== undefined && (field !== "starred" || header.starredPatchVersion === 1),
+		);
 		const previous = fields.map(field => [field, Object.hasOwn(header, field), header[field]] as const);
 		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
@@ -20030,6 +20037,7 @@ export class SessionManager {
 			if (isOwnershipWriteRefusal(error) && this.#fileEntries.includes(header)) {
 				const restored = header as unknown as Record<string, unknown>;
 				for (const [field, present, value] of previous) {
+					if (restored[field] !== patch[field]) continue;
 					if (present) restored[field] = value;
 					else delete restored[field];
 				}

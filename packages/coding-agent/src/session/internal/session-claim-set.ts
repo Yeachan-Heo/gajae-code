@@ -546,7 +546,8 @@ export class SessionClaimSet {
 		queueMicrotask(() => {
 			this.#reclaimQueued.delete(sessionId);
 			const backoff = this.#reclaims.get(sessionId);
-			if (this.#closed || this.#pending.has(sessionId) || this.#claims.has(sessionId)) return;
+			if (this.#closed || this.#transitions > 0 || this.#pending.has(sessionId) || this.#claims.has(sessionId))
+				return;
 			if (backoff !== undefined && Date.now() < backoff.notBefore) return;
 			void this.#reclaim(sessionId);
 		});
