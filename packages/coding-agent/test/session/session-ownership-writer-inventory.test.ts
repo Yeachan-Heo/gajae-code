@@ -362,7 +362,7 @@ const DEFERRED_WRITERS: Record<string, string> = {
 	dropSession:
 		"deletes a session under a scoped claim of its id (4d; session-factory-claims.test.ts); a transcript with an unreadable header is deleted without one, and a live holder always has a valid header",
 	deleteSessionVerified:
-		"broker `session.delete` (and gc retirement): ownership is on the step-8 pre-flip list; gc is deferred (§13 L2)",
+		"broker `session.delete` runs under a scoped claim of its id (row 17; sdk-broker-resume-held-session.test.ts); gc retirement and managed-scope cleanup are not covered: gc is deferred (§13 L2)",
 	setSessionStarredForPicker:
 		"picker write of any session, under a scoped claim of its id (4d; session-factory-claims.test.ts)",
 	remapStagedArtifactReferences: "staged child artifact references; staged sessions claim at commit",

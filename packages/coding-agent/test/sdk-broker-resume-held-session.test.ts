@@ -8,9 +8,10 @@
  * owners home, and the launch command is a counter, except where a real session host is launched
  * to show its refused claim crossing the broker.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { FileLockAcquireStatus, FileLockProbeState, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getAgentDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { resetSettingsForTest } from "../src/config/settings";
@@ -24,7 +25,13 @@ import {
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
-import { claimSessionOwner, SessionHeldError, SessionOwnershipTestHooks } from "../src/session/session-ownership";
+import {
+	claimSessionOwner,
+	probeSessionOwner,
+	SessionHeldError,
+	SessionOwnershipTestHooks,
+} from "../src/session/session-ownership";
+import { FileSessionStorage } from "../src/session/session-storage";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const holderScript = path.join(import.meta.dir, "session", "session-ownership-holder-child.ts");
@@ -33,6 +40,7 @@ const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
 	delete SessionOwnershipTestHooks.mode;
+	delete SessionOwnershipTestHooks.lockBackend;
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	for (const child of holders.splice(0)) {
 		child.kill("SIGKILL");
@@ -140,6 +148,7 @@ async function brokerWithSavedSession(
 		agentDir,
 		stateRoot,
 		sessionId,
+		sessionPath,
 		broker,
 		launchAttempts: () => launchAttempts,
 		/** The broker clock when the first launch was resolved. */
@@ -153,6 +162,9 @@ async function brokerWithSavedSession(
 				`held-resume-${keys}`,
 			);
 		},
+		/** One delete as ACP sends it: every retry under the same per-session idempotency key. */
+		delete: (via: Broker = broker, key = `acp:session.delete:${sessionId}`): Promise<BrokerResponse> =>
+			via.handleRequest("session.delete", { cwd: root, sessionId, sessionPath }, key),
 	};
 }
 
@@ -312,6 +324,141 @@ describe.if(supported)("broker session.resume of a session another process holds
 		setLifecycleTimingForTest(fixture.broker, undefined);
 		await fixture.resume();
 		expect(fixture.launchAttempts()).toBe(1);
+	});
+});
+
+/** The session directory's entries: equal listings mean the delete detached nothing. */
+async function listing(sessionPath: string): Promise<string[]> {
+	return (await fs.readdir(path.dirname(sessionPath), { recursive: true })).sort();
+}
+
+// The holder has no live index row: a `-p` run, an SDK embedding, a TUI without the SDK. Only its
+// claim tells the broker another process is writing the session.
+describe.if(supported)("broker session.delete of a session another process holds", () => {
+	it("enforce: refuses with live_session before touching the transcript; the holder keeps the session", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		const holder = await holdInAnotherProcess(fixture.sessionId);
+		const bytes = await fs.readFile(fixture.sessionPath);
+		const entries = await listing(fixture.sessionPath);
+
+		expect(await fixture.delete()).toEqual({
+			ok: false,
+			error: {
+				code: "live_session",
+				message: `Can't delete this session: it is open in another terminal (pid ${holder.pid}).`,
+				holder: { surface: "terminal", pid: holder.pid },
+			},
+		});
+		expect(await fs.readFile(fixture.sessionPath)).toEqual(bytes);
+		expect(await listing(fixture.sessionPath)).toEqual(entries);
+		expect(await probeSessionOwner(fixture.sessionId)).toMatchObject({
+			state: "held",
+			self: false,
+			holder: { pid: holder.pid },
+		});
+		await holder.release();
+
+		// The refusal changed nothing, so it is not stored: once the holder lets go, the same key
+		// deletes, across a broker restart too, and the broker's claim is released when done.
+		await fixture.broker.stop();
+		const restarted = new Broker({ agentDir: fixture.agentDir });
+		await restarted.start();
+		cleanups.push(() => restarted.stop());
+		expect(await fixture.delete(restarted)).toEqual({ ok: true, result: { sessionId: fixture.sessionId } });
+		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
+		expect(await probeSessionOwner(fixture.sessionId)).toEqual({ state: "free" });
+	});
+
+	it("enforce: a claim that cannot be checked refuses with unavailable, and another key deletes once it can", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		const bytes = await fs.readFile(fixture.sessionPath);
+		// Every claim fails as an owners-directory lock error would.
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => ({ status: FileLockAcquireStatus.Failed, code: "EACCES" }),
+			probe: async () => ({ state: FileLockProbeState.Free }),
+		};
+
+		expect(await fixture.delete()).toEqual({
+			ok: false,
+			error: {
+				code: "unavailable",
+				message: "Can't delete this session: gjc could not check whether another process has it open.",
+			},
+		});
+		expect(await fs.readFile(fixture.sessionPath)).toEqual(bytes);
+
+		// The refused key's retained binding does not fence another caller's key (`gjc sdk` picks its own).
+		delete SessionOwnershipTestHooks.lockBackend;
+		expect(await fixture.delete(fixture.broker, "sdk-cli-delete")).toEqual({
+			ok: true,
+			result: { sessionId: fixture.sessionId },
+		});
+		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
+	});
+
+	it("enforce: a pending cleanup that meets a holder keeps its receipt and finishes under the same key", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const fixture = await brokerWithSavedSession();
+		const artifactsDir = fixture.sessionPath.slice(0, -6);
+		await fs.mkdir(artifactsDir);
+		// The first attempt quarantines the artifact root and stops there, as an interrupted cleanup does.
+		let calls = 0;
+		const verifiedDelete = vi
+			.spyOn(FileSessionStorage.prototype, "deleteSessionVerified")
+			.mockImplementation(async target => {
+				calls += 1;
+				if (calls === 1) {
+					if (!target.plannedArtifactsPath || !target.expectedArtifactsIdentity)
+						throw new Error("Expected preauthorized artifact quarantine");
+					await fs.rename(artifactsDir, target.plannedArtifactsPath);
+					const tree = snapshotDirectoryTree(target.plannedArtifactsPath);
+					if (!tree.ok || !tree.snapshot) throw new Error("Expected a quarantined root tree snapshot");
+					return {
+						kind: "cleanup_pending",
+						phase: "artifacts",
+						error: new Error("interrupted cleanup"),
+						artifactsIdentity: target.expectedArtifactsIdentity,
+						artifactsTree: tree.snapshot,
+						detachedArtifactsPath: target.plannedArtifactsPath,
+						transcriptIdentity: target.transcriptIdentity,
+					};
+				}
+				if (calls === 2) {
+					if (!target.detachedArtifactsPath) throw new Error("Expected the quarantined root on retry");
+					await fs.rmdir(target.detachedArtifactsPath);
+					return { kind: "artifacts_removed", phase: "artifacts", transcriptIdentity: target.transcriptIdentity };
+				}
+				await fs.unlink(target.transcriptPath);
+				return { kind: "deleted" };
+			});
+		cleanups.push(async () => verifiedDelete.mockRestore());
+
+		expect(await fixture.delete()).toMatchObject({
+			ok: false,
+			error: { code: "cleanup_pending", cleanup: { phase: "artifacts", sessionId: fixture.sessionId } },
+		});
+		const holder = await holdInAnotherProcess(fixture.sessionId);
+		const bytes = await fs.readFile(fixture.sessionPath);
+
+		expect(await fixture.delete()).toMatchObject({ ok: false, error: { code: "live_session" } });
+		expect(calls).toBe(1);
+		expect(await fs.readFile(fixture.sessionPath)).toEqual(bytes);
+
+		await holder.release();
+		expect(await fixture.delete()).toEqual({ ok: true, result: { sessionId: fixture.sessionId } });
+		expect(calls).toBe(3);
+		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
+	});
+
+	it("observe: deletes as before ownership", async () => {
+		SessionOwnershipTestHooks.mode = "observe";
+		const fixture = await brokerWithSavedSession();
+		await holdInAnotherProcess(fixture.sessionId);
+
+		expect(await fixture.delete()).toEqual({ ok: true, result: { sessionId: fixture.sessionId } });
+		await expect(fs.stat(fixture.sessionPath)).rejects.toThrow();
 	});
 });
 
