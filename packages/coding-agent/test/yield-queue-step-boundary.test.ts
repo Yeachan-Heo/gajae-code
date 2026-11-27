@@ -8,6 +8,12 @@ import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import { AuthStorage } from "../src/session/auth-storage";
 import { FOLD_WAKE_MERGE_WINDOW_MS } from "../src/session/fold-coordinator";
 import { SessionManager } from "../src/session/session-manager";
+import {
+	classifyOwnedEnvelope,
+	lookupOwnedRegistration,
+	resetTerminalAbortRegistriesForTests,
+	type TurnRegistrationKey,
+} from "../src/session/terminal-abort";
 
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -20,6 +26,26 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_00
 
 function bashCall(command: string): MockResponse {
 	return { content: [{ type: "toolCall", name: "bash", arguments: { command, timeout: 10 } }] };
+}
+
+/** A real background bash job, so the tool call's lineage registers the job as owned. */
+function backgroundBashCall(command: string): MockResponse {
+	return { content: [{ type: "toolCall", name: "bash", arguments: { command, timeout: 30, async: true } }] };
+}
+
+/**
+ * Shell loop that finishes (printing `marker`) only once `gate` exists. The
+ * marker is quoted apart in the command so the tool call's own arguments in the
+ * model context never contain it; only the job's output does.
+ */
+function gatedJob(gate: string, marker: string): string {
+	const split = marker.lastIndexOf("_");
+	return `while [ ! -f "${gate}" ]; do sleep 0.05; done; echo ${marker.slice(0, split)}"${marker.slice(split)}"`;
+}
+
+/** Foreground step that releases the gated job and outlasts its completion delivery. */
+function releaseGate(gate: string): string {
+	return `touch "${gate}"; sleep 1.5`;
 }
 
 /**
@@ -40,6 +66,7 @@ describe("yield queue step-boundary delivery", () => {
 		authStorage = undefined;
 		tempDir = undefined;
 		AsyncJobManager.resetForTests();
+		resetTerminalAbortRegistriesForTests();
 	});
 
 	async function createSession(handler: (call: number) => Promise<MockResponse>): Promise<MockModel> {
@@ -216,4 +243,117 @@ describe("yield queue step-boundary delivery", () => {
 		expect(asyncResultMessages()).toHaveLength(0);
 		expect(session().yieldQueue.has()).toBe(false);
 	}, 20_000);
+
+	function ownedRegistrationOf(jobId: string, generation: string): TurnRegistrationKey | undefined {
+		return lookupOwnedRegistration(jobId, generation, AsyncJobManager.endpointIdOf(manager()));
+	}
+
+	function onlyJob() {
+		const jobs = manager().getAllJobs();
+		if (jobs.length !== 1) throw new Error(`expected one background job, found ${jobs.length}`);
+		return jobs[0]!;
+	}
+
+	test("a background bash job launched by the turn rides the next step boundary and settles its owned registration", async () => {
+		let gate = "";
+		let registeredDuringTurn: TurnRegistrationKey | undefined;
+		let backgroundJob: { id: string; generation: string } | undefined;
+		const mock = await createSession(async call => {
+			if (call === 1) return backgroundBashCall(gatedJob(gate, "BG_OWNED_ALPHA"));
+			if (call === 2) {
+				backgroundJob = onlyJob();
+				registeredDuringTurn = ownedRegistrationOf(backgroundJob.id, backgroundJob.generation);
+				return bashCall(releaseGate(gate));
+			}
+			return { content: [`answer ${call}`] };
+		});
+		gate = `${tempDir!.path()}/gate-alpha`;
+
+		await session().prompt("start background work, then keep working");
+		await settle();
+
+		// The production path attached an ownership envelope that classifies ordinary.
+		expect(registeredDuringTurn).toBeDefined();
+		const delivered = asyncResultMessages();
+		expect(delivered).toHaveLength(1);
+		expect((delivered[0] as { details?: { ownedCompletions?: unknown[] } }).details?.ownedCompletions).toHaveLength(
+			1,
+		);
+		// Delivered in the step after the job completed, with no trailing iteration.
+		expect(contextOf(mock, 1)).not.toContain("BG_OWNED_ALPHA");
+		expect(contextOf(mock, 2)).toContain("BG_OWNED_ALPHA");
+		expect(mock.calls).toHaveLength(3);
+		// Boundary delivery settled the terminal job's owned registration.
+		if (!backgroundJob) throw new Error("expected the background job");
+		expect(ownedRegistrationOf(backgroundJob.id, backgroundJob.generation)).toBeUndefined();
+	}, 20_000);
+
+	test("a completion owned by a terminal-aborted turn (fresh) does not ride a later turn's step boundary", async () => {
+		let gate = "";
+		const mock = await createSession(async call => {
+			if (call === 1) return backgroundBashCall(gatedJob(gate, "BG_FRESH_BETA"));
+			if (call === 3) return bashCall(releaseGate(gate));
+			return { content: [`answer ${call}`] };
+		});
+		gate = `${tempDir!.path()}/gate-beta`;
+
+		await session().prompt("start background work");
+		const job = onlyJob();
+		await session().abortPromptAndWait(session().agent.activeResourceRunId ?? job.id, {
+			graceMs: 50,
+			terminal: { scope: "turn" },
+		});
+		const registration = ownedRegistrationOf(job.id, job.generation);
+		if (!registration) throw new Error("expected the left-running job to stay registered");
+		expect(
+			classifyOwnedEnvelope({
+				lineageIdHash: registration.lineageIdHash,
+				promptAttemptEpoch: registration.promptAttemptEpoch,
+				registration,
+			}),
+		).toBe("fresh");
+
+		await session().prompt("keep working in a new turn");
+		await waitFor(() => asyncResultMessages().length > 0, "fresh resume delivery", 10_000);
+		await session().waitForIdle();
+		await settle();
+
+		// Call 4 follows the tool step during which the job completed: the fresh
+		// resume must not ride it, and arrives through the follow-up path instead.
+		expect(contextOf(mock, 3)).not.toContain("BG_FRESH_BETA");
+		expect(mock.calls.length).toBeGreaterThan(4);
+		expect(contextOf(mock, mock.calls.length - 1)).toContain("BG_FRESH_BETA");
+		expect(asyncResultMessages()).toHaveLength(1);
+	}, 30_000);
+
+	test("a folded job's receipt (production fold disposition) does not ride a later turn's step boundary", async () => {
+		let gate = "";
+		const mock = await createSession(async call => {
+			if (call === 1) return bashCall(gatedJob(gate, "FOLD_RECEIPT_GAMMA"));
+			if (call === 2) return bashCall(releaseGate(gate));
+			return { content: [`answer ${call}`] };
+		});
+		gate = `${tempDir!.path()}/gate-gamma`;
+
+		const folded = session().prompt("run a long foreground command");
+		await waitFor(() => session().hasForegroundBashBackgroundRequestHandler(), "foreground bash");
+		expect(await session().requestForegroundBashBackground()).toBe(true);
+		await folded;
+		expect(mock.calls).toHaveLength(1);
+
+		await session().prompt("keep working in a new turn");
+		await waitFor(
+			() => asyncResultMessages().some(message => JSON.stringify(message).includes("FOLD_RECEIPT_GAMMA")),
+			"fold receipt delivery",
+			10_000,
+		);
+		await session().waitForIdle();
+		await settle();
+
+		// Call 3 follows the tool step during which the folded job completed.
+		expect(contextOf(mock, 2)).not.toContain("FOLD_RECEIPT_GAMMA");
+		expect(mock.calls.length).toBeGreaterThan(3);
+		expect(contextOf(mock, mock.calls.length - 1)).toContain("FOLD_RECEIPT_GAMMA");
+		expect(asyncResultMessages()).toHaveLength(1);
+	}, 30_000);
 });

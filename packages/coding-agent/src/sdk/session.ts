@@ -206,6 +206,7 @@ import {
 	startupAuthConfigError,
 } from "../session/startup-auth-config";
 import {
+	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	type OwnedCompletionEnvelope,
@@ -6131,11 +6132,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
-				// Ordinary completions reach a running turn at its next tool step.
-				// Owned completions need the resume classification and fresh lineage of
-				// the follow-up path, and fold receipts belong to the wake turn, so
-				// both stay on the before-yield/idle path.
-				deliverAtStepBoundary: entry => entry.ownedCompletion === undefined && entry.foldReceipt !== true,
+				// Completions that classify "ordinary" reach a running turn at its next
+				// tool step. That includes jobs launched by a tool call of a turn that
+				// was never terminal-aborted: they carry an ownership envelope whose
+				// terminal scope does not exist. A "fresh" envelope needs the follow-up
+				// path's resume admission (new lineage), a "drop" envelope must never
+				// reach the agent, and a fold receipt belongs to the wake turn, so
+				// those stay on the before-yield/idle path. The classification is
+				// read in the same synchronous tick in which the loop commits the
+				// built message, so it cannot change before delivery.
+				deliverAtStepBoundary: entry =>
+					entry.foldReceipt !== true &&
+					(entry.ownedCompletion === undefined || classifyOwnedEnvelope(entry.ownedCompletion) === "ordinary"),
 				build: entries => {
 					try {
 						return buildAsyncResultBatchMessage(entries);
