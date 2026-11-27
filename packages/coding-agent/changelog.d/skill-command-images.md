@@ -6,3 +6,5 @@
 - A message restored from the queue no longer silently picks up a newer pending image through its `[image N]` placeholder; the pending attachments are dropped with a warning so the image is attached again.
 - Alt+Enter keeps a newer draft or image typed while an input extension is running, and applies input extensions before queueing during compaction.
 - An input extension that filters or redacts an image in place (mutating the event array and returning it) now also applies to `/skill:<name> ... [image N]` messages, so the original image no longer reaches the model.
+- A submission that names an `[image N]` with no attached image is now refused before the shell (`!`) and eval (`$`) handlers as well, so a literal `[image N]` in a shell or eval command with nothing attached shows the missing-image warning instead of running.
+- Pressing Enter while an Alt+Enter follow-up is still waiting on input extensions no longer sends the same draft a second time, and pasted text with many `source="..."` annotations is classified in linear time.

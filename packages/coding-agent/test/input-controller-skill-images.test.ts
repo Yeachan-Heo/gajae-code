@@ -9,10 +9,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { CustomEditor } from "@gajae-code/coding-agent/modes/components/custom-editor";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 
@@ -251,9 +254,6 @@ describe("InputController skill command images", () => {
 	});
 
 	it("applies an image-only extension replacement through the real runner", async () => {
-		const { ExtensionRunner } = await import("@gajae-code/coding-agent/extensibility/extensions/runner");
-		const { ExtensionRuntime } = await import("@gajae-code/coding-agent/extensibility/extensions/loader");
-		const { SessionManager } = await import("@gajae-code/coding-agent/session/session-manager");
 		const redacted = { ...IMAGE, data: "REDACTED" };
 		const extension = {
 			path: "image-only-extension",
@@ -635,5 +635,105 @@ describe("InputController skill command images", () => {
 		expect(sent).not.toContainEqual(IMAGE);
 		expect(stub.showWarning).toHaveBeenCalledTimes(1);
 		expect(stub.customMessages).toHaveLength(0);
+	});
+
+	it("does not send a second copy when Enter submits the draft an Alt+Enter is still preparing", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		stub.ctx.editor.setText("send me once");
+		const followUp = controller.handleFollowUp();
+		// Enter: the editor empties its buffer, then calls onSubmit with the same text.
+		stub.ctx.editor.setText("");
+		await stub.editor.onSubmit?.("send me once");
+		release.resolve();
+		await followUp;
+
+		expect(stub.prompts).toHaveLength(1);
+		expect(extensionRunner.emitInput).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not dispatch a skill twice when Enter submits the draft Alt+Enter is preparing", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [IMAGE], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		stub.ctx.editor.setText("/skill:test-skill look at [image 1]");
+		const followUp = controller.handleFollowUp();
+		stub.ctx.editor.setText("");
+		await stub.editor.onSubmit?.("/skill:test-skill look at [image 1]");
+		release.resolve();
+		await followUp;
+
+		expect(stub.customMessages).toHaveLength(1);
+	});
+
+	it("still submits a different draft typed while Alt+Enter is preparing the first", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async (text: string) => {
+				if (text === "first") await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({
+			skillCommands,
+			pendingImages: [],
+			streaming: true,
+			realEditor: true,
+			extensionRunner,
+		});
+		const controller = new InputController(stub.ctx);
+		controller.setupEditorSubmitHandler();
+		stub.ctx.editor.setText("first");
+		const followUp = controller.handleFollowUp();
+		stub.ctx.editor.setText("");
+		await stub.editor.onSubmit?.("second");
+		release.resolve();
+		await followUp;
+
+		// The claim covers only the draft being prepared; a different draft is not blocked by it.
+		expect(stub.prompts.map(prompt => prompt.text).sort()).toEqual(["first", "second"]);
+	});
+
+	it("rejects a second Alt+Enter while the first is still waiting on extensions", async () => {
+		const release = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: (event: string) => event === "input",
+			getShortcuts: () => [],
+			emitInput: vi.fn(async () => {
+				await release.promise;
+				return {};
+			}),
+		};
+		const stub = createContext({ skillCommands, pendingImages: [], realEditor: true, extensionRunner });
+		const controller = new InputController(stub.ctx);
+		stub.ctx.editor.setText("queued once");
+		const first = controller.handleFollowUp();
+		const second = controller.handleFollowUp();
+		release.resolve();
+		await Promise.all([first, second]);
+
+		expect(extensionRunner.emitInput).toHaveBeenCalledTimes(1);
+		expect(stub.prompts).toHaveLength(1);
 	});
 });

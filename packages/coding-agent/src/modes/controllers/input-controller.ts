@@ -109,6 +109,16 @@ function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
 
+/** What the input-extension pass decided about a submission. */
+type InputExtensionResult =
+	| { handled: true; handledText: string }
+	| {
+			handled: false;
+			text: string;
+			inputImages: InteractiveModeContext["pendingImages"] | undefined;
+			effectiveImages: InteractiveModeContext["pendingImages"];
+	  };
+
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
@@ -369,6 +379,12 @@ export class InputController {
 	#globalInterruptUnsubscribe: (() => void) | undefined;
 	#oauthCopyUnsubscribe: (() => void) | undefined;
 	#draftClearEscapeText: string | undefined;
+	/**
+	 * The draft an Alt+Enter submission is awaiting input extensions for. The draft stays in the
+	 * editor during that wait, so Enter reaches `submitText` with the same text; the submission that
+	 * holds the claim is the only one allowed to send it.
+	 */
+	#followUpClaim: { draft: string; pendingImages: InteractiveModeContext["pendingImages"] } | undefined;
 
 	#resetEscapeGestures(): void {
 		this.ctx.lastEscapeTime = 0;
@@ -1056,6 +1072,16 @@ export class InputController {
 		text = text.trim();
 		// Any submission supersedes a pending or shown next-prompt suggestion.
 		if (text) this.ctx.promptSuggestion?.clear();
+		const claim = this.#followUpClaim;
+		if (claim && text === claim.draft && this.ctx.pendingImages === claim.pendingImages) {
+			// The follow-up submission still owns this draft. The editor emptied its buffer before
+			// calling us, so put the text back for the user and let the claim holder send it once.
+			if (this.#canModifyComposer(composer) && this.ctx.editor.getText().trim().length === 0) {
+				this.ctx.editor.setText(text);
+			}
+			this.ctx.showStatus("The queued follow-up is still being prepared.");
+			return;
+		}
 		const submittedBashMode = this.ctx.isBashMode;
 		const submittedBashNoContext = this.ctx.isBashNoContext;
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
@@ -1863,7 +1889,18 @@ export class InputController {
 		// Same input-extension pass Enter runs, so Alt+Enter cannot send an image an extension
 		// would have replaced or refused, and a compaction-queued message is the transformed text.
 		const pendingImages = this.ctx.pendingImages;
-		const extensionResult = await this.#applyInputExtensions(draft, pendingImages);
+		if (this.#followUpClaim) {
+			this.ctx.showStatus("A queued follow-up is already being prepared.");
+			return;
+		}
+		const claim = { draft, pendingImages };
+		this.#followUpClaim = claim;
+		let extensionResult: InputExtensionResult;
+		try {
+			extensionResult = await this.#applyInputExtensions(draft, pendingImages);
+		} finally {
+			if (this.#followUpClaim === claim) this.#followUpClaim = undefined;
+		}
 		if (extensionResult.handled) {
 			if (extensionResult.handledText) {
 				this.ctx.addMessageToChat({
@@ -2294,15 +2331,7 @@ export class InputController {
 	async #applyInputExtensions(
 		text: string,
 		pendingImages: InteractiveModeContext["pendingImages"],
-	): Promise<
-		| { handled: true; handledText: string }
-		| {
-				handled: false;
-				text: string;
-				inputImages: InteractiveModeContext["pendingImages"] | undefined;
-				effectiveImages: InteractiveModeContext["pendingImages"];
-		  }
-	> {
+	): Promise<InputExtensionResult> {
 		const runner = this.ctx.session.extensionRunner;
 		let inputImages = this.#visiblePendingImagesForText(text, pendingImages);
 		// Only the images the submitted text selected qualify, so an extension that rewrites the
