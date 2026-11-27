@@ -864,6 +864,26 @@ export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined)
 	return subagent ? `a subagent of ${noun} (pid ${holder.pid})` : `${noun} (pid ${holder.pid})`;
 }
 
+/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`; `undefined` if unverified. */
+function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string | undefined {
+	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface)) return undefined;
+	if (holder.host === undefined) return `${holder.surface}, pid ${holder.pid}`;
+	return SAFE_HOST.test(holder.host) ? `gjc on ${holder.host}, pid ${holder.pid}` : undefined;
+}
+
+/**
+ * The CLI command that continues a held session in a copy (design §3.3), for the CLI's refusals
+ * only: the SDK's `operatorMessage` names no command. `undefined` for an id that is not a safe file
+ * name, since any other id may hold any text.
+ */
+export function sessionHeldForkCommand(
+	sessionId: string,
+	options: { readonly print?: boolean } = {},
+): string | undefined {
+	if (!SAFE_ID.test(sessionId)) return undefined;
+	return options.print ? `gjc -p --fork ${sessionId} "<message>"` : `gjc --fork ${sessionId}`;
+}
+
 /**
  * A session another live process holds for writing. `message` is the stable machine code; the
  * fixed, path-free `operatorMessage` is what a person sees.
@@ -881,6 +901,8 @@ export class SessionHeldError extends Error {
 		this.holder = holder;
 		// Only a safe id is quoted, shortened as the CLI shows it; any other id may hold any text.
 		const subject = SAFE_ID.test(sessionId) ? `Session ${sessionId.slice(0, 8)}` : "This session";
-		this.operatorMessage = `${subject} is open for writing in ${sessionOwnerHolderPhrase(holder)}. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
+		const label = sessionOwnerHolderLabel(holder);
+		const where = label ? `another process (${label})` : "another gjc process";
+		this.operatorMessage = `${subject} is open for writing in ${where}. Only one process can write a session at a time.`;
 	}
 }

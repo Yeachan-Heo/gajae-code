@@ -584,13 +584,14 @@ describe("SessionHeldError", () => {
 		expect(error.message).toBe("session_held");
 		expect(error.code).toBe("session_held");
 		expect(error.holder).toEqual({ surface: "terminal", pid: 4242 });
+		// The SDK wording (design §3.3) names no CLI command: an embedder has none to run.
 		expect(error.operatorMessage).toBe(
-			"Session 3f9a1c2e is open for writing in another terminal (pid 4242). Only one process can write a session at a time. Close it there, or fork it to continue in a copy.",
+			"Session 3f9a1c2e is open for writing in another process (terminal, pid 4242). Only one process can write a session at a time.",
 		);
 
 		const unsafe = new SessionHeldError(`${home}/session.jsonl`);
 		expect(unsafe.operatorMessage).toBe(
-			"This session is open for writing in another gjc process. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.",
+			"This session is open for writing in another gjc process. Only one process can write a session at a time.",
 		);
 		expect(unsafe.operatorMessage).not.toContain(home);
 	});

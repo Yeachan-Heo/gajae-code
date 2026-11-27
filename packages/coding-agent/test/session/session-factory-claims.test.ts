@@ -10,9 +10,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
+import { getAgentDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import type { Args } from "../../src/cli/args";
-import { Settings } from "../../src/config/settings";
+import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { createSessionManager, operatorFacingSessionOpenMessage } from "../../src/main";
 import { createAgentSession, probeSessionOwners } from "../../src/sdk";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
@@ -29,6 +30,7 @@ import {
 	sessionOwnerKey,
 	sessionOwnershipCounters,
 } from "../../src/session/session-ownership";
+import { liveSessionOwnershipMode, sessionOwnershipMode } from "../../src/session/session-ownership-mode";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
@@ -111,6 +113,14 @@ function failingFor(...failedIds: string[]): SessionOwnerLockBackend {
 				: tryAcquireFileLock(sidecar, timeoutMs),
 		probe: (sidecar, timeoutMs) =>
 			failed(sidecar) ? Promise.resolve({ state: FileLockProbeState.Free }) : probeFileLock(sidecar, timeoutMs),
+	};
+}
+
+/** Every claim fails as an owners-directory lock error would; probes see nothing held. */
+function failingForEveryId(): SessionOwnerLockBackend {
+	return {
+		tryAcquire: async () => ({ status: FileLockAcquireStatus.Failed, code: "EACCES" }),
+		probe: async () => ({ state: FileLockProbeState.Free }),
 	};
 }
 
@@ -605,6 +615,93 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		} finally {
 			delete SessionManagerTestHooks.eagerHydrationMaxBytesOverride;
 		}
+	});
+
+	it("the kill switch reads the operator's config.yml: off or observe there drops the next refusal; a silent or unreadable one keeps it", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		await holdInAnotherProcess(id);
+		// No test mode: both reads are real. The factory read enforce; only the reread file may lower it.
+		delete SessionOwnershipTestHooks.mode;
+		const openUnderEnforce = () =>
+			SessionManager.open(file, place.destination, undefined, undefined, undefined, {
+				surface: "terminal",
+				mode: "enforce",
+			});
+		const decisions = async (configPath: string) => {
+			const seen: string[] = [];
+			for (const mode of ["off", "observe", undefined, "unreadable"] as const) {
+				await fs.rm(configPath, { recursive: true, force: true });
+				if (mode === "unreadable") await fs.mkdir(configPath);
+				else if (mode !== undefined) await Bun.write(configPath, `session:\n  ownership:\n    mode: ${mode}\n`);
+				try {
+					await (await openUnderEnforce()).close();
+					seen.push(`${mode}: opened`);
+				} catch (error) {
+					seen.push(`${mode}: ${(error as { code?: string }).code}`);
+				}
+			}
+			await fs.rm(configPath, { recursive: true, force: true });
+			return seen;
+		};
+		const expected = ["off: opened", "observe: opened", "undefined: session_held", "unreadable: session_held"];
+		// Without process settings (an embedding): the process agent directory's file.
+		const processConfig = path.join(getAgentDir(), "config.yml");
+		if (!getAgentDir().includes("gjc-test-agent-")) throw new Error("the test preload isolates the agent directory");
+		if (await Bun.file(processConfig).exists())
+			throw new Error("expected no config.yml in the isolated agent directory");
+		// A refusal's reread never changes the mode later factories read once.
+		resetSettingsForTest();
+		expect(sessionOwnershipMode()).toBe("observe");
+		await Bun.write(processConfig, "session:\n  ownership:\n    mode: off\n");
+		expect(liveSessionOwnershipMode()).toBe("off");
+		expect(sessionOwnershipMode()).toBe("observe");
+		expect(await decisions(processConfig)).toEqual(expected);
+		// With process settings (the TUI, -p): their agent directory's file, read again past their cache.
+		const agentDir = path.join(place.root, "agent");
+		await Settings.init({ cwd: place.cwd, agentDir });
+		try {
+			expect(await decisions(path.join(agentDir, "config.yml"))).toEqual(expected);
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+
+	it("createAgentSession refuses the session it creates when its claim fails, closes it, and keeps no claim", async () => {
+		const place = await workspace();
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = failingForEveryId();
+		const close = vi.spyOn(SessionManager.prototype, "close");
+		await expect(
+			createAgentSession({
+				cwd: place.cwd,
+				agentDir: path.join(place.root, "agent"),
+				settings: Settings.isolated(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["__none__"],
+			}),
+		).rejects.toBeInstanceOf(SessionOwnershipError);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect((await inspectSessionOwners()).held).toEqual([]);
+	});
+
+	it("a refused missing-path open leaves no file, and no session directory it created", async () => {
+		const place = await workspace();
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = failingForEveryId();
+		const directory = path.join(place.root, "explicit");
+		await expect(
+			SessionManager.open(path.join(directory, "new.jsonl"), SessionManager.explicitDestination(directory)),
+		).rejects.toBeInstanceOf(SessionOwnershipError);
+		expect(await Bun.file(directory).exists()).toBe(false);
+		expect(await fs.stat(directory).catch(() => "absent")).toBe("absent");
 	});
 
 	it("createAgentSession's owner option names the holder other processes see", async () => {

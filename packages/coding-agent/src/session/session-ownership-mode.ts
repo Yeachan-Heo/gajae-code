@@ -190,9 +190,9 @@ function readSettingSource(options?: { readonly fresh?: boolean }): unknown {
  * The mode as the operator has it now, for a refusal decision (5a). A refusal needs `enforce` both
  * here and in the mode its factory read, so this can only lower a decision: `gjc config set
  * session.ownership.mode off` reaches a running process's next refusal. It rereads the operator's
- * config file. Only an explicit lower value lowers it: a file that names no mode (or one this
- * process's profile does not use, for settings scoped to another agent directory) leaves the
- * factory's decision as it was, and so does the environment override unless it lowers.
+ * config file. Only an explicit lower value lowers it: a file that names no mode, or cannot be read
+ * (the source then reports no value), leaves the factory's decision as it was, and so does the
+ * environment override unless it lowers.
  */
 export function liveSessionOwnershipMode(): SessionOwnershipMode {
 	const forced = sessionOwnershipTestHookSlot().mode;

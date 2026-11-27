@@ -342,7 +342,7 @@ try {
 }
 ```
 
-- `owner: { surface }` names this process to others while it holds the session `createAgentSession` creates (default `sdk`). For a supplied manager, pass the same `{ surface }` as the factory's last argument.
+- `owner: { surface }` names this process to others while it holds the session `createAgentSession` creates (default `sdk`). For a supplied manager, pass the same `{ surface }` as the factory's last argument; `{ surface }` is the only supported form of that argument.
 - `probeSessionOwners` never takes a claim and never creates files. A held session it reports as `self: true` is one this process holds; opening it again shares that claim.
 - Remote control does not open a second writer: ACP `session/load` and `gjc sdk session send` attach to the holder's endpoint.
 

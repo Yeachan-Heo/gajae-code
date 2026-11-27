@@ -110,6 +110,7 @@ import {
 	SessionHeldError,
 	type SessionOwnerSurface,
 	SessionOwnershipError,
+	sessionHeldForkCommand,
 	sessionOwnerHolderPhrase,
 	sessionOwnerSurface,
 	setSessionOwnerSurface,
@@ -975,17 +976,15 @@ export class SessionNotFoundError extends Error {
 	}
 }
 
-const SAFE_SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
-
 /**
  * The CLI refusal for a session another process holds (design §3.3), with the command that
  * continues it in a copy. Only a safe id is printed; any other id may hold any text.
  */
 function sessionHeldCliMessage(error: SessionHeldError, print: boolean): string {
 	const holder = sessionOwnerHolderPhrase(error.holder);
-	if (!SAFE_SESSION_ID.test(error.sessionId))
+	const fork = sessionHeldForkCommand(error.sessionId, { print });
+	if (!fork)
 		return `error: this session is open for writing in ${holder}.\nOnly one process can write a session at a time. Close it there, or fork it to continue in a copy.`;
-	const fork = print ? `gjc -p --fork ${error.sessionId} "<message>"` : `gjc --fork ${error.sessionId}`;
 	return `error: session ${error.sessionId.slice(0, 8)} is open for writing in ${holder}.\nOnly one process can write a session at a time. Close it there, or continue in a copy:\n  ${fork}`;
 }
 
