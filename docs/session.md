@@ -599,7 +599,15 @@ The global setting `session.ownership.mode` decides what claims do:
 | --- | --- |
 | `off` | No claims and no lock calls. The process is invisible to other processes' claims. |
 | `observe` (default) | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. |
-| `enforce` | Reserved for refusals. It currently behaves exactly like `observe`: nothing refuses yet. |
+| `enforce` | Claims as `observe` does, and a session another process holds is not opened for writing (below). Not the default yet. |
+
+Under `enforce`, a session open for writing in another process is refused before anything is written to it:
+
+- `gjc -p --resume <id>` and `gjc -p --continue` (when the newest session is held) print the holder and a `gjc -p --fork <id>` command on stderr and exit non-zero, before any model call. An interactive `gjc --resume <id>` and the `--resume` picker refuse the same way for now; `/resume` inside the TUI shows the refusal as an error.
+- `gjc --continue` in the TUI, and `autoResume` (in the TUI and with `-p`), start a new session instead and say why: `Your most recent session is open in another terminal (pid N), so a new session was started.` A held candidate that could not have been continued anyway is skipped, as before.
+- The SDK session factories (`SessionManager.open`, `openExistingStrict`, `continueRecent`) and `createAgentSession` throw `SessionHeldError`, with `holder` naming the process (its surface and pid). A fork's source is never refused: `gjc --fork` reads a held source where it is.
+- An owners directory that fails its safety checks refuses the session too (`SessionOwnershipError`), as the append lock does.
+- Remote clients are unaffected: ACP `session/load` and `gjc sdk` attach to the holder's endpoint. Only when no endpoint is live does the broker launch a host, and that host's open is refused; the broker reports it as `spawn_failed`.
 
 A claim that cannot lock fails open: the session opens without a claim, the attempt counts `fail_open`, and the writes that follow are not counted as `session_write_without_claim`. On Windows there is no native lock yet, so every claim fails open and `gjc session owners` is always empty. One lock timeout (a stalled network filesystem, for example) turns claims off for the rest of that process, so later opens never wait for the lock again.
 
@@ -607,7 +615,7 @@ Operator notes:
 
 - **Kill switch:** `gjc config set session.ownership.mode off` writes the global config (`config.yml` in the agent directory). The setting is global-only: a project `.gjc/settings.json` or `config.yml` cannot change it, and SDK `config.patch` refuses it.
 - **Environment override:** `GJC_SESSION_OWNERSHIP=off` (or `observe`) can only lower the configured mode, never raise it. A value that comes from a project `.env` is ignored. A value set in your shell applies only to processes started from that shell. Hosts launched by the SDK broker (ACP sessions, `gjc sdk`, Telegram and other daemon sessions) take the broker's environment, not the shell of the client that asked for them, so use `config.yml` to change their mode.
-- **When a change applies:** restart running gjc processes after changing the mode; processes started afterwards use the new mode. A running TUI keeps claiming under the mode it started with, for `/new`, `/resume` and `/fork` too, even on Linux, where it hot-reloads other `config.yml` settings. An SDK embedding without process settings reads `config.yml` once.
+- **When a change applies:** restart running gjc processes after changing the mode; processes started afterwards use the new mode. A running TUI keeps claiming under the mode it started with, for `/new`, `/resume` and `/fork` too, even on Linux, where it hot-reloads other `config.yml` settings. An SDK embedding without process settings reads `config.yml` once. Refusals are the exception: each refusal reads `config.yml` again, and refuses only if both that read and the mode the session was opened under say `enforce`, so setting `off` (or `observe`) stops the next refusal in a running process at once.
 - **Where to look:** `gjc session owners` (or `--json`) lists the sessions held right now and their holder's surface and pid. `gjc stats --summary` and `gjc stats --json` show the ownership counters (`claim_taken`, `claim_released`, `claim_conflict`, `held_at_exit`, `session_write_without_claim`, and others), per gjc version. A process adds its counts only when it exits cleanly, so the totals are a lower bound and a long-running process reports when it stops.
 
 ## Related but Distinct: Prompt History Storage

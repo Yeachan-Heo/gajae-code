@@ -5,8 +5,9 @@
  * (the native `FileLock`), so it ends when its holder exits, however it exits. A holder record
  * beside it names the holder for warnings; the lock is the truth and the record only a label.
  *
- * The session factories claim through the claim set (`internal/session-claim-set.ts`); nothing
- * refuses yet, so a held session only logs and counts until enforcement lands.
+ * The session factories claim through the claim set (`internal/session-claim-set.ts`). A held
+ * session is logged and counted; only under mode `enforce` does a factory refuse it, with
+ * {@link SessionHeldError} (`claimRefusal`).
  */
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";

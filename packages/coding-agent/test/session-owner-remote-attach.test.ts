@@ -4,8 +4,8 @@
  * to its in-process SDK endpoint through the broker. They never open a second writer.
  *
  * Every process here is real: an interactive TUI in a PTY owns session S under ownership mode
- * `observe`; `gjc acp` runs `initialize`, `session/load` S and a prompt; `gjc sdk session send S
- * --wait` sends another; a broker `session.resume` of S must reuse the TUI's endpoint. `gjc session
+ * `observe`, and again under `enforce`; `gjc acp` runs `initialize`, `session/load` S and a
+ * prompt; `gjc sdk session send S --wait` sends another; a broker `session.resume` of S must reuse the TUI's endpoint. `gjc session
  * owners --json` probes the claim with the same HOME, and the
  * per-process ownership counters are read from the stats database after every process exited
  * cleanly, because a process only reports them at exit.
@@ -335,8 +335,12 @@ function subprocessInput(proc: Bun.Subprocess<"pipe", "pipe", "pipe">): Writable
 }
 
 // The harness drives a real PTY and POSIX process groups; Windows keeps its own suites.
+// Under `enforce` too: a refusal never blocks remote control, because attach and reuse never claim.
 describe.skipIf(process.platform === "win32")("remote clients attach to the TUI that owns the session", () => {
-	it("ACP session/load and an SDK send run in the owner's transcript and never claim", async () => {
+	it.each([
+		"observe",
+		"enforce",
+	] as const)("%s: ACP session/load and an SDK send run in the owner's transcript and never claim", async mode => {
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-attach-")));
 		const env = buildChildEnv(root);
 		const agentDir = env.GJC_CODING_AGENT_DIR!;
@@ -382,7 +386,7 @@ describe.skipIf(process.platform === "win32")("remote clients attach to the TUI 
 `,
 		);
 		// The operator's global config (ownership settings are global-only).
-		await Bun.write(path.join(agentDir, "config.yml"), "session:\n  ownership:\n    mode: observe\n");
+		await Bun.write(path.join(agentDir, "config.yml"), `session:\n  ownership:\n    mode: ${mode}\n`);
 
 		const started = await withFixtureBrokerEnvironment(() =>
 			startFixtureBrokerWithLeaseForTest({ agentDir, env }),

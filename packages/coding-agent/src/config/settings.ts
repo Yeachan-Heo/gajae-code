@@ -7236,8 +7236,8 @@ let globalInitOptions: SettingsOptions | null = null;
  */
 const operatorOwnershipModes = new Map<string, unknown>();
 const operatorOwnershipUnreadableWarned = new Set<string>();
-function operatorOwnershipMode(configPath: string): unknown {
-	if (operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
+function operatorOwnershipMode(configPath: string, fresh = false): unknown {
+	if (!fresh && operatorOwnershipModes.has(configPath)) return operatorOwnershipModes.get(configPath);
 	let mode: unknown;
 	let content: string | undefined;
 	try {
@@ -7272,11 +7272,15 @@ function operatorOwnershipMode(configPath: string): unknown {
 // because the session modules sit below config in the import graph.
 // The global layer only: a project or runtime value, including a null or scalar `session` parent
 // that would replace the user's whole `session` object in the merge, never reaches the mode.
-setSessionOwnershipSettingSource(() =>
-	globalInstance
+// A `fresh` read (a refusal decision) rereads the file even under process settings, which do not
+// hot-reload on every platform: the refusal needs enforce in this read too, so it only ever lowers.
+setSessionOwnershipSettingSource(options => {
+	if (options?.fresh)
+		return operatorOwnershipMode(path.join(globalInstance?.getAgentDir() ?? getAgentDir(), "config.yml"), true);
+	return globalInstance
 		? globalInstance.getGlobal("session.ownership.mode")
-		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml")),
-);
+		: operatorOwnershipMode(path.join(getAgentDir(), "config.yml"));
+});
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;

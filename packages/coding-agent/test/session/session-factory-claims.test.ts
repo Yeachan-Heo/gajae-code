@@ -10,9 +10,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
+import type { Subprocess } from "bun";
 import type { Args } from "../../src/cli/args";
 import { Settings } from "../../src/config/settings";
-import { createSessionManager } from "../../src/main";
+import { createSessionManager, operatorFacingSessionOpenMessage } from "../../src/main";
+import { createAgentSession } from "../../src/sdk";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
@@ -20,7 +22,9 @@ import {
 	inspectSessionOwners,
 	probeSessionOwner,
 	resetSessionOwnershipForTests,
+	SessionHeldError,
 	type SessionOwnerLockBackend,
+	SessionOwnershipError,
 	SessionOwnershipTestHooks,
 	sessionOwnerKey,
 	sessionOwnershipCounters,
@@ -96,6 +100,20 @@ function heldElsewhere(...heldIds: string[]): SessionOwnerLockBackend {
 	};
 }
 
+/** The native locks, except that claims of `failedIds` fail as an owners-directory lock error would. */
+function failingFor(...failedIds: string[]): SessionOwnerLockBackend {
+	const failed = (sidecar: string) =>
+		failedIds.some(id => path.basename(sidecar).startsWith(`${sessionOwnerKey(id)}.`));
+	return {
+		tryAcquire: (sidecar, timeoutMs) =>
+			failed(sidecar)
+				? Promise.resolve({ status: FileLockAcquireStatus.Failed, code: "EACCES" })
+				: tryAcquireFileLock(sidecar, timeoutMs),
+		probe: (sidecar, timeoutMs) =>
+			failed(sidecar) ? Promise.resolve({ state: FileLockProbeState.Free }) : probeFileLock(sidecar, timeoutMs),
+	};
+}
+
 async function state(sessionId: string): Promise<string> {
 	return (await probeSessionOwner(sessionId)).state;
 }
@@ -114,35 +132,29 @@ describe.if(supported)("factory claims", () => {
 		expect(await state(manager.getSessionId())).toBe("free");
 	});
 
-	for (const mode of ["observe", "enforce"] as const) {
-		it(`${mode}: a session held elsewhere, or a lock failure enforce would refuse, opens without a claim and is counted`, async () => {
-			const place = await workspace();
-			const { file, id } = await committed(place);
-			SessionOwnershipTestHooks.mode = mode;
-			SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
-			const held = keep(await SessionManager.open(file, place.destination));
-			// The gate where enforce will refuse (5a) can tell the outcomes apart.
-			expect([
-				held.getSessionId(),
-				sessionClaimSetOf(held).has(id),
-				await sessionClaimSetOf(held).settled(),
-			]).toEqual([id, false, "held"]);
-			expect(sessionOwnershipCounters().claim_conflict).toBeGreaterThan(0);
-			await held.close();
+	it("observe: a session held elsewhere, or a lock failure enforce would refuse, opens without a claim and is counted", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.lockBackend = heldElsewhere(id);
+		const held = keep(await SessionManager.open(file, place.destination));
+		// The refusal gate can tell the outcomes apart; only enforce refuses them.
+		expect([held.getSessionId(), sessionClaimSetOf(held).has(id), await sessionClaimSetOf(held).settled()]).toEqual([
+			id,
+			false,
+			"held",
+		]);
+		expect(sessionOwnershipCounters().claim_conflict).toBeGreaterThan(0);
+		await held.close();
 
-			SessionOwnershipTestHooks.lockBackend = {
-				tryAcquire: async () => ({ status: FileLockAcquireStatus.Failed, code: "EACCES" }),
-				probe: async () => ({ state: FileLockProbeState.Free }),
-			};
-			const failed = keep(await SessionManager.open(file, place.destination));
-			expect([
-				failed.getSessionId(),
-				sessionClaimSetOf(failed).has(id),
-				await sessionClaimSetOf(failed).settled(),
-			]).toEqual([id, false, "failed"]);
-			expect(sessionOwnershipCounters().claim_failed).toBeGreaterThan(0);
-		});
-	}
+		SessionOwnershipTestHooks.lockBackend = failingFor(id);
+		const failed = keep(await SessionManager.open(file, place.destination));
+		expect([
+			failed.getSessionId(),
+			sessionClaimSetOf(failed).has(id),
+			await sessionClaimSetOf(failed).settled(),
+		]).toEqual([id, false, "failed"]);
+		expect(sessionOwnershipCounters().claim_failed).toBeGreaterThan(0);
+	});
 
 	it("gjc acp keeps an in-memory manager: autoResume never opens, or contends for, the cwd's newest session", async () => {
 		const place = await workspace();
@@ -369,5 +381,165 @@ describe.if(supported)("factory claims", () => {
 		}
 		expect(sessionOwnershipCounters().claim_taken).toBe(taken + 1);
 		expect((await inspectSessionOwners()).held).toEqual([]);
+	});
+});
+
+const holderScript = path.join(import.meta.dir, "session-ownership-holder-child.ts");
+const holders: Subprocess<"pipe", "pipe", "pipe">[] = [];
+
+afterEach(async () => {
+	for (const child of holders.splice(0)) {
+		child.kill("SIGKILL");
+		await child.exited;
+	}
+});
+
+/** Another process, with HOME at the test's owners home, that holds `sessionId`; returns its pid. */
+async function holdInAnotherProcess(sessionId: string): Promise<number> {
+	const home = SessionOwnershipTestHooks.homeOverride;
+	if (!home) throw new Error("the test preload sets the owners home");
+	const env: Record<string, string | undefined> = {
+		...process.env,
+		HOME: home,
+		OWNER_SESSION_ID: sessionId,
+		OWNER_SURFACE: "terminal",
+	};
+	for (const key of Object.keys(env))
+		if (key.startsWith("XDG_") || /^(GJC|PI)_(CONFIG|CODING_AGENT)_DIR$/.test(key)) delete env[key];
+	const child = Bun.spawn([process.execPath, holderScript], {
+		cwd: import.meta.dir,
+		env,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	holders.push(child);
+	const reader = child.stdout.getReader();
+	let text = "";
+	while (!text.includes("\n")) {
+		const { value, done } = await reader.read();
+		if (done) throw new Error(`holder exited early: ${await new Response(child.stderr).text()}`);
+		text += new TextDecoder().decode(value);
+	}
+	reader.releaseLock();
+	const ready = JSON.parse(text.slice(0, text.indexOf("\n"))) as { status: string; pid: number };
+	if (ready.status !== "claimed") throw new Error(`holder did not claim: ${ready.status}`);
+	return ready.pid;
+}
+
+/** Every file under `root`, with its bytes' hash and mtime: equal snapshots mean nothing was written. */
+async function tree(root: string): Promise<string[]> {
+	const names = (await fs.readdir(root, { recursive: true })).sort();
+	return Promise.all(
+		names.map(async name => {
+			const stat = await fs.lstat(path.join(root, name));
+			const bytes = stat.isFile() ? Bun.hash(await fs.readFile(path.join(root, name))).toString() : "dir";
+			return `${name} ${bytes} ${stat.mtimeMs}`;
+		}),
+	);
+}
+
+// `committed()` leaves the mode at `observe`, so each test sets `enforce` after it.
+describe.if(supported)("enforce refusals (5a)", () => {
+	it("a session another process holds is refused, naming the holder, before the open writes anything", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const pid = await holdInAnotherProcess(id);
+		const before = await tree(place.root);
+		const holder = { surface: "terminal" as const, pid };
+		await expect(SessionManager.open(file, place.destination)).rejects.toMatchObject({
+			code: "session_held",
+			holder,
+		});
+		const capture = SessionManager.captureTranscriptStrict(file);
+		if (capture.kind !== "captured") throw new Error(`capture failed: ${capture.reason}`);
+		const identity = capture.snapshot.identity;
+		capture.snapshot.close();
+		await expect(SessionManager.openExistingStrict(identity, place.destination)).rejects.toBeInstanceOf(
+			SessionHeldError,
+		);
+		// A large transcript opens bounded, which builds session-memory sidecars before the manager's
+		// own claim: the refusal comes before them.
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 64;
+		try {
+			await expect(
+				SessionManager.open(file, place.destination, undefined, undefined, "enabled"),
+			).rejects.toBeInstanceOf(SessionHeldError);
+		} finally {
+			delete SessionManagerTestHooks.eagerHydrationMaxBytesOverride;
+		}
+		expect(await tree(place.root)).toEqual(before);
+		expect((await inspectSessionOwners()).held.filter(sidecar => sidecar.self)).toEqual([]);
+		expect(operatorFacingSessionOpenMessage(new SessionHeldError(id, holder), { print: true })).toBe(
+			`error: session ${id.slice(0, 8)} is open for writing in another terminal (pid ${pid}).\nOnly one process can write a session at a time. Close it there, or continue in a copy:\n  gjc -p --fork ${id} "<message>"`,
+		);
+		// The SDK factory's gate: a manager whose rotation reached the held session (a rotation itself
+		// never refuses in 5a) is refused before createAgentSession's first write.
+		const rotated = keep(SessionManager.create(place.cwd, place.destination));
+		await rotated.setSessionFile(file);
+		await expect(createAgentSession({ sessionManager: rotated })).rejects.toMatchObject({ code: "session_held" });
+	});
+
+	it("a failed claim refuses too, but a fork reads a source it cannot claim in place", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = failingFor(id);
+		await expect(SessionManager.open(file, place.destination)).rejects.toBeInstanceOf(SessionOwnershipError);
+		// The fork's legacy source needs a migration, whose claim fails: it is read where it is.
+		const encoded = path
+			.resolve(place.cwd)
+			.replace(/^[/\\]/, "")
+			.replace(/[/\\:]/g, "-");
+		const legacyDir = path.join(place.destination.securityContext.sessionsRoot, `--${encoded}--`);
+		await fs.mkdir(legacyDir, { recursive: true, mode: 0o700 });
+		const legacy = path.join(legacyDir, path.basename(file));
+		await fs.rename(file, legacy);
+		const fork = keep(await SessionManager.forkFrom(legacy, place.cwd, place.destination));
+		expect(fork.getHeader()?.parentSession).toBe(id);
+		expect((await fs.readdir(place.destination.directory)).filter(name => name.endsWith(`${id}.jsonl`))).toEqual([]);
+	});
+
+	it("the live mode only lowers a refusal: an operator's observe reaches a manager opened under enforce", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		await holdInAnotherProcess(id);
+		SessionOwnershipTestHooks.mode = "observe";
+		const opened = keep(
+			await SessionManager.open(file, place.destination, undefined, undefined, undefined, {
+				surface: "terminal",
+				mode: "enforce",
+			}),
+		);
+		expect([opened.getSessionId(), await sessionClaimSetOf(opened).settled()]).toEqual([id, "held"]);
+	});
+
+	it("--continue and autoResume start fresh with the notice when the newest session is held; -p --continue refuses", async () => {
+		const place = await workspace();
+		const settings = Settings.isolated({ autoResume: true });
+		const destination = SessionManager.managedDestination(place.cwd, settings.getAgentDir());
+		if (destination.kind !== "managed") throw new Error("expected a managed destination");
+		const older = await committed({ ...place, destination });
+		const newest = await committed({ ...place, destination });
+		SessionOwnershipTestHooks.mode = "enforce";
+		const pid = await holdInAnotherProcess(newest.id);
+		const notices: string[] = [];
+		const tui = { interactive: true, notice: (message: string) => notices.push(message) };
+		const fresh = keep(
+			(await createSessionManager({ continue: true } as Args, place.cwd, settings, "terminal", tui))!,
+		);
+		expect([fresh.getSessionId() === newest.id, fresh.getSessionId() === older.id]).toEqual([false, false]);
+		expect(notices).toEqual([
+			`Your most recent session is open in another terminal (pid ${pid}), so a new session was started. Run gjc --resume to pick a session.`,
+		]);
+		const print = { interactive: false, notice: (message: string) => notices.push(message) };
+		await expect(
+			createSessionManager({ continue: true } as Args, place.cwd, settings, "print", print),
+		).rejects.toMatchObject({ code: "session_held", sessionId: newest.id });
+		// autoResume was not asked for, so even -p starts fresh, with the notice, and is not marked --continue.
+		const args = {} as Args;
+		const auto = keep((await createSessionManager(args, place.cwd, settings, "print", print))!);
+		expect([auto.getSessionId() === newest.id, args.continue, notices.length]).toEqual([false, undefined, 2]);
 	});
 });

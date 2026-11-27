@@ -82,6 +82,7 @@ import {
 	SharedControlPublicationError,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { operatorErrorMessage } from "../../session/operator-error-message";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -2413,7 +2414,8 @@ export class SelectorController {
 					// unhandled rejection that can kill the process. Do not auto-retry.
 					done();
 					void this.handleResumeSession(sessionPath).catch(error => {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						// A refusal (a session open in another process, under enforce) carries operator text.
+						this.ctx.showError(operatorErrorMessage(error, String(error)));
 					});
 				},
 				() => {
