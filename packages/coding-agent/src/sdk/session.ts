@@ -3527,6 +3527,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return promise;
 			},
 			getSessionId: () => sessionManager.getSessionId(),
+			getSessionIdentityGeneration: () => sessionManager.getSessionIdentityGeneration(),
 			// Subagents inherit the parent's manager; its registered endpoint is
 			// authoritative for owned-registration keying and endpoint-first
 			// manager lookup (the child's own id is never registered), so tools
@@ -3580,6 +3581,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
 			getSdkPermissionProvider: () => session?.getSdkPermissionProvider(),
 			getClientBridge: () => session?.clientBridge,
+			isSessionDisposed: () => session?.isDisposed ?? false,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
