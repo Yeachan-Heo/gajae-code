@@ -5754,8 +5754,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								return undefined;
 							}
 							// The retry re-dispatches this same model object, so its generated header must
-							// follow the replacement row. The helper carries the generated-header symbol
-							// onto the object's next headers, keeping further rotations owned too.
+							// follow the replacement row. streamSimple permits one auth replacement on
+							// this object; an outer backoff re-enters streamFn with fresh request models.
 							providerModel.headers = modelRegistry.getRequestHeaders(providerModel, replacement.apiKey);
 							return replacement;
 						},

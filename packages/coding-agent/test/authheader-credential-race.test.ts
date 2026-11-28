@@ -8,7 +8,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { isProviderSafetyStopModelTrusted } from "../../ai/src/adapter-internals/provider-safety-stop";
@@ -24,15 +24,21 @@ const LOAD_KEY = "load-generated-key";
 const CREDENTIAL_SCOPE = "authheader-race-scope";
 const KEY_A = "stored-race-key-a";
 const KEY_B = "stored-race-key-b";
+const KEY_C = "stored-race-key-c";
+const KEY_D = "stored-race-key-d";
 const tempDirs = trackTempDirs();
 
-type Outcome = "ok" | "auth";
+type Outcome = "ok" | "auth" | "transient";
 
 /** What the provider actually received, from the request it was handed. */
 type ProviderDispatch = {
 	authorization: string | undefined;
 	apiKey: string | undefined;
 	credentialId: number | undefined;
+	/** The detached provider-local model object `streamSimple` dispatched this attempt with. */
+	model: Model<Api>;
+	/** Undefined on every native attempt: `streamSimple` strips the outer session callback. */
+	onAuthError: SimpleStreamOptions["onAuthError"];
 };
 
 function providerMessage(model: Model<Api>, outcome: Outcome): AssistantMessage {
@@ -57,7 +63,13 @@ function providerMessage(model: Model<Api>, outcome: Outcome): AssistantMessage 
 					errorStatus: 401,
 					transportFailure: { kind: "transport" as const, status: 401, providerCode: "invalid_api_key" },
 				}
-			: {}),
+			: outcome === "transient"
+				? {
+						errorMessage: "503 service unavailable",
+						errorStatus: 503,
+						transportFailure: { kind: "transport" as const, status: 503 },
+					}
+				: {}),
 		timestamp: Date.now(),
 	};
 }
@@ -118,6 +130,8 @@ function registerFakeProvider(outcomeFor: (apiKey: string | undefined) => Outcom
 				authorization: model.headers?.Authorization,
 				apiKey: options?.apiKey,
 				credentialId: options?.credentialId,
+				model,
+				onAuthError: options?.onAuthError,
 			});
 			const message = providerMessage(model, outcomeFor(options?.apiKey));
 			const stream = new AssistantMessageEventStream();
@@ -311,7 +325,7 @@ afterEach(async () => {
  * the replacement row's header.
  */
 describe("authHeader credential race through a real session", () => {
-	async function setup(options: { pinRowA: boolean }): Promise<{
+	async function setup(options: { pinRowA: boolean; credentials?: string[]; retryBounds?: boolean }): Promise<{
 		authStorage: AuthStorage;
 		modelRegistry: ModelRegistry;
 		sessionManager: SessionManager;
@@ -322,10 +336,11 @@ describe("authHeader credential race through a real session", () => {
 		const dir = tempDirs.tempDirSync("@authheader-credential-race-").path();
 		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
 		authStorages.push(authStorage);
-		await authStorage.set(PROVIDER, [
-			{ type: "api_key", key: KEY_A },
-			{ type: "api_key", key: KEY_B },
-		]);
+		const credentialKeys = options.credentials ?? [KEY_A, KEY_B];
+		await authStorage.set(
+			PROVIDER,
+			credentialKeys.map(key => ({ type: "api_key" as const, key })),
+		);
 		const modelRegistry = await createRegistry(dir, authStorage);
 		modelRegistries.push(modelRegistry);
 		const registryModel = modelRegistry.find(PROVIDER, MODEL_ID);
@@ -354,7 +369,17 @@ describe("authHeader credential race through a real session", () => {
 						},
 					}
 				: {}),
-			settings: Settings.isolated({ "compaction.enabled": false }),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				...(options.retryBounds
+					? {
+							"retry.enabled": true,
+							"retry.baseDelayMs": 1,
+							"retry.maxDelayMs": 10,
+							"retry.maxRetries": 2,
+						}
+					: {}),
+			}),
 			disableExtensionDiscovery: true,
 			skills: [],
 			contextFiles: [],
@@ -468,6 +493,104 @@ describe("authHeader credential race through a real session", () => {
 			| AssistantMessage
 			| undefined;
 		expect(last).toMatchObject({ stopReason: "error", errorStatus: 401 });
+	});
+
+	// The review alleges a second auth rotation on the same providerModel can
+	// reuse a stale replacement marker. This pins the boundary such a marker
+	// would have to cross: an outer session retry re-enters streamFn with a
+	// fresh provider model. Drive the real backoff after a rotated replacement
+	// 503, then require that new model to rotate once on its own 401 and stop
+	// at the next 401. Two extra stored credentials rule out exhaustion.
+	it("rotates once on the fresh provider model after an outer auto retry", async () => {
+		const { authStorage, sessionManager, session } = await setup({
+			pinRowA: false,
+			credentials: [KEY_A, KEY_B, KEY_C, KEY_D],
+			retryBounds: true,
+		});
+		const storedKeys = [KEY_A, KEY_B, KEY_C, KEY_D];
+		const rowByKey = new Map(storedKeys.map(key => [key, rowIdForKey(authStorage, key)] as const));
+		const retryStarts: Array<Extract<AgentSessionEvent, { type: "auto_retry_start" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStarts.push(event);
+		});
+		// Calls through to the real invalidation; only the call record is observed.
+		const invalidate = vi.spyOn(authStorage, "invalidateCredentialMatching");
+		let attempt = 0;
+		const dispatches = registerFakeProvider(() => {
+			attempt += 1;
+			if (attempt === 1) return "auth";
+			if (attempt === 2) return "transient";
+			return "auth";
+		});
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		// Exactly four real dispatches: the first model's 401 + replacement 503,
+		// then the outer retry's 401 + replacement 401. Nothing else retries.
+		expect(dispatches).toHaveLength(4);
+		const first = dispatches[0];
+		const firstReplacement = dispatches[1];
+		const afterBackoff = dispatches[2];
+		const terminal = dispatches[3];
+		if (!first || !firstReplacement || !afterBackoff || !terminal) {
+			throw new Error("Expected four provider dispatches");
+		}
+
+		// `streamSimple`'s native rotation reuses one provider model; the outer
+		// retry's new streamFn invocation must hand it a different one.
+		expect(first.model).toBe(firstReplacement.model);
+		expect(afterBackoff.model).toBe(terminal.model);
+		expect(first.model).not.toBe(afterBackoff.model);
+
+		// Every request carries the header materialized for the key it dispatched,
+		// and no native attempt receives the session callback: the adapter-level
+		// retry loop cannot mint a nested callback even with retry budgets set.
+		for (const dispatch of dispatches) {
+			expect(dispatch.authorization).toBe(`Bearer ${dispatch.apiKey}`);
+			expect(dispatch.credentialId).toBe(rowByKey.get(String(dispatch.apiKey)));
+			expect(dispatch.onAuthError).toBeUndefined();
+		}
+
+		// One rotation per model, and the transient attempt keeps the key it
+		// rotated to when the outer retry re-resolves the credential.
+		expect(firstReplacement.apiKey).not.toBe(first.apiKey);
+		expect(afterBackoff.apiKey).toBe(firstReplacement.apiKey);
+		expect(terminal.apiKey).not.toBe(afterBackoff.apiKey);
+		expect(terminal.apiKey).not.toBe(first.apiKey);
+		expect(new Set(dispatches.map(dispatch => dispatch.apiKey)).size).toBe(3);
+
+		// Exactly one invalidation per distinct provider model, each naming the
+		// first attempt's key on that model.
+		expect(invalidate).toHaveBeenCalledTimes(2);
+		expect(invalidate.mock.calls.map(call => [call[0], call[1]])).toEqual([
+			[PROVIDER, first.apiKey],
+			[PROVIDER, afterBackoff.apiKey],
+		]);
+
+		// The outer session retry is the real backoff path, not a direct dispatch.
+		expect(retryStarts).toHaveLength(1);
+		expect(retryStarts[0]).toMatchObject({ type: "auto_retry_start", attempt: 1 });
+		expect(retryStarts[0]?.delayMs).toBeLessThanOrEqual(10);
+
+		// A second 401 on the new model is terminal even though two of the four
+		// stored credentials remain usable: the key that just failed and the key
+		// never dispatched. Stopping is the terminal auth rule, not exhaustion.
+		const unused = storedKeys.filter(key => !dispatches.some(dispatch => dispatch.apiKey === key));
+		expect(unused).toHaveLength(1);
+		for (const key of [terminal.apiKey, unused[0]]) {
+			expect(authStorage.isCredentialAvailable(PROVIDER, rowByKey.get(String(key))!)).toBe(true);
+		}
+
+		const last = [...session.state.messages].reverse().find(message => message.role === "assistant") as
+			| AssistantMessage
+			| undefined;
+		expect(last).toMatchObject({ stopReason: "error", errorStatus: 401 });
+
+		const assistants = await persistedAssistants(sessionManager);
+		// The outer retry's 503 is already in the transcript; the terminal 401 is
+		// the last persisted assistant and must be attributed to its own key.
+		expect(assistants.at(-1)?.credentialId).toBe(rowByKey.get(String(terminal.apiKey)));
 	});
 
 	it("preserves catalog trust on the observer request and final provider model", async () => {
