@@ -870,11 +870,11 @@ export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" |
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
 /**
- * A session control could not complete its admitted shared publication (#7823, #7824).
+ * A session control was refused before any effect (#7823, #7824).
  *
- * `rejected`/`stale` prove nothing was written and nothing live changed. `unknown`
- * and `committed_not_applied` mean the transcript may hold (or holds) the change while
- * this session did not apply it; the session is closed instead of compensating.
+ * Since single-owner step 10c the only thrower is the control fence: a control whose
+ * session manager was replaced while it awaited is refused as `rejected`
+ * (`publication_mode_changed`). The other codes go with the shared layer in 10d/10e.
  */
 export class SharedControlPublicationError extends Error {
 	readonly code: "rejected" | "stale" | "unknown" | "committed_not_applied";

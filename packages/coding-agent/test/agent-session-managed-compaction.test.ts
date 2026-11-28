@@ -22,13 +22,14 @@ const registries: ModelRegistry[] = [];
 const user = (content: string, timestamp = 1) => ({ role: "user" as const, content, timestamp });
 
 async function sessionFixture() {
-	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-compaction-floor-"));
+	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-compaction-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
 	await fs.mkdir(cwd, { recursive: true });
 	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
-	const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+	const destination = SessionManager.managedDestination(cwd, agentDir);
+	const manager = SessionManager.create(cwd, destination);
 	managers.push(manager);
 	const auth = await AuthStorage.create(path.join(root, "auth.db"));
 	stores.push(auth);
@@ -46,7 +47,7 @@ async function sessionFixture() {
 		[
 			"export default function(pi) {",
 			'\tpi.on("session_before_compact", async (event) => ({',
-			'\t\tcompaction: { summary: "hook-summary", shortSummary: undefined,',
+			'\t\tcompaction: { summary: "shared-hook-summary", shortSummary: undefined,',
 			"\t\t\tfirstKeptEntryId: event.preparation.firstKeptEntryId,",
 			"\t\t\ttokensBefore: event.preparation.tokensBefore, details: {} },",
 			"\t}));",
@@ -80,6 +81,7 @@ async function sessionFixture() {
 	}
 	await manager.ensureOnDisk();
 	await manager.flush();
+	const file = manager.getSessionFile()!;
 	const agent = new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } });
 	const session = new AgentSession({
 		agent,
@@ -95,7 +97,14 @@ async function sessionFixture() {
 		extensionRunner: runner,
 	});
 	sessions.push(session);
-	return { manager, session };
+	return { manager, session, file };
+}
+
+async function fixture() {
+	const base = await sessionFixture();
+	// A legacy-route canonical turn after the summarized prefix, which compaction must keep live.
+	base.manager.appendMessage(user("root shared canonical turn", 100));
+	return base;
 }
 
 afterEach(async () => {
@@ -106,6 +115,31 @@ afterEach(async () => {
 	for (const registry of registries.splice(0)) await registry.dispose();
 	for (const store of stores.splice(0)) store.close();
 	for (const root of ownedRoots) await fs.rm(root, { recursive: true, force: true });
+});
+
+describe("managed session compaction", () => {
+	it("runIdleCompaction commits a real context-full summary and rebuilds live context", async () => {
+		const { manager, session, file } = await fixture();
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+		await session.runIdleCompaction();
+		const started = events.filter(event => event.type === "auto_compaction_start");
+		expect(started).toEqual([{ type: "auto_compaction_start", reason: "idle", action: "context-full" }]);
+		const ended = events.filter(event => event.type === "auto_compaction_end");
+		expect(ended).toHaveLength(1);
+		const end = ended[0];
+		if (end?.type !== "auto_compaction_end") throw new Error("Missing terminal compaction event");
+		expect(end).toMatchObject({ action: "context-full", aborted: false });
+		expect(end).toMatchObject({ result: { summary: expect.stringContaining("shared-hook-summary") } });
+		const committed = manager.getBranch().findLast(entry => entry.type === "compaction");
+		expect(committed?.type === "compaction" && committed.summary).toContain("shared-hook-summary");
+		expect((await Bun.file(file).text()).includes('"type":"compaction"')).toBe(true);
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "user" && message.content === "root shared canonical turn",
+			),
+		).toBe(true);
+	});
 });
 
 describe("transcript-size emergency floor", () => {
@@ -135,7 +169,7 @@ describe("transcript-size emergency floor", () => {
 		return stream;
 	};
 
-	it("compacts a managed session above the floor", async () => {
+	it("still compacts a legacy session above the floor", async () => {
 		const { manager, session } = await sessionFixture();
 		session.agent.streamFn = answer;
 		// Above the 48 MiB transcript floor.
