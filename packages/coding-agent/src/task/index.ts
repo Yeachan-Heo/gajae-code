@@ -84,7 +84,7 @@ import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
-import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
+import { mapWithConcurrencyLimit } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary, type TaskResultReceipt } from "./receipt";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
@@ -181,6 +181,7 @@ function captureTaskExecutionScope(session: ToolSession): {
 		"getAsyncJobManager",
 		"getCredentialSessionId",
 		"getAgentId",
+		"getTaskPool",
 		"getSessionAgentDir",
 		"getActiveModelString",
 		"getModelString",
@@ -1239,7 +1240,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 
-		const maxConcurrency = session.settings.get("task.maxConcurrency");
 		const ownerId = session.getAgentId?.() ?? undefined;
 		const parentSession = session.getSessionFile();
 		const admitDuplicateLaunch = (
@@ -1343,47 +1343,59 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
-						const result = await this.#executeSync(
-							descriptor.toolCallId,
-							{ ...descriptor.params, tasks: [resumedTask] },
-							runSignal,
-							undefined,
-							[descriptor.task.id],
-							forkSeeds,
-							{
-								runMode: message ? "message" : "resume",
-								resumeMessage: message,
-								asyncJobManager: manager,
-								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
-								suppressRoiReconciliation: true,
-								...(descriptor.durableOutputAllowed === true
-									? { persistence: descriptor.artifactPersistence }
-									: {
-											persistence: {
-												effectiveArtifactsDir: undefined,
-												parentArtifactManager: undefined,
-											},
-										}),
-							},
-						);
-						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
-						const rawSingleResult = result.details?.results[0];
-						const singleResult = rawSingleResult
-							? {
-									...rawSingleResult,
-									duplicateDisposition: (() => {
-										const initial = descriptor.initialDisposition;
-										const current = admission.disposition;
-										if (!initial) return current;
-										if (!current) return initial;
-										return {
-											action: current.action,
-											predecessorIds: [...new Set([...initial.predecessorIds, ...current.predecessorIds])],
-										};
-									})(),
-								}
-							: rawSingleResult;
-						return subagentRunOutcomeFromSingleResult(finalText, singleResult);
+						// Acquire pool slot for resumed task execution (at depth 0 - top-level resume)
+						const slotInfo = taskPool ? await taskPool.acquire(0, runSignal) : { acquiredSlot: false };
+						if (runSignal.aborted) {
+							if (taskPool) taskPool.release(slotInfo);
+							throw new Error("Aborted before execution");
+						}
+						try {
+							const result = await this.#executeSync(
+								descriptor.toolCallId,
+								{ ...descriptor.params, tasks: [resumedTask] },
+								runSignal,
+								undefined,
+								[descriptor.task.id],
+								forkSeeds,
+								{
+									runMode: message ? "message" : "resume",
+									resumeMessage: message,
+									asyncJobManager: manager,
+									sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
+									suppressRoiReconciliation: true,
+									...(descriptor.durableOutputAllowed === true
+										? { persistence: descriptor.artifactPersistence }
+										: {
+												persistence: {
+													effectiveArtifactsDir: undefined,
+													parentArtifactManager: undefined,
+												},
+											}),
+								},
+							);
+							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
+							const rawSingleResult = result.details?.results[0];
+							const singleResult = rawSingleResult
+								? {
+										...rawSingleResult,
+										duplicateDisposition: (() => {
+											const initial = descriptor.initialDisposition;
+											const current = admission.disposition;
+											if (!initial) return current;
+											if (!current) return initial;
+											return {
+												action: current.action,
+												predecessorIds: [
+													...new Set([...initial.predecessorIds, ...current.predecessorIds]),
+												],
+											};
+										})(),
+									}
+								: rawSingleResult;
+							return subagentRunOutcomeFromSingleResult(finalText, singleResult);
+						} finally {
+							if (taskPool) taskPool.release(slotInfo);
+						}
 					},
 					{
 						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,
@@ -1421,7 +1433,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 			manager.setResumeRunner(resumeRunner);
 		}
-		const semaphore = new Semaphore(maxConcurrency);
+		const taskPool = session.getTaskPool?.();
+		const taskDepth = session.taskDepth ?? 0;
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
 			if (!requestsForkContext(task)) return undefined;
 			if (!session.buildForkContextSeed) {
@@ -1511,9 +1524,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					async ({ signal: runSignal, reportProgress }) => {
 						const startedAt = Date.now();
 						const progress = progressByTaskId.get(taskItem.id);
-						await semaphore.acquire();
+						const slotInfo = taskPool ? await taskPool.acquire(taskDepth, runSignal) : { acquiredSlot: false };
 						if (runSignal.aborted) {
-							semaphore.release();
+							if (taskPool && slotInfo.acquiredSlot) taskPool.release(slotInfo);
 							if (progress) {
 								progress.status = "aborted";
 							}
@@ -1623,7 +1636,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							}
 							throw error;
 						} finally {
-							semaphore.release();
+							if (taskPool) taskPool.release(slotInfo);
 						}
 					},
 					{
@@ -2580,6 +2593,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentHindsightSessionState: session.getHindsightSessionState?.(),
 						parentTelemetry: session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
+						parentTaskPool: session.getTaskPool?.(),
 						forkContextSeed,
 					});
 					return {
@@ -2672,6 +2686,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentHindsightSessionState: session.getHindsightSessionState?.(),
 						parentTelemetry: session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
+						parentTaskPool: session.getTaskPool?.(),
 						forkContextSeed,
 					});
 					let capturedResult = {

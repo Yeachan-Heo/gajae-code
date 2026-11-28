@@ -83,34 +83,160 @@ export async function mapWithConcurrencyLimit<T, R>(
 	return { results, aborted: signal?.aborted ?? false };
 }
 
+interface QueuedWaiter {
+	resolve: () => void;
+	preAllocated?: boolean;
+	/** Token to safely remove from queue if cancelled */
+	token?: object;
+}
+
 /**
  * Simple counting semaphore for limiting concurrency across independently-scheduled async work.
+ * Supports in-place resizing while preserving active permits and queued waiters.
  */
 export class Semaphore {
-	#max: number;
+	#max: number | null; // null = unlimited
 	#current = 0;
-	#queue: Array<() => void> = [];
+	#queue: QueuedWaiter[] = [];
 
-	constructor(max: number) {
-		this.#max = Math.max(1, max);
+	constructor(max: number | null) {
+		if (max === null || max === 0) {
+			this.#max = null; // unlimited
+		} else {
+			this.#max = Math.max(1, max);
+		}
 	}
 
-	async acquire(): Promise<void> {
+	async acquire(signal?: AbortSignal): Promise<void> {
+		// Unlimited: always acquire immediately
+		if (this.#max === null) {
+			if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+			this.#current++; // Track active count even in unlimited mode
+			return;
+		}
+
 		if (this.#current < this.#max) {
+			if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
 			this.#current++;
 			return;
 		}
-		const { promise, resolve } = Promise.withResolvers<void>();
-		this.#queue.push(resolve);
-		return promise;
+
+		// Need to queue and wait
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const token = {};
+		const waiter: QueuedWaiter = { resolve, token };
+		this.#queue.push(waiter);
+
+		// Handle abort signal if provided
+		let abortListener: (() => void) | undefined;
+		if (signal) {
+			if (signal.aborted) {
+				// Already aborted, remove from queue immediately
+				const idx = this.#queue.indexOf(waiter);
+				if (idx !== -1) {
+					this.#queue.splice(idx, 1);
+				}
+				reject(signal.reason ?? new Error("Aborted"));
+				return;
+			}
+			// Listen for abort while waiting
+			abortListener = () => {
+				// Remove from queue if still waiting
+				const idx = this.#queue.findIndex(w => w.token === token);
+				if (idx !== -1) {
+					this.#queue.splice(idx, 1);
+				}
+				reject(signal.reason ?? new Error("Aborted"));
+			};
+			signal.addEventListener("abort", abortListener);
+		}
+
+		try {
+			await promise;
+			// If pre-allocated by release/setMax, don't increment. Otherwise increment now.
+			if (!waiter.preAllocated) {
+				this.#current++;
+			}
+		} finally {
+			if (abortListener && signal) {
+				signal.removeEventListener("abort", abortListener);
+			}
+		}
 	}
 
 	release(): void {
-		const next = this.#queue.shift();
-		if (next) {
-			next();
-		} else {
+		// Unlimited: decrement the active count we incremented in acquire
+		if (this.#max === null) {
 			this.#current--;
+			return;
 		}
+
+		// First, decrement since we're releasing
+		this.#current--;
+
+		// If we still have waiters and capacity is available, wake a waiter
+		if (this.#current < this.#max && this.#queue.length > 0) {
+			const waiter = this.#queue.shift();
+			if (waiter) {
+				// Mark as pre-allocated and increment #current for this waiter
+				waiter.preAllocated = true;
+				this.#current++;
+				// Resolve the waiter; it will NOT re-increment in its acquire() return
+				waiter.resolve();
+			}
+		}
+	}
+
+	/**
+	 * Resize the semaphore limit while preserving existing permits and queued waiters.
+	 * When shrinking: existing holders drain naturally, new acquires blocked if over limit.
+	 * When growing: queued waiters are woken to fill new slots, with permits reserved.
+	 */
+	setMax(newMax: number | null): void {
+		if (newMax === null || newMax === 0) {
+			this.#max = null; // Switch to unlimited
+			// Wake all queued waiters since we're now unlimited
+			// Reserve permits for each waiter being woken
+			while (this.#queue.length > 0) {
+				const waiter = this.#queue.shift();
+				if (waiter) {
+					waiter.preAllocated = true;
+					this.#current++;
+					waiter.resolve();
+				}
+			}
+			return;
+		}
+
+		const normalized = Math.max(1, newMax);
+
+		// If currently unlimited, convert to limited
+		if (this.#max === null) {
+			this.#max = normalized;
+			// Keep #current as-is; it represents actual holders
+			// If #current > normalized, new acquires will block until releases bring it down
+			return;
+		}
+
+		const oldMax = this.#max;
+		this.#max = normalized;
+
+		// If growing, wake waiters to fill new slots.
+		// Only wake if the new limit provides additional capacity
+		if (normalized > oldMax) {
+			const availableSlots = normalized - this.#current;
+			for (let i = 0; i < availableSlots && this.#queue.length > 0; i++) {
+				const waiter = this.#queue.shift();
+				if (waiter) {
+					// Mark as pre-allocated and reserve the permit
+					waiter.preAllocated = true;
+					this.#current++;
+					// Resolve the waiter; it will NOT re-increment in its acquire() return
+					waiter.resolve();
+				}
+			}
+		}
+		// If shrinking: nothing to do. Existing holders drain naturally.
+		// When they release(), we'll check if we're over the new limit.
 	}
 }

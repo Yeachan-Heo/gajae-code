@@ -136,7 +136,7 @@ function resultError(error: unknown): { ok: false; error: { code: string; messag
 			error: {
 				code: "broker_unavailable",
 				message: normalized.cleanupUnverified
-					? brokerLockRefusalApiMessage(normalized.refusalCode) + " Spawned broker cleanup was not verified."
+					? `${brokerLockRefusalApiMessage(normalized.refusalCode)} Spawned broker cleanup was not verified.`
 					: brokerLockRefusalApiMessage(normalized.refusalCode),
 			},
 		};

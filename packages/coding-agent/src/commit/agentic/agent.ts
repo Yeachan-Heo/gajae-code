@@ -10,6 +10,7 @@ import { getMarkdownTheme } from "../../modes/theme/theme";
 import { createAgentSession } from "../../sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import type { SessionTaskPool } from "../../task/task-pool";
 import agentUserPrompt from "./prompts/session-user.md" with { type: "text" };
 import agentSystemPrompt from "./prompts/system.md" with { type: "text" };
 import type { CommitAgentState } from "./state";
@@ -42,6 +43,9 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 	});
 	const state: CommitAgentState = { diffText: input.diffText };
 	const spawns = "quick_task";
+	// Container for the session task pool getter (set after session creation)
+	const context: { sessionTaskPoolGetter?: () => SessionTaskPool | undefined } = {};
+
 	const tools = createCommitTools({
 		cwd: input.cwd,
 		authStorage: input.authStorage,
@@ -51,6 +55,8 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		state,
 		changelogTargets: input.changelogTargets,
 		enableAnalyzeFiles: true,
+		// Use a getter that lazily retrieves the pool from the session
+		getTaskPool: () => context.sessionTaskPoolGetter?.(),
 	});
 
 	const { session } = await createAgentSession({
@@ -74,6 +80,8 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		promptTemplates: [],
 		slashCommands: [],
 	});
+	// Set the task pool getter to retrieve from the session
+	context.sessionTaskPoolGetter = () => session.getTaskPool?.();
 	let toolCalls = 0;
 	let messageCount = 0;
 	let isThinking = false;

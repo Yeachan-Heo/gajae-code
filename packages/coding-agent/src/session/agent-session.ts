@@ -487,6 +487,7 @@ import {
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { DelegationHintController } from "../task/delegation-hint";
+import { SessionTaskPool } from "../task/task-pool";
 import { modelSupportsThinkingOff, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -2994,6 +2995,7 @@ export type ExactMcpControlAction = "suspend" | "resume" | "reconnect";
 export type SessionMcpScope = "global" | "project";
 export type SessionMcpServerState = "connected" | "connecting" | "disconnected" | "disabled" | "failed";
 export type SessionMcpDisabledReason = "enabled-false" | "disabled-servers" | "project-stdio-unapproved";
+
 export interface SessionMcpDeclaredServer {
 	readonly name: string;
 	readonly scope: SessionMcpScope;
@@ -3419,7 +3421,16 @@ export class AgentSession {
 	readonly memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
+	readonly #taskPool: SessionTaskPool;
 	#workflowGatePublication: "endpoint" | "local";
+
+	/**
+	 * Get the session-global task concurrency pool.
+	 * Used to enforce task.maxConcurrency across all concurrent task() calls.
+	 */
+	getTaskPool(): SessionTaskPool {
+		return this.#taskPool;
+	}
 	readonly yieldQueue: YieldQueue;
 	// True from the start of a handoff transition through commit/rollback. While
 	// set, the yield queue treats the session as busy so background async-job
@@ -6730,6 +6741,7 @@ export class AgentSession {
 			: undefined;
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
+		this.#taskPool = new SessionTaskPool(this.settings, this.settings.get("task.maxConcurrency"));
 		this.#workflowGatePublication = config.workflowGatePublication ?? "endpoint";
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
 		// + stale screenshot cleanup). Session-keyed so concurrent sessions share one timer safely.
