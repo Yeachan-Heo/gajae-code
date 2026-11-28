@@ -1370,6 +1370,24 @@ function flushCodexEvents(context: CodexStreamProcessingContext, runtime: CodexS
 	runtime.eventsReleased = true;
 }
 
+async function flushCodexEventsCooperatively(
+	context: CodexStreamProcessingContext,
+	runtime: CodexStreamRuntime,
+): Promise<void> {
+	// Flush buffered events cooperatively, yielding periodically to allow timers, abort,
+	// and other work to make progress. Process events in batches to avoid starvation.
+	const batchSize = 100;
+	for (let i = 0; i < runtime.bufferedEvents.length; i++) {
+		context.stream.push(runtime.bufferedEvents[i]!);
+		// Yield after each batch to allow other microtasks to run
+		if ((i + 1) % batchSize === 0) {
+			await Bun.sleep(0);
+		}
+	}
+	runtime.bufferedEvents.length = 0;
+	runtime.eventsReleased = true;
+}
+
 function discardCodexEvents(runtime: CodexStreamRuntime, resumeBuffering = false): void {
 	runtime.bufferedEvents.length = 0;
 	runtime.eventsReleased = !resumeBuffering;
@@ -1388,20 +1406,7 @@ function emitCodexEvent(
 		context.stream.push(event);
 		return;
 	}
-	// Delta events (text_delta, toolcall_delta) must flow immediately to avoid starving
-	// the event loop and blocking message_update delivery. Only buffer structural events
-	// (start, done, etc.) that need replay for error recovery.
-	const isDeltaEvent = event.type === "text_delta" || event.type === "toolcall_delta";
-	if (isDeltaEvent) {
-		// Flush any buffered structural events before emitting this delta, so they arrive
-		// in the correct order
-		if (runtime.bufferedEvents.length > 0) {
-			flushCodexEvents(context, runtime);
-		}
-		context.stream.push(event);
-		return;
-	}
-	// Public consumers cannot retract starts or deltas. Hold replayable attempts
+	// Public consumers cannot retract deltas or starts. Hold all replayable attempts
 	// until they commit, and discard their events when replay resets the output.
 	if (
 		!runtime.eventsReleased &&
@@ -2050,16 +2055,8 @@ function handleToolCallArgumentsDelta(
 		currentBlock.argumentsComplete = false;
 	}
 	currentBlock.partialJson += delta;
-	// Optimization: check for completion only when we see a closing brace or on
-	// size boundaries to avoid O(n²) parsing behavior on large streaming responses.
-	const shouldCheckCompletion =
-		delta.includes("}") || // Likely end of JSON
-		currentBlock.partialJson.length % 1024 === 0; // Check every ~1KB
-	if (shouldCheckCompletion) {
-		currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
-		// Always update arguments when we check completeness (which is infrequent now)
-		currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-	}
+	currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
+	currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
 	currentBlock.argumentsAuthoritative =
 		currentBlock.argumentsAuthoritative || (currentBlock.argumentsComplete && delta.trim().length > 0);
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -2935,7 +2932,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const completion = await processCodexResponseStream(processingContext, runtime);
 			processingContext.firstTokenTime = completion.firstTokenTime;
 			const message = finalizeCodexResponse(processingContext, runtime, completion);
-			flushCodexEvents(processingContext, runtime);
+			await flushCodexEventsCooperatively(processingContext, runtime);
 			stream.push({ type: "done", reason: message.stopReason as "stop" | "length" | "toolUse", message });
 			stream.end();
 		} catch (error) {
@@ -2965,7 +2962,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					},
 					startTime,
 				} satisfies CodexStreamProcessingContext);
-			if (runtime) flushCodexEvents(failureContext, runtime);
+			if (runtime) await flushCodexEventsCooperatively(failureContext, runtime);
 			const failure = await handleCodexStreamFailure(failureContext, error);
 			stream.push({ type: "error", reason: failure.stopReason as "error" | "aborted", error: failure });
 			stream.end();

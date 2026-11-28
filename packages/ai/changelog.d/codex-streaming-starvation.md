@@ -2,7 +2,7 @@
 
 ### Fixed
 
-- Codex provider no longer buffers delta events, which was causing the event loop to block for minutes during long streaming responses (#8127)
-- JSON argument parsing is now deferred to avoid O(n²) behavior when processing many streaming deltas
-- Delta events (text_delta, toolcall_delta) flow immediately without buffering, allowing the event loop to yield and process concurrent work
-- Completion checks for JSON parsing are now done only on boundaries (when closing braces are seen or every 1KB), not on every delta
+- Codex provider event flushing is now cooperative, yielding periodically to allow timers, abort, and other concurrent work to make progress during long streaming responses (#8127)
+- All events (including deltas) are properly buffered during replay-eligible attempts to maintain the lossless-retry contract
+- JSON argument completion is checked on every delta to ensure accurate argument parsing
+- Event loop starvation caused by processing thousands of delta events in one non-yielding microtask chain has been resolved
