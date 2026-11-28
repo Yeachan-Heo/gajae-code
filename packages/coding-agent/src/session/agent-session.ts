@@ -929,7 +929,22 @@ export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_r
 
 export type AgentSessionEvent =
 	| AgentEvent
-	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" | "idle"; action: "context-full" | "handoff" }
+	| {
+			type: "auto_compaction_start";
+			reason:
+				| "threshold"
+				| "overflow"
+				| "idle"
+				| "transcriptFile"
+				| "heap"
+				| "retainedMemory"
+				| "providerBytes"
+				| "imageBytes"
+				| "messageCount";
+			action: "context-full" | "handoff";
+			/** Emergency reason if triggered by resource floor breach (e.g., "transcriptFile", "heap") */
+			emergencyReason?: string;
+	  }
 	| {
 			type: "auto_compaction_end";
 			action: "context-full" | "handoff";
@@ -3519,6 +3534,11 @@ export class AgentSession {
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
 
+	/** Transcript file size immediately after a transcriptFile emergency compaction.
+	 *  Used to prevent re-triggering compaction on every prompt when the file cannot
+	 *  shrink further; allows 50% growth margin before re-triggering. */
+	#transcriptFileSizeAfterLastCompaction: number | undefined;
+
 	#rebuildEventListenerSnapshot(): void {
 		this.#eventListenerSnapshot = Object.freeze([...this.#eventListeners]);
 		__agentSessionPerfCounters.listenerSnapshotRebuilds += 1;
@@ -5456,6 +5476,11 @@ export class AgentSession {
 			this.#sessionTransitionGeneration += 1;
 			this.#discoveredToolActivationChain = Promise.resolve();
 			if (this.#sessionTransitionKind !== "mcp-control") this.#btwGeneration += 1;
+			// Reset transcript size baseline when the active transcript changes (new-session, switch-session, etc)
+			// but not for mcp-control which preserves the same transcript
+			if (this.#sessionTransitionKind !== "mcp-control") {
+				this.#transcriptFileSizeAfterLastCompaction = undefined;
+			}
 		}
 	}
 
@@ -5869,6 +5894,7 @@ export class AgentSession {
 		}
 		return true;
 	}
+
 	/**
 	 * Allocate a FRESH prompt attempt/lineage for an allowed owned-completion
 	 * delivery (corrected turn semantics). The new turn gets a new attempt epoch
@@ -12875,8 +12901,15 @@ export class AgentSession {
 				if (isNonDispatchedToolEvent(event)) markNonDispatchedToolEvent(extensionEvent);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "auto_compaction_start") {
+				// Map emergency reasons to 'overflow' for the extension event contract
+				const extensionEventReason =
+					event.reason === "threshold" || event.reason === "idle" ? event.reason : "overflow";
 				await this.#extensionRunner.emit(
-					{ type: "auto_compaction_start", reason: event.reason, action: event.action },
+					{
+						type: "auto_compaction_start",
+						reason: extensionEventReason,
+						action: event.action,
+					},
 					undefined,
 					deliveryScope,
 				);
@@ -27411,14 +27444,32 @@ export class AgentSession {
 		if (contextWindow <= 0) return;
 		// F6: non-disableable emergency floor — compact before OOM even when token-based
 		// compaction is disabled or its threshold is set too high (weak-hardware protection).
-		const emergencyReason = emergencyCompactionReason(this.#resourceSampler());
+		const sample = this.#resourceSampler();
+		const emergencyReason = emergencyCompactionReason(
+			sample,
+			undefined, // use default limits
+			this.#transcriptFileSizeAfterLastCompaction,
+		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
-			await this.#runAutoCompaction("overflow", false, false, {
+			const compactionResult = await this.#runAutoCompaction("overflow", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
 				force: true,
+				emergencyReason,
 			});
+			// Update tracking for transcriptFile compactions to prevent re-triggering on every
+			// prompt when the file cannot shrink further. Update baseline on benign no-progress
+			// outcomes (skipped); keep failed/aborted attempts eligible for retry.
+			// Note: successful compaction ("compacted") baseline is recorded in #runAutoCompactionImpl
+			// right after entry appending to handle post-publication aborts correctly.
+			if (emergencyReason === "transcriptFile" && compactionResult.kind === "skipped") {
+				try {
+					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
+				} catch {
+					// Best effort; if we can't stat the file, don't update the tracking
+				}
+			}
 			return;
 		}
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -28822,7 +28873,16 @@ export class AgentSession {
 	 * Internal: Run auto-compaction with events.
 	 */
 	#runAutoCompaction(
-		reason: "overflow" | "threshold" | "idle",
+		reason:
+			| "overflow"
+			| "threshold"
+			| "idle"
+			| "heap"
+			| "retainedMemory"
+			| "transcriptFile"
+			| "providerBytes"
+			| "imageBytes"
+			| "messageCount",
 		willRetry: boolean,
 		deferred = false,
 		options?: {
@@ -28833,6 +28893,7 @@ export class AgentSession {
 			beforeTerminalOverflowNoop?: () => void;
 			resourceRunId?: string;
 			sdkOwnership?: SdkContinuationOwnership;
+			emergencyReason?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		if (this.#isDisposed || this.#sessionAdmissionClosing) return Promise.resolve({ kind: "skipped" });
@@ -28843,7 +28904,16 @@ export class AgentSession {
 	}
 
 	async #runAutoCompactionImpl(
-		reason: "overflow" | "threshold" | "idle",
+		reason:
+			| "overflow"
+			| "threshold"
+			| "idle"
+			| "heap"
+			| "retainedMemory"
+			| "transcriptFile"
+			| "providerBytes"
+			| "imageBytes"
+			| "messageCount",
 		willRetry: boolean,
 		deferred = false,
 		options?: {
@@ -28854,6 +28924,7 @@ export class AgentSession {
 			beforeTerminalOverflowNoop?: () => void;
 			resourceRunId?: string;
 			sdkOwnership?: SdkContinuationOwnership;
+			emergencyReason?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -28943,7 +29014,13 @@ export class AgentSession {
 
 		try {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
-			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
+			await this.#emitSessionEvent({
+				type: "auto_compaction_start",
+				reason,
+				action,
+				...(options?.emergencyReason && { emergencyReason: options.emergencyReason }),
+			});
+
 			if (autoCompactionSignal.aborted) return await emitAborted();
 			// Start the workflow projection in parallel with the synchronous compaction
 			// preparation. Overflow recovery often has no eligible history after the
@@ -29410,6 +29487,18 @@ export class AgentSession {
 			this.#commitCatalogPreservingTransition();
 			this.#recordAdaptiveCompactionReset(tokensBefore);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+			// Record transcript file baseline after entry is successfully appended and applied,
+			// BEFORE checking for abort. This ensures the baseline is updated when the entry is
+			// published, so a cancellation after publication won't cause re-triggering on the
+			// next prompt. Only update on successful compaction (kind would be "compacted"),
+			// not on skipped attempts.
+			if (options?.emergencyReason === "transcriptFile") {
+				try {
+					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
+				} catch {
+					// Best effort; if we can't stat the file, don't update the tracking
+				}
+			}
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const result: CompactionResult = {
@@ -33771,6 +33860,8 @@ export class AgentSession {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				// Reset transcript size baseline when session file changes
+				this.#transcriptFileSizeAfterLastCompaction = undefined;
 				if (preflightSessionId !== undefined && this.sessionManager.getSessionId() !== preflightSessionId)
 					throw new Error("Session MCP reload identity changed after preflight");
 				const loadedSessionFile = this.sessionManager.getSessionFile();

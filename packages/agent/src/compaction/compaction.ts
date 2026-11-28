@@ -387,6 +387,7 @@ export const DEFAULT_EMERGENCY_COMPACTION_LIMITS: EmergencyCompactionLimits = re
 export function emergencyCompactionReason(
 	sample: EmergencyCompactionSample,
 	limits: EmergencyCompactionLimits = resolveEmergencyCompactionLimits(),
+	previousTranscriptFileBytesAfterCompaction?: number,
 ): CompactionTriggerReason | null {
 	const retainedMemoryBytes = (sample.materializedResidentBytes ?? 0) + (sample.tuiCachedRenderBytes ?? 0);
 	const tuiChatChildren = sample.tuiChatChildren ?? 0;
@@ -417,8 +418,24 @@ export function emergencyCompactionReason(
 	if (
 		sample.transcriptFileBytes &&
 		sample.transcriptFileBytes > (limits.transcriptFileBytes ?? EMERGENCY_TRANSCRIPT_FILE_BYTES)
-	)
-		return "transcriptFile";
+	) {
+		// Prevent emergency compaction loop: only trigger if no previous compaction has happened,
+		// or if the file has grown significantly since the last transcriptFile compaction.
+		// Retry threshold caps at min(baseline*1.5, managed cap - safety margin) so the file
+		// is retried before hitting the managed cap. This ensures a transcript at 90MiB after
+		// compaction will retry at the lower of 135MiB (1.5x) or 112MiB (128MiB cap - 16MiB margin).
+		const TRANSCRIPT_CAP_BYTES = 128 * 1024 * 1024; // matches MANAGED_ARTIFACT_MAX_FILE_BYTES
+		const SAFETY_MARGIN_BYTES = 16 * 1024 * 1024;
+		const retryThresholdBytes = previousTranscriptFileBytesAfterCompaction
+			? Math.max(
+					previousTranscriptFileBytesAfterCompaction,
+					Math.min(previousTranscriptFileBytesAfterCompaction * 1.5, TRANSCRIPT_CAP_BYTES - SAFETY_MARGIN_BYTES),
+				)
+			: undefined;
+		if (!retryThresholdBytes || sample.transcriptFileBytes > retryThresholdBytes) {
+			return "transcriptFile";
+		}
+	}
 	if (sample.providerBytes > limits.providerBytes) return "providerBytes";
 	if (sample.imageBytes > limits.imageBytes) return "imageBytes";
 	if (sample.messageCount > limits.messageCount) return "messageCount";
