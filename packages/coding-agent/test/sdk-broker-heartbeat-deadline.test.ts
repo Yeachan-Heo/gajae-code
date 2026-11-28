@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as lockModule from "../src/config/file-lock";
 import { Broker } from "../src/sdk/broker/broker";
-import { brokerDiscoveryPath, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { BROKER_HEARTBEAT_TTL_MS, brokerDiscoveryPath, readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
@@ -148,6 +148,64 @@ describe("broker startup heartbeat budget", () => {
 			expect((await readBrokerDiscovery(dir))?.ownerId).toBe(discovery.ownerId);
 		} finally {
 			await successor.stop();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a retained successor record before claiming discovery ownership", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-successor-record-"));
+		const file = brokerDiscoveryPath(dir);
+		let successorRecord = "";
+		const broker = new Broker({
+			agentDir: dir,
+			port: 0,
+			startupAfterDiscoveryWriteTestHook: async () => {
+				successorRecord = JSON.stringify({
+					...(await Bun.file(file).json()),
+					ownerId: "successor-owner",
+				});
+				await Bun.write(`${file}.successor`, successorRecord);
+				await fs.rename(`${file}.successor`, file);
+			},
+		});
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker discovery record changed before retained publication.");
+			expect(broker.ownsDiscovery).toBe(false);
+			expect(await fs.readFile(file, "utf8")).toBe(successorRecord);
+			expect((await readBrokerDiscovery(dir))?.ownerId).toBe("successor-owner");
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes its own record when the startup checkpoint outlasts the discovery heartbeat TTL", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-stale-own-record-"));
+		const realNow = Date.now.bind(Date);
+		let skewMs = 0;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + skewMs);
+		let ready = false;
+		const broker = new Broker({
+			agentDir: dir,
+			port: 0,
+			startupPrePublicationTestHook: async () => {
+				skewMs = BROKER_HEARTBEAT_TTL_MS + 1_000;
+			},
+			onStartupReady: () => {
+				ready = true;
+			},
+		});
+		try {
+			const discovery = await broker.start();
+			expect(ready).toBe(true);
+			expect(broker.ownsDiscovery).toBe(true);
+			expect(await Bun.file(brokerDiscoveryPath(dir)).json()).toMatchObject({
+				ownerId: discovery.ownerId,
+				token: discovery.token,
+			});
+		} finally {
+			clock.mockRestore();
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
