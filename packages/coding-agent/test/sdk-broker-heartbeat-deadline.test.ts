@@ -153,6 +153,33 @@ describe("broker startup heartbeat budget", () => {
 		}
 	});
 
+	it("rejects a retained successor record before claiming discovery ownership", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-successor-record-"));
+		const file = brokerDiscoveryPath(dir);
+		let successorRecord = "";
+		const broker = new Broker({
+			agentDir: dir,
+			port: 0,
+			startupAfterDiscoveryWriteTestHook: async () => {
+				successorRecord = JSON.stringify({
+					...(await Bun.file(file).json()),
+					ownerId: "successor-owner",
+				});
+				await Bun.write(`${file}.successor`, successorRecord);
+				await fs.rename(`${file}.successor`, file);
+			},
+		});
+		try {
+			await expect(broker.start()).rejects.toThrow();
+			expect(broker.ownsDiscovery).toBe(false);
+			expect(await fs.readFile(file, "utf8")).toBe(successorRecord);
+			expect((await readBrokerDiscovery(dir))?.ownerId).toBe("successor-owner");
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("aborts startup after slow process probes exhaust the checkpoint budget", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-heartbeat-probe-deadline-"));
 		const index = await new SessionIndex(dir).open();

@@ -242,6 +242,18 @@ function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBroke
 	}
 }
 
+async function requirePublishedDiscovery(agentDir: string, expected: BrokerDiscovery): Promise<void> {
+	const current = await readBrokerDiscovery(agentDir);
+	if (
+		!current ||
+		current.ownerId !== expected.ownerId ||
+		current.pid !== expected.pid ||
+		current.incarnation !== expected.incarnation ||
+		current.token !== expected.token
+	)
+		throw new Error("Broker discovery record changed before retained publication.");
+}
+
 async function rollbackPublishedBrokerDiscovery(agentDir: string, discovery: BrokerDiscovery): Promise<void> {
 	const file = brokerDiscoveryPath(agentDir);
 	try {
@@ -500,6 +512,7 @@ export async function publishBrokerDiscovery(
 			rootDigest: await canonicalServiceRootDigest(agentDir),
 		};
 		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		await requirePublishedDiscovery(agentDir, published);
 		if (platform === "win32") retained = new LegacyWindowsBrokerDiscovery(agentDir, published);
 		else retained = new NativeRetainedBrokerDiscovery(requireRetainedBrokerPublication(agentDir));
 		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
