@@ -77,7 +77,6 @@ describe("graph successors after root shared append", () => {
 		await fs.mkdir(artifacts, { recursive: true, mode: 0o700 });
 		await fs.writeFile(path.join(artifacts, "1.bash.log"), "tool output", { mode: 0o600 });
 		const bytes = await bytesAt(file);
-		expect(manager.graphSuccessorRefusal({ wholeSession: true })).toBeUndefined();
 		const stage = await manager.prepareFork();
 		if (!stage?.sessionFile || !stage.artifactsDir) throw new Error("missing fork transcript");
 		expect(await Bun.file(path.join(stage.artifactsDir, "1.bash.log")).text()).toBe("tool output");
@@ -92,7 +91,7 @@ describe("graph successors after root shared append", () => {
 
 	it("refuses an entry that is not on this opener's committed graph", async () => {
 		const { manager } = await twoSharedPrompts();
-		expect(manager.graphSuccessorRefusal({ leafId: "missing" })).toBe("unknown-entry");
+		expect(manager.graphSuccessorRefusal("missing")).toBe("unknown-entry");
 		await expect(manager.prepareBranchedSession("missing")).rejects.toThrow();
 	});
 
