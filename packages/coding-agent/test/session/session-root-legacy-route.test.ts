@@ -131,14 +131,14 @@ describe.skipIf(!supported)("the root session write route", () => {
 		await target.close();
 
 		const sessionManager = await manager(place.cwd, place.managed, "enforce");
-		const seen: boolean[] = [];
+		const seen: (string | undefined)[] = [];
 		let session: AgentSession | undefined;
 		const extensionRunner = {
 			hasHandlers: () => false,
 			emit: async (event: { type: string }) => {
 				if (event.type !== "session_switch" || !session) return;
 				await session.appendCustomEntryForSession("switch-hook", { wrote: true });
-				seen.push(sessionManager.requiresSharedMutationAdmission());
+				seen.push(sessionManager.getSessionFile());
 			},
 		} as unknown as ExtensionRunner;
 		session = await rootSession(sessionManager, place.root, extensionRunner);
@@ -152,7 +152,7 @@ describe.skipIf(!supported)("the root session write route", () => {
 		expect(notices).toEqual([]);
 		// The rotation's own claim released the cover when it landed, before the hook wrote.
 		expect(admission?.released).toBe(true);
-		expect(seen).toEqual([false]);
+		expect(seen).toEqual([targetFile]);
 		admission?.release();
 		const [row] = (await sessionManager.listForResumePickerReadOnly()).filter(
 			candidate => candidate.path === targetFile,
@@ -171,7 +171,6 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 			failOpenLocks(failOpen);
 		const sessionManager = await manager(place.cwd, place.managed, mode);
 		const session = await rootSession(sessionManager, place.root);
-		expect(sessionManager.requiresSharedMutationAdmission()).toBe(false);
 		await session.prompt("first prompt");
 		await session.prompt("second prompt");
 		await sessionManager.flush();
@@ -182,7 +181,6 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 
 	it.each(ROUTES)("%s (fail-open: %s): star, rewrite, rewind and /fork all take effect", async (mode, failOpen) => {
 		const { sessionManager, session, users, file } = await prompted(mode, failOpen);
-		expect(sessionManager.requiresSharedMutationAdmission()).toBe(false);
 		const [row] = await sessionManager.listForResumePickerReadOnly();
 		await sessionManager.setSessionStarredForPicker(row!, true);
 		expect(sessionManager.isSessionStarred()).toBe(true);
@@ -201,7 +199,6 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		expect(sessionManager.getSessionId()).not.toBe(sourceId);
 		// The direct route names the parent by its transcript path, as dev's legacy branch does.
 		expect(sessionManager.getHeader()?.parentSession).toBe(sourceFile);
-		expect(sessionManager.requiresSharedMutationAdmission()).toBe(false);
 	});
 
 	/** A writer the holder cannot see (ownership off, an older binary) appends to the transcript. */

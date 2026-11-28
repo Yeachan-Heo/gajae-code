@@ -181,7 +181,6 @@
     "SessionTranscriptOversizedError",
     "Settings",
     "SettingsSelectorComponent",
-    "SharedSessionMutationUnsupportedError",
     "ShowImagesSelectorComponent",
     "SideConversationControls",
     "Spacer",

@@ -10,7 +10,7 @@ import { AgentRegistry } from "../src/registry/agent-registry";
 import { createAgentSession } from "../src/sdk/session";
 import { getSessionClientControls } from "../src/sdk/session-client-controls";
 import { AuthStorage } from "../src/session/auth-storage";
-import { SessionManager } from "../src/session/session-manager";
+import { SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
 
 async function fixture(
 	managed: boolean | "explicit" = false,
@@ -1182,15 +1182,13 @@ test.each([
 		const old = getSessionClientControls(session),
 			oldFile = manager.getSessionFile(),
 			generation = manager.getCwdGeneration();
-		const actual = manager.assertLegacyMutationAllowed.bind(manager);
-		const metadata = spyOn(manager, "assertLegacyMutationAllowed").mockImplementation(operation => {
-			if (operation === "append header patch") throw new Error("metadata rejected");
-			actual(operation);
-		});
+		SessionManagerTestHooks.beforeHeaderPatch = patch => {
+			if (patch.cwd !== undefined) throw new Error("metadata rejected");
+		};
 		try {
 			await expect(manager.moveTo(destination.path())).rejects.toThrow("metadata rejected");
 		} finally {
-			metadata.mockRestore();
+			SessionManagerTestHooks.beforeHeaderPatch = undefined;
 		}
 		expect(manager.getCwdGeneration()).toBeGreaterThan(generation);
 		expect(manager.getCwd()).toBe(managed ? env.cwd : path.resolve(destination.path()));

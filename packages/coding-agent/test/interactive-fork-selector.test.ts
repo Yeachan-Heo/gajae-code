@@ -742,28 +742,4 @@ describe("interactive /fork prompt selector", () => {
 		expect(harness.editorContainer.children).toEqual([harness.editor]);
 		expect([...harness.errors, ...harness.statuses].join("\n")).toContain("Usage: /fork");
 	});
-
-	it("refuses before goal continuation or the side chat change when no prompt can fork", async () => {
-		const harness = await createHarness({ messages: 0 });
-		harness.sessionManager.appendModelChange("anthropic/claude-sonnet-4-5", "default");
-		harness.sessionManager.appendMessage({ role: "user", content: "prompt-1", timestamp: 1_000 });
-		harness.sessionManager.appendMessage(assistantMessage("answer-1", 1_001));
-		await harness.sessionManager.flush();
-		vi.spyOn(harness.sessionManager, "graphSuccessorRefusal").mockReturnValue("foreign-entry");
-		await dispatchFork(harness);
-		expect(harness.errors).toEqual([
-			"Fork failed: Cannot fork this session: another gjc process has written to this session.",
-		]);
-		expect(harness.cancelGoalContinuation).not.toHaveBeenCalled();
-		expect(harness.ctx.handleBtwEscape).not.toHaveBeenCalled();
-		expect(harness.editorContainer.children).toEqual([harness.editor]);
-	});
-
-	it("still opens when a parentless prompt can start a fresh successor", async () => {
-		const harness = await createHarness();
-		vi.spyOn(harness.sessionManager, "graphSuccessorRefusal").mockReturnValue("foreign-entry");
-		await dispatchFork(harness);
-		expect(harness.errors).toEqual([]);
-		expect(visibleSelector(harness)).toBeInstanceOf(UserMessageSelectorComponent);
-	});
 });

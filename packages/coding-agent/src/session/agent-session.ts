@@ -869,24 +869,17 @@ export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" |
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
 /**
- * A session control was refused before any effect (#7823, #7824).
- *
- * The only thrower is the control fence: a control whose session manager was replaced
- * while it awaited is refused as `rejected` (`publication_mode_changed`).
+ * A session control was refused before any effect because its session manager was
+ * replaced (a fork) while it awaited (#7823, #7824). Thrown only by the control fence.
  */
-export class SharedControlPublicationError extends Error {
+export class SessionControlReplacedError extends Error {
 	readonly code = "rejected" as const;
 
-	constructor(
-		readonly operation: string,
-		readonly outcome: { readonly kind: "rejected"; readonly error: unknown },
-		publicationCause?: unknown,
-	) {
+	constructor(readonly operation: string) {
 		super(
 			`Could not ${operation}: the session was replaced before the update was written. Nothing was changed; retry.`,
-			{ cause: publicationCause ?? outcome },
 		);
-		this.name = "SharedControlPublicationError";
+		this.name = "SessionControlReplacedError";
 	}
 }
 
@@ -15197,7 +15190,6 @@ export class AgentSession {
 				return tool !== undefined && isMCPBridgeTool(tool);
 			});
 			if (activated.length > 0) {
-				this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
@@ -15543,12 +15535,6 @@ export class AgentSession {
 			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
-		const assertControlMutationAllowed = () => {
-			if (options?.explicitActiveToolSelectionGeneration !== undefined) {
-				this.sessionManager.assertLegacyMutationAllowed("select active tools");
-			}
-		};
-		assertControlMutationAllowed();
 		const activeToolSelectionRevision = this.#activeToolSelectionRevision;
 		const selectionIsCurrent = () =>
 			(options?.fence?.isCurrent() ?? true) &&
@@ -15641,7 +15627,6 @@ export class AgentSession {
 					return undefined;
 				}
 				if (generation !== this.#baseSystemPromptGeneration) continue;
-				assertControlMutationAllowed();
 				this.#baseSystemPrompt = built.systemPrompt;
 				this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				this.#lastAppliedToolSignature = signature;
@@ -15735,7 +15720,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: { explicit?: boolean; persistMCPSelection?: boolean; retryOnMcpCatalogChange?: boolean },
 	): Promise<void> {
-		const assertPublicationMode = this.#controlPublicationModeFence("select active tools");
+		const assertSessionCurrent = this.#controlSessionFence("select active tools");
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
 		const shouldPersistMCPSelectionIfUnchanged =
@@ -15801,7 +15786,7 @@ export class AgentSession {
 					!sessionContext.hasPersistedMCPToolSelection ||
 					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
 				) {
-					assertPublicationMode();
+					assertSessionCurrent();
 					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
 				}
 			}
@@ -16526,7 +16511,7 @@ export class AgentSession {
 
 	/** Credential intent is durable before it is live (#7824): a refused write leaves AuthStorage untouched. */
 	async #publishCredentialIntentThenApply(data: Record<string, unknown>, apply: () => void): Promise<void> {
-		this.#controlPublicationModeFence("change credential selection");
+		this.#controlSessionFence("change credential selection");
 		this.sessionManager.appendCustomEntry("auth-credential-pin", data);
 		apply();
 	}
@@ -22103,13 +22088,11 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
-		// /drop deletes the predecessor after the successor is live. A shared session's
-		// transcript cannot be deleted by this opener (#7824): refuse before switching
-		// instead of switching and then reporting a drop that never happened.
+		// /drop deletes the predecessor after the successor is live. A transcript another
+		// process changed is not this opener's to delete: refuse before switching instead
+		// of switching and then reporting a drop that never happened.
 		if (options?.drop) {
 			try {
-				this.sessionManager.assertLegacyMutationAllowed("drop session");
-				// On the legacy route, a transcript another process changed is not this opener's to delete.
 				this.sessionManager.assertTranscriptUnchanged();
 			} catch (error) {
 				return Promise.reject(error);
@@ -22422,12 +22405,12 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		// A context clear appends a parentless root marker; the legacy refusal runs before
+		// A context clear appends a parentless root marker; the session fence runs before
 		// resetting anything. A transcript that already refuses writes is refused before the
 		// agent reset, which would otherwise drop the in-memory history and then fail at the flush.
 		this.#assertTranscriptAcceptsTurn();
 		const operation = "clear context";
-		const assertMode = this.#controlPublicationModeFence(operation);
+		const assertSessionCurrent = this.#controlSessionFence(operation);
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -22442,7 +22425,7 @@ export class AgentSession {
 			this.#closeAllProviderSessions("context clear");
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
-			assertMode();
+			assertSessionCurrent();
 			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
@@ -22582,13 +22565,6 @@ export class AgentSession {
 				this.#followUpMessages = [];
 				this.#resetActiveSdkRunOwnership();
 			};
-
-			// Refuse before the hook and the agent disconnect below. A bounded cold fork
-			// copies through SessionManager.forkFrom, not prepareFork.
-			const forkRefusal = this.sessionManager.getSessionMemoryStats().coldRetirementActive
-				? undefined
-				: this.sessionManager.graphSuccessorRefusal({ wholeSession: true });
-			if (forkRefusal) throw new GraphSuccessorUnavailableError("prepare fork", forkRefusal);
 
 			// Emit session_before_switch event with reason "fork" (can be cancelled)
 			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
@@ -22813,14 +22789,12 @@ export class AgentSession {
 			);
 			return;
 		}
-		this.sessionManager.assertLegacyMutationAllowed("set model");
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
-		this.sessionManager.assertLegacyMutationAllowed("set model");
 		options?.onMutationStarted?.();
 		const cause = options?.cause ?? "user-selection";
 		if (cause === "user-selection") this.markUserModelSelection();
@@ -23309,15 +23283,6 @@ export class AgentSession {
 						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
 					}
 
-					if (prepared || preparedLiveModelSelection) {
-						try {
-							this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
-						} catch (error) {
-							stagedModels!.rollback();
-							modelRollbackAttempted = true;
-							throw new ConfigurationReloadError("PUBLICATION_FAILED", error);
-						}
-					}
 					let publication: SettingsConfigReloadPublication | undefined;
 					let modelCommitStarted = false;
 					let activationPublicationStarted = false;
@@ -23964,7 +23929,6 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
-		this.sessionManager.assertLegacyMutationAllowed("select model profile");
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		this.#assertSessionAdmissionOpen();
@@ -24028,7 +23992,6 @@ export class AgentSession {
 			}
 		};
 		const assertRuntime = () => {
-			this.sessionManager.assertLegacyMutationAllowed("select model profile");
 			assertBound();
 			if (!util.isDeepStrictEqual(captureRuntime(), expectedRuntime))
 				throw new Error("Session model, thinking, or role intent changed while selecting profile");
@@ -24217,14 +24180,6 @@ export class AgentSession {
 		};
 	}
 
-	/**
-	 * Refuse before any caller-side effect when {@link setConfiguredModelChain}'s legacy
-	 * append would be refused (shared admission latched; #7824).
-	 */
-	assertConfiguredModelChainWritable(): void {
-		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
-	}
-
 	/** Persist the configured fallback selectors for a model role. */
 	setConfiguredModelChain(
 		role: string,
@@ -24389,7 +24344,6 @@ export class AgentSession {
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
 		if (options?.signal?.aborted) return;
-		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		this.#btwPrefixLedger.clear();
 		const suppliedScope = options?.providerSessionScope;
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
@@ -24410,7 +24364,6 @@ export class AgentSession {
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
 		if (options?.shouldMutate && !options.shouldMutate()) return;
 		const assertCurrent = () => {
-			this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 			options?.signal?.throwIfAborted();
 			if (
 				this.sessionId !== expectedSessionId ||
@@ -24420,7 +24373,6 @@ export class AgentSession {
 			)
 				throw new Error("Session changed while selecting temporary model");
 		};
-		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		options?.onMutationStarted?.();
 		let materialized = false;
 		if (observedAtRequest?.marker.kind === "profile") {
@@ -24467,7 +24419,6 @@ export class AgentSession {
 		if (replaceAutoScope && currentAutoScope) {
 			await this.#restoreTopTemporaryProviderSessionScope();
 		}
-		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		const scope = isTemporaryOperation
 			? (suppliedScope ??
 				(replaceAutoScope && this.model && modelsAreEqual(this.model, model)
@@ -24647,7 +24598,6 @@ export class AgentSession {
 		thinkingLevel: ThinkingLevel | undefined,
 		durable?: ModelSelectionRollbackDurableState,
 	): Promise<void> {
-		this.sessionManager.assertLegacyAppendAllowed("restore model selection");
 		if (durable?.defaultChain) {
 			const chain = durable.defaultChain.state;
 			this.setConfiguredModelChain(
@@ -24864,7 +24814,7 @@ export class AgentSession {
 			onAfterMutationAdmissionReadyForTests?: () => Promise<void>;
 		},
 	): Promise<DefaultModelSelectionResult> {
-		const assertPublicationMode = this.#controlPublicationModeFence("select default model");
+		const assertSessionCurrent = this.#controlSessionFence("select default model");
 		// Reserve the causal selection fence synchronously, before credential
 		// probing can yield. Later external prompts wait behind this operation,
 		// while an inherited post-prompt continuation may bypass the fence so
@@ -24924,7 +24874,7 @@ export class AgentSession {
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
-					assertPublicationMode();
+					assertSessionCurrent();
 					options?.onBeforeMutation?.();
 					if (this.sessionId !== expectedSessionId) {
 						throw new Error("Session changed while selecting model");
@@ -24977,7 +24927,7 @@ export class AgentSession {
 						| undefined;
 					const materialized = materializedRoles !== undefined;
 					const assertCurrent = () => {
-						assertPublicationMode();
+						assertSessionCurrent();
 						// Disposal drains the already-authorized selection transaction;
 						// it rejects new/queued ingress without revoking that owner's lease.
 						if (
@@ -25185,7 +25135,6 @@ export class AgentSession {
 	): Promise<RoleModelCycleResult | undefined> {
 		const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
 		if (roleModels.length <= 1) return undefined;
-		this.sessionManager.assertLegacyMutationAllowed("cycle role models");
 
 		const currentModel = this.model!;
 
@@ -25247,7 +25196,6 @@ export class AgentSession {
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		if (this.#scopedModels.length <= 1) return undefined;
-		this.sessionManager.assertLegacyMutationAllowed("cycle models");
 		const observedOwnership = readDurableModelProfileOwnership(this.settings);
 		const scopedModels = await this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
@@ -25326,9 +25274,6 @@ export class AgentSession {
 		operatorIntent: boolean,
 		onApplied?: (mutationRevision: number) => void,
 	): void {
-		if (persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel) {
-			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
-		}
 		this.#btwPrefixLedger.clear();
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
@@ -25358,10 +25303,7 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		if (persist) {
-			return this.sessionManager.withDurableThinkingControl(() => this.#setThinkingLevelForControl(level, true));
-		}
-		return this.#setThinkingLevelForControl(level, false);
+		return this.#setThinkingLevelForControl(level, persist);
 	}
 
 	/** Non-operator, session-only thinking change (plan mode model follow): the synchronous legacy write. */
@@ -25370,7 +25312,6 @@ export class AgentSession {
 	}
 
 	async #setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		const previousThinkingLevel = this.thinkingLevel;
 		if (!persist) {
 			this.#applyThinkingLevel(
@@ -25429,7 +25370,6 @@ export class AgentSession {
 			throw new Error("Unable to persist reasoning settings.");
 		}
 
-		this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		if (
 			mutationRevision === this.#thinkingLevelMutationRevision &&
 			this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision
@@ -25729,7 +25669,6 @@ export class AgentSession {
 	#applyLegacyServiceTier(serviceTier: ServiceTier | undefined): void {
 		const rearm = serviceTier === "priority" || serviceTier === "claude-only";
 		if (this.serviceTier === serviceTier && !rearm) return;
-		this.sessionManager.assertLegacyMutationAllowed("set service tier");
 		this.#btwPrefixLedger.clear();
 		if (rearm) this.#rearmFastMode();
 		if (this.serviceTier === serviceTier) return;
@@ -25739,7 +25678,6 @@ export class AgentSession {
 
 	async setFastMode(enabled: boolean): Promise<void> {
 		if (enabled && this.isFastModeEnabled()) {
-			this.sessionManager.assertLegacyMutationAllowed("rearm fast mode");
 			this.#rearmFastMode();
 			return;
 		}
@@ -25813,10 +25751,8 @@ export class AgentSession {
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<ToolOutputPruneResult | undefined> {
-		this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
-		this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
 		// Over-threshold callers have already proven tool-output savings before entering
 		// this path. If exact persistence is unavailable, fail closed before hashing and
 		// planning large outputs so maintenance cannot drift into timeout-driven abort.
@@ -25854,12 +25790,6 @@ export class AgentSession {
 					candidate => candidate.type === "message" && candidate.id === digest.entryId,
 				);
 				if (entry?.type !== "message" || entry.message.role !== "toolResult") continue;
-				try {
-					this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
-				} catch (error) {
-					await removePublishedArtifacts();
-					throw error;
-				}
 				const captured = extractToolOutputText(entry.message as ToolResultMessage);
 				const outcome = await artifactManager.publishExactText(captured.text, { toolType: "evicted" });
 				if (outcome.outcome === "saved") {
@@ -25937,12 +25867,6 @@ export class AgentSession {
 		if (signal?.aborted) {
 			await removePublishedArtifacts();
 			return undefined;
-		}
-		try {
-			this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
-		} catch (error) {
-			await removePublishedArtifacts();
-			throw error;
 		}
 		const rollbackIds = new Set<string>();
 		for (const digest of plan.digests) rollbackIds.add(digest.entryId);
@@ -26205,7 +26129,6 @@ export class AgentSession {
 		// Compaction runs hooks and a summarization model before its append; a transcript
 		// that already refuses writes would spend both and then fail.
 		this.#assertTranscriptAcceptsTurn();
-		this.sessionManager.assertLegacyMutationAllowed("compact session");
 		this.#assertSessionAdmissionOpen();
 		// Automatic context maintenance owns the transition lease while its
 		// post-append hooks run. A manual request must join behind that owner so
@@ -26218,7 +26141,6 @@ export class AgentSession {
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
-		this.sessionManager.assertLegacyMutationAllowed("compact session");
 		this.#beginSessionTransition("compact");
 		const completion = Promise.withResolvers<void>();
 		this.#compactionCompletion = completion.promise;
@@ -26309,13 +26231,11 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
 				// Bind the destination before the snapshot's asynchronous workflow reads.
 				const compactionManager = this.sessionManager;
 				const compactionStateSnapshot = await this.#compactionStateSnapshot({
 					trackWorkflowRecoveryProgress: true,
 				});
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
 				if (!this.model) {
 					throw new Error("No model selected");
 				}
@@ -26364,13 +26284,11 @@ export class AgentSession {
 					}
 				}
 
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
 				const compactionPrep = await this.#prepareCompactionFromHooks(
 					preparation,
 					hookCompaction,
 					compactionStateSnapshot,
 				);
-				this.sessionManager.assertLegacyMutationAllowed("compact session");
 
 				let summary: string;
 				let shortSummary: string | undefined;
@@ -27551,7 +27469,6 @@ export class AgentSession {
 		if (!checkpointState) {
 			return;
 		}
-		this.sessionManager.assertLegacyMutationAllowed("rewind session");
 		const safeCount = Math.max(0, Math.min(checkpointState.checkpointMessageCount, this.agent.state.messages.length));
 		this.agent.replaceMessages(this.agent.state.messages.slice(0, safeCount), {
 			historyRewrite: { reason: "rewind", preserveSeededPrefix: true },
@@ -28710,7 +28627,6 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		this.sessionManager.assertLegacyMutationAllowed("compact session");
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
@@ -28728,7 +28644,6 @@ export class AgentSession {
 				continue;
 			}
 
-			this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -30058,12 +29973,6 @@ export class AgentSession {
 			resolution.explicitThinkingLevel,
 			resolution.thinkingLevel,
 		);
-		const effectiveThinking = resolution.model
-			? resolveThinkingLevelForModel(resolution.model, thinkingLevel)
-			: this.#thinkingLevel;
-		// The legacy refusal runs before seeding fallback state or switching the model.
-		if (resolution.model && effectiveThinking !== this.#thinkingLevel)
-			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		if (activeIndex > resolutionStart) {
 			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		} else {
@@ -31866,21 +31775,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Bind a control to the session manager it started on and the legacy refusal: a control
-	 * whose session was replaced (fork) while it awaited is refused before effects.
+	 * Bind a control to the session manager it started on: a control whose session was
+	 * replaced (fork) while it awaited is refused before effects.
 	 */
-	#controlPublicationModeFence(operation: string): () => void {
+	#controlSessionFence(operation: string): () => void {
 		const manager = this.sessionManager;
-		const assertMode = () => {
-			if (this.sessionManager !== manager)
-				throw new SharedControlPublicationError(operation, {
-					kind: "rejected",
-					error: new Error("publication_mode_changed"),
-				});
-			manager.assertLegacyMutationAllowed(operation);
+		const assertSessionCurrent = () => {
+			if (this.sessionManager !== manager) throw new SessionControlReplacedError(operation);
 		};
-		assertMode();
-		return assertMode;
+		assertSessionCurrent();
+		return assertSessionCurrent;
 	}
 
 	async #promptAgentWithIdleRetry(
@@ -34415,7 +34319,7 @@ export class AgentSession {
 			}
 			// Refuse before the hook, the agent disconnect and the /btw settle below.
 			const branchRefusal = selectedEntry.parentId
-				? this.sessionManager.graphSuccessorRefusal({ leafId: selectedEntry.parentId })
+				? this.sessionManager.graphSuccessorRefusal(selectedEntry.parentId)
 				: undefined;
 			if (branchRefusal) throw new GraphSuccessorUnavailableError("prepare branched session", branchRefusal);
 			const previousSessionFile = this.sessionFile;
@@ -34783,9 +34687,6 @@ export class AgentSession {
 		// lease (handoff/compact/new/switch/branch/clear/fork). navigateTree rewrites
 		// live history in place, so a concurrent transition would race the same state.
 		const currentLeafId = this.sessionManager.getLeafId();
-		if (targetId !== currentLeafId && options.summarize) {
-			this.sessionManager.assertLegacyMutationAllowed("summarize branch");
-		}
 		this.#beginSessionTransition("navigate-tree");
 		try {
 			const oldLeafId = currentLeafId;
@@ -34848,14 +34749,10 @@ export class AgentSession {
 				}
 			}
 
-			if (options.summarize && entriesToSummarize.length > 0)
-				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
 			this.#disconnectFromAgent();
 			await this.#settleActivePromptForHistoryTransition();
 
-			if (options.summarize && entriesToSummarize.length > 0)
-				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
@@ -34865,7 +34762,6 @@ export class AgentSession {
 				if (!apiKey) {
 					throw new Error(`No API key for ${model.provider}`);
 				}
-				this.sessionManager.assertLegacyMutationAllowed("summarize branch");
 				const branchSummarySettings = this.settings.getGroup("branchSummary");
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...this.#maintenanceProviderTransport(),

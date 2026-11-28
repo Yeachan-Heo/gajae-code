@@ -62,7 +62,6 @@ type ModelProfileActivationSession = Pick<
 	"model" | "thinkingLevel" | "sessionId" | "getConfiguredModelChain" | "setConfiguredModelChain"
 > & {
 	credentialSessionId?: string;
-	assertConfiguredModelChainWritable?: AgentSession["assertConfiguredModelChainWritable"];
 	setModelTemporary?: AgentSession["setModelTemporary"];
 	setActiveModelProfile?: (name: string | undefined, activatedByThisProcess?: boolean) => void;
 	getActiveModelProfile?: () => string | undefined;
@@ -310,7 +309,6 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "getConfiguredModelChain"
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
-		| "assertConfiguredModelChainWritable"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getActivatedModelProfile"
@@ -343,7 +341,6 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "getConfiguredModelChain"
 		| "getConfiguredModelChainState"
 		| "setConfiguredModelChain"
-		| "assertConfiguredModelChainWritable"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getActivatedModelProfile"
@@ -556,8 +553,6 @@ async function commitMaterializedProfileAssignments(
 	const writesChain = !preserveStartupOverrideChain || previousChain?.origin !== "startup-override";
 	const assertCurrent = () => {
 		options.validateCurrent?.();
-		// The chain append below must not be refused after the durable settings commit.
-		if (writesChain) options.session.assertConfiguredModelChainWritable?.();
 		if (
 			options.session.sessionId !== sessionId ||
 			options.session.model !== previousModel ||

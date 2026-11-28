@@ -59,7 +59,6 @@ function createForkContext(branch: () => Promise<boolean>, committedFailure = fa
 			getSessionFile: () => sessionFile,
 			getSessionId: () => sessionFile,
 			getCwd: () => "/tmp",
-			graphSuccessorRefusal: () => undefined,
 		},
 		editor,
 		editorContainer,

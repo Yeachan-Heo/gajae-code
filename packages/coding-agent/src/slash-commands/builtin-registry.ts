@@ -2633,8 +2633,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			if (!isDirectory) return usage(`Directory does not exist or is not a directory: ${resolvedPath}`, runtime);
 			try {
-				// Refuse before flushing, not from inside moveTo.
-				runtime.sessionManager.assertLegacyMutationAllowed("move session");
 				await runtime.sessionManager.flush();
 				await runtime.sessionManager.moveTo(resolvedPath);
 			} catch (err) {
