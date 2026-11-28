@@ -7,6 +7,7 @@ import {
 	decodePastedPathCandidate,
 	decodePastedPathCandidates,
 	formatPastedImageReference,
+	imageReferenceNumbers,
 	locatePastedImageReferenceAroundCursor,
 	MAX_PASTED_IMAGE_COUNT,
 	MAX_PASTED_IMAGE_PATH_CHARACTERS,
@@ -396,5 +397,38 @@ describe("trailing terminal newlines", () => {
 			}),
 			{ seed: 433, numRuns: 64 },
 		);
+	});
+});
+
+describe("imageReferenceNumbers with source spans", () => {
+	it("skips placeholders inside source paths while keeping the ones between them", () => {
+		const a = formatPastedImageReference("[image 1]", "/tmp/[image 9].png");
+		const b = formatPastedImageReference("[image 2]", "/tmp/b.png");
+		const c = formatPastedImageReference("[image 3]", "/tmp/[image 8].png");
+		expect(imageReferenceNumbers(`${a} then [image 4] ${b} and [image 5] ${c} end [image 6]`)).toEqual([
+			1, 4, 2, 5, 3, 6,
+		]);
+	});
+
+	it("classifies a large interleaved paste in linear time", () => {
+		const unit = `${formatPastedImageReference("[image 1]", "/tmp/a.png")} [image 2] `;
+		// 40k units (1.6 MB) take about 5 s with a per-placeholder scan of the span list and a few ms with a sweep.
+		const line = unit.repeat(40000);
+		const started = performance.now();
+		const numbers = imageReferenceNumbers(line);
+		const elapsed = performance.now() - started;
+		expect(numbers.length).toBe(80000);
+		expect(elapsed).toBeLessThan(500);
+	});
+
+	it("locates a placeholder around the cursor across many source spans", () => {
+		const unit = `${formatPastedImageReference("[image 1]", "/tmp/[image 7].png")} `;
+		const line = unit.repeat(500);
+		const end = unit.length * 499 + "[image 1]".length;
+		expect(locatePastedImageReferenceAroundCursor(line, end)).toEqual({
+			imageIndex: 1,
+			startCol: unit.length * 499,
+			endCol: unit.length * 500 - 1,
+		});
 	});
 });

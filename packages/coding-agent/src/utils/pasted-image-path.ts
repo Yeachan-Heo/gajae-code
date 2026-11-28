@@ -373,7 +373,8 @@ function findJsonStringEnd(text: string, startCol: number): number | null {
  */
 function findSourceValueSpans(line: string): Array<{ start: number; end: number }> {
 	const spans: Array<{ start: number; end: number }> = [];
-	const sourcePattern = /source=/g;
+	// The editor writes `source=` as its own field after a placeholder, so it must start a token.
+	const sourcePattern = /(?<![^\s])source=/g;
 	while (true) {
 		const match = sourcePattern.exec(line);
 		if (!match) return spans;
@@ -391,7 +392,23 @@ function findSourceValueSpans(line: string): Array<{ start: number; end: number 
  * images its text already names.
  */
 export function imageReferenceNumbers(text: string): number[] {
-	return Array.from(text.matchAll(/\[image ([1-9]\d*)\]/g), match => Number.parseInt(match[1] ?? "", 10));
+	const numbers: number[] = [];
+	for (const line of text.split("\n")) {
+		// Spans are disjoint and in order, and matchAll yields placeholders in order, so one
+		// forward sweep classifies every placeholder in linear time.
+		const sourceValueSpans = findSourceValueSpans(line);
+		let spanIndex = 0;
+		for (const match of line.matchAll(/\[image ([1-9]\d*)\]/g)) {
+			while (spanIndex < sourceValueSpans.length && (sourceValueSpans[spanIndex]?.end ?? 0) <= match.index) {
+				spanIndex += 1;
+			}
+			// A placeholder-looking token inside a validated `source="…"` path is part of the path.
+			const span = sourceValueSpans[spanIndex];
+			if (span && match.index >= span.start && match.index < span.end) continue;
+			numbers.push(Number.parseInt(match[1] ?? "", 10));
+		}
+	}
+	return numbers;
 }
 
 export function locatePastedImageReferenceAroundCursor(
@@ -401,6 +418,7 @@ export function locatePastedImageReferenceAroundCursor(
 	if (!Number.isInteger(cursorCol) || cursorCol < 0 || cursorCol > line.length) return null;
 
 	const sourceValueSpans = findSourceValueSpans(line);
+	let spanIndex = 0;
 	const placeholderPattern = /\[image ([1-9]\d*)\]/g;
 	while (true) {
 		const match = placeholderPattern.exec(line);
@@ -411,7 +429,9 @@ export function locatePastedImageReferenceAroundCursor(
 		const imageIndex = Number.parseInt(match[1] ?? "", 10);
 		if (!Number.isSafeInteger(imageIndex)) continue;
 
-		const enclosingSpan = sourceValueSpans.find(span => startCol >= span.start && startCol < span.end);
+		while (spanIndex < sourceValueSpans.length && (sourceValueSpans[spanIndex]?.end ?? 0) <= startCol) spanIndex += 1;
+		const candidateSpan = sourceValueSpans[spanIndex];
+		const enclosingSpan = candidateSpan && startCol >= candidateSpan.start ? candidateSpan : undefined;
 		if (enclosingSpan) {
 			placeholderPattern.lastIndex = enclosingSpan.end;
 			continue;

@@ -282,6 +282,9 @@ async function createContext(options?: {
 			getSessionName() {
 				return "test-session";
 			},
+			getSessionId() {
+				return "test-session-id";
+			},
 		} as unknown as InteractiveModeContext["sessionManager"],
 		locallySubmittedUserSignatures: new Set<string>(),
 		isKnownSlashCommand: () => false,
@@ -672,7 +675,11 @@ describe("InputController keybinding setup", () => {
 		await editor.onQueue?.();
 		await Bun.sleep(0);
 
-		expect(spies.queueCompactionMessage).toHaveBeenCalledWith("queue while compacting via shortcut", "followUp");
+		expect(spies.queueCompactionMessage).toHaveBeenCalledWith(
+			"queue while compacting via shortcut",
+			"followUp",
+			expect.objectContaining({ ownsComposer: true }),
+		);
 		expect(spies.prompt).not.toHaveBeenCalled();
 		expect(editor.getText()).toBe("");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);

@@ -132,6 +132,7 @@ function createStubInputControllerContext(opts: {
 		},
 		sessionManager: {
 			getCwd: () => process.cwd(),
+			getSessionId: () => "test-session-id",
 		},
 		showError,
 		updatePendingMessagesDisplay,
@@ -724,6 +725,7 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession, deq
 		pendingPythonComponents: [],
 		session,
 		compactionQueuedMessages: [],
+		pendingImages: [],
 		keybindings: {
 			getDisplayString: (_action: string) => dequeueDisplay,
 		},

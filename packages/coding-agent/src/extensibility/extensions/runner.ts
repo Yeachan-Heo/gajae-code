@@ -1706,8 +1706,8 @@ export class ExtensionRunner {
 						extensionHandlerTimeoutMs,
 					)) as InputEventResult | undefined;
 					if (result?.handled) return { action: "return", value: result };
-					if (result?.text !== undefined) {
-						currentEvent.text = result.text;
+					if (result?.text !== undefined || result?.images !== undefined) {
+						currentEvent.text = result.text ?? currentEvent.text;
 						currentEvent.images = result.images ?? currentEvent.images;
 						return { action: "continue", event: currentEvent, transformed: true };
 					}
