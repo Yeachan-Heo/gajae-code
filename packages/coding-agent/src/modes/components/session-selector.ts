@@ -90,6 +90,8 @@ class SessionList implements Component {
 	readonly #searchInput = new Input();
 	readonly #heldMarkers = new Map<string, string>();
 	#inputFrozen = false;
+	/** Cache of prebuilt search text for each session (never rebuilds per keystroke). */
+	#sessionSearchTextCache = new Map<SessionInfo, string>();
 	onSelect?: (session: SessionInfo) => void;
 	onCancel?: () => void;
 	onExit: () => void = () => {};
@@ -101,6 +103,10 @@ class SessionList implements Component {
 		private readonly showCwd = false,
 	) {
 		this.#filteredSessions = prioritizeStarredSessions(allSessions);
+		// Pre-build search text cache for all sessions (one-time cost)
+		for (const session of allSessions) {
+			this.#buildSessionSearchText(session);
+		}
 		this.#searchInput.onSubmit = () => {
 			const selected = this.#filteredSessions[this.#selectedIndex];
 			if (selected) this.onSelect?.(selected);
@@ -124,29 +130,71 @@ class SessionList implements Component {
 				: Math.max(0, Math.min(this.#selectedIndex, this.#filteredSessions.length - 1));
 	}
 
+	/** Pre-build and cache the search text for a session (called once per session). */
+	#buildSessionSearchText(session: SessionInfo): string {
+		const cached = this.#sessionSearchTextCache.get(session);
+		if (cached !== undefined) return cached;
+
+		const searchText = [
+			session.id,
+			session.title ?? "",
+			session.cwd ?? "",
+			session.firstMessage ?? "",
+			session.recap?.text ?? "",
+			session.allMessagesText,
+			session.path,
+		]
+			.filter(Boolean)
+			.join(" ");
+
+		this.#sessionSearchTextCache.set(session, searchText);
+		return searchText;
+	}
+
 	#filterSessions(query: string): void {
-		this.#filteredSessions = prioritizeStarredSessions(
-			fuzzyFilter(this.allSessions, query, session =>
-				[
-					session.id,
-					session.title ?? "",
-					session.cwd ?? "",
-					session.firstMessage ?? "",
-					session.recap?.text ?? "",
-					session.allMessagesText,
-					session.path,
-				]
-					.filter(Boolean)
-					.join(" "),
-			),
-		);
+		if (!query.trim()) {
+			this.#filteredSessions = prioritizeStarredSessions(this.allSessions);
+			this.#clampSelectedIndex();
+			return;
+		}
+
+		// Fast substring pre-filter before expensive fuzzy matching.
+		// Build search text only once per session and reuse for both filters.
+		const queryLower = query.toLowerCase();
+		const searchTexts = new Map<SessionInfo, string>();
+		const prescreened: SessionInfo[] = [];
+		const prescreenedSearchText = new Map<SessionInfo, string>();
+
+		for (const session of this.allSessions) {
+			const searchText = this.#buildSessionSearchText(session);
+			searchTexts.set(session, searchText);
+			if (searchText.toLowerCase().includes(queryLower)) {
+				prescreened.push(session);
+				prescreenedSearchText.set(session, searchText);
+			}
+		}
+
+		// When prescreened list is very large, skip expensive fuzzy matching and return in order.
+		// This provides acceptable results (sorted by recency) while keeping keystroke handling responsive.
+		// For typical user queries matching <200 sessions, fuzzy matching is fast enough.
+		const MAX_FUZZY_CANDIDATES = 1000;
+		if (prescreened.length > MAX_FUZZY_CANDIDATES) {
+			this.#filteredSessions = prioritizeStarredSessions(prescreened);
+		} else {
+			// Apply fuzzy ranking to prescreened results, reusing cached search text
+			this.#filteredSessions = prioritizeStarredSessions(
+				fuzzyFilter(prescreened, query, session => prescreenedSearchText.get(session) ?? ""),
+			);
+		}
 		this.#clampSelectedIndex();
 	}
 
 	removeSession(sessionPath: string): void {
 		const index = this.allSessions.findIndex(session => session.path === sessionPath);
 		if (index === -1) return;
+		const removed = this.allSessions[index];
 		this.allSessions.splice(index, 1);
+		this.#sessionSearchTextCache.delete(removed);
 		this.#filterSessions(this.#searchInput.getValue());
 	}
 
@@ -154,6 +202,7 @@ class SessionList implements Component {
 		const session = this.allSessions.find(session => session.path === sessionPath);
 		if (!session) return;
 		session.starred = starred;
+		// Cache is still valid; starred flag doesn't affect search text
 		this.#filterSessions(this.#searchInput.getValue());
 		this.#selectedIndex = Math.max(
 			0,
