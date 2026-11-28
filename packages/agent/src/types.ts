@@ -7,6 +7,7 @@ import type {
 	Message,
 	Model,
 	ProviderDiagnostic,
+	ResolvedApiKey,
 	SimpleStreamOptions,
 	Static,
 	streamSimple,
@@ -24,6 +25,16 @@ import type { HarmonyAuditEvent } from "./harmony-leak";
 import type { PromptPrefixTracker } from "./prompt-prefix-telemetry";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
+
+/**
+ * Result of a per-request API key lookup. A {@link ResolvedApiKey} also names
+ * the stored credential row behind the key so the turn can be attributed to it;
+ * a bare string is an external or unknown key.
+ */
+export type ApiKeyResolution = string | ResolvedApiKey | undefined;
+
+/** Resolves the API key for one LLM request. */
+export type GetApiKeyFn = (provider: string) => Promise<ApiKeyResolution> | ApiKeyResolution;
 
 /** Stream function - can return sync or Promise for async config lookup */
 export type StreamFn = (
@@ -340,9 +351,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Resolves an API key dynamically for each LLM call.
 	 *
 	 * Useful for short-lived OAuth tokens (e.g., GitHub Copilot) that may expire
-	 * during long-running tool execution phases.
+	 * during long-running tool execution phases. Return a {@link ResolvedApiKey}
+	 * to record the stored credential row on the resulting assistant message.
 	 */
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: GetApiKeyFn;
 
 	/** Returns the credential type selected by the most recent getApiKey call for this session/provider. */
 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;

@@ -9,22 +9,30 @@ export type SessionApiKeyModel = {
 	baseUrl?: string;
 };
 
+/** A resolved key plus the stored credential row that supplied it, when any. */
+export type SessionApiKeyLookup = {
+	apiKey: string | undefined;
+	credentialRowId: number | undefined;
+};
+
 export type SessionApiKeyRegistry = {
-	getApiKey(
+	getApiKeyWithCredentialRowId(
 		model: SessionApiKeyModel,
 		sessionId?: string,
 		options?: { signal?: AbortSignal },
-	): Promise<string | undefined>;
-	getApiKeyForProvider(
+	): Promise<SessionApiKeyLookup>;
+	getApiKeyForProviderWithCredentialRowId(
 		provider: string,
 		sessionId?: string,
 		baseUrl?: string,
 		options?: { signal?: AbortSignal },
-	): Promise<string | undefined>;
+	): Promise<SessionApiKeyLookup>;
 };
 
 export type SessionApiKeyResolution = {
 	apiKey: string;
+	/** Stored credential row behind `apiKey`; undefined for runtime, config, env, or fallback keys. */
+	credentialRowId: number | undefined;
 	credentialSessionId: string | undefined;
 };
 
@@ -53,20 +61,25 @@ async function lookupOnce(
 	sessionId: string | undefined,
 	model: SessionApiKeyModel | undefined,
 	signal: AbortSignal | undefined,
-): Promise<string | undefined> {
+): Promise<SessionApiKeyLookup> {
 	signal?.throwIfAborted();
 	const matchingModel = model?.provider === provider ? model : undefined;
 	const options = signal ? { signal } : undefined;
-	let key: string | undefined;
+	let lookup: SessionApiKeyLookup | undefined;
 	if (matchingModel) {
-		key = await registry.getApiKey(matchingModel, sessionId, options);
+		lookup = await registry.getApiKeyWithCredentialRowId(matchingModel, sessionId, options);
 		signal?.throwIfAborted();
 	}
-	if (!key) {
-		key = await registry.getApiKeyForProvider(provider, sessionId, matchingModel?.baseUrl, options);
+	if (!lookup?.apiKey) {
+		lookup = await registry.getApiKeyForProviderWithCredentialRowId(
+			provider,
+			sessionId,
+			matchingModel?.baseUrl,
+			options,
+		);
 		signal?.throwIfAborted();
 	}
-	return key;
+	return lookup;
 }
 
 export async function lookupSessionApiKey(
@@ -77,18 +90,20 @@ export async function lookupSessionApiKey(
 	allowUnscopedRetry = true,
 	signal?: AbortSignal,
 ): Promise<SessionApiKeyResolution> {
-	let key = await lookupOnce(registry, provider, sessionId, model, signal);
+	let lookup = await lookupOnce(registry, provider, sessionId, model, signal);
 	// Architect children inherit the parent SID. Direct `-p --no-session` does
 	// not. Scoped miss then global/broker hit is the remaining 0-token death
 	// after #5105 (jsonl: Agent run failed / output 0).
-	if (!key && sessionId && allowUnscopedRetry) {
-		key = await lookupOnce(registry, provider, undefined, model, signal);
-		if (key) return { apiKey: key, credentialSessionId: undefined };
+	if (!lookup.apiKey && sessionId && allowUnscopedRetry) {
+		lookup = await lookupOnce(registry, provider, undefined, model, signal);
+		if (lookup.apiKey) {
+			return { apiKey: lookup.apiKey, credentialRowId: lookup.credentialRowId, credentialSessionId: undefined };
+		}
 	}
-	if (!key) {
+	if (!lookup.apiKey) {
 		throw Object.assign(new Error(`No API key found for provider "${provider}"`), {
 			code: "provider_unavailable",
 		});
 	}
-	return { apiKey: key, credentialSessionId: sessionId };
+	return { apiKey: lookup.apiKey, credentialRowId: lookup.credentialRowId, credentialSessionId: sessionId };
 }

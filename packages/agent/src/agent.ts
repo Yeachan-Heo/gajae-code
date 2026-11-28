@@ -45,6 +45,7 @@ import type {
 	AgentState,
 	AgentTool,
 	AgentToolContext,
+	GetApiKeyFn,
 	ManagedAttemptContinuation,
 	ManagedAttemptContinuationOwnership,
 	ManagedAttemptDecision,
@@ -353,7 +354,7 @@ export interface AgentOptions {
 	 * Resolves an API key dynamically for each LLM call.
 	 * Useful for expiring tokens (e.g., GitHub Copilot OAuth).
 	 */
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: GetApiKeyFn;
 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;
 
 	/**
@@ -649,7 +650,7 @@ export class Agent {
 	}
 
 	streamFn: StreamFn;
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: GetApiKeyFn;
 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;
 	/**
 	 * Hook invoked after tool arguments are validated and before execution.

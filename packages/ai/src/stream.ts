@@ -417,7 +417,8 @@ function pipeAssistantStream(
 	inner: AssistantMessageEventStream,
 	signal?: AbortSignal,
 	onStreamCreated?: () => void,
-): void {
+): () => void {
+	const iteration = closableIteration(inner);
 	void (async () => {
 		try {
 			let admitted = false;
@@ -426,7 +427,8 @@ function pipeAssistantStream(
 				admitted = true;
 				onStreamCreated?.();
 			};
-			for await (const event of inner) {
+			for await (const event of iteration.events) {
+				if (iteration.isClosed()) break;
 				if (event.type !== "start") markAdmission();
 				outer.push(event);
 				// The inner provider stream owns abort semantics (it receives the
@@ -438,11 +440,42 @@ function pipeAssistantStream(
 					return;
 				}
 			}
+			// A closed consumer still gets a settled result: the provider ends
+			// its stream once its cleanup runs, exactly as without the close.
+			if (iteration.isClosed()) markAdmission();
 			if (!outer.done) outer.end(await inner.result());
 		} catch (error) {
 			outer.fail(error);
 		}
 	})();
+	return iteration.close;
+}
+
+interface ClosableIteration {
+	events: AssistantMessageEventStream;
+	isClosed(): boolean;
+	close(): void;
+}
+
+/**
+ * Iterate a provider stream on behalf of an outer stream's consumer.
+ *
+ * `close()` stops the iteration even while it is parked waiting for the next
+ * event and runs the inner stream's own `onConsumerClose` cleanup. Aborting the
+ * request signal alone never reaches a provider that cleans up only through
+ * that hook.
+ */
+function closableIteration(inner: AssistantMessageEventStream): ClosableIteration {
+	let closed = false;
+	return {
+		events: inner,
+		isClosed: () => closed,
+		close: () => {
+			if (closed) return;
+			closed = true;
+			inner.closeConsumers();
+		},
+	};
 }
 
 export function streamFromLazyImport(
@@ -755,13 +788,18 @@ export function streamSimple<TApi extends Api>(
 		: undefined;
 	if (retryApiKey) {
 		const consumerAbortController = new AbortController();
-		const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
+		let closeActiveAttempt: (() => void) | undefined;
+		const outer = new AssistantMessageEventStream(() => {
+			consumerAbortController.abort();
+			closeActiveAttempt?.();
+		});
 		const requestSignal = options?.signal
 			? AbortSignal.any([options.signal, consumerAbortController.signal])
 			: consumerAbortController.signal;
 		const onAuthError = options!.onAuthError!;
 		const runAttempt = async (
 			apiKey: string,
+			credentialId: number | undefined,
 			captureAuthFailure: boolean,
 			onStreamCreated?: () => void,
 		): Promise<AuthRetryFailure | undefined> => {
@@ -782,11 +820,15 @@ export function streamSimple<TApi extends Api>(
 				const inner = streamSimple(model, context, {
 					...options,
 					apiKey,
+					credentialId,
 					onAuthError: undefined,
 					onStreamCreated: markAdmission,
 					signal: requestSignal,
 				});
-				for await (const event of inner) {
+				const iteration = closableIteration(inner);
+				closeActiveAttempt = iteration.close;
+				for await (const event of iteration.events) {
+					if (iteration.isClosed()) break;
 					if (!emittedReplayUnsafeEvent && event.type === "start") {
 						bufferedEvents.push(event);
 						continue;
@@ -838,7 +880,10 @@ export function streamSimple<TApi extends Api>(
 		};
 
 		void (async () => {
-			const failure = await runAttempt(retryApiKey, true, options?.onStreamCreated);
+			// The caller's credential id describes `options.apiKey` only; an env
+			// fallback key is never a stored row.
+			const initialCredentialId = options?.apiKey === retryApiKey ? options?.credentialId : undefined;
+			const failure = await runAttempt(retryApiKey, initialCredentialId, true, options?.onStreamCreated);
 			if (!failure) return;
 			let nextCredential: string | AuthRetryCredential | undefined;
 			try {
@@ -853,11 +898,119 @@ export function streamSimple<TApi extends Api>(
 				emitFailure(failure);
 				return;
 			}
-			await runAttempt(retryCredential.apiKey, false, retryCredential.onStreamCreated);
+			await runAttempt(retryCredential.apiKey, retryCredential.credentialId, false, retryCredential.onStreamCreated);
 		})();
 		return outer;
 	}
 
+	const credentialId = attributableCredentialId(model, options);
+	if (credentialId === undefined) return dispatchStreamSimple(model, context, options);
+	return streamWithCredentialAttribution(model, context, options ?? {}, credentialId);
+}
+
+/**
+ * Stored credential row to record on this request's messages, if any.
+ *
+ * The id only describes `options.apiKey`: without that key the request falls
+ * back to env/ADC credentials, and a pi-native gateway bearer authenticates to
+ * the gateway rather than to the upstream account that serves the turn.
+ */
+function attributableCredentialId(model: Model<Api>, options: SimpleStreamOptions | undefined): number | undefined {
+	const credentialId = options?.credentialId;
+	if (credentialId === undefined || !options?.apiKey || model.transport === "pi-native") return undefined;
+	return Number.isSafeInteger(credentialId) ? credentialId : undefined;
+}
+
+/** Best-effort: attribution must never fail a request whose message object rejects writes. */
+function setCredentialId(message: AssistantMessage, credentialId: number): void {
+	try {
+		Reflect.set(message, "credentialId", credentialId);
+	} catch {
+		// Frozen or hostile provider object; leave it unattributed.
+	}
+}
+
+function stampCredentialId(event: AssistantMessageEvent, credentialId: number): void {
+	if (event.type === "done") setCredentialId(event.message, credentialId);
+	else if (event.type === "error") setCredentialId(event.error, credentialId);
+	else if ("partial" in event) setCredentialId(event.partial, credentialId);
+}
+
+/**
+ * Whether a terminal message carries facts only a provider response can supply:
+ * an HTTP status, or a diagnostic minted from structured provider metadata. A
+ * transport exception, a local timeout, or an abort before any response has
+ * none of these.
+ */
+function carriesProviderResponse(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error" && message.stopReason !== "aborted") return true;
+	return (
+		message.errorStatus !== undefined ||
+		message.transportFailure?.status !== undefined ||
+		message.providerDiagnostic !== undefined
+	);
+}
+
+/**
+ * Whether this event proves the provider answered the request. `start` does
+ * not: providers emit it before the request is sent.
+ */
+function isProviderResponseEvidence(event: AssistantMessageEvent): boolean {
+	if (event.type === "start") return false;
+	if (event.type === "error") return carriesProviderResponse(event.error);
+	return true;
+}
+
+/**
+ * Dispatch one request and record its stored credential row on every message
+ * the provider's response produced (partials, the terminal message, and the
+ * result), so the persisted turn names the account that served it. Until the
+ * provider has answered, nothing is stamped: a failure before any response
+ * stays unattributed, while a response-backed error (401, 429) and anything
+ * after the first streamed event keep the row.
+ */
+function streamWithCredentialAttribution<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options: SimpleStreamOptions,
+	credentialId: number,
+): AssistantMessageEventStream {
+	const consumerAbortController = new AbortController();
+	const signal = options.signal
+		? AbortSignal.any([options.signal, consumerAbortController.signal])
+		: consumerAbortController.signal;
+	const inner = dispatchStreamSimple(model, context, { ...options, signal });
+	const iteration = closableIteration(inner);
+	const outer = new AssistantMessageEventStream(() => {
+		consumerAbortController.abort();
+		iteration.close();
+	});
+	void (async () => {
+		let responded = false;
+		try {
+			for await (const event of iteration.events) {
+				if (iteration.isClosed()) break;
+				responded ||= isProviderResponseEvidence(event);
+				if (responded) stampCredentialId(event, credentialId);
+				outer.push(event);
+				if (outer.done) return;
+			}
+			if (outer.done) return;
+			const result = await inner.result();
+			if (responded || carriesProviderResponse(result)) setCredentialId(result, credentialId);
+			outer.end(result);
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+	return outer;
+}
+
+function dispatchStreamSimple<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
 	// Pi-native transport short-circuits the per-provider dispatch entirely:
 	// the gateway resolves provider + credential server-side, so we don't
 	// need an `apiKey` from `getEnvApiKey` here — `options.apiKey` carries
@@ -884,8 +1037,11 @@ export function streamSimple<TApi extends Api>(
 			maxTokens: resolvedRequestMaxTokens,
 		});
 		if (!options?.onStreamCreated) return events;
-		const forwarded = new AssistantMessageEventStream();
-		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
+		// The provider stream may clean up only through its own consumer-close
+		// hook, so the forwarder hands an early close through to it.
+		let closeEvents: (() => void) | undefined;
+		const forwarded = new AssistantMessageEventStream(() => closeEvents?.());
+		closeEvents = pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
 		return forwarded;
 	}
 	if (options?.customApiRegistry !== undefined && !isBuiltInApi(model.api)) {
