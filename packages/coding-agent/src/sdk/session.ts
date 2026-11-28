@@ -12,6 +12,7 @@ import {
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
 import {
+	type Api,
 	type AssistantMessage,
 	type AttemptScopeRef,
 	type AuthCredentialSelector,
@@ -5711,24 +5712,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Detach the shared model before any deferred work. A registry lookup renders
 				// its generated `Authorization` into the model object it resolves against, so a
 				// concurrent lookup on this session's model must not rewrite the header of a
-				// request that already resolved its own credential.
-				const requestClone = {
-					...streamModel,
-					headers: modelRegistry.getRequestHeaders(streamModel, streamOptions?.apiKey),
+				// request that already resolved its own credential. Models without a generated
+				// header are dispatched as-is: cloning them would strip the prototype and
+				// identity that stateful handles (MockModel) and custom stream functions rely on.
+				// Catalog trust is preserved across the detach so first-party adapters keep their
+				// safety-stop authority; an untrusted model stays on the plain clone.
+				const detachRequestModel = (source: Model<Api>, apiKey: string | undefined): Model<Api> => {
+					if (!modelRegistry.rendersAuthHeader(source)) return source;
+					const clone = { ...source, headers: modelRegistry.getRequestHeaders(source, apiKey) };
+					return registerFinalizedModelClone(source, clone) ?? clone;
 				};
-				// Preserve catalog trust across the detach so first-party adapters keep
-				// their safety-stop authority. An untrusted model stays on the plain clone.
-				const requestModel = registerFinalizedModelClone(streamModel, requestClone) ?? requestClone;
+				const requestModel = detachRequestModel(streamModel, streamOptions?.apiKey);
 				const startProviderStream = (providerOptions: SimpleStreamOptions) => {
 					// An observer or gateway can supply the key actually dispatched, so the final
 					// provider-local model materializes its headers from that key. `streamSimple`'s
 					// internal 401 retry reuses this exact object, which is what lets `onAuthError`
 					// refresh its headers in place before handing back the replacement credential.
-					const providerClone = {
-						...requestModel,
-						headers: modelRegistry.getRequestHeaders(requestModel, providerOptions.apiKey),
-					};
-					const providerModel = registerFinalizedModelClone(requestModel, providerClone) ?? providerClone;
+					const providerModel = detachRequestModel(requestModel, providerOptions.apiKey);
 					return streamSimple(providerModel, context, {
 						...providerOptions,
 						onAuthError: async (provider, oldKey, error) => {
@@ -5756,7 +5756,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// The retry re-dispatches this same model object, so its generated header must
 							// follow the replacement row. streamSimple permits one auth replacement on
 							// this object; an outer backoff re-enters streamFn with fresh request models.
-							providerModel.headers = modelRegistry.getRequestHeaders(providerModel, replacement.apiKey);
+							// A model that was not detached is the shared session model; never mutate it.
+							if (providerModel !== streamModel) {
+								providerModel.headers = modelRegistry.getRequestHeaders(providerModel, replacement.apiKey);
+							}
 							return replacement;
 						},
 					});
