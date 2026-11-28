@@ -65,13 +65,74 @@ function assistantText(message: AssistantMessage): string {
 		.join("");
 }
 
+/**
+ * Resolve the terminal disposition of a print-mode turn, robustly handling message
+ * compaction that may occur during or after the prompt.
+ *
+ * When compaction occurs during `session.prompt()`, it can remove messages from the
+ * array, making a pre-prompt index stale. This function handles that by using the
+ * turnStartUserMessage (if provided) to find assistant messages for this turn.
+ *
+ * @param messages Current message array (may have been compacted)
+ * @param submittedPrompt Whether a prompt was actually submitted
+ * @param turnStartIndex Index of the first message in this turn (before prompt). May be stale after compaction.
+ * @param turnStartUserMessage The user message that was submitted in this turn. If provided and found in the
+ *   current messages, it's used to find assistant messages that come after it, making lookup robust to compaction.
+ * @param consumedLocalCommandWithoutPrompt Whether a local command was consumed without submitting a prompt.
+ *   When true, skips historical error resolution since the consumed command is a separate interaction.
+ * @returns The terminal disposition, or undefined if no prompt was submitted or a silent abort occurred
+ */
 export function resolvePrintTerminalDisposition(
 	messages: readonly AgentMessage[],
 	submittedPrompt: boolean,
 	turnStartIndex?: number,
+	turnStartUserMessage?: AgentMessage,
+	consumedLocalCommandWithoutPrompt?: boolean,
 ): PrintTerminalDisposition | undefined {
-	if (!submittedPrompt) return undefined;
-	const turnMessages = turnStartIndex === undefined ? messages : messages.slice(turnStartIndex);
+	// When no prompt was submitted, check only the final assistant message for errors.
+	// This handles resumed sessions with no new input, where we still need to report
+	// any terminal errors from the restored transcript.
+	// However, if a local command was consumed without a prompt, skip this check since
+	// the consumed command is a separate interaction and should not inherit errors from prior turns.
+	if (!submittedPrompt) {
+		if (consumedLocalCommandWithoutPrompt) {
+			// A consumed local command succeeded; don't report historical errors
+			return undefined;
+		}
+		const lastAssistant = messages.findLast((message): message is AssistantMessage => message.role === "assistant");
+		if (
+			(lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") &&
+			!isSilentAbort(lastAssistant.errorMessage)
+		) {
+			return {
+				status: "failure",
+				error: {
+					code: "assistant_error",
+					message: sanitizeText(lastAssistant.errorMessage || `Request ${lastAssistant.stopReason}`),
+				},
+			};
+		}
+		return undefined;
+	}
+
+	// Find assistant messages from this turn, handling compaction-induced index staleness.
+	// If turnStartUserMessage is provided, search for it in the current messages array
+	// to find assistant messages that came after it, making the lookup compaction-robust.
+	let startIndex = turnStartIndex ?? 0;
+	if (turnStartUserMessage !== undefined) {
+		// Find the user message in the current array by reference
+		const userMessageIndex = messages.indexOf(turnStartUserMessage);
+		if (userMessageIndex !== -1) {
+			// Search for assistant messages after this user message
+			startIndex = userMessageIndex + 1;
+		} else if (turnStartIndex !== undefined && turnStartIndex < messages.length) {
+			// Fallback: use the provided index if it's still valid
+			startIndex = turnStartIndex;
+		}
+		// If neither condition holds, startIndex defaults to turnStartIndex or 0
+	}
+
+	const turnMessages = messages.slice(startIndex);
 	const lastAssistant = turnMessages.findLast((message): message is AssistantMessage => message.role === "assistant");
 	if (!lastAssistant) return { status: "failure", error: EMPTY_TURN_ERROR };
 	if (
@@ -248,6 +309,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	let consumedCommand = false;
 	let jsonFailureObserved = false;
 	let lastPromptMessageStart: number | undefined;
+	let lastPromptUserMessage: AgentMessage | undefined;
 
 	try {
 		for (const warning of new Set(session.configWarnings)) {
@@ -291,6 +353,9 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 						(event.message.stopReason === "error" || event.message.stopReason === "aborted"))
 				) {
 					jsonFailureObserved = true;
+					// Track failure events for duplicate-event suppression in terminal resolution.
+					// Do NOT set exit code here; it must be set only from the final terminal disposition
+					// so that retryable errors that are later recovered don't leave a failed exit code.
 				}
 				stdout.write(`${JSON.stringify(event)}\n`);
 			});
@@ -319,9 +384,49 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				}
 				if (command !== false) text = command.prompt;
 			}
+			// Reset the captured user message reference only before submitting an actual prompt,
+			// not before slash-command dispatch. This preserves the reference when a consumed
+			// command returns without adding messages, allowing proper terminal resolution of the
+			// prior turn even if compaction occurred.
+			lastPromptUserMessage = undefined;
 			submittedPrompt = true;
-			lastPromptMessageStart = session.state.messages.length;
+			// Track the boundary before this prompt to detect new messages and restrict the
+			// user-message capture to only messages added in this turn. Store the message itself
+			// (by reference) so we can find it after compaction.
+			const messageBefore = session.state.messages[session.state.messages.length - 1];
+			const messageCountBefore = session.state.messages.length;
+			lastPromptMessageStart = messageCountBefore;
 			await session.prompt(text, images ? { images } : undefined);
+			// Capture the user message that was just added, for compaction-robust turn tracking.
+			// Only capture if the last message changed (indicating messages were added/modified).
+			// This prevents capturing historical messages when no new user message is added.
+			const currentLastMessage = session.state.messages[session.state.messages.length - 1];
+			if (currentLastMessage !== messageBefore) {
+				// Messages were added in this turn. Find the boundary to restrict the search to new messages.
+				// First, try to find the previous last message by reference to identify the boundary,
+				// handling the case where compaction may have removed or shifted messages.
+				let boundaryIndex = -1;
+				if (messageBefore !== undefined) {
+					boundaryIndex = session.state.messages.lastIndexOf(messageBefore);
+				}
+
+				// Search backward for the user message from this turn, restricting to new messages.
+				// If the boundary message is found, search after it. If boundary was compacted away,
+				// search from the end (all messages are potentially new).
+				const searchStart = boundaryIndex >= 0 ? boundaryIndex : -1;
+				for (let i = session.state.messages.length - 1; i > searchStart; i--) {
+					if (session.state.messages[i]?.role === "user" || session.state.messages[i]?.role === "custom") {
+						// Verify this user message has a following assistant message in this turn
+						const hasFollowingAssistant = session.state.messages.some(
+							(msg, idx) => idx > i && msg.role === "assistant",
+						);
+						if (hasFollowingAssistant) {
+							lastPromptUserMessage = session.state.messages[i];
+							break;
+						}
+					}
+				}
+			}
 		};
 
 		// Send the initial input and remaining inputs, dispatching only commands
@@ -333,43 +438,59 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			await logger.time("print:prompt:next", () => submitInput(message));
 		}
 
-		const terminal = resolvePrintTerminalDisposition(session.state.messages, submittedPrompt, lastPromptMessageStart);
+		const terminal = resolvePrintTerminalDisposition(
+			session.state.messages,
+			submittedPrompt,
+			lastPromptMessageStart,
+			lastPromptUserMessage,
+			!submittedPrompt && consumedCommand,
+		);
 		if (terminal?.status === "failure") {
-			if (!options.suppressProcessExit) process.exitCode = 1;
-			if (mode === "json" && !jsonFailureObserved) {
-				stdout.write(`${JSON.stringify({ type: "agent_failed", error: terminal.error })}\n`);
-			} else if (mode === "text" && terminal.error.code === EMPTY_TURN_ERROR.code) {
-				await writeStderrAndQuiesce(`${terminal.error.message}\n`);
+			if (mode === "json") {
+				if (!jsonFailureObserved) {
+					stdout.write(`${JSON.stringify({ type: "agent_failed", error: terminal.error })}\n`);
+				}
+				// Set failure exit code after terminal resolution, ensuring retried errors that are later
+				// recovered (success) don't leave a failed exit status from earlier attempts.
+				if (!options.suppressProcessExit) process.exitCode = 1;
+			} else if (mode === "text") {
+				// Handle terminal failure diagnostics and exit codes
+				if (terminal.error.code === EMPTY_TURN_ERROR.code) {
+					if (!options.suppressProcessExit) process.exitCode = 1;
+					await writeStderrAndQuiesce(`${terminal.error.message}\n`);
+				} else if (terminal.error.code === "assistant_error") {
+					// Look up the assistant message to check for context overflow and get proper exit code
+					const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
+					if (lastMessage?.role === "assistant") {
+						const assistantMsg = lastMessage as AssistantMessage;
+						const isOverflow =
+							assistantMsg.stopReason === "error" &&
+							isContextOverflow(assistantMsg, session.model?.contextWindow);
+						const exitCode = isOverflow ? CONTEXT_OVERFLOW_EXIT_CODE : 1;
+						if (!options.suppressProcessExit) process.exitCode = exitCode;
+						const errorLine = isOverflow
+							? formatContextOverflowError(assistantMsg, session.autoCompactionEnabled)
+							: terminal.error.message;
+						await writeStderrAndQuiesce(`${errorLine}\n`);
+						if (!isOverflow) {
+							const safetyStopHint = resolveProviderSafetyStopHint(assistantMsg, session);
+							if (safetyStopHint) await writeStderrAndQuiesce(`${sanitizeText(safetyStopHint)}\n`);
+						}
+					} else {
+						// Fallback: write the error directly if the assistant message isn't found
+						if (!options.suppressProcessExit) process.exitCode = 1;
+						await writeStderrAndQuiesce(`${terminal.error.message}\n`);
+					}
+				}
 			}
 		}
 
-		// In text mode, output final response.
-		if (mode === "text" && (!consumedCommand || submittedPrompt)) {
+		// In text mode, output final response (unless terminal indicates failure).
+		if (mode === "text" && (!consumedCommand || submittedPrompt) && terminal?.status !== "failure") {
 			const lastMessage = session.state.messages.findLast(message => message.role === "assistant");
 			if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;
-				let printContent = true;
-
-				// Check for error/aborted — skip silent-abort (plan-mode compaction transition).
-				if (
-					(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
-					!isSilentAbort(assistantMsg.errorMessage)
-				) {
-					const isOverflow =
-						assistantMsg.stopReason === "error" && isContextOverflow(assistantMsg, session.model?.contextWindow);
-					const errorLine = isOverflow
-						? formatContextOverflowError(assistantMsg, session.autoCompactionEnabled)
-						: sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
-					const exitCode = isOverflow ? CONTEXT_OVERFLOW_EXIT_CODE : 1;
-
-					if (!options.suppressProcessExit) process.exitCode = exitCode;
-					await writeStderrAndQuiesce(`${errorLine}\n`);
-					if (!isOverflow) {
-						const safetyStopHint = resolveProviderSafetyStopHint(assistantMsg, session);
-						if (safetyStopHint) await writeStderrAndQuiesce(`${sanitizeText(safetyStopHint)}\n`);
-					}
-					printContent = false;
-				}
+				const printContent = true;
 
 				if (
 					assistantMsg.errorMessage &&
