@@ -170,7 +170,7 @@ async function canonicalMessage(f: Fixture): Promise<void> {
 }
 
 describe("#7856 setTemporaryModel in a root TUI session", () => {
-	it("allows setTemporaryModel at startup after the first message without throwing SharedSessionMutationUnsupportedError", async () => {
+	it("allows setTemporaryModel at startup after the first message", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
 
@@ -179,7 +179,6 @@ describe("#7856 setTemporaryModel in a root TUI session", () => {
 
 		const entriesBeforeOverride = f.manager.getEntries().length;
 
-		// This should not throw SharedSessionMutationUnsupportedError
 		try {
 			await f.session.setModelTemporary(model, undefined, {
 				persistAsSessionDefault: true,
