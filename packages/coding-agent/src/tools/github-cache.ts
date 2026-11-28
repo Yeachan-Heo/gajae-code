@@ -19,8 +19,9 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getGithubCacheDbPath, logger } from "@gajae-code/utils";
+import { getGithubCacheDbPath, isCredentialKey, logger, redactCrashSecrets } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
+import { parsePrUnifiedDiff, scrubPrDiffText } from "./gh";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -254,6 +255,11 @@ export function getCached<T = unknown>(
 			logger.debug("github cache: corrupt payload row, ignoring", { err: String(err), repo, kind, number });
 			return null;
 		}
+		// Scrub on read too: rows written before the write-path scrub (or by an
+		// older binary) are still on disk, and a hit renders them back to the
+		// model. Reindexing uses the stored kind, so legacy diff offsets are
+		// rebuilt against the scrubbed text instead of the original.
+		const scrubbed = scrubStoredView(row.kind, payload, row.rendered, row.source_url ?? undefined);
 		return {
 			authKey: row.auth_key,
 			repo: row.repo,
@@ -261,9 +267,9 @@ export function getCached<T = unknown>(
 			number: row.number,
 			includeComments: row.include_comments === 1,
 			fetchedAt: row.fetched_at,
-			payload,
-			rendered: row.rendered,
-			sourceUrl: row.source_url ?? undefined,
+			payload: scrubbed.payload as T,
+			rendered: scrubbed.rendered,
+			sourceUrl: scrubbed.sourceUrl,
 		};
 	} catch (err) {
 		logger.debug("github cache: read failed", { err: String(err) });
@@ -283,12 +289,796 @@ export interface PutCachedInput<T = unknown> {
 	fetchedAt?: number;
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Assignment-style credentials, bounded to the value token. The shared crash
+ * redactor deliberately redacts through end-of-line; on a cached issue body
+ * that eats the rest of a Markdown table row or the command after a
+ * `TOKEN=…` example. These spans are redacted here and masked while the crash
+ * redactor runs, so it cannot consume the tail a second time.
+ *
+ * `authorization`/`bearer`/`cookies` are deliberately left to the shared
+ * redactor: their grammars are not a single value token.
+ */
+const BOUNDED_CREDENTIAL_ASSIGNMENT =
+	/(?<![A-Za-z0-9])((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)([._\t -]{0,2}["']?[ \t]*[:=][ \t]*)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|\{((?:\\.|[^{}\\\r\n])*)\}|\[((?:\\.|[^[\]\\\r\n])*)\]|([^\s"'`|;&,<>#]+)|(?=[\r\n]|$))/gi;
+
+/**
+ * Sentinels are nonce-prefixed so a literal NUL sequence in user text cannot
+ * alias a mask slot and be replaced or deleted by restoration.
+ */
+const CACHE_MASK_NONCE = Math.random().toString(36).slice(2);
+const BOUNDED_CREDENTIAL_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-credential-`;
+const BOUNDED_AUTHORIZATION_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-auth-`;
+
+function restoreMasked(scrubbed: string, prefix: string, values: readonly string[]): string {
+	let restored = scrubbed;
+	for (let index = 0; index < values.length; index += 1) {
+		// Function replacer: a `$&`/`$'` sequence in sanitized text must stay literal.
+		restored = restored.replaceAll(`${prefix}${index}\u0000`, () => values[index] ?? "");
+	}
+	return restored;
+}
+
+const AT_SIGN_MASK = `\u0000gjc-${CACHE_MASK_NONCE}-at-\u0000`;
+
+/**
+ * Find the end of a JSON object or array, honoring quoted strings and escapes so
+ * a `}` or `]` inside a string cannot end the value early.
+ */
+function findBalancedValueEnd(text: string, start: number): number {
+	const stack: string[] = [];
+	let quote: string | null = null;
+	let escaped = false;
+	for (let index = start; index < text.length; index += 1) {
+		const character = text.charAt(index);
+		if (quote) {
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (character === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (character === quote) quote = null;
+			continue;
+		}
+		if (character === '"' || (character === "'" && !isWordApostrophe(text, index))) {
+			quote = character;
+			continue;
+		}
+		if (character === "{") {
+			stack.push("}");
+			continue;
+		}
+		if (character === "[") {
+			stack.push("]");
+			continue;
+		}
+		if (character === "}" || character === "]") {
+			if (stack.pop() !== character) return -1;
+			if (stack.length === 0) return index + 1;
+		}
+	}
+	return -1;
+}
+
+/**
+ * A JSON-text credential whose value is an object or array has to be consumed
+ * with quote and depth awareness; the flat assignment mask would stop at a
+ * nested brace or a delimiter inside a string and leave the rest behind.
+ * Matches inside an already-consumed value are skipped, and an unterminated
+ * value is redacted through the end of its line rather than left behind.
+ */
+function maskCredentialJsonContainers(
+	text: string,
+	diff: boolean,
+): { text: string; restore: (scrubbed: string) => string } {
+	if (!text.includes("{") && !text.includes("[")) return { text, restore: scrubbed => scrubbed };
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(
+		/(?<![A-Za-z0-9])"((?:access|refresh|id|session|private)[._\t -]*token|api[._\t -]*key|apikey|client[._\t -]*secret|secret[._\t -]*key|private[._\t -]*key|pass(?:word|wd|phrase)|pwd|token|secrets?|credentials?)"\s*:\s*/gi,
+	)) {
+		const matchIndex = match.index ?? 0;
+		if (matchIndex < last) continue;
+		const valueStart = matchIndex + match[0].length;
+		const first = text.charAt(valueStart);
+		if (first !== "{" && first !== "[") continue;
+		let end = findBalancedValueEnd(text, valueStart);
+		if (end === -1) {
+			// The container never closes. A unified diff section boundary is a
+			// safe stop and keeps the following file's patch; a blank line is
+			// not, because an empty diff context line is a single space and the
+			// value can continue after it. Prose falls back to its paragraph.
+			const tail = text.slice(valueStart);
+			// Only a real unified diff has sections; a lookalike line in prose is
+			// text, not a boundary the scrubber may trust.
+			const section = diff ? tail.indexOf("\ndiff --git ") : -1;
+			// A blank line is legal whitespace inside a JSON array, so prose
+			// has no safe intermediate stop: fail closed to the end of the text.
+			end = section === -1 ? text.length : valueStart + section;
+		}
+		out += text.slice(last, valueStart) + '"«redacted»"';
+		last = end;
+	}
+	out += text.slice(last);
+	return { text: out, restore: scrubbed => scrubbed };
+}
+
+/**
+ * Authorization headers are redacted through the scheme word and the value, but
+ * not through the rest of the line, so a table cell or shell command after the
+ * header survives. `cookies` stays with the shared redactor: cookie pairs are
+ * not a single value token.
+ */
+/** Redact parameterized inline auth values such as `Token token="..."`. */
+function maskParameterizedAuthValues(text: string): string {
+	const prefix =
+		/((?:"?(?:(?:[A-Za-z0-9]+-)*authorization|auth)"?)[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)([A-Za-z0-9_.-]+[ \t]*=[ \t]*)/gi;
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(prefix)) {
+		const index = match.index ?? 0;
+		if (index < last) continue;
+		const valueStart = index + match[0].length;
+		let end = valueStart;
+		const first = text[valueStart];
+		if (first === '"' || first === "'") {
+			end = valueStart + 1;
+			for (; end < text.length; end++) {
+				if (text[end] === "\n") break;
+				if (text[end] === first && text[end - 1] !== "\\") {
+					end++;
+					break;
+				}
+			}
+		} else {
+			let slashes = 0;
+			while (text[valueStart + slashes] === "\\") slashes++;
+			const quote = slashes > 0 && slashes % 2 === 1 ? text[valueStart + slashes] : "";
+			if (quote === '"' || quote === "'") {
+				const lineEnd = text.indexOf("\n", valueStart);
+				const limit = lineEnd === -1 ? text.length : lineEnd;
+				const cookieContainer = /\s+cookie\s*:\s*[[{]/i.exec(text.slice(valueStart, limit));
+				end = cookieContainer ? valueStart + cookieContainer.index : limit;
+			} else {
+				while (end < text.length && !/[\s,;]/.test(text[end])) end++;
+			}
+		}
+		out += text.slice(last, index) + match[1] + match[2] + match[3] + match[4] + "«redacted»";
+		last = end;
+	}
+	return out + text.slice(last);
+}
+
+function maskBoundedAuthorizationHeaders(text: string): { text: string; restore: (scrubbed: string) => string } {
+	const sanitized: string[] = [];
+	const masked = text.replace(
+		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)(?:[ \t]*["']?[ \t]*[:=][ \t]*["']?))(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"((?:\\.|[^"\\\r\n])*)"|'((?:\\.|[^'\\\r\n])*)'|([^\s|;"'`&,]+))/gi,
+		(
+			_match: string,
+			label: string,
+			scheme: string,
+			spacing: string,
+			doubleQuoted: string | undefined,
+			singleQuoted: string | undefined,
+			_unquoted: string | undefined,
+			offset: number,
+			text: string,
+		) => {
+			const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : "";
+			const sentinel = `${BOUNDED_AUTHORIZATION_MASK}${sanitized.length}\u0000`;
+			sanitized.push(`${label}${scheme}${spacing}${quote}«redacted»${quote}`);
+			return sentinel;
+		},
+	);
+	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
+	return { text: masked, restore: scrubbed => restoreMasked(scrubbed, BOUNDED_AUTHORIZATION_MASK, sanitized) };
+}
+
+function maskBoundedCredentialAssignments(text: string): { text: string; restore: (scrubbed: string) => string } {
+	const sanitized: string[] = [];
+	const masked = text.replace(
+		BOUNDED_CREDENTIAL_ASSIGNMENT,
+		(
+			_match: string,
+			label: string,
+			separator: string,
+			doubleQuoted: string | undefined,
+			singleQuoted: string | undefined,
+		) => {
+			const quote =
+				doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : separator.includes('"') ? '"' : "";
+			const sentinel = `${BOUNDED_CREDENTIAL_MASK}${sanitized.length}\u0000`;
+			sanitized.push(`${label}${separator}${quote}«redacted»${quote}`);
+			return sentinel;
+		},
+	);
+	if (sanitized.length === 0) return { text, restore: scrubbed => scrubbed };
+	return { text: masked, restore: scrubbed => restoreMasked(scrubbed, BOUNDED_CREDENTIAL_MASK, sanitized) };
+}
+
+/**
+ * Remove URL userinfo. Authentication is what makes a URL sensitive; the host,
+ * path, query and surrounding markup stay readable. Handles `scheme://`,
+ * JSON-escaped `scheme:\/\/`, and protocol-relative `//user:pass@host` forms,
+ * including a raw `@`, an apostrophe, or a `|` inside the userinfo. Userinfo
+ * removal runs before the assignment masks so a URL shaped like
+ * `scheme://user:token=value@host` keeps its host.
+ *
+ * A Markdown table row treats `|` as a cell boundary; elsewhere it is part of
+ * the authority. Table rows are detected from the row itself (edge pipes) or
+ * from the `---|---` delimiter row, because a 2-column row without edge pipes
+ * also has a single pipe. The line is classified once and the matching pattern
+ * set is used, so a compact table cannot be merged into one URL.
+ */
+const SCHEME_USERINFO = /(?<![A-Za-z0-9.])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))[^\r\n /?#"`<>]*@/gi;
+const SCHEME_USERINFO_TABLE = /(?<![A-Za-z0-9.])([a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/))(?:\\\||[^\r\n /?#"`<>|])*@/gi;
+const RELATIVE_USERINFO = /(?<![A-Za-z0-9.:])\/\/[^\r\n /?#"`<>]*@/g;
+const RELATIVE_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\/\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
+const ESCAPED_USERINFO = /(?<![A-Za-z0-9.:])\\\/\\\/[^\r\n /?#"`<>]*@/g;
+const ESCAPED_USERINFO_TABLE = /(?<![A-Za-z0-9.:])\\\/\\\/(?:\\\||[^\r\n /?#"`<>|])*@/g;
+const BLOCK_START = /^(?:#{1,6}(?:\s|$)|[-+*]\s|\d+[.)]\s|>)/;
+const TABLE_DELIMITER_ROW = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
+
+function tableRowFlags(lines: string[]): boolean[] {
+	const flags = new Array<boolean>(lines.length).fill(false);
+	const fenced = new Array<boolean>(lines.length).fill(false);
+	// Splitting on "\n" leaves "\r" on CRLF input, and "." does not match it.
+	const rows = lines.map(line => line.replace(/\r$/, ""));
+	let opener: { marker: string; length: number; indent: number } | null = null;
+	for (let i = 0; i < lines.length; i++) {
+		const match = /^( *)(`{3,}|~{3,})(.*)$/.exec(rows[i] ?? "");
+		if (opener === null) {
+			if (match) {
+				const marker = match[2] ?? "";
+				opener = { marker: marker.charAt(0), length: marker.length, indent: (match[1] ?? "").length };
+				fenced[i] = true;
+			}
+			continue;
+		}
+		fenced[i] = true;
+		const marker = match?.[2] ?? "";
+		// GFM allows a closing marker up to three columns beyond its container;
+		// a list-nested fence can therefore be indented deeper than its opener
+		// by the container width. A much deeper run is literal code.
+		if (
+			match &&
+			marker.charAt(0) === opener.marker &&
+			marker.length >= opener.length &&
+			(match[3] ?? "").trim() === "" &&
+			(match[1] ?? "").length <= opener.indent + 3
+		) {
+			opener = null;
+		}
+	}
+	const indentOf = (row: string): number => row.length - row.trimStart().length;
+	// A table can be nested in a list and indented past four columns, where a
+	// top-level four-space line is code. Track list continuations so the two are
+	// distinguished without a full Markdown parser.
+	const inList = new Array<boolean>(rows.length).fill(false);
+	const listIndentAt = new Array<number | null>(rows.length).fill(null);
+	let listIndent: number | null = null;
+	for (let i = 0; i < rows.length; i++) {
+		const row = rows[i] ?? "";
+		// Markers inside a fence are literal text, not list structure. A fence
+		// opener less indented than the list content starts outside the item, so
+		// it ends the list continuation.
+		if (fenced[i] === true) {
+			const fenceMarker = /^( *)(`{3,}|~{3,})/.exec(row);
+			if (fenceMarker && listIndent !== null && (fenceMarker[1] ?? "").length < listIndent) listIndent = null;
+			continue;
+		}
+		const marker = /^(\s*)(?:[-+*]|\d+[.)])\s+/.exec(row);
+		if (marker) {
+			listIndent = (marker[0] ?? "").length;
+			inList[i] = true;
+			listIndentAt[i] = listIndent;
+			continue;
+		}
+		if (row.trim() === "") {
+			inList[i] = listIndent !== null;
+			listIndentAt[i] = listIndent;
+			continue;
+		}
+		if (listIndent !== null && indentOf(row) >= listIndent) {
+			inList[i] = true;
+			listIndentAt[i] = listIndent;
+			continue;
+		}
+		listIndent = null;
+	}
+	// Four columns past the list content baseline is an indented code block
+	// nested in the item, just as four columns past column 0 is top-level code.
+	const isIndentedCode = (index: number): boolean => {
+		const indent = indentOf(rows[index] ?? "");
+		if (inList[index] === true) {
+			const base = listIndentAt[index];
+			return base !== null && indent >= base + 4;
+		}
+		return indent >= 4;
+	};
+	// A GFM table always has a delimiter row; a pipe-delimited line without one
+	// is plain text, so the delimiter pass below is the only table signal.
+	let covered = -1;
+	for (let i = 1; i < lines.length; i++) {
+		if (i <= covered || fenced[i] === true || fenced[i - 1] === true) continue;
+		if (isIndentedCode(i) || isIndentedCode(i - 1)) continue;
+		if (!TABLE_DELIMITER_ROW.test(rows[i] ?? "") || !(rows[i - 1] ?? "").includes("|")) continue;
+		// A heading, list item, or blockquote is a block, not a table header,
+		// including when nested at a list content baseline.
+		if (BLOCK_START.test((rows[i - 1] ?? "").trimStart())) continue;
+		// GFM requires the header and delimiter to declare the same cell count;
+		// a prose line that happens to contain a pipe is not a header.
+		const cellsOf = (row: string): number => {
+			let trimmed = row.trim().replace(/\\\|/g, "");
+			if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+			if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+			return trimmed.split("|").length;
+		};
+		if (cellsOf(rows[i] ?? "") !== cellsOf(rows[i - 1] ?? "")) continue;
+		flags[i - 1] = true;
+		flags[i] = true;
+		let j = i + 1;
+		for (; j < lines.length; j++) {
+			if (fenced[j] === true) break;
+			const row = rows[j] ?? "";
+			if (row.trim() === "" || !row.includes("|") || isIndentedCode(j)) break;
+			// A block start ends the table even without a blank line.
+			if (BLOCK_START.test(row.trimStart())) break;
+			flags[j] = true;
+		}
+		covered = j - 1;
+	}
+	return flags;
+}
+
+function stripUrlUserinfo(text: string): string {
+	const lines = text.split("\n");
+	const tables = tableRowFlags(lines);
+	return lines
+		.map((line, index) => {
+			const table = tables[index] === true;
+			const withoutScheme = line.replace(table ? SCHEME_USERINFO_TABLE : SCHEME_USERINFO, "$1");
+			return withoutScheme
+				.replace(table ? RELATIVE_USERINFO_TABLE : RELATIVE_USERINFO, "//")
+				.replace(table ? ESCAPED_USERINFO_TABLE : ESCAPED_USERINFO, "\\/\\/");
+		})
+		.join("\n");
+}
+
+/**
+ * Vendor token shapes re-checked with only alphanumerics as the left boundary.
+ * The crash redactor anchors on a word boundary, so a token glued to an
+ * identifier (`build_ghp_…`) survives there; cached bodies are arbitrary user
+ * text, so the cache cannot inherit that assumption.
+ */
+const CACHE_VENDOR_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+	[/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»"],
+	[/github_pat_[A-Za-z0-9_]{20,}/g, "«redacted-github-token»"],
+	[/gh[opsur]_[A-Za-z0-9]{16,}/g, "«redacted-github-token»"],
+	[/(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, "«redacted-api-key»"],
+	[/sk-[A-Za-z0-9_-]{8,}/g, "«redacted-api-key»"],
+	[/xox[baprs]-[A-Za-z0-9-]{8,}/g, "«redacted-slack-token»"],
+	[/npm_[A-Za-z0-9]{20,}/g, "«redacted-npm-token»"],
+	[/glpat-[A-Za-z0-9_-]{20,}/g, "«redacted-gitlab-token»"],
+	[/hf_[A-Za-z0-9]{20,}/g, "«redacted-api-key»"],
+	[/(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}/g, "«redacted-aws-key»"],
+	[/AIza[0-9A-Za-z_-]{35}/g, "«redacted-google-api-key»"],
+];
+
+function scrubCacheVendorTokens(text: string): string {
+	let scrubbed = text;
+	for (const [pattern, marker] of CACHE_VENDOR_TOKEN_PATTERNS) scrubbed = scrubbed.replace(pattern, marker);
+	return scrubbed;
+}
+
+/**
+ * Strip the local home directory from cached text. `/home/<user>/x`,
+ * `/Users/<user>/x`, `/root/x` and `C:\Users\<user>\x` all become `~/x`: the
+ * path stays useful but no longer names this machine's account. Relative forms
+ * (`~/x`, `$HOME/x`) and non-home roots such as `/srv/app` are untouched, and
+ * a URL's own path is never rewritten.
+ */
+function scrubHostPaths(text: string): string {
+	const home = os.homedir();
+	const homePattern = home.length > 1 ? new RegExp(`${escapeRegExp(home)}(?![A-Za-z0-9._-])`, "g") : undefined;
+	const escapedHome = home.length > 1 ? home.replaceAll("/", "\\/") : "";
+	// JSON text escapes quotes and backslashes as well as slashes.
+	const jsonHome = home.length > 1 ? JSON.stringify(home).slice(1, -1) : "";
+	const scrubLocal = (chunk: string): string => {
+		let scrubbed = homePattern ? chunk.replace(homePattern, "~") : chunk;
+		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
+		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z])\/(?:home|Users)\/[^/\s"'`<>()[\]{},;|:=]+/g, "~");
+		scrubbed = scrubbed.replace(/(?<![A-Za-z])\/root(?![A-Za-z0-9._-])/g, "~");
+		// JSON text can escape path separators; mask the same local paths in
+		// that spelling without changing the surrounding text.
+		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|:=]+/g, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|:=]+/gi, "$1~");
+		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
+		return scrubbed.replace(/[A-Za-z]:[\\/]Users[\\/][^\\/\r\n"`<>()[\]{},;|:=]+/gi, "~");
+	};
+	// A `file:` URL's path is local, so scrub it without turning the marker into
+	// an authority: `file:///home/u/x` -> `file:///~/x`,
+	// `file://localhost/home/u/x` -> `file://localhost/~/x`.
+	const scrubFileUrl = (url: string): string => {
+		const match = /^(file:(?:\/\/|\\\/\\\/))([^/\\]*)([\s\S]*)$/i.exec(url);
+		if (!match) return scrubLocal(url);
+		const [, scheme, authority, rawPath] = match as unknown as [string, string, string, string];
+		if (!rawPath) return url;
+		const scrubbedPath = scrubLocal(rawPath);
+		if (scrubbedPath === rawPath) return url;
+		return scrubbedPath.startsWith("/")
+			? `${scheme}${authority}${scrubbedPath}`
+			: `${scheme}${authority}/${scrubbedPath}`;
+	};
+	// A URL path is usually content, but `/home/<account>` and `/Users/<account>`
+	// still name this machine's account even when the surrounding text looks
+	// like a URL. Keep the URL shape and mask only the account segment.
+	const scrubHomeSegmentInUrl = (url: string): string => {
+		// A valid URL path is content. Only a malformed local authority (empty
+		// port on localhost) is treated as carrying a local path.
+		const localAuthority =
+			/^(?:[a-z][a-z0-9+.-]*:)?\/\/(?:localhost(?::(?=\/))?\/|\/)/i.test(url) ||
+			/^(?:[a-z][a-z0-9+.-]*:)?\\\/\\\/(?:localhost(?::(?=\\\/))?\\\/|\\\/)/i.test(url);
+		if (!localAuthority) return url;
+		let scrubbed = homePattern ? url.replace(homePattern, "~") : url;
+		if (escapedHome) scrubbed = scrubbed.split(escapedHome).join("~");
+		if (jsonHome && jsonHome !== home) scrubbed = scrubbed.split(jsonHome).join("~");
+		scrubbed = scrubbed.replace(/(\/(?:home|Users)\/)[^/\s"'`<>()[\]{},;|:=]+/g, "$1~");
+		scrubbed = scrubbed.replace(/\/root(?=\/|[?#]|$)/g, "~");
+		scrubbed = scrubbed.replace(/(\\\/home\\\/|\\\/Users\\\/)[^\\/\s"'`<>()[\]{},;|:=]+/g, "$1~");
+		scrubbed = scrubbed.replace(/([A-Za-z]:\\\\Users\\\\)[^\\/\r\n"`<>()[\]{},;|:=]+/gi, "$1~");
+		scrubbed = scrubbed.replace(/\\\/root(?=\\\/|[?#]|$)/g, "~");
+		return scrubbed.replace(/([A-Za-z]:[\\/]Users[\\/])[^\\/\r\n"`<>()[\]{},;|:=]+/gi, "$1~");
+	};
+	// A URL's path is content, not a local path, so only scrub outside URL spans.
+	// `|` ends a span so a compact Markdown table row does not shield the next
+	// cell's home path.
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(/(?:[a-z][a-z0-9+.-]*:(?:\/\/|\\\/\\\/)|\/\/)[^\s"'`<>(){}|]*/gi)) {
+		const index = match.index ?? 0;
+		const url = match[0];
+		out += scrubLocal(text.slice(last, index));
+		out += /^file:/i.test(url) ? scrubFileUrl(url) : scrubHomeSegmentInUrl(url);
+		last = index + url.length;
+	}
+	return out + scrubLocal(text.slice(last));
+}
+
+/** Text-level scrub for everything the view cache persists or serves back. */
+/** True when the character at `index` is preceded by an odd backslash run. */
+function isEscapedAt(text: string, index: number): boolean {
+	let slashes = 0;
+	for (let i = index - 1; i >= 0 && text[i] === "\\"; i--) slashes++;
+	return slashes % 2 === 1;
+}
+
+/** True when a line begins a credential header that can safely reset prose quote state. */
+function startsCredentialHeader(line: string): boolean {
+	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*cookie|(?:(?:[A-Za-z0-9]+-)*authorization|auth))[ \t]*["']?[ \t]*[:=]/i.test(
+		line,
+	);
+}
+
+/** True when the line containing `index` is a bare credential container opener. */
+function isContainerOpenerLine(text: string, index: number): boolean {
+	const start = text.lastIndexOf("\n", index) + 1;
+	const end = text.indexOf("\n", index);
+	const line = text.slice(start, end === -1 ? text.length : end);
+	return /^[ \t]*[-+]?[ \t]*(?:(?:[A-Za-z0-9]+-)*(?:cookie|authorization|auth))[ \t]*["']?[ \t]*[:=][ \t]*[[{]/i.test(
+		line,
+	);
+}
+
+/** True when a single quote sits between word characters. */
+function isWordApostrophe(text: string, index: number): boolean {
+	return /[A-Za-z0-9]/.test(text[index - 1] ?? "") && /[A-Za-z0-9]/.test(text[index + 1] ?? "");
+}
+
+/** True when the current line starts a credential header. */
+function lineStartsCredentialHeader(text: string, index: number): boolean {
+	const start = text.lastIndexOf("\n", index) + 1;
+	const end = text.indexOf("\n", index);
+	return startsCredentialHeader(text.slice(start, end === -1 ? text.length : end));
+}
+
+/** True when only indentation/marker precedes a single quote on its line. */
+function isSingleQuoteItemStart(text: string, index: number): boolean {
+	const start = text.lastIndexOf("\n", index) + 1;
+	return /^[ \t]*[-+]?[ \t]*$/.test(text.slice(start, index));
+}
+
+/** Quote-aware bracket scan up to `end`. */
+function scanStructure(text: string, end: number): { stack: { ch: string; index: number }[]; quoted: boolean } {
+	const stack: { ch: string; index: number }[] = [];
+	let quote: string | null = null;
+	for (let i = 0; i < end; i++) {
+		const ch = text[i];
+		if ((i === 0 || text[i - 1] === "\n") && stack.length === 0) {
+			const lineEnd = text.indexOf("\n", i);
+			const line = text.slice(i, lineEnd === -1 ? text.length : lineEnd);
+			if (startsCredentialHeader(line)) quote = null;
+		}
+		if (quote) {
+			if (ch === quote && !isEscapedAt(text, i)) quote = null;
+			continue;
+		}
+		if (
+			ch === '"' ||
+			(ch === "'" &&
+				!isWordApostrophe(text, i) &&
+				(lineStartsCredentialHeader(text, i) || isSingleQuoteItemStart(text, i)))
+		) {
+			quote = ch;
+			continue;
+		}
+		if (ch === "{" || ch === "[") stack.push({ ch, index: i });
+		else if (ch === "}" || ch === "]") stack.pop();
+	}
+	return { stack, quoted: quote !== null };
+}
+
+/** True when a match carries a Cookie-owned structural closer. */
+function closesMatchingContainer(text: string, end: number, match: string): boolean {
+	const scan = scanStructure(text, end);
+	if (scan.quoted) return false;
+	const stack = [...scan.stack];
+	let quote: string | null = null;
+	for (let i = 0; i < match.length; i++) {
+		const ch = match[i];
+		if (quote) {
+			if (ch === quote && !isEscapedAt(match, i)) quote = null;
+			continue;
+		}
+		if (ch === '"' || (ch === "'" && !isWordApostrophe(match, i))) {
+			quote = ch;
+			continue;
+		}
+		if (ch === "{" || ch === "[") {
+			stack.push({ ch, index: end + i });
+			continue;
+		}
+		if (ch !== "}" && ch !== "]") continue;
+		const top = stack.at(-1);
+		if (!top || !((ch === "]" && top.ch === "[") || (ch === "}" && top.ch === "{"))) continue;
+		const rest = match.slice(i + 1).trim();
+		if (rest !== "" && rest !== ",") continue;
+		if (!isContainerOpenerLine(text, top.index)) return false;
+		stack.pop();
+		return true;
+	}
+	return false;
+}
+
+/** Count unbalanced `{`/`[` before a match so line masks never corrupt a container. */
+function containerDepthAt(text: string, end: number): number {
+	return scanStructure(text, end).stack.length;
+}
+
+/** True when the match starts inside a double-quoted string. */
+function insideContainerQuote(text: string, end: number): boolean {
+	return scanStructure(text, end).quoted;
+}
+
+/** True when the match itself contains a paired double-quoted value. */
+function hasLocalDoubleQuotePair(match: string): boolean {
+	const first = match.indexOf('"');
+	if (first < 0) return false;
+	for (let i = first + 1; i < match.length; i++) {
+		if (match[i] === '"' && !isEscapedAt(match, i)) return true;
+	}
+	return false;
+}
+
+/** Redact a whole Auth/Authorization container through its balanced end. */
+function maskAuthContainers(text: string): string {
+	let out = "";
+	let last = 0;
+	for (const match of text.matchAll(
+		/((?:"(?:[A-Za-z0-9]+-)*(?:authorization|auth)"|(?:[A-Za-z0-9]+-)*(?:authorization|auth))[ \t]*[:=][ \t]*)([[{])/gi,
+	)) {
+		const index = match.index ?? 0;
+		if (index < last) continue;
+		const valueStart = index + match[0].length - 1;
+		const end = findBalancedValueEnd(text, valueStart);
+		const stop = end === -1 ? text.length : end;
+		out += text.slice(last, index) + `${match[1]}«redacted»`;
+		last = stop;
+	}
+	return out + text.slice(last);
+}
+
+function scrubCacheText(text: string, diff = false): string {
+	// Userinfo comes off the raw text first: container masking can collapse a
+	// blank line that ended a Markdown table, and a later table classification
+	// would then hide a URL behind its cell separator.
+	const withoutUserinfo = stripUrlUserinfo(text);
+	// Structured containers next: a partial flat match would hide the credential
+	// label from the quote-aware container pass.
+	const containers = maskCredentialJsonContainers(withoutUserinfo, diff);
+	// The shared URL rule does not know about Markdown cell separators and can
+	// treat `|'person@example.test'` as userinfo. Mask the remaining `@` signs
+	// (userinfo was already removed) so only our authority pass sees them.
+	// Credential labels are masked before paths so a path scrub cannot consume
+	// a label and orphan its value; paths run before `@` masking so a home path
+	// that itself contains `@` still matches; and paths run before the shared
+	// redactor so a token cannot consume a following `file` scheme word.
+	// PEM blocks are masked before any line-truncating header rule can delete
+	// their BEGIN marker and orphan the key body.
+	const withoutPem = containers.text.replace(
+		/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+		"«redacted-private-key»",
+	);
+	// Digest/Negotiate headers carry parameters after the scheme; mask the rest
+	// of the header line so a `response=` parameter cannot survive.
+	const withoutAuthContainers = maskAuthContainers(withoutPem);
+	const withoutParameterizedAuth = withoutAuthContainers.replace(
+		/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
+		"$1 «redacted»",
+	);
+	const withoutLineAuth = maskParameterizedAuthValues(withoutParameterizedAuth)
+		.replace(
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?(?:Digest|Negotiate)\b)[^\r\n]*/gi,
+			"$1$2$3 «redacted»",
+		)
+		.replace(
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*authorization|auth)[ \t]*["']?[ \t]*[:=][ \t]*["']?)(Bearer|Basic|Token|Negotiate|Digest|NTLM)([ \t]+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s|;"'`&,]+)/gi,
+			"$1$2$3$4$5«redacted»",
+		);
+	const authHeaders = maskBoundedAuthorizationHeaders(maskParameterizedAuthValues(withoutLineAuth));
+	const assignments = maskBoundedCredentialAssignments(authHeaders.text);
+	const withoutBearer = assignments.text.replace(/Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer «redacted»");
+	const withoutCookies = withoutBearer
+		.replace(
+			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*\r?\n[-+][^\S\r\n]*[[{][^\r\n]*(?:\r?\n[-+]?[^\r\n]*)*?\r?\n[-+]?[^\S\r\n]*[\]}][^\r\n]*/gi,
+			"$1$2Cookie: «redacted»",
+		)
+		.replace(
+			/(^|\n)([-+]?)(?:(?:[A-Za-z0-9]+-)*cookie)[^\S\r\n]*:[^\S\r\n]*(?![^\S\r\n]*\r?\n[^\S\r\n]*[[{])(?=[^\S\r\n]*\r?\n)(?:\r?\n[-+]?[^\S\r\n]+[^\r\n]*)+/gi,
+			"$1$2Cookie: «redacted»",
+		)
+		.replace(
+			/(^|\n)([-+]?)((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
+			(match: string, lineStart: string, marker: string, label: string, offset: number, text: string) => {
+				if (containerDepthAt(text, offset) === 0) return `${lineStart}${marker}${label}«redacted»`;
+				if (insideContainerQuote(text, offset)) return match;
+				if (closesMatchingContainer(text, offset, match)) {
+					if (!match.includes("'")) return match;
+					const closerIndex = Math.max(match.lastIndexOf("]"), match.lastIndexOf("}"));
+					const closer = closerIndex >= 0 ? match.slice(closerIndex) : "";
+					return `${lineStart}${marker}${label}«redacted»${closer}`;
+				}
+				if (match.includes('"') && !hasLocalDoubleQuotePair(match)) return match;
+				return `${lineStart}${marker}${label}«redacted»`;
+			},
+		)
+		.replace(
+			/(?<![A-Za-z0-9_-])((?:(?:[A-Za-z0-9]+-)*cookie)[ \t]*:[ \t]*)(?![^\S\r\n]*[[{])(?![^\S\r\n]*(?:\r?\n[^\S\r\n]*[[{]|$))[^\r\n]+/gi,
+			(match: string, label: string, offset: number, text: string) =>
+				containerDepthAt(text, offset) > 0 ? match : `${label}«redacted»`,
+		);
+	const withoutAtSigns = scrubHostPaths(withoutCookies).replaceAll("@", AT_SIGN_MASK);
+	let scrubbed = redactCrashSecrets(withoutAtSigns);
+	scrubbed = scrubCacheVendorTokens(scrubbed);
+	scrubbed = scrubbed.replaceAll(AT_SIGN_MASK, "@");
+	return containers.restore(authHeaders.restore(assignments.restore(scrubbed)));
+}
+
+/** Scrub credential-shaped text and host paths inside a value before it is JSON-encoded or served back. */
+function scrubPersistedValue(value: unknown): unknown {
+	if (typeof value === "string") return scrubCacheText(value);
+	if (typeof value !== "object" || value === null) return value;
+	if (value instanceof Date) return value;
+	if (Array.isArray(value)) return value.map(scrubPersistedValue);
+	const proto = Object.getPrototypeOf(value);
+	if (proto !== Object.prototype && proto !== null) return value;
+	// An opaque value under a credential-named field is credential material even
+	// when it has no recognizable token shape.
+	const out: Record<string, unknown> = {};
+	const seenKeys = new Set<string>();
+	for (const [key, child] of Object.entries(value)) {
+		const baseKey = scrubCacheText(key);
+		let outKey = baseKey;
+		let disambiguator = 2;
+		while (seenKeys.has(outKey)) outKey = `${baseKey}#${disambiguator++}`;
+		seenKeys.add(outKey);
+		const scrubbedChild =
+			isCredentialKey(key) && child !== null && child !== undefined ? "«redacted»" : scrubPersistedValue(child);
+		// `defineProperty` keeps an own `__proto__` key an ordinary entry instead of
+		// assigning through the prototype setter.
+		Object.defineProperty(out, outKey, {
+			value: scrubbedChild,
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+	}
+	return out;
+}
+
+interface ScrubbedView {
+	payload: unknown;
+	rendered: string;
+	sourceUrl: string | undefined;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Sanitize one stored representation. Runs on write and again on read, so a row
+ * written before this scrub existed is never served verbatim.
+ *
+ * A `pr-diff` row needs more than a text pass: its index holds byte offsets
+ * into the unified text, so a scrub (which changes byte lengths) requires
+ * rebuilding the index from the scrubbed text. Git path tokens are escape-
+ * decoded by the parser, and decoding can turn `\141ccess_token=…` into a
+ * recognizable credential, so the encoded header tokens are rewritten from
+ * their scrubbed decoded form before the index is rebuilt. The recursive value
+ * scrub then covers decoded paths and every other string field.
+ */
+function scrubStoredView(
+	kind: CacheKind,
+	payload: unknown,
+	rendered: string,
+	sourceUrl: string | undefined,
+): ScrubbedView {
+	const scrubbedSourceUrl = sourceUrl === undefined ? undefined : scrubCacheText(sourceUrl);
+	if (kind !== "pr-diff") {
+		return {
+			payload: scrubPersistedValue(payload),
+			rendered: scrubCacheText(rendered),
+			sourceUrl: scrubbedSourceUrl,
+		};
+	}
+	const unified = isRecordValue(payload) ? payload.unified : undefined;
+	if (typeof unified !== "string") {
+		// A diff row without unified text cannot be reindexed consistently. Fail
+		// closed: the read becomes a miss and the write is skipped.
+		throw new Error("github cache: pr-diff payload without unified text");
+	}
+	// The raw unified text goes straight into the diff-aware scrub. Scrubbing
+	// it as prose first could consume a header operand (`Authorization:`), and
+	// the damaged text would be indexed as the persisted one. Sibling fields are
+	// scrubbed generically; the rebuilt `unified` and `files` come from the
+	// exact text that is stored so slice offsets stay valid.
+	const scrubbedUnified = scrubPrDiffText(unified, value => scrubCacheText(value, true));
+	const reparsed = parsePrUnifiedDiff(scrubbedUnified);
+	const extras = isRecordValue(payload)
+		? scrubPersistedValue(
+				Object.fromEntries(Object.entries(payload).filter(([key]) => key !== "unified" && key !== "files")),
+			)
+		: {};
+	return {
+		payload: {
+			...(isRecordValue(extras) ? extras : {}),
+			unified: scrubbedUnified,
+			files: scrubPersistedValue(reparsed.files),
+		},
+		rendered: scrubbedUnified,
+		sourceUrl: scrubbedSourceUrl,
+	};
+}
+
 export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 	const db = openDb();
 	if (!db) return;
 	try {
 		const fetchedAt = input.fetchedAt ?? Date.now();
-		const payloadJson = JSON.stringify(input.payload);
+		// Sanitize before JSON encoding. Encoding first glues a token to an
+		// escaped newline and the scrubber misses it. The live fetch result is not
+		// rewritten; a later hit reads this scrubbed row.
+		const scrubbed = scrubStoredView(input.kind, input.payload, input.rendered, input.sourceUrl);
+		const payloadJson = JSON.stringify(scrubbed.payload);
 		db.prepare(
 			"INSERT OR REPLACE INTO github_view_cache (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(
@@ -299,8 +1089,8 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 			input.includeComments ? 1 : 0,
 			fetchedAt,
 			payloadJson,
-			input.rendered,
-			input.sourceUrl ?? null,
+			scrubbed.rendered,
+			scrubbed.sourceUrl ?? null,
 		);
 		protectDbFiles(getGithubCacheDbPath());
 	} catch (err) {
