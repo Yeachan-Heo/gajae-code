@@ -7,7 +7,9 @@ import {
 	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
 	FileLockAcquireError,
 } from "../src/config/file-lock";
+import { Broker } from "../src/sdk/broker/broker";
 import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex, sessionIndexStartupLockOptions } from "../src/sdk/broker/session-index";
 
 const holderFixture = path.join(import.meta.dir, "fixtures", "session-index-lock-holder.ts");
@@ -190,4 +192,97 @@ describe("session-index dead-owner reclaim", () => {
 		expect(error.holder).toContain("liveness unknown from this host");
 		expect(await Bun.file(path.join(lockDir, "info")).text()).toBe(before);
 	});
+
+	it("죽은 주인 잠금 → 회수 후 시작", async () => {
+		const dir = await makeAgentDir();
+		const dead = await holdLock(dir, "same-host");
+		const lockDir = `${indexPath(dir)}.lock`;
+		const before = await Bun.file(path.join(lockDir, "info")).text();
+		const broker = new Broker({ agentDir: dir, startupCheckpointDeadline: performance.now() + 15_000 });
+		try {
+			const started = performance.now();
+			const discovery = await broker.start();
+			expect(performance.now() - started).toBeLessThan(5_000);
+			expect(discovery.pid).toBe(process.pid);
+			const sessions = await fs.readdir(path.join(dir, "sdk", "sessions"));
+			const tombstones = sessions.filter(name => name.startsWith("index.jsonl.lock.stale-"));
+			expect(tombstones).toHaveLength(1);
+			expect(await Bun.file(path.join(dir, "sdk", "sessions", tombstones[0]!, "info")).text()).toBe(before);
+			expect(JSON.parse(before)).toMatchObject({ pid: dead.pid });
+			expect(await fs.exists(lockDir)).toBe(false);
+		} finally {
+			await broker.stop();
+		}
+	}, 20_000);
+
+	it("살아 있는 주인 → 시작 거부", async () => {
+		const dir = await makeAgentDir();
+		const host = await brokerLockHostIdentity(dir);
+		const file = indexPath(dir);
+		const release = await acquireFileLock(file, { retries: 3, retryDelayMs: 5, ...host });
+		const before = await Bun.file(path.join(`${file}.lock`, "info")).text();
+		const broker = new Broker({ agentDir: dir, startupCheckpointDeadline: performance.now() + 800 });
+		try {
+			const failure = await broker.start().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect((failure as FileLockAcquireError).holderIsLive).toBe(true);
+			expect(await Bun.file(path.join(`${file}.lock`, "info")).text()).toBe(before);
+			const sessions = await fs.readdir(path.join(dir, "sdk", "sessions"));
+			expect(sessions.filter(name => name.startsWith("index.jsonl.lock.stale-"))).toEqual([]);
+		} finally {
+			await release();
+			await broker.stop();
+		}
+	}, 15_000);
+
+	it("does not recover an empty info lock or an incarnation mismatch", async () => {
+		const dir = await makeAgentDir();
+		const host = await brokerLockHostIdentity(dir);
+		const incarnation = processIncarnation(process.pid);
+		if (!incarnation) throw new Error("Current process incarnation is unavailable");
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const emptyLock = path.join(sessionsDir, "index.jsonl.lock");
+		await fs.mkdir(emptyLock, { mode: 0o700 });
+		await Bun.write(path.join(emptyLock, "info"), "");
+		const emptyBroker = new Broker({ agentDir: dir, startupCheckpointDeadline: performance.now() + 800 });
+		try {
+			const failure = await emptyBroker.start().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(await Bun.file(path.join(emptyLock, "info")).text()).toBe("");
+			expect(await fs.exists(emptyLock)).toBe(true);
+		} finally {
+			await emptyBroker.stop();
+		}
+		await fs.rm(emptyLock, { recursive: true, force: true });
+
+		const mismatched = JSON.stringify({
+			pid: process.pid,
+			process_incarnation: `${incarnation}-mismatch`,
+			timestamp: Date.now(),
+			owner_host_id: host.ownerHostId,
+			owner_token: "incarnation-mismatch",
+		});
+		await fs.mkdir(emptyLock, { mode: 0o700 });
+		await Bun.write(path.join(emptyLock, "info"), mismatched);
+		const mismatchBroker = new Broker({ agentDir: dir, startupCheckpointDeadline: performance.now() + 800 });
+		try {
+			const failure = await mismatchBroker.start().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(await Bun.file(path.join(emptyLock, "info")).text()).toBe(mismatched);
+			expect(await fs.exists(emptyLock)).toBe(true);
+			const sessions = await fs.readdir(sessionsDir);
+			expect(sessions.filter(name => name.startsWith("index.jsonl.lock.stale-"))).toEqual([]);
+		} finally {
+			await mismatchBroker.stop();
+		}
+	}, 15_000);
 });
