@@ -473,6 +473,22 @@ describe("shared publication admission split", () => {
 		).toThrow("legacy callback exploded");
 	});
 
+	it("withholds Python onPersisted when the legacy append throws", async () => {
+		const f = await fixture({ sharedAppend: false });
+		const append = f.manager.appendMessage.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessage").mockImplementation(message => {
+			if (message.role === "pythonExecution") throw new Error("append refused");
+			return append(message);
+		});
+		const persisted = vi.fn();
+		expect(() =>
+			f.session.recordPythonResult("print('refused')", shellResult("python refused output"), {
+				onPersisted: persisted,
+			}),
+		).toThrow("append refused");
+		expect(persisted).not.toHaveBeenCalled();
+	});
+
 	it("reserves the queued continuation before a throwing legacy Python callback", async () => {
 		const f = await fixture({ sharedAppend: false });
 		// Queue directly on the agent: the session's own follow-up path would schedule
