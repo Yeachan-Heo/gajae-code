@@ -366,6 +366,91 @@ function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Incremental JSON validator that tracks string/escape/depth state across deltas.
+ * Tracks the validation state per-ToolCall block to avoid re-parsing from the start.
+ */
+interface IncrementalJsonValidatorState {
+	/** Whether we're inside a string literal. */
+	inString: boolean;
+	/** Whether the last character was an unescaped backslash (for escape sequences). */
+	lastWasEscape: boolean;
+	/** Depth of braces/brackets nesting. */
+	depth: number;
+	/** Whether we've seen content (non-whitespace after root open). */
+	sawContent: boolean;
+	/** Buffer size at last validation point. */
+	lastValidatedSize: number;
+}
+
+/**
+ * Create initial state for incremental JSON validation.
+ * Returns a state object that can be updated incrementally with new deltas.
+ */
+function createIncrementalJsonValidatorState(): IncrementalJsonValidatorState {
+	return {
+		inString: false,
+		lastWasEscape: false,
+		depth: 0,
+		sawContent: false,
+		lastValidatedSize: 0,
+	};
+}
+
+/**
+ * Update incremental JSON validator state with a new delta.
+ * Returns whether the accumulated JSON (up to current position) forms a complete object.
+ * Cost is O(delta length), not O(accumulated length).
+ */
+function updateIncrementalJsonValidatorState(state: IncrementalJsonValidatorState, buffer: string): boolean {
+	// Process only the new portion of the buffer
+	const startIdx = state.lastValidatedSize;
+	const endIdx = buffer.length;
+
+	for (let i = startIdx; i < endIdx; i++) {
+		const char = buffer[i];
+		const code = char?.charCodeAt(0) ?? 0;
+
+		// Handle escape sequences in strings
+		if (state.inString) {
+			if (state.lastWasEscape) {
+				state.lastWasEscape = false;
+			} else if (code === 0x5c) {
+				// Backslash
+				state.lastWasEscape = true;
+			} else if (code === 0x22) {
+				// Quote - end of string
+				state.inString = false;
+			}
+			continue;
+		}
+
+		// Not in a string, process structural characters
+		if (code === 0x22) {
+			// Quote - start of string
+			state.inString = true;
+		} else if (code === 0x7b) {
+			// Open brace
+			state.depth++;
+			state.sawContent = true;
+		} else if (code === 0x7d) {
+			// Close brace
+			if (state.depth > 0) state.depth--;
+		} else if (code === 0x5b) {
+			// Open bracket
+			state.depth++;
+		} else if (code === 0x5d) {
+			// Close bracket
+			if (state.depth > 0) state.depth--;
+		}
+	}
+
+	state.lastValidatedSize = endIdx;
+
+	// Complete JSON object: depth is 0, we saw content, and not currently in a string
+	return !state.inString && state.depth === 0 && state.sawContent;
+}
+
 function isCompleteJsonObject(value: string): boolean {
 	try {
 		return isPlainJsonObject(JSON.parse(value));
@@ -397,6 +482,8 @@ type CodexOutputBlock =
 			sourceCallId?: string;
 			sourceName?: string;
 			sourceOutputIndex?: number;
+			/** Incremental JSON validator state for per-delta completeness checks. */
+			jsonValidatorState?: IncrementalJsonValidatorState;
 	  });
 export interface OpenAICodexWebSocketDebugStats {
 	fullContextRequests: number;
@@ -530,6 +617,8 @@ interface CodexStreamRuntime {
 	finalizedToolCallIds: Set<string>;
 	/** Event types whose degraded non-string increment was already diagnosed. */
 	degradedIncrementDiagnostics: Set<string>;
+	/** Event queued for publication after a cooperative flush due to replay-eligibility change. */
+	queuedEventAfterFlush: AssistantMessageEvent | null;
 	/** An argument event identified a different active item; never salvage this response. */
 	toolArgumentCorrelationFailed: boolean;
 	/** Bounded event descriptors retained for transient stream-close diagnostics. */
@@ -1308,6 +1397,7 @@ function createCodexStreamRuntime(initial: {
 		toolArgumentCorrelationFailed: false,
 		recentEvents: [],
 		recentEventIndex: 0,
+		queuedEventAfterFlush: null,
 	};
 }
 
@@ -1330,10 +1420,16 @@ async function processCodexResponseStream(
 					rawEvent,
 					firstTokenTime,
 				});
+				// If an event was queued for publication after cooperative flushing, flush now and push it.
+				if (runtime.queuedEventAfterFlush !== null) {
+					await flushCodexEventsCooperatively(context, runtime);
+					context.stream.push(runtime.queuedEventAfterFlush);
+					runtime.queuedEventAfterFlush = null;
+				}
 				if (runtime.sawTerminalEvent) break;
 			}
 			if (!runtime.sawTerminalEvent) {
-				trySalvageCodexFinalizedToolCalls(
+				await trySalvageCodexFinalizedToolCalls(
 					context,
 					runtime,
 					new Error("Codex stream ended before terminal completion event"),
@@ -1341,7 +1437,7 @@ async function processCodexResponseStream(
 			}
 			return { firstTokenTime };
 		} catch (error) {
-			if (trySalvageCodexFinalizedToolCalls(context, runtime, error)) {
+			if (await trySalvageCodexFinalizedToolCalls(context, runtime, error)) {
 				return { firstTokenTime };
 			}
 			const recovered = await recoverCodexStreamError(context, runtime, error);
@@ -1370,6 +1466,31 @@ function flushCodexEvents(context: CodexStreamProcessingContext, runtime: CodexS
 	runtime.eventsReleased = true;
 }
 
+async function flushCodexEventsCooperatively(
+	context: CodexStreamProcessingContext,
+	runtime: CodexStreamRuntime,
+): Promise<void> {
+	// Flush buffered events cooperatively, yielding periodically to allow timers, abort,
+	// and other work to make progress. Process events in batches to avoid starvation.
+	// Check abort signal before starting and after each batch.
+	const batchSize = 100;
+	for (let i = 0; i < runtime.bufferedEvents.length; i++) {
+		// Check abort signal before pushing each event
+		if (context.options?.signal?.aborted) {
+			runtime.bufferedEvents.length = 0;
+			runtime.eventsReleased = true;
+			throw new Error("Request was aborted");
+		}
+		context.stream.push(runtime.bufferedEvents[i]!);
+		// Yield after each batch to allow other microtasks and abort checks to run
+		if ((i + 1) % batchSize === 0) {
+			await Bun.sleep(0);
+		}
+	}
+	runtime.bufferedEvents.length = 0;
+	runtime.eventsReleased = true;
+}
+
 function discardCodexEvents(runtime: CodexStreamRuntime, resumeBuffering = false): void {
 	runtime.bufferedEvents.length = 0;
 	runtime.eventsReleased = !resumeBuffering;
@@ -1388,7 +1509,7 @@ function emitCodexEvent(
 		context.stream.push(event);
 		return;
 	}
-	// Public consumers cannot retract starts or deltas. Hold replayable attempts
+	// Public consumers cannot retract deltas or starts. Hold all replayable attempts
 	// until they commit, and discard their events when replay resets the output.
 	if (
 		!runtime.eventsReleased &&
@@ -1401,15 +1522,22 @@ function emitCodexEvent(
 		runtime.bufferedEvents.push(event);
 		return;
 	}
+	// Buffered events must be flushed before this non-replay-eligible event is published.
+	// Queue this event for publication after the cooperative flush in the stream processing loop.
+	if (runtime.bufferedEvents.length > 0 && !runtime.eventsReleased) {
+		runtime.queuedEventAfterFlush = event;
+		return;
+	}
+	// If there are no buffered events, publish immediately (all events have already been released).
 	flushCodexEvents(context, runtime);
 	context.stream.push(event);
 }
 
-function trySalvageCodexFinalizedToolCalls(
+async function trySalvageCodexFinalizedToolCalls(
 	context: CodexStreamProcessingContext,
 	runtime: CodexStreamRuntime,
 	error: unknown,
-): boolean {
+): Promise<boolean> {
 	const toolCalls = context.output.content.filter((block): block is ToolCall => block.type === "toolCall");
 	const completeToolCalls = toolCalls.filter(toolCall => {
 		const block = toolCall as ToolCall & {
@@ -1503,7 +1631,8 @@ function trySalvageCodexFinalizedToolCalls(
 		return false;
 	}
 
-	flushCodexEvents(context, runtime);
+	// Use cooperative flush to avoid blocking the event loop during salvage
+	await flushCodexEventsCooperatively(context, runtime);
 	if ((canSalvageFinalizedCall || canSalvageCompleteArguments) && runtime.currentBlock?.type === "thinking") {
 		context.stream.push({
 			type: "thinking_end",
@@ -2037,8 +2166,15 @@ function handleToolCallArgumentsDelta(
 		currentBlock.argumentsComplete = false;
 	}
 	currentBlock.partialJson += delta;
+	// Use incremental validator for O(delta) instead of O(accumulated) per-delta cost
+	if (!currentBlock.jsonValidatorState) {
+		currentBlock.jsonValidatorState = createIncrementalJsonValidatorState();
+	}
+	currentBlock.argumentsComplete = updateIncrementalJsonValidatorState(
+		currentBlock.jsonValidatorState,
+		currentBlock.partialJson,
+	);
 	currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-	currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
 	currentBlock.argumentsAuthoritative =
 		currentBlock.argumentsAuthoritative || (currentBlock.argumentsComplete && delta.trim().length > 0);
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -2054,6 +2190,7 @@ function handleToolCallArgumentsDone(
 	if (typeof args === "string") {
 		currentBlock.partialJson = args;
 		currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+		// At terminal boundary, use full parse to ensure authoritative validation
 		currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
 		currentBlock.argumentsAuthoritative = currentBlock.argumentsComplete;
 		captureUnicodeEscapeEvidence(currentBlock, args);
@@ -2914,7 +3051,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const completion = await processCodexResponseStream(processingContext, runtime);
 			processingContext.firstTokenTime = completion.firstTokenTime;
 			const message = finalizeCodexResponse(processingContext, runtime, completion);
-			flushCodexEvents(processingContext, runtime);
+			await flushCodexEventsCooperatively(processingContext, runtime);
+			// Recheck abort signal after the cooperative flush returns
+			if (processingContext.options?.signal?.aborted) {
+				throw new Error("Request was aborted");
+			}
 			stream.push({ type: "done", reason: message.stopReason as "stop" | "length" | "toolUse", message });
 			stream.end();
 		} catch (error) {
@@ -2944,7 +3085,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					},
 					startTime,
 				} satisfies CodexStreamProcessingContext);
-			if (runtime) flushCodexEvents(failureContext, runtime);
+			if (runtime) await flushCodexEventsCooperatively(failureContext, runtime);
 			const failure = await handleCodexStreamFailure(failureContext, error);
 			stream.push({ type: "error", reason: failure.stopReason as "error" | "aborted", error: failure });
 			stream.end();
