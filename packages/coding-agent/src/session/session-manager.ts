@@ -2050,24 +2050,6 @@ function sameManagedTranscript(observed: ManagedFileSnapshot["identity"], expect
 	);
 }
 
-/** Title publication has patch evidence, not a conversation-graph entry ID. */
-export type SharedTitleOutcome =
-	| { readonly kind: "committed"; readonly title: string }
-	| { readonly kind: "skipped"; readonly reason: "stale" | "named" }
-	| {
-			readonly kind: "stale";
-			readonly reason: "transcript_moved" | "persistence_latched" | "rewrite_required" | "unsupported_transcript";
-	  }
-	| { readonly kind: "rejected"; readonly error: unknown }
-	| {
-			readonly kind: "unknown";
-			readonly sessionId: string;
-			readonly patch: Readonly<{ title: string; titleSource: "auto" | "user" }>;
-			readonly predecessor?: ManagedFileIdentity;
-			readonly receipt?: ManagedAppendReceipt;
-			readonly error: unknown;
-	  };
-
 /**
  * Outcome of publishing an append into a transcript another opener may also be writing.
  *
@@ -8187,7 +8169,7 @@ export class SessionManager {
 	/**
 	 * Permanent bar on resident-graph and whole-transcript rewrites. Latched once this
 	 * manager re-anchors to a committed transcript whose entries it did not import:
-	 * every canonical shared append, and a title that adopts an existing transcript.
+	 * every canonical shared append.
 	 * Enforced at the write funnels (`#writeEntriesAtomicallySync`,
 	 * `#rewriteFileContents`, `#rewriteFileSync`), so recovery and close-time
 	 * escalations cannot bypass it.
@@ -19924,205 +19906,6 @@ export class SessionManager {
 		}
 	}
 
-	/** Publish only a title patch, never a resident transcript or a legacy header replay. */
-	async setSessionNameSharingSession(
-		name: string,
-		source: "auto" | "user" = "auto",
-		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
-	): Promise<SharedTitleOutcome> {
-		this.#assertRecoveryHydrationWritable();
-		const sanitized = SessionManager.#sanitizeName(name);
-		if (!sanitized) return { kind: "rejected", error: new Error("empty_session_title") };
-		if (this.destination.kind !== "managed")
-			return { kind: "rejected", error: new Error("shared_title_requires_managed_destination") };
-		const sessionId = this.#sessionId;
-		const identityGeneration = this.#committedIdentityGeneration;
-		if (SessionManager.#durableThinkingControls.has(sessionId))
-			return { kind: "rejected", error: new Error("shared_title_durable_thinking_control_in_flight") };
-		this.#refreshManagedTranscriptRelocation();
-		const sessionFile = this.#sessionFile;
-		if (!sessionFile) return { kind: "rejected", error: new Error("shared_title_requires_session_file") };
-		const current = () =>
-			this.#sessionId === sessionId &&
-			this.#committedIdentityGeneration === identityGeneration &&
-			options?.isCurrent?.() !== false;
-		const patch = { title: sanitized, titleSource: source } as const;
-		const predecessor = this.#titleMutationTail;
-		const completion = Promise.withResolvers<void>();
-		this.#titleMutationTail = completion.promise;
-		let result: SharedTitleOutcome;
-		let releasePublication: (() => void) | undefined;
-		try {
-			releasePublication = this.#enterSharedPublication(sessionId, { append: false, rewrite: false });
-			await predecessor;
-			if (!current()) return { kind: "skipped", reason: "stale" };
-			this.#assertRecoveryHydrationWritable();
-			const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
-			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-			let attempted = false;
-			let predecessorIdentity: ManagedFileIdentity | undefined;
-			let priorCommittedDigest: string | undefined;
-			let receipt: ManagedAppendReceipt | undefined;
-			let retainedFailure: Error | undefined;
-			const retainUnknown = (error: unknown): SharedTitleOutcome => {
-				const outcome: SharedTitleOutcome = {
-					kind: "unknown",
-					sessionId,
-					patch,
-					predecessor: predecessorIdentity,
-					receipt,
-					error,
-				};
-				if (retainedFailure) retainedFailure.cause = outcome;
-				else {
-					retainedFailure = new Error("Shared session title publication outcome is unknown", { cause: outcome });
-					this.#recordPersistError(retainedFailure);
-				}
-				return outcome;
-			};
-			try {
-				result = await withManagedSessionTransaction<SharedTitleOutcome>({ locksDirectory, sessionId }, scope => {
-					scope.assertOwned();
-					if (!current()) return { kind: "skipped", reason: "stale" };
-					if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
-					this.#refreshManagedTranscriptRelocation();
-					if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
-						return { kind: "stale", reason: "transcript_moved" };
-					if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
-					const store = this.#managedTranscriptStore(sessionFile);
-					const relative = path.basename(sessionFile);
-					store.assertBound();
-					const snapshot = store.readExpected(relative);
-					if (!this.#flushed && snapshot) return { kind: "stale", reason: "transcript_moved" };
-					let committedHeader: SessionHeader;
-					if (snapshot) {
-						let entries: FileEntry[];
-						try {
-							entries = parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(snapshot.bytes));
-						} catch {
-							return { kind: "stale", reason: "unsupported_transcript" };
-						}
-						const header = entries[0];
-						if (header?.type !== "session" || header.id !== sessionId)
-							return { kind: "stale", reason: "transcript_moved" };
-						if (header.version !== CURRENT_SESSION_VERSION || snapshot.bytes.at(-1) !== 10)
-							return { kind: "stale", reason: "unsupported_transcript" };
-						committedHeader = header;
-						predecessorIdentity = snapshot.identity;
-						// The digest this manager last committed. Equal to the snapshot digest only
-						// when no other opener advanced this transcript since.
-						priorCommittedDigest = this.#managedPersistExpectedIdentity?.sha256 ?? this.#openCommittedDigest;
-					} else {
-						if (
-							this.#flushed ||
-							!this.persist ||
-							this.#readOnlyResume ||
-							this.#ensuredOnDisk ||
-							this.#managedPersistExpectedIdentity
-						)
-							return { kind: "stale", reason: "transcript_moved" };
-						const header = this.#fileEntries[0];
-						if (header?.type !== "session" || header.id !== sessionId)
-							return { kind: "stale", reason: "transcript_moved" };
-						committedHeader = header;
-					}
-					if (options?.onlyIfUnnamed && committedHeader.title) return { kind: "skipped", reason: "named" };
-					if (source === "auto" && committedHeader.titleSource === "user")
-						return { kind: "skipped", reason: "named" };
-					if (!current()) return { kind: "skipped", reason: "stale" };
-					try {
-						this.#ownershipClaims.checkWrite("shared title", sessionId);
-						const record: HeaderPatchRecord = { type: "header_patch", patch };
-						if (snapshot) {
-							attempted = true;
-							scope.assertOwned();
-							receipt = store.appendExpectedIdentitySync(
-								relative,
-								Buffer.from(`${JSON.stringify(record)}\n`),
-								snapshot.identity,
-							);
-						} else {
-							const entries = materializeResidentEntriesForPersistenceSync(
-								this.#fileEntries,
-								this.#residentBlobStores(),
-							).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
-							const first = entries[0];
-							if (first?.type !== "session") return { kind: "stale", reason: "transcript_moved" };
-							entries[0] = { ...first, title: sanitized, titleSource: source };
-							const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
-							attempted = true;
-							scope.assertOwned();
-							store.publishNoReplaceSync(relative, bytes);
-							const published = store.readExpected(relative);
-							if (!published?.bytes.equals(bytes)) throw new Error("durability_unproven");
-							receipt = { identity: published.identity, descriptor: store.descriptorExpected(relative)! };
-						}
-						const verified = store.readExpected(relative);
-						const patchBytes = Buffer.from(`${JSON.stringify(record)}\n`);
-						if (
-							!verified ||
-							!receipt ||
-							verified.identity.sha256 !== receipt.identity.sha256 ||
-							(snapshot &&
-								(!verified.bytes.subarray(0, snapshot.bytes.length).equals(snapshot.bytes) ||
-									!verified.bytes.subarray(snapshot.bytes.length).equals(patchBytes)))
-						)
-							throw new Error("durability_unproven");
-						return { kind: "committed", title: sanitized };
-					} catch (error) {
-						if (error instanceof ManagedAppendIdentityMismatchError)
-							return { kind: "stale", reason: "transcript_moved" };
-						return retainUnknown(error);
-					}
-				});
-			} catch (error) {
-				if (!attempted) throw error;
-				return retainUnknown(error);
-			}
-			if (result.kind === "committed") {
-				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-				if (header) {
-					applyHeaderPatch(header, patch);
-					this.#markHeaderCommitted(header, patch);
-					this.#headerExportRevision++;
-				}
-				this.#sessionName = sanitized;
-				this.#titleSource = source;
-				if (receipt) {
-					this.#managedPersistExpectedIdentity = receipt.identity;
-					this.#openCommittedDigest = receipt.identity.sha256;
-				}
-				// The snapshot branch imported only the header. Rewrite authority stays barred
-				// only when the transcript already held a state this manager never committed:
-				// renaming a transcript this manager wrote itself keeps full authority.
-				//
-				// Invariant behind not latching on the `unknown` outcome below: this latch only
-				// runs after `result.kind === "committed"`. When the patch outcome is `unknown`,
-				// rewrite authority is left open, so safety rests on the expected identity NOT
-				// advancing: a later whole-graph write then fails the identity fence instead of
-				// clobbering the sibling branch. Do not advance
-				// `#managedPersistExpectedIdentity` on a non-committed title outcome.
-				if (predecessorIdentity && predecessorIdentity.sha256 !== priorCommittedDigest)
-					this.#latchSharedRewriteBar(sessionId);
-				if (!this.#flushed) {
-					this.#flushed = true;
-					this.#ensuredOnDisk = true;
-					if (this.#effectiveSessionMemoryMode() !== "off") {
-						this.#buildDisposableSidecars(this.#fileEntries);
-						if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
-					}
-				}
-				invalidateSessionTitleGeneration(this);
-				this.#abandonedPublicationError = undefined;
-			}
-		} finally {
-			completion.resolve();
-			releasePublication?.();
-		}
-		if (result.kind === "committed") options?.onApplied?.(sanitized);
-		return result;
-	}
-
 	async #appendHeaderPatch(
 		patch: HeaderPatchRecord["patch"],
 		options?: {
@@ -21136,9 +20919,6 @@ export class SessionManager {
 	 *   `appendToolSelectionsSharingSession`) latch only rewrite authority: their
 	 *   additive entries are safe to continue from, but the adopted transcript
 	 *   identity is not.
-	 * - A title arms neither bar at acquisition. It latches rewrite authority from its
-	 *   commit path (`#latchSharedRewriteBar`) only when it adopted an existing
-	 *   transcript, because the latch must be deferred until the patch is durable.
 	 *
 	 * Both bars latch at entry, not at commit: a publication that is later refused
 	 * (`stale`, `rejected`, superseded, or a pre-write failure) still leaves its bars
@@ -21169,9 +20949,8 @@ export class SessionManager {
 	}
 
 	/**
-	 * The only writer of {@link #sharedRewriteBarSessionIds}. Used by
-	 * `#enterSharedPublication` for publications that arm before they write, and by a
-	 * title's commit path, which must defer the latch until its patch is durable.
+	 * The only writer of {@link #sharedRewriteBarSessionIds}, used by
+	 * `#enterSharedPublication` for publications that arm before they write.
 	 */
 	#latchSharedRewriteBar(sessionId: string): void {
 		this.#sharedRewriteBarSessionIds.add(sessionId);
