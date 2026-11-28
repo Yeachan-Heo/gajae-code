@@ -390,6 +390,7 @@ describe("bash-shell-guardian", () => {
 
 	describe("findSparedSdkBrokerPids", () => {
 		const brokerArgv = (agentDir: string) => ["/bin/gjc", "sdk", "broker-internal", "--agent-dir", agentDir];
+		const launchDeps = { expectedBrokerArgv: brokerArgv, executableMatches: () => true };
 		const owned = (pid: number, incarnation: string, args: string[] | (() => string[])) => ({
 			pid,
 			incarnation,
@@ -401,6 +402,7 @@ describe("bash-shell-guardian", () => {
 				[owned(10, "b", brokerArgv("/agent")), owned(20, "x", ["python3", "-c", "sleep"])],
 				{
 					readDiscovery: async dir => (dir === "/agent" ? { pid: 10, incarnation: "b" } : null),
+					...launchDeps,
 					lineage: pid => (pid === 10 ? new Set([10, 11, 12]) : undefined),
 					incarnationOf: pid => (pid === 10 ? "b" : undefined),
 				},
@@ -408,9 +410,129 @@ describe("bash-shell-guardian", () => {
 			expect([...spared].sort()).toEqual([10, 11, 12]);
 		});
 
+		for (const { name, expected, forged } of [
+			{
+				name: "an unrelated executable",
+				expected: ["/bin/gjc", "sdk", "broker-internal"],
+				forged: ["/usr/bin/python3", "x.py", "sdk", "broker-internal"],
+			},
+			{
+				name: "a different Bun script",
+				expected: [
+					process.execPath,
+					"--no-env-file",
+					"--config=/repo/bunfig.toml",
+					"/repo/cli.ts",
+					"sdk",
+					"broker-internal",
+				],
+				forged: [process.execPath, "/tmp/evil.ts", "sdk", "broker-internal"],
+			},
+		]) {
+			it(`rejects ${name} even when it publishes a matching discovery record`, async () => {
+				const deps = {
+					readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+					lineage: () => new Set([10, 11]),
+					incarnationOf: () => "b",
+					expectedBrokerArgv: (dir: string) => [...expected, "--agent-dir", dir],
+					executableMatches: () => true,
+				};
+				const spared = await findSparedSdkBrokerPids([owned(10, "b", [...forged, "--agent-dir", "/agent"])], deps);
+				expect([...spared]).toEqual([]);
+			});
+		}
+
+		it("spares an exact source-mode broker launch only with matching executable identity", async () => {
+			const dir = "/agent with spaces";
+			const expected = [
+				process.execPath,
+				"--no-env-file",
+				"--config=/repo/bunfig.toml",
+				"/repo/cli.ts",
+				"sdk",
+				"broker-internal",
+				"--agent-dir",
+				dir,
+			];
+			const calls: Array<[number, string, string]> = [];
+			const spared = await findSparedSdkBrokerPids([owned(10, "b", expected)], {
+				expectedBrokerArgv: agentDir => (agentDir === dir ? expected : undefined),
+				executableMatches: (pid, incarnation, command) => {
+					calls.push([pid, incarnation, command]);
+					return true;
+				},
+				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				lineage: () => new Set([10, 11]),
+				incarnationOf: () => "b",
+			});
+			expect([...spared].sort()).toEqual([10, 11]);
+			expect(calls).toEqual([[10, "b", process.execPath]]);
+		});
+
+		it("rejects altered source-mode launch options, command, or CLI path", async () => {
+			const expected = [
+				process.execPath,
+				"--no-env-file",
+				"--config=/repo/bunfig.toml",
+				"/repo/cli.ts",
+				"sdk",
+				"broker-internal",
+				"--agent-dir",
+				"/agent",
+			];
+			const deps = {
+				expectedBrokerArgv: () => expected,
+				executableMatches: () => true,
+				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				lineage: () => new Set([10, 11]),
+				incarnationOf: () => "b",
+			};
+			for (const [index, replacement] of [
+				[0, "/bin/other-bun"],
+				[1, "--env-file=evil"],
+				[2, "--config=/tmp/evil.toml"],
+				[3, "/tmp/evil.ts"],
+			] as const) {
+				const forged = [...expected];
+				forged[index] = replacement;
+				expect((await findSparedSdkBrokerPids([owned(10, "b", forged)], deps)).size).toBe(0);
+			}
+		});
+
+		it("rejects a copied full argv when the executable identity does not match", async () => {
+			const calls: Array<[number, string, string]> = [];
+			const spared = await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], {
+				...launchDeps,
+				executableMatches: (pid, incarnation, command) => {
+					calls.push([pid, incarnation, command]);
+					return false;
+				},
+				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				lineage: () => new Set([10, 11]),
+				incarnationOf: () => "b",
+			});
+			expect([...spared]).toEqual([]);
+			expect(calls).toEqual([[10, "b", "/bin/gjc"]]);
+		});
+
+		it("spares nothing when the expected launch cannot be resolved", async () => {
+			for (const expected of [undefined, []]) {
+				const spared = await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], {
+					...launchDeps,
+					expectedBrokerArgv: () => expected,
+					readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+					lineage: () => new Set([10, 11]),
+					incarnationOf: () => "b",
+				});
+				expect(spared.size).toBe(0);
+			}
+		});
+
 		it("kills a broker-shaped process whose identity does not match the discovery record", async () => {
 			const deps = {
 				lineage: (pid: number) => new Set([pid]),
+				expectedBrokerArgv: brokerArgv,
+				executableMatches: () => true,
 				incarnationOf: () => "b",
 			};
 			// A reused pid: same pid, different incarnation.
@@ -442,6 +564,7 @@ describe("bash-shell-guardian", () => {
 		it("does not spare a broker that changed incarnation during the lineage walk", async () => {
 			const spared = await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], {
 				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				...launchDeps,
 				lineage: () => new Set([10, 11]),
 				incarnationOf: () => "replacement",
 			});
@@ -451,6 +574,7 @@ describe("bash-shell-guardian", () => {
 		it("still spares the broker itself when its lineage cannot be read", async () => {
 			const spared = await findSparedSdkBrokerPids([owned(10, "b", brokerArgv("/agent"))], {
 				readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+				...launchDeps,
 				lineage: () => undefined,
 				incarnationOf: () => "b",
 			});
@@ -466,6 +590,7 @@ describe("bash-shell-guardian", () => {
 				],
 				{
 					readDiscovery: async () => ({ pid: 10, incarnation: "b" }),
+					...launchDeps,
 					lineage: () => new Set([10]),
 					incarnationOf: () => "b",
 				},
@@ -481,19 +606,45 @@ describe("bash-shell-guardian", () => {
 			args: () => ["/bin/gjc", "sdk", "broker-internal", "--agent-dir", "/agent"],
 		};
 		const published = async () => ({ pid: 10, incarnation: "b" });
+		const launchDeps = {
+			expectedBrokerArgv: (dir: string) => ["/bin/gjc", "sdk", "broker-internal", "--agent-dir", dir],
+			executableMatches: () => true,
+		};
 
 		it("spares the published broker when the lookup completes in time", async () => {
 			const spared = await findSparedSdkBrokerPidsBounded([broker], {
 				readDiscovery: published,
+				...launchDeps,
 				lineage: () => new Set([10, 11]),
 				incarnationOf: () => "b",
 			});
 			expect([...spared].sort()).toEqual([10, 11]);
 		});
 
+		for (const failingCheck of ["expectedBrokerArgv", "executableMatches"] as const) {
+			it(`spares nothing when ${failingCheck} throws after an earlier broker matched`, async () => {
+				const second = { ...broker, pid: 20, args: () => launchDeps.expectedBrokerArgv("/other") };
+				const spared = await findSparedSdkBrokerPidsBounded([broker, second], {
+					readDiscovery: async dir => ({ pid: dir === "/agent" ? 10 : 20, incarnation: "b" }),
+					expectedBrokerArgv: dir => {
+						if (dir === "/other" && failingCheck === "expectedBrokerArgv") throw new Error("unavailable");
+						return launchDeps.expectedBrokerArgv(dir);
+					},
+					executableMatches: pid => {
+						if (pid === 20 && failingCheck === "executableMatches") throw new Error("unavailable");
+						return true;
+					},
+					lineage: pid => new Set([pid]),
+					incarnationOf: () => "b",
+				});
+				expect(spared.size).toBe(0);
+			});
+		}
+
 		it("spares nothing when the lineage walk throws", async () => {
 			const spared = await findSparedSdkBrokerPidsBounded([broker], {
 				readDiscovery: published,
+				...launchDeps,
 				lineage: () => {
 					throw new Error("proc_listallpids failed");
 				},
@@ -504,6 +655,7 @@ describe("bash-shell-guardian", () => {
 
 		it("spares nothing when the discovery read throws synchronously", async () => {
 			const spared = await findSparedSdkBrokerPidsBounded([broker], {
+				...launchDeps,
 				readDiscovery: () => {
 					throw new Error("sync failure");
 				},
@@ -519,6 +671,7 @@ describe("bash-shell-guardian", () => {
 				[broker],
 				{
 					readDiscovery: () => new Promise(() => {}),
+					...launchDeps,
 					lineage: () => new Set([10]),
 					incarnationOf: () => "b",
 				},
