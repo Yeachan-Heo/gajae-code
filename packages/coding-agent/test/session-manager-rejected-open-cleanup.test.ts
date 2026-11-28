@@ -571,7 +571,7 @@ describe("managed strict-resume target races", () => {
 		const manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
 		storage.writeTextSync(sourceFile, replacement);
 		try {
-			await expect(manager.close()).rejects.toThrow("managed_replace_identity_mismatch");
+			await expect(manager.close()).rejects.toThrow("managed_append_identity_mismatch");
 			expect(storage.readTextSync(sourceFile)).toBe(replacement);
 		} finally {
 			await manager.close().catch(() => undefined);
@@ -593,7 +593,7 @@ describe("managed strict-resume target races", () => {
 		storage.writeTextSync(sourceFile, replacement);
 		try {
 			expect(() => manager.appendMessage({ role: "user", content: "must not persist", timestamp: 1 })).toThrow(
-				"managed_replace_identity_mismatch",
+				"managed_append_identity_mismatch",
 			);
 			expect(storage.readTextSync(sourceFile)).toBe(replacement);
 		} finally {

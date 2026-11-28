@@ -193,7 +193,7 @@ describe("Print mode", () => {
 		await runPrintMode(tracking.session, { mode: "text", initialMessage: "hello" });
 		expect(process.exitCode).toBe(1);
 		expect(output).toEqual([
-			"Another process changed this session's transcript, so this process stopped saving to it. To continue, reopen the session with /resume (or gjc --resume), or fork it with /fork (or gjc --fork).\n",
+			"Another process changed this session's transcript, so this process stopped saving to it. To continue, reopen the session with /resume (or gjc --resume), or fork it with gjc --fork.\n",
 		]);
 		expect(tracking.dispose).toHaveBeenCalledTimes(1);
 	});

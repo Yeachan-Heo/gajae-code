@@ -1111,8 +1111,6 @@ export interface AgentSessionLifecycleState {
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
-	/** Internal root-TUI experiment only; never inherited by child sessions. */
-	rootInteractiveSharedAppend?: boolean;
 	settings: Settings;
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
@@ -4782,7 +4780,6 @@ export class AgentSession {
 	}
 
 	#turnIndex = 0;
-	#rootInteractiveSharedAppend = false;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler | undefined;
 	#workerIntegrationRequestedForTurn = false;
 	// First-party internal before-agent-start contributors (not user hooks).
@@ -6699,7 +6696,6 @@ export class AgentSession {
 		});
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
-		this.#rootInteractiveSharedAppend = config.rootInteractiveSharedAppend === true;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
@@ -33827,19 +33823,14 @@ export class AgentSession {
 	}
 
 	/**
-	 * The single eligibility rule for admitted shared publication (#7824):
-	 * managed destination && ((root shared mode && not the session's sole owner) || session already
-	 * requires shared admission). A root session whose manager is the only writer of its session
-	 * (single-owner step 9) takes the legacy route; a latched bar still wins.
+	 * The single eligibility rule for admitted shared publication (#7824): managed destination &&
+	 * session already requires shared admission (a latched bar). Every session, root TUI included,
+	 * otherwise writes on the legacy route (single-owner step 10a).
 	 * Every migrated control and canonical producer routes through this predicate.
 	 */
 	#usesSharedSessionPublication(): boolean {
 		const manager = this.sessionManager;
-		return (
-			manager.isManagedDestination() &&
-			((this.#rootInteractiveSharedAppend && !manager.isSoleOwnerRoute()) ||
-				manager.requiresSharedMutationAdmission())
-		);
+		return manager.isManagedDestination() && manager.requiresSharedMutationAdmission();
 	}
 
 	/**

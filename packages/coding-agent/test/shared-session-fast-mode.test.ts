@@ -9,9 +9,7 @@ import { AgentSession, SharedControlPublicationError } from "../src/session/agen
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager, type SharedEntriesAppendOutcome } from "../src/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -20,7 +18,7 @@ const registries: ModelRegistry[] = [];
 const stores: AuthStorage[] = [];
 const user = (content: string) => ({ role: "user" as const, content, timestamp: 1 });
 
-async function fixture(rootInteractiveSharedAppend = true) {
+async function fixture(shared = true) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-fast-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -45,9 +43,9 @@ async function fixture(rootInteractiveSharedAppend = true) {
 		sessionManager: manager,
 		settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
 		modelRegistry: registry,
-		rootInteractiveSharedAppend,
 	});
 	sessions.push(session);
+	if (shared) routeThroughSharedPublication(manager);
 	return { session, manager, file, destination };
 }
 

@@ -608,7 +608,7 @@ The global setting `session.ownership.mode` decides what claims do:
 | Mode | Behaviour |
 | --- | --- |
 | `off` | No claims and no lock calls. The process is invisible to other processes' claims. |
-| `observe` | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. A broker resume of a held session waits briefly for the holder's endpoint first (above). |
+| `observe` | Claims, releases and counts. A session that another process already holds is counted as a conflict and opened anyway: nothing is refused and no warning is shown; the log records it. Both processes then write the session directly, as in every mode: in gjc's own session storage, the one whose copy of the transcript is out of date stops saving with "Another process changed this session's transcript" before its next write; a session opened by path (`--resume <file>`) or kept in a `--session-dir` has no such check, and both append. A broker resume of a held session waits briefly for the holder's endpoint first (above). |
 | `enforce` (default) | Claims as `observe` does, and a session another process holds is not opened for writing (below). |
 
 Under `enforce`, a session open for writing in another process is refused before anything is written to it:

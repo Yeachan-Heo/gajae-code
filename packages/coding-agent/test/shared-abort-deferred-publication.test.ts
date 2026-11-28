@@ -13,9 +13,7 @@ import { managedSessionTransactionLocksDirectory } from "../src/session/internal
 import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 // A `!`/`$` result recorded while a turn streams is deferred and published through the
 // shared lease when the turn ends. A transition that leaves the session (`/new`,
@@ -51,7 +49,7 @@ const shellResult = (output: string) => ({
 });
 
 /**
- * A root interactive shared-append session whose model replies to a turn after
+ * A session on the shared-publication layer whose model replies to a turn after
  * `replyDelayMs`. `ownerShutdown` adds the agent id and owned async job manager that
  * `createAgentSession` installs, which routes `/new` through its owner-shutdown branch.
  */
@@ -64,6 +62,7 @@ async function fixture(replyDelayMs: number, ownerShutdown: boolean) {
 	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 	const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 	managers.push(manager);
+	routeThroughSharedPublication(manager);
 	const auth = await AuthStorage.create(path.join(root, "auth.db"));
 	stores.push(auth);
 	const mock = createMockModel({
@@ -99,7 +98,6 @@ async function fixture(replyDelayMs: number, ownerShutdown: boolean) {
 		sessionManager: manager,
 		settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: true,
 		...(ownerShutdown
 			? {
 					agentId: "deferred-transition",

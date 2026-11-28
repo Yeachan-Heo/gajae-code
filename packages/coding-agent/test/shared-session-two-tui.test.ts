@@ -84,161 +84,14 @@ function startFakeModel(reply: string | FakeModelHandler) {
 	return { server, port, hits };
 }
 
-function startManagedFakeModel(readTarget: string) {
-	type RequestBody = {
-		messages?: { role?: string; content?: unknown }[];
-		tools?: {
-			type?: string;
-			function?: { name?: string; parameters?: { required?: string[]; properties?: Record<string, unknown> } };
-		}[];
-	};
-	const observed: { kind: string; roles: string[]; toolNames: string[] }[] = [];
-	let toolRequested = false;
-	let toolSupported = false;
-	let discoveryRequested = false;
-	const secondTurns = new Set<string>();
-	const overlappingTurns = Promise.withResolvers<void>();
-	const peerToolStarted = Promise.withResolvers<void>();
-	const releasePeerTool = Promise.withResolvers<void>();
-	const thirdTurnStarted = Promise.withResolvers<void>();
-	const releaseThirdTurn = Promise.withResolvers<void>();
-	let stopping = false;
-	let barrierFailure: unknown;
-	const model = startFakeModel(async request => {
-		if (request.method === "GET") {
-			peerToolStarted.resolve();
-			try {
-				await withTimeout(releasePeerTool.promise, 20_000, "A2 discovery must progress while B2 bash is active");
-			} catch (error) {
-				barrierFailure = error;
-				return new Response("Peer tool barrier failed", { status: 400 });
-			}
-			return new Response("peer tool completed");
-		}
-		const body = (await request.json()) as RequestBody;
-		const messages = body.messages ?? [];
-		const last = messages.at(-1);
-		const latestUser = messages.findLast(message => message.role === "user");
-		const prompt = [
-			"managed-A1",
-			"managed-B1",
-			"managed-A2",
-			"managed-B2",
-			"managed-survivor3",
-			"managed-survivor4",
-		].find(value => (JSON.stringify(latestUser?.content) ?? "").includes(`"${value}"`));
-		const read = body.tools?.find(
-			tool =>
-				tool.type === "function" &&
-				tool.function?.name === "read" &&
-				tool.function.parameters?.properties?.path &&
-				(tool.function.parameters.required ?? []).every(field => field === "path"),
-		);
-		if (prompt === "managed-A1" && read) toolSupported = true;
-		const isToolResult = last?.role === "tool";
-		if (isToolResult && prompt === "managed-A2") releasePeerTool.resolve();
-		const kind = isToolResult ? "tool-result" : (prompt ?? "background");
-		observed.push({
-			kind,
-			roles: messages.map(message => message.role ?? "?"),
-			toolNames: (body.tools ?? []).map(tool => tool.function?.name ?? "?"),
-		});
-		const isSecondTurn = kind === "managed-A2" || kind === "managed-B2";
-		if (isSecondTurn) {
-			secondTurns.add(kind);
-			if (secondTurns.size === 2) overlappingTurns.resolve();
-		}
-		if (kind === "managed-survivor3") thirdTurnStarted.resolve();
-		const barrier =
-			kind === "managed-survivor3"
-				? releaseThirdTurn.promise
-				: kind === "managed-A2"
-					? Promise.all([overlappingTurns.promise, peerToolStarted.promise])
-					: isSecondTurn
-						? overlappingTurns.promise
-						: undefined;
-		if (barrier) {
-			try {
-				await withTimeout<unknown>(
-					barrier,
-					20_000,
-					kind === "managed-survivor3"
-						? "The closing peer must exit before the survivor receives its reply"
-						: "Both TUIs must reach the provider before either second turn completes",
-				);
-			} catch (error) {
-				barrierFailure = error;
-				return Response.json({ error: { message: "Managed TUI barrier failed" } }, { status: 400 });
-			}
-		}
-		if (stopping) return new Response(null, { status: 503 });
-		let delta: object;
-		let finish: "tool_calls" | "stop";
-		if ((prompt === "managed-A1" && read && !toolRequested) || kind === "managed-B2") {
-			const peerTool = kind === "managed-B2";
-			if (!peerTool) toolRequested = true;
-			delta = {
-				role: "assistant",
-				tool_calls: [
-					{
-						index: 0,
-						id: peerTool ? "managed-peer-bash-call" : "managed-read-call",
-						type: "function",
-						function: peerTool
-							? {
-									name: "bash",
-									arguments: JSON.stringify({
-										command: `'${process.execPath.replaceAll("'", "'\\''")}' -e 'process.stdout.write(await (await fetch("http://127.0.0.1:${model.port}/v1/chat/completions")).text())'`,
-									}),
-								}
-							: { name: "read", arguments: JSON.stringify({ path: readTarget }) },
-					},
-				],
-			};
-			finish = "tool_calls";
-		} else if (kind === "managed-A2" && !discoveryRequested) {
-			discoveryRequested = true;
-			delta = {
-				role: "assistant",
-				tool_calls: [
-					{
-						index: 0,
-						id: "managed-discovery-call",
-						type: "function",
-						function: {
-							name: "search_tool_bm25",
-							arguments: JSON.stringify({ query: "cron recurring schedule", limit: 1 }),
-						},
-					},
-				],
-			};
-			finish = "tool_calls";
-		} else {
-			delta = {
-				role: "assistant",
-				content: prompt ? `${prompt}-reply` : "background-reply",
-			};
-			finish = "stop";
-		}
-		return { delta, finish };
+/** A model that answers each prompt `<prompt>` with `<prompt>-reply`, and anything else with `background-reply`. */
+function startEchoModel() {
+	return startFakeModel(async request => {
+		const body = (await request.json()) as { messages?: { role?: string; content?: unknown }[] };
+		const latestUser = body.messages?.findLast(message => message.role === "user");
+		const prompt = /"([a-z]+-[A-Za-z0-9]+)"/.exec(JSON.stringify(latestUser?.content) ?? "")?.[1];
+		return { delta: { role: "assistant", content: prompt ? `${prompt}-reply` : "background-reply" }, finish: "stop" };
 	});
-	return {
-		server: model.server,
-		port: model.port,
-		observed,
-		barrierFailure: () => barrierFailure,
-		thirdTurnStarted: thirdTurnStarted.promise,
-		releaseThirdTurn: () => releaseThirdTurn.resolve(),
-		stop: async () => {
-			stopping = true;
-			overlappingTurns.resolve();
-			peerToolStarted.resolve();
-			releasePeerTool.resolve();
-			releaseThirdTurn.resolve();
-			await model.server.stop(true);
-		},
-		toolEvidence: () => ({ toolRequested, toolSupported }),
-	};
 }
 
 type Tui = { pty: PtySession; done: Promise<PtyRunResult>; screen: () => string };
@@ -270,6 +123,7 @@ function startTui(options: {
 	sessions?: string;
 	noTitle?: boolean;
 	extra?: string[];
+	ownership?: "observe" | "enforce";
 }): Tui {
 	// Explicit allowlist rather than the whole environment: the child must not inherit credentials
 	// or an outer agent directory from the process running the suite.
@@ -283,9 +137,10 @@ function startTui(options: {
 		GJC_AUTOMATION: "1",
 		GJC_NOTIFY: "off",
 		// Two writers on one session exist only below the default `enforce`, which gives the second
-		// TUI the held-session warning instead. These cases cover the shared-publication layer that
-		// `observe` still runs (single-owner step 10 retargets them), so they lower the mode.
-		GJC_SESSION_OWNERSHIP: "observe",
+		// TUI the held-session warning instead. Since single-owner step 10a both write on the legacy
+		// route: a managed transcript's identity fence stops the one whose view is stale, while an
+		// explicit `--session-dir` transcript has no such fence and takes both appends.
+		GJC_SESSION_OWNERSHIP: options.ownership ?? "observe",
 	};
 	const pty = new PtySession();
 	let raw = "";
@@ -403,7 +258,8 @@ function expectResolvableParents(entries: TranscriptEntry[]) {
 
 // The harness drives a real pty and relies on POSIX behaviour; Windows keeps its own suites.
 describe.skipIf(process.platform === "win32")("two interactive TUIs on one session", () => {
-	it.each(["creator", "resumed"] as const)("managed branches survive %s exit", async closingPeer => {
+	/** A managed (default storage) session that `first` opened and answered `managed-A1` in. */
+	async function managedSession(ownership: "observe" | "enforce") {
 		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-managed-"));
 		roots.push(root);
 		const cwd = path.join(root, "workspace");
@@ -412,158 +268,90 @@ describe.skipIf(process.platform === "win32")("two interactive TUIs on one sessi
 		await fs.mkdir(agent, { recursive: true });
 		const sessions = SessionManager.getDefaultSessionDirReadOnly(cwd, agent);
 		const cli = path.resolve(import.meta.dirname, "../src/cli.ts");
-		const model = startManagedFakeModel(cli);
-		const terminals: Tui[] = [];
-		let failure: unknown;
-		let shutdownFailure: unknown;
-		try {
-			await writeModelsConfig(agent, model.port, 200_000);
-			const first = startTui({ cli, cwd, root, agent, noTitle: false });
-			terminals.push(first);
-			await ready(first);
-			first.pty.write("managed-A1\r");
-			await committed(sessions, "managed-A1-reply");
-			const beforeSecond = await readSingleTranscript(sessions);
-			const sessionId = beforeSecond.header.id!;
-			expect(sessionId).toBeTruthy();
-			const split = beforeSecond.entries.find(
-				entry => entry.type === "message" && JSON.stringify(entry).includes('"managed-A1-reply"'),
-			)?.id;
-			if (!split) throw new Error("Completed A1 reply has no branch anchor");
+		const model = startEchoModel();
+		await writeModelsConfig(agent, model.port);
+		// Keep almost nothing recent so a manual /compact of this short session has work to do, with
+		// automatic compaction off so no process rewrites the transcript behind the checks.
+		await Bun.write(path.join(agent, "config.yml"), "compaction:\n  enabled: false\n  keepRecentTokens: 1\n");
+		const first = startTui({ cli, cwd, root, agent, ownership });
+		await ready(first);
+		first.pty.write("managed-A1\r");
+		await committed(sessions, "managed-A1-reply");
+		const file = path.join(sessions, (await sessionFiles(sessions))[0]!);
+		const sessionId = (await readSingleTranscript(sessions)).header.id!;
+		const resume = () => startTui({ cli, cwd, root, agent, ownership, extra: ["--resume", sessionId] });
+		return { sessions, model, first, file, sessionId, resume };
+	}
 
-			const second = startTui({ cli, cwd, root, agent, noTitle: false, extra: ["--resume", sessionId] });
-			terminals.push(second);
+	it("observe: the TUI whose view a peer changed stops saving with the identity-mismatch message; the transcript keeps both", async () => {
+		const { sessions, model, first, sessionId, resume } = await managedSession("observe");
+		try {
+			// B loads the transcript after A's turn, so B's first write matches and lands.
+			const second = resume();
 			await ready(second);
 			second.pty.write("managed-B1\r");
 			await committed(sessions, "managed-B1-reply");
+			// A's view predates B's turn: its next write is refused, and nothing of it reaches disk.
+			const mark = first.screen().length;
 			first.pty.write("managed-A2\r");
-			second.pty.write("managed-B2\r");
 			await waitFor(
-				async () => {
-					const failure = model.barrierFailure();
-					if (failure !== undefined) throw failure;
-					const text = await transcriptText(sessions);
-					return text?.includes("managed-A2-reply") === true && text.includes("managed-B2-reply");
-				},
+				() => first.screen().slice(mark).includes("Another process changed this session's transcript"),
 				60_000,
-				"both completed overlapping turns",
+				"the identity-mismatch message in A",
 			);
-
-			const merged = await readSingleTranscript(sessions);
-			expect(merged.header.id).toBe(sessionId);
-			expect(await sessionFiles(sessions)).toHaveLength(1);
-			expectResolvableParents(merged.entries);
-			const ids = merged.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
-			expect(new Set(ids).size).toBe(ids.length);
-			const idFor = (text: string) => {
-				const matches = promptEntries(merged.entries, text);
-				expect(matches).toHaveLength(1);
-				return matches[0]!.id!;
-			};
-			const a1 = idFor("managed-A1");
-			const b1 = idFor("managed-B1");
-			const a2 = idFor("managed-A2");
-			const b2 = idFor("managed-B2");
-			for (const [promptId, reply] of [
-				[a1, "managed-A1-reply"],
-				[b1, "managed-B1-reply"],
-				[a2, "managed-A2-reply"],
-				[b2, "managed-B2-reply"],
-			] as const) {
-				expect(ancestors(merged.entries, idFor(reply))).toContain(promptId);
-			}
-			expect(ancestors(merged.entries, b1)).toContain(split);
-			expect(ancestors(merged.entries, a2)).toContain(a1);
-			expect(ancestors(merged.entries, a2)).not.toContain(b1);
-			expect(ancestors(merged.entries, b2)).toContain(b1);
-			expect(ancestors(merged.entries, b2)).not.toContain(a2);
-			for (const promptId of [a2, b2]) {
-				const prompt = merged.entries.find(entry => entry.id === promptId)!;
-				expect(merged.entries.find(entry => entry.id === prompt.parentId)).toMatchObject({
-					type: "custom",
-					customType: "workflow-intent-diff",
-				});
-			}
-			const { toolSupported, toolRequested } = model.toolEvidence();
-			expect(toolSupported).toBe(true);
-			expect(toolRequested).toBe(true);
-			expect(
-				merged.entries.some(
-					entry => entry.type === "message" && JSON.stringify(entry).includes('"role":"toolResult"'),
-				),
-			).toBe(true);
-			expect(model.observed.some(request => request.kind === "tool-result")).toBe(true);
-			for (const id of ["managed-discovery-call", "managed-peer-bash-call"])
-				expect(
-					merged.entries.find(
-						entry => entry.type === "message" && JSON.stringify(entry).includes(`"toolCallId":"${id}"`),
-					),
-				).toMatchObject({ message: { role: "toolResult", isError: false } });
-			expect(
-				model.observed.some(request => request.kind === "tool-result" && request.toolNames.includes("cron")),
-			).toBe(true);
-			// Background requests are recorded separately; eligibility varies with default settings.
-			expect(model.observed.some(request => request.kind === "managed-A1")).toBe(true);
-			expect(model.observed.some(request => request.kind === "managed-B2")).toBe(true);
-			const survivor = closingPeer === "creator" ? second : first;
-			const closer = closingPeer === "creator" ? first : second;
-			survivor.pty.write("managed-survivor3\r");
-			await withTimeout(model.thirdTurnStarted, 20_000, "Survivor must reach the provider while its peer is alive");
-			expect(await transcriptText(sessions)).not.toContain("managed-survivor3-reply");
-			closer.pty.write("/quit\r");
-			expect(await withTimeout(closer.done, 20_000, "Closing peer did not exit cleanly")).toMatchObject({
-				exitCode: 0,
-				cancelled: false,
-				timedOut: false,
-			});
-			expect(await transcriptText(sessions)).not.toContain("managed-survivor3-reply");
-			model.releaseThirdTurn();
-			await committed(sessions, "managed-survivor3-reply");
-			survivor.pty.write("managed-survivor4\r");
-			await committed(sessions, "managed-survivor4-reply");
-			const continued = await readSingleTranscript(sessions);
-			expect(continued.header.id).toBe(sessionId);
-			expect(await sessionFiles(sessions)).toHaveLength(1);
-			expectResolvableParents(continued.entries);
-			const finalIds = continued.entries.flatMap(entry => (typeof entry.id === "string" ? [entry.id] : []));
-			expect(new Set(finalIds).size).toBe(finalIds.length);
-			for (const id of ids) expect(finalIds).toContain(id);
-			const finalReply = promptEntries(continued.entries, "managed-survivor4-reply");
-			expect(finalReply).toHaveLength(1);
-			const continuedBranch = ancestors(continued.entries, finalReply[0]!.id!);
-			expect(continuedBranch).toContain(closingPeer === "creator" ? b2 : a2);
-			expect(continuedBranch).not.toContain(closingPeer === "creator" ? a2 : b2);
-			if (closingPeer === "creator") expect(continuedBranch).toContain(b1);
-			else expect(continuedBranch).not.toContain(b1);
-			survivor.pty.write("/quit\r");
-			expect(await withTimeout(survivor.done, 20_000, "Survivor did not exit cleanly")).toMatchObject({
-				exitCode: 0,
-				cancelled: false,
-				timedOut: false,
-			});
-		} catch (error) {
-			failure = new Error(
-				`Managed TUI root: ${root}; requests: ${JSON.stringify(model.observed)}; tool: ${JSON.stringify(model.toolEvidence())}; screens: ${JSON.stringify(terminals.map(terminal => terminal.screen().slice(-12000)))}`,
-				{
-					cause: error,
-				},
+			await Bun.sleep(1_000);
+			const stopped = await readSingleTranscript(sessions);
+			expect(stopped.header.id).toBe(sessionId);
+			expect(promptEntries(stopped.entries, "managed-A1")).toHaveLength(1);
+			expect(promptEntries(stopped.entries, "managed-B1")).toHaveLength(1);
+			expect(promptEntries(stopped.entries, "managed-A2")).toHaveLength(0);
+			expectResolvableParents(stopped.entries);
+			// A full rewrite from the stopped TUI is refused as well and leaves the transcript as it is.
+			const bytes = await transcriptText(sessions);
+			const compactMark = first.screen().length;
+			first.pty.write("/compact\r");
+			await waitFor(
+				() => /Compaction failed|Error:/.test(first.screen().slice(compactMark)),
+				60_000,
+				"the refused compaction in A",
 			);
+			await Bun.sleep(1_000);
+			expect(first.screen().slice(compactMark)).not.toContain("Nothing to compact");
+			expect(await transcriptText(sessions)).toBe(bytes);
+			// B keeps writing the session.
+			second.pty.write("managed-B2\r");
+			await committed(sessions, "managed-B2-reply");
+			expectResolvableParents((await readSingleTranscript(sessions)).entries);
 		} finally {
-			shutdownFailure = await withTimeout(model.stop(), 20_000, "Model server cleanup did not settle").then(
-				() => undefined,
-				error => error,
-			);
+			model.server.stop(true);
 		}
-		if (shutdownFailure !== undefined)
-			failure = new AggregateError(
-				failure === undefined ? [shutdownFailure] : [failure, shutdownFailure],
-				`Managed TUI cleanup failed; retained root: ${root}`,
+	}, 180_000);
+
+	it("enforce: a second TUI on a held session is warned, and Fork continues in a copy that leaves the original to its holder", async () => {
+		const { sessions, model, first, file, resume } = await managedSession("enforce");
+		try {
+			const bytes = await Bun.file(file).text();
+			const second = resume();
+			await waitFor(() => second.screen().includes("Fork into a new session"), 60_000, "the held-session warning");
+			second.pty.write("\r");
+			await waitFor(async () => (await sessionFiles(sessions)).length === 2, 60_000, "the fork's transcript");
+			await ready(second);
+			second.pty.write("forked-B1\r");
+			const forked = path.join(sessions, (await sessionFiles(sessions)).find(name => !file.endsWith(name))!);
+			await waitFor(
+				async () => (await Bun.file(forked).text()).includes('"forked-B1-reply"'),
+				60_000,
+				"the fork's turn",
 			);
-		if (failure !== undefined) {
-			retainedFailures.set(root, failure);
-			throw failure;
+			expect(await Bun.file(file).text()).toBe(bytes);
+			// The holder keeps writing its session.
+			first.pty.write("managed-A2\r");
+			await waitFor(async () => (await Bun.file(file).text()).includes('"managed-A2-reply"'), 60_000, "A's turn");
+			expect(await Bun.file(forked).text()).not.toContain('"managed-A2"');
+		} finally {
+			model.server.stop(true);
 		}
-	}, 240_000);
+	}, 180_000);
 
 	it("appends to one transcript from both processes and keeps their branches separate", async () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-two-tui-"));

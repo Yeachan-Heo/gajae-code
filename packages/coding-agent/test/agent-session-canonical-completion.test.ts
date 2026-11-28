@@ -12,9 +12,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir, withTimeout } from "@gajae-code/utils";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 function assistant(): AssistantMessage {
 	return {
@@ -85,9 +83,9 @@ describe("AgentSession canonical completion", () => {
 			sessionManager: manager,
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
-			rootInteractiveSharedAppend: options?.sharedManaged === true,
 		});
 		if (options?.sharedManaged) {
+			routeThroughSharedPublication(manager);
 			// A managed prompt resolves local:// synchronously; settle the real legacy
 			// migration gate before entering the accepted-prompt path.
 			await initializeLocalRoot({
