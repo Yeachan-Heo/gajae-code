@@ -14,6 +14,7 @@ import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { discoverAppendSystemPromptFile, readAppendSystemPromptFile } from "../cli/append-system-prompt";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -666,6 +667,7 @@ export async function runSessionHost(
 		initializeLifecycleExtensions?: typeof initializeExtensions;
 		openLifecycleSessionManager?: typeof openLifecycleSessionManager;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
+		discoverAppendSystemPromptFile?: typeof discoverAppendSystemPromptFile;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
 		writeSessionLifecycleStartupCommit?: typeof writeSessionLifecycleStartupCommit;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
@@ -681,6 +683,7 @@ export async function runSessionHost(
 	const initializeSessionExtensions = timing.initializeLifecycleExtensions ?? initializeExtensions;
 	const openLifecycleSession = timing.openLifecycleSessionManager ?? openLifecycleSessionManager;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
+	const discoverAppendPromptFile = timing.discoverAppendSystemPromptFile ?? discoverAppendSystemPromptFile;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const writeStartupCommit = timing.writeSessionLifecycleStartupCommit ?? writeSessionLifecycleStartupCommit;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
@@ -1257,23 +1260,31 @@ export async function runSessionHost(
 			mcpStartupTimeoutMs = remaining;
 		}
 
+		// User-level APPEND_SYSTEM.md, as the CLI appends it. The read stays inside the startup deadline.
+		const resolvedAppendPrompt = await beforeCutoff(
+			async () => await readAppendSystemPromptFile(await discoverAppendPromptFile()),
+			undefined,
+			{ processLocalOnly: true },
+		);
+
 		created = await beforeCutoff(
 			async () => {
 				sessionManagerTransferred = true;
-				return await createLifecycleSession(
-					{
-						cwd,
-						agentDir,
-						ephemeral: request.ephemeral,
-						sessionManager: opened?.sessionManager,
-						...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
-						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
-						...(request.readiness ? { readiness: request.readiness } : {}),
-						...(request.modelId ? { modelId: request.modelId } : {}),
-						lifecycleRequestId: effectMarker,
-					},
-					startupOwner,
-				);
+				const sessionOptions: Parameters<typeof createLifecycleSession>[0] = {
+					cwd,
+					agentDir,
+					ephemeral: request.ephemeral,
+					sessionManager: opened?.sessionManager,
+					...(mcpConfigPath ? { mcpConfigPath, lifecycleMcpOrigin: true } : {}),
+					...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
+					...(request.readiness ? { readiness: request.readiness } : {}),
+					...(request.modelId ? { modelId: request.modelId } : {}),
+					lifecycleRequestId: effectMarker,
+				};
+				if (resolvedAppendPrompt) {
+					sessionOptions.systemPrompt = defaultPrompt => [...defaultPrompt, resolvedAppendPrompt];
+				}
+				return await createLifecycleSession(sessionOptions, startupOwner);
 			},
 			async late => {
 				if ("failure" in late) {

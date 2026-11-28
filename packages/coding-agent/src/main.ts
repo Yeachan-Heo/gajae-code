@@ -5,7 +5,6 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,7 +23,7 @@ import {
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { canonicalEnvKey } from "@gajae-code/utils/env-file";
 import chalk from "chalk";
-import { selectAppendSystemPromptFile } from "./cli/append-system-prompt";
+import { discoverAppendSystemPromptFile } from "./cli/append-system-prompt";
 import { type Args, resolvePlanModelOverride } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { fetchGithubChannelRelease } from "./cli/github-release";
@@ -32,7 +31,6 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { promptHeldSession, selectSession } from "./cli/session-picker";
-import { getConfigDirs } from "./config";
 import { FileLockAcquireError, FileLockStagingCleanupError } from "./config/file-lock";
 import {
 	activateModelProfile,
@@ -1790,15 +1788,6 @@ async function maybeAutoChdir(parsed: Args): Promise<void> {
 	}
 }
 
-/** User APPEND_SYSTEM.md only. Repository copies are not appended. */
-function discoverAppendSystemPromptFile(): string | undefined {
-	const candidates = getConfigDirs("", { existingOnly: false }).flatMap(entry => {
-		const filePath = path.join(entry.path, "APPEND_SYSTEM.md");
-		return existsSync(filePath) ? [{ level: entry.level, path: filePath }] : [];
-	});
-	return selectAppendSystemPromptFile(candidates);
-}
-
 async function buildSessionOptions(
 	parsed: Args,
 	scopedModels: ScopedModel[],
@@ -1814,7 +1803,7 @@ async function buildSessionOptions(
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
-	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
+	const appendPromptSource = parsed.appendSystemPrompt ?? (await discoverAppendSystemPromptFile());
 	const resolvedAppendPrompt = await resolvePromptInput(appendPromptSource, "append system prompt");
 
 	if (sessionManager) {
