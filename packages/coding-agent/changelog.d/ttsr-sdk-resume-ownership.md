@@ -1,2 +1,0 @@
-### Fixed
-- An SDK turn that hits an interrupting TTSR rule (for example `interruptMode: "tool-only"`) now settles with the resumed run's outcome. Before this fix it was reported as `cancelled` with no receipt, even though the agent kept working and finished normally. The TTSR resume now continues the SDK prompt the same way overflow retry and auto-retry do: it holds the interrupted terminal and inherits the run's SDK owner. A resume that never runs still publishes the original cancelled terminal ([#8094](https://github.com/Yeachan-Heo/gajae-code/issues/8094)).

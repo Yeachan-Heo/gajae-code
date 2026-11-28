@@ -1,3 +1,0 @@
-### Fixed
-
-- A persistent `monitor` whose command exits cleanly after printing at least one line reports the exit in one monitor notification ("exited (code 0)") instead of also waking the agent with a background-job completion notice. The exit rides on the final line when that line is still undelivered; otherwise it is added to the next turn without waking the agent. The old completion notice arrived after the final answer and produced an extra "already handled" reply (#7993). Failures, timeouts, monitors that printed nothing, monitors whose line notification the session rejected, and ACP clients that defer agent-initiated turns still get the completion notice.

@@ -1,2 +1,0 @@
-### Fixed
-- Browser headless launch no longer creates unhandled EBUSY rejections on Windows when puppeteer's temp profile cleanup fails. gjc now creates the userDataDir itself before launch and passes it to puppeteer, preventing puppeteer from attempting to remove it. If launch fails or Chrome exits, gjc cleans up the profile dir with EBUSY tolerance using the existing removeOwnedWarmupDir pattern.

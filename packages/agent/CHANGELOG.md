@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-11-28
+
+### Added
+
+- `getApiKey` may return a `ResolvedApiKey` (`{ apiKey, credentialId }`) instead of a bare string. The agent loop forwards `credentialId` to the stream so the resulting assistant message names the stored credential row that served it. A bare string and the static `apiKey` fallback remain unattributed. A turn aborted after streaming began keeps the partial's `credentialId`. `streamProxy` strips `credentialId` from prior assistant messages before posting the context to the proxy server.
+
+- `AgentLoopConfig.getStepBoundaryMessages` and `Agent.setStepBoundaryMessageProvider()` deliver queued asynchronous messages into the current turn after a completed tool step. The loop polls only after steering, abort, and pause checks and only when it would call the model again anyway, so the hook never interrupts running tools, never bypasses a pause, and never adds a model call. The `Agent` skips the provider while steering admission is fenced or the run is aborted.
+
 ## [0.22.2] - 2026-11-25
 
 ## [0.22.1] - 2026-11-24

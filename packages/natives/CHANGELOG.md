@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-11-28
+
+### Fixed
+
+- Windows exact-replace-retained binary update now requests READ_CONTROL access on both file handles, enabling GetSecurityInfo() to verify ownership-only ACL enforcement. Without READ_CONTROL, GetSecurityInfo() returned acl_unavailable on every real Windows update, blocking all retained installations with "acl_unavailable" status. (#6096)
+
+- ast_edit and ast_grep trim surrounding whitespace on a raw path, and a literalPath value is kept so a resolved directory name that ends in a space is not rewritten onto a sibling.
+
+- On Linux, a full rewrite of a managed session transcript (for example a compaction) and another process's append to the same transcript no longer overlap. Previously an append that landed while the rewrite was being swapped in could be reported saved and yet be missing from the transcript; its bytes survived only in a `.gjc-managed-replace-*` recovery file. Both now hold an exclusive lock on the transcript across their check and their write or swap. A writer that keeps holding the transcript makes the other wait at most about 2 s, after which it fails with the retryable `transcript_busy`. An append whose file changed after it wrote, and a rewrite whose result no longer checks out after the swap, report `identity_changed_after_write`, distinct from the `identity_mismatch` refusal before writing; a failed check of the names after the swap reports `io_error`.
+- This covers local filesystems with `flock` and atomic rename exchange (ext4, xfs, btrfs, tmpfs). It does not cover mounts without rename flags or usable `flock` (NFS, 9p such as WSL `/mnt/c`, some FUSE filesystems), which keep the previous unserialized behaviour, or an older gjc that takes no lock.
+
+- PTY cancel and timeout now reap setsid descendants that double-fork out of the process group, including descendants adopted by a Linux init or child subreaper.
+
 ## [0.22.2] - 2026-11-25
 
 ### Added
