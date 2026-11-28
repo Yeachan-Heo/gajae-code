@@ -5707,8 +5707,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
-				const startProviderStream = (providerOptions: SimpleStreamOptions) =>
-					streamSimple(streamModel, context, {
+				// Detach the shared model before any deferred work. A registry lookup renders
+				// its generated `Authorization` into the model object it resolves against, so a
+				// concurrent lookup on this session's model must not rewrite the header of a
+				// request that already resolved its own credential.
+				const requestModel = {
+					...streamModel,
+					headers: modelRegistry.getRequestHeaders(streamModel, streamOptions?.apiKey),
+				};
+				const startProviderStream = (providerOptions: SimpleStreamOptions) => {
+					// An observer or gateway can supply the key actually dispatched, so the final
+					// provider-local model materializes its headers from that key. `streamSimple`'s
+					// internal 401 retry reuses this exact object, which is what lets `onAuthError`
+					// refresh its headers in place before handing back the replacement credential.
+					const providerModel = {
+						...requestModel,
+						headers: modelRegistry.getRequestHeaders(requestModel, providerOptions.apiKey),
+					};
+					return streamSimple(providerModel, context, {
 						...providerOptions,
 						onAuthError: async (provider, oldKey, error) => {
 							const resolvedScope = resolvedCredentialScopes.has(provider)
@@ -5732,14 +5748,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							) {
 								return undefined;
 							}
+							// The retry re-dispatches this same model object, so its generated header must
+							// follow the replacement row. The helper carries the generated-header symbol
+							// onto the object's next headers, keeping further rotations owned too.
+							providerModel.headers = modelRegistry.getRequestHeaders(providerModel, replacement.apiKey);
 							return replacement;
 						},
 					});
+				};
 				try {
 					// The session captures the exact dispatched request and the terminal result so /btw can
 					// extend the main provider prefix; the returned stream is the provider's own stream.
 					stream = session
-						? await session.observeMainProviderStream(streamModel, context, streamOptions, startProviderStream)
+						? await session.observeMainProviderStream(requestModel, context, streamOptions, startProviderStream)
 						: await startProviderStream(streamOptions ?? {});
 				} catch (error) {
 					const prewarm = await runtimeServices.networkPrewarm.get("first-request");
