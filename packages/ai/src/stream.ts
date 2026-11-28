@@ -932,8 +932,10 @@ function setCredentialId(message: AssistantMessage, credentialId: number): void 
 
 function stampCredentialId(event: AssistantMessageEvent, credentialId: number): void {
 	if (event.type === "done") setCredentialId(event.message, credentialId);
-	else if (event.type === "error") setCredentialId(event.error, credentialId);
-	else if ("partial" in event) setCredentialId(event.partial, credentialId);
+	else if (event.type === "error") {
+		setCredentialId(event.error, credentialId);
+		if (event.partial && event.partial !== event.error) setCredentialId(event.partial, credentialId);
+	} else if ("partial" in event) setCredentialId(event.partial, credentialId);
 }
 
 /**
