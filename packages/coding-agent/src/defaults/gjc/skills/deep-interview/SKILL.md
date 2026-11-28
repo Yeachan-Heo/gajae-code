@@ -157,7 +157,7 @@ Complete this phase before Phase 1, before brownfield exploration, before GJC st
    - `config.yml` uses the nested (schema) form - `gjc: { deepInterview: { ambiguityThreshold } }`. Project configuration beats user configuration. The reported `threshold_source` is the canonical path of the winning file, or the default. `config.yml` is the ONLY settings surface: the legacy `settings.json` files' workflow keys are retired: the config-root `~/.gjc/settings.json` is migrated once into the default global agent `config.yml` and its source removed, while the project `.gjc/settings.json` is retained for non-workflow settings (only its workflow keys are migrated into project `.gjc/config.yml` and no longer read unless a migration target is absent - a migration that could not publish (e.g. a read-only `.gjc`) leaves the retained legacy value effective as the previously configured override until it can publish). Invalid optional settings files continue to the next layer or the default (tolerant) — never a failed `Read`; do not probe arbitrary ancestor candidates.
 3. **Resolve threshold and source**:
    - Use the first valid configured value in the precedence order above; otherwise use the mode default when a resolution flag was passed: `--quick` = `0.6`, `--standard` = `0.5`, `--deep` = `0.35`; with no resolution flag, use the base default `0.05`.
-   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `./.gjc/config.yml`, `<agentDir>/config.yml` such as `~/.gjc/agent/config.yml`, or the selected mode default).
+   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`. Use the same source strings as the native runtime: `flag:--threshold` for an explicit `--threshold`, `flag:--quick` / `flag:--standard` / `flag:--deep` for a resolution flag, the canonical path of the winning config file (for example `./.gjc/config.yml` or `<agentDir>/config.yml` such as `~/.gjc/agent/config.yml`), or exactly `default` when nothing chose a value.
 4. **Emit the required first line to the user before any other interview announcement**:
 
 ```
@@ -276,9 +276,21 @@ The first line of this announcement MUST be exactly the Phase 0 threshold marker
 >
 > Starting deep interview. I'll ask targeted questions to understand your idea thoroughly before building anything. After each answer, I'll show your clarity score. We'll proceed to execution once ambiguity drops below <resolvedThresholdPercent>.
 >
+> <thresholdChangeLine>
+> <thresholdRecommendationLine>
+>
 > **Your idea:** "{initial_idea}"
 > **Project type:** {greenfield|brownfield}
 > **Current ambiguity:** 100% (we haven't started yet)
+
+`<thresholdChangeLine>` depends on `<resolvedThresholdSource>`, following the precedence `--threshold` > configured value > `--quick`/`--standard`/`--deep` > default:
+- `default`, `flag:--quick`, `flag:--standard`, or `flag:--deep`: `To change the target: start with --quick (60%), --standard (50%), --deep (35%), or --threshold <n> (for example /skill:deep-interview --quick <idea>), or save gjc.deepInterview.ambiguityThreshold in .gjc/config.yml.`
+- a config file path: `To change the target: edit gjc.deepInterview.ambiguityThreshold in <resolvedThresholdSource>, or start with --threshold <n>. --quick/--standard/--deep do not override a configured value.`
+- `flag:--threshold` or any other source: `To change the target: start with a different --threshold <n>.`
+
+Every `<thresholdChangeLine>` ends with this sentence, because an active interview keeps the threshold it was seeded with and re-invoking the skill in the same session resumes it unchanged: `This applies to a new interview: run /new, then /skill:deep-interview with the new setting.`
+
+`<thresholdRecommendationLine>` is emitted only when `<resolvedThresholdSource>` is exactly `default`; otherwise omit that line. It names one mode recommended for this idea, chosen from the initial idea's scope, blast radius, and initial ambiguity (a small, bounded, low-risk idea recommends `--quick` or `--standard`; a broad, cross-cutting, or high-risk idea recommends `--deep` or keeps the 5% default), with a one-line reason, in the form `Suggested for this idea: --<mode> (<percent>), because <reason>. To use it, run /new, then /skill:deep-interview --<mode> <idea>.` When the recommendation is the 5% default, say that the current target already fits. This line is advisory only: never change `<resolvedThreshold>` or its source because of it, and never add an extra `ask` for it.
 
 Before emitting the prose lines in this announcement, apply the self-proofread once (DIPP-5); keep the required threshold marker and the quoted `{initial_idea}` unchanged.
 

@@ -287,3 +287,39 @@ describe("deep-interview invocation arguments contract", () => {
 		expect(skill).not.toContain("{{ARGUMENTS}}");
 	});
 });
+
+describe("deep-interview threshold discoverability at kickoff (#7316)", () => {
+	it("tells the user how to change the threshold in a way that matches the threshold source", () => {
+		expect(skill).toContain("> <thresholdChangeLine>");
+		expect(skill).toContain(
+			"- `default`, `flag:--quick`, `flag:--standard`, or `flag:--deep`: `To change the target: start with --quick (60%), --standard (50%), --deep (35%), or --threshold <n> (for example /skill:deep-interview --quick <idea>), or save gjc.deepInterview.ambiguityThreshold in .gjc/config.yml.`",
+		);
+		// A configured value beats the mode flags, so the config-path wording must not advertise them as overrides.
+		expect(skill).toContain(
+			"- a config file path: `To change the target: edit gjc.deepInterview.ambiguityThreshold in <resolvedThresholdSource>, or start with --threshold <n>. --quick/--standard/--deep do not override a configured value.`",
+		);
+		expect(skill).toContain(
+			"- `flag:--threshold` or any other source: `To change the target: start with a different --threshold <n>.`",
+		);
+		// An active interview keeps its seeded threshold on resume, so the advice must point at a new interview.
+		expect(skill).toContain(
+			"`This applies to a new interview: run /new, then /skill:deep-interview with the new setting.`",
+		);
+		expect(skill).toContain("To use it, run /new, then /skill:deep-interview --<mode> <idea>.");
+	});
+
+	it("suggests a mode only for unconfigured runs without changing the threshold or asking", () => {
+		expect(skill).toContain("> <thresholdRecommendationLine>");
+		expect(skill).toMatch(
+			/`<thresholdRecommendationLine>` is emitted only when `<resolvedThresholdSource>` is exactly `default`/,
+		);
+		expect(skill).toMatch(/advisory only: never change `<resolvedThreshold>` or its source/);
+		expect(skill).toMatch(/never add an extra `ask` for it/);
+	});
+
+	it("pins the threshold source strings to the native runtime values", () => {
+		expect(skill).toMatch(/`flag:--threshold` for an explicit `--threshold`/);
+		expect(skill).toMatch(/`flag:--quick` \/ `flag:--standard` \/ `flag:--deep` for a resolution flag/);
+		expect(skill).toMatch(/exactly `default` when nothing chose a value/);
+	});
+});

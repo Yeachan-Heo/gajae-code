@@ -1,3 +1,4 @@
+import { DEEP_INTERVIEW_RESERVED_OPTIONS } from "../../gjc-runtime/deep-interview-threshold";
 import { isKnownWorkflowState } from "../../gjc-runtime/workflow-manifest";
 import type { CanonicalGjcWorkflowSkill } from "../../skill-state/active-state";
 import { assertMcpInstallPolicy } from "./mcp-policy";
@@ -26,6 +27,12 @@ export function validateBinding(fm: SubskillFrontmatter): void {
 	if (isParentSkill(parent)) {
 		if (!isKnownWorkflowState(parent, fm.phase)) {
 			throw new GjcPluginLoadError("invalid_phase", `Invalid GJC sub-skill phase for ${parent}: ${fm.phase}`);
+		}
+		if (parent === "deep-interview" && DEEP_INTERVIEW_RESERVED_OPTIONS.has(fm.activation_arg)) {
+			throw new GjcPluginLoadError(
+				"duplicate_arg",
+				`GJC sub-skill activation_arg for deep-interview collides with the built-in --${fm.activation_arg} option; choose another name`,
+			);
 		}
 		return;
 	}

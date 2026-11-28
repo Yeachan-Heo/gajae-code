@@ -3342,6 +3342,13 @@ const PLAN_DISPLAY_FENCE_CLOSE = "\n</untrusted-content>";
  * fence is the last model boundary. Critical and fence tags inside the path
  * cannot close the plan-mode prompt.
  */
+/** Raw `/skill:<name>` arguments carried on a skill-prompt message, if any. */
+function skillPromptArgs(details: unknown): string | undefined {
+	if (!details || typeof details !== "object") return undefined;
+	const args = (details as { args?: unknown }).args;
+	return typeof args === "string" ? args : undefined;
+}
+
 function framePlanModeDisplayPath(value: string): string {
 	const escaped = value.replace(/<\/?\s*(?:critical|untrusted-content)(?=[\s>/]|$)/gi, tag => `&lt;${tag.slice(1)}`);
 	return `${PLAN_DISPLAY_FENCE_OPEN}${escaped}${PLAN_DISPLAY_FENCE_CLOSE}`;
@@ -18688,6 +18695,8 @@ export class AgentSession {
 				cwd: this.sessionManager.getCwd(),
 				skill,
 				sessionId,
+				args: skillPromptArgs(details),
+				agentDir: this.getSessionAgentDir(),
 			});
 			const subskillDetails = details as {
 				subskillActivation?: LoadedSubskillActivation;
@@ -18764,6 +18773,8 @@ export class AgentSession {
 				skill: name.trim(),
 				sessionId: this.sessionManager.getSessionId(),
 				activeSubskills: activations.length ? activations.map(toActiveSubskillEntry) : undefined,
+				args: skillPromptArgs(details),
+				agentDir: this.getSessionAgentDir(),
 			});
 		} catch {
 			return undefined;

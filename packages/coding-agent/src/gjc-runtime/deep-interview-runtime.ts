@@ -3,7 +3,6 @@ import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isRecord } from "@gajae-code/utils";
-import { isSettingsInitialized, Settings } from "../config/settings";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
 	type FileEntry,
@@ -37,6 +36,12 @@ import {
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
+import {
+	DEEP_INTERVIEW_VALUE_FLAGS,
+	DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD,
+	RESOLUTION_THRESHOLDS,
+	resolveConfiguredAmbiguityThreshold,
+} from "./deep-interview-threshold";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { modeStatePath, sessionSpecsDir, transactionJournalPath } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
@@ -56,7 +61,6 @@ import {
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { anchorInputFileArgs, assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
-import { resolveWorkflowSetting } from "./workflow-settings";
 
 function assertNoFutureDeepInterviewEnvelope(value: Record<string, unknown>, surface: string): void {
 	if (
@@ -86,14 +90,6 @@ export interface DeepInterviewCommandResult {
 	stdout?: string;
 	stderr?: string;
 }
-
-const DEFAULT_AMBIGUITY_THRESHOLD = 0.05;
-
-const RESOLUTION_THRESHOLDS = {
-	quick: 0.6,
-	standard: 0.5,
-	deep: 0.35,
-} as const;
 
 const TRACE_MAX_RELEVANT_PATHS = 12;
 const TRACE_MAX_PACKAGE_HINTS = 8;
@@ -177,15 +173,7 @@ class DeepInterviewCommandError extends CommandError {
 	}
 }
 
-const VALUE_FLAGS = new Set([
-	"--session-id",
-	"--threshold",
-	"--threshold-source",
-	"--stage",
-	"--slug",
-	"--spec",
-	"--handoff",
-]);
+const VALUE_FLAGS: ReadonlySet<string> = DEEP_INTERVIEW_VALUE_FLAGS;
 
 // Keep the runtime's transcript and publication bounds aligned with the pure
 // Crystal validator.  These are byte bounds for recovery reads; normal input
@@ -1794,39 +1782,6 @@ interface DeepInterviewSpecWriteSummary {
 	};
 }
 
-/**
- * Resolve the configured ambiguity threshold through the shared five-layer
- * resolver: project `.gjc/config.yml` > project `.gjc/settings.json` > user
- * `getAgentDir()/config.yml` > legacy config-root `settings.json` > default.
- * Project configuration beats user configuration, and invalid optional files
- * continue to lower layers (tolerant contract). Returns `undefined` when the
- * resolver falls back to the default so the resolution flags (`--quick`/
- * `--standard`/`--deep`) still apply.
- */
-async function resolveConfiguredAmbiguityThreshold(
-	cwd: string,
-	agentDir?: string,
-): Promise<{ threshold: number; source: string } | undefined> {
-	const resolution = await resolveWorkflowSetting(cwd, "gjc.deepInterview.ambiguityThreshold", {
-		defaultValue: DEFAULT_AMBIGUITY_THRESHOLD,
-		parse: value => {
-			if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 1) {
-				return {
-					kind: "invalid",
-					reason: "expected gjc.deepInterview.ambiguityThreshold to be a number in (0, 1]",
-				};
-			}
-			return { kind: "valid", value };
-		},
-		// The session's effective agent profile: an SDK session created with
-		// `createAgentSession({ agentDir })` resolves against that directory
-		// instead of the process-global default.
-		agentDir: agentDir ?? (isSettingsInitialized() ? Settings.instance.getAgentDir() : undefined),
-	});
-	if (resolution.source === "default") return undefined;
-	return { threshold: resolution.value, source: resolution.source };
-}
-
 function englishLanguagePreference(): DeepInterviewLanguagePreference {
 	return {
 		code: "en",
@@ -1952,7 +1907,7 @@ async function resolveDeepInterviewArgs(
 	const resolution: DeepInterviewResolution | undefined = explicitResolutions[0];
 
 	// Precedence: --threshold > settings.json (project then user) > resolution flag default > 0.05.
-	let threshold: number = DEFAULT_AMBIGUITY_THRESHOLD;
+	let threshold: number = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
 	let thresholdSource = "default";
 	const thresholdOverride = flagValue(args, "--threshold");
 	if (thresholdOverride !== undefined) {
