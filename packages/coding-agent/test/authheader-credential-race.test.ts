@@ -442,6 +442,34 @@ describe("authHeader credential race through a real session", () => {
 		expect(assistants[0]?.credentialId).toBe(retriedRow);
 	});
 
+	// Native auth recovery permits one rotation; another 401 is terminal rather
+	// than invoking the session callback again on the same provider-local model.
+	it("rotates the header once and stops when both native attempts are rejected", async () => {
+		const { authStorage, session } = await setup({ pinRowA: false });
+		const rowByKey = new Map([KEY_A, KEY_B].map(key => [key, rowIdForKey(authStorage, key)] as const));
+		const dispatches = registerFakeProvider(() => "auth");
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		expect(dispatches).toHaveLength(2);
+		const rejected = dispatches[0];
+		const retried = dispatches[1];
+		if (!rejected || !retried) throw new Error("Expected both native attempts to reach the provider");
+		expect(retried.apiKey).not.toBe(rejected.apiKey);
+		expect(rejected.authorization).toBe(`Bearer ${rejected.apiKey}`);
+		expect(retried.authorization).toBe(`Bearer ${retried.apiKey}`);
+		expect(rejected.credentialId).toBe(rowByKey.get(String(rejected.apiKey)));
+		expect(retried.credentialId).toBe(rowByKey.get(String(retried.apiKey)));
+
+		// The retry's 401 is terminal: no third rotation, and the final assistant
+		// message keeps the provider's 401 rather than a later attempt's header.
+		const last = [...session.state.messages].reverse().find(message => message.role === "assistant") as
+			| AssistantMessage
+			| undefined;
+		expect(last).toMatchObject({ stopReason: "error", errorStatus: 401 });
+	});
+
 	it("preserves catalog trust on the observer request and final provider model", async () => {
 		const catalogModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!catalogModel) throw new Error("Expected the bundled Anthropic fixture model");
