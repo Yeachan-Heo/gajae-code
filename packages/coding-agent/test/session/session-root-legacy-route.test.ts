@@ -18,7 +18,10 @@ import { Settings } from "../../src/config/settings";
 import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
 import { AgentSession } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
-import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
+import {
+	ManagedCommittedMutationError,
+	ManagedSessionDescendantStore,
+} from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
 import { type SessionDestinationInput, SessionManager } from "../../src/session/session-manager";
 import { resetSessionOwnershipForTests, SessionOwnershipTestHooks } from "../../src/session/session-ownership";
@@ -241,13 +244,54 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		const { sessionManager, file } = await prompted("enforce");
 		await peerAppends(file, "peer entry");
 		const before = await Bun.file(file).text();
-		await expect(sessionManager.rewriteEntries()).rejects.toThrow("managed_replace_identity_mismatch");
+		await expect(sessionManager.rewriteEntries()).rejects.toThrow("managed_append_identity_mismatch");
 		// The refusal is latched: a star after it does not adopt the peer's bytes either.
 		const [row] = await sessionManager.listForResumePickerReadOnly();
 		await expect(sessionManager.setSessionStarredForPicker(row!, true)).rejects.toThrow(/identity_mismatch/);
 		await expect(sessionManager.rewriteEntries()).rejects.toThrow(/identity_mismatch/);
 		expect(await Bun.file(file).text()).toBe(before);
 		expect(before).toContain("peer entry");
+	});
+
+	// How the fence refuses the loser of a write race varies with the platform and the moment: the
+	// native append reports its refusal as an uncertain committed append, a rewrite as a failed
+	// replace. Each must stop the writer with the operator message, keep stopping it, and let /resume
+	// leave the transcript and reload the peer's entries.
+	it.each([
+		[
+			"an append",
+			"appendExpectedSync",
+			() => new ManagedCommittedMutationError("append", new Error("identity_mismatch")),
+		],
+		["an append", "appendExpectedSync", () => new Error("source_changed")],
+		["a rewrite", "replaceExpectedIdentitySync", () => new Error("managed_replace_failed:identity_mismatch")],
+		["a rewrite", "replaceExpectedIdentitySync", () => new Error("identity_mismatch")],
+	] as const)("%s that loses a race to a peer (%s) stops with the operator message; /resume leaves cleanly", async (_write, method, refusal) => {
+		const { sessionManager, session, file } = await prompted("observe");
+		const lose = vi.spyOn(ManagedSessionDescendantStore.prototype, method).mockImplementationOnce(() => {
+			// The peer's append lands, then the fence refuses this write.
+			fsSync.appendFileSync(
+				file,
+				`${JSON.stringify({ type: "custom", id: "peerrace", parentId: null, timestamp: new Date().toISOString(), customType: "peer" })}\n`,
+			);
+			throw refusal();
+		});
+		if (method === "appendExpectedSync") await session.prompt("loser turn").catch(() => undefined);
+		else await sessionManager.rewriteEntries().catch(() => undefined);
+		expect(lose).toHaveBeenCalledTimes(1);
+		expect(sessionManager.getAppendIdentityMismatch()?.operatorMessage).toContain(
+			"Another process changed this session's transcript",
+		);
+		const stopped = await Bun.file(file).text();
+		await session.prompt("after the stop").catch(() => undefined);
+		expect(await Bun.file(file).text()).toBe(stopped);
+		expect(await session.switchSession(file)).toBe(true);
+		expect(sessionManager.getAppendIdentityMismatch()).toBeUndefined();
+		await session.prompt("after resume");
+		await sessionManager.flush();
+		const resumed = await Bun.file(file).text();
+		expect(resumed).toContain('"customType":"peer"');
+		expect(resumed).toContain("after resume");
 	});
 
 	it("a rewrite adopts only its own bytes; an append right after it fails later writes closed", async () => {

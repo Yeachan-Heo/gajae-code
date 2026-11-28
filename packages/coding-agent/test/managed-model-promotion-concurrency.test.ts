@@ -62,7 +62,8 @@ describe("staged default model selection on a shared transcript", () => {
 		// `not_promoted`/`unknown` union without proving the fence ran.
 		expect(promotion.kind).toBe("unknown");
 		if (promotion.kind !== "unknown") throw new Error(`unexpected promotion outcome: ${promotion.kind}`);
-		expect(promotion.error.message).toBe("managed_replace_identity_mismatch");
+		// The fence's refusal stops the writer as every identity mismatch does.
+		expect(promotion.error.message).toBe("managed_append_identity_mismatch");
 
 		// Nothing at all was published: the bytes are exactly what the refusing opener found,
 		// so the refused selection's thinking-level entry cannot have leaked in either.

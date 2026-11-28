@@ -2002,9 +2002,23 @@ export type CommittedTranscriptRead =
 	| { readonly kind: "absent" }
 	| { readonly kind: "unsupported"; readonly reason: string };
 
-/** The managed store's cross-process identity fence; the message is its only channel. */
+/** Every spelling the managed store's identity fence refuses a write with. */
+const MANAGED_IDENTITY_MISMATCH_MESSAGES = new Set([
+	"managed_replace_identity_mismatch",
+	"managed_replace_failed:identity_mismatch",
+	"identity_mismatch",
+	"source_changed",
+]);
+
+/**
+ * The managed store's cross-process identity fence: another writer changed the transcript, so this
+ * write was refused. The message is its only channel; the native append's refusal arrives wrapped
+ * as an uncertain committed mutation.
+ */
 function isManagedReplaceIdentityMismatch(error: unknown): boolean {
-	return error instanceof Error && error.message === "managed_replace_identity_mismatch";
+	if (error instanceof ManagedAppendIdentityMismatchError) return true;
+	if (error instanceof ManagedCommittedMutationError) return isManagedReplaceIdentityMismatch(error.cause);
+	return error instanceof Error && MANAGED_IDENTITY_MISMATCH_MESSAGES.has(error.message);
 }
 
 /**
@@ -17418,7 +17432,10 @@ export class SessionManager {
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
 							// resident transcript. Any present-but-different identity still fails
-							// closed so a concurrent successor is never overwritten.
+							// closed so a concurrent successor is never overwritten, and stops the
+							// writer as every fence refusal does.
+							if (isManagedReplaceIdentityMismatch(err))
+								throw new ManagedAppendIdentityMismatchError(relativePath);
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
 							store.replaceSync(relativePath, bytes);
@@ -20165,8 +20182,11 @@ export class SessionManager {
 					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
 				} catch (err) {
 					const predecessorMissing = store.descriptorExpected(relativePath) === null;
-					if (!isEnoent(err) && (!(err instanceof ManagedAppendIdentityMismatchError) || !predecessorMissing))
-						throw err;
+					if (!isEnoent(err) && (!isManagedReplaceIdentityMismatch(err) || !predecessorMissing))
+						// A writer that lost a race to another process stops as every fence refusal does.
+						throw isManagedReplaceIdentityMismatch(err)
+							? new ManagedAppendIdentityMismatchError(relativePath)
+							: err;
 					// Appending only the new records would create a truncated transcript.
 					// Recreate the missing file from the complete resident entry set instead.
 					this.#managedPersistExpectedIdentity = undefined;
