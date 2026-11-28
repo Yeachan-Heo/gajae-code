@@ -1874,6 +1874,20 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:scripts/clean.test.ts");
 		expect(keys).toContain("root-check");
 	});
+	// The deleted path alone must select the guard, even with test existence validation.
+	test("deleted release-simplified entrypoint selects its anti-resurrection guard", () => {
+		const tasks = planTargetedTasks(
+			["scripts/release-simplified.ts"],
+			targetingPackages,
+			["scripts/release-policy.test.ts"],
+			true,
+		);
+		const guardTasks = tasks.filter(task => task.key === "test:scripts/release-policy.test.ts");
+		expect(guardTasks).toHaveLength(1);
+		expect(guardTasks[0]?.command).toEqual(["bun", "test", "scripts/release-policy.test.ts"]);
+		expect(tasks.map(task => task.key)).toContain("root-check");
+	});
+
 	test("cache-eval fixture adds its focused AI test without bypassing root fallback coverage", () => {
 		const tasks = targeted(["packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json"]);
 		expect(tasks.map(task => task.key)).toEqual([

@@ -12,6 +12,9 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir, withTimeout } from "@gajae-code/utils";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
+
+pinSharedPublicationMode();
 
 function assistant(): AssistantMessage {
 	return {

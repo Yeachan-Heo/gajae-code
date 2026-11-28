@@ -9,6 +9,9 @@ import { AgentSession, SharedControlPublicationError } from "../src/session/agen
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager, type SharedEntriesAppendOutcome } from "../src/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
+
+pinSharedPublicationMode();
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];

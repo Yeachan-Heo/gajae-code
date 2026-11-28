@@ -16,6 +16,9 @@ import { ManagedSessionDescendantStore } from "../src/session/internal/managed-s
 import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
+import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
+
+pinSharedPublicationMode();
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];

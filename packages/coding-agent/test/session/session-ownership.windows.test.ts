@@ -38,7 +38,7 @@ function user(text: string) {
 describe.skipIf(process.platform !== "win32")("session ownership on Windows, default mode", () => {
 	it("fails open on every claim: sessions open, write and reopen, and the counts are recorded", async () => {
 		expect(SessionOwnershipTestHooks.mode).toBeUndefined();
-		expect(sessionOwnershipMode()).toBe("observe");
+		expect(sessionOwnershipMode()).toBe("enforce");
 
 		// The spelling under os.tmpdir(), as the other Windows suites use it: a realpath expands the 8.3
 		// short name (C:\Users\RUNNER~1) that safe cleanup does not recognise as the temp root.

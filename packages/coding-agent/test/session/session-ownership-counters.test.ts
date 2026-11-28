@@ -111,7 +111,8 @@ describe("session ownership counters", () => {
 		expect((await claimSessionOwner("a", { surface: "terminal" })).status).toBe("held");
 		expect((await claimSessionOwner("b", { surface: "terminal" })).status).toBe("skipped");
 		expect((await claimSessionOwner("c", { surface: "terminal" })).status).toBe("skipped");
-		// Latched unavailable: every later claim is also a fail-open claim.
+		// b timed out, which skips that call only; c found no usable lock, which latches, so every later
+		// claim is also a fail-open claim. Each skipped claim counts once.
 		expect((await claimSessionOwner("d", { surface: "terminal" })).status).toBe("skipped");
 		expect(sessionOwnershipCounters()).toMatchObject({ claim_conflict: 1, fail_open: 3, claim_taken: 1 });
 	});

@@ -50,6 +50,7 @@ import {
 	resolveManagedGcScopeForRead,
 	taskArtifactOwnerStorageContextForScope,
 } from "../../session/internal/managed-session-scope";
+import { claimsUnder, resolveSessionOwnership, withScopedSessionClaim } from "../../session/internal/session-claim-set";
 import { captureTaskArtifactOwnerDeletionEvidence } from "../../session/internal/task-artifact-owner-access";
 import {
 	hasSiblingTaskArtifactOwnerTranscript,
@@ -57,6 +58,7 @@ import {
 } from "../../session/internal/task-artifact-owner-transcript";
 import {
 	probeSessionOwner,
+	SessionHeldError,
 	type SessionOwnerHolder,
 	type SessionOwnerHolderSummary,
 	sessionOwnerHolderPhrase,
@@ -1487,7 +1489,7 @@ function hasResumableEndpoint(authority: LiveResumeAuthority, sessionId: string)
  */
 const ENFORCE_HELD_ENDPOINT_WAIT_MS = 8_000;
 /**
- * Longest a resume under the default `observe` waits. `observe` never refuses: after the wait it goes
+ * Longest a resume under `observe` waits. `observe` never refuses: after the wait it goes
  * on as before ownership, so for a holder that never publishes an endpoint (an embedding such as the
  * desktop app) the wait is pure latency added to every resume, and it shortens a later launch's
  * admission window. 2 s covers the measured TUI startup gap several times over and keeps both small.
@@ -1541,6 +1543,21 @@ async function foreignSessionClaim(sessionId: string): Promise<{ holder: Session
 		logger.warn("sdk broker: session owner probe failed; resume continues as unheld", { error: String(error) });
 		return undefined;
 	}
+}
+
+/**
+ * Under `enforce`, a live generation-0 row of another process counts as a holder even while the
+ * claim is free: a terminal taking the session over with Continue here (design §13 L1) appends it
+ * before the broker closes the host, and claims only once the host has exited. A resume in that gap
+ * waits for the terminal's endpoint instead of refusing the endpointless row or launching a host.
+ */
+function handoverFence(authority: LiveResumeAuthority): { holder: SessionOwnerHolder | undefined } | undefined {
+	return resumeOwnershipMode() === "enforce" &&
+		authority.kind === "live" &&
+		authority.record.endpointGeneration === 0 &&
+		authority.record.pid !== process.pid
+		? { holder: undefined }
+		: undefined;
 }
 
 /**
@@ -1605,7 +1622,7 @@ async function awaitHeldSessionEndpoint(
 		await broker.index.refreshIfChanged();
 		authority = liveResumeAuthority(broker.index.listSessions().sessions, sessionId);
 		if (authority.kind === "ambiguous" || hasResumableEndpoint(authority, sessionId)) break;
-		claim = await foreignSessionClaim(sessionId);
+		claim = (await foreignSessionClaim(sessionId)) ?? handoverFence(authority);
 	}
 	return { authority, waitedMs: timing.now() - startedAt };
 }
@@ -7230,6 +7247,7 @@ async function executeLifecycleResponse(
 	identity: string,
 	cleanup?: CleanupEvidence,
 	onIdleHostExited?: (record: IndexedSession) => void,
+	underDeleteClaim = false,
 ): Promise<BrokerResponse> {
 	const requestedSessionId = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (requestedSessionId !== undefined && !isCanonicalSessionId(requestedSessionId))
@@ -7292,7 +7310,7 @@ async function executeLifecycleResponse(
 				authority.kind !== "ambiguous" &&
 				!hasResumableEndpoint(authority, requestedSessionId)
 			) {
-				const claim = await foreignSessionClaim(requestedSessionId);
+				const claim = (await foreignSessionClaim(requestedSessionId)) ?? handoverFence(authority);
 				if (claim) {
 					const readiness = startupAdmittedInputs.has(input)
 						? 0
@@ -8224,6 +8242,35 @@ async function executeLifecycleResponse(
 		if (record && !isSessionAuthorityEligible(record))
 			return fail("endpoint_stale", "Session authority is ambiguous and cannot be deleted safely.");
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
+		// Scoped claim (single-owner design §1 row 17), held for the whole delete: under enforce a session
+		// another process holds without a live row (a `-p` run, an embedding, a TUI without the SDK) is
+		// refused with the live-row refusal's code, before this request records any cleanup phase. `id` is the
+		// requested id: the header id on a fresh delete (only the managed candidate whose header names it
+		// is deleted) and `cleanup.sessionId` on a replay. Both refusals leave the key retryable
+		// (broker.ts `isRetryableDeleteRefusal`). Lifecycle- and metadata-phase cleanup replays return from
+		// `executeLifecycle` before this point and run without a claim. A host this broker
+		// launched is never the holder here: its live row is refused above, and close waits for its exit.
+		const ownership = resolveSessionOwnership();
+		if (!underDeleteClaim && claimsUnder(ownership)) {
+			let admitted = false;
+			try {
+				return await withScopedSessionClaim(ownership, id, "delete", () => {
+					admitted = true;
+					return executeLifecycleResponse(broker, operation, input, identity, cleanup, onIdleHostExited, true);
+				});
+			} catch (error) {
+				// Only the claim's refusal is thrown before the delete is admitted. A real hold is the
+				// live-row refusal, naming the holder; a claim that could not be checked has nothing to
+				// close, so it is the retryable `unavailable`.
+				if (admitted || !(error instanceof Error)) throw error;
+				if (!(error.cause instanceof SessionHeldError)) return fail("unavailable", error.message);
+				const holder = sessionOwnerHolderSummary(error.cause.holder);
+				return {
+					ok: false,
+					error: { code: "live_session", message: error.message, ...(holder ? { holder } : {}) },
+				};
+			}
+		}
 		if (cleanup === undefined) {
 			const requestedTranscriptPath = text(input.sessionPath);
 			const requestedCwd = lifecycleCwd(input);

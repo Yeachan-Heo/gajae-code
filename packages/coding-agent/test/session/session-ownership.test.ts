@@ -531,30 +531,27 @@ describe("narrow fail-open", () => {
 		expect(warnings).toEqual([]);
 	});
 
-	it("one timeout turns claims off for the process: later claims fail open without waiting", async () => {
-		const STALL_MS = 200;
-		const calls = backend(async () => {
-			await Bun.sleep(STALL_MS);
-			return { status: FileLockAcquireStatus.TimedOut, code: "timed_out" };
-		});
-		const stalled = Date.now();
-		expect(await claimSessionOwner("f4", { surface: "terminal" })).toEqual({
-			status: "skipped",
-			reason: "timed_out",
-			code: "timed_out",
-		});
-		expect(Date.now() - stalled).toBeGreaterThanOrEqual(STALL_MS - 5);
-		const later = Date.now();
-		for (const id of ["f4", "f4-new", "f4-fork"])
+	it("a timeout skips that one claim only: the next claim tries again and can succeed (design §2.7)", async () => {
+		let stalled = true;
+		const calls = backend(async sidecar =>
+			stalled ? { status: FileLockAcquireStatus.TimedOut, code: "timed_out" } : tryAcquireFileLock(sidecar, 2_000),
+		);
+		for (const id of ["f4", "f4", "f4-new"])
 			expect(await claimSessionOwner(id, { surface: "terminal" })).toEqual({
 				status: "skipped",
 				reason: "timed_out",
 				code: "timed_out",
 			});
-		expect(Date.now() - later).toBeLessThan(STALL_MS);
-		expect(calls.acquire).toBe(1);
-		expect(sessionOwnershipCounters().fail_open).toBe(4);
-		expect(warnings).toEqual(["Session ownership claim timed out; claims are off for this process"]);
+		expect(calls.acquire).toBe(3);
+		expect(sessionOwnershipCounters().fail_open).toBe(3);
+		expect(await probeSessionOwner("f4")).toEqual({ state: "free" });
+		stalled = false;
+		const claimed = await claimSessionOwner("f4", { surface: "terminal" });
+		if (claimed.status !== "claimed") throw new Error(`expected a claim, got ${claimed.status}`);
+		expect(await probeSessionOwner("f4")).toMatchObject({ state: "held", self: true });
+		claimed.claim.release();
+		expect(sessionOwnershipCounters().fail_open).toBe(3);
+		expect(warnings).not.toContain("Session ownership is unavailable; claims are off for this process");
 	});
 
 	it("any other lock failure refuses, open/permission EACCES included", async () => {
@@ -644,9 +641,13 @@ describe("dormant", () => {
 		};
 		expect(manifest.exports["./session/session-ownership"]).toBeNull();
 		expect(manifest.exports["./session/session-ownership.js"]).toBeNull();
+		expect(manifest.exports["./session/session-owner-holder"]).toBeNull();
+		expect(manifest.exports["./session/session-owner-holder.js"]).toBeNull();
 		for (const specifier of [
 			"@gajae-code/coding-agent/session/session-ownership",
 			"@gajae-code/coding-agent/session/session-ownership.js",
+			"@gajae-code/coding-agent/session/session-owner-holder",
+			"@gajae-code/coding-agent/session/session-owner-holder.js",
 		]) {
 			expect(() => Bun.resolveSync(specifier, import.meta.dir)).toThrow();
 		}

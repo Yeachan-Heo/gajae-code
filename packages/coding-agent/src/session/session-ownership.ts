@@ -28,6 +28,14 @@ import { getStatsDbPath, getTrustedHomeDir, isEnoent, logger } from "@gajae-code
 import { VERSION } from "@gajae-code/utils/cli-metadata";
 import { observeProcess, processIncarnation } from "../sdk/broker/process-incarnation";
 import {
+	isSessionOwnerSurface as isSurface,
+	SAFE_SESSION_HOST as SAFE_HOST,
+	SAFE_SESSION_ID as SAFE_ID,
+	type SessionOwnerBaseSurface,
+	type SessionOwnerHolder,
+	type SessionOwnerSurface,
+} from "./session-owner-holder";
+import {
 	classifySessionOwnerEntry,
 	SESSION_OWNER_RECORD_SUFFIX,
 	SESSION_OWNER_SIDECAR_SUFFIX,
@@ -43,6 +51,21 @@ import {
 	type RuntimeLockDirectory,
 } from "./session-storage";
 
+export {
+	SESSION_OWNER_SURFACES,
+	SessionHeldError,
+	type SessionOwnerBaseSurface,
+	type SessionOwnerHolder,
+	type SessionOwnerHolderSummary,
+	type SessionOwnerSurface,
+	sessionHeldForkCommand,
+	sessionHeldForkedNotice,
+	sessionHeldWarning,
+	sessionOwnerHolderMarker,
+	sessionOwnerHolderPhrase,
+	sessionOwnerHolderSummary,
+} from "./session-owner-holder";
+
 const SIDECAR_SUFFIX = SESSION_OWNER_SIDECAR_SUFFIX;
 const RECORD_SUFFIX = SESSION_OWNER_RECORD_SUFFIX;
 const RECORD_VERSION = 1;
@@ -50,28 +73,11 @@ const RECORD_MAX_BYTES = 4096;
 /** Every native call answers within this budget, or reports `timed_out`. */
 const NATIVE_BUDGET_MS = 2_000;
 const PROBE_CONCURRENCY = 16;
-const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 /** Keys must not differ only in case: macOS volumes are case-insensitive by default. */
 const PLAIN_KEY = /^[a-z0-9_-]{1,128}$/;
-const SAFE_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
 const SAFE_VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
 /** A UTC instant as `Date#toISOString` writes it; anything else in a record is not shown. */
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
-
-export const SESSION_OWNER_SURFACES = ["app", "terminal", "print", "sdk-host", "acp-host", "sdk"] as const;
-export type SessionOwnerBaseSurface = (typeof SESSION_OWNER_SURFACES)[number];
-/** Where the holder runs; a subagent child carries its parent's surface plus ` (subagent)`. */
-export type SessionOwnerSurface = SessionOwnerBaseSurface | `${SessionOwnerBaseSurface} (subagent)`;
-
-/** A verified holder: its lock is held, and (on this host) its pid and incarnation match its record. */
-export interface SessionOwnerHolder {
-	readonly surface: SessionOwnerSurface;
-	readonly pid: number;
-	/** Present only when the holder runs on another host, whose pid cannot be checked here. */
-	readonly host?: string;
-	readonly gjcVersion?: string;
-	readonly claimedAt?: string;
-}
 
 export type SessionOwnerUnknownReason = "unavailable" | "timed_out" | "failed";
 
@@ -86,6 +92,8 @@ export interface SessionOwnerClaim {
 	/** True when this process already held the session and this claim shares it. */
 	readonly shared: boolean;
 	readonly released: boolean;
+	/** How many claims in this process share the session's lock now, this one included; 0 once released. */
+	readonly holders: number;
 	/** Drop this claim. Idempotent; the last claim of a session removes the record, then unlocks. */
 	release(): void;
 }
@@ -230,12 +238,6 @@ interface OwnerRecord {
 	readonly claimedAt: string;
 }
 
-function isSurface(value: unknown): value is SessionOwnerSurface {
-	if (typeof value !== "string") return false;
-	const base = value.endsWith(" (subagent)") ? value.slice(0, -" (subagent)".length) : value;
-	return (SESSION_OWNER_SURFACES as readonly string[]).includes(base);
-}
-
 function parseRecord(text: string): OwnerRecord | undefined {
 	let value: unknown;
 	try {
@@ -338,6 +340,11 @@ interface RegistryEntry {
 	readonly recordPath: string;
 	readonly lock: FileLock;
 	holders: number;
+	/**
+	 * Admission claims among the holders: an open's or a switch's cover, kept only until the opener's
+	 * own claim lands ({@link releaseSessionAdmissions}). Absent in a registry an older copy created.
+	 */
+	admissions?: Set<Claim>;
 }
 
 interface SessionOwnerRegistry {
@@ -345,9 +352,12 @@ interface SessionOwnerRegistry {
 	readonly entries: Map<string, RegistryEntry>;
 	/** Acquires in flight, so a second claim in this process waits instead of contending. */
 	readonly pending: Map<string, Promise<void>>;
-	/** Set once a lock call reports `unavailable` or times out: claims are off for this process. */
+	/**
+	 * Set once a lock call reports `unavailable` (no usable lock on this platform): claims are off for
+	 * this process. A timeout never sets it (design §2.7): it skips that one call.
+	 */
 	unavailable: string | undefined;
-	/** Why the latch above was set; added later, so a registry from an older copy may lack it. */
+	/** Why the latch above was set; an older copy of this module may still latch `timed_out` here. */
 	latchReason?: "unavailable" | "timed_out";
 	/** In-process event counts (design §2.9); added after v1 shipped, so a v1 registry may lack it. */
 	counters?: Map<SessionOwnershipCounter, number>;
@@ -468,23 +478,18 @@ export function persistSessionOwnershipCounters(options: { readonly atExit?: boo
 	}
 }
 
-function markUnavailable(code: string | undefined, reason: "unavailable" | "timed_out" = "unavailable"): string {
+function markUnavailable(code: string | undefined): string {
 	const current = registry();
-	const latched = code ?? reason;
+	const latched = code ?? "unavailable";
 	if (current.unavailable === undefined) {
 		current.unavailable = latched;
-		current.latchReason = reason;
-		logger.warn(
-			reason === "timed_out"
-				? "Session ownership claim timed out; claims are off for this process"
-				: "Session ownership is unavailable; claims are off for this process",
-			{ code: latched },
-		);
+		current.latchReason = "unavailable";
+		logger.warn("Session ownership is unavailable; claims are off for this process", { code: latched });
 	}
 	return current.unavailable;
 }
 
-/** The fail-open a latched process returns for every later claim. */
+/** The fail-open a latched process returns for every later claim (`timed_out` only from an older copy). */
 function latchedFailOpen(current: SessionOwnerRegistry): SessionOwnerClaimResult {
 	return failOpen(current.latchReason ?? "unavailable", current.unavailable);
 }
@@ -495,10 +500,20 @@ class Claim implements SessionOwnerClaim {
 	readonly shared: boolean;
 	#released = false;
 
-	constructor(sidecar: string, entry: RegistryEntry, shared: boolean) {
+	constructor(sidecar: string, entry: RegistryEntry, shared: boolean, admission: boolean) {
 		this.#sidecar = sidecar;
 		this.#entry = entry;
 		this.shared = shared;
+		if (admission) {
+			entry.admissions ??= new Set();
+			entry.admissions.add(this);
+		}
+	}
+
+	/** Release every admission claim of this session except this claim, which keeps the lock. */
+	releaseAdmissions(): void {
+		if (this.#released) return;
+		for (const admission of [...(this.#entry.admissions ?? [])]) if (admission !== this) admission.release();
 	}
 
 	get sessionId(): string {
@@ -513,10 +528,15 @@ class Claim implements SessionOwnerClaim {
 		return this.#released;
 	}
 
+	get holders(): number {
+		return this.#released ? 0 : this.#entry.holders;
+	}
+
 	release(): void {
 		if (this.#released) return;
 		this.#released = true;
 		const entry = this.#entry;
+		entry.admissions?.delete(this);
 		entry.holders -= 1;
 		if (entry.holders > 0) return;
 		const entries = registry().entries;
@@ -538,6 +558,14 @@ class Claim implements SessionOwnerClaim {
 	}
 }
 
+/**
+ * `claim`, an opener's own claim of its session, has landed: release the admission claims that
+ * covered the open. `claim` is held, so the lock never lapses between them (design §2.5).
+ */
+export function releaseSessionAdmissions(claim: SessionOwnerClaim): void {
+	if (claim instanceof Claim) claim.releaseAdmissions();
+}
+
 function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
 	return { surface: entry.surface, pid: process.pid, gjcVersion: VERSION, claimedAt: entry.claimedAt };
 }
@@ -546,8 +574,12 @@ function selfHolder(entry: RegistryEntry): SessionOwnerHolder {
 // Claim and probe
 // =============================================================================
 
-function failOpen(reason: "unavailable" | "timed_out", code: string | undefined): SessionOwnerClaimResult {
-	countSessionOwnershipEvent("fail_open");
+function failOpen(
+	reason: "unavailable" | "timed_out",
+	code: string | undefined,
+	counted = true,
+): SessionOwnerClaimResult {
+	if (counted) countSessionOwnershipEvent("fail_open");
 	return { status: "skipped", reason, code };
 }
 
@@ -555,11 +587,24 @@ function failOpen(reason: "unavailable" | "timed_out", code: string | undefined)
  * Claim `sessionId` for this process. A session this process already holds is shared (design D10).
  * Throws `SessionOwnershipError` when the owners directory or the lock fails in a way that must
  * refuse the session; only `unavailable` and `timed_out` fail open (design §2.7).
+ *
+ * `repeat` names the outcome the caller's previous attempt of this id had (a turn-start
+ * re-attempt): the same outcome again is neither counted nor logged again, so the counters count
+ * episodes, not turns.
+ *
+ * `admission` marks a cover an open or a switch takes before it reads the session: the opener's own
+ * claim releases it when it lands ({@link releaseSessionAdmissions}), so it is never a second holder
+ * once the session is open.
  */
 export async function claimSessionOwner(
 	sessionId: string,
-	request: { readonly surface: SessionOwnerSurface },
+	request: {
+		readonly surface: SessionOwnerSurface;
+		readonly repeat?: "held" | "timed_out";
+		readonly admission?: boolean;
+	},
 ): Promise<SessionOwnerClaimResult> {
+	const admission = request.admission === true;
 	const key = sessionOwnerKey(sessionId);
 	const current = registry();
 	if (current.unavailable !== undefined) return latchedFailOpen(current);
@@ -575,13 +620,13 @@ export async function claimSessionOwner(
 		const held = current.entries.get(sidecar);
 		if (held) {
 			held.holders += 1;
-			return { status: "claimed", claim: new Claim(sidecar, held, true) };
+			return { status: "claimed", claim: new Claim(sidecar, held, true, admission) };
 		}
 		const pending = current.pending.get(sidecar);
 		if (!pending) break;
 		await pending;
 	}
-	// The acquire waited on may have found the platform unavailable, or timed out.
+	// The acquire waited on may have found the platform unavailable.
 	if (current.unavailable !== undefined) return latchedFailOpen(current);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	current.pending.set(sidecar, promise);
@@ -634,10 +679,10 @@ export async function claimSessionOwner(
 				}
 				current.entries.set(sidecar, entry);
 				countSessionOwnershipEvent("claim_taken");
-				return { status: "claimed", claim: new Claim(sidecar, entry, false) };
+				return { status: "claimed", claim: new Claim(sidecar, entry, false, admission) };
 			}
 			case FileLockAcquireStatus.Held:
-				countSessionOwnershipEvent("claim_conflict");
+				if (request.repeat !== "held") countSessionOwnershipEvent("claim_conflict");
 				return {
 					status: "held",
 					holder: verifiedHolder(readRecord(path.join(owners, `${key}${RECORD_SUFFIX}`)), sessionId),
@@ -645,9 +690,12 @@ export async function claimSessionOwner(
 			case FileLockAcquireStatus.Unavailable:
 				return failOpen("unavailable", markUnavailable(result.code));
 			case FileLockAcquireStatus.TimedOut:
-				// A stalled lock filesystem (NFS, for one) would make every later open wait the full native
-				// budget again, so one timeout turns claims off for the rest of this process.
-				return failOpen("timed_out", markUnavailable(result.code ?? "timed_out", "timed_out"));
+				// A stall skips this call only (design §2.7): latching it would leave a long-lived writer
+				// unclaimed, and so invisible to other processes, for the rest of its life. Turn start
+				// re-attempts the current session, with backoff (`SessionClaimSet.reclaimCurrent`).
+				if (request.repeat !== "timed_out")
+					logger.warn("Session ownership claim timed out; this claim was skipped", { code: result.code });
+				return failOpen("timed_out", result.code ?? "timed_out", request.repeat !== "timed_out");
 			default:
 				throw new SessionOwnershipError(result.code ?? "lock_failed");
 		}
@@ -832,151 +880,4 @@ export async function inspectSessionOwners(
 	}
 	held.sort((a, b) => a.key.localeCompare(b.key));
 	return { directory: "present", ...counts, held };
-}
-
-// =============================================================================
-// Refusal
-// =============================================================================
-
-const SURFACE_NOUNS: Record<SessionOwnerBaseSurface, string> = {
-	app: "the Gajae Code app",
-	terminal: "another terminal",
-	print: "a gjc -p run",
-	"sdk-host": "an SDK session host",
-	"acp-host": "an ACP session host",
-	sdk: "an application using the gjc SDK",
-};
-
-/** The holder as a remote client is told it, in a broker lifecycle error: surface and pid only. */
-export interface SessionOwnerHolderSummary {
-	readonly surface: SessionOwnerSurface;
-	readonly pid: number;
-}
-
-/**
- * {@link SessionOwnerHolderSummary} of `holder`, checked field by field because it may come from
- * a file another process wrote; `undefined` when it does not name a surface and a positive pid.
- * A holder on another host keeps its surface and pid; its host name stays out.
- */
-export function sessionOwnerHolderSummary(holder: unknown): SessionOwnerHolderSummary | undefined {
-	if (typeof holder !== "object" || holder === null) return undefined;
-	const { surface, pid } = holder as { surface?: unknown; pid?: unknown };
-	return isSurface(surface) && typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
-		? { surface, pid }
-		: undefined;
-}
-
-/**
- * How a holder is named to a person (design §3.4). The holder is checked again here, because a
- * caller may build one: anything malformed reads as "another gjc process", never as raw text.
- */
-export function sessionOwnerHolderPhrase(holder: SessionOwnerHolder | undefined): string {
-	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface))
-		return "another gjc process";
-	if (holder.host !== undefined)
-		return SAFE_HOST.test(holder.host)
-			? `a gjc process on ${holder.host} (pid ${holder.pid})`
-			: "another gjc process";
-	const subagent = holder.surface.endsWith(" (subagent)");
-	const base = (subagent ? holder.surface.slice(0, -" (subagent)".length) : holder.surface) as SessionOwnerBaseSurface;
-	const noun = SURFACE_NOUNS[base];
-	return subagent ? `a subagent of ${noun} (pid ${holder.pid})` : `${noun} (pid ${holder.pid})`;
-}
-
-/** The holder as the SDK message names it (design §3.3): `terminal, pid 4242`, or `a gjc process on build-box, pid 4242` for a remote holder; `undefined` if unverified. */
-function sessionOwnerHolderLabel(holder: SessionOwnerHolder | undefined): string | undefined {
-	if (!holder || !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || !isSurface(holder.surface)) return undefined;
-	if (holder.host === undefined) return `${holder.surface}, pid ${holder.pid}`;
-	return SAFE_HOST.test(holder.host) ? `a gjc process on ${holder.host}, pid ${holder.pid}` : undefined;
-}
-
-/**
- * The CLI command that continues a held session in a copy (design §3.3), for the CLI's refusals
- * only: the SDK's `operatorMessage` names no command. `undefined` for an id that is not a safe file
- * name, since any other id may hold any text.
- */
-export function sessionHeldForkCommand(
-	sessionId: string,
-	options: {
-		readonly print?: boolean;
-		/** The transcript path the session was named by, repeated so the command reads the same file. */
-		readonly source?: string;
-		/** The `--session-dir` the session was found in; an id resolves only there. */
-		readonly sessionDir?: string;
-	} = {},
-): string | undefined {
-	if (!SAFE_ID.test(sessionId)) return undefined;
-	const source = options.source === undefined ? sessionId : shellWord(options.source);
-	const sessionDir = options.sessionDir === undefined ? undefined : shellWord(options.sessionDir);
-	if (source === undefined || (options.sessionDir !== undefined && sessionDir === undefined)) return undefined;
-	const flags = sessionDir === undefined ? "" : `--session-dir ${sessionDir} `;
-	return options.print ? `gjc -p ${flags}--fork ${source} "<message>"` : `gjc ${flags}--fork ${source}`;
-}
-
-/** One shell word for a path in a printed command; `undefined` for text no terminal should print. */
-function shellWord(value: string): string | undefined {
-	if (value === "" || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)) return undefined;
-	return /^[A-Za-z0-9._/:@%+=,-]+$/.test(value) && !value.startsWith("-")
-		? value
-		: `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-/**
- * The terminal warning for a session another process holds (design §3.1; Fork and Cancel only, the
- * read-only view and Take over are deferred). Fixed vocabulary, the holder's §3.4 phrase and a safe
- * short id only: nothing a session or another process wrote reaches the screen.
- */
-export function sessionHeldWarning(error: SessionHeldError): { readonly heading: string; readonly lines: string[] } {
-	const subject = SAFE_ID.test(error.sessionId) ? `Session ${error.sessionId.slice(0, 8)}` : "This session";
-	return {
-		heading: "This session is open in another process",
-		lines: [
-			`${subject} is open for writing in ${sessionOwnerHolderPhrase(error.holder)}.`,
-			"Only one process can write a session at a time.",
-		],
-	};
-}
-
-/** What a launch or the TUI says after Fork (design §3.1). */
-export function sessionHeldForkedNotice(error: SessionHeldError): string {
-	return `Forked into a new session. The original stays with ${sessionOwnerHolderPhrase(error.holder)}.`;
-}
-
-const SURFACE_MARKERS: Record<SessionOwnerBaseSurface, string> = {
-	app: "in app",
-	terminal: "in terminal",
-	print: "in gjc -p",
-	"sdk-host": "in session host",
-	"acp-host": "in session host",
-	sdk: "in SDK app",
-};
-
-/** The short marker a session list shows on a row another process holds (design §1 row 2): `in terminal`. */
-export function sessionOwnerHolderMarker(holder: SessionOwnerHolder | undefined): string {
-	if (!holder || !isSurface(holder.surface) || holder.host !== undefined) return "in use";
-	if (holder.surface.endsWith(" (subagent)")) return "in subagent";
-	return SURFACE_MARKERS[holder.surface as SessionOwnerBaseSurface];
-}
-
-/**
- * A session another live process holds for writing. `message` is the stable machine code; the
- * fixed, path-free `operatorMessage` is what a person sees.
- */
-export class SessionHeldError extends Error {
-	readonly code = "session_held";
-	readonly sessionId: string;
-	readonly holder: SessionOwnerHolder | undefined;
-	readonly operatorMessage: string;
-
-	constructor(sessionId: string, holder?: SessionOwnerHolder) {
-		super("session_held");
-		this.name = "SessionHeldError";
-		this.sessionId = sessionId;
-		this.holder = holder;
-		// Only a safe id is quoted, shortened as the CLI shows it; any other id may hold any text.
-		const subject = SAFE_ID.test(sessionId) ? `Session ${sessionId.slice(0, 8)}` : "This session";
-		const label = sessionOwnerHolderLabel(holder);
-		const where = label ? `another process (${label})` : "another gjc process";
-		this.operatorMessage = `${subject} is open for writing in ${where}. Only one process can write a session at a time.`;
-	}
 }

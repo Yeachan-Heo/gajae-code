@@ -7,6 +7,7 @@ import {
 } from "../src/sdk/bus/prompt-reconciliation";
 import { CursorRegistry, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
 import { formatPromptFailureForLocalLog } from "../src/sdk/prompt-failure";
+import { SessionHeldError } from "../src/session/session-owner-holder";
 
 const correlation = (n = 1) => ({ commandId: `command-${n}`, turnId: `turn-${n}` });
 
@@ -72,6 +73,21 @@ describe("prompt reconciliation record", () => {
 		expect(result.error.message).not.toMatch(/[\t\r\n]/);
 		expect(result.error.message.length).toBeLessThanOrEqual(512);
 		expect(result.terminalAt).toBeGreaterThan(0);
+	});
+
+	it("records a turn refused for a held session under the broker's live_session code", () => {
+		// A queued or continued turn refused after acceptance (another process now holds the session)
+		// fails through agent_failed; its record carries the code remote clients read for a held session.
+		const rec = createPromptReconciliation();
+		rec.noteAccepted(correlation(7), "ref-held");
+		rec.noteTransition(correlation(7), {
+			type: "agent_failed",
+			error: new SessionHeldError("held-session", { surface: "terminal", pid: 4242 }),
+		});
+		expect(rec.lookup({ clientRef: "ref-held" })).toMatchObject({
+			status: "failed",
+			error: { code: "live_session", message: "Prompt submission failed." },
+		});
 	});
 
 	it("accepts explicit cancellation and non-text activity without a visible receipt", () => {

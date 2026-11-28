@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { isRecord } from "@gajae-code/utils";
-import { type SessionOwnerHolderSummary, sessionOwnerHolderSummary } from "../../session/session-ownership";
+import { type SessionOwnerHolderSummary, sessionOwnerHolderSummary } from "../../session/session-owner-holder";
 import {
 	resolvedScopeV1,
 	resolveScopeRequest,

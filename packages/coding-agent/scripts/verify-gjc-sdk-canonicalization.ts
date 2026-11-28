@@ -1784,6 +1784,8 @@ function forbiddenMachineModule(file: string): string | undefined {
 	if (file === "packages/coding-agent/src/modes/acp/acp-event-mapper.ts") return undefined;
 	// Import-free error-text helper: it formats operator messages and cannot reach session state.
 	if (file === "packages/coding-agent/src/session/operator-error-message.ts") return undefined;
+	// Import-free holder text and error: it names who holds a session and cannot reach the claim machinery.
+	if (file === "packages/coding-agent/src/session/session-owner-holder.ts") return undefined;
 	if (file === "packages/coding-agent/src/main.ts" || file === "packages/coding-agent/src/modes/interactive-mode.ts")
 		return "process bootstrap/main session host";
 	if (file === "packages/coding-agent/src/sdk/session.ts") return "direct session mutation module";
