@@ -2,6 +2,9 @@ Executes bash command in shell session for terminal operations like git, bun, ca
 
 <instruction>
 - Use `cwd` to set working directory, not `cd dir && …`
+{{#if isWindows}}
+- This host is Windows, but this tool runs a bash-compatible shell, not PowerShell or cmd. Use bash syntax: `VAR=value cmd` (not `$env:VAR=…` or `set VAR=…`), `rm`/`ls`/`cat` (not `Remove-Item`/`dir`/`type`).
+{{/if}}
 {{#when restrictionProfile "==" "read-only"}}
 - Do not pass `env` overrides or `pty: true`; read-only bash rejects both.
 - Shell control operators such as `;`, `|`, `&`, `<`, `>`, and command substitution are blocked.

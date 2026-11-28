@@ -209,6 +209,12 @@ export interface ToolSession {
 	hasSessionAgentModelOverride?: (role: string) => boolean;
 	/** Current working directory */
 	cwd: string;
+	/**
+	 * Host platform that platform-dependent tool descriptions render for. Defaults to
+	 * `process.platform`; the tool-catalog generator pins it so the committed catalog
+	 * regenerates identically on every host.
+	 */
+	platform?: NodeJS.Platform;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session will bind a workflow-gate emitter after tool construction. */

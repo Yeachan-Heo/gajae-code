@@ -27,6 +27,9 @@ export interface GeneratedToolCatalogEntry {
 	platformExclusions?: readonly { platform: string; arch?: string }[];
 }
 
+/** Host platform the committed catalog renders platform-dependent tool descriptions for. */
+const TOOL_CATALOG_RENDER_PLATFORM: NodeJS.Platform = "linux";
+
 export interface ToolCatalogGenerationOptions {
 	platform?: NodeJS.Platform;
 	arch?: NodeJS.Architecture;
@@ -115,6 +118,9 @@ function makeSession(cwd: string): any {
 	const settings = makeSettings();
 	return {
 		cwd,
+		// The committed catalog is platform-independent: render platform-dependent descriptions
+		// (e.g. the bash tool's Windows shell hint) for a fixed non-Windows host.
+		platform: TOOL_CATALOG_RENDER_PLATFORM,
 		hasUI: false,
 		workflowGateEligible: true,
 		settings,
