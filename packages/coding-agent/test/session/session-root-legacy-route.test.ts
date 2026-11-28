@@ -23,7 +23,11 @@ import {
 	ManagedSessionDescendantStore,
 } from "../../src/session/internal/managed-session-storage";
 import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
-import { type SessionDestinationInput, SessionManager } from "../../src/session/session-manager";
+import {
+	SessionAppendPersistenceError,
+	type SessionDestinationInput,
+	SessionManager,
+} from "../../src/session/session-manager";
 import { resetSessionOwnershipForTests, SessionOwnershipTestHooks } from "../../src/session/session-ownership";
 import type { SessionOwnershipMode } from "../../src/session/session-ownership-mode";
 import { createAssistantMessage } from "../helpers/agent-session-setup";
@@ -293,6 +297,46 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		expect(resumed).toContain('"customType":"peer"');
 		expect(resumed).toContain("after resume");
 	});
+
+	// Failures that are not a refusal before writing keep the uncertain committed-append handling:
+	// no operator stop, the entry stays in memory, and the next persist rewrites the whole transcript.
+	it.each([
+		["io_error", false],
+		["fsync_failed", false],
+		["identity_changed_after_write", true],
+	] as const)(
+		"an append that fails with %s is not the operator stop; the entry stays for a full rewrite",
+		async (code, written) => {
+			// `off`: an uncertain outcome keeps its claim through a failed close, which this case does not test.
+			const { sessionManager, file } = await prompted("off");
+			const append = ManagedSessionDescendantStore.prototype.appendExpectedSync;
+			vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedSync").mockImplementationOnce(function (
+				this: ManagedSessionDescendantStore,
+				...args
+			) {
+				if (written) append.apply(this, args);
+				throw new ManagedCommittedMutationError("append", new Error(code));
+			});
+			let thrown: unknown;
+			try {
+				sessionManager.appendMessage({ role: "user", content: "uncertain entry", timestamp: Date.now() });
+			} catch (error) {
+				thrown = error;
+			}
+			// The uncertain outcome, never `not_committed`: the entry is kept, not rolled back.
+			expect(thrown).toBeInstanceOf(SessionAppendPersistenceError);
+			expect((thrown as SessionAppendPersistenceError).phase).toBe("current_append");
+			expect(sessionManager.getAppendIdentityMismatch()).toBeUndefined();
+			expect(JSON.stringify(sessionManager.getEntries())).toContain("uncertain entry");
+			expect((await Bun.file(file).text()).includes("uncertain entry")).toBe(written);
+			// Disposing a session with an uncertain written append waits out its ~5 s close budget.
+			await sessions
+				.splice(-1)[0]
+				?.dispose()
+				.catch(() => undefined);
+		},
+		30_000,
+	);
 
 	it("a rewrite adopts only its own bytes; an append right after it fails later writes closed", async () => {
 		const { sessionManager, file } = await prompted("enforce");
