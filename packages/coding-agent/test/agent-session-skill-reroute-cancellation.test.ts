@@ -2,7 +2,7 @@ import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -11,12 +11,26 @@ import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layo
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/hooks/skill-state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { FallbackChainController } from "@gajae-code/coding-agent/session/fallback-chain-controller";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as z from "zod/v4";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;
 let tempDir: string | undefined;
+
+function makeTool(name: string): AgentTool {
+	return {
+		name,
+		label: name,
+		description: `${name} test tool`,
+		parameters: z.object({}),
+		async execute() {
+			return { content: [{ type: "text", text: `${name} called` }] };
+		},
+	};
+}
 
 function createLifecycleIndependentSessionManager(): SessionManager {
 	const lifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
@@ -113,12 +127,63 @@ test.serial("forwards preflight cancellation when a prompt reroutes to a skill",
 	controller.abort();
 
 	await expect(prompt).rejects.toMatchObject({ code: "busy" });
-	expect(invokeSkill).toHaveBeenCalledWith("fixture-skill", "review", {
-		preflightSignal: controller.signal,
-	});
+	expect(invokeSkill).toHaveBeenCalledWith(
+		"fixture-skill",
+		"review",
+		expect.objectContaining({
+			preflightSignal: controller.signal,
+			promptAdmissionFence: expect.any(Object),
+		}),
+	);
+	expect(invokeSkill.mock.calls[0]?.[2]?.promptAdmissionFence?.signal.aborted).toBe(true);
 });
 
-test.serial("does not reroute ordinary text that merely contains a later skill token", async () => {
+test.serial("cancels inline skill preparation after a session abort without an external signal", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-internal-abort-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const contentLoadStarted = Promise.withResolvers<void>();
+	const contentLoadRelease = Promise.withResolvers<void>();
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				loadContent: async () => {
+					contentLoadStarted.resolve();
+					await contentLoadRelease.promise;
+					return "Fixture skill body";
+				},
+			},
+		],
+	});
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage");
+	const pending = session.prompt("Review /skill:fixture-skill while loading");
+	try {
+		await contentLoadStarted.promise;
+		await session.abort();
+		await expect(pending).rejects.toMatchObject({ code: "busy" });
+		expect(promptCustomMessage).not.toHaveBeenCalled();
+	} finally {
+		contentLoadRelease.resolve();
+		await pending.catch(() => undefined);
+	}
+});
+
+test.serial("loads a skill referenced inline in ordinary prompt text", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-leading-slash-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -142,14 +207,274 @@ test.serial("does not reroute ordinary text that merely contains a later skill t
 				filePath: "/tmp/fixture-skill/SKILL.md",
 				baseDir: "/tmp/fixture-skill",
 				source: "test",
+				content: "Fixture skill body",
 			},
 		],
 	});
 
-	const invokeSkill = vi.spyOn(session, "invokeSkill");
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
 	await session.prompt("xskill:noise /skill:fixture-skill review");
 
-	expect(invokeSkill).not.toHaveBeenCalled();
+	expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+	expect(promptCustomMessage.mock.calls[0]?.[0]).toMatchObject({
+		content: expect.stringContaining("Fixture skill body"),
+		details: expect.objectContaining({ args: "xskill:noise review", name: "fixture-skill" }),
+	});
+	const agentPrompt = vi.spyOn(agent, "prompt").mockResolvedValue(undefined);
+	await session.prompt("preserve /skill:unknown literally");
+	expect(agentPrompt.mock.calls[0]?.[0]).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				role: "user",
+				content: expect.arrayContaining([{ type: "text", text: "preserve /skill:unknown literally" }]),
+			}),
+		]),
+	);
+	expect(session.resolvePromptSkillInvocation("preserve /skill:unknown literally")).toBeUndefined();
+});
+
+test.serial("keeps synthetic and agent-attributed inline skill text on the ordinary prompt path", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-internal-prompt-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				content: "Fixture skill body",
+			},
+		],
+	});
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
+	const agentPrompt = vi.spyOn(agent, "prompt").mockResolvedValue(undefined);
+	await session.prompt("Approved plan /skill:fixture-skill should remain a plan", { synthetic: true });
+	await session.prompt("Worker assignment /skill:fixture-skill remains literal", { attribution: "agent" });
+
+	expect(promptCustomMessage).not.toHaveBeenCalled();
+	expect(agentPrompt.mock.calls[0]?.[0]).toEqual(
+		expect.arrayContaining([expect.objectContaining({ role: "developer" })]),
+	);
+	expect(agentPrompt.mock.calls[1]?.[0]).toEqual(
+		expect.arrayContaining([expect.objectContaining({ role: "user", attribution: "agent" })]),
+	);
+});
+
+test.serial("honors disabled skill commands without disabling explicit skill invocation", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-command-disabled-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const settings = Settings.isolated({ "compaction.enabled": false, "skills.enableSkillCommands": false });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings,
+		skillsSettings: settings.getGroup("skills"),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				content: "Fixture skill body",
+			},
+		],
+	});
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
+	const agentPrompt = vi.spyOn(agent, "prompt").mockResolvedValue(undefined);
+	await session.prompt("Explain /skill:fixture-skill behavior");
+	expect(promptCustomMessage).not.toHaveBeenCalled();
+	expect(agentPrompt.mock.calls[0]?.[0]).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				role: "user",
+				content: expect.arrayContaining([{ type: "text", text: "Explain /skill:fixture-skill behavior" }]),
+			}),
+		]),
+	);
+	expect(session.resolvePromptSkillInvocation("Explain /skill:fixture-skill behavior")).toBeUndefined();
+
+	await session.invokeSkill("fixture-skill", "explicit call");
+	expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+	expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Fixture skill body");
+});
+
+test.serial("preserves follow-up delivery options when an inline skill reroutes during streaming", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-follow-up-reroute-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const activeTurnStarted = Promise.withResolvers<void>();
+	const activeTurnRelease = Promise.withResolvers<void>();
+	const mock = createMockModel({
+		responses: [
+			async () => {
+				activeTurnStarted.resolve();
+				await activeTurnRelease.promise;
+				return { content: ["active turn complete"] };
+			},
+			{ content: ["skill follow-up complete"] },
+		],
+	});
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: mock.stream,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				content: "Fixture skill body",
+			},
+		],
+	});
+	const activePrompt = session.prompt("active turn");
+	const resetFallbackBudget = vi.spyOn(FallbackChainController.prototype, "resetAttemptBudget");
+	try {
+		await activeTurnStarted.promise;
+		resetFallbackBudget.mockClear();
+		const promptCustomMessage = vi.spyOn(session, "promptCustomMessage");
+		const accepted = vi.fn();
+		await session.prompt("Please handle /skill:fixture-skill this way", {
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+			onPreflightAcceptCommit: accepted,
+		});
+
+		expect(promptCustomMessage.mock.calls[0]?.[1]).toMatchObject({
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Fixture skill body");
+		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+		expect(accepted).toHaveBeenCalledTimes(1);
+	} finally {
+		activeTurnRelease.resolve();
+		await activePrompt;
+		await session.waitForIdle();
+	}
+	expect(resetFallbackBudget).toHaveBeenCalled();
+});
+
+test.serial("enforces plan-mode decisions after an inline skill turn", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-plan-mode-reroute-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const askTool = makeTool("ask");
+	const resolveTool = makeTool("resolve");
+	const mock = createMockModel({
+		responses: [{ content: ["skill complete"] }, { content: ["plan reminder complete"] }],
+	});
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [askTool, resolveTool], messages: [] },
+		streamFn: mock.stream,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+		toolRegistry: new Map([
+			[askTool.name, askTool],
+			[resolveTool.name, resolveTool],
+		]),
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				content: "Fixture skill body",
+			},
+		],
+	});
+	session.setPlanModeState({ enabled: true, planFilePath: path.join(tempDir, "plan.md") });
+	const resetFallbackBudget = vi.spyOn(FallbackChainController.prototype, "resetAttemptBudget");
+	const prompt = vi.spyOn(session, "prompt");
+	await session.prompt("Review /skill:fixture-skill and choose the next step");
+
+	expect(resetFallbackBudget).toHaveBeenCalled();
+	expect(prompt).toHaveBeenCalledTimes(2);
+	expect(prompt.mock.calls[1]?.[0]).toContain("ask");
+	expect(prompt.mock.calls[1]?.[1]).toMatchObject({ synthetic: true, toolChoice: "required" });
+});
+
+test.serial("retains the eager-todo prelude for an idle inline skill prompt", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-eager-todo-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const todoWriteTool = makeTool("todo_write");
+	const mock = createMockModel({ responses: [{ content: ["skill complete"] }] });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [todoWriteTool], messages: [] },
+		streamFn: mock.stream,
+	});
+	const settings = Settings.isolated({
+		"compaction.enabled": false,
+		"todo.enabled": true,
+		"todo.eager": true,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings,
+		modelRegistry,
+		toolRegistry: new Map([[todoWriteTool.name, todoWriteTool]]),
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				content: "Fixture skill body",
+			},
+		],
+	});
+	const agentPrompt = vi.spyOn(agent, "prompt");
+	await session.prompt("Implement /skill:fixture-skill and add regression tests");
+
+	expect(agentPrompt.mock.calls[0]?.[0]).toEqual(
+		expect.arrayContaining([expect.objectContaining({ role: "custom", customType: "eager-todo-prelude" })]),
+	);
 });
 
 test.serial("keeps SDK ownership when an internal skill invocation becomes a custom prompt", async () => {
