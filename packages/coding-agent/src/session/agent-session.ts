@@ -5908,6 +5908,12 @@ export class AgentSession {
 		}
 		return true;
 	}
+
+	/** True when this session uses shared session publication (managed destination). */
+	#usesSharedSessionPublication(): boolean {
+		return this.sessionManager.isManagedDestination();
+	}
+
 	/**
 	 * Allocate a FRESH prompt attempt/lineage for an allowed owned-completion
 	 * delivery (corrected turn semantics). The new turn gets a new attempt epoch
@@ -27475,12 +27481,14 @@ export class AgentSession {
 				emergencyReason,
 			});
 			// Update tracking for transcriptFile compactions to prevent re-triggering on every
-			// prompt when the file cannot shrink further. Only update baseline on successful compaction
-			// or benign no-progress outcome (skipped); keep failed/aborted attempts eligible for retry.
+			// prompt when the file cannot shrink further. Update baseline on benign no-progress
+			// outcomes (skipped); keep failed/aborted attempts eligible for retry.
+			// Note: successful compaction ("compacted") baseline is recorded in #runAutoCompactionImpl
+			// right after entry appending to handle post-publication aborts correctly.
 			if (
 				emergencyReason === "transcriptFile" &&
 				!this.#usesSharedSessionPublication() &&
-				(compactionResult.kind === "compacted" || compactionResult.kind === "skipped")
+				compactionResult.kind === "skipped"
 			) {
 				try {
 					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
@@ -29505,6 +29513,18 @@ export class AgentSession {
 			this.#commitCatalogPreservingTransition();
 			this.#recordAdaptiveCompactionReset(tokensBefore);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+			// Record transcript file baseline after entry is successfully appended and applied,
+			// BEFORE checking for abort. This ensures the baseline is updated when the entry is
+			// published, so a cancellation after publication won't cause re-triggering on the
+			// next prompt. Only update on successful compaction (kind would be "compacted"),
+			// not on skipped attempts.
+			if (options?.emergencyReason === "transcriptFile" && !this.#usesSharedSessionPublication()) {
+				try {
+					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
+				} catch {
+					// Best effort; if we can't stat the file, don't update the tracking
+				}
+			}
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const result: CompactionResult = {

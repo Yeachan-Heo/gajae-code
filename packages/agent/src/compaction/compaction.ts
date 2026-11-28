@@ -427,7 +427,10 @@ export function emergencyCompactionReason(
 		const TRANSCRIPT_CAP_BYTES = 128 * 1024 * 1024; // matches MANAGED_ARTIFACT_MAX_FILE_BYTES
 		const SAFETY_MARGIN_BYTES = 16 * 1024 * 1024;
 		const retryThresholdBytes = previousTranscriptFileBytesAfterCompaction
-			? Math.min(previousTranscriptFileBytesAfterCompaction * 1.5, TRANSCRIPT_CAP_BYTES - SAFETY_MARGIN_BYTES)
+			? Math.max(
+					previousTranscriptFileBytesAfterCompaction,
+					Math.min(previousTranscriptFileBytesAfterCompaction * 1.5, TRANSCRIPT_CAP_BYTES - SAFETY_MARGIN_BYTES),
+				)
 			: undefined;
 		if (!retryThresholdBytes || sample.transcriptFileBytes > retryThresholdBytes) {
 			return "transcriptFile";

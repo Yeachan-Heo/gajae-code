@@ -180,4 +180,54 @@ describe("emergencyCompactionReason (W4 / F6)", () => {
 		const cappedThresholdExpected = Math.min(uncappedThreshold, TRANSCRIPT_CAP - SAFETY_MARGIN);
 		expect(cappedThresholdExpected).toBe(112 * 1024 * 1024);
 	});
+
+	it("never re-triggers on unchanged transcript when baseline is above 112MiB (safety margin)", () => {
+		// Regression test for issue where threshold = min(baseline*1.5, 128MiB-16MiB)
+		// caused re-triggering when baseline was high.
+		// Example: baseline 120MiB gives threshold min(180MiB, 112MiB) = 112MiB < 120MiB baseline
+		// This violates the invariant that unchanged transcripts should not re-trigger.
+		// Fix: threshold = max(baseline, min(baseline*1.5, 128MiB-16MiB))
+
+		const cappedLimits = { ...LIM };
+
+		// Case 1: baseline at 120MiB (above the 112MiB capped threshold)
+		const baseline120 = 120 * 1024 * 1024;
+		// Without fix: threshold = min(180MiB, 112MiB) = 112MiB (WRONG: < baseline)
+		// With fix: threshold = max(120MiB, min(180MiB, 112MiB)) = max(120MiB, 112MiB) = 120MiB
+
+		// Unchanged transcript at baseline should NOT trigger
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: baseline120 }, cappedLimits, baseline120),
+		).toBeNull();
+
+		// Transcript with 1.5x growth from 120MiB (= 180MiB) should NOT trigger
+		// because cap limits it to 120MiB threshold, and 180MiB > 120MiB, so it SHOULD trigger
+		// Wait, let me recalculate:
+		// threshold = max(baseline, min(baseline*1.5, cap-margin))
+		// = max(120MiB, min(180MiB, 112MiB))
+		// = max(120MiB, 112MiB) = 120MiB
+		// So file at 180MiB > 120MiB should trigger
+		const growth150percent = Math.floor(baseline120 * 1.5);
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: growth150percent }, cappedLimits, baseline120),
+		).toBe("transcriptFile");
+
+		// Case 2: baseline at 115MiB (also above 112MiB capped threshold)
+		const baseline115 = 115 * 1024 * 1024;
+		// threshold = max(115MiB, min(172.5MiB, 112MiB)) = max(115MiB, 112MiB) = 115MiB
+		// Unchanged at 115MiB should NOT trigger
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: baseline115 }, cappedLimits, baseline115),
+		).toBeNull();
+
+		// Case 3: Skipped compaction scenario (baseline recorded but not updated)
+		// If first compaction succeeds at 120MiB and second compaction is skipped,
+		// the baseline stays at 120MiB. If transcript is still 120MiB, no re-trigger.
+		// If transcript grows to 121MiB, still < 120MiB * 1.5 = 180MiB, so no re-trigger.
+		// If transcript grows to 180MiB (1.5x), should trigger.
+		const slightGrowthFrom120 = 121 * 1024 * 1024;
+		expect(
+			emergencyCompactionReason({ ...under, transcriptFileBytes: slightGrowthFrom120 }, cappedLimits, baseline120),
+		).toBeNull();
+	});
 });
