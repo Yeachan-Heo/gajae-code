@@ -4258,6 +4258,9 @@ fn append_managed(
 	// SAFETY: successful openat returned a uniquely owned fd.
 	let mut file = unsafe { File::from_raw_fd(fd) };
 	crate::path_identity::platform::verify_created_owner_only_file(&file)?;
+	// Held until `file` drops: a replacement of this inode cannot check and swap
+	// while the append checks and writes (`lock_managed_transcript`).
+	lock_managed_transcript(&file)?;
 	if !same_expected(
 		&file,
 		expected_dev,
@@ -4269,24 +4272,112 @@ fn append_managed(
 	)? {
 		return Err("identity_mismatch");
 	}
+	// A replacement that swapped the name while this append waited for the lock
+	// left `file` displaced: writing it would land outside the live transcript.
+	let named = statat(&parent, &name)?;
+	if named.st_dev.to_string() != expected_dev || named.st_ino.to_string() != expected_ino {
+		return Err("identity_mismatch");
+	}
 	file.write_all(data).map_err(|_| "io_error")?;
 	file.sync_all().map_err(|_| "fsync_failed")?;
 	crate::path_identity::platform::verify_created_owner_only_file(&file)?;
+	// From here the bytes are written: a changed file is not a refusal before the
+	// write, so it gets its own code.
 	let mut identity = regular_identity(&file)?;
 	if identity.dev != expected_dev
 		|| identity.ino != expected_ino
 		|| identity.size != appended_size.to_string()
 	{
-		return Err("identity_mismatch");
+		return Err("identity_changed_after_write");
 	}
 	let named = statat(&parent, &name)?;
 	if !stat_matches_regular_identity(&named, &identity) {
-		return Err("identity_mismatch");
+		return Err("identity_changed_after_write");
 	}
 	identity.sha256 = Some(digest_hex(&file)?);
 	parent.sync_all().map_err(|_| "fsync_failed")?;
 	Ok(RecoveryFsResult::success(identity))
 }
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+	/// Runs once inside the next `replace_managed` on this thread, while it holds
+	/// the transcript lock, after its identity re-check and before its swap.
+	static BEFORE_MANAGED_REPLACE_EXCHANGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Every time `lock_managed_transcript` found the lock held, the `(dev, ino)`
+/// of the transcript it waited for (tests only), so a test counts contention on
+/// its own file and not on another test's.
+#[cfg(all(test, target_os = "linux"))]
+static MANAGED_TRANSCRIPT_LOCK_CONTENDED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// How often `lock_managed_transcript` found the lock held on `file`'s inode.
+#[cfg(all(test, target_os = "linux"))]
+fn managed_transcript_lock_contention(file: &std::path::Path) -> usize {
+	let metadata = std::fs::metadata(file).expect("contended transcript metadata");
+	let key = (metadata.dev(), metadata.ino());
+	MANAGED_TRANSCRIPT_LOCK_CONTENDED
+		.lock()
+		.iter()
+		.filter(|entry| **entry == key)
+		.count()
+}
+
+/// How long a managed append or rewrite waits for another writer's hold on the
+/// same transcript. It runs on the JS thread inside a synchronous call, so it
+/// is bounded like the file-lock budget (`file_lock::DEFAULT_BUDGET_MS`).
+#[cfg(target_os = "linux")]
+const MANAGED_TRANSCRIPT_LOCK_BUDGET: Duration = Duration::from_secs(2);
+
+/// Exclusive `flock` on a managed transcript inode, shared by `append_managed`
+/// and `replace_managed`, so a rewrite never displaces an append that lands
+/// between its identity check and its swap. Processes that claim nothing (an
+/// unclaimed writer, ownership `off`) still serialize here. A wait past
+/// [`MANAGED_TRANSCRIPT_LOCK_BUDGET`] fails closed with the retryable
+/// `transcript_busy`, which is not an identity mismatch.
+///
+/// A filesystem without usable `flock` keeps the unserialized behaviour:
+/// `ENOLCK`, `EOPNOTSUPP`, `ENOSYS`, and `EBADF`. On NFS the fence is not
+/// dependable: the rewrite takes no lock (its descriptor is read-only, which
+/// NFS refuses with `EBADF`), and the append's emulated byte-range lock is
+/// dropped as soon as the identity hash dups and closes a descriptor on the
+/// file.
+#[cfg(target_os = "linux")]
+fn lock_managed_transcript(file: &File) -> Result<(), &'static str> {
+	let deadline = Instant::now() + MANAGED_TRANSCRIPT_LOCK_BUDGET;
+	loop {
+		// SAFETY: `file` owns a live descriptor; the lock goes with its last close.
+		if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+			return Ok(());
+		}
+		match std::io::Error::last_os_error().raw_os_error() {
+			Some(libc::EINTR) => {},
+			Some(libc::EWOULDBLOCK) => {
+				#[cfg(test)]
+				if let Ok(metadata) = file.metadata() {
+					MANAGED_TRANSCRIPT_LOCK_CONTENDED
+						.lock()
+						.push((metadata.dev(), metadata.ino()));
+				}
+				if Instant::now() >= deadline {
+					return Err("transcript_busy");
+				}
+				std::thread::sleep(Duration::from_millis(5));
+			},
+			Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS | libc::EBADF) => return Ok(()),
+			_ => return Err("io_error"),
+		}
+	}
+}
+
+/// Remove a replacement candidate that was never swapped in.
+#[cfg(target_os = "linux")]
+fn discard_managed_candidate(parent: &File, name: &CString) {
+	// SAFETY: retained parent fd and validated leaf name; a failure leaves the
+	// candidate for the recovery reaper.
+	let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+}
+
 #[cfg(target_os = "linux")]
 fn replace_managed(
 	root: &File,
@@ -4302,6 +4393,8 @@ fn replace_managed(
 ) -> Result<RecoveryFsResult, &'static str> {
 	let recovery_parent = recovery_directory(root, recovery)?;
 	let authorized = open_existing(root, relative_path, false)?;
+	// Unlocked: a stale writer is refused before it builds a candidate. The check
+	// that decides is repeated under the lock below.
 	if !same_expected(
 		&authorized,
 		expected_dev,
@@ -4367,6 +4460,42 @@ fn replace_managed(
 	crate::path_identity::platform::verify_created_owner_only_file(&candidate_file)?;
 	let candidate_parent = recovery_parent;
 	let (destination_parent, destination_name) = open_parent(root, relative_path)?;
+	// The candidate is built and synced; only the re-check and the swap run under
+	// the lock, held on `authorized` until the exchange drops it after `renameat2`.
+	// A managed append to this inode can neither land between the re-check and the
+	// swap, where the swap would displace it out of the live transcript, nor write
+	// the displaced inode afterwards. The link fallback releases `authorized`
+	// before its rename (see `exchange_managed_replacement`), so on a mount without
+	// rename flags the swap step itself stays unserialized.
+	let fenced = (|| {
+		lock_managed_transcript(&authorized)?;
+		if !same_expected(
+			&authorized,
+			expected_dev,
+			expected_ino,
+			expected_size,
+			expected_mtime_ns,
+			expected_ctime_ns,
+			expected_sha256,
+		)? {
+			return Err("identity_mismatch");
+		}
+		// Another writer may have swapped the name since `authorized` was opened.
+		// (On NFS this fence is not dependable at all; see `lock_managed_transcript`.)
+		let named = statat(&destination_parent, &destination_name)?;
+		if named.st_dev.to_string() != expected_dev || named.st_ino.to_string() != expected_ino {
+			return Err("identity_mismatch");
+		}
+		Ok(())
+	})();
+	if let Err(code) = fenced {
+		discard_managed_candidate(&candidate_parent, &candidate_name);
+		return Err(code);
+	}
+	#[cfg(test)]
+	if let Some(hook) = BEFORE_MANAGED_REPLACE_EXCHANGE.with(|hook| hook.borrow_mut().take()) {
+		hook();
+	}
 	// The descriptor proving the destination's identity is held across the
 	// exchange, matching the authority `renameat2` would have carried. On the
 	// link fallback it is released between the rollback link and the rename that
@@ -4431,10 +4560,10 @@ fn replace_managed(
 	crate::path_identity::platform::verify_created_owner_only_file(&replacement)?;
 	let terminal_replacement_identity = regular_identity(&replacement)?;
 	let terminal_displaced_identity = regular_identity(&displaced)?;
+	// The swap has happened: a failure from here is not a refusal before the write.
 	let terminal_replacement =
-		statat(&destination_parent, &destination_name).map_err(|_| "identity_mismatch")?;
-	let terminal_displaced =
-		statat(&candidate_parent, &candidate_name).map_err(|_| "identity_mismatch")?;
+		statat(&destination_parent, &destination_name).map_err(|_| "io_error")?;
+	let terminal_displaced = statat(&candidate_parent, &candidate_name).map_err(|_| "io_error")?;
 	if terminal_replacement_identity != replacement_identity
 		|| terminal_displaced_identity != displaced_identity
 		|| digest_hex(&replacement)? != candidate_digest
@@ -4442,7 +4571,7 @@ fn replace_managed(
 		|| !stat_matches_regular_identity(&terminal_replacement, &terminal_replacement_identity)
 		|| !stat_matches_regular_identity(&terminal_displaced, &terminal_displaced_identity)
 	{
-		return Err("identity_mismatch");
+		return Err("identity_changed_after_write");
 	}
 	// The exchange committed, so publish a terminal family name for the displaced
 	// predecessor. Keeping the in-flight name would exempt this completed evidence
@@ -4466,12 +4595,15 @@ fn replace_managed(
 	candidate_parent
 		.sync_all()
 		.map_err(|_| "rollback_unavailable")?;
-	let terminal_completed =
-		statat(&candidate_parent, &completed_candidate_name).map_err(|_| "identity_mismatch")?;
+	// These check the displaced predecessor's recovery file, not the live
+	// transcript: the rewrite has already landed, so a failure is not a refusal
+	// before the write.
+	let terminal_completed = statat(&candidate_parent, &completed_candidate_name)
+		.map_err(|_| "identity_changed_after_write")?;
 	if !stat_matches_regular_identity_after_rename(&terminal_completed, &displaced_identity)
 		|| !reaper_owner_file_stat(&terminal_completed)
 	{
-		return Err("identity_mismatch");
+		return Err("identity_changed_after_write");
 	}
 	// Publication is committed and the displaced object remains recoverable under
 	// a terminal name. The reaper retains it for the configured TTL, then removes
@@ -6666,6 +6798,152 @@ mod tests {
 			!temporary.0.join("staged-tree").exists(),
 			"canonical tree name removed after detach"
 		);
+	}
+
+	/// A writer that keeps holding the transcript (a stopped peer) never freezes
+	/// the caller's thread: the wait ends after the budget with the retryable
+	/// `transcript_busy`, not an identity mismatch, and nothing is written.
+	#[test]
+	fn managed_writes_give_up_on_a_held_transcript_after_the_budget() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"{\"seed\":1}\n";
+		let identity = managed_file(&root, "transcript", original);
+		let holder = File::open(temporary.0.join("transcript")).expect("holder");
+		// SAFETY: `holder` owns a live descriptor for the duration of the test.
+		assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+		let started = Instant::now();
+		let appended = append_managed(
+			&root,
+			"transcript",
+			b"{\"peer\":1}\n",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		assert_eq!(appended.err(), Some("transcript_busy"));
+		let replaced = replace_managed(
+			&root,
+			None,
+			"transcript",
+			b"{\"rewritten\":1}\n",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		assert_eq!(replaced.err(), Some("transcript_busy"));
+		assert!(started.elapsed() < MANAGED_TRANSCRIPT_LOCK_BUDGET * 2 + Duration::from_secs(2));
+		assert_eq!(fs::read(temporary.0.join("transcript")).expect("transcript"), original);
+		// The rewrite built its candidate in the recovery directory before it found
+		// the transcript held, so the directory exists, and the candidate is gone.
+		let leftovers: Vec<String> = fs::read_dir(temporary.0.join(".gjc-recovery"))
+			.expect("the rewrite created its recovery directory")
+			.filter_map(Result::ok)
+			.map(|entry| entry.file_name().to_string_lossy().into_owned())
+			.filter(|name| name.starts_with(".gjc-managed-replace"))
+			.collect();
+		assert_eq!(leftovers, Vec::<String>::new(), "a refused rewrite leaves no candidate behind");
+	}
+
+	/// Two unclaimed writers of one managed transcript: an append that races a
+	/// rewrite of the same inode, after the rewrite's identity re-check and
+	/// before its swap, must never be reported committed while missing from the
+	/// live transcript. The hook proves the append reached the lock and found
+	/// it held; it then waits for the rewrite and is refused, so the stale
+	/// writer stops before it writes and the rewrite stands as checked.
+	#[test]
+	fn managed_append_racing_a_replacement_never_leaves_the_live_transcript() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"{\"seed\":1}\n";
+		let identity = managed_file(&root, "transcript", original);
+		let replacement = b"{\"rewritten\":1}\n";
+		let directory = temporary.0.clone();
+		type Appender = std::thread::JoinHandle<Result<RecoveryFsResult, &'static str>>;
+		let appender: std::rc::Rc<RefCell<Option<Appender>>> = std::rc::Rc::default();
+		let handle = std::rc::Rc::clone(&appender);
+		let contention: std::rc::Rc<RefCell<Option<bool>>> = std::rc::Rc::default();
+		let reached = std::rc::Rc::clone(&contention);
+		let append_identity = identity.clone();
+		let transcript = temporary.0.join("transcript");
+		BEFORE_MANAGED_REPLACE_EXCHANGE.with(|hook| {
+			*hook.borrow_mut() = Some(Box::new(move || {
+				// Counted on this transcript's inode only, so another test's contention
+				// (the busy test waits on its own file for seconds) cannot satisfy it.
+				let contended = managed_transcript_lock_contention(&transcript);
+				let thread = std::thread::spawn(move || {
+					let peer_root = File::open(&directory).expect("peer root");
+					append_managed(
+						&peer_root,
+						"transcript",
+						b"{\"peer\":1}\n",
+						&append_identity.dev,
+						&append_identity.ino,
+						&append_identity.size,
+						&append_identity.mtime_ns,
+						&append_identity.ctime_ns,
+						&file_digest(original),
+					)
+				});
+				// The append must find the lock held before the swap runs. Unserialized,
+				// it would complete here instead, and the wait times out.
+				let deadline = Instant::now() + Duration::from_secs(10);
+				while managed_transcript_lock_contention(&transcript) == contended
+					&& !thread.is_finished()
+					&& Instant::now() < deadline
+				{
+					std::thread::sleep(Duration::from_millis(1));
+				}
+				*reached.borrow_mut() =
+					Some(managed_transcript_lock_contention(&transcript) > contended);
+				*handle.borrow_mut() = Some(thread);
+			}));
+		});
+		let replaced = replace_managed(
+			&root,
+			None,
+			"transcript",
+			replacement,
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		let appended = appender
+			.borrow_mut()
+			.take()
+			.expect("the hook ran")
+			.join()
+			.expect("append thread");
+		assert_eq!(
+			*contention.borrow(),
+			Some(true),
+			"the append reached the transcript lock while the rewrite held it"
+		);
+		let live = fs::read(temporary.0.join("transcript")).expect("live transcript");
+		let appended = appended.map(|result| (result.ok, result.code));
+		assert!(
+			!matches!(appended, Ok((true, _))) || live.windows(8).any(|w| w == b"\"peer\":1"),
+			"an append reported committed is in the live transcript: {appended:?}, live {:?}",
+			String::from_utf8_lossy(&live)
+		);
+		assert_eq!(
+			appended.err(),
+			Some("identity_mismatch"),
+			"the stale append is refused before it writes"
+		);
+		let replaced =
+			replaced.unwrap_or_else(|code| panic!("the rewrite stands as checked: {code}"));
+		assert!(replaced.ok, "{:?}", replaced.code);
+		assert_eq!(live, replacement);
 	}
 
 	/// `replace_managed` reaches `RENAME_EXCHANGE` directly. Without a fallback
