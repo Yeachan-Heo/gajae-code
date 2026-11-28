@@ -1388,6 +1388,19 @@ function emitCodexEvent(
 		context.stream.push(event);
 		return;
 	}
+	// Delta events (text_delta, toolcall_delta) must flow immediately to avoid starving
+	// the event loop and blocking message_update delivery. Only buffer structural events
+	// (start, done, etc.) that need replay for error recovery.
+	const isDeltaEvent = event.type === "text_delta" || event.type === "toolcall_delta";
+	if (isDeltaEvent) {
+		// Flush any buffered structural events before emitting this delta, so they arrive
+		// in the correct order
+		if (runtime.bufferedEvents.length > 0) {
+			flushCodexEvents(context, runtime);
+		}
+		context.stream.push(event);
+		return;
+	}
 	// Public consumers cannot retract starts or deltas. Hold replayable attempts
 	// until they commit, and discard their events when replay resets the output.
 	if (
@@ -2037,8 +2050,16 @@ function handleToolCallArgumentsDelta(
 		currentBlock.argumentsComplete = false;
 	}
 	currentBlock.partialJson += delta;
-	currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-	currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
+	// Optimization: check for completion only when we see a closing brace or on
+	// size boundaries to avoid O(n²) parsing behavior on large streaming responses.
+	const shouldCheckCompletion =
+		delta.includes("}") || // Likely end of JSON
+		currentBlock.partialJson.length % 1024 === 0; // Check every ~1KB
+	if (shouldCheckCompletion) {
+		currentBlock.argumentsComplete = isCompleteJsonObject(currentBlock.partialJson);
+		// Always update arguments when we check completeness (which is infrequent now)
+		currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+	}
 	currentBlock.argumentsAuthoritative =
 		currentBlock.argumentsAuthoritative || (currentBlock.argumentsComplete && delta.trim().length > 0);
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
