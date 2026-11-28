@@ -13,6 +13,7 @@ function contextForModel(name: string): SegmentContext {
 				thinkingLevel: ThinkingLevel.Off,
 			},
 			isFastModeActive: () => false,
+			isUltrafastActive: () => false,
 		} as unknown as SegmentContext["session"],
 		width: 120,
 		options: {},

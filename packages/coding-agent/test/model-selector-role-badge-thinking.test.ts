@@ -1034,6 +1034,9 @@ function createFastSelector(args: {
 	isFastForProvider: (provider?: string) => boolean;
 	isFastForSubagentProvider?: (provider?: string) => boolean;
 	isCurrentModelFastModeActive?: () => boolean;
+	isUltrafastForProvider?: (provider?: string, supportsUltrafastTier?: boolean) => boolean;
+	isUltrafastForSubagentProvider?: (provider?: string, supportsUltrafastTier?: boolean) => boolean;
+	isCurrentModelUltrafastActive?: () => boolean;
 	currentModel?: Model;
 }): ModelSelectorComponent {
 	const { models, settings, isFastForProvider, currentModel } = args;
@@ -1058,13 +1061,61 @@ function createFastSelector(args: {
 		scoped,
 		() => {},
 		() => {},
-		{ isFastForProvider, isFastForSubagentProvider, isCurrentModelFastModeActive: args.isCurrentModelFastModeActive },
+		{
+			isFastForProvider,
+			isFastForSubagentProvider,
+			isCurrentModelFastModeActive: args.isCurrentModelFastModeActive,
+			isUltrafastForProvider: args.isUltrafastForProvider,
+			isUltrafastForSubagentProvider: args.isUltrafastForSubagentProvider,
+			isCurrentModelUltrafastActive: args.isCurrentModelUltrafastActive,
+		},
 	);
 }
 
 describe("ModelSelector fast-mode indicator", () => {
 	beforeAll(async () => {
 		testTheme = await loadTestTheme();
+	});
+
+	for (const currentUltrafast of [false, true]) {
+		test(`ultrafast role badges respect independent subagent tier (current ultrafast: ${currentUltrafast})`, async () => {
+			setThemeInstance(testTheme);
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const selector = createFastSelector({
+				models: [model],
+				settings: Settings.isolated({
+					modelRoles: { default: `${model.provider}/${model.id}:low` },
+					"task.agentModelOverrides": { executor: `${model.provider}/${model.id}:high` },
+				}),
+				isFastForProvider: () => true,
+				isUltrafastForProvider: () => true,
+				isUltrafastForSubagentProvider: () => !currentUltrafast,
+				isCurrentModelUltrafastActive: () => currentUltrafast,
+				currentModel: model,
+			});
+			await Bun.sleep(0);
+			setThemeInstance(testTheme);
+			const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+			expect(rendered).toContain(`DEFAULT (low) ${currentUltrafast ? theme.icon.ultrafast : theme.icon.fast}`);
+			expect(rendered).toContain(`EXECUTOR (high) ${currentUltrafast ? theme.icon.fast : theme.icon.ultrafast}`);
+			expect(countOccurrences(rendered, theme.icon.ultrafast)).toBe(1);
+		});
+	}
+
+	test("standalone current-model glyph prefers effective ultrafast over fast", async () => {
+		setThemeInstance(testTheme);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const selector = createFastSelector({
+			models: [model],
+			settings: Settings.isolated({}),
+			isFastForProvider: () => true,
+			isCurrentModelUltrafastActive: () => true,
+			currentModel: model,
+		});
+		await Bun.sleep(0);
+		setThemeInstance(testTheme);
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(countOccurrences(rendered, theme.icon.ultrafast)).toBe(1);
 	});
 
 	test("AC-1: renders fast glyph after DEFAULT and EXECUTOR badges for priority tier", async () => {

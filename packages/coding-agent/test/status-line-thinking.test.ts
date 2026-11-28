@@ -14,6 +14,7 @@ function createCtx(thinkingLevel: ThinkingLevel): SegmentContext {
 				thinkingLevel,
 			},
 			isFastModeActive: () => false,
+			isUltrafastActive: () => false,
 		} as unknown as SegmentContext["session"],
 		width: 120,
 		options: { model: { showThinkingLevel: true } },

@@ -206,6 +206,9 @@ function createControllerContext() {
 		isFastForProvider: () => false,
 		isFastForSubagentProvider: () => false,
 		isFastModeActive: () => false,
+		isUltrafastActive: () => false,
+		isUltrafastForProvider: () => false,
+		isUltrafastForSubagentProvider: () => false,
 	};
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn(), requestLayoutRender: vi.fn() },

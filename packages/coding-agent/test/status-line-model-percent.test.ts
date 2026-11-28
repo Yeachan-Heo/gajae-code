@@ -13,6 +13,7 @@ function makeCtx(overrides: Partial<SegmentContext> = {}): SegmentContext {
 				thinkingLevel: ThinkingLevel.High,
 			},
 			isFastModeActive: () => false,
+			isUltrafastActive: () => false,
 			getUnavailableModelProfile: () => undefined,
 		} as unknown as SegmentContext["session"],
 		width: 120,
@@ -108,6 +109,7 @@ describe("model segment inline context percentage", () => {
 					thinkingLevel: ThinkingLevel.XHigh,
 				},
 				isFastModeActive: () => false,
+				isUltrafastActive: () => false,
 				getUnavailableModelProfile: () => "claude-codex",
 			} as unknown as SegmentContext["session"],
 		});
@@ -127,6 +129,7 @@ describe("model segment inline context percentage", () => {
 					thinkingLevel: ThinkingLevel.Off,
 				},
 				isFastModeActive: () => false,
+				isUltrafastActive: () => false,
 			} as unknown as SegmentContext["session"],
 		});
 		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
