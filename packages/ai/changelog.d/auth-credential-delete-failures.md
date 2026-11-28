@@ -1,8 +1,0 @@
-### Fixed
-- `SqliteAuthCredentialStore.deleteAuthCredential` and `deleteAuthCredentialsForProvider` now throw when the SQLite write fails instead of swallowing the error, so a credential that is still active on disk is no longer reported as removed. `AuthStorage.disableCredentialById`, `remove()`, and `logout()` change memory, selectors, and `credential_disabled` events only after the write succeeds.
-- `tryDisableAuthCredentialIfMatches` and `tryDisableAuthCredentialIfRevision` return `false` only when no active row matched; a database error now throws instead of looking like a lost compare-and-swap.
-- `deleteAuthCredential` no longer rewrites a row that is already disabled; the row keeps its first disabled cause and revision.
-- When disabling a credential after a definitive OAuth refresh failure cannot be written, the original authentication error is raised, the credential stays in memory, and it is blocked in this process for five minutes so other sessions move to another credential instead of replaying the failed refresh.
-- Deduplication keeps a duplicate credential whose delete failed, per row. A remote auth-broker store is no longer asked to delete duplicates it serves (its synchronous delete can only throw); the client keeps the rows the broker sends.
-- The auth broker answers `POST /v1/credential/:id/disable` with 500 instead of `200 { ok: true }` (or 404 for a revision-checked disable) when its store cannot write, and the background refresher logs a failed disable and retries on the next sweep.
-- `pi-ai logout` exits non-zero without printing a success line when the logout cannot be written.
