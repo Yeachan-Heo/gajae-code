@@ -759,4 +759,15 @@ describe("getRequestHeaders materializes detached request auth headers", () => {
 		expect(withoutKey?.["X-Tenant-Id"]).toBe("tenant-explicit");
 		expect(model.headers).toBe(sharedHeaders);
 	});
+
+	it("reports only generated-header models as needing a request-local detach", async () => {
+		const registry = await headerRegistry();
+		expect(registry.rendersAuthHeader(headerModel(registry, "generated"))).toBe(true);
+
+		// A provider without `authHeader: true` never gets a generated Authorization, so the
+		// session dispatches its model object as-is and keeps the handle's identity intact.
+		const catalogModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!catalogModel) throw new Error("Expected the bundled Anthropic fixture model");
+		expect(registry.rendersAuthHeader(catalogModel)).toBe(false);
+	});
 });

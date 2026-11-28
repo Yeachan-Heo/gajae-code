@@ -7845,6 +7845,24 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Whether the registry renders a generated `Authorization` into `model`.
+	 *
+	 * Only such models need a request-local copy before dispatch (see
+	 * {@link getRequestHeaders}); every other model is sent as-is, so provider
+	 * handles whose identity or prototype carries state (for example a MockModel)
+	 * reach their stream function unchanged.
+	 */
+	rendersAuthHeader(model: Model<Api>): boolean {
+		return (
+			this.#authHeaderSetting(model.provider) === true ||
+			this.#generatedAuthHeaders.has(model) ||
+			typeof (model.headers as { [GENERATED_AUTH_HEADER]?: string } | undefined)?.[GENERATED_AUTH_HEADER] ===
+				"string" ||
+			this.#generatedAuthHeaderProviders.has(model.provider)
+		);
+	}
+
+	/**
 	 * Headers for one request, detached from the shared model that produced them.
 	 *
 	 * With `authHeader: true` the registry renders the resolved credential into the
@@ -8034,13 +8052,7 @@ export class ModelRegistry {
 	}
 
 	#applyEffectiveAuthHeader(model: Model<Api>, apiKey: string | undefined): void {
-		const runtimeCredentialRevoked =
-			this.#runtimeProviderApiKeys.has(model.provider) &&
-			!this.#runtimeProviderCredentialInstalled.has(model.provider);
-		const authHeader = runtimeCredentialRevoked
-			? this.#customProviderAuthHeaders.get(model.provider)
-			: (this.#runtimeProviderAuthHeaders.get(model.provider) ??
-				this.#customProviderAuthHeaders.get(model.provider));
+		const authHeader = this.#authHeaderSetting(model.provider);
 		if (authHeader === true) this.#generatedAuthHeaderProviders.add(model.provider);
 		const headers = { ...(model.headers ?? {}) } as Record<string, string> & {
 			[GENERATED_AUTH_HEADER]?: string;
@@ -8065,6 +8077,14 @@ export class ModelRegistry {
 		if (authHeader === true && apiKey && apiKey !== kNoAuth && (ownsAuthorization || !hadAuthorization)) {
 			this.#generatedAuthHeaders.set(model, { authorization: model.headers.Authorization });
 		}
+	}
+
+	#authHeaderSetting(provider: string): boolean | undefined {
+		const runtimeCredentialRevoked =
+			this.#runtimeProviderApiKeys.has(provider) && !this.#runtimeProviderCredentialInstalled.has(provider);
+		return runtimeCredentialRevoked
+			? this.#customProviderAuthHeaders.get(provider)
+			: (this.#runtimeProviderAuthHeaders.get(provider) ?? this.#customProviderAuthHeaders.get(provider));
 	}
 
 	/**
