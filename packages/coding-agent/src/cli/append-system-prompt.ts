@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -32,10 +31,16 @@ export async function readAppendSystemPromptFile(filePath: string | undefined): 
 }
 
 /** User APPEND_SYSTEM.md only. Repository copies are not appended. */
-export function discoverAppendSystemPromptFile(): string | undefined {
-	const candidates = getConfigDirs("", { existingOnly: false }).flatMap(entry => {
-		const filePath = path.join(entry.path, "APPEND_SYSTEM.md");
-		return existsSync(filePath) ? [{ level: entry.level, path: filePath }] : [];
-	});
-	return selectAppendSystemPromptFile(candidates);
+export async function discoverAppendSystemPromptFile(): Promise<string | undefined> {
+	const probed = await Promise.all(
+		getConfigDirs("", { existingOnly: false }).map(async entry => {
+			const filePath = path.join(entry.path, "APPEND_SYSTEM.md");
+			const exists = await fs.access(filePath).then(
+				() => true,
+				() => false,
+			);
+			return exists ? [{ level: entry.level, path: filePath }] : [];
+		}),
+	);
+	return selectAppendSystemPromptFile(probed.flat());
 }

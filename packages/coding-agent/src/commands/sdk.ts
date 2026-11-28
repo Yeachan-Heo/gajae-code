@@ -1262,7 +1262,7 @@ export async function runSessionHost(
 
 		// User-level APPEND_SYSTEM.md, as the CLI appends it. The read stays inside the startup deadline.
 		const resolvedAppendPrompt = await beforeCutoff(
-			() => readAppendSystemPromptFile(discoverAppendPromptFile()),
+			async () => await readAppendSystemPromptFile(await discoverAppendPromptFile()),
 			undefined,
 			{ processLocalOnly: true },
 		);

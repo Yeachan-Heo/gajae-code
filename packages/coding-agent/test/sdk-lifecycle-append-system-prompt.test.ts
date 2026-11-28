@@ -63,7 +63,7 @@ async function captureLifecycleOptions(appendFile: string | undefined): Promise<
 			parsed: { messages: [], fileArgs: [], unknownFlags: new Map() } as ParsedArgs,
 			sessionManager,
 		}),
-		discoverAppendSystemPromptFile: () => appendFile,
+		discoverAppendSystemPromptFile: async () => appendFile,
 		createLifecycleAgentSession: async options => {
 			captured = options;
 			throw stop;

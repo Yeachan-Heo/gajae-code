@@ -1803,7 +1803,7 @@ async function buildSessionOptions(
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
-	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
+	const appendPromptSource = parsed.appendSystemPrompt ?? (await discoverAppendSystemPromptFile());
 	const resolvedAppendPrompt = await resolvePromptInput(appendPromptSource, "append system prompt");
 
 	if (sessionManager) {
