@@ -1403,11 +1403,8 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		try {
 			await manager.ensureOnDisk();
 			await manager.flush();
-			const outcome = await manager.appendCompactionSharingSession(
-				{ summary: "Earlier reminders compacted", firstKeptEntryId: kept, tokensBefore: 1 },
-				() => true,
-			);
-			expect(outcome.kind).toBe("committed");
+			manager.appendCompaction("Earlier reminders compacted", undefined, kept, 1);
+			await manager.flush();
 		} finally {
 			expect((await manager.closeStrict()).kind).toBe("closed");
 		}

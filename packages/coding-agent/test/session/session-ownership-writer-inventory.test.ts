@@ -192,32 +192,6 @@ const CURRENT_WRITERS: Record<string, Writer> = {
 	setSessionName: m => m.setSessionName("inventory title", "user"),
 	ensureOnDisk: { fresh: true, run: m => m.ensureOnDisk() },
 	appendMessageSharingSession: m => m.appendMessageSharingSession(user("shared")),
-	appendCustomEntrySharingSession: m => m.appendCustomEntrySharingSession("inventory", { v: 2 }),
-	appendCustomMessageEntrySharingSession: m => m.appendCustomMessageEntrySharingSession("inventory", "c", true),
-	appendTemporaryModelChangeSharingSession: m =>
-		m.appendTemporaryModelChangeSharingSession("anthropic/claude-sonnet-4-5", undefined, always),
-	appendModelProfileActivationSharingSession: m =>
-		m.appendModelProfileActivationSharingSession(
-			{
-				configuredDefaultChain: {
-					role: "default",
-					entries: ["anthropic/claude-sonnet-4-5"],
-					origin: "inventory",
-					explicitHead: true,
-					cleared: false,
-				},
-			} as never,
-			always,
-		),
-	appendServiceTierChangeSharingSession: m => m.appendServiceTierChangeSharingSession("priority", true, always),
-	appendControlEntriesSharingSession: m =>
-		m.appendControlEntriesSharingSession([{ type: "service_tier_change", serviceTier: "priority" }], always),
-	appendCompactionSharingSession: (m, { first }) =>
-		m.appendCompactionSharingSession({ summary: "summary", firstKeptEntryId: first, tokensBefore: 1 }, always),
-	appendModeChangeSharingSession: m => m.appendModeChangeSharingSession("plan"),
-	appendToolSelectionsSharingSession: m => m.appendToolSelectionsSharingSession(["mcp_tool"], undefined, always),
-	appendTtsrInjectionSharingSession: m => m.appendTtsrInjectionSharingSession(["rule"]),
-	appendLabelChangeSharingSession: (m, { first }) => m.appendLabelChangeSharingSession(first, "label"),
 };
 
 /** Writers of a successor's transcript (a new id). Run unclaimed, each write must be detected. */
@@ -281,11 +255,6 @@ const INDIRECT_WRITERS: Record<string, IndirectWriter> = {
 	appendSessionRecap: {
 		funnel: APPEND_FUNNELS,
 		writer: { setup: completedTurn, run: (m, _context, recap) => m.appendSessionRecap(recap as never) },
-	},
-	// Shared publications are managed-only; an explicit destination rejects them unwritten.
-	appendSessionRecapSharingSession: {
-		funnel: { managed: "managed append" },
-		writer: { setup: completedTurn, run: (m, _context, recap) => m.appendSessionRecapSharingSession(recap as never) },
 	},
 	appendThinkingLevelChangeSharingSession: {
 		funnel: {},

@@ -115,40 +115,6 @@ describe("shared thinking publication", () => {
 		expect((await records(file)).filter(entry => entry.type === "thinking_level_change")).toHaveLength(1);
 	});
 
-	it("refuses own and sibling message/custom writes while an owned control is held", async () => {
-		const { manager, file, cwd, agentDir } = await sharedSession();
-		const sibling = await SessionManager.open(file, SessionManager.managedDestination(cwd, agentDir));
-		managers.push(sibling);
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const held = manager.withSharedThinkingControl(async () => {
-			entered.resolve();
-			await release.promise;
-			return manager.appendThinkingLevelChangeSharingSession("high", true, () => true);
-		});
-		try {
-			await bounded(entered.promise);
-			const before = await Bun.file(file).text();
-			expect(await sibling.appendThinkingLevelChangeSharingSession("low", true, () => true)).toMatchObject({
-				kind: "rejected",
-			});
-			for (const opener of [manager, sibling]) {
-				expect(await bounded(opener.appendMessageSharingSession(user("blocked")))).toMatchObject({
-					kind: "rejected",
-				});
-				expect(await bounded(opener.appendCustomEntrySharingSession("blocked", { write: true }))).toMatchObject({
-					kind: "rejected",
-				});
-			}
-			expect(await Bun.file(file).text()).toBe(before);
-		} finally {
-			release.resolve();
-			await bounded(held).catch(() => undefined);
-		}
-		const outcome = await bounded(held);
-		expect(outcome.kind).toBe("committed");
-	});
-
 	it("excludes legacy and owned controls in both directions but admits overlapping owned controls", async () => {
 		const { manager, file } = await sharedSession();
 		for (const first of ["legacy", "owned"] as const) {
@@ -268,44 +234,6 @@ describe("shared thinking publication", () => {
 });
 
 describe("shared publication uncertain outcomes", () => {
-	it("publishes a custom entry with its original data and a resolvable branch parent", async () => {
-		const { manager, file, anchor } = await sharedSession();
-		const data = { version: 1, route: "direct", triggers: ["bounded"] };
-		const outcome = await manager.appendCustomEntrySharingSession("workflow-intent-diff", data);
-		expect(outcome.kind).toBe("committed");
-		if (outcome.kind !== "committed") throw new Error("custom entry was not committed");
-		const entry = (await records(file)).find(candidate => candidate.id === outcome.id);
-		expect(entry).toMatchObject({
-			type: "custom",
-			customType: "workflow-intent-diff",
-			data,
-			parentId: anchor,
-		});
-		const next = await manager.appendMessageSharingSession(user("following prompt"));
-		expect(next.kind).toBe("committed");
-		if (next.kind === "committed")
-			expect((await records(file)).find(candidate => candidate.id === next.id)?.parentId).toBe(outcome.id);
-	});
-
-	it("retains the attempted custom entry ID when publication is uncertain without reappending", async () => {
-		const { manager, file, anchor } = await sharedSession();
-		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
-		let attemptedId: string | undefined;
-		const append = vi
-			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
-			.mockImplementation(function (this: ManagedSessionDescendantStore, ...args: Parameters<typeof original>) {
-				attemptedId = manager.getLeafId()!;
-				original.apply(this, args);
-				throw new ManagedCommittedMutationError("append", new Error("custom uncertainty"));
-			});
-		const outcome = await manager.appendCustomEntrySharingSession("workflow-intent-diff", { version: 1 });
-		expect(outcome).toMatchObject({ kind: "unknown", id: attemptedId });
-		expect(append).toHaveBeenCalledTimes(1);
-		const matching = (await records(file)).filter(entry => entry.id === attemptedId);
-		expect(matching).toHaveLength(1);
-		expect(matching[0]).toMatchObject({ type: "custom", customType: "workflow-intent-diff", parentId: anchor });
-	});
-
 	it.skipIf(process.platform === "win32")(
 		"keeps the opener cursor when a cold index invalidates after a foreign branch append",
 		async () => {

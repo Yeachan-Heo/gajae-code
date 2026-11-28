@@ -951,42 +951,12 @@ export type ConfiguredModelChain = Pick<
 	"role" | "entries" | "origin" | "identity" | "explicitHead" | "cleared"
 >;
 
-/**
- * One entry of an admitted shared control publication
- * ({@link SessionManager.appendControlEntriesSharingSession}). Controls describe
- * their transcript effect as data so every control shares one admission path.
- */
-export type SharedControlEntry =
-	| { readonly type: "configured_model_chain"; readonly chain: ConfiguredModelChain }
-	| {
-			readonly type: "model_change";
-			readonly model: string;
-			readonly role: string;
-			readonly metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
-	  }
-	| { readonly type: "model_role_clear"; readonly role: string }
-	| { readonly type: "thinking_level_change"; readonly level: string | undefined; readonly operatorIntent: boolean }
-	| { readonly type: "service_tier_change"; readonly serviceTier: ServiceTier | null }
-	| { readonly type: "custom"; readonly customType: string; readonly data: unknown }
-	/**
-	 * A parentless `context_clear` root: it starts this opener's fresh active branch. Only
-	 * valid as the first entry of a publication; later entries descend from it.
-	 */
-	| { readonly type: "context_clear"; readonly data: Record<string, unknown> | undefined };
-
 export interface DefaultModelSelectionEntriesOptions {
 	readonly appendThinkingLevel: boolean;
 	readonly appendTemporaryModelChange?: boolean;
 	readonly configuredDefaultChain?: readonly string[];
 	readonly selectionRole?: string;
 }
-
-export type ModelProfileTranscriptPlan = {
-	configuredDefaultChain?: ConfiguredModelChain;
-	temporaryModel?: string;
-	thinking?: { readonly level: string | undefined };
-	resumeDefault?: { readonly selector: string | undefined };
-};
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
@@ -17666,37 +17636,6 @@ export class SessionManager {
 		return this.persist;
 	}
 
-	/**
-	 * The additive entries of a concrete default model selection, in the same order
-	 * {@link stageDefaultModelSelection} stages them, for admitted shared publication.
-	 */
-	defaultModelSelectionControlEntries(
-		model: string,
-		thinkingLevel: string | undefined,
-		options?: DefaultModelSelectionEntriesOptions,
-	): SharedControlEntry[] {
-		const entries: SharedControlEntry[] = [];
-		if (options?.appendTemporaryModelChange !== false)
-			entries.push({ type: "model_change", model, role: "temporary" });
-		if (options?.appendThinkingLevel)
-			entries.push({ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false });
-		if (options?.configuredDefaultChain)
-			entries.push({
-				type: "configured_model_chain",
-				chain: {
-					role: "default",
-					entries: [...options.configuredDefaultChain],
-					origin: "model_selection",
-					explicitHead: true,
-					cleared: options.configuredDefaultChain.length === 0,
-				},
-			});
-		entries.push({ type: "model_change", model, role: "default" });
-		if (options?.selectionRole && options.selectionRole !== "default")
-			entries.push({ type: "model_change", model, role: options.selectionRole });
-		return entries;
-	}
-
 	async stageDefaultModelSelection(
 		model: string,
 		thinkingLevel: string | undefined,
@@ -21125,137 +21064,6 @@ export class SessionManager {
 		return this.#publishOwnedEntrySharingSession(id => this.#appendMessageWithId(message, id));
 	}
 
-	/** Publish a workflow custom entry at the same managed branch cursor as canonical messages. */
-	async appendCustomEntrySharingSession(customType: string, data?: unknown): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id => this.#appendCustomEntryWithId(customType, data, id));
-	}
-
-	/** A bounded temporary model operation shares one lease and preserves both attempted IDs. */
-	async appendTemporaryModelChangeSharingSession(
-		model: string,
-		thinking: { readonly level: string | undefined } | undefined,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		return this.#publishOwnedEntriesSharingSession(
-			thinking ? 2 : 1,
-			(index, id) =>
-				index === 0
-					? this.#appendModelChangeWithId(model, "temporary", id)
-					: this.#appendThinkingLevelChangeWithId(thinking!.level, false, id),
-			undefined,
-			isCurrent,
-			true,
-			true,
-		);
-	}
-
-	/** Publish ordered profile entries under one managed lease at this opener's branch cursor. */
-	async appendModelProfileActivationSharingSession(
-		plan: ModelProfileTranscriptPlan,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		const entries: SharedControlEntry[] = [];
-		if (plan.configuredDefaultChain !== undefined)
-			entries.push({ type: "configured_model_chain", chain: plan.configuredDefaultChain });
-		if (plan.temporaryModel !== undefined)
-			entries.push({ type: "model_change", model: plan.temporaryModel, role: "temporary" });
-		if (plan.thinking !== undefined)
-			entries.push({ type: "thinking_level_change", level: plan.thinking.level, operatorIntent: false });
-		if (plan.resumeDefault !== undefined) {
-			const selector = plan.resumeDefault.selector;
-			entries.push(
-				selector === undefined
-					? { type: "model_role_clear", role: "default" }
-					: { type: "model_change", model: selector, role: "default" },
-			);
-		}
-		return this.appendControlEntriesSharingSession(entries, isCurrent);
-	}
-
-	/** Publish changed service-tier intent, or validate admission for an unchanged-tier rearm. */
-	async appendServiceTierChangeSharingSession(
-		serviceTier: ServiceTier | null,
-		appendEntry: boolean,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		return this.appendControlEntriesSharingSession(
-			appendEntry ? [{ type: "service_tier_change", serviceTier }] : [],
-			isCurrent,
-		);
-	}
-
-	/**
-	 * The common admitted publication for session controls once a session publishes
-	 * through the shared transaction (#7823, #7824).
-	 *
-	 * Every entry is a child of this opener's validated cursor and is written in order
-	 * under one managed lease; the transcript is never rewritten and an unseen sibling
-	 * branch is never followed. An empty list validates admission and currentness without
-	 * writing. Inside {@link withSharedThinkingControl} the active owner is consumed, so
-	 * one owned control scope admits exactly one publication.
-	 *
-	 * Control appends latch only rewrite authority (see {@link #enterSharedPublication}):
-	 * their additive entries are safe to continue from, the adopted identity is not.
-	 */
-	async appendControlEntriesSharingSession(
-		entries: readonly SharedControlEntry[],
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		const snapshot = entries.map(entry => structuredClone(entry));
-		// A new root mid-publication would orphan the entries before it from the branch.
-		if (snapshot.some((entry, index) => entry.type === "context_clear" && index > 0))
-			return { kind: "rejected", error: new Error("shared_control_context_clear_must_be_first") };
-		const owner = SessionManager.#thinkingControlOwner.getStore();
-		if (owner) {
-			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
-				return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
-			owner.used = true;
-		}
-		return this.#publishOwnedEntriesSharingSession(
-			snapshot.length,
-			(index, id) => {
-				const entry = snapshot[index];
-				if (!entry) throw new Error("shared_control_invalid_entry_index");
-				return this.#appendSharedControlEntryWithId(entry, id);
-			},
-			owner,
-			isCurrent,
-			true,
-			true,
-		);
-	}
-
-	#appendSharedControlEntryWithId(entry: SharedControlEntry, id: string): string {
-		switch (entry.type) {
-			case "configured_model_chain":
-				return this.#appendConfiguredModelChainWithId(entry.chain, id);
-			case "model_change":
-				return this.#appendModelChangeWithId(entry.model, entry.role, id, entry.metadata);
-			case "model_role_clear":
-				return this.#clearModelRoleWithId(entry.role, id);
-			case "thinking_level_change":
-				return this.#appendThinkingLevelChangeWithId(entry.level, entry.operatorIntent, id);
-			case "service_tier_change":
-				return this.#appendServiceTierChangeWithId(entry.serviceTier, id);
-			case "custom":
-				return this.#appendCustomEntryWithId(entry.customType, entry.data, id);
-			case "context_clear":
-				return this.#appendContextClearRootWithId(entry.data, id);
-		}
-	}
-
-	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
-	async appendCompactionSharingSession<T = unknown>(
-		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
-		isCurrent: () => boolean,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendCompactionWithId(payload, id),
-			undefined,
-			isCurrent,
-		);
-	}
-
 	/** Only the active owner may publish one thinking entry inside the existing shared transaction. */
 	async appendThinkingLevelChangeSharingSession(
 		thinkingLevel: string | undefined,
@@ -21664,16 +21472,6 @@ export class SessionManager {
 		return this.#appendModeChangeWithId(mode, data, this.#generateEntryId());
 	}
 
-	/** Publish a mode change at this opener's admitted branch cursor under a shared lease. */
-	async appendModeChangeSharingSession(mode: string, data?: Record<string, unknown>): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendModeChangeWithId(mode, data, id),
-			undefined,
-			undefined,
-			true,
-		);
-	}
-
 	#appendModeChangeWithId(mode: string, data: Record<string, unknown> | undefined, id: string): string {
 		const entry: ModeChangeEntry = {
 			type: "mode_change",
@@ -21851,26 +21649,6 @@ export class SessionManager {
 	}
 
 	/**
-	 * Publish a recap at this opener's admitted branch cursor under a shared lease.
-	 *
-	 * The plan is computed against this manager's own graph before the lease is taken: a
-	 * concurrent sibling append can only make the recap's freshness claim stale, and
-	 * {@link getSessionRecap} re-validates provenance on every read, so the entry itself
-	 * is always additive-safe.
-	 */
-	async appendSessionRecapSharingSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
-		this.#assertRecoveryHydrationWritable();
-		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
-		if (!plan.ok) return { status: "rejected", reason: plan.reason };
-		const outcome = await this.appendCustomEntrySharingSession(SESSION_RECAP_ENTRY, plan.data);
-		if (outcome.kind === "committed") return { status: "appended", entryId: outcome.id };
-		throw new Error(
-			`Shared session recap append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-			{ cause: outcome },
-		);
-	}
-
-	/**
 	 * Recap of the active branch's last turn, or undefined when there is none or it
 	 * is stale (the conversation advanced past its source entry, the leaf moved to a
 	 * branch that does not contain it, or the payload/provenance is invalid). Never
@@ -21914,23 +21692,6 @@ export class SessionManager {
 		const id = this.#appendContextClearRootWithId(data, this.#generateEntryId());
 		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
 		return id;
-	}
-
-	/**
-	 * The admitted shared form of {@link appendContextClearEntry}: the parentless root and
-	 * the carried-over profile ownership marker, as entries for
-	 * {@link appendControlEntriesSharingSession}. The root is appended, never rewritten, so
-	 * earlier history and any unseen sibling branch stay in the transcript.
-	 */
-	contextClearControlEntries(data: Record<string, unknown> | undefined): SharedControlEntry[] {
-		const ownershipMarker = this.getModelProfileOwnershipMarker();
-		const entries: SharedControlEntry[] = [{ type: "context_clear", data }];
-		if (ownershipMarker) {
-			const validated = validateModelProfileOwnershipMarker(ownershipMarker);
-			if (!validated) throw new InvalidModelProfileOwnershipError();
-			entries.push({ type: "custom", customType: MODEL_PROFILE_OWNERSHIP_ENTRY, data: validated });
-		}
-		return entries;
 	}
 
 	#appendContextClearRootWithId(data: Record<string, unknown> | undefined, id: string): string {
@@ -22096,25 +21857,6 @@ export class SessionManager {
 		);
 	}
 
-	/**
-	 * Publish a custom message at the managed branch cursor under a shared lease.
-	 * Sessions that publish canonical messages through the shared path must use this
-	 * for custom messages too: once shared admission is armed, the legacy append is
-	 * refused.
-	 */
-	async appendCustomMessageEntrySharingSession<T = unknown>(
-		customType: string,
-		content: string | (TextContent | ImageContent)[],
-		display: boolean,
-		details?: T,
-		attribution: MessageAttribution = "agent",
-		observationId?: string,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id =>
-			this.#appendCustomMessageEntryWithId(customType, content, display, details, attribution, observationId, id),
-		);
-	}
-
 	#appendCustomMessageEntryWithId<T>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
@@ -22151,31 +21893,6 @@ export class SessionManager {
 	// =========================================================================
 	// TTSR (Time Traveling Stream Rules)
 	// =========================================================================
-
-	/** Publish one or both discovered-tool authorities at this opener's branch cursor. */
-	async appendToolSelectionsSharingSession(
-		mcpToolNames: string[] | undefined,
-		builtinToolNames: string[] | undefined,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		if (!mcpToolNames && !builtinToolNames)
-			return { kind: "rejected", error: new Error("shared_tool_selection_requires_change") };
-		const mcp = mcpToolNames && [...mcpToolNames];
-		const builtin = builtinToolNames && [...builtinToolNames];
-		const correlationId = mcp && builtin ? crypto.randomUUID() : undefined;
-		return this.#publishOwnedEntriesSharingSession(
-			mcp && builtin ? 2 : 1,
-			(index, id) =>
-				mcp && index === 0
-					? this.#appendMCPToolSelectionWithId(mcp, correlationId, id)
-					: this.#appendDiscoveredBuiltinToolSelectionWithId(builtin!, correlationId, id),
-			undefined,
-			isCurrent,
-			// A control operation: verification and release failures latch persistence.
-			true,
-			true,
-		);
-	}
 
 	/** Append MCP discovery selection authority without altering discovered built-in authority. */
 	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
@@ -22232,24 +21949,6 @@ export class SessionManager {
 	 */
 	appendTtsrInjection(ruleNames: string[], records?: TtsrInjectionRecord[], ttsrMessageCount?: number): string {
 		return this.#appendTtsrInjectionWithId(ruleNames, records, ttsrMessageCount, this.#generateEntryId());
-	}
-
-	/**
-	 * Publish a TTSR injection marker at this opener's admitted branch cursor.
-	 * Sessions that publish canonical messages through the shared path must use this for
-	 * injection markers too: once shared admission is armed, the legacy append is refused.
-	 */
-	async appendTtsrInjectionSharingSession(
-		ruleNames: string[],
-		records?: TtsrInjectionRecord[],
-		ttsrMessageCount?: number,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendTtsrInjectionWithId(ruleNames, records, ttsrMessageCount, id),
-			undefined,
-			undefined,
-			true,
-		);
 	}
 
 	#appendTtsrInjectionWithId(
@@ -22889,15 +22588,6 @@ export class SessionManager {
 	 */
 	appendLabelChange(targetId: string, label: string | undefined): string {
 		return this.#appendLabelChangeWithId(targetId, label, this.#generateEntryId());
-	}
-
-	/**
-	 * Publish a label change at this opener's admitted branch cursor under a shared lease.
-	 * Sessions that publish canonical messages through the shared path must use this for
-	 * labels too: once shared admission is armed, the legacy append is refused.
-	 */
-	async appendLabelChangeSharingSession(targetId: string, label: string | undefined): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id => this.#appendLabelChangeWithId(targetId, label, id));
 	}
 
 	#appendLabelChangeWithId(targetId: string, label: string | undefined, id: string): string {

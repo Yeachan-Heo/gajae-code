@@ -5,7 +5,6 @@ import * as path from "node:path";
 import {
 	type FileEntry,
 	parseSessionEntries,
-	type SessionEntry,
 	SessionManager,
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
@@ -116,100 +115,6 @@ describe("graph successors after root shared append", () => {
 		expect(await bytesAt(file)).toEqual(bytes);
 	});
 
-	it("matches a legacy branch of the same history: thinking, tool calls, compaction, model changes, images", async () => {
-		const legacy = await fresh();
-		const shared = await fresh();
-		const ids = { legacy: await history(legacy.manager, false), shared: await history(shared.manager, true) };
-		expect(legacy.manager.requiresSharedMutationAdmission()).toBe(false);
-		expect(shared.manager.requiresSharedMutationAdmission()).toBe(true);
-		const sharedFile = shared.manager.getSessionFile()!;
-		const sharedBytes = await bytesAt(sharedFile);
-		const legacyStage = await legacy.manager.prepareBranchedSession(ids.legacy.forkParent);
-		const sharedStage = await shared.manager.prepareBranchedSession(ids.shared.forkParent);
-		const onDisk = async (file: string) => normalise((await readEntries(file)).slice(1) as SessionEntry[]);
-		expect(await onDisk(sharedStage.sessionFile!)).toEqual(await onDisk(legacyStage.sessionFile!));
-		legacy.manager.commitPreparedNewSession(legacyStage);
-		shared.manager.commitPreparedNewSession(sharedStage);
-		expect(normalise(shared.manager.getEntries())).toEqual(normalise(legacy.manager.getEntries()));
-		// A compaction summary's timestamp is its entry's; the fixtures differ only there.
-		const context = (manager: SessionManager) =>
-			manager.buildSessionContext().messages.map(message => ({ ...message, timestamp: 0 }));
-		expect(context(shared.manager)).toEqual(context(legacy.manager));
-		expect(shared.manager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
-		expect(shared.manager.getEntries().some(entry => entry.type === "label")).toBe(true);
-		expect(await bytesAt(sharedFile)).toEqual(sharedBytes);
-	});
-
-	it("forks a resumed session whose resident entries came from disk", async () => {
-		const legacy = await fresh();
-		const legacyIds = await history(legacy.manager, false);
-		const created = await fresh();
-		await history(created.manager, true);
-		const file = created.manager.getSessionFile()!;
-		await created.manager.closeStrict();
-		const resumed = await SessionManager.open(file, created.destination);
-		managers.push(resumed);
-		const resumedIds = Object.fromEntries(
-			resumed.getEntries().flatMap(entry => (entry.type === "label" ? [["label", entry.id]] : [])),
-		);
-		// A resumed root TUI latches the bars with its first shared message.
-		await committed(resumed, user("after resume"));
-		expect(resumed.requiresSharedMutationAdmission()).toBe(true);
-		const bytes = await bytesAt(file);
-		expect(resumed.graphSuccessorRefusal({ leafId: resumedIds.label! })).toBeUndefined();
-		const stage = await resumed.prepareBranchedSession(resumedIds.label!);
-		const legacyStage = await legacy.manager.prepareBranchedSession(legacyIds.forkParent);
-		const onDisk = async (path: string) => normalise((await readEntries(path)).slice(1) as SessionEntry[]);
-		expect(await onDisk(stage.sessionFile!)).toEqual(await onDisk(legacyStage.sessionFile!));
-		resumed.commitPreparedNewSession(stage);
-		expect(resumed.getSessionId()).toBe(stage.sessionId);
-		expect(resumed.getHeader()?.parentSession).toBe(created.manager.getSessionId());
-		await committed(resumed, user("next in fork"));
-		expect(await bytesAt(file)).toEqual(bytes);
-	});
-
-	for (const resume of [false, true]) {
-		it(`matches a legacy branch and fork with OpenAI Responses replay history (${resume ? "resumed" : "live"})`, async () => {
-			const open = async (shared: boolean) => {
-				const fixture = await fresh();
-				let manager = fixture.manager;
-				const ids = await responsesHistory(manager, shared);
-				if (resume) {
-					const file = manager.getSessionFile()!;
-					await manager.closeStrict();
-					manager = await SessionManager.open(file, fixture.destination);
-					managers.push(manager);
-					// A resumed root TUI latches the bars with its first shared message.
-					if (shared) await committed(manager, user("after resume"));
-					else {
-						manager.appendMessage(user("after resume"));
-						await manager.flush();
-					}
-				}
-				return { manager, ids, file: manager.getSessionFile()! };
-			};
-			const legacy = await open(false);
-			const shared = await open(true);
-			expect(legacy.manager.requiresSharedMutationAdmission()).toBe(false);
-			expect(shared.manager.requiresSharedMutationAdmission()).toBe(true);
-			const bytes = await bytesAt(shared.file);
-			const onDisk = async (file: string) => normalise((await readEntries(file)).slice(1) as SessionEntry[]);
-			expect(shared.manager.graphSuccessorRefusal({ leafId: shared.ids.reply })).toBeUndefined();
-			const sharedBranch = await shared.manager.prepareBranchedSession(shared.ids.reply);
-			const legacyBranch = await legacy.manager.prepareBranchedSession(legacy.ids.reply);
-			expect(await onDisk(sharedBranch.sessionFile!)).toEqual(await onDisk(legacyBranch.sessionFile!));
-			await shared.manager.discardPreparedNewSession(sharedBranch);
-			await legacy.manager.discardPreparedNewSession(legacyBranch);
-			const sharedFork = await shared.manager.prepareFork();
-			const legacyFork = await legacy.manager.prepareFork();
-			expect(await onDisk(sharedFork!.sessionFile!)).toEqual(await onDisk(legacyFork!.sessionFile!));
-			const payloadOnDisk = (await Bun.file(sharedFork!.sessionFile!).text()).includes("openaiResponsesHistory");
-			// A live opener keeps the replay payload; a resumed one strips it, as a legacy fork does.
-			expect(payloadOnDisk).toBe(!resume);
-			expect(await bytesAt(shared.file)).toEqual(bytes);
-		});
-	}
-
 	it("reports and refuses a successor before any write while a peer sibling exists", async () => {
 		const { manager, file, destination, r1 } = await twoSharedPrompts();
 		expect(manager.graphSuccessorRefusal({ leafId: r1 })).toBeUndefined();
@@ -257,21 +162,54 @@ describe("graph successors after root shared append", () => {
 		expect(manager.graphSuccessorRefusal({ leafId: "missing" })).toBe("unknown-entry");
 		await expect(manager.prepareBranchedSession("missing")).rejects.toThrow();
 	});
+
+	it("branches a mixed history that replays as the source does at the branch point", async () => {
+		const { manager, destination } = await fresh();
+		const forkParent = await mixedHistory(manager);
+		const source = manager.getSessionFile()!;
+		const sourceBytes = await bytesAt(source);
+		const stage = await manager.prepareBranchedSession(forkParent);
+		manager.commitPreparedNewSession(stage);
+		await manager.flush();
+		expect(await bytesAt(source)).toEqual(sourceBytes);
+		// The oracle is the source itself, reopened and moved to the branch point.
+		const oracle = await SessionManager.open(source, destination);
+		managers.push(oracle);
+		oracle.branch(forkParent);
+		const branched = await SessionManager.open(stage.sessionFile!, destination);
+		managers.push(branched);
+		// The branch re-emits a label as a fresh entry, so a label's own id is not compared; its
+		// target and text are.
+		const comparable = (entries: FileEntry[]) =>
+			entries.map(entry => ({
+				...entry,
+				id: entry.type === "label" ? undefined : "id" in entry ? entry.id : undefined,
+				parentId: undefined,
+				timestamp: undefined,
+			}));
+		const onPath = new Set(oracle.getBranch().map(entry => entry.id));
+		const sourcePath = (await readEntries(source)).filter(entry => "id" in entry && onPath.has(entry.id));
+		expect(comparable((await readEntries(stage.sessionFile!)).slice(1))).toEqual(comparable(sourcePath));
+		expect(branched.getEntries().map(entry => entry.type)).toEqual(oracle.getBranch().map(entry => entry.type));
+		expect(branched.buildSessionContext()).toEqual(oracle.buildSessionContext());
+		expect(branched.getBranch().map(entry => entry.type)).toEqual(
+			expect.arrayContaining(["model_change", "thinking_level_change", "compaction", "label"]),
+		);
+		expect(await Bun.file(stage.sessionFile!).text()).toContain("openaiResponsesHistory");
+	});
 });
 
 const IMAGE = Buffer.alloc(96 * 1024, 7).toString("base64");
 
 /**
- * The same conversation, published either through legacy appends or through root
- * shared append. A TUI's startup model and thinking entries are legacy appends before
- * its first shared message in both cases.
+ * Thinking, a tool call and result, an image, compaction, model changes, a label and an
+ * OpenAI Responses reply with replay metadata, written through the legacy appends. Returns
+ * the label's id, the parent of the selected prompt.
  */
-async function history(manager: SessionManager, shared: boolean) {
-	const add = async (message: Parameters<SessionManager["appendMessage"]>[0]) =>
-		shared ? await committed(manager, message) : manager.appendMessage(message);
+async function mixedHistory(manager: SessionManager): Promise<string> {
 	manager.appendModelChange("anthropic/test", "default");
 	manager.appendThinkingLevelChange("high");
-	const p1 = await add({
+	const p1 = manager.appendMessage({
 		role: "user",
 		content: [
 			{ type: "text", text: "look at this" },
@@ -279,7 +217,7 @@ async function history(manager: SessionManager, shared: boolean) {
 		],
 		timestamp: 1,
 	});
-	await add({
+	manager.appendMessage({
 		...assistant("calling a tool"),
 		content: [
 			{ type: "thinking", thinking: "private reasoning", thinkingSignature: "sig" },
@@ -287,58 +225,17 @@ async function history(manager: SessionManager, shared: boolean) {
 		],
 		stopReason: "toolUse",
 	});
-	const result = await add({
+	const result = manager.appendMessage({
 		role: "toolResult",
 		toolCallId: "call-1",
 		toolName: "read",
-		// Past MAX_PERSIST_CHARS (persisted truncated) and EDIT_SNAPSHOT_INLINE_MAX_CHARS (receipt).
-		content: [{ type: "text", text: "x".repeat(600_000) }],
-		details: { edits: [{ oldText: "o".repeat(20 * 1024), newText: "n".repeat(20 * 1024) }] },
+		content: [{ type: "text", text: "tool output" }],
 		isError: false,
 		timestamp: 3,
 	});
-	const payload = { summary: "compacted", firstKeptEntryId: result, tokensBefore: 1234 };
-	if (shared) {
-		const outcome = await manager.appendCompactionSharingSession(payload, () => true);
-		if (outcome.kind !== "committed") throw new Error(`compaction ${outcome.kind}`);
-		const model = await manager.appendTemporaryModelChangeSharingSession("anthropic/other", undefined, () => true);
-		if (model.kind !== "committed") throw new Error(`model change ${model.kind}`);
-	} else {
-		manager.appendCompaction(payload.summary, undefined, payload.firstKeptEntryId, payload.tokensBefore);
-		manager.appendModelChange("anthropic/other", "temporary");
-	}
-	await add(assistant("after compaction"));
-	// The label sits on the path, so it is the selected prompt's parent.
-	let forkParent: string;
-	if (shared) {
-		const label = await manager.appendLabelChangeSharingSession(p1, "first prompt");
-		if (label.kind !== "committed") throw new Error(`label ${label.kind}`);
-		forkParent = label.id;
-	} else forkParent = manager.appendLabelChange(p1, "first prompt");
-	await add(user("selected prompt"));
-	await add(assistant("selected reply"));
-	if (!shared) await manager.ensureOnDisk();
-	return { p1, forkParent };
-}
-
-/** Entries with ids and timestamps replaced by their position, so two histories compare. */
-function normalise(entries: readonly SessionEntry[]) {
-	const position = new Map(entries.map((entry, index) => [entry.id, index]));
-	return entries.map(entry => {
-		const { id: _id, parentId, timestamp: _timestamp, ...rest } = entry as SessionEntry & { targetId?: string };
-		const copy = JSON.parse(JSON.stringify(rest)) as Record<string, unknown>;
-		if (typeof copy.targetId === "string") copy.targetId = position.get(copy.targetId);
-		if (typeof copy.firstKeptEntryId === "string") copy.firstKeptEntryId = position.get(copy.firstKeptEntryId);
-		return { ...copy, parent: parentId === null ? null : position.get(parentId) };
-	});
-}
-
-/** An OpenAI Responses reply carries replay metadata that resume strips in memory only. */
-async function responsesHistory(manager: SessionManager, shared: boolean) {
-	const add = async (message: Parameters<SessionManager["appendMessage"]>[0]) =>
-		shared ? await committed(manager, message) : manager.appendMessage(message);
-	await add(user("p1"));
-	const reply = await add({
+	manager.appendCompaction("compacted", undefined, result, 1234);
+	manager.appendModelChange("openai/gpt", "temporary");
+	manager.appendMessage({
 		...assistant("r1"),
 		api: "openai-responses",
 		provider: "openai",
@@ -353,8 +250,10 @@ async function responsesHistory(manager: SessionManager, shared: boolean) {
 			items: [{ type: "message", id: "msg_1" }],
 		},
 	} as Parameters<SessionManager["appendMessage"]>[0]);
-	await add(user("p2"));
-	await add(assistant("r2"));
-	if (!shared) await manager.ensureOnDisk();
-	return { reply };
+	const forkParent = manager.appendLabelChange(p1, "first prompt");
+	manager.appendMessage(user("selected prompt"));
+	manager.appendMessage(assistant("selected reply"));
+	await manager.ensureOnDisk();
+	await manager.flush();
+	return forkParent;
 }
