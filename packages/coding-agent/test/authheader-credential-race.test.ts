@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
 import { registerCustomApi, unregisterCustomApis } from "@gajae-code/ai/api-registry";
+import { getBundledModel } from "@gajae-code/ai/models";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@gajae-code/ai/types";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -9,6 +11,7 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { isProviderSafetyStopModelTrusted } from "../../ai/src/adapter-internals/provider-safety-stop";
 import { trackTempDirs } from "./helpers/tracked-temp-dirs";
 
 const SOURCE_ID = "authheader-credential-race-test";
@@ -56,6 +59,47 @@ function providerMessage(model: Model<Api>, outcome: Outcome): AssistantMessage 
 				}
 			: {}),
 		timestamp: Date.now(),
+	};
+}
+
+/** One real Anthropic refusal envelope, so the provider itself mints the stop mark. */
+function anthropicRefusalRequest(): {
+	withResponse(): Promise<{
+		data: AsyncIterable<Record<string, unknown>>;
+		response: Response;
+		request_id: string | null;
+	}>;
+} {
+	const response = new Response(null, { status: 200, headers: { "request-id": "req_authheader_refusal" } });
+	return {
+		async withResponse() {
+			return {
+				data: {
+					async *[Symbol.asyncIterator]() {
+						yield {
+							type: "message_start",
+							message: {
+								id: "msg_authheader_refusal",
+								usage: {
+									input_tokens: 3,
+									output_tokens: 0,
+									cache_read_input_tokens: 0,
+									cache_creation_input_tokens: 0,
+								},
+							},
+						};
+						yield {
+							type: "message_delta",
+							delta: { stop_reason: "refusal", stop_sequence: null, stop_details: null },
+							usage: { input_tokens: 3, output_tokens: 0 },
+						};
+						yield { type: "message_stop" };
+					},
+				},
+				response,
+				request_id: response.headers.get("request-id"),
+			};
+		},
 	};
 }
 
@@ -224,6 +268,24 @@ function deferObservedProviderDispatch(session: AgentSession): { entered: Promis
 	return { entered: entered.promise, release: () => released.resolve() };
 }
 
+/** Capture the detached request model the session hands to the provider observer. */
+function captureObservedProviderModel(session: AgentSession): Model[] {
+	const observed: Model[] = [];
+	const real = session.observeMainProviderStream.bind(session);
+	vi.spyOn(session, "observeMainProviderStream").mockImplementation(
+		async (
+			model: Model,
+			context: Context,
+			options: SimpleStreamOptions | undefined,
+			start: (options: SimpleStreamOptions) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
+		) => {
+			observed.push(model);
+			return await real(model, context, options, start);
+		},
+	);
+	return observed;
+}
+
 const sessions: AgentSession[] = [];
 const modelRegistries: ModelRegistry[] = [];
 const authStorages: AuthStorage[] = [];
@@ -378,6 +440,76 @@ describe("authHeader credential race through a real session", () => {
 		const assistants = await persistedAssistants(sessionManager);
 		expect(assistants).toHaveLength(1);
 		expect(assistants[0]?.credentialId).toBe(retriedRow);
+	});
+
+	it("preserves catalog trust on the observer request and final provider model", async () => {
+		const catalogModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!catalogModel) throw new Error("Expected the bundled Anthropic fixture model");
+		const dir = tempDirs.tempDirSync("@authheader-trust-").path();
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		modelRegistries.push(modelRegistry);
+		const sessionManager = SessionManager.create(dir, dir);
+		const { session } = await createAgentSession({
+			cwd: dir,
+			agentDir: dir,
+			authStorage,
+			modelRegistry,
+			sessionManager,
+			model: catalogModel,
+			credentialSessionId: CREDENTIAL_SCOPE,
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		sessions.push(session);
+
+		const observed = captureObservedProviderModel(session);
+		const create = vi
+			.spyOn(Messages.prototype, "create")
+			.mockImplementation(() => anthropicRefusalRequest() as never);
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		// The observer sees the request-model clone before any deferred dispatch; it
+		// must retain the catalog identity or first-party adapters lose authority.
+		expect(observed).toHaveLength(1);
+		expect(isProviderSafetyStopModelTrusted(observed[0])).toMatchObject({
+			api: "anthropic-messages",
+			provider: "anthropic",
+			id: "claude-sonnet-4-5",
+		});
+
+		// The real Anthropic adapter mints the terminal stop only when the final
+		// provider model it received is still trusted.
+		expect(create).toHaveBeenCalledTimes(1);
+		const last = [...session.state.messages].reverse().find(message => message.role === "assistant") as
+			| AssistantMessage
+			| undefined;
+		expect(last).toMatchObject({ stopReason: "error", errorKind: "provider_safety_stop" });
+		// The provider sets this kind only when its adapter invocation was trusted;
+		// the untrusted path instead publishes a statusless transport failure.
+		expect(last?.transportFailure).toBeUndefined();
+	});
+
+	it("does not grant catalog trust to a synthetic custom dispatch model", async () => {
+		const { session } = await setup({ pinRowA: true });
+		registerFakeProvider(() => "ok");
+		const observed = captureObservedProviderModel(session);
+
+		await session.prompt("hello");
+		await session.waitForIdle();
+
+		expect(observed).toHaveLength(1);
+		expect(isProviderSafetyStopModelTrusted(observed[0])).toBe(false);
 	});
 });
 

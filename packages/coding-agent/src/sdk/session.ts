@@ -28,6 +28,7 @@ import {
 	streamSimple,
 	type ToolResultMessage,
 } from "@gajae-code/ai/core";
+import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 import type { Component } from "@gajae-code/tui";
 import {
 	$flag,
@@ -5711,19 +5712,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// its generated `Authorization` into the model object it resolves against, so a
 				// concurrent lookup on this session's model must not rewrite the header of a
 				// request that already resolved its own credential.
-				const requestModel = {
+				const requestClone = {
 					...streamModel,
 					headers: modelRegistry.getRequestHeaders(streamModel, streamOptions?.apiKey),
 				};
+				// Preserve catalog trust across the detach so first-party adapters keep
+				// their safety-stop authority. An untrusted model stays on the plain clone.
+				const requestModel = registerFinalizedModelClone(streamModel, requestClone) ?? requestClone;
 				const startProviderStream = (providerOptions: SimpleStreamOptions) => {
 					// An observer or gateway can supply the key actually dispatched, so the final
 					// provider-local model materializes its headers from that key. `streamSimple`'s
 					// internal 401 retry reuses this exact object, which is what lets `onAuthError`
 					// refresh its headers in place before handing back the replacement credential.
-					const providerModel = {
+					const providerClone = {
 						...requestModel,
 						headers: modelRegistry.getRequestHeaders(requestModel, providerOptions.apiKey),
 					};
+					const providerModel = registerFinalizedModelClone(requestModel, providerClone) ?? providerClone;
 					return streamSimple(providerModel, context, {
 						...providerOptions,
 						onAuthError: async (provider, oldKey, error) => {
