@@ -1,0 +1,879 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type { AgentMessage } from "@gajae-code/agent-core";
+import { pathIdentityKey, postmortem } from "@gajae-code/utils";
+import { releaseSettingsScope } from "../capability";
+import { isSessionCredentialPinBlocking } from "../config/model-profile-activation";
+import { createRegistrySelectorIndex, ModelRegistry, registrySelectorResolvesToModel } from "../config/model-registry";
+import { normalizeModelSelectorValue } from "../config/model-selector-value";
+import { Settings } from "../config/settings";
+import { validateSettingPatch } from "../config/settings-schema";
+import { loadSlashCommands } from "../extensibility/slash-commands";
+import { initializeLocalRoot } from "../internal-urls";
+import { usePostmortemSignalExitAuthority } from "../lsp/client";
+import { type InitializeExtensionsOptions, initializeExtensions } from "../modes/runtime-init";
+import { AgentRegistry } from "../registry/agent-registry";
+import {
+	buildSessionContext,
+	type FileEntry,
+	migrateSessionEntries,
+	parseSessionEntries,
+	RESUME_TRANSCRIPT_MAX_BYTES,
+	type SessionEntry,
+	SessionManager,
+} from "../session/session-manager";
+import { FileSessionStorage } from "../session/session-storage";
+import { type BrokerDiscovery, readBrokerDiscovery } from "./broker/discovery";
+import { observeProcess } from "./broker/process-incarnation";
+import { SessionIndex, sessionIndexPresent, sessionIndexStartupLockOptions } from "./broker/session-index";
+import { SdkClient } from "./client/client";
+import { type SessionLifecycleClient, SessionLifecycleService } from "./lifecycle/service";
+import { createSdkPreferenceControls } from "./preference-controls";
+import type { SdkRevisionInput, SdkRevisionResult } from "./protocol/revision-contracts";
+import { reviseSession, SdkRevisionError, type SdkRevisionRuntimeOptions } from "./revision-controls";
+import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./session";
+
+export type EmbeddedRevisionInput =
+	| Omit<Extract<SdkRevisionInput, { action?: "edit" }>, "sessionId">
+	| Omit<Extract<SdkRevisionInput, { action: "select" }>, "sessionId">;
+export type EmbeddedRevisionOptions = Pick<SdkRevisionRuntimeOptions, "onRunAccepted" | "onPreflightAcceptCommit">;
+export type { SdkRevisionResult } from "./protocol/revision-contracts";
+export { SdkRevisionError } from "./revision-controls";
+
+/** Answered sibling prompt revisions; identifiers are exact transcript entry IDs. */
+export interface EmbeddedPromptRevision {
+	index: number;
+	count: number;
+	previous?: string;
+	next?: string;
+}
+
+const promptRevisionCache = new WeakMap<
+	SessionManager,
+	{
+		identity: number;
+		leaf: string | null;
+		revisions: Map<string, EmbeddedPromptRevision | null>;
+	}
+>();
+
+const isUserPrompt = (entry: SessionEntry | undefined): boolean =>
+	entry?.type === "message" && entry.message.role === "user";
+const isConversation = (entry: SessionEntry): boolean =>
+	entry.type === "message" ||
+	entry.type === "custom_message" ||
+	entry.type === "compaction" ||
+	entry.type === "branch_summary";
+
+/** Oldest first, retaining manager order for ties and unreadable timestamps. */
+function orderedRevisionEntries(entries: SessionEntry[]): SessionEntry[] {
+	return entries
+		.map((entry, order) => ({ entry, order, time: Date.parse(entry.timestamp) }))
+		.sort((left, right) => {
+			const elapsed = left.time - right.time;
+			return (Number.isNaN(elapsed) ? 0 : elapsed) || left.order - right.order;
+		})
+		.map(item => item.entry);
+}
+
+/** Public read-only projection. Revision navigation belongs exclusively to the factory's revise control. */
+export function getEmbeddedPromptRevision(
+	session: CreateAgentSessionResult["session"],
+	entryId: string,
+): EmbeddedPromptRevision | undefined {
+	if (session.sessionLifecycle.disposed || session.sessionLifecycle.transitioning) return undefined;
+	const manager = session.sessionManager;
+	const identity = manager.getSessionIdentityGeneration();
+	const leaf = manager.getLeafId();
+	let cache = promptRevisionCache.get(manager);
+	if (!cache || cache.identity !== identity) {
+		cache = { identity, leaf, revisions: new Map() };
+		promptRevisionCache.set(manager, cache);
+	} else if (cache.leaf !== leaf) {
+		let current = leaf;
+		let answersOnly = false;
+		for (let steps = 0; current && steps < 64; steps++) {
+			const entry = manager.getEntry(current);
+			if (!entry || isUserPrompt(entry)) break;
+			if (current === cache.leaf) {
+				answersOnly = true;
+				break;
+			}
+			current = entry.parentId;
+		}
+		if (!answersOnly) cache.revisions.clear();
+		cache.leaf = leaf;
+	}
+	const cached = cache.revisions.get(entryId);
+	if (cached !== undefined) return cached ? { ...cached } : undefined;
+	const entry = manager.getEntry(entryId);
+	if (!entry || !isUserPrompt(entry)) return undefined;
+	let anchor = entry.parentId;
+	while (anchor) {
+		const parent = manager.getEntry(anchor);
+		if (!parent || isConversation(parent)) break;
+		anchor = parent.parentId;
+	}
+	const children = (id: string | null) =>
+		orderedRevisionEntries(id === null ? manager.getTree().map(node => node.entry) : manager.getChildren(id));
+	const prompts: SessionEntry[] = [];
+	const pending = children(anchor);
+	for (let index = 0; index < pending.length; index++) {
+		const candidate = pending[index]!;
+		if (isUserPrompt(candidate)) prompts.push(candidate);
+		else if (!isConversation(candidate)) pending.push(...children(candidate.id));
+	}
+	const revisions = orderedRevisionEntries(prompts).filter(
+		prompt => prompt.id === entryId || manager.getChildren(prompt.id).length > 0,
+	);
+	const index = revisions.findIndex(prompt => prompt.id === entryId);
+	const result =
+		index < 0 || revisions.length < 2
+			? undefined
+			: {
+					index,
+					count: revisions.length,
+					...(index > 0 ? { previous: revisions[index - 1]!.id } : {}),
+					...(index < revisions.length - 1 ? { next: revisions[index + 1]!.id } : {}),
+				};
+	cache.revisions.set(entryId, result ?? null);
+	return result ? { ...result } : undefined;
+}
+
+/** Credential-aware local catalog, including session-pin failures. */
+export function getEmbeddedAvailableModels(session: CreateAgentSessionResult["session"]) {
+	return session
+		.getAvailableModels()
+		.filter(
+			model => !isSessionCredentialPinBlocking(session.modelRegistry, model.provider, session.credentialSessionId),
+		);
+}
+
+export interface EmbeddedAgentSessionOptions
+	extends Omit<CreateAgentSessionOptions, "sessionManager" | "settings" | "modelRegistry" | "agentRegistry"> {
+	cwd: string;
+	agentDir: string;
+	storage:
+		| { directory: string; file?: string; manager?: CreateAgentSessionResult["session"]["sessionManager"] }
+		| { managed: true; file?: string; manager?: CreateAgentSessionResult["session"]["sessionManager"] }
+		| { persist: false };
+	/** Trusted factory injection for embedding integration tests. */
+	createSession?: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+	/** Control-only sessions own no transcript, extensions, MCP connections or project discovery. */
+	controlOnly?: boolean;
+}
+
+export interface EmbeddedAgentSessionResult extends CreateAgentSessionResult {
+	/** Branch through the native lifecycle and bind revision authority to its settled successor. */
+	branch(entryId: string): Promise<{ selectedText: string; cancelled: boolean }>;
+	/** Factory-bound canonical same-session edit or exact answered-branch selection. */
+	revise(input: EmbeddedRevisionInput, options?: EmbeddedRevisionOptions): Promise<SdkRevisionResult>;
+	/** Initialize once per extension runner; later contexts only rebind the UI. May await an interactive session_start. */
+	initializeUI(options: InitializeExtensionsOptions): Promise<void>;
+	/** Refresh file-command discovery through the SDK without publishing a retired identity. */
+	refreshCommands(): Promise<void>;
+	/** Refresh this factory owner's credential-scoped catalog; control-only owners use the global enrollment view. */
+	refreshModels(strategy: "online" | "offline"): Promise<void>;
+	/** Join actual session teardown before releasing the factory's scoped dependencies. Retryable after failure. */
+	releaseResources(): Promise<void>;
+	modelProfileWarning?: string;
+}
+
+/** Public validation without exposing mutable schema definitions or granting write authority. */
+export function validateEmbeddedConfigPatch(patch: Record<string, unknown>): Array<{ path: string; detail: string }> {
+	return validateSettingPatch(patch);
+}
+
+/** Admit either an explicit local writer or the canonical verified managed/shared-session writer. */
+export async function createEmbeddedAgentSession(
+	options: EmbeddedAgentSessionOptions,
+): Promise<EmbeddedAgentSessionResult> {
+	const { storage, createSession = createAgentSession, controlOnly = false, ...sessionOptions } = options;
+	const destination =
+		"persist" in storage
+			? undefined
+			: "managed" in storage
+				? SessionManager.managedDestination(options.cwd, options.agentDir)
+				: storage.directory;
+	const manager =
+		"persist" in storage
+			? SessionManager.inMemory(options.cwd)
+			: (storage.manager ??
+				(storage.file
+					? await SessionManager.open(storage.file, destination)
+					: SessionManager.create(options.cwd, destination)));
+	let settings: Settings;
+	try {
+		// The same directory, not the same spelling: a transcript a terminal wrote through a symlinked
+		// path (macOS `/var` for `/private/var`, a linked project folder) belongs to the project too.
+		if (pathIdentityKey(manager.getCwd()) !== pathIdentityKey(options.cwd))
+			throw new Error("Session project does not match catalog");
+		// Factory injection does not bypass the managed local:// migration barrier.
+		await initializeLocalRoot({
+			getArtifactsDir: () => manager.getArtifactsDir(),
+			isManagedDestination: () => manager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => manager.getSessionId(),
+		});
+		settings = await Settings.loadForScope({ cwd: options.cwd, agentDir: options.agentDir });
+	} catch (error) {
+		try {
+			await manager.close();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "Embedding preflight and writer release failed");
+		}
+		throw error;
+	}
+	const closeSettings = async (): Promise<void> => {
+		try {
+			await settings.close();
+		} finally {
+			releaseSettingsScope(settings);
+		}
+	};
+	let registry: ModelRegistry | undefined;
+	let result: CreateAgentSessionResult | undefined;
+	try {
+		const authStorage = options.authStorage;
+		// Leave auth construction to the SDK factory when this is the root control owner.
+		if (authStorage) {
+			registry = new ModelRegistry(authStorage, path.join(options.agentDir, "models.yml"), settings, {
+				agentDir: options.agentDir,
+			});
+			await registry.refresh("offline");
+			const profile = registry.getModelProfiles().get(settings.get("modelProfile.default") ?? "");
+			const selectors = [
+				...Object.values(profile?.modelMapping ?? {}),
+				...Object.values(settings.get("modelRoles") ?? {}),
+				...Object.values(settings.get("task.agentModelOverrides") ?? {}),
+			].flatMap(normalizeModelSelectorValue);
+			const index = createRegistrySelectorIndex(registry.getAll());
+			if (selectors.some(selector => selector.includes("/") && !registrySelectorResolvesToModel(selector, index))) {
+				try {
+					await registry.refresh("online");
+				} catch {
+					/* Construction reports unresolved selectors. */
+				}
+			}
+		}
+		result = await createSession({
+			...sessionOptions,
+			...(controlOnly
+				? {
+						extensions: [],
+						disableExtensionDiscovery: true,
+						skills: [],
+						rules: [],
+						contextFiles: [],
+						promptTemplates: [],
+						slashCommands: [],
+						enableMcpAutoload: false,
+						deferModelProfileActivation: true,
+						deferOptionalModelRefresh: true,
+						enableLsp: false,
+						skipPythonPreflight: true,
+						toolNames: [],
+						notificationHostModeSupported: false,
+						sdkHostModeSupported: false,
+					}
+				: {}),
+			settings,
+			...(registry ? { modelRegistry: registry } : {}),
+			agentRegistry: new AgentRegistry(),
+			sessionManager: manager,
+		});
+		const created = result;
+		let revisionIdentity = manager.getSessionIdentityGeneration();
+		const ownsRevisionIdentity = () =>
+			!controlOnly &&
+			created.session.sessionManager === manager &&
+			manager.getSessionIdentityGeneration() === revisionIdentity;
+		// The native factory establishes the scoped discovery context before capability reads.
+		if (!controlOnly && sessionOptions.slashCommands === undefined)
+			created.session.setSlashCommands(await loadSlashCommands({ cwd: options.cwd }));
+		let modelProfileWarning: string | undefined;
+		const defaultProfile = settings.get("modelProfile.default");
+		if (!controlOnly && defaultProfile) {
+			const controls = createSdkPreferenceControls(created.session);
+			try {
+				const outcome = await controls.selectProfile({ name: defaultProfile, scope: "session" });
+				if (!outcome.applied)
+					modelProfileWarning = `Could not apply the default model profile (${defaultProfile}). Choose a model in settings.`;
+			} catch (error) {
+				modelProfileWarning = `Could not apply the default model profile (${defaultProfile}): ${String(error).slice(0, 300)}`;
+			} finally {
+				controls.dispose();
+			}
+		}
+		let initializedRunner: CreateAgentSessionResult["session"]["extensionRunner"];
+		let initialization: Promise<void> | undefined;
+		let releasing: Promise<void> | undefined;
+		// Extend the actual result so lazy factory resource getters retain their exact ownership.
+		return Object.assign(created, {
+			...(modelProfileWarning ? { modelProfileWarning } : {}),
+			async branch(entryId: string): Promise<{ selectedText: string; cancelled: boolean }> {
+				const session = created.session;
+				if (!ownsRevisionIdentity() || session.sessionLifecycle.disposed)
+					throw new SdkRevisionError("resource_gone");
+				if (session.sessionLifecycle.transitioning) throw new SdkRevisionError("busy");
+				const identity = revisionIdentity;
+				const generation = session.sessionLifecycle.generation;
+				const sessionId = session.sessionId;
+				const agent = session.agent;
+				const result = await session.branch(entryId);
+				const lifecycle = session.sessionLifecycle;
+				// Native branch commits one prepared identity and one lifecycle transition;
+				// reject any intervening adoption instead of trusting its mutable current token.
+				if (
+					created.session !== session ||
+					session.sessionManager !== manager ||
+					session.agent !== agent ||
+					lifecycle.disposed ||
+					lifecycle.transitioning ||
+					manager.getSessionIdentityGeneration() !== identity + (result.cancelled ? 0 : 1) ||
+					lifecycle.generation !== generation + (result.cancelled ? 0 : 1) ||
+					(result.cancelled ? session.sessionId !== sessionId : session.sessionId === sessionId)
+				)
+					throw new SdkRevisionError("resource_gone");
+				// A failure (including post-commit failure) never reaches this renewal.
+				if (!result.cancelled) revisionIdentity = identity + 1;
+				return result;
+			},
+			revise(
+				input: EmbeddedRevisionInput,
+				revisionOptions: EmbeddedRevisionOptions = {},
+			): Promise<SdkRevisionResult> {
+				const session = created.session;
+				if (!ownsRevisionIdentity()) return Promise.reject(new SdkRevisionError("resource_gone"));
+				if (Object.hasOwn(input, "sessionId")) return Promise.reject(new SdkRevisionError("invalid_input"));
+				return reviseSession(
+					session,
+					{ ...input, sessionId: session.sessionId },
+					{
+						onRunAccepted: revisionOptions.onRunAccepted,
+						onPreflightAcceptCommit: revisionOptions.onPreflightAcceptCommit,
+					},
+				);
+			},
+			initializeUI(uiOptions: InitializeExtensionsOptions): Promise<void> {
+				const lifecycle = created.session.sessionLifecycle;
+				if (lifecycle.disposed || lifecycle.transitioning)
+					throw new Error("Session changed before extension initialization");
+				if (uiOptions.uiContext) created.setToolUIContext(uiOptions.uiContext, true);
+				const runner = created.session.extensionRunner;
+				const generation = lifecycle.generation;
+				if (initialization && initializedRunner === runner) {
+					if (uiOptions.uiContext) runner?.setUIContext(uiOptions.uiContext);
+					return initialization;
+				}
+				initializedRunner = runner;
+				initialization = Promise.resolve().then(() => {
+					const current = created.session.sessionLifecycle;
+					if (
+						current.disposed ||
+						current.transitioning ||
+						current.generation !== generation ||
+						created.session.extensionRunner !== runner
+					)
+						throw new Error("Session changed before extension initialization");
+					return initializeExtensions(created.session, uiOptions);
+				});
+				return initialization;
+			},
+			async refreshCommands(): Promise<void> {
+				if (controlOnly) throw new Error("Command discovery is unavailable for control-only sessions");
+				const session = created.session;
+				const before = session.sessionLifecycle;
+				if (before.disposed || before.transitioning) throw new Error("Session changed before refreshing commands");
+				const generation = before.generation;
+				const sessionId = session.sessionId;
+				const cwd = manager.getCwd();
+				const commands = await loadSlashCommands({ cwd });
+				const lifecycle = session.sessionLifecycle;
+				if (
+					lifecycle.disposed ||
+					lifecycle.transitioning ||
+					lifecycle.generation !== generation ||
+					session.sessionManager !== manager ||
+					session.sessionId !== sessionId ||
+					manager.getCwd() !== cwd
+				)
+					throw new Error("Session changed while refreshing commands");
+				session.setSlashCommands(commands);
+			},
+			async refreshModels(strategy: "online" | "offline"): Promise<void> {
+				const session = created.session;
+				const generation = session.sessionLifecycle.generation;
+				const sessionId = session.sessionId;
+				const ownerRegistry = session.modelRegistry;
+				const assertCurrent = () => {
+					const lifecycle = session.sessionLifecycle;
+					if (
+						lifecycle.disposed ||
+						lifecycle.transitioning ||
+						lifecycle.generation !== generation ||
+						session.sessionManager !== manager ||
+						session.sessionId !== sessionId ||
+						session.modelRegistry !== ownerRegistry
+					)
+						throw new Error("Session changed while refreshing models");
+				};
+				assertCurrent();
+				if (controlOnly) await ownerRegistry.refresh(strategy);
+				else await ownerRegistry.refresh(strategy, session.credentialSessionId);
+				assertCurrent();
+			},
+			releaseResources(): Promise<void> {
+				if (releasing) return releasing;
+				releasing = (async () => {
+					await created.session.awaitDisposeCompletion();
+					const outcomes = await Promise.allSettled([registry?.dispose(), closeSettings()]);
+					const failures: unknown[] = outcomes.flatMap(outcome =>
+						outcome.status === "rejected" ? [outcome.reason] : [],
+					);
+					if (failures.length) throw new AggregateError(failures, "Session dependencies failed to release");
+				})();
+				void releasing.catch(() => {
+					releasing = undefined;
+				});
+				return releasing;
+			},
+		});
+	} catch (error) {
+		if (result) {
+			const disposal = result.session.dispose();
+			void disposal.catch(() => {});
+			await result.session.awaitDisposeCompletion();
+		} else await manager.close();
+		await registry?.dispose();
+		await closeSettings();
+		throw error;
+	}
+}
+
+/** Read-only inventory; neither recovery nor writer admission is performed. */
+export async function listEmbeddedProjectSessions(input: { cwd: string; agentDir: string; directory: string }) {
+	const [managed, local] = await Promise.all([
+		SessionManager.listManagedForResumePickerReadOnly(input.cwd, input.agentDir),
+		SessionManager.listForResumePickerReadOnly(input.cwd, input.directory),
+	]);
+	return { managed, local };
+}
+
+/** Capture and copy through the SDK's strict immutable transcript boundary. */
+export async function forkEmbeddedSession(
+	input: { file: string; cwd: string } & ({ directory: string } | { agentDir: string; managed: true }),
+) {
+	const capture = SessionManager.captureTranscriptStrict(input.file);
+	if (capture.kind !== "captured") throw new Error("Could not capture source transcript for fork");
+	try {
+		const destination =
+			"managed" in input ? SessionManager.managedDestination(input.cwd, input.agentDir) : input.directory;
+		const copied = await SessionManager.forkFromCaptured(capture.snapshot, input.cwd, destination);
+		if (copied.kind !== "forked") throw new Error("Could not create captured session fork");
+		return copied.manager;
+	} finally {
+		capture.snapshot.close();
+	}
+}
+
+/** Where a transcript stands on disk relative to one open session's copy of it. */
+export interface EmbeddedTranscriptTail {
+	/** Newest committed entry: where any surface that opens the transcript now lands. Null when empty. */
+	committed: string | null;
+	/**
+	 * Newest committed entry this session holds. It equals `committed` until another process
+	 * appends; after that it names this session's last known position in the file.
+	 */
+	held: string | null;
+}
+
+/** File identity a full tail read was taken against. */
+interface TranscriptStamp {
+	file: string;
+	sessionId: string;
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+/** The last full read per open session; a later check reuses it while the file's stamp is unchanged. */
+const transcriptTails = new WeakMap<SessionManager, { stamp: TranscriptStamp; tail: EmbeddedTranscriptTail }>();
+
+async function stampTranscript(file: string, sessionId: string): Promise<TranscriptStamp | undefined> {
+	try {
+		const stat = await fs.stat(file, { bigint: true });
+		if (!stat.isFile()) return undefined;
+		const { dev, ino, size, mtimeNs, ctimeNs } = stat;
+		return { file, sessionId, dev, ino, size, mtimeNs, ctimeNs };
+	} catch {
+		return undefined;
+	}
+}
+
+function sameStamp(left: TranscriptStamp, right: TranscriptStamp): boolean {
+	return (
+		left.file === right.file &&
+		left.sessionId === right.sessionId &&
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+/**
+ * A write in the same timestamp tick as a read can leave every stat field unchanged. A read
+ * only vouches for later stamps once it began clearly after the file last changed: 10 ms on
+ * filesystems with sub-millisecond timestamps, 2 s on coarse ones (whole-millisecond values).
+ */
+function readAfterSettled(stamp: TranscriptStamp, readStartedNs: bigint): boolean {
+	const fine = stamp.ctimeNs % 1_000_000n !== 0n || stamp.mtimeNs % 1_000_000n !== 0n;
+	const changed = stamp.ctimeNs > stamp.mtimeNs ? stamp.ctimeNs : stamp.mtimeNs;
+	return readStartedNs - changed > (fine ? 10_000_000n : 2_000_000_000n);
+}
+
+/**
+ * Read the committed transcript without touching the session's cursor, entries or writer state.
+ * Undefined when nothing readable is published for this session: absent, unsupported, or a
+ * different transcript identity at its path.
+ *
+ * A repeat check stats the file first and reuses the previous answer while the file's device,
+ * inode, size, modification and change times are all unchanged and that answer held the tail.
+ * Any write changes at least one of them, so the session's own writes and another process's
+ * appends or rewrites (including a same-size rewrite that restores the modification time) are
+ * read in full again.
+ */
+export async function readEmbeddedTranscriptTail(
+	session: Pick<CreateAgentSessionResult["session"], "sessionManager">,
+): Promise<EmbeddedTranscriptTail | undefined> {
+	const manager = session.sessionManager;
+	const file = manager.getSessionFile();
+	const before = file ? await stampTranscript(file, manager.getSessionId()) : undefined;
+	const cached = transcriptTails.get(manager);
+	if (
+		cached &&
+		before &&
+		sameStamp(cached.stamp, before) &&
+		cached.tail.committed === cached.tail.held &&
+		(cached.tail.held === null || manager.getEntry(cached.tail.held) !== undefined)
+	)
+		return { ...cached.tail };
+	transcriptTails.delete(manager);
+	const readStartedNs = BigInt(Date.now()) * 1_000_000n;
+	const read = await manager.captureCommittedSnapshot();
+	if (read.kind !== "snapshot" || read.snapshot.sessionId !== manager.getSessionId()) return undefined;
+	const { entryIds } = read.snapshot;
+	let held: string | null = null;
+	for (let index = entryIds.length - 1; index >= 0 && held === null; index--)
+		if (manager.getEntry(entryIds[index]!)) held = entryIds[index]!;
+	const tail: EmbeddedTranscriptTail = { committed: entryIds.at(-1) ?? null, held };
+	// Remember the read only when nothing changed the file while it ran.
+	const after =
+		before && read.snapshot.sessionFile === before.file
+			? await stampTranscript(before.file, before.sessionId)
+			: undefined;
+	if (
+		before &&
+		after &&
+		sameStamp(before, after) &&
+		after.size === BigInt(read.snapshot.size) &&
+		readAfterSettled(after, readStartedNs)
+	)
+		transcriptTails.set(manager, { stamp: after, tail: { ...tail } });
+	return tail;
+}
+
+/** The conversation a transcript shows, read without opening a writer. */
+export interface EmbeddedTranscriptHistory {
+	/** Transcript identity from its header. */
+	sessionId: string;
+	/** Newest entry: where any surface that opens the transcript lands. Null when empty. */
+	tail: string | null;
+	/** The entry the messages lead to. */
+	leafId: string | null;
+	/** That branch's conversation, as an opened session would show it. */
+	messages: AgentMessage[];
+}
+
+/**
+ * Read a transcript's conversation for display without opening a session, taking a writer or
+ * migrating the file. `leaf` selects a saved position: it is shown when `whenTail` is still the
+ * newest entry, otherwise the newest entry is, exactly as reopening the transcript after another
+ * surface appended would land. Without a recorded `whenTail` the position is shown unless it is a
+ * strict ancestor of the newest entry (`isEmbeddedAncestor`), which means something was appended
+ * after it. An unknown target also falls back to the newest entry. Undefined when the file is
+ * absent, larger than a resumable transcript, or not a readable transcript.
+ */
+export async function readEmbeddedTranscriptHistory(
+	file: string,
+	leaf?: { entryId: string | null; whenTail?: string | null },
+): Promise<EmbeddedTranscriptHistory | undefined> {
+	let entries: FileEntry[];
+	try {
+		const stat = await fs.stat(file);
+		if (!stat.isFile() || stat.size > RESUME_TRANSCRIPT_MAX_BYTES) return undefined;
+		entries = parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(await Bun.file(file).bytes()));
+	} catch {
+		return undefined;
+	}
+	const header = entries[0];
+	if (header?.type !== "session" || typeof header.id !== "string") return undefined;
+	// Migration only shapes this in-memory copy; the file is never rewritten here.
+	migrateSessionEntries(entries);
+	const sessionEntries = entries.filter(
+		(entry): entry is SessionEntry => entry.type !== "session" && typeof entry.id === "string",
+	);
+	const tail = sessionEntries.at(-1)?.id ?? null;
+	const target = leaf?.entryId;
+	const parents = new Map(sessionEntries.map(entry => [entry.id, entry.parentId]));
+	const restore =
+		leaf !== undefined &&
+		(target === null || sessionEntries.some(entry => entry.id === target)) &&
+		(leaf.whenTail === undefined
+			? !isEmbeddedAncestor(entryId => parents.get(entryId), target ?? null, tail)
+			: leaf.whenTail === tail);
+	const leafId = restore ? (target ?? null) : tail;
+	return {
+		sessionId: header.id,
+		tail,
+		leafId,
+		messages: buildSessionContext(sessionEntries, leafId, undefined, header.id).messages,
+	};
+}
+
+/**
+ * Whether `entryId` lies on the path from the root to `tail` without being `tail` itself; the
+ * empty root (`null`) is an ancestor of every entry. `parentOf` answers an entry's parent id
+ * (`undefined` for an unknown entry). A view saved before tails were recorded whose position is
+ * a strict ancestor of today's tail was at what was then the end of the transcript, so what
+ * follows it was appended later; a position on another branch was a deliberate choice.
+ */
+export function isEmbeddedAncestor(
+	parentOf: (entryId: string) => string | null | undefined,
+	entryId: string | null,
+	tail: string | null,
+): boolean {
+	if (tail === null || entryId === tail) return false;
+	if (entryId === null) return true;
+	const seen = new Set<string>();
+	for (let current = parentOf(tail); current; current = parentOf(current)) {
+		if (current === entryId) return true;
+		if (seen.has(current)) return false;
+		seen.add(current);
+	}
+	return false;
+}
+
+/**
+ * True once the store refused this session's write because another process changed the
+ * transcript after this session read it. The refusal lasts for the session's lifetime: reopen
+ * the transcript to continue.
+ */
+export function isEmbeddedAppendRefused(session: Pick<CreateAgentSessionResult["session"], "sessionManager">): boolean {
+	return session.sessionManager.getAppendIdentityMismatch() !== undefined;
+}
+
+/**
+ * Whether another live process holds a transcript open. `unknown` means the answer could not be
+ * had: no broker is running and the session index cannot decide (`broker_absent`: its
+ * registration predates recorded process incarnations, or the index could not be read), or the
+ * broker failed or did not answer in time (`broker_unavailable`).
+ */
+export type EmbeddedLiveOwner =
+	| { kind: "live" }
+	| { kind: "none" }
+	| { kind: "unknown"; reason: "broker_absent" | "broker_unavailable" };
+
+const LIVE_OWNER_ACTOR = { id: "embedding", namespace: "embedding-live-owner" };
+const LIVE_OWNER_TIMEOUT_MS = 1_000;
+
+/**
+ * The agent directory's running broker as a lifecycle client: one connection per request, no
+ * reconnects, each bounded by what is left of the caller's deadline. Undefined when no broker
+ * runs; reading the discovery file never starts, restarts or recovers one.
+ */
+async function runningBrokerClient(
+	agentDir: string,
+	timeoutMs: number,
+	remaining: () => number,
+): Promise<SessionLifecycleClient | undefined> {
+	const discovery: BrokerDiscovery | null = await readBrokerDiscovery(agentDir);
+	if (!discovery) return undefined;
+	const { url, token } = discovery;
+	return {
+		global: async (operation, request, options) => {
+			const connection = await SdkClient.connect(url, token, {
+				timeoutMs: remaining(),
+				reconnectAttempts: 0,
+			});
+			try {
+				return await connection.global(operation, request, {
+					...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+					timeoutMs: Math.min(options.timeoutMs ?? timeoutMs, remaining()),
+				});
+			} finally {
+				await connection.close().catch(() => {});
+			}
+		},
+	};
+}
+
+/**
+ * With no broker running, the session index still holds every CLI run's registration, but nothing
+ * keeps its liveness current. Read the session's latest registration from the index and observe
+ * that exact process the way the broker does (`observeProcess`, by pid and recorded start
+ * incarnation, `processIncarnation ?? hostIncarnation`): `alive` is live, `exited` is none, and
+ * `uncertain` (no incarnation recorded, or a process the probe cannot inspect) decides nothing. A
+ * row the broker itself would not act on, terminal-uncertain or ambiguous, decides nothing either.
+ * Reading takes the machine-global index lock within the caller's deadline; see
+ * `findEmbeddedLiveOwner` for what that does on disk.
+ */
+async function indexedLiveOwner(
+	agentDir: string,
+	sessionId: string,
+	remaining: () => number,
+): Promise<EmbeddedLiveOwner> {
+	const undecided = { kind: "unknown", reason: "broker_absent" } as const;
+	// No index: nothing has registered here. Opening one would create it, so a reader does not.
+	if (!(await sessionIndexPresent(agentDir))) return { kind: "none" };
+	const index = await new SessionIndex(agentDir).open(
+		sessionIndexStartupLockOptions(performance.now() + remaining(), AbortSignal.timeout(remaining())),
+	);
+	const row = index.listSessions(new Map(), new Set([sessionId])).sessions.find(item => item.sessionId === sessionId);
+	if (!row) return { kind: "none" };
+	if (row.terminalUncertain || row.ambiguous) return undecided;
+	if (row.terminal) return { kind: "none" };
+	switch (observeProcess(row.pid, row.processIncarnation ?? row.hostIncarnation)) {
+		case "alive":
+			return { kind: "live" };
+		case "exited":
+			return { kind: "none" };
+		default:
+			return undecided;
+	}
+}
+
+/**
+ * Ask the running SDK broker whether a live process holds `sessionId` open: any CLI run with a
+ * durable transcript (it registers in the session index at startup, whatever its mode or SDK
+ * hosting) or an owner the broker started. An embedding's own session, with SDK hosting off, is
+ * never reported. Bounded: it never starts, restarts or recovers a broker, makes one exact
+ * `session.list` lookup with a single connection and no reconnects, and answers `unknown` instead
+ * of waiting past `timeoutMs`, which covers reading the discovery file too (only its synchronous
+ * process-incarnation probe cannot be cut short). With a broker running it only reads.
+ *
+ * With no broker running, it reads the session's latest registration from the session index and
+ * observes that exact process the way the broker does, which covers a terminal started with
+ * `GJC_SDK_DISABLE=1` or one whose broker could not start. That is not a pure read: where an
+ * index exists it takes the machine-global index lock (within the same deadline), may create the
+ * index folder and set its permissions, replays the whole index, may append to or rotate the
+ * index's rejection audit file, and may create the agent directory's machine identity file. On a
+ * large index this costs about 100 to 250 ms. Where no index exists it answers `none` and writes
+ * nothing. A replay that outlives `timeoutMs` keeps the lock until it finishes.
+ * Advisory only: a process that opens the transcript after the answer is not seen.
+ * `client` replaces the agent directory's broker connection (tests, custom transports).
+ */
+export async function findEmbeddedLiveOwner(input: {
+	agentDir: string;
+	sessionId: string;
+	timeoutMs?: number;
+	client?: SessionLifecycleClient;
+}): Promise<EmbeddedLiveOwner> {
+	const timeoutMs = input.timeoutMs ?? LIVE_OWNER_TIMEOUT_MS;
+	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
+	const absent = { kind: "unknown", reason: "broker_absent" } as const;
+	// One deadline for the whole lookup, from reading the discovery file to the broker's answer. The
+	// discovery read's process-incarnation probe is synchronous, so the answer can come only once
+	// that probe returns; everything else stops counting at the deadline.
+	const deadline = Date.now() + timeoutMs;
+	const remaining = () => Math.max(1, deadline - Date.now());
+	const lookup = (async (): Promise<EmbeddedLiveOwner> => {
+		const client = input.client ?? (await runningBrokerClient(input.agentDir, timeoutMs, remaining));
+		if (!client) return indexedLiveOwner(input.agentDir, input.sessionId, remaining).catch(() => absent);
+		const listed = await new SessionLifecycleService(client).list({
+			actor: LIVE_OWNER_ACTOR,
+			capability: "session.list",
+			target: { resolveSessionId: input.sessionId },
+			timeoutMs: remaining(),
+		});
+		if (!listed.ok || "rows" in listed.result) return unavailable;
+		return listed.result.sessions.some(entry => entry.sessionId === input.sessionId && entry.live === true)
+			? { kind: "live" }
+			: { kind: "none" };
+	})().catch(() => unavailable);
+	return Promise.race([lookup, Bun.sleep(timeoutMs).then(() => unavailable)]);
+}
+
+/**
+ * What became of an idle-only close request. `not_closed` carries the code of the broker's answer:
+ * `busy` (the owner has work in progress), `close_refused` (the process was not started by the
+ * broker or refused the idle fence), `invalid_input` (a terminal with no SDK endpoint), `not_found`
+ * (nothing is registered for the session), and so on. `unknown` means no answer was had: no broker
+ * is running (`broker_absent`), or the request failed in transport or outlived `timeoutMs`
+ * (`broker_unavailable`), so the close may or may not still happen.
+ */
+export type EmbeddedIdleOwnerClose =
+	| { kind: "closed" }
+	| { kind: "not_closed"; code: string }
+	| { kind: "unknown"; reason: "broker_absent" | "broker_unavailable" };
+
+const IDLE_CLOSE_ACTOR = { id: "embedding", namespace: "embedding-idle-close" };
+const IDLE_CLOSE_TIMEOUT_MS = 3_000;
+
+/**
+ * Ask the running SDK broker to close the owner process it started for `sessionId`, only if that
+ * owner is idle. For an embedding that used to reach a transcript through a broker-started owner
+ * and now opens it itself: the leftover owner keeps `findEmbeddedLiveOwner` answering `live` with
+ * nobody using it. The broker refuses instead of acting when the owner has any work in progress
+ * (`busy`), and never signals or closes a process it did not start, such as a terminal
+ * (`close_refused`). Bounded like `findEmbeddedLiveOwner`: it never starts, restarts or recovers a
+ * broker, makes one `session.close` request with a single connection and no reconnects, and
+ * answers `unknown` instead of waiting past `timeoutMs` (default 3 s). Only `closed` is an
+ * answer about the owner; after anything else, ask `findEmbeddedLiveOwner` again.
+ * `client` replaces the agent directory's broker connection (tests, custom transports).
+ */
+export async function closeEmbeddedIdleOwner(input: {
+	agentDir: string;
+	sessionId: string;
+	timeoutMs?: number;
+	client?: SessionLifecycleClient;
+}): Promise<EmbeddedIdleOwnerClose> {
+	const timeoutMs = input.timeoutMs ?? IDLE_CLOSE_TIMEOUT_MS;
+	const unavailable = { kind: "unknown", reason: "broker_unavailable" } as const;
+	const deadline = Date.now() + timeoutMs;
+	const remaining = () => Math.max(1, deadline - Date.now());
+	const request = (async (): Promise<EmbeddedIdleOwnerClose> => {
+		const client = input.client ?? (await runningBrokerClient(input.agentDir, timeoutMs, remaining));
+		if (!client) return { kind: "unknown", reason: "broker_absent" };
+		const closed = await new SessionLifecycleService(client).close({
+			actor: IDLE_CLOSE_ACTOR,
+			capability: "session.close",
+			// A fresh key per request: a retry after `busy` must reach the owner, not replay the refusal.
+			requestKey: `embedding-idle-close:${crypto.randomUUID()}`,
+			target: { sessionId: input.sessionId, ifIdle: true },
+			timeoutMs: remaining(),
+		});
+		if (closed.ok) return { kind: "closed" };
+		// A refusal the broker decided on is an answer; a transport failure says nothing either way.
+		if (closed.certainty === "terminal" || closed.error.code === "busy")
+			return { kind: "not_closed", code: closed.error.code };
+		return unavailable;
+	})().catch(() => unavailable);
+	return Promise.race([request, Bun.sleep(timeoutMs).then(() => unavailable)]);
+}
+
+/** The embedding must first release its writer and remove the durable catalog reference. */
+export async function deleteEmbeddedSession(file: string, options?: { managed: true }): Promise<void> {
+	if (options?.managed && (await Bun.file(file).exists())) await SessionManager.deleteManagedCandidate(file);
+	// Managed deletion tombstones the verified name before artifact cleanup.
+	await new FileSessionStorage().deleteSessionWithArtifacts(file);
+}
+
+/** Process-entrypoint cleanup keeps the SDK's signal-exit authority intact. */
+export function registerEmbeddedProcessCleanup(name: string, cleanup: () => Promise<void>): () => void {
+	usePostmortemSignalExitAuthority();
+	return postmortem.register(name, cleanup);
+}

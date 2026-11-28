@@ -1,0 +1,507 @@
+import { afterEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Model } from "@gajae-code/ai/core";
+import {
+	type CreateAgentSessionResult,
+	createAgentSession,
+	SdkPreferenceControls,
+	SdkPreferenceError,
+	Settings,
+} from "@gajae-code/coding-agent/sdk";
+import { createDesktopPreferencesController } from "../src/preferences-controls";
+
+const provider = "desktop-preferences-fixture";
+const selector = (id: string) => `${provider}/${id}`;
+const keyless = "desktop-preferences-keyless";
+const local = "desktop-preferences-local";
+const model: Model = {
+	id: "base",
+	name: "Base",
+	provider,
+	api: "openai-completions",
+	baseUrl: "https://example.invalid",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 4096,
+	maxTokens: 1024,
+};
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+	vi.restoreAllMocks();
+	while (cleanups.length) await cleanups.pop()?.();
+});
+
+/** Public factory and SDK controls; all configuration files are isolated fixture input. */
+async function fixture(durable = false) {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-sdk-preferences-"));
+	const agentDir = path.join(directory, "agent");
+	await fs.mkdir(agentDir);
+	await Bun.write(
+		path.join(agentDir, "model-presets", "control.json"),
+		JSON.stringify({ version: 1, disabled: true }),
+	);
+	await Bun.write(
+		path.join(agentDir, "models.yml"),
+		JSON.stringify({
+			providers: {
+				[provider]: {
+					api: model.api,
+					baseUrl: model.baseUrl,
+					apiKey: "fixture-key",
+					models: [
+						{ id: "base", name: "Base", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 1024 },
+						{
+							id: "nested/next",
+							name: "Next",
+							reasoning: false,
+							input: ["text"],
+							contextWindow: 4096,
+							maxTokens: 1024,
+						},
+					],
+				},
+				// Configured to read its key from the credential store, which holds none.
+				[keyless]: {
+					api: model.api,
+					baseUrl: model.baseUrl,
+					credential: "store",
+					models: [
+						{ id: "base", name: "Base", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 1024 },
+					],
+				},
+				// An endpoint that needs no credential.
+				[local]: {
+					api: model.api,
+					baseUrl: model.baseUrl,
+					auth: "none",
+					models: [
+						{ id: "base", name: "Base", reasoning: false, input: ["text"], contextWindow: 4096, maxTokens: 1024 },
+					],
+				},
+			},
+			profiles: {
+				"desk-a": {
+					display_name: "Desktop A",
+					required_providers: [provider],
+					model_mapping: { default: selector("base") },
+				},
+				"desk-b": {
+					display_name: "Desktop B",
+					required_providers: [provider],
+					model_mapping: { default: selector("nested/next"), executor: selector("base") },
+				},
+				// A provider nothing configures, and one configured without a credential.
+				"desk-unconfigured": {
+					display_name: "Desktop Unconfigured",
+					required_providers: ["desktop-preferences-absent"],
+					model_mapping: { default: "desktop-preferences-absent/base" },
+				},
+				"desk-keyless": {
+					display_name: "Desktop Keyless",
+					required_providers: [keyless],
+					model_mapping: { default: `${keyless}/base` },
+				},
+				"desk-local": {
+					display_name: "Desktop Local",
+					required_providers: [local],
+					model_mapping: { default: `${local}/base` },
+				},
+				// Both providers are required; only one has a credential.
+				"desk-partial": {
+					display_name: "Desktop Partial",
+					required_providers: [provider, "desktop-preferences-absent"],
+					model_mapping: { default: selector("base") },
+				},
+				// The provider has a credential, but the default model is not in its catalog.
+				"desk-unresolved": {
+					display_name: "Desktop Unresolved",
+					required_providers: [provider],
+					model_mapping: { default: selector("absent") },
+				},
+			},
+		}),
+	);
+	const settings = durable
+		? await Settings.loadForScope({ cwd: directory, agentDir })
+		: Settings.isolated({ "compaction.enabled": false });
+	let result: CreateAgentSessionResult | undefined;
+	cleanups.push(async () => {
+		await result?.session.dispose();
+		await settings.close();
+		await fs.rm(directory, { recursive: true, force: true });
+	});
+	result = await createAgentSession({
+		cwd: directory,
+		agentDir,
+		settings,
+		model,
+		providerSessionId: crypto.randomUUID(),
+		agentId: `preferences-${crypto.randomUUID()}`,
+		disableExtensionDiscovery: true,
+		extensions: [],
+		skills: [],
+		rules: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		workspaceTree: { rootPath: directory, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+		enableMcpAutoload: false,
+		enableLsp: false,
+		toolNames: [],
+		skipPythonPreflight: true,
+		deferOptionalModelRefresh: true,
+		deferModelProfileActivation: true,
+		notificationHostModeSupported: false,
+		sdkHostModeSupported: false,
+	});
+	const controller = createDesktopPreferencesController(result.session);
+	cleanups.push(async () => {
+		controller.dispose();
+	});
+	return { directory, agentDir, settings, session: result.session, controller };
+}
+
+describe("desktop SDK preferences delegation", () => {
+	test("lists every profile with the availability the managed profile list reports", async () => {
+		const { controller, session } = await fixture();
+		expect(session.modelRegistry.getError()).toBeUndefined();
+		const profiles = (await controller.read()).profiles;
+		// Built-in presets are listed too; their availability depends on the environment.
+		expect(
+			profiles.filter(profile => profile.id.startsWith("desk-")).map(profile => [profile.id, profile.available]),
+		).toEqual([
+			["desk-a", true],
+			["desk-b", true],
+			["desk-keyless", false],
+			// No credential is needed, so the profile can be selected.
+			["desk-local", true],
+			["desk-partial", false],
+			["desk-unconfigured", false],
+			// Its provider has a credential, but selecting it could not resolve the default model.
+			["desk-unresolved", false],
+		]);
+		expect(await controller.listProfiles()).toEqual(profiles);
+	});
+	test("preferences.get leaves stored credentials and the session's credential choice untouched", async () => {
+		const { controller, session, agentDir } = await fixture();
+		const auth = session.modelRegistry.authStorage;
+		// Two stored keys: resolving one would record it as this session's choice.
+		await auth.set(keyless, [
+			{ type: "api_key", key: "keyless-one" },
+			{ type: "api_key", key: "keyless-two" },
+		]);
+		const sessionId = session.credentialSessionId;
+		const snapshot = async () => {
+			const files: Array<[string, string]> = [];
+			for (const name of (await fs.readdir(agentDir, { recursive: true })).sort()) {
+				const file = path.join(agentDir, name);
+				if (!(await fs.stat(file)).isFile()) continue;
+				files.push([name, Buffer.from(await Bun.file(file).arrayBuffer()).toString("base64")]);
+			}
+			return files;
+		};
+		const resolving = [
+			vi.spyOn(auth, "getApiKey"),
+			vi.spyOn(auth, "getApiKeyWithCredentialRowId"),
+			vi.spyOn(auth, "peekApiKey"),
+		];
+		const before = await snapshot();
+		const profiles = (await controller.read()).profiles;
+		expect(profiles.find(profile => profile.id === "desk-keyless")?.available).toBe(true);
+		for (const spy of resolving) expect(spy).not.toHaveBeenCalled();
+		expect(auth.getSessionCredentialType(keyless, sessionId)).toBeUndefined();
+		expect(auth.getSessionCredentialType(provider, sessionId)).toBeUndefined();
+		expect(await snapshot()).toEqual(before);
+	});
+	test("a listed profile selects for the session exactly when it is listed available", async () => {
+		const outcomes: Array<[string, boolean, boolean]> = [];
+		for (const id of [
+			"desk-a",
+			"desk-keyless",
+			"desk-local",
+			"desk-partial",
+			"desk-unconfigured",
+			"desk-unresolved",
+		]) {
+			const { controller } = await fixture();
+			const listed = (await controller.read()).profiles.find(profile => profile.id === id);
+			const selected = await controller.apply({ type: "profile.select", name: id, scope: "session" }).then(
+				() => true,
+				() => false,
+			);
+			outcomes.push([id, listed?.available ?? false, selected]);
+		}
+		expect(outcomes).toEqual([
+			["desk-a", true, true],
+			["desk-keyless", false, false],
+			["desk-local", true, true],
+			["desk-partial", false, false],
+			["desk-unconfigured", false, false],
+			["desk-unresolved", false, false],
+		]);
+	});
+	test("maps session/default profile scopes and reads the canonical SDK result", async () => {
+		const { controller, session, settings } = await fixture(true);
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile");
+		expect(await controller.apply({ type: "profile.select", name: "desk-b", scope: "session" })).toMatchObject({
+			applied: "profile.select",
+			profileId: "desk-b",
+			scope: "session",
+			durability: "session",
+		});
+		expect(select).toHaveBeenLastCalledWith({ name: "desk-b", scope: "session" });
+		expect(session.getActiveModelProfile()).toBe("desk-b");
+		expect((await controller.read()).profiles.find(item => item.id === "desk-b")).toMatchObject({
+			name: "Desktop B",
+			active: true,
+			group: "CUSTOM",
+			groupRank: null,
+		});
+		expect(await controller.apply({ type: "profile.select", name: "desk-a", scope: "default" })).toMatchObject({
+			profileId: "desk-a",
+			scope: "default",
+			durability: "persisted",
+		});
+		expect(select).toHaveBeenLastCalledWith({ name: "desk-a", scope: "global" });
+		expect(settings.getGlobal("modelProfile.default")).toBe("desk-a");
+		expect((await controller.read()).profiles.find(item => item.id === "desk-a")?.default).toBe(true);
+	});
+
+	test("delegates nested default model identities and task-role ownership/clear", async () => {
+		const { controller, session } = await fixture(true);
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectModel");
+		const role = vi.spyOn(SdkPreferenceControls.prototype, "setRole");
+		await controller.apply({ type: "role.set", role: "default", modelId: selector("nested/next") });
+		expect(select).toHaveBeenCalledWith({ provider, modelId: "nested/next", scope: "global" });
+		expect(session.model?.id).toBe("nested/next");
+		await controller.apply({ type: "role.set", role: "planner", modelId: selector("base") });
+		expect(role).toHaveBeenLastCalledWith({ role: "planner", modelId: selector("base") });
+		expect((await controller.read()).roles.find(item => item.id === "planner")).toMatchObject({
+			configured: true,
+			model: { id: "base", provider },
+			scope: "session",
+			canClear: { available: true },
+		});
+		await controller.apply({ type: "role.set", role: "planner", modelId: null });
+		expect(role).toHaveBeenLastCalledWith({ role: "planner", modelId: null });
+		expect((await controller.read()).roles.find(item => item.id === "planner")?.canClear.available).toBe(false);
+	});
+
+	test("SDK role readback is authoritative, not a reconstructed settings override", async () => {
+		const { controller } = await fixture();
+		const readRoles = vi.spyOn(SdkPreferenceControls.prototype, "readRoles");
+		// A real role write exercises both SDK-owned source and effective-resolution mapping.
+		await controller.apply({ type: "role.set", role: "architect", modelId: selector("nested/next") });
+		const dto = await controller.read();
+		expect(readRoles).toHaveBeenCalled();
+		expect(dto.roles.find(item => item.id === "architect")).toMatchObject({
+			configured: true,
+			model: { id: "nested/next", provider, name: "Next" },
+			canClear: { available: true },
+		});
+		dto.profiles[0]!.name = "caller mutation";
+		expect((await controller.read()).profiles[0]!.name).not.toBe("caller mutation");
+		expect(JSON.stringify(dto)).not.toContain("fixture-key");
+		expect(JSON.stringify(dto)).not.toContain("example.invalid");
+	});
+
+	test("malformed and unsupported wire actions never enter SDK mutation", async () => {
+		const { controller } = await fixture();
+		const profile = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile");
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectModel");
+		const role = vi.spyOn(SdkPreferenceControls.prototype, "setRole");
+		const patch = vi.spyOn(SdkPreferenceControls.prototype, "patchConfig");
+		for (const action of [
+			null,
+			[],
+			{},
+			{ type: "profile.select", name: "desk-a", scope: "global" },
+			{ type: "profile.select", name: "desk-a", scope: "session", owner: "caller" },
+			{ type: "role.set", role: "executor", modelId: false },
+			{ type: "role.set", role: "default", modelId: "unqualified" },
+			{ type: "sampling.set", parameter: "temperature", value: Number.NaN, scope: "session" },
+		])
+			await expect(controller.apply(action)).rejects.toMatchObject({ code: "invalid_input" });
+		for (const action of [
+			{ type: "role.set", role: "image", modelId: selector("base") },
+			{ type: "role.set", role: "default", modelId: null },
+			{ type: "sampling.set", parameter: "temperature", value: 0.5, scope: "session" },
+		])
+			await expect(controller.apply(action)).rejects.toMatchObject({ code: "unsupported_preference" });
+		expect(profile).not.toHaveBeenCalled();
+		expect(select).not.toHaveBeenCalled();
+		expect(role).not.toHaveBeenCalled();
+		expect(patch).not.toHaveBeenCalled();
+	});
+
+	test("accessor input is rejected without evaluating caller code", async () => {
+		const { controller } = await fixture();
+		const read = vi.fn(() => "desk-a");
+		const action = { type: "profile.select", scope: "session" };
+		Object.defineProperty(action, "name", { enumerable: true, get: read });
+		await expect(controller.apply(action)).rejects.toMatchObject({ code: "invalid_input" });
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test("SDK validation, persistence, busy and stale failures remain refusals", async () => {
+		const { controller } = await fixture();
+		await expect(
+			controller.apply({ type: "profile.select", name: "missing", scope: "session" }),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		await expect(
+			controller.apply({ type: "profile.select", name: "desk-a", scope: "default" }),
+		).rejects.toMatchObject({ code: "unsupported_preference" });
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile");
+		for (const code of ["preference_busy", "stale_preferences", "preference_failed"] as const) {
+			select.mockRejectedValueOnce(new SdkPreferenceError(code, "SDK refusal"));
+			await expect(
+				controller.apply({ type: "profile.select", name: "desk-a", scope: "session" }),
+			).rejects.toMatchObject({ code });
+		}
+		controller.dispose();
+		await expect(
+			controller.apply({ type: "profile.select", name: "desk-a", scope: "session" }),
+		).rejects.toMatchObject({ code: "stale_preferences" });
+	});
+
+	test("SDK admission rejects overlapping preference operations without desktop reservations", async () => {
+		const { controller, session } = await fixture();
+		const available = vi.spyOn(session, "getAvailableModels");
+		const pending = controller.apply({ type: "role.set", role: "executor", modelId: selector("base") });
+		// SDK admission is synchronous; its real model preflight yields before mutation.
+		expect(available).toHaveBeenCalled();
+		await expect(
+			controller.apply({ type: "profile.select", name: "desk-b", scope: "session" }),
+		).rejects.toMatchObject({ code: "preference_busy" });
+		await expect(pending).resolves.toMatchObject({ applied: "role.set", role: "executor" });
+	});
+
+	test("disposing during SDK preflight fences late mutation", async () => {
+		const { controller, session } = await fixture();
+		const available = vi.spyOn(session, "getAvailableModels");
+		const pending = controller.apply({ type: "role.set", role: "planner", modelId: selector("base") });
+		expect(available).toHaveBeenCalled();
+		controller.dispose();
+		await expect(pending).rejects.toMatchObject({ code: "stale_preferences" });
+		expect(session.hasSessionAgentModelOverride("planner")).toBe(false);
+	});
+
+	test("retirement after a real global profile commit still reports it applied, without stale readback", async () => {
+		const { controller, directory, agentDir, settings } = await fixture(true);
+		const selectProfile = SdkPreferenceControls.prototype.selectProfile;
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile").mockImplementation(async function (
+			this: SdkPreferenceControls,
+			input,
+		) {
+			const result = await selectProfile.call(this, input);
+			expect(result).toMatchObject({ applied: true, durability: "persisted" });
+			controller.dispose();
+			return result;
+		});
+		// The change applied, so it is reported as applied; only the read-back state is missing.
+		expect(await controller.apply({ type: "profile.select", name: "desk-b", scope: "default" })).toEqual({
+			applied: "profile.select",
+			profileId: "desk-b",
+			scope: "default",
+			durability: "persisted",
+			preferences: null,
+			outcome: { scope: "global", applied: true, durability: "persisted", application: "session" },
+		});
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(settings.getGlobal("modelProfile.default")).toBe("desk-b");
+		const reopened = await Settings.loadForScope({ cwd: directory, agentDir });
+		try {
+			expect(reopened.getGlobal("modelProfile.default")).toBe("desk-b");
+		} finally {
+			await reopened.close();
+		}
+		await expect(controller.read()).rejects.toThrow("Session preferences have been closed.");
+	});
+
+	test("a readback failure after an applied change reports it applied without exposing backend errors", async () => {
+		const { controller } = await fixture(true);
+		const selectModel = SdkPreferenceControls.prototype.selectModel;
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectModel").mockImplementation(async function (
+			this: SdkPreferenceControls,
+			input,
+		) {
+			const result = await selectModel.call(this, input);
+			expect(result).toMatchObject({ applied: true, durability: "persisted" });
+			vi.spyOn(SdkPreferenceControls.prototype, "readRoles").mockImplementation(() => {
+				throw new Error("private backend path and fixture-key");
+			});
+			return result;
+		});
+		const result = await controller.apply({ type: "role.set", role: "default", modelId: selector("nested/next") });
+		expect(result).toMatchObject({
+			applied: "role.set",
+			role: "default",
+			preferences: null,
+			outcome: { scope: "global", applied: true, durability: "persisted" },
+		});
+		expect(JSON.stringify(result)).not.toContain("private backend");
+		expect(JSON.stringify(result)).not.toContain("fixture-key");
+		expect(select).toHaveBeenCalledTimes(1);
+	});
+
+	test("committed-unapplied and uncertain outcomes are not fabricated success", async () => {
+		const { controller } = await fixture();
+		const select = vi.spyOn(SdkPreferenceControls.prototype, "selectProfile");
+		for (const outcome of [
+			{
+				scope: "global",
+				durability: "persisted",
+				applied: false,
+				application: "committed-unapplied",
+				committedVersion: 7,
+			},
+			{ scope: "global", durability: "unknown", applied: false, application: "recovery-required" },
+		] as const) {
+			select.mockResolvedValueOnce({ ...outcome, profileId: "desk-a" });
+			await expect(
+				controller.apply({ type: "profile.select", name: "desk-a", scope: "default" }),
+			).rejects.toMatchObject({ code: "preference_failed", outcome });
+		}
+	});
+
+	test("global/project config scopes retain SDK settings versus next-session outcomes", async () => {
+		const { controller, settings } = await fixture(true);
+		const patch = vi.spyOn(SdkPreferenceControls.prototype, "patchConfig");
+		const global = await controller.writeConfig({ scope: "global", patch: { "compaction.enabled": true } });
+		expect(patch).toHaveBeenLastCalledWith({ scope: "global", patch: { "compaction.enabled": true } });
+		expect(global).toMatchObject({
+			scope: "global",
+			durability: "persisted",
+			applied: true,
+			application: "settings",
+		});
+		expect(settings.getGlobal("compaction.enabled")).toBe(true);
+		const project = await controller.writeConfig({ scope: "project", patch: { "compaction.enabled": false } });
+		expect(patch).toHaveBeenLastCalledWith({ scope: "project", patch: { "compaction.enabled": false } });
+		expect(project).toMatchObject({
+			scope: "project",
+			durability: "persisted",
+			applied: false,
+			application: "next-session",
+		});
+		expect(settings.get("compaction.enabled")).toBe(true);
+	});
+
+	test("scoped SDK config writes stay session-owned and restore on disposal", async () => {
+		const { controller, settings } = await fixture();
+		const before = settings.get("compaction.enabled");
+		const patch = vi.spyOn(SdkPreferenceControls.prototype, "patchConfig");
+		const result = await controller.writeConfig({ scope: "session", patch: { "compaction.enabled": !before } });
+		expect(patch).toHaveBeenCalledWith({ scope: "session", patch: { "compaction.enabled": !before } });
+		expect(result).toMatchObject({ applied: true, durability: "session", scope: "session", application: "settings" });
+		expect(settings.get("compaction.enabled")).toBe(!before);
+		await expect(
+			controller.writeConfig({ scope: "session", patch: { "modelProfile.default": "desk-a" } }),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		controller.dispose();
+		expect(settings.get("compaction.enabled")).toBe(before);
+	});
+});

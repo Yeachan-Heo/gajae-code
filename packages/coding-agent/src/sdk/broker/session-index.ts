@@ -302,6 +302,15 @@ const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
 const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.jsonl");
+/** Whether the agent directory has a session index on disk; a reader that finds none creates none. */
+export async function sessionIndexPresent(agentDir: string): Promise<boolean> {
+	const present = (file: string) =>
+		fs.stat(file).then(
+			() => true,
+			() => false,
+		);
+	return (await present(logFor(agentDir))) || (await present(snapshotFor(agentDir)));
+}
 /**
  * Idle-poll change stamp over the two index files (#4689). A polling reader
  * that has already replayed the index must be able to prove "nothing changed"

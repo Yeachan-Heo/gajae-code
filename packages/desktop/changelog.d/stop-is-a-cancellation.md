@@ -1,0 +1,2 @@
+### Fixed
+- Pressing Stop during a running turn now records the prompt, and any steer or follow-up the stopped run had already taken, as cancelled instead of "Prompt outcome unknown", so no recovery card or error banner appears for input that is already in the conversation. A Stop that lands before a prompt reaches the conversation, including while an extension is still checking the message, returns its text to the composer instead of letting it run afterwards, and closing the workspace mid-run still reports an unknown outcome.

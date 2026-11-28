@@ -1,0 +1,2 @@
+### Fixed
+- A conversation the app has open no longer fails every message after the terminal adds to it. Selecting it or sending the next message reloads it with the terminal's turns, and the message continues from them. If the terminal writes at the very moment the app does, the app says in plain words that the conversation changed elsewhere, puts an unsent message back in the composer and shows the reloaded conversation. A conversation with a running turn or queued messages is never reloaded underneath them; it is reloaded once that work has finished.

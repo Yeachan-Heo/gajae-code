@@ -20,19 +20,19 @@ bun add @gajae-code/coding-agent
 
 Core exports for embedders:
 
-- `createAgentSession`
-- `SessionManager`
-- `Settings`
-- `AuthStorage`
-- `ModelRegistry`
-- `discoverAuthStorage`
+- `createAgentSession` for a minimally configured session
+- `createEmbeddedAgentSession` for SDK-owned local storage, configuration and extension initialization
+- `listEmbeddedProjectSessions`, `forkEmbeddedSession`, `deleteEmbeddedSession` for local embedding storage
+- `captureSessionView`, `restoreSessionView`, `SdkSessionView` for exact local conversation presentation
+- `Settings` and `getSettingsCatalog` for configuration observations
+- `createSdkPreferenceControls`, `createSdkComposerObservation`, `createActivityControls`, `createSdkOperatorControls`, `SideConversationControls`, `AuthorizationControls`, `createSdkDiffObservation` for session-owned controls
 - Discovery helpers for retained context/prompt surfaces (`discoverContextFiles`, `discoverPromptTemplates`)
 - Tool factory surface (`createTools`, `BUILTIN_TOOLS`, tool classes)
 
 ## Quick start (auto-discovery defaults)
 
 ```ts
-import { createAgentSession } from "@gajae-code/coding-agent";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 
 const { session, modelFallbackMessage } = await createAgentSession();
 
@@ -286,13 +286,15 @@ a cancellation request is not proof that extension work was cleaned up.
 ### File-backed (default)
 
 ```ts
-import { createAgentSession, SessionManager } from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession } from "@gajae-code/coding-agent/sdk";
 
-const { session } = await createAgentSession({
-  sessionManager: SessionManager.create(process.cwd()),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory, agentDir: configurationDirectory, storage: { managed: true },
 });
 
-console.log(session.sessionFile); // absolute .jsonl path
+console.log(embedded.session.sessionFile); // absolute .jsonl path
+await embedded.session.dispose();
+await embedded.releaseResources();
 ```
 
 - Persists conversation/messages/state deltas to session files.
@@ -302,13 +304,15 @@ console.log(session.sessionFile); // absolute .jsonl path
 ### In-memory
 
 ```ts
-import { createAgentSession, SessionManager } from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession } from "@gajae-code/coding-agent/sdk";
 
-const { session } = await createAgentSession({
-  sessionManager: SessionManager.inMemory(),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory, agentDir: configurationDirectory, storage: { persist: false },
 });
 
-console.log(session.sessionFile); // undefined
+console.log(embedded.session.sessionFile); // undefined
+await embedded.session.dispose();
+await embedded.releaseResources();
 ```
 
 - No filesystem persistence.
@@ -318,11 +322,20 @@ console.log(session.sessionFile); // undefined
 ### Resume/open/list helpers
 
 ```ts
-import { SessionManager } from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession, listEmbeddedProjectSessions } from "@gajae-code/coding-agent/sdk";
 
-const recent = await SessionManager.continueRecent(process.cwd());
-const listed = await SessionManager.list(process.cwd());
-const opened = listed[0] ? await SessionManager.open(listed[0].path) : null;
+const inventory = await listEmbeddedProjectSessions({
+  cwd: projectDirectory, agentDir: configurationDirectory, directory: transcriptDirectory,
+});
+const candidate = inventory.managed[0];
+if (candidate) {
+  const opened = await createEmbeddedAgentSession({
+    cwd: projectDirectory, agentDir: configurationDirectory,
+    storage: { managed: true, file: candidate.path },
+  });
+  await opened.session.dispose();
+  await opened.releaseResources();
+}
 ```
 
 ### Sessions open in another process
@@ -375,32 +388,197 @@ These are in-process controls, not additional transport mutation authority.
 
 Call `session.generateAutoSessionTitle(text, { signal })` independently at first accepted input, before its first user message is recorded. It reuses SDK model/credential/obfuscation logic and returns `applied`, `skipped` (with a reason), or `failed`; it never changes prompt delivery. Do not seed a display placeholder using a user-sourced name. Existing/manual names win, duplicate generation is coalesced, and session identity/lifecycle changes fence late completion. Hosts must abort their signal synchronously before retiring/replacing the live owner and must recheck ownership before publishing derived metadata. A successful result has committed the SDK title; a redundant application catalog cache can be reconciled from it on reopening. No generation transport operation is implicitly admitted.
 
-### Explicit wiring
+### Explicit local embedding ownership
 
 ```ts
 import {
-  createAgentSession,
-  discoverAuthStorage,
-  ModelRegistry,
-  SessionManager,
-} from "@gajae-code/coding-agent";
+  createEmbeddedAgentSession,
+  createSdkPreferenceControls,
+} from "@gajae-code/coding-agent/sdk";
 
-const authStorage = await discoverAuthStorage();
-const modelRegistry = new ModelRegistry(authStorage);
-await modelRegistry.refresh();
-
-const available = modelRegistry.getAvailable();
-if (available.length === 0)
-  throw new Error("No authenticated models available");
-
-const { session } = await createAgentSession({
-  authStorage,
-  modelRegistry,
-  model: available[0],
-  thinkingLevel: "medium",
-  sessionManager: SessionManager.inMemory(),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory,
+  agentDir: configurationDirectory,
+  storage: { managed: true }, // shared terminal/SDK store with verified writer admission
+  // An intentionally private local store may use { directory: transcriptDirectory }.
+  // To reopen, add storage.file. For a non-catalog control owner use
+  // storage: { persist: false }, controlOnly: true.
 });
+const preferences = createSdkPreferenceControls(embedded.session);
+try {
+  const outcome = await preferences.selectModel({
+    provider: "anthropic", modelId: "selected-model", scope: "session",
+  });
+  if (!outcome.applied) throw new Error(`Selection requires recovery: ${outcome.application}`);
+} finally {
+  preferences.dispose();
+  await embedded.session.dispose();
+  await embedded.releaseResources();
+}
 ```
+
+`storage: { managed: true }` resolves the canonical workspace destination inside the SDK;
+applications do not construct managed-writer security contexts. Use
+`forkEmbeddedSession({ file, cwd, agentDir, managed: true })` and
+`deleteEmbeddedSession(file, { managed: true })` for shared transcripts. Verified
+managed deletion precedes tombstone-protected derived-artifact cleanup. A catalog
+row whose transcript was already removed still requires live-owner disposal before
+being forgotten.
+
+`embedded.branch(entryId)` creates the native selected-entry successor and renews
+revision authority only after that factory-owned transition settles. Calling native
+identity-changing operations outside this binding does not renew its authority.
+
+`embedded.revise({ entryId, action: "edit", body, images? }, observers?)` edits an
+exact prompt within the same factory-owned session. `action: "select"` selects an
+exact answered revision without issuing another provider request; remembered
+continuations remain SDK-owned. `getEmbeddedPromptRevision(session, entryId)`
+returns detached previous/next revision metadata for the existing app controls.
+The binding accepts no caller session ID or run capability. Optional acceptance
+observers join the canonical preflight/journal boundary; they do not replace native
+identity, cancellation, attribution or competing-prompt checks.
+
+For exact presentation across session recreation, persist the public
+`captureSessionView(session)` result in the application's existing catalog:
+`SdkSessionView = { sessionId: string; leafEntryId: string | null }`. Capture only
+settled, idle sessions after transcript persistence, and save before acknowledging
+view-changing operations. On reopening the same admitted transcript, call
+`await restoreSessionView(session, savedView)` before publishing the session or
+replacing catalog metadata. Restore selects that exact cursor without provider
+requests or navigation hooks; it does not infer a continuation, edit the transcript,
+or fall back to its latest branch. Invalid, missing or foreign targets fail explicitly;
+retain the saved descriptor and dispose an unpublished candidate on failure.
+
+The selector is application-owned presentation metadata, not writer admission or
+control authority. Keep transcript identity distinct from the application's catalog
+ID. Avoid initially tracking an empty new transcript: saving a null cursor there
+would hide a later first turn written by the terminal. Once tracking begins, null
+means the intentionally viewed empty root. Refresh the descriptor after settled
+prompts, revision selection and other transcript mutations, including settled
+teardown; a busy capture must never replace the previous saved intent.
+
+A saved view can go stale when another surface continues the transcript. Save the
+`held` id from `await readEmbeddedTranscriptTail(session)` together with the view.
+On reopen, restore the view only when the transcript's `committed` tail still equals
+that saved id; otherwise stay where the transcript opened, at its newest entry, so the
+other surface's turns are visible and the next prompt continues them. A view saved without
+a tail has no such evidence: restore it unless its position is a strict ancestor of the
+`committed` tail (`isEmbeddedAncestor(parentOf, leafEntryId, committed)`, where `parentOf`
+returns an entry's `parentId`; the empty root counts as an ancestor of every entry). A strict
+ancestor was the end of the transcript when the view was saved, so what follows it was
+appended later; a position on another branch was a deliberate choice and is restored. While a session
+is open, `committed !== held` means another process appended after this session read
+the file. `isEmbeddedAppendRefused(session)` reports the store's lasting refusal of a
+stale writer; reopen the transcript to continue. Both read only; neither changes the
+session's cursor, entries or writer state. A repeat `readEmbeddedTranscriptTail` call on
+the same session costs one `stat`: it reuses the previous full read while the file's device,
+inode, size, modification and change times are unchanged and that read held the tail. Any
+write changes one of them, so the session's own appends, another process's appends and a
+same-size rewrite (even one that restores the modification time) are read in full again.
+A read taken within 10 ms of the file's last change (2 s when the filesystem reports
+whole-millisecond times) is not reused, because a write in the same timestamp tick could
+leave every field equal.
+
+To show a conversation the application does not hold open, for example one it released
+so another surface could continue it, call `await readEmbeddedTranscriptHistory(file, leaf?)`.
+It parses the transcript without opening a session, taking a writer or rewriting the file, and
+returns `{ sessionId, tail, leafId, messages }`. Pass the saved view as
+`{ entryId: view.leafEntryId, whenTail: savedHeldTail }` to show the same position a reopen
+would: the saved entry while `whenTail` is still the newest entry, otherwise the newest entry.
+Without `whenTail`, the saved entry is shown unless it is a strict ancestor of the newest entry,
+the same rule as above. It returns `undefined` for an absent, oversized or
+unreadable file. The result is display data only; reopen the transcript to continue it.
+
+`createEmbeddedAgentSession` refuses a transcript whose recorded directory is not the `cwd` it
+is given ("Session project does not match catalog"). It compares directories, not spellings:
+a terminal on macOS records `/var/...` or `/tmp/...` for a project under `/private`, and a
+terminal started from a symlinked folder records that folder, and both open for the real path.
+An embedding that lists transcripts for a project (`listEmbeddedProjectSessions`) should admit
+exactly those for which `pathIdentityKey(recordedCwd) === pathIdentityKey(projectPath)` holds
+(`pathIdentityKey` is exported by `@gajae-code/utils`). That is the same test the factory applies,
+so a listed transcript always opens.
+
+Before opening a writer for a transcript another surface may hold, an embedding can call
+`await findEmbeddedLiveOwner({ agentDir, sessionId })`. It asks the agent directory's running
+SDK broker, with one exact `session.list` lookup over a single connection, whether a live
+process holds that transcript open, and answers `{ kind: "live" }`, `{ kind: "none" }` or
+`{ kind: "unknown", reason }`. Every CLI run with a durable transcript registers its session in
+the agent directory's session index at startup, whatever its mode (interactive, `-p`, RPC; not
+ACP) and with or without `GJC_SDK_DISABLE=1`, and owners the broker started are registered too;
+a running broker reports each of them as live while its process is. An embedding's own session
+(created with SDK hosting off, as `createEmbeddedAgentSession` callers do) registers nothing and
+is never reported. The helper never starts, restarts or recovers a broker. With no broker
+running, nothing keeps the index's liveness current, so it reads the session's latest
+registration from the index itself and observes that exact process the way the broker does, by
+pid and the start incarnation the registration recorded (`processIncarnation`, or for an
+SDK-hosting terminal `hostIncarnation`): `live` while that process runs, `none` once it has
+exited (or its pid now belongs to another process) or when the session was never registered.
+`broker_absent` means the index could not decide: the process cannot be inspected (another
+user's, say), no incarnation was recorded, the row is one the broker itself would not act on
+(terminal-uncertain or ambiguous), or the index could not be read. This fallback is not a pure
+read: where an index exists it takes the machine-global index lock within the same deadline, may
+create the index folder and set its permissions, replays the whole index, may append to or
+rotate the index's rejection audit file and may create the agent directory's machine identity
+file; on a large index it costs about 100 to 250 ms, and a replay that outlives the deadline keeps
+the lock until it finishes. With no index on disk it answers `none` and writes nothing. A broker
+that fails or does not answer within `timeoutMs` (default 1 s) yields `broker_unavailable`. The bound covers the whole lookup, reading the discovery file included;
+only the synchronous check that the broker's process is still the one that wrote that file
+cannot be cut short, so on a slow system the answer can come that much later. The answer is advisory: a process that opens the transcript after the
+check, or a process that registered nothing (an ACP session, an older gjc), is not seen, so keep relying on the store's
+compare-and-append refusal (`isEmbeddedAppendRefused`) as the backstop. A turn the session
+starts by itself, for example when background work it owns completes, is preceded by no
+embedding request, so no check can run before it writes. The refusal covers the plain append
+path, which the embedding and a non-interactive CLI run (`gjc -p`) use: an append from a
+position older than the file's newest entry is refused (`managed_append_identity_mismatch`),
+and that writer reopens to continue. An interactive terminal appends through
+`appendMessageSharingSession` instead, which is not refused for a stale position: it commits
+its entry as a child of its own position, a sibling of what the embedding wrote since. The
+embedding's next append is then refused, a reopen lands on the terminal's entry (now the
+newest), and the embedding's turns from that window stay in the transcript on the other
+branch, where a view at the tail no longer shows them.
+
+An embedding that used to reach a transcript through the broker (a lifecycle `session.resume`,
+which starts an owner process that outlives the embedding's connection) and now opens it
+itself finds that leftover owner reported as `live` with nobody using it.
+`await closeEmbeddedIdleOwner({ agentDir, sessionId })` asks the running broker for an
+idle-fenced `session.close` of that session and answers `{ kind: "closed" }`,
+`{ kind: "not_closed", code }` or `{ kind: "unknown", reason }`. The owner itself decides: with
+a turn, queued input, a shell command, background jobs or any session transition in progress it
+answers `busy` and nothing happens. The broker sends that request only to a process it started
+itself, and an idle-fenced close is never sent as a signal to a process that has not accepted
+it, so a terminal that has the transcript open keeps running: one hosting an SDK endpoint is
+refused with `close_refused`, and one without an endpoint (a direct registration, generation 0)
+with `invalid_input`, because the broker's endpoint lookup rejects that generation. An owner
+that accepts the close and has not exited within the broker's 2 s close window is terminated
+as any close is (SIGTERM, then SIGKILL), possibly after this helper has stopped waiting. Like
+the lookup, the helper never starts, restarts or recovers a broker, uses a single connection
+with no reconnects, and stops waiting at `timeoutMs` (default 3 s). Only `closed` says anything
+about the owner; after `unknown`, the close may still complete, so ask `findEmbeddedLiveOwner`
+again. Use it only for sessions the embedding itself once resumed
+through the broker: an idle owner that another client started would be closed as well.
+
+`initializeUI(options)` binds the host UI through SDK-owned extension initialization;
+embedders do not import terminal runtime initialization or completion providers.
+`releaseResources()` joins actual session disposal before closing the embedding's
+scoped registry/settings. Dispose the session first; a cancellation acknowledgement
+alone is not resource-settlement proof. A control-only owner has no transcript or
+application catalog row and must be released with the app.
+
+The desktop IPC protocol is app-local UI plumbing, not an alternate agent-control
+API. Local adapters use the public SDK services above; managed attachments use
+`SessionRouter` query/control operations against their exact owner. RPC/WebSocket
+framing remains an internal transport. Frozen diff references, operator operation
+IDs, activity references, side-conversation history/cleanup and preference receipts
+belong to the SDK, not desktop-local copies. `pending` or `unknown_effect` cleanup
+must not be presented as successful provider exit.
+
+The compiled desktop entrypoint has a narrow bootstrap exception: it dispatches the
+SDK CLI and shell guardian/supervisor/runtime reentry because SDK children execute
+`process.execPath` (the desktop host image). These imports do not manipulate sessions;
+`worker-dispatch.test.ts` verifies their authenticated child protocol. Production
+controls cannot import coding-agent internals or TUI providers; the desktop-host
+source-boundary regression enforces this distinction. Test-only native fixtures may
+construct internal owners to exercise public SDK fences; they are not shipped controls.
 
 ### Selection order when `model` is omitted
 
@@ -665,31 +843,16 @@ Use `setToolUIContext(...)` only if your embedder provides UI capabilities that 
 ## Minimal controlled embed example
 
 ```ts
-import {
-  createAgentSession,
-  discoverAuthStorage,
-  ModelRegistry,
-  SessionManager,
-  Settings,
-} from "@gajae-code/coding-agent";
+import { createEmbeddedAgentSession, createSdkPreferenceControls } from "@gajae-code/coding-agent/sdk";
 
-const authStorage = await discoverAuthStorage();
-const modelRegistry = new ModelRegistry(authStorage);
-await modelRegistry.refresh();
-
-const settings = Settings.isolated({
-  "compaction.enabled": true,
-  "retry.enabled": true,
-});
-
-const { session } = await createAgentSession({
-  authStorage,
-  modelRegistry,
-  settings,
-  sessionManager: SessionManager.inMemory(),
+const embedded = await createEmbeddedAgentSession({
+  cwd: projectDirectory, agentDir: configurationDirectory,
+  storage: { persist: false },
   toolNames: ["read", "search", "find", "edit", "write"],
   enableLsp: true,
 });
+const { session } = embedded;
+const preferences = createSdkPreferenceControls(session);
 
 session.subscribe((event) => {
   if (
@@ -700,6 +863,15 @@ session.subscribe((event) => {
   }
 });
 
-await session.prompt("Find all TODO comments in this repo and propose fixes.");
-await session.dispose();
+try {
+  await preferences.patchConfig({
+    scope: "session",
+    patch: { "compaction.enabled": true, "retry.enabled": true },
+  });
+  await session.prompt("Find all TODO comments in this repo and propose fixes.");
+} finally {
+  preferences.dispose();
+  await session.dispose();
+  await embedded.releaseResources();
+}
 ```

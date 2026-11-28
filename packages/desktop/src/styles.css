@@ -1,0 +1,1196 @@
+/* Fallback palette only: applyTheme() writes the selected bundled TUI theme at runtime. */
+:root {
+	color-scheme: dark;
+	/* The reader's setting is the size of the conversation text; every other size in this file is
+	   a rem multiple of it, so the root is derived from that size and `body` lands on it exactly. */
+	--text-size: 14px;
+	font-size: calc(var(--text-size) / 0.875);
+	--bg: #110b0b;
+	--sidebar: #1b1010;
+	--card: #221313;
+	--surface: #2a1515;
+	--border: #4a2320;
+	--input-border: #6f4743;
+	--text: #ffe7dc;
+	--muted: #b98f86;
+	--accent: #ff6a3d;
+	--accent-hover: color-mix(in srgb, var(--accent) 80%, #fff);
+	--accent-soft: color-mix(in srgb, var(--accent) 16%, var(--bg));
+	--on-accent: #110b0b;
+	--error: #ff4d5e;
+	--error-soft: color-mix(in srgb, var(--error) 16%, var(--bg));
+	--status-running: #5aa9ff;
+	--status-waiting: #f5b84b;
+	--status-done: #4ec98a;
+	--status-error: #ff5d6c;
+	--mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+	/* Shape, elevation and motion keep one soft, rounded scale across surfaces. */
+	--radius-xs: 8px;
+	--radius-sm: 10px;
+	--radius-md: 13px;
+	--radius-lg: 16px;
+	--radius-xl: 20px;
+	--radius-pill: 999px;
+	--border-soft: color-mix(in srgb, var(--border) 58%, transparent);
+	--surface-2: color-mix(in srgb, var(--surface) 62%, var(--bg));
+	--shadow-soft: 0 1px 2px rgb(0 0 0 / 14%), 0 18px 44px rgb(0 0 0 / 26%);
+	--shadow-rest: 0 1px 2px rgb(0 0 0 / 12%);
+	--ring: 0 0 0 3px color-mix(in srgb, var(--accent) 60%, transparent);
+	--ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+	--dur: 160ms;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+	line-height: 1.55;
+	color: var(--text);
+	background: var(--bg);
+}
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; overflow: hidden; overscroll-behavior: none; }
+body { margin: 0; font-size: 0.875rem; word-break: keep-all; overflow-wrap: anywhere; }
+#root { position: fixed; inset: 0; height: 100dvh; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+input:disabled, textarea:disabled, select:disabled { color: var(--muted); cursor: not-allowed; background: var(--surface); opacity: 1; }
+button, input, textarea, select, summary, a { transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease), border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+::selection { background: var(--accent); color: var(--on-accent); }
+h1, h2, h3, p { margin: 0 0 12px; }
+h1 { font-size: 1rem; font-weight: 600; line-height: 1.4; }
+h2 { font-size: 0.9375rem; font-weight: 600; line-height: 1.45; }
+h3 { font-size: 0.875rem; font-weight: 600; }
+small, .muted { color: var(--muted); }
+small { font-size: 0.75rem; }
+a { color: var(--accent); text-underline-offset: 3px; }
+label { display: block; margin: 8px 0 4px; }
+input, textarea, select {
+	width: 100%;
+	min-width: 0;
+	max-width: 100%;
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	padding: 7px 11px;
+	line-height: 1.45;
+	background: var(--surface-2);
+	box-shadow: var(--shadow-rest);
+	transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background-color var(--dur) var(--ease);
+}
+input:not([type="checkbox"]):focus-visible, textarea:focus-visible, select:focus-visible { border-color: var(--accent); box-shadow: var(--ring); outline: none; }
+input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Forced colors drops the box-shadow ring, so fields fall back to an outline. The ring reset above is
+   *more* specific (`:not([type="checkbox"])`), which is why `!important` is required here rather than
+   source order; it also keeps surviving future focus rules. */
+@media (forced-colors: active) {
+	input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible,
+	a:focus-visible, summary:focus-visible {
+		outline: 2px solid Highlight !important;
+		outline-offset: 2px;
+	}
+}
+input:not([type="checkbox"]), select { min-height: 34px; }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+textarea { display: block; resize: vertical; max-height: 240px; }
+pre { font-family: var(--mono); font-size: 0.75rem; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+p, h1, h2, h3, button, label, small, summary, .message-text { word-break: keep-all; overflow-wrap: anywhere; }
+.button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	min-width: 0;
+	max-width: 100%;
+	min-height: 34px;
+	padding: 6px 10px;
+	/* The design language draws no outline on a button: the surface it gains under the pointer
+	   is what says it is clickable. The transparent border stays so sizes never shift. */
+	border: 1px solid transparent;
+	border-radius: var(--radius-sm);
+	background: transparent;
+	text-align: center;
+	line-height: 1.45;
+}
+.button svg, .error-banner > svg, .question-heading > svg,
+.question-pending svg, .notice > svg {
+	width: 16px;
+	height: 16px;
+	flex-shrink: 0;
+	stroke-width: 1.75;
+}
+/* Tool rows size their icons in rem (16px at the default size), like the tool-call cards beside them. */
+.tool-disclosure svg { width: 1rem; height: 1rem; flex-shrink: 0; stroke-width: 1.75; }
+.button:hover:not(:disabled), summary:hover { background: var(--surface-2); }
+.button:active:not(:disabled) { background: var(--surface); }
+.button.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 600; box-shadow: var(--shadow-rest); }
+.button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
+/* Danger ink is the fixed status red (not the theme's error hue, which sits near the accent in some
+   palettes) mixed 72% toward the body ink: 4.5:1 or better on a card or dialog, hovered and pressed, in
+   every bundled palette. Hue alone cannot part it from a red-orange accent, so a danger button also
+   carries a status-red edge, which plain and primary buttons never have. */
+.button.danger { color: color-mix(in srgb, var(--status-error) 72%, var(--text)); border-color: var(--status-error); }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.app-shell { display: flex; height: 100dvh; overflow: hidden; }
+.sidebar {
+	width: 264px;
+	flex: 0 0 264px;
+	background: var(--sidebar);
+	border-right: 1px solid var(--border-soft);
+	padding: 12px 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-height: 0;
+}
+.sidebar nav { overflow: auto; flex: 1; min-height: 0; padding: 0 4px 8px; }
+.sidebar footer { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+.sidebar-toggle { margin-left: auto; }
+.project-initials, .compact-more { display: none; }
+/* A compact sidebar remains a navigation rail, never a hidden drawer: narrow windows collapse
+   to it automatically and its toggle still expands the full sidebar in place. */
+.desktop-sidebar[data-compact] { width: 64px; flex-basis: 64px; padding-inline: 6px; }
+.desktop-sidebar[data-compact] .sidebar-label,
+.desktop-sidebar[data-compact] .project-heading > h2,
+.desktop-sidebar[data-compact] .project-heading > .button:not(.project-toggle),
+.desktop-sidebar[data-compact] .project-toggle > svg,
+.desktop-sidebar[data-compact] .path,
+.desktop-sidebar[data-compact] .session-title { display: none; }
+.desktop-sidebar[data-compact] .sidebar-heading,
+.desktop-sidebar[data-compact] .sidebar-heading strong,
+.desktop-sidebar[data-compact] .project-heading { justify-content: center; }
+.desktop-sidebar[data-compact] .sidebar-heading strong { gap: 0; }
+.desktop-sidebar[data-compact] .project-initials { display: inline; }
+.desktop-sidebar[data-compact] .project-toggle { width: 100%; height: 32px; font-size: 0.8125rem; font-weight: 600; }
+.desktop-sidebar[data-compact] .session-select { justify-content: center; min-height: 32px; padding: 8px; }
+.desktop-sidebar[data-compact] .compact-more { display: block; }
+.desktop-sidebar[data-compact] footer { flex-direction: column; align-items: center; }
+.desktop-sidebar[data-compact] footer > .button { width: 36px; padding-inline: 0; }
+.desktop-sidebar[data-compact] .sidebar-toggle { margin-left: 0; }
+.sidebar-heading, .project-heading, .toolbar, .modal header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.project-heading { justify-content: flex-start; }
+.sidebar-heading { padding: 4px; }
+.sidebar-heading strong { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.brand-mark { width: 26px; height: 26px; flex: none; border-radius: var(--radius-xs); }
+
+.project-group { position: relative; margin: 10px 0 6px; border-radius: var(--radius-md); }
+/* Pointer reorder paints a boundary, never a whole-project selection outline. */
+.project-group.dragging { opacity: 0.45; }
+.project-group.drop-target::after { content: ""; position: absolute; left: 0; right: 0; height: 3px; border-radius: var(--radius-pill); background: var(--accent); pointer-events: none; z-index: 1; }
+.project-group.drop-before::after { top: -4px; }
+.project-group.drop-after::after { bottom: -4px; }
+.project-heading { cursor: grab; border-radius: var(--radius-xs); touch-action: none; user-select: none; -webkit-user-select: none; }
+.project-group.dragging .project-heading { cursor: grabbing; }
+.session-item { border-radius: var(--radius-sm); }
+.show-more { width: 100%; justify-content: center; min-height: 26px; margin-top: 2px; font-size: 0.75rem; }
+/* Right-click menu: a scrim swallows the dismissing click, the menu stacks above it. */
+.menu-scrim { position: fixed; inset: 0; z-index: 40; border: 0; padding: 0; background: transparent; }
+.context-menu { position: fixed; z-index: 41; display: flex; flex-direction: column; gap: 2px; min-width: 200px; padding: 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); }
+.context-menu .button { justify-content: flex-start; border: 0; background: transparent; font-size: 0.8125rem; }
+.context-menu .button:hover:not(:disabled) { background: var(--surface-2); }
+/* Task list and goal state share compact cards within the session work panel. */
+.todo-panel, .goal-strip { max-width: 800px; margin: 0 auto 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.todo-panel { padding: 4px; }
+.todo-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text); text-align: left; }
+.todo-toggle:hover { background: var(--surface-2); }
+.todo-toggle > svg:first-child { color: var(--accent); flex: none; }
+.todo-toggle > svg:last-child { margin-left: auto; color: var(--muted); flex: none; }
+.todo-summary { display: flex; flex: 1; flex-direction: column; gap: 2px; min-width: 0; font-size: 0.8125rem; }
+.todo-summary small { color: var(--muted); font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-phases { padding: 4px 8px 10px; }
+.todo-phase h3 { margin: 0; font-size: 0.75rem; color: var(--muted); }
+.todo-phase > ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.todo-task { display: flex; align-items: flex-start; gap: 8px; font-size: 0.8125rem; line-height: 1.45; }
+.todo-task > svg { flex: none; margin-top: 3px; width: 14px; height: 14px; }
+.todo-task.completed { color: var(--muted); }
+.todo-task.completed > svg { color: var(--status-done); }
+.todo-task.in_progress > svg { color: var(--accent); }
+.todo-task.abandoned { color: var(--muted); }
+.goal-strip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+.goal-status { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 0.75rem; color: var(--muted); }
+.goal-objective { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8125rem; }
+.goal-action { margin-left: auto; padding: 6px; border: 0; background: transparent; color: var(--muted); }
+.goal-action + .goal-action { margin-left: 0; }
+.goal-action:hover:not(:disabled) { color: var(--accent); background: var(--surface-2); }
+
+.project-heading h2 { flex: 1; margin: 0; min-width: 0; font-size: 0.8125rem; }
+/* The add control is sized in em, so it always matches the height of the name beside it instead
+   of towering over a 13px row. */
+.project-heading .button { flex-shrink: 0; min-height: 0; width: 1.7em; height: 1.7em; padding: 0; font-size: inherit; }
+.project-heading .button svg { width: 1em; height: 1em; }
+/* The chevron folds the workspace's conversation list away; it turns right when folded. */
+.project-toggle { color: var(--muted); padding: 2px 4px; }
+.project-toggle .disclosure-chevron[data-open] { transform: rotate(90deg); }
+/* One line at any font size: a wrapped path doubles the height of every workspace header. */
+.path { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 0.6875rem; margin: 1px 0 4px; color: var(--muted); }
+.session-row { display: flex; align-items: center; border: 1px solid transparent; border-radius: var(--radius-sm); margin: 1px 0; min-width: 0; }
+.session-row:hover { background: var(--surface-2); }
+.session-row.selected { background: var(--card); border-color: var(--border-soft); box-shadow: var(--shadow-rest); }
+/* One row per conversation: the state indicator sits to the left of the name, so a list of
+   conversations never spends two lines on one entry. */
+.session-select { display: flex; flex: 1; min-width: 0; align-items: center; text-align: left; gap: 7px; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 5px 8px; }
+.session-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: anywhere; line-height: 1.45; }
+.session-state { display: inline-flex; flex: none; align-items: center; color: var(--muted); }
+/* In rem, like the connection mark beside it (13px at the default size), so the pair grows together. */
+.session-state svg { width: 0.8125rem; height: 0.8125rem; }
+.session-state.running { color: var(--status-running); }
+.session-state.waiting { color: var(--status-waiting); }
+.session-state.done { color: var(--status-done); }
+.session-state.error { color: var(--status-error); }
+.main-pane { display: flex; flex: 1; min-width: 0; flex-direction: column; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.workspace-body { display: flex; flex: 1; min-width: 0; min-height: 0; }
+.conversation-column { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.toolbar { padding: 12px 20px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; flex-shrink: 0; background: var(--bg); }
+.toolbar-title { flex: 1; min-width: 120px; }
+.toolbar-title small { display: block; margin-bottom: 2px; }
+.toolbar-title h1 { margin: 0; }
+.conversation { flex: 1; overflow: auto; min-height: 80px; overscroll-behavior: contain; padding: 8px max(24px, calc((100% - 800px)/2)); overflow-anchor: none; scrollbar-gutter: stable; }
+.message { padding: 20px 0; min-width: 0; }
+.role-label { font-size: 0.75rem; font-weight: 600; display: block; margin-bottom: 8px; color: var(--muted); }
+.message.user { background: var(--surface-2); padding: 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); margin: 12px 0; }
+.message.system { border-left: 2px solid var(--border-soft); padding: 8px 12px; margin: 12px 0; color: var(--muted); font-size: 0.8125rem; }
+.message.tool { padding: 12px 0; }
+.message.tool .role-label { margin-bottom: 4px; }
+/* The transcript is the only vertical scroller: a message grows to its full height, so reading
+   a long answer never nests a second scroll inside the conversation. */
+.message-text { white-space: pre-wrap; line-height: 1.7; }
+.markdown { white-space: normal; min-width: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown p { white-space: pre-wrap; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin: 16px 0 8px; line-height: 1.45; }
+.markdown > :first-child { margin-top: 0; }
+.markdown h1 { font-size: 1.25rem; }
+.markdown h2 { font-size: 1.125rem; }
+.markdown h3, .markdown h4, .markdown h5, .markdown h6 { font-size: 1rem; }
+.markdown ul, .markdown ol { padding-left: 24px; margin: 8px 0 12px; }
+.markdown li > p { margin-bottom: 4px; }
+.markdown input[type="checkbox"] { width: auto; margin-right: 6px; accent-color: var(--accent); }
+.markdown blockquote { margin: 12px 0; padding: 4px 12px; border-left: 3px solid var(--border); color: var(--muted); }
+.markdown blockquote > :last-child { margin-bottom: 0; }
+.markdown :not(pre) > code { padding: 2px 6px; border-radius: var(--radius-xs); background: var(--surface); font-family: var(--mono); font-size: 0.9em; }
+.markdown hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+.markdown-code-block { margin: 12px 0; min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-md); overflow: hidden; background: var(--surface); color: var(--text); }
+.markdown-code-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 0.75rem; }
+.markdown-code-language { margin-right: auto; color: var(--muted); }
+/* An icon-only control: weight comes from the hover surface, not from an outline. */
+.markdown-code-copy { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--muted); }
+.markdown-code-copy:hover { background: var(--surface-2); color: var(--text); }
+.markdown-code-status { color: var(--muted); }
+/* Code scrolls sideways for long lines but never vertically: the transcript owns the only
+   vertical scroll. */
+.markdown-code-content { margin: 0; padding: 12px; white-space: pre; overflow-x: auto; overflow-wrap: normal; word-break: normal; font-size: 0.8125rem; }
+.markdown-table-wrap { max-width: 100%; margin: 12px 0; }
+.markdown table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.markdown th, .markdown td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; }
+.markdown th { background: var(--surface); }
+.message-error { color: var(--error); }
+.message-error .role-label { color: var(--error); }
+/* The disclosure line is a control, so its hover surface follows the same rounded shape as
+   every other control instead of painting a square block. */
+.thinking-disclosure { color: var(--muted); font-size: 0.8125rem; }
+.thinking-disclosure > summary { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: var(--radius-sm); list-style: none; }
+.thinking-disclosure > summary::-webkit-details-marker { display: none; }
+.thinking-disclosure .message-text { padding: 0 12px 12px; }
+.message-image { margin: 8px 0; max-width: 100%; }
+.message-image img { display: block; max-width: 100%; max-height: 320px; width: auto; height: auto; object-fit: contain; }
+.message-image-unavailable { margin: 8px 0; color: var(--muted); font-size: 0.8125rem; }
+.truncation-notice { display: block; margin: 0 0 8px; padding: 8px 12px; border-left: 2px solid var(--border-soft); background: var(--surface); border-radius: var(--radius-xs); }
+summary { cursor: pointer; padding: 8px 0; overflow-wrap: anywhere; }
+.tool-disclosure { border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.tool-disclosure summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; list-style: none; border-radius: var(--radius-xs); font-size: 0.8125rem; }
+.tool-disclosure summary::-webkit-details-marker { display: none; }
+.tool-name { min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); }
+.tool-failure { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; font-family: inherit; }
+.disclosure-chevron { color: var(--muted); transition: transform 120ms; }
+.tool-disclosure[open] > summary .disclosure-chevron { transform: rotate(90deg); }
+.tool-disclosure[open] > summary { border-bottom: 1px solid var(--border-soft); border-radius: var(--radius-xs) var(--radius-xs) 0 0; }
+.bounded-output { max-height: 320px; overflow: auto; background: var(--surface-2); padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); }
+.tool-output { max-height: 320px; overflow: auto; min-width: 0; }
+.tool-output .message-image, .tool-output .message-image-unavailable, .tool-output .thinking-disclosure { margin: 8px 12px; }
+/* The output fills the card's bottom, so its corners follow the card's inner curve. */
+.tool-disclosure .bounded-output { margin: 0; border: 0; border-radius: 0 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px); color: var(--text); }
+.message-error .tool-disclosure { border-color: var(--error); }
+.message-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.message-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; margin: -6px 0 2px; }
+.message-header .role-label { margin-bottom: 0; }
+.message-header .message-actions { margin-top: 0; gap: 2px; justify-content: flex-end; }
+.message-copy, .message-icon-action { width: 28px; min-height: 28px; padding: 0; color: var(--muted); }
+.message-copy-error { color: var(--error); font-size: 0.75rem; }
+.prompt-revision { display: inline-flex; align-items: center; gap: 0; color: var(--muted); }
+.prompt-revision-position { min-width: 3ch; font-size: 0.75rem; font-variant-numeric: tabular-nums; text-align: center; }
+/* The editor replaces the prompt in place; its frame matches the composer so the send affordance reads the same. */
+.prompt-editor { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.prompt-editor:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }
+.prompt-editor textarea { width: 100%; min-height: calc(2lh + 12px); max-height: 320px; padding: 6px; border: 0; background: transparent; box-shadow: none; resize: vertical; line-height: 1.55; }
+.prompt-editor textarea:focus-visible { box-shadow: none; }
+.prompt-editor-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
+.prompt-editor-send { min-width: 30px; min-height: 30px; aspect-ratio: 1; padding: 0; justify-content: center; border-radius: var(--radius-sm); }
+.prompt-editor-send > svg { margin: 0; }
+.composer-area { padding: 12px 24px 20px; flex-shrink: 0; max-height: 60dvh; overflow: auto; }
+.composer { position: relative; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); padding: 12px; max-width: 800px; min-width: 0; margin: 0 auto; box-shadow: var(--shadow-rest); transition: border-color var(--dur) var(--ease); }
+.composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-soft)); }
+.composer:has(textarea:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.composer[data-disabled] { border-color: var(--border); background: var(--surface); }
+.app-shell[data-file-dragging] .composer { border-color: var(--accent); box-shadow: var(--ring); }
+.attachment-drop-overlay { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 16px; border-radius: calc(var(--radius-lg) - 1px); background: color-mix(in srgb, var(--card) 86%, #000); color: var(--text); pointer-events: none; }
+.attachment-drop-overlay > svg { flex-shrink: 0; width: 24px; height: 24px; color: var(--accent); }
+.attachment-drop-overlay > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.attachment-drop-overlay strong { font-size: 0.875rem; font-weight: 600; }
+.attachment-drop-overlay small { color: var(--muted); font-size: 0.75rem; }
+.composer-metrics { position: absolute; width: 1ch; height: 1lh; line-height: 1.55; visibility: hidden; pointer-events: none; }
+.composer-input { min-width: 0; }
+.composer-attachments { min-width: 0; max-height: min(160px, 20dvh); overflow-y: auto; padding: 2px 6px 8px; }
+.composer textarea { background: transparent; border: 0; box-shadow: none; border-radius: var(--radius-sm); padding: 7px 6px; min-height: max(34px, calc(1lh + 12px)); max-height: 200px; resize: none; line-height: 1.55; }
+.composer textarea:focus-visible { box-shadow: none; }
+.composer-controls .attachment-picker { display: contents; }
+.composer-controls .attachment-trigger { flex: none; width: 34px; height: 34px; padding: 0; }
+.composer textarea::placeholder { white-space: nowrap; }
+.composer textarea:focus-visible { outline-offset: 0; }
+/* Top-aligned, not baseline or centred: the controls block can be taller than the action when
+   the model status line wraps underneath, and the action must stay on the control row. */
+.composer-footer { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; padding: 10px 0 2px; border-top: 1px solid var(--border-soft); margin-top: 6px; }
+/* Zero basis so the controls shrink to the row and never push the action onto a second line;
+   their own content wraps instead. */
+.composer-controls { display: flex; align-items: flex-start; flex: 1 1 0%; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
+/* One panel: attachment, model, reasoning and the single send/stop slot share the footer line. */
+.composer-footer .model-controls { flex: 1 1 0%; }
+.composer-controls > * { min-width: 0; max-width: 100%; }
+.composer-actions { display: flex; align-items: center; margin-left: auto; flex: none; }
+.composer-action { min-width: 34px; min-height: 34px; aspect-ratio: 1; padding: 0; justify-content: center; border-radius: var(--radius-sm); }
+.composer-action > svg { margin: 0; }
+/* Portal above the composer: the bounded composer-area must not clip its suggestions. */
+.composer-completions { position: fixed; z-index: 40; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); padding: 4px; }
+.composer-completions [role="option"] { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; min-width: 0; border: 0; border-radius: var(--radius-xs); background: transparent; padding: 9px 12px; text-align: left; overflow-wrap: anywhere; white-space: pre-wrap; }
+.composer-completions [role="option"]:hover, .composer-completions [aria-selected="true"] { background: var(--accent-soft); }
+.composer-completions strong { font-weight: 500; }
+.composer-completions strong, .composer-completions small { min-width: 0; max-width: 100%; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.composer-completions small, .composer-completions > p { color: var(--muted); font-size: 0.8125rem; }
+.composer-completions > p { margin: 0; padding: 9px 12px; }
+.error-banner { display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; margin: 8px 0; border: 1px solid color-mix(in srgb, var(--error) 60%, transparent); border-radius: var(--radius-md); color: color-mix(in srgb, var(--error) 72%, var(--text)); background: var(--error-soft); overflow-wrap: anywhere; white-space: pre-wrap; }
+/* The message mixes the theme's error hue toward the body ink (as tool-card error text does), so it
+   clears 4.5:1 on the banner's tint in every bundled palette; the icon and edge keep the pure hue. */
+.error-banner > svg { margin-top: 3px; color: var(--error); }
+.error-content { min-width: 0; }
+.conversation-column > .error-banner { margin: 8px 16px; }
+.empty { margin: auto; padding: 40px 24px; text-align: center; color: var(--muted); max-width: 560px; }
+.empty h2 { color: var(--text); margin-bottom: 8px; }
+.empty p:last-child { margin-bottom: 0; }
+.empty > svg { width: 24px; height: 24px; margin-bottom: 12px; stroke-width: 1.5; }
+.empty-brand { width: 88px; height: 88px; margin-bottom: 14px; border-radius: var(--radius-xl); image-rendering: auto; }
+.question-card { border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: var(--radius-lg); background: var(--card); padding: 16px; margin: 16px 0; min-width: 0; }
+.question-heading { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
+.question-heading > svg { margin-top: 3px; color: var(--accent); }
+.question-heading h3 { margin: 0; }
+.question-pending { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.75rem; }
+.question-card[aria-busy="true"] { background: var(--surface); }
+.question-card form > .button, .question-card > .button { margin-top: 12px; }
+.question-card > p { color: var(--muted); font-size: 0.8125rem; }
+.option-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.option-list .button { text-align: left; justify-content: flex-start; }
+.modal { background: var(--card); color: var(--text); border: 1px solid var(--border-soft); border-radius: var(--radius-xl); padding: 24px; width: min(680px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: hidden; box-shadow: var(--shadow-soft); }
+.modal[open] { display: flex; flex-direction: column; }
+.modal-content { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 4px; }
+.delete-confirmation { display: grid; gap: 12px; margin-bottom: 16px; overflow-wrap: anywhere; }
+.delete-confirmation p { margin: 0; }
+/* The warning's words mix the status red toward the body ink (as tool-card error text does), so they
+   clear 4.5:1 on its tint in every bundled palette; the icon and edge keep the pure red. */
+.delete-warning { display: flex; align-items: flex-start; gap: 10px; padding: 12px; color: color-mix(in srgb, var(--status-error) 72%, var(--text)); background: color-mix(in srgb, var(--status-error) 9%, transparent); border: 1px solid color-mix(in srgb, var(--status-error) 30%, transparent); border-radius: var(--radius-sm); }
+.delete-warning svg { flex: none; width: 18px; height: 18px; color: var(--status-error); }
+/* In rem, so the close button grows with the title beside it (34px and a 16px icon at the default size). */
+.modal-close { flex: none; width: 2.125rem; height: 2.125rem; padding: 0; border-radius: var(--radius-sm); }
+.modal-close > svg { width: 1rem; height: 1rem; }
+.modal::backdrop { background: color-mix(in srgb, var(--bg) 38%, transparent); backdrop-filter: blur(4px); }
+.modal > header { flex: none; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-soft); align-items: flex-start; flex-wrap: nowrap; }
+.modal header h2 { margin: 4px 0; flex: 1 1 160px; min-width: 0; }
+.modal header > .button { margin-left: auto; }
+.modal section, .modal form { margin: 16px 0 24px; }
+.modal form > .button { margin-top: 12px; }
+.modal .setting-field { margin: 16px 0; }
+.setting-field { padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
+.setting-field small { display: block; margin: 4px 0 8px; }
+.setting-field label { font-family: var(--mono); overflow-wrap: anywhere; font-size: 0.8125rem; }
+.setting-field > .button { margin-top: 8px; }
+/* The shared input rule fills the row; a boolean checkbox keeps its native size. */
+.setting-field input[type="checkbox"] { width: auto; margin: 0; padding: 0; border: 0; background: none; accent-color: var(--accent); }
+.checkbox-label { display: flex; gap: 8px; align-items: center; }
+.checkbox-label input { width: auto; }
+.capability { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--border-soft); }
+.capability small { flex-basis: 100%; overflow-wrap: anywhere; }
+.capability span { color: var(--muted); }
+.command-list { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
+.command-list .button { justify-content: flex-start; }
+.session-work-card, .review-card { flex: 0 0 clamp(320px, 32%, 380px); align-self: flex-start; min-width: 0; margin: 16px 16px 16px 0; overflow: hidden; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); }
+.session-work-panel, .review-card-panel { display: flex; flex-direction: column; max-height: 60dvh; min-height: 0; min-width: 0; }
+.session-work-header, .review-card-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border-soft); flex: none; }
+.session-work-header h2, .review-card-header h2 { margin: 0; }
+.session-work-body, .review-card-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
+.session-work-body > section { margin: 0 0 16px; }
+.session-work-body > :last-child { margin-bottom: 0; }
+.session-work-body h3 { margin-top: 0; }
+.session-work-body .activity-entry-main h4 { margin: 0; flex-basis: 100%; }
+.session-work-body .activity-meta p { margin: 0; }
+.session-work-body .activity-group { margin-top: 16px; }
+.session-work-body .activity-entry-main { gap: 4px 8px; }
+.session-work-body .activity-actions { margin-top: 8px; }
+.session-work-body .activity-toolbar { margin-bottom: 8px; }
+.session-work-body .todo-panel, .session-work-body .goal-strip { margin: 0; max-width: none; }
+.session-work-toggle { position: relative; order: 1; margin-left: auto; }
+/* The conversation toolbar's icons grow with the text together (16px at the default size). */
+.toolbar .button > svg { width: 1rem; height: 1rem; }
+.toolbar .review-toggle[aria-pressed="true"], .toolbar .session-work-toggle[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--accent); border-color: var(--accent); }
+.session-work-toggle .activity-badge { position: absolute; top: -6px; right: -6px; padding: 1px 5px; pointer-events: none; }
+@media (max-width: 1099px) {
+	.workspace-body { flex-direction: column; }
+	.session-work-card, .review-card { order: -1; flex: none; align-self: flex-end; width: min(380px, calc(100% - 24px)); margin: 12px; }
+	.session-work-card .session-work-panel, .review-card .review-card-panel { max-height: 30dvh; }
+}
+.review-card-body > :first-child { margin-top: 0; }
+.review-card-body > :last-child { margin-bottom: 0; }
+.diff-output { overflow: auto; padding: 12px 0; max-width: 100%; }
+.queued-inputs { display: flex; flex-direction: column; flex-shrink: 0; max-height: 20dvh; overflow: auto; overscroll-behavior: contain; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border-soft); background: var(--surface-2); border-radius: var(--radius-md) var(--radius-md) 0 0; }
+.queued-input { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 0.75rem; min-width: 0; }
+.queued-input span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.queued-input .button { flex-shrink: 0; }
+.notice { color: var(--muted); margin: 8px 0; font-size: 0.8125rem; }
+.notice > svg { vertical-align: -3px; margin-right: 6px; }
+.activity-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent); font-size: 0.6875rem; }
+.activity-panel { min-width: 0; }
+.activity-toolbar, .activity-entry-main, .activity-actions, .gate-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.activity-toolbar { justify-content: space-between; margin-bottom: 16px; }
+.activity-group { min-width: 0; }
+.activity-group > ul, .attachment-list { margin: 0; padding: 0; list-style: none; }
+.activity-entry { min-width: 0; margin: 8px 0; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.activity-entry-main { justify-content: space-between; }
+.activity-meta, .activity-empty { color: var(--muted); font-size: 0.75rem; }
+.activity-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0; }
+.activity-actions { margin-top: 12px; }
+/* Like the tool disclosure: the app's chevron is the only marker, and it turns when open. */
+.activity-details > summary { display: inline-flex; align-items: center; gap: 4px; list-style: none; }
+.activity-details > summary::-webkit-details-marker { display: none; }
+.activity-details[open] > summary .disclosure-chevron { transform: rotate(90deg); }
+.gate-evidence dl { display: grid; grid-template-columns: minmax(64px, auto) minmax(0, 1fr); gap: 4px 12px; margin: 8px 0; }
+.gate-evidence dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.gate-dialog { width: min(800px, calc(100vw - 32px)); }
+.gate-dialog .gate-content, .gate-dialog .gate-evidence, .gate-dialog .gate-schema { min-width: 0; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.gate-schema .bounded-output { max-height: 32dvh; overflow: auto; padding: 12px; border-radius: var(--radius-md); background: var(--surface-2); }
+.gate-evidence ul { padding-left: 20px; }
+.gate-evidence code { font-size: 0.75rem; overflow-wrap: anywhere; }
+.gate-status { color: var(--muted); font-size: 0.75rem; }
+.gate-actions .button { text-align: left; }
+.gate-actions .button small { display: block; }
+.attachment-picker { display: inline-flex; align-items: center; min-width: 0; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; }
+.attachment-chip { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; max-width: 100%; min-width: 0; padding: 4px 10px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); background: var(--surface-2); }
+.attachment-name { max-width: min(280px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; }
+.attachment-chip .button { min-height: 28px; padding: 4px; }
+.attachment-chip small[role="alert"], .attachment-error { color: var(--error); }
+/* Model/reasoning components own their operations and state; these are presentation slots. */
+.model-controls { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 8px 12px; align-items: center; min-width: 0; max-width: 100%; }
+.model-controls > * { min-width: 0; max-width: 100%; }
+.model-trigger { min-width: 0; max-width: 100%; text-align: left; }
+.model-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The level names are short and fixed, so the control takes the width of its own label instead
+   of a fixed column that leaves a long empty strip inside the trigger. */
+.reasoning-control { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; max-width: min(220px, 100%); margin: 0; }
+.reasoning-control .select-control, .reasoning-control .select-trigger { flex: 0 1 auto; }
+/* Reasoning listbox. It reuses only the base button metrics shared with .model-trigger. */
+.select-control { position: relative; display: flex; min-width: 0; max-width: 100%; flex: 1 1 auto; }
+.select-trigger { flex: 1 1 auto; justify-content: flex-start; gap: 8px; }
+.select-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.select-trigger > svg:last-child { margin-left: auto; flex-shrink: 0; }
+.select-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); z-index: 30; margin: 0; padding: 5px; list-style: none; min-width: 240px; max-height: 40dvh; overflow: auto; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); box-shadow: var(--shadow-soft); }
+.select-option { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; min-height: 30px; padding: 6px 9px; border: 0; border-radius: var(--radius-xs); background: transparent; text-align: left; white-space: normal; }
+.select-option:hover:not(:disabled) { background: var(--surface); }
+.select-option[aria-selected="true"] { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+.select-option small { width: 100%; color: var(--muted); font-weight: 400; line-height: 1.4; }
+.model-control-status { flex-basis: 100%; min-width: 0; margin: 0; color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+.model-control-status[role="alert"] { color: var(--error); }
+.model-dialog { width: min(640px, calc(100vw - 32px)); }
+.model-search { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding-left: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
+.model-search > svg { width: 16px; height: 16px; flex-shrink: 0; color: var(--muted); }
+/* A placeholder (or an unfocused query) too long for a narrow field ends with an ellipsis, not a cut word. */
+.model-search input { border: 0; background: transparent; padding-left: 0; text-overflow: ellipsis; }
+.model-search input:focus-visible { border-color: transparent; box-shadow: none; outline: none; }
+.model-result-list { display: flex; flex-direction: column; gap: 6px; max-height: 44dvh; overflow: auto; margin: 0 0 12px; padding: 4px; list-style: none; }
+.model-result-list li { min-width: 0; }
+.model-result-row { display: flex; min-width: 0; }
+.model-result-row > .model-option { flex: 1; }
+.model-favorite { flex: none; width: 38px; padding: 0; border: 0; border-left: 1px solid var(--border-soft); border-radius: 0; }
+.model-favorite[aria-pressed="true"] { color: var(--accent); }
+.model-option { display: flex; align-items: stretch; gap: 0; padding: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); overflow: hidden; text-align: left; transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+.model-option:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); }
+.model-option:hover { background: var(--surface); }
+.model-option[aria-current="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.model-option-hit { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; border: 0; background: transparent; text-align: left; }
+.model-option-hit:focus-visible { outline-offset: -2px; }
+/* One tab language: the model dialog and the settings dialog share the same pill bar. */
+.model-tabs { display: flex; gap: 4px; margin: 0 0 12px; padding: 4px; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--surface-2); }
+.model-tab { flex: 1; justify-content: center; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--muted); font-weight: 550; }
+.model-tab:hover:not(:disabled) { background: color-mix(in srgb, var(--card) 70%, transparent); color: var(--text); }
+.model-tab[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow-rest), inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, var(--border-soft)); }
+/* The search field and its refresh button share one 36px row: the field is a 34px input inside a
+   1px border, so a fixed 34px button sat two pixels short of it. */
+/* The search field and its refresh button share one 36px row. The field is a label, which
+   inherits the global label margin; leaving that margin in place pushed the field 8px down
+   inside the row and left the button four pixels higher. */
+.model-toolbar { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.model-toolbar > .model-search { flex: 1; min-width: 0; height: 36px; margin: 0; }
+.model-refresh { flex: none; width: 36px; height: 36px; min-height: 0; padding: 0; }
+/* One role per line: the role reads as the same tag the model list uses, and its selector sits
+   at the right edge so a column of presets can be scanned down the selectors. */
+.preset-roles { display: flex; flex-direction: column; gap: 3px; font-size: 0.75rem; color: var(--muted); }
+.preset-role { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* The role name never wraps or shrinks; the selector beside it gives way instead. */
+.preset-role .model-role-tag { flex: none; white-space: nowrap; }
+.preset-role-model { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preset-group-list { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; }
+.preset-group { min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); }
+.preset-group-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 38px; padding: 6px 10px; border: 0; background: transparent; text-align: left; }
+.preset-group-head > small { margin-left: auto; color: var(--muted); font-weight: 400; }
+.preset-group-head .disclosure-chevron[data-open] { transform: rotate(90deg); }
+.preset-group .model-result-list { margin: 0; padding: 0 6px 6px; }
+/* A provider family holding the active preset is marked like the preset itself, so the header
+   answers "where is my current preset?" without expanding every group. */
+.preset-group[data-active] { border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft)); }
+.preset-group[data-active] .preset-group-head strong { color: var(--accent); }
+/* An unregistered provider's presets stay listed but read as unavailable: dimmed text, border
+   and surface instead of prose that would take a row from every entry. */
+.preset-unavailable { opacity: 0.5; }
+.preset-unavailable .model-option { border-color: var(--border-soft); background: transparent; }
+/* A family with no selectable preset dims from its header down, and the header keeps its surface
+   so the group still reads as a group rather than a floating label. */
+.preset-group.preset-unavailable { background: transparent; }
+.preset-group.preset-unavailable .preset-group-head { cursor: not-allowed; }
+.preset-unavailable .model-option-hit:disabled, .preset-unavailable .model-favorite:disabled { cursor: not-allowed; opacity: 1; }
+.select-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* The tab bar stays pinned while only the active panel scrolls. */
+.modal-content:has(> .settings-dialog) { display: flex; flex-direction: column; overflow: hidden; }
+.settings-dialog { display: flex; flex-direction: column; gap: 16px; min-height: 0; flex: 1; }
+.settings-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	padding: 4px;
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-lg);
+	background: var(--surface-2);
+	flex: none;
+}
+.settings-tab {
+	flex: 0 0 auto;
+	min-height: 32px;
+	padding: 5px 16px;
+	border: 0;
+	border-radius: var(--radius-md);
+	background: transparent;
+	color: var(--muted);
+	font-size: 0.8125rem;
+	font-weight: 550;
+	white-space: nowrap;
+}
+.settings-tab:hover:not(:disabled) { background: color-mix(in srgb, var(--card) 70%, transparent); color: var(--text); }
+.settings-tab[aria-selected="true"] {
+	background: var(--surface);
+	color: var(--text);
+	box-shadow: var(--shadow-rest), inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, var(--border-soft));
+}
+.settings-panels { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 2px 2px 8px; flex: 1; }
+/* Invariant: every panel stays mounted (the tab bar's aria-controls must always resolve), so
+   hiding is CSS. Keep the `[hidden]` rule after this one; it must outrank the `display` above. */
+.settings-panel { display: flex; flex-direction: column; gap: 4px; }
+.settings-panel[hidden] { display: none; }
+/* Sections carry their own rhythm; the dialog's generic section margin must not stack on it. */
+.modal .settings-section { margin: 0; padding: 16px 4px; border-top: 1px solid var(--border-soft); }
+/* The panel owns the inset, so the first child contributes none of its own. */
+.settings-panel > :first-child { padding-top: 4px; border-top: 0; }
+.settings-section-head { margin-bottom: 12px; }
+.settings-section-head h3 { margin: 0; font-size: 0.875rem; font-weight: 600; }
+.settings-hint { margin: 4px 0 0; color: var(--muted); font-size: 0.75rem; max-width: 52ch; }
+.settings-section-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.settings-section-body > .model-controls { margin: 0; }
+.settings-form { display: flex; flex-direction: column; gap: 4px; max-width: 420px; }
+.settings-form > .button { align-self: flex-start; margin-top: 10px; }
+/* The dialog generic `section, form` margin must not stack inside a panel. */
+.settings-panel :is(section, form) { margin: 0; }
+.settings-panel-hint { margin: 4px 4px 8px; }
+.theme-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin: 8px 0 16px; }
+.theme-option { justify-content: flex-start; gap: 10px; }
+.theme-option[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.font-size-control { display: flex; align-items: center; gap: 6px; }
+.font-size-control .button { width: 32px; height: 32px; min-height: 0; padding: 0; font-size: 1rem; }
+/* A field, not a button: it still carries no accent outline, only its own surface.
+   `--surface-2` sits within a rounding error of the dialog card, so this uses `--surface`. */
+.font-size-input { width: 4.5em; height: 32px; padding: 0 6px; border: 1px solid transparent; border-radius: var(--radius-xs); background: var(--surface); color: var(--text); text-align: center; font: inherit; }
+.font-size-input:focus-visible { outline: var(--ring); outline-offset: 1px; }
+.font-size-unit { color: var(--muted); font-size: 0.75rem; }
+.theme-swatch { width: 16px; height: 16px; flex: none; border-radius: var(--radius-pill); border: 1px solid var(--border-soft); }
+.modal h3 > svg { width: 15px; height: 15px; vertical-align: -2px; margin-right: 4px; }
+.model-role-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.model-role-tag { display: inline-flex; align-items: center; border-radius: var(--radius-pill); padding: 2px 8px; background: var(--accent-soft); color: var(--accent); font-size: 0.6875rem; }
+.model-role-choice, .model-role-list { display: grid; gap: 12px; }
+.model-role-choice > p { margin: 0; }
+.model-role-back, .model-role-cancel { justify-self: start; }
+.model-scope-actions { flex-wrap: nowrap; }
+.model-role-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.model-role-option, .model-scope-option { flex: 1 1 180px; justify-content: flex-start; }
+.model-scope-option { background: var(--surface); }
+.model-role-reason { flex-basis: 100%; }
+.model-role-clear { font-size: 0.75rem; }
+.model-favorites-error { color: var(--error); font-size: 0.75rem; }
+.model-option-main { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 4px; /* The row's text owns the full width so a role's selector can right-align against it. */ align-self: stretch; }
+.model-option-main strong { font-weight: 600; overflow-wrap: anywhere; }
+.model-option-main small { font-size: 0.75rem; color: var(--muted); overflow-wrap: anywhere; }
+.model-empty { padding: 24px 16px; border: 1px dashed var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); }
+.mcp-panel, .session-info-panel { display: grid; gap: 16px; min-width: 0; }
+.mcp-heading, .session-info-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.mcp-heading h3, .session-info-heading h3, .mcp-panel h4, .session-info-panel h4 { margin: 0; font-size: 0.8125rem; }
+.mcp-panel p, .session-info-panel p { margin: 0; line-height: 1.6; }
+.mcp-help, .mcp-meta, .session-info-note { color: var(--muted); font-size: 0.75rem; }
+.mcp-server-list, .session-info-usage-groups { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.mcp-server, .session-info-panel section { min-width: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-md); padding: 16px; background: var(--card); }
+.mcp-server dl, .session-info-grid { display: grid; grid-template-columns: minmax(104px, 0.7fr) minmax(0, 1fr); gap: 6px 16px; margin: 12px 0; font-size: 0.75rem; }
+.mcp-server dt, .session-info-grid dt { color: var(--muted); }
+.mcp-server dd, .session-info-grid dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.mcp-actions { margin-bottom: 0; }
+.session-info-text { overflow-wrap: anywhere; }
+.session-info-meter { display: block; width: 100%; height: 12px; margin: 12px 0; accent-color: var(--accent); }
+/* Session status: one icon-led tile per TUI status-line field, the full report folded beneath. */
+.session-hud-panel { display: grid; gap: 12px; min-width: 0; }
+.session-hud { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 8px; margin: 0; }
+.session-hud-tile { display: grid; align-content: start; gap: 4px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--card); }
+.session-hud-tile[data-wide] { grid-column: span 2; }
+.session-hud-tile dt { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.75rem; }
+.session-hud-tile dt svg { flex: none; stroke-width: 1.75; }
+.session-hud-tile dd { min-width: 0; margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.session-hud-tile dd small { font-weight: 400; }
+.session-hud-path { font-family: var(--mono); font-size: 0.75rem; font-weight: 400; }
+.session-hud-unknown { color: var(--muted); font-weight: 400; }
+.session-hud-meter { display: block; width: 100%; height: 6px; margin-top: 6px; accent-color: var(--accent); }
+.session-hud-link { padding: 0; border: 0; background: none; color: var(--accent); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+.session-hud-details > summary { width: fit-content; padding: 4px 8px; border-radius: var(--radius-xs); color: var(--muted); font-size: 0.75rem; cursor: pointer; }
+.session-hud-details[open] > summary { margin-bottom: 12px; }
+.updates-panel { display: grid; gap: 16px; min-width: 0; }
+.updates-versions { display: grid; gap: 8px; margin: 0; }
+.updates-versions > div { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
+.updates-versions dt { display: flex; align-items: center; gap: 8px; }
+.updates-versions dd { margin: 0; font-family: var(--mono); font-size: 0.8125rem; }
+.updates-note { color: var(--muted); font-size: 0.8125rem; margin: 0; }
+.updates-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.updates-notification { position: fixed; z-index: 30; top: 16px; right: 16px; width: min(380px, calc(100vw - 32px)); padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-soft); display: grid; gap: 12px; }
+@media (max-width: 480px) {
+ .session-hud-tile[data-wide] { grid-column: auto; }
+}
+@media (max-width: 480px) {
+ .mcp-server dl, .session-info-grid { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+ .mcp-server dd, .session-info-grid dd { padding-bottom: 6px; }
+}
+.fork-panel { display: grid; gap: 12px; min-width: 0; max-width: 100%; }
+.fork-panel p, .fork-panel label { margin: 0; }
+.fork-panel label { margin-bottom: 4px; }
+.fork-panel .truncation-notice { margin-top: 8px; font-size: 0.75rem; }
+.btw-panel { display: grid; gap: 12px; min-width: 0; max-width: 100%; }
+.btw-panel p { margin: 0; }
+.btw-help, .btw-status { color: var(--muted); font-size: 0.75rem; }
+.btw-empty { min-width: 0; padding: 16px; border: 1px dashed var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); }
+.btw-empty h3 { margin-bottom: 8px; }
+.btw-empty p { color: var(--muted); font-size: 0.8125rem; }
+.btw-history { min-width: 0; max-width: 100%; max-height: min(360px, 44dvh); overflow: auto; overscroll-behavior: contain; padding: 4px; }
+.btw-turn-list { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.btw-turn-list > li { min-width: 0; }
+.btw-turn { min-width: 0; padding: 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); }
+.btw-text { min-width: 0; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; line-height: 1.7; margin-bottom: 12px; }
+.btw-panel .btw-status { margin-bottom: 8px; }
+.btw-turn[data-status="running"] .btw-status, .btw-turn[data-status="cancel_requested"] .btw-status { color: var(--accent); }
+.btw-turn[data-status="failed"] .btw-status { color: var(--error); }
+.btw-panel .truncation-notice { margin-top: 12px; font-size: 0.75rem; }
+.btw-panel .btw-composer, .showcase .btw-panel .btw-composer { width: 100%; max-width: 100%; margin: 0; }
+.btw-composer label { margin-top: 0; font-size: 0.8125rem; }
+.btw-composer textarea { word-break: keep-all; overflow-wrap: anywhere; }
+/* Side chat keeps its own footer row so it never inherits the composer action slot. */
+.btw-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+.btw-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; max-width: 100%; }
+.modal .btw-panel { margin: 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+.showcase { max-width: 960px; height: 100%; overflow: auto; overscroll-behavior: contain; margin: 0 auto; padding: 32px 24px; }
+.showcase-heading { padding: 12px 0 24px; }
+.showcase-brand { width: 40px; height: 40px; border-radius: var(--radius-md); margin-bottom: 10px; }
+.showcase-heading h1 { font-size: 1.25rem; margin-top: 8px; }
+.showcase-heading p { max-width: 640px; color: var(--muted); }
+.showcase-eyebrow { font-size: 0.75rem; color: var(--muted); }
+.showcase-index { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.showcase > section { margin: 24px 0; padding: 24px; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); scroll-margin-top: 16px; }
+.showcase > section > h2 { padding-bottom: 12px; margin-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
+.showcase .composer { margin: 12px 0 24px; }
+.showcase .session-row { max-width: 360px; }
+.showcase .fixture-note { flex: 1 1 100%; }
+#showcase-models > .model-controls, #showcase-models > .reasoning-control { margin: 12px 0 24px; }
+.showcase-result { padding: 12px 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); color: var(--muted); }
+@media (max-width: 759px) {
+	.toolbar { padding: 8px 12px; }
+	.conversation { padding: 8px 16px; }
+	.composer-area { padding: 8px 12px 16px; }
+	.showcase { padding: 16px 8px; }
+	.showcase > section { padding: 16px; }
+	.modal { padding: 16px; }
+}
+@media (max-width: 480px) {
+	.model-controls > .model-trigger { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+	*, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}
+
+/* Feature sections. Each package appends only inside its own section, so parallel changes never
+   touch the same lines. They follow the shared @media blocks above, so a section carries its own
+   responsive rules. */
+
+/* Section A: tool call cards (ToolCallCard.tsx, transcript-groups.tsx). */
+/* Text on cards and tinted lines is mixed toward the foreground, so it keeps 4.5:1 in every theme
+   by construction: error text keeps the --status-error hue, quiet text keeps the muted tone. */
+.tool-call, .tool-run, .tool-call-details {
+	--tool-error-text: color-mix(in srgb, var(--status-error) 72%, var(--text));
+	--tool-quiet-text: color-mix(in srgb, var(--muted) 55%, var(--text));
+}
+/* The summary is one call line plus an optional muted intent line. The subject keeps one line and
+   ellipsizes (the full text is its hover title); facts and status wrap below it when narrow. */
+.tool-call .tool-disclosure > summary { flex-wrap: nowrap; align-items: flex-start; }
+/* Icons are sized in rem so they grow with the text size (16 px and 14 px at the default size). A
+   chevron centers on its summary's first text line, which is one line-height (1lh) tall. */
+.tool-call .tool-disclosure > summary svg, .tool-group-summary svg { width: 1rem; height: 1rem; }
+.tool-call .tool-disclosure > summary > .disclosure-chevron, .tool-group-summary > .disclosure-chevron { margin-top: max(0px, calc((1lh - 1rem) / 2)); }
+.tool-call-head { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.tool-call-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.tool-call-icon { color: var(--muted); }
+.tool-call-verb { flex-shrink: 0; font-weight: 600; }
+.tool-call-verb.tool-name { font-weight: 500; }
+.tool-call-subject { flex: 1 1 8rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 0.8125rem; color: var(--text); }
+.tool-call-meta { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-left: auto; color: var(--muted); font-size: 0.75rem; }
+.tool-call-facts { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tool-fact-added { color: var(--status-done); }
+.tool-fact-removed { color: var(--tool-error-text); }
+.tool-call-status { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.tool-call .tool-disclosure > summary .tool-call-status svg, .tool-group-summary .tool-call-status svg { width: 0.875rem; height: 0.875rem; }
+.tool-call-running { color: var(--status-running); }
+.tool-call-waiting { color: var(--status-waiting); }
+/* Cancelled is a neutral outcome, like Idle: muted, never the error treatment. */
+.tool-call-status.tool-call-cancelled { color: var(--muted); }
+.tool-call-status.tool-failure { color: var(--tool-error-text); }
+.tool-call-intent { color: var(--muted); font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
+/* A failed card keeps its error border and status; its summary text stays readable. */
+.tool-call.message-error { color: var(--text); }
+/* The expanded body: what tool.detail adds (or why it cannot), then the bounded output. */
+.tool-call-details { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px 0; min-width: 0; }
+.tool-call-details > .truncation-notice { margin: 0; }
+.tool-detail-note { margin: 0; color: var(--muted); font-size: 0.8125rem; }
+.tool-detail-error { margin: 0; color: var(--tool-error-text); }
+.tool-call > .truncation-notice, .tool-call-details > .truncation-notice { color: var(--tool-quiet-text); }
+.tool-detail-section, .tool-diff-file { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tool-detail-heading { color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+.tool-output-heading { display: block; padding: 10px 12px 4px; }
+.tool-call-details .bounded-output { margin: 0; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); }
+.tool-detail-code { white-space: pre-wrap; word-break: normal; overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.8125rem; }
+.tool-diff-header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 0.75rem; }
+.tool-diff-path { min-width: 0; font-family: var(--mono); word-break: normal; overflow-wrap: anywhere; }
+.tool-diff-op { padding: 0 6px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); }
+.tool-diff-error { margin: 0; color: var(--tool-error-text); font-size: 0.8125rem; word-break: keep-all; overflow-wrap: anywhere; }
+/* A grid keeps every line as wide as the widest, so highlights span the scrolled width too. */
+.tool-diff { display: grid; margin: 0; max-height: 320px; overflow: auto; padding: 6px 0; border: 1px solid var(--border-soft); border-radius: var(--radius-xs); background: var(--surface-2); font-family: var(--mono); font-size: 0.8125rem; line-height: 1.5; }
+.tool-diff-line { min-height: 1.5em; padding: 0 12px; white-space: pre; }
+.tool-diff-add { background: color-mix(in srgb, var(--status-done) 14%, transparent); }
+.tool-diff-remove { background: color-mix(in srgb, var(--status-error) 14%, transparent); }
+.tool-diff-hunk { color: var(--muted); }
+.tool-diff-number { display: inline-block; min-width: 4ch; margin-right: 8px; color: var(--tool-quiet-text); text-align: right; user-select: none; }
+.tool-diff-sign { margin-right: 6px; }
+/* A run of calls is a wrapper; a single card keeps its own message rhythm. A group of two or more
+   is one collapsed summary card whose members, when opened, hang below it on a quiet rule. */
+.message.tool-run { padding: 0; }
+.message.tool-group { padding: 12px 0; }
+.tool-group .role-label { margin-bottom: 4px; }
+.tool-group-summary { display: flex; align-items: flex-start; gap: 8px; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); color: var(--text); text-align: left; font-size: 0.8125rem; }
+.tool-group-summary:hover { background: var(--surface-2); }
+.tool-group-summary svg { flex-shrink: 0; stroke-width: 1.75; }
+.tool-group-summary .disclosure-chevron[data-open] { transform: rotate(90deg); }
+.tool-group-head { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.tool-group-title { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-group-count { font-weight: 600; }
+.tool-group-kinds { color: var(--muted); }
+.tool-group-failed { display: inline-flex; align-items: center; gap: 4px; color: var(--tool-error-text); }
+.tool-group-summary .tool-group-failed svg { width: 0.875rem; height: 0.875rem; }
+.tool-group-latest { min-width: 0; color: var(--muted); }
+.tool-group-latest .tool-call-verb { font-weight: 500; }
+.tool-group .tool-run-items { margin: 4px 0 0 12px; padding-left: 12px; border-left: 1px solid var(--border-soft); }
+.tool-group .tool-run-items > .message { padding: 6px 0; }
+.tool-group .tool-call > .role-label { display: none; }
+
+/* Section B: task list (TodoPanel.tsx, TodoToolBody.tsx, SessionWorkProgress.tsx). */
+.todo-progress { display: block; height: 0.25rem; margin-top: 0.25rem; overflow: hidden; border-radius: var(--radius-pill); background: var(--border-soft); }
+.todo-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.todo-progress.complete > span { background: var(--status-done); }
+/* Phases are numbered by position, as in the terminal; the number is presentation, not data. */
+.todo-phases { counter-reset: todo-phase; }
+.todo-phase { counter-increment: todo-phase; }
+.todo-phase + .todo-phase { margin-top: 0.5rem; }
+.todo-phase-heading { display: flex; align-items: baseline; gap: 0.5rem; margin: 0.375rem 0 0.25rem; }
+.todo-phase-heading h3 { flex: 1; min-width: 0; }
+.todo-phase-heading h3::before { content: counter(todo-phase) " · "; font-variant-numeric: tabular-nums; }
+.todo-phase-count { flex: none; color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.todo-task-body { flex: 1; min-width: 0; }
+.todo-task-text { word-break: keep-all; overflow-wrap: anywhere; }
+.todo-task.completed .todo-task-text, .todo-task.abandoned .todo-task-text { text-decoration: line-through; }
+.todo-note-count { display: inline-flex; align-items: center; gap: 0.125rem; margin-left: 0.375rem; padding: 0 0.375rem; border-radius: var(--radius-pill); background: var(--surface-2); color: var(--muted); font-size: 0.6875rem; line-height: 1.5; white-space: nowrap; vertical-align: 0.0625rem; }
+.todo-note-count > svg { width: 0.6875rem; height: 0.6875rem; flex: none; }
+.todo-task .todo-notes { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.25rem 0 0.125rem; padding: 0 0 0 0.625rem; border-left: 2px solid var(--border-soft); list-style: none; color: var(--muted); font-size: 0.75rem; }
+/* Notes are prose the model wrote, often several lines; keep its line breaks. */
+.todo-notes > li { white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
+.todo-cap { margin: 0.5rem 0 0; color: var(--muted); font-size: 0.75rem; }
+/* The toolbar chip is the always-visible sign of the list; the button keeps its icon-first shape. */
+.toolbar .session-work-toggle:has(.session-work-progress) { gap: 0.375rem; }
+.session-work-progress { padding: 0 0.375rem; border-radius: var(--radius-pill); background: var(--surface-2); color: var(--muted); font-size: 0.6875rem; line-height: 1.5; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* The pressed button is accent-tinted, where accent and green text both fall under 4.5:1 in some
+   palettes; the count takes the body ink there, finished or not. */
+.session-work-toggle[aria-pressed="true"] .session-work-progress { background: transparent; color: var(--text); }
+.session-work-progress.complete { color: var(--status-done); }
+.todo-stale { display: flex; align-items: flex-start; gap: 0.5rem; margin: 0 0 0.5rem; color: var(--status-waiting); font-size: 0.75rem; }
+.todo-stale > svg { flex: none; width: 0.875rem; height: 0.875rem; margin-top: 0.1875rem; }
+.todo-stale > span { min-width: 0; color: var(--text); }
+/* Same bounded, scrollable area as a tool row's generic output. */
+.todo-tool-body { max-height: 20rem; min-width: 0; overflow: auto; padding: 0.625rem 0.75rem; }
+.todo-tool-summary { margin: 0; font-size: 0.8125rem; }
+.todo-tool-body .todo-phases { padding: 0.25rem 0 0; }
+.showcase-todo-states { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1.5rem; align-items: start; }
+.showcase-todo-state { min-width: 0; }
+.showcase-todo-state + .showcase-todo-state { margin-top: 1.5rem; }
+.showcase-todo-states > .showcase-todo-state { margin-top: 0; }
+.showcase-todo-state > h3 { margin: 0 0 0.5rem; color: var(--muted); font-size: 0.75rem; font-weight: 500; }
+.showcase-todo-state .todo-panel { margin: 0; max-width: none; }
+.showcase-todo-card { margin: 0; }
+.showcase-todo-toolbar { border: 1px solid var(--border-soft); border-radius: var(--radius-md); margin-bottom: 0.5rem; }
+.showcase-todo-label { display: block; font-size: 0.8125rem; }
+/* Showcase only: the selected Session work fixture state reads as pressed, in the body ink. */
+#showcase-session-work .actions > .button[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--text); }
+
+/* Section C: tool catalog and tool search (ToolCatalogDialog.tsx, ToolSearchBody.tsx). */
+/* The Tools dialog pins its search row, the tool-search notice and the Save footer; only the list
+   scrolls, and it gives up its height first, down to nothing. Only when the pinned parts alone
+   cannot fit (text beyond the Settings range in a short window) does the whole panel scroll. */
+.modal-content:has(> .tool-catalog) { display: flex; flex-direction: column; overflow: hidden; }
+.tool-catalog { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; gap: 0.75rem; overflow: auto; overscroll-behavior: contain; }
+.tool-catalog-head { flex: none; }
+.tool-catalog-head > .model-search { height: 2.25rem; margin: 0; }
+.tool-catalog-head > .model-search > svg { width: 1rem; height: 1rem; }
+.tool-catalog-summary { margin: 0.5rem 0 0; font-size: 0.75rem; }
+.tool-catalog-loading { margin: 0; color: var(--muted); }
+.tool-catalog-failure { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; flex: none; }
+.tool-catalog-failure > .error-banner { align-self: stretch; margin: 0; }
+.tool-catalog-changed { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; flex: none; padding: 0.5rem 0.75rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 9%, transparent); }
+.tool-catalog-changed > p { flex: 1 1 14rem; margin: 0; font-size: 0.8125rem; }
+.tool-catalog-list { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 0.125rem; }
+.modal .tool-catalog-section { margin: 0 0 1rem; }
+.modal .tool-catalog-section:last-child { margin-bottom: 0; }
+.tool-catalog-section > h3 { display: flex; align-items: baseline; gap: 0.375rem; margin: 0 0 0.5rem; font-size: 0.75rem; color: var(--muted); }
+.tool-catalog-count { font-weight: 400; font-variant-numeric: tabular-nums; }
+.tool-catalog-section > ul { display: flex; flex-direction: column; gap: 0.375rem; margin: 0; padding: 0; list-style: none; }
+/* A row is one bordered box like a model option; the whole box toggles its checkbox. */
+.tool-catalog-option { display: flex; align-items: flex-start; gap: 0.625rem; margin: 0; padding: 0.5rem 0.625rem; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); cursor: pointer; transition: border-color var(--dur) var(--ease), background-color var(--dur) var(--ease); }
+.tool-catalog-option:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); background: var(--surface); }
+.tool-catalog-option input[type="checkbox"] { flex: none; width: 0.9375rem; height: 0.9375rem; min-height: 0; margin: 0.1875rem 0 0; padding: 0; border: 0; background: none; box-shadow: none; accent-color: var(--accent); }
+.tool-catalog-option:has(input:disabled) { cursor: default; }
+/* A checked state that differs from the saved one: a dashed accent edge until Save lands. */
+.tool-catalog-row[data-edited] > .tool-catalog-option { border-style: dashed; border-color: color-mix(in srgb, var(--accent) 70%, var(--border-soft)); }
+.tool-catalog-main { display: flex; flex: 1; flex-direction: column; gap: 0.125rem; min-width: 0; }
+.tool-catalog-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.5rem; }
+.tool-catalog-name { font-family: var(--mono); font-size: 0.8125rem; font-weight: 600; overflow-wrap: anywhere; word-break: break-all; }
+.tool-catalog-label { font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-catalog-description { font-size: 0.75rem; line-height: 1.45; color: var(--muted); word-break: keep-all; overflow-wrap: anywhere; }
+.tool-catalog-tags { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; }
+.tool-catalog-tag { display: inline-flex; align-items: center; padding: 0.0625rem 0.5rem; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); background: var(--surface-2); color: var(--muted); font-size: 0.6875rem; line-height: 1.5; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-catalog-tag-found { border-color: transparent; background: var(--accent-soft); color: var(--accent); }
+.tool-catalog-tag-hidden { border-style: dashed; background: transparent; }
+.tool-catalog-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 0.5rem 0.75rem; flex: none; padding-top: 0.75rem; border-top: 1px solid var(--border-soft); }
+.tool-catalog-status { flex: 1 1 14rem; min-width: 0; font-size: 0.75rem; color: var(--muted); }
+.tool-catalog-status > p { margin: 0; }
+.tool-catalog-status > .tool-catalog-reason { color: var(--text); }
+/* The tool-search card body: the query, the tools it turned on, then the ranked matches. */
+.tool-search-body { display: flex; flex-direction: column; gap: 0.625rem; max-height: 20rem; overflow: auto; padding: 0.75rem; min-width: 0; }
+.tool-search-body > p { margin: 0; font-size: 0.8125rem; }
+.tool-search-query { color: var(--muted); }
+.tool-search-query code, .tool-search-match code { font-family: var(--mono); color: var(--text); overflow-wrap: anywhere; word-break: break-all; }
+.tool-search-activated { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; font-size: 0.75rem; }
+.tool-search-activated > span { color: var(--muted); }
+.tool-search-activated > ul { display: flex; flex-wrap: wrap; gap: 0.25rem; min-width: 0; margin: 0; padding: 0; list-style: none; }
+.tool-search-chip { display: inline-flex; padding: 0.0625rem 0.5rem; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent); font-family: var(--mono); font-size: 0.6875rem; line-height: 1.5; overflow-wrap: anywhere; word-break: break-all; }
+.tool-search-matches { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); }
+.tool-search-match { display: flex; flex-direction: column; gap: 0.125rem; min-width: 0; padding: 0.5rem 0.75rem; }
+.tool-search-match + .tool-search-match { border-top: 1px solid var(--border-soft); }
+.tool-search-match-title { display: flex; flex-wrap: wrap; align-items: center; gap: 0.125rem 0.5rem; font-size: 0.8125rem; }
+.tool-search-match-title > strong { font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
+.tool-search-match-title code { font-size: 0.75rem; color: var(--muted); }
+.tool-search-match-description { overflow: hidden; color: var(--muted); font-size: 0.75rem; white-space: nowrap; text-overflow: ellipsis; }
+.tool-search-empty, .tool-search-total { color: var(--muted); }
+/* Showcase only: a dialog-sized frame so each state shows the pinned search, list and footer. */
+.tool-catalog-showcase { margin: 1.5rem 0 0; scroll-margin-top: 1rem; }
+.tool-catalog-frame { display: flex; flex-direction: column; max-height: 30rem; margin-top: 0.5rem; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); box-shadow: var(--shadow-soft); }
+.tool-catalog-frame-narrow { max-width: 20rem; }
+@media (max-width: 480px) {
+	.tool-catalog-footer > .button { width: 100%; }
+}
+/* A short window leaves the list more room by tightening the pinned parts' spacing. */
+@media (max-height: 640px) {
+	.tool-catalog { gap: 0.5rem; }
+	.tool-catalog-summary { margin-top: 0.25rem; }
+	.tool-catalog-changed { padding: 0.375rem 0.625rem; }
+	.tool-catalog-footer { padding-top: 0.5rem; }
+}
+
+/* Section P: providers dialog and onboarding notice (ProvidersDialog.tsx, ProvidersPanel.tsx,
+   ProviderOnboardingNotice.tsx). */
+.providers-dialog { width: min(640px, calc(100vw - 32px)); }
+/* The dialog's generic section/form rhythm must not stack on the panel's own grid. */
+.providers-panel { display: grid; gap: 0.75rem; min-width: 0; }
+/* The panel is the query container for its narrow layout (end of this section), so the dialog in a
+   narrow window and the showcase's narrow frame lay out alike. */
+.providers-panel { container: providers-panel / inline-size; }
+/* Error words mix the error hue toward the body ink, so they clear 4.5:1 on the card, a hovered row
+   and inset surfaces in every bundled palette; dots and icons keep the pure hue. */
+.providers-panel { --provider-error-ink: color-mix(in srgb, var(--status-error) 60%, var(--text)); }
+.providers-panel :is(section, form) { margin: 0; }
+.providers-panel form > .button { margin-top: 0; }
+.providers-panel :is(p, h3, h4, h5, label) { margin: 0; }
+.providers-panel .model-toolbar { margin: 0; }
+.provider-summary, .provider-footer, .provider-hint { color: var(--muted); font-size: 0.75rem; }
+.provider-summary { font-size: 0.8125rem; }
+.provider-load-error { display: grid; gap: 0.5rem; justify-items: start; }
+/* The banner spans the dialog like every other dialog's error banner; only Retry keeps its own width. */
+.provider-load-error > .error-banner { justify-self: stretch; margin: 0; }
+.provider-list { display: grid; gap: 0.75rem; max-height: 52dvh; overflow: auto; overscroll-behavior: contain; padding: 4px; }
+/* The list step pins search, the summary line and the footnote; only the list scrolls, and it gives
+   up its height first, as the Tools dialog's list does. Only if the pinned parts alone cannot fit
+   does the dialog's content scroll, as it does for the whole detail step. */
+.modal-content:has(> .providers-panel[data-step="list"]) { display: flex; flex-direction: column; }
+.providers-panel[data-step="list"] { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
+.providers-panel[data-step="list"] > * { flex: none; }
+.providers-panel[data-step="list"] > .provider-list { flex: 0 1 auto; min-height: 0; }
+.provider-group { display: grid; gap: 0.375rem; min-width: 0; }
+.provider-group-heading { padding: 0 0.25rem; color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+.provider-rows { display: grid; gap: 0.375rem; margin: 0; padding: 0; list-style: none; }
+.provider-rows > li { min-width: 0; }
+/* One bordered row per provider, in the model picker's option language. */
+/* The status and tags keep their own width, so a long name wraps beside them instead of running
+   under them; once the name would get less than 12rem, they move to a line of their own. */
+.provider-row { width: 100%; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.75rem; padding: 0.5rem 0.625rem; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--card); text-align: left; }
+.provider-row:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 35%, var(--border-soft)); background: var(--surface); }
+.provider-row:focus-visible { outline-offset: -2px; }
+/* Headings take focus only so a step change is announced; they are not controls and show no ring. */
+.providers-panel :is(h3, h4, h5)[tabindex="-1"]:focus-visible { outline: none; }
+.provider-row-main { flex: 1 1 12rem; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.provider-row-main > strong { font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
+.provider-id { font-family: var(--mono); font-size: 0.6875rem; color: var(--muted); overflow-wrap: anywhere; word-break: break-all; }
+.provider-row-meta { flex: none; max-width: 100%; min-width: 0; margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 0.25rem; }
+.provider-methods { justify-content: flex-end; }
+.provider-methods .model-role-tag { white-space: nowrap; }
+.provider-status { display: inline-flex; align-items: center; gap: 0.375rem; color: var(--muted); font-size: 0.75rem; white-space: nowrap; }
+.provider-status::before { content: ""; flex: none; width: 0.5rem; height: 0.5rem; border-radius: var(--radius-pill); background: currentColor; }
+.provider-status[data-state="none"]::before { background: transparent; box-shadow: inset 0 0 0 1px currentColor; }
+.provider-status[data-state="ready"] { color: var(--status-done); }
+.provider-status[data-state="configured"] { color: var(--status-waiting); }
+.provider-status[data-state="connecting"] { color: var(--status-running); }
+.provider-status[data-state="failed"] { color: var(--provider-error-ink); }
+.provider-status[data-state="failed"]::before { background: var(--status-error); }
+.provider-empty { padding: 1.5rem 0.75rem; border: 1px dashed var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); color: var(--muted); text-align: center; }
+.provider-detail { display: grid; gap: 0.875rem; min-width: 0; }
+.provider-back { justify-self: start; padding-left: 0.25rem; color: var(--muted); }
+.provider-back > svg { width: 1rem; height: 1rem; }
+.provider-detail-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 0.375rem 0.75rem; }
+.provider-detail-title { display: grid; gap: 2px; min-width: 0; }
+.provider-detail-title > h3 { font-size: 1rem; }
+.provider-detail-note { display: grid; gap: 2px; color: var(--muted); font-size: 0.8125rem; }
+.provider-method { display: grid; gap: 0.5rem; min-width: 0; padding: 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-2); }
+.provider-method h4 { font-size: 0.8125rem; }
+.provider-field-row { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.provider-field-row > input { flex: 1 1 12rem; }
+.provider-field-row > .button { flex: none; }
+.provider-field-error { color: var(--provider-error-ink); font-size: 0.75rem; }
+/* A refused key keeps an error edge, also while focused (the field keeps focus after the refusal),
+   where the focus halo takes the error hue instead of the accent. */
+.provider-key input[aria-invalid="true"] { border-color: var(--status-error); }
+.provider-key input[aria-invalid="true"]:focus-visible { border-color: var(--status-error); box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-error) 45%, transparent); }
+.provider-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.provider-blocked { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.5rem; padding: 0.625rem 0.75rem; border-radius: var(--radius-sm); background: var(--surface-2); color: var(--muted); font-size: 0.8125rem; }
+.provider-link { min-height: 0; padding: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.provider-link:hover:not(:disabled) { background: transparent; }
+.provider-disconnect { display: grid; gap: 0.25rem; justify-items: start; }
+/* The flow card replaces the methods while this provider owns the Host's single flow. */
+.provider-flow { display: grid; gap: 0.75rem; min-width: 0; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); }
+.provider-flow[data-tone="waiting"] { border-color: color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
+.provider-flow[data-tone="done"] { border-color: color-mix(in srgb, var(--status-done) 40%, var(--border-soft)); }
+.provider-flow-heading { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; }
+.provider-flow-heading > svg { flex: none; width: 1rem; height: 1rem; }
+.provider-flow[data-tone="running"] .provider-flow-heading > svg { color: var(--status-running); }
+.provider-flow[data-tone="done"] .provider-flow-heading > svg { color: var(--status-done); }
+.provider-flow[data-tone="waiting"] .provider-flow-heading > svg { color: var(--status-waiting); }
+.provider-flow-status { color: var(--muted); font-size: 0.8125rem; }
+/* Text on an amber-tinted card uses the body ink: muted ink falls under 4.5:1 on the tint in some
+   palettes. The amber stays on the card's edge, its icon and its heading. A warning can arrive after
+   the sign-in page and code, so they are covered too. */
+.provider-flow[data-tone="waiting"] :is(.provider-flow-status, .provider-code > span, .provider-url) { color: var(--text); }
+.provider-code { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.25rem; justify-items: start; min-width: 0; }
+.provider-code > span { color: var(--muted); font-size: 0.75rem; }
+.provider-code-value { padding: 0.5rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); font-family: var(--mono); font-size: 1.5rem; font-weight: 600; letter-spacing: 0.12em; user-select: all; }
+/* A code is typed character by character, so it never breaks across lines. In a narrow panel the
+   type shrinks with the panel's width (10cqi keeps a usual 9-character code whole in the dialog of a
+   390px window at the largest text size); a longer code scrolls inside its own block. */
+.provider-code-value { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; white-space: nowrap; font-size: min(1.5rem, 10cqi); }
+.provider-browser { display: grid; gap: 0.5rem; justify-items: start; min-width: 0; }
+.provider-url { max-width: 100%; color: var(--muted); font-family: var(--mono); font-size: 0.75rem; overflow-wrap: anywhere; word-break: break-all; }
+.provider-warning { display: grid; gap: 0.625rem; min-width: 0; padding: 0.75rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-md); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
+.provider-warning > h5 { display: flex; align-items: center; gap: 0.375rem; color: var(--status-waiting); font-size: 0.8125rem; font-weight: 600; }
+.provider-warning > h5 > svg { flex: none; width: 1rem; height: 1rem; }
+.provider-warning > p { white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
+.provider-prompt { display: grid; gap: 0.375rem; }
+/* The zero-model guide: the waiting hue marks a missing prerequisite, not a failure. */
+.provider-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; max-width: 800px; min-width: 0; margin: 0 auto 8px; padding: 0.75rem 0.875rem; border: 1px solid color-mix(in srgb, var(--status-waiting) 45%, var(--border-soft)); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--status-waiting) 8%, var(--card)); }
+/* Icon and text are one flex item: the button wraps below them, never the icon. */
+.provider-notice-main { flex: 1 1 16rem; min-width: 0; display: flex; align-items: center; gap: 0.75rem; }
+.provider-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; color: var(--status-waiting); }
+.provider-notice-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; }
+.provider-notice-text > span { font-size: 0.8125rem; }
+.provider-notice-action { flex: none; margin-left: auto; }
+/* Below the empty state, which takes the free space, so the notice lands at the column's bottom. */
+.provider-notice-dock { flex: none; padding: 12px 24px 20px; }
+.provider-notice-dock > .provider-notice { margin-bottom: 0; }
+.providers-summary { display: grid; gap: 0.625rem; justify-items: start; }
+.providers-summary-empty { display: flex; align-items: center; gap: 0.375rem; color: var(--status-waiting); }
+.providers-summary-empty > svg { flex: none; width: 1rem; height: 1rem; }
+/* Showcase only: group labels line up with their buttons, and the selected fixture state reads as
+   pressed, in the body ink. */
+#showcase-providers > .actions { align-items: center; }
+#showcase-providers > .actions > .button[aria-pressed="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--text); }
+.providers-showcase-frame { max-width: 640px; min-width: 0; padding: 1rem; border: 1px solid var(--border-soft); border-radius: var(--radius-xl); background: var(--card); }
+.providers-showcase-frame + .providers-showcase-frame { margin-top: 0.75rem; }
+/* The Providers dialog in a 390px window: its width there (the UA's dialog max-width, 100% - 6px - 2em,
+   under the dialog's own 100vw - 32px), its 16px narrow padding and the content's 4px. */
+.providers-showcase-frame[data-narrow] { max-width: min(358px, calc(384px - 2em)); padding: 20px; }
+.providers-showcase-column { display: flex; flex-direction: column; min-height: 22rem; border: 1px dashed var(--border-soft); border-radius: var(--radius-lg); }
+@media (max-width: 759px) {
+	.provider-notice-dock { padding: 8px 12px 16px; }
+}
+/* A short window keeps room for the composer: the notice drops to one visible line, and its
+   explanation stays available to assistive technology. */
+@media (max-height: 640px) {
+	.provider-notice { padding: 0.5rem 0.75rem; }
+	/* Only the title shows, so the text asks for its own width and the button stays beside it whenever both fit. */
+	.provider-notice-main { flex-basis: auto; }
+	.provider-notice:not([data-expanded]) .provider-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+	.provider-notice[data-expanded] .provider-notice-main { flex-basis: 16rem; }
+}
+/* 404px is the panel's width in the dialog of a 480px window at the default text size. */
+@container providers-panel (max-width: 404px) {
+	.provider-row-meta { margin-left: 0; align-items: flex-start; }
+	.provider-methods { justify-content: flex-start; }
+	.provider-field-row { flex-wrap: wrap; }
+	.provider-actions > .button, .provider-field-row > .button, .provider-browser > .button { flex: 1 1 100%; width: 100%; }
+}
+@media (max-width: 480px) {
+	.provider-notice-action { flex: 1 1 100%; width: 100%; }
+}
+/* Showcase only: the notice as a 390px window shows it, in a column that is the window less the 64px
+   sidebar rail and 12px of padding each side; the narrow rule above keys off the window, so it is
+   repeated for this frame. */
+.providers-showcase-narrow-notice { max-width: 302px; }
+.providers-showcase-narrow-notice .provider-notice-action { flex: 1 1 100%; width: 100%; }
+/* Section S: session connection and recovery labels (RecoveryConversation.tsx, SessionConnection.tsx). */
+/* One bounded card per delivery, in the conversation's 800px reading column with the column's 16px
+   gutter (as the error banner beside it), so stacked cards and their actions stay apart: what
+   happened, which conversation, an orphan's text, then one row of actions. */
+.recovery-card { flex: none; display: grid; gap: 0.5rem; width: min(800px, calc(100% - 32px)); min-width: 0; margin: 8px auto; padding: 0.75rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); color: var(--muted); font-size: 0.8125rem; }
+.recovery-card p { margin: 0; }
+.recovery-card-message { display: grid; gap: 0.25rem; word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-conversation { display: grid; gap: 0.25rem; min-width: 0; }
+.recovery-conversation-name { min-width: 0; color: var(--text); font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-conversation-hint { word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-card-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+/* Scoped to the card, among muted prose: an enabled action is filled and in the body ink, a disabled
+   one unfilled with a dashed muted edge, so the two differ by more than color in every palette. The
+   disabled one is not faded as well: fading made its edge vanish (about 1.2:1); at full strength the
+   muted edge clears 3:1 on the card. */
+.recovery-card-actions > .button { border-color: var(--border-soft); background: var(--surface-2); color: var(--text); }
+.recovery-card-actions > .button:hover:not(:disabled) { background: var(--surface); }
+.recovery-card-actions > .button:disabled { opacity: 1; border-style: dashed; border-color: var(--muted); background: transparent; color: var(--muted); }
+.recovery-card-reason { font-size: 0.75rem; word-break: keep-all; overflow-wrap: anywhere; }
+/* The Delete dialog pins its question, warning and Delete; only the unsent-message list scrolls, and
+   it gives up its height first, as the Tools and Providers lists do. Only if the pinned parts alone
+   cannot fit does the dialog's content scroll. */
+.modal-content:has(> .delete-dialog) { display: flex; flex-direction: column; }
+.delete-dialog { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
+.delete-dialog > * { flex: none; }
+.delete-dialog > .button.danger { align-self: flex-start; }
+/* In the Delete conversation confirmation: the unrestored texts that go with it, and a copy first. */
+.delete-recoveries { display: flex; flex-direction: column; gap: 0.5rem; margin: 0 0 1rem; }
+.delete-dialog > .delete-recoveries { flex: 0 1 auto; min-height: 0; }
+.delete-recoveries > * { flex: none; }
+.delete-recoveries > .delete-recovery-texts { flex: 0 1 auto; min-height: 2.5rem; }
+.delete-recoveries > p { margin: 0; word-break: keep-all; overflow-wrap: anywhere; }
+/* Each unsent message is its own numbered item; the list scrolls as one, its texts never on their own. */
+.delete-recovery-texts { display: grid; gap: 0.5rem; max-height: 16rem; min-width: 0; margin: 0; padding: 0; overflow: auto; overscroll-behavior: contain; list-style: none; }
+.delete-recovery-texts > li { display: grid; gap: 0.25rem; min-width: 0; }
+.delete-recovery-number { color: var(--muted); font-size: 0.75rem; font-weight: 600; }
+.delete-recovery-texts .recovery-text { max-height: none; overflow: visible; }
+/* An orphan's unsent text, in the bounded-output vocabulary: inset, scrollable, its whitespace kept
+   and selectable, because it may be the last copy. Long text starts behind a disclosure. */
+.recovery-text, .recovery-text-disclosure { flex-basis: 100%; min-width: 0; }
+.recovery-text { max-height: 12rem; margin: 0; padding: 0.5rem 0.75rem; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text); font: inherit; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; user-select: text; }
+.recovery-text-disclosure > summary { display: inline-flex; align-items: center; gap: 4px; padding: 4px 0; color: var(--text); list-style: none; }
+.recovery-text-disclosure > summary::-webkit-details-marker { display: none; }
+.recovery-text-disclosure > summary > svg { width: 1rem; height: 1rem; }
+.recovery-text-disclosure[open] > summary .disclosure-chevron { transform: rotate(90deg); }
+.recovery-text-disclosure[open] > .recovery-text { margin-top: 0.25rem; }
+/* Copy feedback is visible: done in the body ink with a green check, a failure in error ink (the
+   error hue mixed toward the body ink, as in the error banner) with the hue on its icon. */
+.recovery-copy-status, .recovery-copy-error { display: flex; flex-basis: 100%; align-items: flex-start; gap: 0.375rem; margin: 0; word-break: keep-all; overflow-wrap: anywhere; }
+.recovery-copy-status > svg, .recovery-copy-error > svg { flex: none; width: 1rem; height: 1rem; margin-top: max(0px, calc((1lh - 1rem) / 2)); }
+.recovery-copy-status { color: var(--text); }
+.recovery-copy-status > svg { color: var(--status-done); }
+.recovery-copy-error { color: color-mix(in srgb, var(--error) 72%, var(--text)); }
+.recovery-copy-error > svg { color: var(--error); }
+/* The composer's place while the app does not write the conversation: a neutral card in the
+   composer's 800px column, not an error. The draft is kept and returns with the composer. */
+.connection-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; max-width: 800px; min-width: 0; margin: 0 auto; padding: 0.75rem 0.875rem; border: 1px solid var(--border-soft); border-radius: var(--radius-lg); background: var(--card); box-shadow: var(--shadow-rest); }
+/* Icon and text are one flex item, as in the onboarding notice: the button wraps below them, never
+   the icon, and both states lay out alike at any width. The icon sits level with the title line. */
+.connection-notice-main { flex: 1 1 16rem; min-width: 0; display: flex; align-items: flex-start; gap: 0.75rem; }
+.connection-notice-icon { flex: none; width: 1.125rem; height: 1.125rem; margin-top: max(0px, calc((1lh - 1.125rem) / 2)); color: var(--muted); }
+.connection-notice-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; word-break: keep-all; overflow-wrap: anywhere; }
+.connection-notice-text > span { color: var(--muted); font-size: 0.8125rem; }
+.connection-notice-action { flex: none; margin-left: auto; }
+/* Every label of either state reserves the button's width (one generated line each), so a pending
+   label never reflows the text beside it and both states' buttons, and layouts, match. */
+.connection-notice-label { display: inline-flex; flex-direction: column; align-items: center; }
+.connection-notice-label::after { content: attr(data-reserve); height: 0; overflow: hidden; visibility: hidden; white-space: pre; }
+/* Pending keeps the primary colors (a legible label is the only sign of progress), adds an inset edge
+   and a progress cursor, and does not react to the pointer. */
+.button.primary.connection-notice-action[aria-disabled="true"] { cursor: progress; background: var(--accent); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--on-accent) 30%, transparent); }
+/* Header chip beside the title and the sidebar mark beside a row's name: muted, never a status hue. */
+/* The gap sits on the title's end, so a badge that wraps to its own line starts flush with the title. */
+.toolbar-title h1:has(+ .connection-badge) { display: inline; margin-right: 8px; }
+.connection-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--border-soft); border-radius: var(--radius-pill); color: var(--muted); font-size: 0.6875rem; font-weight: 500; line-height: 1.4; vertical-align: 0.15em; white-space: nowrap; }
+.connection-badge svg, .connection-mark svg { width: 0.75rem; height: 0.75rem; }
+.connection-mark { flex: none; display: inline-flex; color: var(--muted); }
+.desktop-sidebar[data-compact] .connection-mark { display: none; }
+.disconnect-confirmation p { word-break: keep-all; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+	.connection-notice-action { flex: 1 1 100%; width: 100%; }
+}
+/* A short window keeps the action in view under a long title: one visible line sized to the title,
+   with the explanation still available to assistive technology (as the onboarding notice does). */
+/* The details toggle exists only where the explanation is folded away (short windows, below). */
+.connection-notice-more, .provider-notice-more { display: none; }
+@media (max-height: 640px) {
+	.connection-notice { padding: 0.5rem 0.75rem; }
+	.connection-notice-main { flex-basis: auto; }
+	.connection-notice:not([data-expanded]) .connection-notice-text > span { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+	/* Unfolded, the notice lays out as in a tall window: the explanation wraps beside the icon. */
+	.connection-notice[data-expanded] .connection-notice-main { flex-basis: 16rem; }
+	.connection-notice-more, .provider-notice-more { display: inline-flex; flex: none; min-height: 0; margin-top: max(0px, calc((1lh - 1.75rem) / 2)); padding: 0.25rem; color: var(--muted); }
+	.connection-notice-more > svg, .provider-notice-more > svg { width: 1.25rem; height: 1.25rem; transition: transform var(--dur) var(--ease); }
+	:is(.connection-notice, .provider-notice)[data-expanded] :is(.connection-notice-more, .provider-notice-more) > svg { transform: rotate(180deg); }
+}
+/* Showcase only: the narrow state's column and a sidebar-width strip of rows. */
+.showcase-session-narrow { max-width: 20rem; }
+.showcase-recovery-column { overflow: visible; padding: 8px 0; border: 1px dashed var(--border-soft); border-radius: var(--radius-lg); }
+.showcase-session-rows { max-width: 264px; padding: 8px; border-radius: var(--radius-md); background: var(--sidebar); }

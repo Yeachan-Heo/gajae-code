@@ -8,7 +8,17 @@ import {
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatchesWithCurrent,
 } from "../config/atomic-yaml-patch";
-import { validateModelProfileName } from "../config/model-profile-contract";
+import {
+	collectModelProfileAuthentication,
+	createPassiveModelProfileCredentials,
+	isModelProfileSelectable,
+	type ModelProfileAvailabilityContext,
+} from "../config/model-profile-availability";
+import {
+	type ModelProfileCatalogItem,
+	projectModelProfileCatalog,
+	validateModelProfileName,
+} from "../config/model-profile-contract";
 import { ModelProfileApplyCommittedError, readDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import {
 	createRegistrySelectorIndex,
@@ -57,6 +67,11 @@ export interface SdkRoleModelPreference {
 	configurationResolution: SettingsPathResolution;
 	canClear: boolean;
 }
+export interface SdkProfileCatalogEntry extends ModelProfileCatalogItem {
+	available: boolean;
+	roles: Array<{ role: "default" | "image" | SessionAgentModelRole; model: string | null }>;
+}
+
 export interface SdkRoleModelPreferences {
 	roles: SdkRoleModelPreference[];
 }
@@ -310,6 +325,43 @@ export class SdkPreferenceControls {
 		this.#assertIdentity();
 		if (this.#session.getUserModelSelectionRevision() !== revision)
 			throw new SdkPreferenceError("preference_busy", "A newer model selection superseded the request.");
+	}
+
+	/**
+	 * Canonical read-only profile presentation. Availability is the managed
+	 * `models.profiles.list` decision (providers authenticated directly, through an alternative or a
+	 * configured proxy, and mapped models resolvable) with one difference: a credential counts when
+	 * a usable one exists. The read resolves no key, refreshes no OAuth token and records no session
+	 * credential choice, so it never changes which credential a later request uses. It never
+	 * refreshes the registry's catalogs either.
+	 */
+	async readProfiles(): Promise<SdkProfileCatalogEntry[]> {
+		this.#assertIdentity();
+		const definitions = this.#registry.getModelProfiles();
+		const catalog = projectModelProfileCatalog(definitions, this.#registry.getError());
+		const context: ModelProfileAvailabilityContext = {
+			registry: this.#registry,
+			settings: this.#settings,
+			resolutionSettings: this.#settings,
+			credentialSessionId: this.#session.credentialSessionId,
+			credentials: createPassiveModelProfileCredentials(this.#registry),
+		};
+		const authenticated = await collectModelProfileAuthentication(context, definitions);
+		const result = await Promise.all(
+			catalog.map(async profile => {
+				const definition = definitions.get(profile.id)!;
+				return {
+					...profile,
+					available: await isModelProfileSelectable(context, definition, authenticated),
+					roles: (["default", "image", ...ROLES] as const).map(role => {
+						const model = definition.modelMapping[role];
+						return { role, model: Array.isArray(model) ? (model[0] ?? null) : (model ?? null) };
+					}),
+				};
+			}),
+		);
+		this.#assertIdentity();
+		return result;
 	}
 
 	#requirePersistence(): void {

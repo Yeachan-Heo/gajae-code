@@ -1,0 +1,2142 @@
+/** Real SDK streaming/queue/persistence lifecycle with an in-process controlled provider stream. */
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
+import { z } from "@gajae-code/ai";
+import type { AssistantMessage, Model } from "@gajae-code/ai/core";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { setModelPresetRegistryDisabled } from "@gajae-code/coding-agent/config/model-preset-registry";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import {
+	ExtensionRunner,
+	type ExtensionUIContext,
+	loadExtensions,
+} from "@gajae-code/coding-agent/extensibility/extensions";
+import { type CreateAgentSessionResult, createSdkOperatorControls } from "@gajae-code/coding-agent/sdk";
+import { approvalGate } from "@gajae-code/coding-agent/sdk/workflow-gates";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { EventBus } from "@gajae-code/coding-agent/utils/event-bus";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { createSdkRunCapability } from "../../coding-agent/src/sdk/host/sdk-run-capability";
+import { DeliveryJournal } from "../src/delivery-journal";
+import { DesktopHost } from "../src/host";
+import {
+	type DesktopCommandResult,
+	type DesktopDisconnectResult,
+	type DesktopFrame,
+	type DesktopHistory,
+	type DesktopProject,
+	type DesktopRequest,
+	type DesktopSession,
+	type DesktopSnapshot,
+	parseRequest,
+} from "../src/protocol";
+
+const model: Model = {
+	id: "controlled",
+	name: "Controlled local stream",
+	provider: "desktop-stream-fixture",
+	api: "openai-completions",
+	baseUrl: "https://example.invalid",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 200_000,
+	maxTokens: 1024,
+};
+
+function controlledAgent() {
+	const started = Promise.withResolvers<void>();
+	const prompts: string[] = [];
+	let aborts = 0;
+	let finishTurn: ((text: string, failed?: boolean) => void) | undefined;
+	let finishWithToolCall: (() => void) | undefined;
+	let toolCalls = 0;
+	let toolEntered = Promise.withResolvers<void>();
+	let releaseTool: (() => void) | undefined;
+	// A real tool the controlled model can call; it runs until the test releases it or the run aborts.
+	const read: AgentTool = {
+		name: "read",
+		label: "Read",
+		description: "Parks until the test releases it",
+		parameters: z.object({ path: z.string() }),
+		execute: async (_id, _args, signal) => {
+			const released = Promise.withResolvers<void>();
+			releaseTool = () => released.resolve();
+			signal?.addEventListener("abort", () => released.resolve(), { once: true });
+			toolEntered.resolve();
+			await released.promise;
+			return { content: [{ type: "text", text: "file body" }] };
+		},
+	};
+	const agent = new Agent({
+		initialState: { model, messages: [], tools: [read], systemPrompt: [] },
+		getApiKey: () => "local-stream-only",
+		streamFn: (_model, context, options) => {
+			const text = context.messages
+				.flatMap(message =>
+					message.role === "user"
+						? [
+								typeof message.content === "string"
+									? message.content
+									: message.content
+											.filter(block => block.type === "text")
+											.map(block => block.text)
+											.join(""),
+							]
+						: [],
+				)
+				.join("\n");
+			prompts.push(text);
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "working" }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "stop",
+				timestamp: Date.now(),
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			};
+			let done = false;
+			const settle = (aborted: boolean, response = "", failed = false) => {
+				if (done) return;
+				done = true;
+				options?.signal?.removeEventListener("abort", abort);
+				if (aborted) {
+					aborts++;
+					message.stopReason = "aborted";
+					stream.push({ type: "error", reason: "aborted", error: message });
+				} else if (failed) {
+					message.stopReason = "error";
+					message.errorMessage = "controlled provider failure";
+					stream.push({ type: "error", reason: "error", error: message });
+				} else {
+					message.content = [{ type: "text", text: response }];
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			};
+			const abort = () => settle(true);
+			finishTurn = (response, failed) => settle(false, response, failed);
+			finishWithToolCall = () => {
+				if (done) return;
+				done = true;
+				options?.signal?.removeEventListener("abort", abort);
+				message.content = [
+					{ type: "toolCall", id: `read-${++toolCalls}`, name: "read", arguments: { path: "a.ts" } },
+				];
+				message.stopReason = "toolUse";
+				stream.push({ type: "done", reason: "toolUse", message });
+			};
+			options?.signal?.addEventListener("abort", abort, { once: true });
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "working", partial: message });
+				if (options?.signal?.aborted) abort();
+			});
+			return stream;
+		},
+	});
+	agent.subscribe(event => {
+		if (event.type === "message_update") started.resolve();
+	});
+	return {
+		agent,
+		started: started.promise,
+		prompts,
+		get aborts() {
+			return aborts;
+		},
+		finishTurn(response: string, failed = false) {
+			if (!finishTurn) throw new Error("No controlled provider turn is running");
+			finishTurn(response, failed);
+		},
+		/** Ends the streaming turn with a `read` call and resolves once that tool is running. */
+		callTool(): Promise<void> {
+			if (!finishWithToolCall) throw new Error("No controlled provider turn is running");
+			toolEntered = Promise.withResolvers<void>();
+			finishWithToolCall();
+			return toolEntered.promise;
+		},
+		releaseTool() {
+			if (!releaseTool) throw new Error("No controlled tool is running");
+			releaseTool();
+		},
+	};
+}
+
+/** The visible text of a transcript message, for asserting what actually reached the conversation. */
+const copyText = (message: AgentSession["messages"][number]): string =>
+	!("content" in message)
+		? ""
+		: typeof message.content === "string"
+			? message.content
+			: message.content.map(block => (block.type === "text" ? block.text : "")).join("");
+
+describe("desktop streaming lifecycle", () => {
+	let environment: NodeJS.ProcessEnv;
+	let previousAgentDir: string;
+	beforeEach(() => {
+		environment = { ...process.env };
+		previousAgentDir = getAgentDir();
+		process.env.GJC_DESKTOP_ISOLATED = "1";
+		delete process.env.GJC_CODING_AGENT_DIR;
+	});
+	const cleanups: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		try {
+			while (cleanups.length > 0) await cleanups.pop()?.();
+		} finally {
+			vi.restoreAllMocks();
+			for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];
+			Object.assign(process.env, environment);
+			setAgentDir(previousAgentDir);
+		}
+	});
+
+	async function launch(withRunner = false, extensionSource?: string) {
+		const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-stream-"));
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-desktop-project-"));
+		await setModelPresetRegistryDisabled({ agentDir: path.join(dataDir, "agent"), disabled: true });
+		await Bun.write(
+			path.join(projectDir, ".gjc", "config.yml"),
+			"compaction:\n  enabled: false\nretry:\n  enabled: false\n",
+		);
+		const extensionPath = path.join(projectDir, "input-extension.ts");
+		if (extensionSource) await Bun.write(extensionPath, extensionSource);
+		// Host initialization ordinarily refreshes online; model discovery is not under test.
+		vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined);
+		const frames: DesktopFrame[] = [];
+		const startupEvents: string[] = [];
+		const captures: Array<{
+			session: AgentSession;
+			control: ControlledAgent;
+			runner?: ExtensionRunner;
+			contexts: ExtensionUIContext[];
+		}> = [];
+		const host = new DesktopHost({
+			dataDir,
+			emit: frame => frames.push(frame),
+			createSession: async options => {
+				if (!options.sessionManager || !options.settings || !options.modelRegistry || !options.authStorage)
+					throw new Error("Host must supply genuine session-scoped SDK services");
+				options.authStorage.setRuntimeApiKey(model.provider, "local-stream-only");
+				options.settings.override("compaction.enabled", false);
+				options.settings.override("retry.enabled", false);
+				const control = controlledAgent();
+				const eventBus = new EventBus();
+				const extensionsResult = await loadExtensions(
+					extensionSource ? [extensionPath] : [],
+					options.sessionManager.getCwd(),
+					eventBus,
+				);
+				const runner = withRunner
+					? new ExtensionRunner(
+							extensionsResult.extensions,
+							extensionsResult.runtime,
+							options.sessionManager.getCwd(),
+							options.sessionManager,
+							options.modelRegistry,
+						)
+					: undefined;
+				if (runner) {
+					const emit = runner.emit.bind(runner);
+					vi.spyOn(runner, "emit").mockImplementation((event, ...args) => {
+						startupEvents.push(event.type);
+						return emit(event, ...args);
+					});
+					vi.spyOn(runner, "onError");
+				}
+				const contexts: ExtensionUIContext[] = [];
+				const session = new AgentSession({
+					agent: control.agent,
+					sessionManager: options.sessionManager,
+					settings: options.settings,
+					modelRegistry: options.modelRegistry,
+					agentDir: options.agentDir,
+					workflowGatePublication: "local",
+					extensionRunner: runner,
+				});
+				captures.push({ session, control, runner, contexts });
+				session.registerToolSessionCleanup(() => eventBus.clear());
+				// No extensions/tools are loaded in this fixture. Only the unrelated factory UI setter is unused.
+				return {
+					session,
+					extensionsResult,
+					eventBus,
+					setToolUIContext: ui => {
+						contexts.push(ui);
+					},
+				} satisfies CreateAgentSessionResult;
+			},
+		});
+		cleanups.push(async () => {
+			try {
+				await host.close();
+			} finally {
+				await fs.rm(dataDir, { recursive: true, force: true });
+				await fs.rm(projectDir, { recursive: true, force: true });
+			}
+		});
+		const call = async <T>(
+			method: DesktopRequest["method"],
+			params: Record<string, unknown> = {},
+			id: string = crypto.randomUUID(),
+		): Promise<T> => {
+			await host.handle(parseRequest(JSON.stringify({ id, method, params })));
+			const response = frames.findLast(frame => frame.type === "response" && frame.id === id);
+			if (response?.type !== "response") throw new Error(`No response for ${method}`);
+			if (!response.ok) throw new Error(response.error);
+			return response.result as T;
+		};
+		const snapshot = () => call<DesktopSnapshot>("bootstrap");
+		const project = await call<DesktopProject>("project.open", { path: projectDir });
+		const session = await call<DesktopSession>("session.create", { projectId: project.id });
+		return {
+			call,
+			snapshot,
+			project,
+			session,
+			sdk: captures[0]!.session,
+			control: captures[0]!.control,
+			runner: captures[0]!.runner,
+			contexts: captures[0]!.contexts,
+			startupEvents,
+			frames,
+			/** Opens another conversation in the same workspace, with its own controlled SDK session. */
+			async open() {
+				const opened = await call<DesktopSession>("session.create", { projectId: project.id });
+				const capture = captures.at(-1);
+				if (!capture || capture.session === captures[0]!.session) throw new Error("No second SDK session");
+				return { session: opened, sdk: capture.session, control: capture.control };
+			},
+		};
+	}
+
+	test("same runner refreshes UI without repeating startup or error listeners", async () => {
+		const { call, snapshot, session, sdk, runner, contexts, startupEvents } = await launch(true);
+		if (!runner) throw new Error("Expected extension runner");
+		await call("command.run", { sessionId: session.id, text: "/tools" });
+		const oldUI = contexts[0]!;
+		expect(await sdk.clearContext()).toBe(true);
+		await call("session.select", { sessionId: session.id });
+		expect(runner.onError).toHaveBeenCalledTimes(1);
+		expect(startupEvents.filter(type => type === "session_start")).toHaveLength(1);
+		expect(contexts.length).toBeGreaterThan(1);
+		expect(await oldUI.input("stale")).toBeUndefined();
+		const answer = runner.getUIContext().input("fresh");
+		const question = (await snapshot()).sessions[0]?.question;
+		expect(question?.title).toBe("fresh");
+		await call("question.answer", { sessionId: session.id, questionId: question!.id, value: "answer" });
+		expect(await answer).toBe("answer");
+	});
+
+	test("real input hooks transform direct and queued prompts and handle input locally", async () => {
+		const { call, snapshot, session, control } = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => event.text === "handled" ? { handled: true } : { text: "transformed: " + event.text });
+		}`,
+		);
+		await call("prompt", { sessionId: session.id, text: "handled" }, "handled-input");
+		expect(control.prompts).toHaveLength(0);
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({ id: "handled-input", disposition: "completed" }),
+		);
+		const running = call("prompt", { sessionId: session.id, text: "direct" }, "transformed-direct");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before stream");
+			}),
+		]);
+		expect(control.prompts[0]).toContain("transformed: direct");
+		await call("prompt", { sessionId: session.id, text: "queued", deliverAs: "followUp" }, "transformed-queued");
+		control.finishTurn("first");
+		for (let i = 0; i < 200 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(control.prompts[1]).toContain("transformed: queued");
+		control.finishTurn("second");
+		await running;
+	});
+
+	test("forwarded commands dispatch input hooks exactly once", async () => {
+		const { call, session, control } = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => ({ text: "hook: " + event.text }));
+		}`,
+		);
+		const running = call("command.run", { sessionId: session.id, text: "forwarded" }, "forwarded-hook");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before stream");
+			}),
+		]);
+		expect(control.prompts[0]).toContain("hook: forwarded");
+		expect(control.prompts[0]).not.toContain("hook: hook:");
+		control.finishTurn("done");
+		await running;
+	});
+
+	test("a run reports running, accepts a steer, and abort clears it", async () => {
+		const { call, snapshot, session, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-run");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		expect(sdk.isStreaming).toBe(true);
+		expect(control.prompts).toHaveLength(1);
+		expect(control.prompts[0]).toContain("long task");
+		expect((await snapshot()).sessions[0]?.status).toBe("running");
+		expect((await snapshot()).sessions[0]?.messages.map(message => message.text)).toContain("working");
+		await expect(call("command.run", { sessionId: session.id, text: "/tools" })).rejects.toThrow(
+			"Another operation is running",
+		);
+
+		const steer = await call<{ queued: boolean; submissionId: string }>(
+			"prompt",
+			{
+				sessionId: session.id,
+				text: "change direction",
+				deliverAs: "steer",
+			},
+			"steer-delivery",
+		);
+		expect(steer.queued).toBe(true);
+		expect(sdk.getQueuedMessages().steering).toEqual(["change direction"]);
+		expect((await snapshot()).sessions[0]?.queued).toEqual([
+			expect.objectContaining({
+				id: steer.submissionId,
+				text: "change direction",
+				deliverAs: "steer",
+				cancelable: true,
+			}),
+		]);
+		expect(
+			await call<{ removed: boolean }>("queue.cancel", { sessionId: session.id, queueId: steer.submissionId }),
+		).toEqual({ removed: true });
+		expect(sdk.getQueuedMessages().steering).toEqual([]);
+		expect((await snapshot()).sessions[0]?.queued ?? []).toHaveLength(0);
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-delivery",
+				sdkSubmissionId: steer.submissionId,
+				disposition: "cancelled",
+			}),
+		);
+
+		await call("prompt", { sessionId: session.id, text: "second turn", deliverAs: "followUp" }, "followup-delivery");
+		expect(sdk.getQueuedMessages().followUp).toEqual(["second turn"]);
+		expect((await snapshot()).sessions[0]?.queued ?? []).toHaveLength(1);
+		await call("abort", { sessionId: session.id });
+		// A user Stop is a cancellation, not an uncertain outcome: the prompt request settles
+		// normally and its text, already in the session's transcript, stays in the conversation.
+		expect(await running).toBeNull();
+		expect(control.aborts).toBe(1);
+		expect(sdk.isStreaming).toBe(false);
+		expect(sdk.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		const aborted = state.sessions[0];
+		expect(aborted?.status).not.toBe("running");
+		expect(aborted?.status).not.toBe("error");
+		expect(aborted?.error).toBeUndefined();
+		expect(aborted?.errorOwner).toBeUndefined();
+		expect(aborted?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "stopped-run", disposition: "cancelled" }));
+		// Stop kept the queued follow-up from running. It never reached the conversation, so it is
+		// `removed`, which returns its text to the composer; `cancelled` would drop it.
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "followup-delivery", disposition: "removed" }),
+		);
+		const history = await call<DesktopHistory>("history.get", { sessionId: session.id });
+		expect(history.messages.map(message => message.text)).toContain("long task");
+		expect(history.messages.map(message => message.text)).not.toContain("second turn");
+		expect(frames.some(frame => frame.type === "session" && frame.session.status === "running")).toBe(true);
+	});
+
+	test("a Stop after acceptance but before the transcript append restores the draft", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			if (id === "stopped-before-append" && changes.disposition === "accepted") {
+				held.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const running = call("prompt", { sessionId: session.id, text: "keep this draft" }, "stopped-before-append");
+		// SDK preflight accepted the prompt; its user message is appended only after this write.
+		await held.promise;
+		// The SDK abort joins the in-flight acceptance, so the write is released once Stop reached it.
+		const stopping = call("abort", { sessionId: session.id });
+		await stopReached.promise;
+		release.resolve();
+		await stopping;
+		expect(await running).toBeNull();
+		const state = await snapshot();
+		// The app restores a refused prompt into the composer before finalizing it. A cancelled
+		// receipt is finalized without restoring, which would lose text the transcript never got.
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-before-append", disposition: "refused" }),
+		);
+		expect(control.prompts).toHaveLength(0);
+		expect(sdk.messages.some(message => message.role === "user")).toBe(false);
+		expect(state.sessions[0]?.error).toBeUndefined();
+		expect(state.sessions[0]?.errorOwner).toBeUndefined();
+	});
+
+	test("closing the workspace during a run leaves the prompt outcome unknown", async () => {
+		const { call, snapshot, session, project, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "interrupted by close" }, "closed-run");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		// A Host-initiated abort is not the user's Stop: the app cannot claim a cancellation.
+		await call("project.close", { projectId: project.id });
+		await expect(running).rejects.toThrow("Prompt outcome unknown");
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({ id: "closed-run", disposition: "unknown" }),
+		);
+	});
+
+	test("Stop leaves the conversation idle and keeps a follow-up the agent queued for the next turn", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-with-agent-follow-up");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		// Monitor and cron notifications reach a streaming run as agent follow-ups that trigger a turn.
+		await sdk.sendCustomMessage(
+			{ customType: "task-notification", content: "monitor fired", display: false, attribution: "agent" },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		expect(sdk.agent.hasQueuedMessages()).toBe(true);
+		await call("abort", { sessionId: session.id });
+		// Stop settles the stopped prompt's own request instead of handing the session to a new turn.
+		expect(await Promise.race([running.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe(
+			"settled",
+		);
+		// A resumed turn would start about a millisecond after the abort returns.
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(sdk.isStreaming).toBe(false);
+		const state = await snapshot();
+		expect(state.sessions[0]?.status).toBe("done");
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-with-agent-follow-up", disposition: "cancelled" }),
+		);
+		// The notification is not lost: it waits in the queue and follows the next turn.
+		expect(sdk.agent.hasQueuedMessages()).toBe(true);
+		const next = call("prompt", { sessionId: session.id, text: "next" }, "after-stop");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		control.finishTurn("answered");
+		for (let i = 0; i < 400 && control.prompts.length < 3; i++) await Bun.sleep(5);
+		expect(control.prompts).toHaveLength(3);
+		control.finishTurn("notification handled");
+		await next;
+		const delivered = sdk.messages.findIndex(
+			message => message.role === "custom" && message.customType === "task-notification",
+		);
+		const nextPrompt = sdk.messages.findIndex(message => message.role === "user" && copyText(message) === "next");
+		expect(nextPrompt).toBeGreaterThan(-1);
+		expect(delivered).toBeGreaterThan(nextPrompt);
+		expect(sdk.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	/** Every receipt a delivery id passed through, in emission order. */
+	const receiptTrail = (frames: DesktopFrame[], id: string) =>
+		frames.flatMap(frame =>
+			frame.type === "delivery" && frame.receipt.id === id ? [frame.receipt.disposition] : [],
+		);
+
+	test("Stop returns every input still queued to the composer, identical texts included", async () => {
+		const { call, snapshot, session, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-with-queue");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "same", deliverAs: "steer" }, "queued-first");
+		await call("prompt", { sessionId: session.id, text: "same", deliverAs: "steer" }, "queued-second");
+		expect((await snapshot()).sessions[0]?.queued).toHaveLength(2);
+		await call("abort", { sessionId: session.id });
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-with-queue", disposition: "cancelled" }),
+		);
+		for (const id of ["queued-first", "queued-second"]) {
+			expect(state.deliveries).toContainEqual(expect.objectContaining({ id, disposition: "removed" }));
+			// The SDK also reports these as cancelled removals. The app settles a receipt on the first
+			// final frame it sees, so no `cancelled` frame may ever reach it for them.
+			expect(receiptTrail(frames, id)).not.toContain("cancelled");
+		}
+		expect(sdk.messages.filter(message => message.role === "user").map(copyText)).toEqual(["long task"]);
+	});
+
+	test("a steer admitted while Stop is settling the queue is returned as well", async () => {
+		const { call, snapshot, session, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-while-settling");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "queued first", deliverAs: "steer" }, "settled-first");
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			// Hold Stop's own write for the queued input; other journal writes proceed.
+			if (id === "settled-first" && changes.disposition !== "queued" && changes.disposition !== "accepted") {
+				held.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const stopping = call("abort", { sessionId: session.id });
+		await held.promise;
+		// Stop has counted itself and is writing the first input's receipt; this steer still queues.
+		const late = await call<{ queued: boolean }>(
+			"prompt",
+			{ sessionId: session.id, text: "typed during Stop", deliverAs: "steer" },
+			"admitted-during-stop",
+		);
+		expect(late.queued).toBe(true);
+		release.resolve();
+		expect(await stopping).toBeNull();
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		for (const id of ["settled-first", "admitted-during-stop"]) {
+			expect(state.deliveries).toContainEqual(expect.objectContaining({ id, disposition: "removed" }));
+			expect(receiptTrail(frames, id)).not.toContain("cancelled");
+		}
+		expect(sdk.messages.filter(message => message.role === "user").map(copyText)).toEqual(["long task"]);
+	});
+
+	test("pressing Stop twice settles the run once and returns the queued input", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-twice");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "typed next", deliverAs: "steer" }, "queued-before-stops");
+		const first = call("abort", { sessionId: session.id });
+		const second = call("abort", { sessionId: session.id });
+		expect(await Promise.all([first, second])).toEqual([null, null]);
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(control.aborts).toBe(1);
+		expect(sdk.isStreaming).toBe(false);
+		const state = await snapshot();
+		expect(state.sessions[0]?.status).toBe("done");
+		expect(state.sessions[0]?.error).toBeUndefined();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-twice", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "queued-before-stops", disposition: "removed" }),
+		);
+	});
+
+	test("a workspace close right after Stop keeps the Stop's outcomes", async () => {
+		const { call, snapshot, session, project, sdk, control, frames } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "stopped-then-closed");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: session.id, text: "typed next", deliverAs: "steer" }, "queued-before-close");
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const stopping = call("abort", { sessionId: session.id });
+		// The close starts while the Stop's abort is still unwinding.
+		await stopReached.promise;
+		const closing = call("project.close", { projectId: project.id });
+		expect(await stopping).toBeNull();
+		await closing;
+		expect(await running).toBeNull();
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "stopped-then-closed", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "queued-before-close", disposition: "removed" }),
+		);
+		expect(receiptTrail(frames, "queued-before-close")).not.toContain("cancelled");
+	});
+
+	/**
+	 * Presses Stop from inside the SDK's report that it took the next steer from the queue: the
+	 * input is consumed but not yet appended, so the aborted run hands it back and never sends it.
+	 */
+	function stopAtNextSteerConsumption(sdk: AgentSession, stop: () => Promise<unknown>): () => Promise<unknown> {
+		const consumed = sdk.agent.onSteeringConsumed;
+		if (!consumed) throw new Error("The SDK no longer reports steering consumption");
+		cleanups.push(async () => {
+			sdk.agent.onSteeringConsumed = consumed;
+		});
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const stopping = Promise.withResolvers<unknown>();
+		sdk.agent.onSteeringConsumed = async (messages, promotion) => {
+			await consumed(messages, promotion);
+			sdk.agent.onSteeringConsumed = consumed;
+			stop().then(stopping.resolve, stopping.reject);
+			await stopReached.promise;
+		};
+		return () => stopping.promise;
+	}
+	const userTurns = (sdk: AgentSession) => sdk.messages.filter(message => message.role === "user").map(copyText);
+	const settledReceipts = async (snapshot: () => Promise<DesktopSnapshot>, ids: string[]) => {
+		let state = await snapshot();
+		for (
+			let i = 0;
+			i < 200 &&
+			ids.some(id =>
+				["pending", "accepted", "queued"].includes(
+					state.deliveries.find(item => item.id === id)?.disposition ?? "pending",
+				),
+			);
+			i++
+		) {
+			await Bun.sleep(5);
+			state = await snapshot();
+		}
+		return Object.fromEntries(ids.map(id => [id, state.deliveries.find(item => item.id === id)?.disposition]));
+	};
+
+	test("an identical steer the stopped run took but never sent does not borrow the earlier one's turn", async () => {
+		const h = await launch();
+		const running = h.call("prompt", { sessionId: h.session.id, text: "long task" }, "tool-run");
+		await h.control.started;
+		await h.control.callTool();
+		// Both are queued before either reaches the transcript, so both can see the first one's turn.
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-sent");
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-taken");
+		h.control.releaseTool();
+		for (let i = 0; i < 400 && h.control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(h.control.prompts[1]).toBe("long task\nsame");
+		await h.control.callTool();
+		const stopped = stopAtNextSteerConsumption(h.sdk, () => h.call("abort", { sessionId: h.session.id }));
+		h.control.releaseTool();
+		expect(await stopped()).toBeNull();
+		expect(await running).toBeNull();
+		expect(h.control.prompts).toHaveLength(2);
+		expect(userTurns(h.sdk)).toEqual(["long task", "same"]);
+		// The handed-back steer is not left in the agent's queue, so restoring it cannot send it twice.
+		expect(h.sdk.agent.hasQueuedMessages()).toBe(false);
+		// One transcript turn is evidence for one input. The input it does not belong to never ran
+		// visibly, so it must not be settled as a cancellation that drops its text.
+		expect(await settledReceipts(h.snapshot, ["tool-run", "steer-sent", "steer-taken"])).toEqual({
+			"tool-run": "cancelled",
+			"steer-sent": "cancelled",
+			"steer-taken": "unknown",
+		});
+	});
+
+	test("after Stop, a steer taken at a finished turn but never sent is not reported completed", async () => {
+		const h = await launch();
+		const running = h.call("prompt", { sessionId: h.session.id, text: "long task" }, "finished-run");
+		await h.control.started;
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-answered");
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-dropped");
+		h.control.finishTurn("one");
+		for (let i = 0; i < 400 && h.control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(h.control.prompts[1]).toBe("long task\nsame");
+		const stopped = stopAtNextSteerConsumption(h.sdk, () => h.call("abort", { sessionId: h.session.id }));
+		// The turn's answer is final, so the run ends completed although Stop handed the steer back.
+		h.control.finishTurn("two");
+		expect(await stopped()).toBeNull();
+		await running;
+		expect(h.control.prompts).toHaveLength(2);
+		expect(userTurns(h.sdk)).toEqual(["long task", "same"]);
+		expect(h.sdk.agent.hasQueuedMessages()).toBe(false);
+		expect(await settledReceipts(h.snapshot, ["finished-run", "steer-answered", "steer-dropped"])).toEqual({
+			"finished-run": "completed",
+			"steer-answered": "completed",
+			// `completed` would finalize it silently; its text never reached the conversation.
+			"steer-dropped": "unknown",
+		});
+	});
+
+	test("Stop after two identical steers both reached the transcript cancels both", async () => {
+		const h = await launch();
+		const running = h.call("prompt", { sessionId: h.session.id, text: "long task" }, "both-sent-run");
+		await h.control.started;
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-one");
+		await h.call("prompt", { sessionId: h.session.id, text: "same", deliverAs: "steer" }, "steer-two");
+		h.control.finishTurn("one");
+		for (let i = 0; i < 400 && h.control.prompts.length < 2; i++) await Bun.sleep(5);
+		h.control.finishTurn("two");
+		for (let i = 0; i < 400 && h.control.prompts.length < 3; i++) await Bun.sleep(5);
+		expect(h.control.prompts[2]).toBe("long task\nsame\nsame");
+		await h.call("abort", { sessionId: h.session.id });
+		expect(await running).toBeNull();
+		expect(userTurns(h.sdk)).toEqual(["long task", "same", "same"]);
+		expect(await settledReceipts(h.snapshot, ["both-sent-run", "steer-one", "steer-two"])).toEqual({
+			"both-sent-run": "cancelled",
+			"steer-one": "cancelled",
+			"steer-two": "cancelled",
+		});
+	});
+
+	/** An input hook that asks the user before letting any text starting with "ask" through. */
+	const askingInputHook = `export default function (pi) {
+		pi.on("input", async (event, ctx) => {
+			if (event.text.startsWith("ask")) await ctx.ui.input("Send " + event.text + "?");
+			return { text: event.text };
+		});
+	}`;
+	const questionShown = async (snapshot: () => Promise<DesktopSnapshot>) => {
+		for (let i = 0; i < 400 && !(await snapshot()).sessions[0]?.question; i++) await Bun.sleep(5);
+		expect((await snapshot()).sessions[0]?.question).toBeDefined();
+	};
+
+	test("Stop while a prompt's input hook runs keeps it from running and returns its text", async () => {
+		const { call, snapshot, session, project, sdk, control } = await launch(true, askingInputHook);
+		const running = call("prompt", { sessionId: session.id, text: "ask first" }, "stopped-in-hook");
+		await questionShown(snapshot);
+		// Nothing has reached the SDK yet, so the Stop's abort has nothing to end.
+		await call("abort", { sessionId: session.id });
+		expect(await Promise.race([running.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe(
+			"settled",
+		);
+		expect(control.prompts).toHaveLength(0);
+		expect(sdk.messages.some(message => message.role === "user")).toBe(false);
+		let state = await snapshot();
+		// `refused` is what returns the text to the composer.
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "stopped-in-hook",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(state.sessions[0]?.status).not.toBe("running");
+		expect(state.sessions[0]?.error).toBeUndefined();
+		// That Stop cannot label a later prompt's Host abort as the user's cancellation.
+		const later = call("prompt", { sessionId: session.id, text: "next task" }, "closed-after-hook-stop");
+		await Promise.race([
+			control.started,
+			later.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("project.close", { projectId: project.id });
+		await expect(later).rejects.toThrow("Prompt outcome unknown");
+		state = await snapshot();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "closed-after-hook-stop", disposition: "unknown" }),
+		);
+	});
+
+	test("Stop while a steer's input hook runs keeps it from queueing or starting a turn", async () => {
+		const { call, snapshot, session, sdk, control } = await launch(true, askingInputHook);
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-before-hooked-steer");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const steer = call("prompt", { sessionId: session.id, text: "ask steer", deliverAs: "steer" }, "steer-in-hook");
+		await questionShown(snapshot);
+		await call("abort", { sessionId: session.id });
+		expect(await running).toBeNull();
+		expect(await steer).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(sdk.isStreaming).toBe(false);
+		expect(sdk.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "run-before-hooked-steer", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-in-hook",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	test("Stop while the SDK is still admitting a steer cancels it and returns its text", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-before-admitted-steer");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			// The SDK accepted the steer's preflight and waits for this write before queueing it.
+			if (id === "steer-in-preflight" && changes.disposition === "accepted") {
+				held.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(options => {
+			stopReached.resolve();
+			return abort(options);
+		});
+		const steer = call(
+			"prompt",
+			{ sessionId: session.id, text: "typed before Stop", deliverAs: "steer" },
+			"steer-in-preflight",
+		);
+		await held.promise;
+		// The abort cancels the pending preflight, so the SDK refuses the steer once the write lands.
+		const stopping = call("abort", { sessionId: session.id });
+		await stopReached.promise;
+		release.resolve();
+		expect(await stopping).toBeNull();
+		expect(await steer).toBeNull();
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.sessions[0]?.error).toBeUndefined();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-in-preflight",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	/** Holds the Host's first journal write for one delivery: the request has arrived but is not yet admitted. */
+	function holdDeliveryBegin(id: string) {
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const begin = DeliveryJournal.prototype.begin;
+		vi.spyOn(DeliveryJournal.prototype, "begin").mockImplementation(async function (
+			this: DeliveryJournal,
+			deliveryId,
+			sessionId,
+		) {
+			if (deliveryId === id) {
+				held.resolve();
+				await release.promise;
+			}
+			return begin.call(this, deliveryId, sessionId);
+		});
+		return { held: held.promise, release: () => release.resolve() };
+	}
+
+	test("Stop while a steer's delivery record is written keeps it from starting a turn, not later messages", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-before-record");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const record = holdDeliveryBegin("steer-in-record");
+		const steer = call(
+			"prompt",
+			{ sessionId: session.id, text: "typed then stopped", deliverAs: "steer" },
+			"steer-in-record",
+		);
+		await record.held;
+		// Nothing is queued yet, so the Stop only ends the run; the steer arrives at an idle session.
+		expect(await call("abort", { sessionId: session.id })).toBeNull();
+		expect(await running).toBeNull();
+		record.release();
+		expect(await Promise.race([steer.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe("settled");
+		expect(await steer).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		expect(sdk.isStreaming).toBe(false);
+		let state = await snapshot();
+		expect(state.sessions[0]?.status).toBe("done");
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "run-before-record", disposition: "cancelled" }),
+		);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-in-record",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+		// A Stop that has settled is not held against messages sent after it.
+		const later = call("prompt", { sessionId: session.id, text: "sent after Stop" }, "after-settled-stop");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		const laterSteer = await call<{ queued: boolean }>(
+			"prompt",
+			{ sessionId: session.id, text: "steered after Stop", deliverAs: "steer" },
+			"steer-after-settled-stop",
+		);
+		expect(laterSteer.queued).toBe(true);
+		control.finishTurn("first answer");
+		for (let i = 0; i < 400 && control.prompts.length < 3; i++) await Bun.sleep(5);
+		control.finishTurn("second answer");
+		expect(await later).toBeNull();
+		expect(await settledReceipts(snapshot, ["after-settled-stop", "steer-after-settled-stop"])).toEqual({
+			"after-settled-stop": "completed",
+			"steer-after-settled-stop": "completed",
+		});
+		state = await snapshot();
+		expect(userTurns(sdk)).toEqual(["long task", "sent after Stop", "steered after Stop"]);
+	});
+
+	for (const deliverAs of ["followUp", "steer"] as const)
+		test(`an input the SDK admits while Stop sweeps the queue is handed back too (${deliverAs})`, async () => {
+			const { call, snapshot, session, sdk, control, frames } = await launch();
+			const running = call("prompt", { sessionId: session.id, text: "long task" }, `run-swept-${deliverAs}`);
+			await Promise.race([
+				control.started,
+				running.then(() => {
+					throw new Error("Prompt settled before its controlled stream started");
+				}),
+			]);
+			const abort = sdk.abort.bind(sdk);
+			const abortReached = Promise.withResolvers<void>();
+			vi.spyOn(sdk, "abort").mockImplementation(options => {
+				abortReached.resolve();
+				return abort(options);
+			});
+			const submit = sdk.submitUserMessage.bind(sdk);
+			let stopping: Promise<unknown> | undefined;
+			vi.spyOn(sdk, "submitUserMessage").mockImplementation(async (content, options) => {
+				const submission = await submit(content, options);
+				// The SDK has admitted the input; Stop sweeps the queue and aborts before the Host adds it.
+				stopping = call("abort", { sessionId: session.id });
+				await abortReached.promise;
+				return submission;
+			});
+			const id = `admitted-during-sweep-${deliverAs}`;
+			expect(
+				await call("prompt", { sessionId: session.id, text: "typed as Stop was pressed", deliverAs }, id),
+			).toBeNull();
+			expect(await stopping).toBeNull();
+			expect(await running).toBeNull();
+			await Bun.sleep(50);
+			expect(control.prompts).toHaveLength(1);
+			expect(sdk.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			const state = await snapshot();
+			expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+			expect(state.deliveries).toContainEqual(expect.objectContaining({ id, disposition: "removed" }));
+			expect(receiptTrail(frames, id)).not.toContain("cancelled");
+		});
+
+	test("a steer whose record lands while the Stop is still ending the run is handed back", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "long task" }, "run-still-stopping");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const record = holdDeliveryBegin("steer-while-stopping");
+		const steer = call(
+			"prompt",
+			{ sessionId: session.id, text: "typed then stopped", deliverAs: "steer" },
+			"steer-while-stopping",
+		);
+		await record.held;
+		// Keep the run streaming until the steer has been through the queued path.
+		const abort = sdk.abort.bind(sdk);
+		const stopReached = Promise.withResolvers<void>();
+		const proceed = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			stopReached.resolve();
+			await proceed.promise;
+			return abort(options);
+		});
+		const stopping = call("abort", { sessionId: session.id });
+		await stopReached.promise;
+		record.release();
+		expect(await steer).toBeNull();
+		proceed.resolve();
+		expect(await stopping).toBeNull();
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "steer-while-stopping",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	const until = async (check: () => boolean | Promise<boolean>, what: string) => {
+		for (let i = 0; i < 1_000; i++) {
+			if (await check()) return;
+			await Bun.sleep(5);
+		}
+		throw new Error(`Timed out waiting for ${what}`);
+	};
+	/** A prompt that arrived just before a Stop of something other than the run must still run. */
+	async function promptOutlivesStop(
+		h: {
+			call: <T>(method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<T>;
+		} & {
+			session: DesktopSession;
+			sdk: AgentSession;
+			control: ControlledAgent;
+		},
+		id: string,
+		stop: () => Promise<void>,
+	) {
+		const record = holdDeliveryBegin(id);
+		const prompt = h.call("prompt", { sessionId: h.session.id, text: "sent before Stop" }, id);
+		await record.held;
+		await stop();
+		await until(() => !h.sdk.isBashRunning, "the command to end");
+		record.release();
+		expect(
+			await Promise.race([
+				h.control.started.then(() => "ran"),
+				prompt.then(
+					() => "settled without running",
+					() => "failed without running",
+				),
+			]),
+		).toBe("ran");
+		h.control.finishTurn("answered");
+		expect(await prompt).toBeNull();
+		expect(h.control.prompts).toHaveLength(1);
+		expect(userTurns(h.sdk)).toEqual(["sent before Stop"]);
+	}
+
+	test("a Stop that cancels a running shell command is not held against a prompt sent before it", async () => {
+		const h = await launch();
+		await h.call("operator.execute", { sessionId: h.session.id, text: "! sleep 30" });
+		await until(() => h.sdk.isBashRunning, "the command to start");
+		await promptOutlivesStop(h, "prompt-before-command-stop", async () => {
+			// This Stop is the command's, not the conversation run's.
+			expect(await h.call("abort", { sessionId: h.session.id })).toBeNull();
+		});
+		expect(await settledReceipts(h.snapshot, ["prompt-before-command-stop"])).toEqual({
+			"prompt-before-command-stop": "completed",
+		});
+	});
+
+	test("a Stop refused because another owner's command is running is not held against a prompt sent before it", async () => {
+		const h = await launch();
+		// Another owner of the same SDK session runs the command, so the Host has no operation to cancel.
+		const owner = createSdkOperatorControls(h.sdk);
+		const running = owner.execute({ text: "! sleep 30" });
+		await until(() => h.sdk.isBashRunning, "the command to start");
+		await promptOutlivesStop(h, "prompt-before-refused-stop", async () => {
+			await expect(h.call("abort", { sessionId: h.session.id })).rejects.toThrow("Stop cannot be proven");
+			owner.cancel({ operationId: running.operation.operationId });
+		});
+		expect(await settledReceipts(h.snapshot, ["prompt-before-refused-stop"])).toEqual({
+			"prompt-before-refused-stop": "completed",
+		});
+	});
+
+	test("Stop before a builtin command's forwarded prompt starts keeps it from running", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		// `/notify on` is a real builtin that hands its own text on as a prompt.
+		const record = holdDeliveryBegin("forwarding-command");
+		const command = call<DesktopCommandResult>(
+			"prompt",
+			{ sessionId: session.id, text: "/notify on" },
+			"forwarding-command",
+		);
+		await record.held;
+		expect(await call("abort", { sessionId: session.id })).toBeNull();
+		record.release();
+		expect(await Promise.race([command.then(() => "settled"), Bun.sleep(1_000).then(() => "pending")])).toBe(
+			"settled",
+		);
+		expect(await command).toMatchObject({ consumed: true, prompt: "/notify on" });
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(0);
+		expect(sdk.isStreaming).toBe(false);
+		expect(userTurns(sdk)).toEqual([]);
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "forwarding-command",
+				disposition: "refused",
+				error: "Prompt stopped before it started",
+			}),
+		);
+	});
+
+	/** A request's own response frame, whether it succeeded or not. */
+	async function respond(
+		h: {
+			call: (method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<unknown>;
+		} & {
+			frames: DesktopFrame[];
+		},
+		method: DesktopRequest["method"],
+		params: Record<string, unknown>,
+		id: string = crypto.randomUUID(),
+	) {
+		await h.call(method, params, id).catch(() => {});
+		return h.frames.findLast(frame => frame.type === "response" && frame.id === id);
+	}
+	const active = (snapshot: DesktopSnapshot) =>
+		snapshot.deliveries.filter(receipt => ["pending", "accepted", "queued"].includes(receipt.disposition));
+
+	test("requests that arrive while a confirmed Disconnect is stopping the run are refused and handed back", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-disconnect");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "queued before", deliverAs: "followUp" }, "queued-before-disconnect");
+		// Keep the Disconnect inside its Stop: the run is still being ended.
+		const abort = sdk.abort.bind(sdk);
+		const abortReached = Promise.withResolvers<void>();
+		const finishAbort = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			abortReached.resolve();
+			await finishAbort.promise;
+			return abort(options);
+		});
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await abortReached.promise;
+		const prompt = await respond(h, "prompt", { sessionId, text: "typed while disconnecting" }, "prompt-late");
+		const steer = await respond(
+			h,
+			"prompt",
+			{ sessionId, text: "steered while disconnecting", deliverAs: "steer" },
+			"steer-late",
+		);
+		const command = await respond(h, "prompt", { sessionId, text: "/notify on" }, "command-late");
+		const rename = await respond(h, "session.rename", { sessionId, title: "renamed while disconnecting" });
+		finishAbort.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		expect(await running).toBeNull();
+		await Bun.sleep(50);
+		expect(control.prompts).toHaveLength(1);
+		for (const response of [prompt, steer, command])
+			expect(response).toMatchObject({ ok: false, deliveryDisposition: "refused" });
+		expect(rename).toMatchObject({ ok: false, error: expect.stringContaining("disconnect") });
+		const state = await snapshot();
+		expect(
+			await settledReceipts(snapshot, [
+				"run-before-disconnect",
+				"queued-before-disconnect",
+				"prompt-late",
+				"steer-late",
+				"command-late",
+			]),
+		).toEqual({
+			"run-before-disconnect": "cancelled",
+			"queued-before-disconnect": "removed",
+			"prompt-late": "refused",
+			"steer-late": "refused",
+			"command-late": "refused",
+		});
+		expect(active(state)).toEqual([]);
+		expect(state.sessions[0]?.connection).toEqual({ state: "disconnected" });
+		expect(state.sessions[0]?.title).not.toBe("renamed while disconnecting");
+		expect(userTurns(sdk)).toEqual(["long task"]);
+	});
+
+	test("a Disconnect whose stop outlasts its budget gives up and leaves the conversation usable", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-wedged");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		// The run's abort is wedged until the test lets it go.
+		const abort = sdk.abort.bind(sdk);
+		const unwedge = Promise.withResolvers<void>();
+		const spy = vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			await unwedge.promise;
+			return abort(options);
+		});
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true }).then(
+			() => "disconnected",
+			(error: Error) => error.message,
+		);
+		expect(await Promise.race([disconnecting, Bun.sleep(9_000).then(() => "still waiting")])).toContain(
+			"still stopping",
+		);
+		// Nothing was released, and the fence is gone: requests are answered normally again.
+		const state = await snapshot();
+		expect(state.sessions[0]?.connection).toEqual({ state: "connected" });
+		expect((await call<DesktopSession>("session.select", { sessionId })).connection).toEqual({
+			state: "connected",
+		});
+		unwedge.resolve();
+		spy.mockRestore();
+		expect(await running).toBeNull();
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+	}, 20_000);
+
+	test("a Disconnect whose stop fails says why, at once, and releases nothing", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-journal-fails");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "queued behind", deliverAs: "followUp" }, "queued-journal-fails");
+		// The receipt that hands the queued text back cannot be written once.
+		const update = DeliveryJournal.prototype.update;
+		let failures = 0;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			if (id === "queued-journal-fails" && changes.disposition === "removed" && failures++ === 0)
+				throw new Error("delivery journal disk is full");
+			return update.call(this, id, changes);
+		});
+		const started = performance.now();
+		const failed = await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true }).then(
+			() => "disconnected",
+			(error: Error) => error.message,
+		);
+		// The real cause, not a timeout's "still stopping" five seconds later.
+		expect(failed).toContain("delivery journal disk is full");
+		expect(failed).not.toContain("still stopping");
+		expect(performance.now() - started).toBeLessThan(2_000);
+		// Nothing was released, and the fence is gone: requests are answered normally again.
+		expect(sdk.isDisposed).toBe(false);
+		expect((await snapshot()).sessions[0]?.connection).toEqual({ state: "connected" });
+		expect((await call<DesktopSession>("session.select", { sessionId })).connection).toEqual({
+			state: "connected",
+		});
+		// Trying again stops the run and releases the writer.
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		expect(await running).toBeNull();
+		// The queued text never ran, so it still goes back to the composer although the receipt
+		// that hands it back failed once.
+		expect(await settledReceipts(snapshot, ["run-journal-fails", "queued-journal-fails"])).toEqual({
+			"run-journal-fails": "cancelled",
+			"queued-journal-fails": "removed",
+		});
+	}, 20_000);
+
+	test("a confirmed Disconnect waits for the shell command it stopped", async () => {
+		const h = await launch();
+		const { call, session, sdk } = h;
+		const sessionId = session.id;
+		await call("operator.execute", { sessionId, text: "! sleep 30" });
+		for (let i = 0; i < 400 && !sdk.isBashRunning; i++) await Bun.sleep(5);
+		expect(sdk.isBashRunning).toBe(true);
+		expect(await call<DesktopDisconnectResult>("session.disconnect", { sessionId })).toEqual({
+			disconnected: false,
+			confirm: { running: true, queued: 0 },
+		});
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		expect(sdk.isBashRunning).toBe(false);
+	}, 20_000);
+
+	test("a Disconnect asks first when an approval is waiting, and never answers it", async () => {
+		const { call, session, sdk } = await launch();
+		const sessionId = session.id;
+		const emitter = sdk.getWorkflowGateEmitter();
+		if (!emitter) throw new Error("Missing the session's workflow gate emitter");
+		let answered = false;
+		const waiting = emitter
+			.emitGate(approvalGate({ plan: "Plan waiting for approval" }), { signal: new AbortController().signal })
+			.then(() => {
+				answered = true;
+			});
+		void waiting.catch(() => {});
+		for (let i = 0; i < 400 && !sdk.getWorkflowGateEmitter()?.listPendingGates?.().length; i++) await Bun.sleep(5);
+		// Waiting work, like a running turn, needs the user's confirmation before it is released.
+		expect(await call<DesktopDisconnectResult>("session.disconnect", { sessionId })).toEqual({
+			disconnected: false,
+			confirm: { running: true, queued: 0 },
+		});
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		expect(answered).toBe(false);
+	});
+
+	test("a second Disconnect and a delete wait for a Disconnect that is still stopping the run", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-joined-disconnect");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const abort = sdk.abort.bind(sdk);
+		const abortReached = Promise.withResolvers<void>();
+		const finishAbort = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "abort").mockImplementation(async options => {
+			abortReached.resolve();
+			await finishAbort.promise;
+			return abort(options);
+		});
+		const first = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await abortReached.promise;
+		const order: string[] = [];
+		const second = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true }).then(result => {
+			order.push("second disconnect");
+			return result;
+		});
+		const deleted = call("session.delete", { sessionId }).then(result => {
+			order.push("delete");
+			return result;
+		});
+		await Bun.sleep(100);
+		// Neither acts on the conversation while the first Disconnect is still releasing it.
+		expect(order).toEqual([]);
+		finishAbort.resolve();
+		expect((await first).disconnected).toBe(true);
+		expect((await second).disconnected).toBe(true);
+		await deleted;
+		expect(order).toEqual(["second disconnect", "delete"]);
+		expect(await running).toBeNull();
+		expect(control.prompts).toHaveLength(1);
+		const state = await snapshot();
+		expect(state.sessions.some(item => item.id === sessionId)).toBe(false);
+		expect(active(state)).toEqual([]);
+	});
+
+	test("Disconnect settles a steer the run already sent as cancelled before releasing the writer", async () => {
+		const h = await launch();
+		const { call, snapshot, session, sdk, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-with-sent-steer");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "steer it", deliverAs: "steer" }, "sent-steer");
+		control.finishTurn("first answer");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		expect(control.prompts[1]).toBe("long task\nsteer it");
+		await call("prompt", { sessionId, text: "still waiting", deliverAs: "followUp" }, "waiting-follow-up");
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		// Every receipt is final the moment Disconnect answers, judged against this session's transcript.
+		const state = await snapshot();
+		expect(active(state)).toEqual([]);
+		expect(
+			Object.fromEntries(
+				state.deliveries
+					.filter(receipt => ["run-with-sent-steer", "sent-steer", "waiting-follow-up"].includes(receipt.id))
+					.map(receipt => [receipt.id, receipt.disposition]),
+			),
+		).toEqual({ "run-with-sent-steer": "cancelled", "sent-steer": "cancelled", "waiting-follow-up": "removed" });
+		expect(await running).toBeNull();
+		expect(control.prompts).toHaveLength(2);
+		expect(userTurns(sdk)).toEqual(["long task", "steer it"]);
+	});
+
+	test("an input whose hook outlasts Disconnect's wait is still handed back once it ends", async () => {
+		const holdKey = "__gjcDesktopLongHookHold";
+		const enteredKey = "__gjcDesktopLongHookEntered";
+		const hold = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const globals = globalThis as Record<string, unknown>;
+		globals[holdKey] = hold.promise;
+		globals[enteredKey] = () => entered.resolve();
+		cleanups.push(async () => {
+			hold.resolve();
+			delete globals[holdKey];
+			delete globals[enteredKey];
+		});
+		const h = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => {
+				if (event.text.startsWith("slow")) {
+					globalThis.${enteredKey}();
+					await globalThis.${holdKey};
+				}
+				return { text: event.text };
+			});
+		}`,
+		);
+		const { call, snapshot, session, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-long-hook");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const steer = respond(h, "prompt", { sessionId, text: "slow steer", deliverAs: "steer" }, "steer-in-long-hook");
+		await entered.promise;
+		// Disconnect waits for it only so long, then releases the writer with the hook still running.
+		expect(
+			(await call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true })).disconnected,
+		).toBe(true);
+		hold.resolve();
+		await steer;
+		expect(await settledReceipts(snapshot, ["steer-in-long-hook"])).toEqual({ "steer-in-long-hook": "refused" });
+		expect(control.prompts).toHaveLength(1);
+	}, 20_000);
+
+	test("Disconnect waits for a rename still writing before it releases the writer", async () => {
+		const { call, session, sdk } = await launch();
+		const sessionId = session.id;
+		const setName = sdk.setSessionName.bind(sdk);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(sdk, "setSessionName").mockImplementation(async (...args) => {
+			entered.resolve();
+			await release.promise;
+			return setName(...args);
+		});
+		const renaming = call("session.rename", { sessionId, title: "Renamed before release" });
+		await entered.promise;
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await Bun.sleep(100);
+		release.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		await renaming;
+		expect(sdk.sessionName).toBe("Renamed before release");
+	});
+
+	test("Disconnect answers only once a steer the run sent has its receipt written", async () => {
+		const h = await launch();
+		const { call, snapshot, session, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-with-slow-receipt");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId, text: "steer it", deliverAs: "steer" }, "steer-slow-receipt");
+		control.finishTurn("first answer");
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		// The steer's final receipt is slow to be written.
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const update = DeliveryJournal.prototype.update;
+		vi.spyOn(DeliveryJournal.prototype, "update").mockImplementation(async function (
+			this: DeliveryJournal,
+			id,
+			changes,
+		) {
+			if (id === "steer-slow-receipt" && changes.disposition === "cancelled") {
+				entered.resolve();
+				await release.promise;
+			}
+			return update.call(this, id, changes);
+		});
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		await entered.promise;
+		expect(await Promise.race([disconnecting.then(() => "answered"), Bun.sleep(200).then(() => "waiting")])).toBe(
+			"waiting",
+		);
+		release.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		// Final the moment Disconnect answers.
+		expect(active(await snapshot())).toEqual([]);
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({ id: "steer-slow-receipt", disposition: "cancelled" }),
+		);
+		expect(await running).toBeNull();
+	});
+
+	test("Disconnect waits for an input still in its hook and hands it back before releasing the writer", async () => {
+		const holdKey = "__gjcDesktopDisconnectHookHold";
+		const enteredKey = "__gjcDesktopDisconnectHookEntered";
+		const hold = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const globals = globalThis as Record<string, unknown>;
+		globals[holdKey] = hold.promise;
+		globals[enteredKey] = () => entered.resolve();
+		cleanups.push(async () => {
+			hold.resolve();
+			delete globals[holdKey];
+			delete globals[enteredKey];
+		});
+		const h = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => {
+				if (event.text.startsWith("slow")) {
+					globalThis.${enteredKey}();
+					await globalThis.${holdKey};
+				}
+				return { text: event.text };
+			});
+		}`,
+		);
+		const { call, snapshot, session, control } = h;
+		const sessionId = session.id;
+		const running = call("prompt", { sessionId, text: "long task" }, "run-before-hooked-disconnect");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const steer = respond(h, "prompt", { sessionId, text: "slow steer", deliverAs: "steer" }, "steer-in-hook");
+		await entered.promise;
+		const disconnecting = call<DesktopDisconnectResult>("session.disconnect", { sessionId, confirm: true });
+		// The writer is not released under an input that is still being admitted.
+		expect(await Promise.race([disconnecting.then(() => "released"), Bun.sleep(200).then(() => "waiting")])).toBe(
+			"waiting",
+		);
+		hold.resolve();
+		expect((await disconnecting).disconnected).toBe(true);
+		const state = await snapshot();
+		expect(active(state)).toEqual([]);
+		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "steer-in-hook", disposition: "refused" }));
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "run-before-hooked-disconnect", disposition: "cancelled" }),
+		);
+		// The request settles; its refused receipt is what returns the text to the composer.
+		expect(await steer).toMatchObject({ ok: true, result: null });
+		expect(control.prompts).toHaveLength(1);
+	});
+
+	test("Stop in one conversation leaves another conversation's run and inputs alone", async () => {
+		const first = await launch();
+		const running = first.call("prompt", { sessionId: first.session.id, text: "task a" }, "run-a");
+		await Promise.race([
+			first.control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		const other = await first.open();
+		const call = first.call;
+		const runningB = call("prompt", { sessionId: other.session.id, text: "task b" }, "run-b");
+		await Promise.race([
+			other.control.started,
+			runningB.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await call("prompt", { sessionId: other.session.id, text: "b queued", deliverAs: "steer" }, "queued-b");
+		// This input has reached the Host but is not admitted yet when the other conversation stops.
+		const record = holdDeliveryBegin("in-flight-b");
+		const inFlight = call<{ queued: boolean }>(
+			"prompt",
+			{ sessionId: other.session.id, text: "b in flight", deliverAs: "steer" },
+			"in-flight-b",
+		);
+		await record.held;
+		expect(await call("abort", { sessionId: first.session.id })).toBeNull();
+		expect(await running).toBeNull();
+		record.release();
+		expect((await inFlight).queued).toBe(true);
+		expect(other.sdk.isStreaming).toBe(true);
+		other.control.finishTurn("b one");
+		for (let i = 0; i < 400 && other.control.prompts.length < 2; i++) await Bun.sleep(5);
+		other.control.finishTurn("b two");
+		for (let i = 0; i < 400 && other.control.prompts.length < 3; i++) await Bun.sleep(5);
+		other.control.finishTurn("b three");
+		expect(await runningB).toBeNull();
+		expect(first.control.prompts).toHaveLength(1);
+		expect(other.control.prompts).toHaveLength(3);
+		expect(userTurns(other.sdk)).toEqual(["task b", "b queued", "b in flight"]);
+		expect(await settledReceipts(first.snapshot, ["run-a", "run-b", "queued-b", "in-flight-b"])).toEqual({
+			"run-a": "cancelled",
+			"run-b": "completed",
+			"queued-b": "completed",
+			"in-flight-b": "completed",
+		});
+	});
+
+	test("invalid prompt reports a definitive refusal before admission", async () => {
+		const { call, session, frames, snapshot } = await launch();
+		await expect(call("prompt", { sessionId: session.id, text: "" }, "invalid-id")).rejects.toThrow();
+		expect(frames.findLast(frame => frame.type === "response" && frame.id === "invalid-id")).toMatchObject({
+			ok: false,
+			deliveryDisposition: "refused",
+		});
+		expect((await snapshot()).deliveries.some(receipt => receipt.id === "invalid-id")).toBe(false);
+		await call("delivery.ack", { deliveryId: "invalid-id" });
+		await expect(call("prompt", { sessionId: session.id, text: "valid" }, "invalid-id")).rejects.toThrow(
+			"Duplicate delivery id",
+		);
+	});
+
+	test("preflight refusals and uncertain acceptance do not own session errors", async () => {
+		const { call, snapshot, session, sdk } = await launch();
+		const prompt = vi.spyOn(sdk, "prompt");
+		prompt.mockImplementationOnce(async () => {
+			throw new Error("preflight refused");
+		});
+		await expect(call("prompt", { sessionId: session.id, text: "private input" }, "refused-id")).rejects.toThrow(
+			"preflight refused",
+		);
+		let state = await snapshot();
+		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "refused-id", disposition: "refused" }));
+		expect(state.sessions[0]?.errorOwner).toBeUndefined();
+		prompt.mockImplementationOnce(async (_text, options) => {
+			await options?.onPreflightAcceptCommit?.();
+			throw new Error("preflight lost");
+		});
+		await expect(call("prompt", { sessionId: session.id, text: "private input" }, "unknown-id")).rejects.toThrow(
+			"preflight lost",
+		);
+		state = await snapshot();
+		expect(state.deliveries).toContainEqual(expect.objectContaining({ id: "unknown-id", disposition: "unknown" }));
+		expect(state.sessions[0]?.errorOwner).toBeUndefined();
+	});
+
+	test("a resolved provider error retains a failed receipt and causal session error", async () => {
+		const { call, snapshot, session, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "provider error" }, "provider-error-id");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before stream");
+			}),
+		]);
+		control.finishTurn("", true);
+		await expect(running).rejects.toThrow("Prompt failed");
+		const state = await snapshot();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "provider-error-id", disposition: "failed" }),
+		);
+		expect(state.sessions[0]).toMatchObject({ errorOwner: "provider-error-id" });
+	});
+
+	test("a forwarded real provider failure owns the command request", async () => {
+		const { call, snapshot, session, control } = await launch();
+		const running = call(
+			"command.run",
+			{ sessionId: session.id, text: "forwarded provider error" },
+			"forwarded-error-id",
+		);
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before stream");
+			}),
+		]);
+		control.finishTurn("", true);
+		await expect(running).rejects.toThrow("Prompt failed");
+		const state = await snapshot();
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({ id: "forwarded-error-id", disposition: "failed" }),
+		);
+		expect(state.sessions[0]).toMatchObject({
+			status: "error",
+			error: "Prompt failed",
+			errorOwner: "forwarded-error-id",
+		});
+	});
+
+	for (const result of ["success", "error", "abort"] as const) {
+		test(`consumed queued input matches cloned scope on ${result}`, async () => {
+			const { call, snapshot, session, sdk, control } = await launch();
+			const original = sdk.submitUserMessage.bind(sdk);
+			let cloned = false;
+			vi.spyOn(sdk, "submitUserMessage").mockImplementation(async (content, options) => {
+				const submission = await original(content, options);
+				return {
+					...submission,
+					terminal: submission.terminal.then(outcome => {
+						if (outcome.disposition !== "completed") return outcome;
+						const attemptScope = { ...outcome.attemptScope };
+						cloned = attemptScope !== outcome.attemptScope;
+						return { ...outcome, attemptScope };
+					}),
+				};
+			});
+			const running = call("prompt", { sessionId: session.id, text: "initial" }, `initial-${result}`);
+			await Promise.race([
+				control.started,
+				running.then(() => {
+					throw new Error("Prompt settled before stream");
+				}),
+			]);
+			const queued = await call<{ submissionId: string }>(
+				"prompt",
+				{ sessionId: session.id, text: "queued", deliverAs: "followUp" },
+				`queued-${result}`,
+			);
+			control.finishTurn("first completed");
+			for (let i = 0; i < 200 && control.prompts.length < 2; i++) await Bun.sleep(5);
+			expect(control.prompts.length).toBe(2);
+			if (result === "abort") await call("abort", { sessionId: session.id });
+			else control.finishTurn("second completed", result === "error");
+			if (result === "error") await expect(running).rejects.toThrow("Prompt failed");
+			else await running;
+			const expected = result === "success" ? "completed" : result === "error" ? "failed" : "cancelled";
+			let state = await snapshot();
+			for (
+				let i = 0;
+				i < 200 && state.deliveries.find(item => item.id === `queued-${result}`)?.disposition !== expected;
+				i++
+			) {
+				await Bun.sleep(5);
+				state = await snapshot();
+			}
+			expect(cloned).toBe(true);
+			expect(state.deliveries).toContainEqual(
+				expect.objectContaining({
+					id: `queued-${result}`,
+					sdkSubmissionId: queued.submissionId,
+					disposition: expected,
+				}),
+			);
+			if (result === "error") expect(state.sessions[0]?.errorOwner).toBe(`initial-${result}`);
+		});
+	}
+
+	test("a real queued no-model refusal retains a refused receipt without a provider turn", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const submit = sdk.submitUserMessage.bind(sdk);
+		vi.spyOn(sdk, "submitUserMessage").mockImplementation((content, options) =>
+			submit(content, { ...options, sdkRunCapability: createSdkRunCapability("host-refused-queued-run") }),
+		);
+		const running = call("prompt", { sessionId: session.id, text: "predecessor" }, "predecessor-id");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before stream");
+			}),
+		]);
+		const queued = await call<{ submissionId: string }>(
+			"prompt",
+			{
+				sessionId: session.id,
+				text: "restore this input",
+				deliverAs: "followUp",
+			},
+			"refused-queue-id",
+		);
+		sdk.agent.setModel(undefined);
+		control.finishTurn("predecessor completed");
+		await running;
+		let state = await snapshot();
+		for (
+			let i = 0;
+			i < 200 && state.deliveries.find(item => item.id === "refused-queue-id")?.disposition !== "refused";
+			i++
+		) {
+			await Bun.sleep(5);
+			state = await snapshot();
+		}
+		expect(control.prompts).toHaveLength(1);
+		expect(state.deliveries).toContainEqual(
+			expect.objectContaining({
+				id: "refused-queue-id",
+				sessionId: session.id,
+				sdkSubmissionId: queued.submissionId,
+				disposition: "refused",
+			}),
+		);
+		expect(state.sessions[0]?.errorOwner).not.toBe("refused-queue-id");
+		expect(state.sessions[0]?.queued ?? []).toHaveLength(0);
+		expect(state.sessions[0]?.messages.some(message => message.text.includes("restore this input"))).toBe(false);
+		await call("delivery.ack", { deliveryId: "refused-queue-id" });
+		expect((await snapshot()).deliveries.some(item => item.id === "refused-queue-id")).toBe(false);
+	});
+
+	test("SDK queue removal remains visible as a removed receipt", async () => {
+		const { call, snapshot, session, sdk, control } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "running" });
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before stream");
+			}),
+		]);
+		const queued = await call<{ submissionId: string }>(
+			"prompt",
+			{ sessionId: session.id, text: "discarded", deliverAs: "followUp" },
+			"removed-delivery",
+		);
+		sdk.clearQueue();
+		let receipt = (await snapshot()).deliveries.find(item => item.id === "removed-delivery");
+		for (let i = 0; i < 100 && receipt?.disposition !== "removed"; i++) {
+			await Bun.sleep(5);
+			receipt = (await snapshot()).deliveries.find(item => item.id === "removed-delivery");
+		}
+		expect(receipt).toMatchObject({ disposition: "removed", sdkSubmissionId: queued.submissionId });
+		control.finishTurn("done");
+		await running;
+	});
+
+	test("a completed turn returns the session to idle and keeps its genuine transcript", async () => {
+		const { call, snapshot, session, sdk, control, project } = await launch();
+		const running = call("prompt", { sessionId: session.id, text: "short task" }, "prompt-delivery");
+		await Promise.race([
+			control.started,
+			running.then(() => {
+				throw new Error("Prompt settled before its controlled stream started");
+			}),
+		]);
+		await expect(call("delivery.ack", { deliveryId: "prompt-delivery" })).rejects.toThrow("not final");
+		await expect(call("prompt", { sessionId: session.id, text: "another task" }, "prompt-delivery")).rejects.toThrow(
+			"Duplicate delivery id",
+		);
+		control.finishTurn("echo: short task");
+		await running;
+		expect((await snapshot()).deliveries).toContainEqual(
+			expect.objectContaining({ id: "prompt-delivery", disposition: "completed" }),
+		);
+		await call("delivery.ack", { deliveryId: "prompt-delivery" });
+		expect((await snapshot()).deliveries.some(receipt => receipt.id === "prompt-delivery")).toBe(false);
+		const done = (await snapshot()).sessions[0];
+		// A settled session that finished a turn reports "done"; a never-used session stays "idle".
+		expect(done?.status).toBe("done");
+		expect(done?.messages.map(message => message.text)).toContain("echo: short task");
+		const history = await call<DesktopHistory>("history.get", { sessionId: session.id });
+		expect(history.messages.map(message => message.text)).toContain("short task");
+		expect(history.messages.map(message => message.text)).toContain("echo: short task");
+		const transcript = await Bun.file(sdk.sessionFile!).text();
+		expect(transcript).toContain("short task");
+		expect(transcript).toContain("echo: short task");
+		expect(sdk.sessionManager.getCwd()).toBe(project.path);
+		expect(await call<DesktopCommandResult>("command.run", { sessionId: session.id, text: "/jobs" })).toMatchObject({
+			consumed: true,
+		});
+	});
+
+	async function promptTurn(
+		call: <T>(method: DesktopRequest["method"], params?: Record<string, unknown>, id?: string) => Promise<T>,
+		control: ControlledAgent,
+		params: Record<string, unknown>,
+		response: string,
+	): Promise<string> {
+		const before = control.prompts.length;
+		const running = call("prompt", params);
+		for (let i = 0; i < 400 && control.prompts.length === before; i++) await Bun.sleep(5);
+		expect(control.prompts).toHaveLength(before + 1);
+		control.finishTurn(response);
+		await running;
+		return control.prompts.at(-1)!;
+	}
+	const conversation = async (snapshot: () => Promise<DesktopSnapshot>) =>
+		((await snapshot()).sessions[0]?.messages ?? []).filter(
+			message => message.role === "user" || message.role === "assistant",
+		);
+
+	test("notices stay where they were raised and never count as conversation", async () => {
+		const { call, snapshot, session, control, runner } = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("session_start", async (_event, ctx) => ctx.ui.notify("extension ready", "info"));
+		}`,
+		);
+		let state = await snapshot();
+		for (let i = 0; i < 200 && !state.sessions[0]?.messages.length; i++) {
+			await Bun.sleep(5);
+			state = await snapshot();
+		}
+		expect(state.sessions[0]?.messages).toEqual([
+			expect.objectContaining({ role: "system", text: "extension ready" }),
+		]);
+		// A notice is not a turn: a new conversation holding only a notice is still idle.
+		expect(state.sessions[0]?.status).toBe("idle");
+		await promptTurn(call, control, { sessionId: session.id, text: "first turn" }, "first answer");
+		if (!runner) throw new Error("Expected extension runner");
+		runner.getUIContext().notify("between turns", "info");
+		await promptTurn(call, control, { sessionId: session.id, text: "second turn" }, "second answer");
+		const after = (await snapshot()).sessions[0];
+		expect(after?.messages.map(message => message.text)).toEqual([
+			"extension ready",
+			"first turn",
+			"first answer",
+			"between turns",
+			"second turn",
+			"second answer",
+		]);
+		expect(after?.status).toBe("done");
+	});
+
+	test("editing a prompt rewinds like /tree and its revisions switch between branches", async () => {
+		const { call, snapshot, session, control } = await launch();
+		await promptTurn(call, control, { sessionId: session.id, text: "first question" }, "answer one");
+		await promptTurn(call, control, { sessionId: session.id, text: "second question" }, "answer two");
+		const original = await conversation(snapshot);
+		expect((await snapshot()).sessions[0]?.promptEditing).toBe(true);
+		expect(original.some(message => message.revision)).toBe(false);
+		const firstId = original.find(message => message.text === "first question")?.entryId;
+		if (!firstId) throw new Error("Expected a persisted first prompt");
+
+		const context = await promptTurn(
+			call,
+			control,
+			{ sessionId: session.id, text: "first edited", editEntryId: firstId },
+			"edited answer",
+		);
+		// The model sees the conversation from before the edited prompt, not the abandoned branch.
+		expect(context).toBe("first edited");
+		const edited = await conversation(snapshot);
+		expect(edited.map(message => message.text)).toEqual(["first edited", "edited answer"]);
+		const editedId = edited[0]?.entryId;
+		expect(edited[0]?.revision).toEqual({ index: 1, count: 2, previous: firstId });
+
+		await call("session.revision", { sessionId: session.id, entryId: firstId });
+		const restored = await conversation(snapshot);
+		expect(restored.map(message => message.text)).toEqual([
+			"first question",
+			"answer one",
+			"second question",
+			"answer two",
+		]);
+		expect(restored[0]?.revision).toEqual({ index: 0, count: 2, next: editedId });
+
+		await call("session.revision", { sessionId: session.id, entryId: editedId! });
+		expect((await conversation(snapshot)).map(message => message.text)).toEqual(["first edited", "edited answer"]);
+	});
+
+	test("refused prompt edits leave the branch being read untouched", async () => {
+		const { call, snapshot, session, sdk, control } = await launch(
+			true,
+			`export default function (pi) {
+			pi.on("input", async event => event.text === "handled" ? { handled: true } : undefined);
+		}`,
+		);
+		await promptTurn(call, control, { sessionId: session.id, text: "first question" }, "answer one");
+		const [prompt] = await conversation(snapshot);
+		const leaf = sdk.sessionManager.getLeafId();
+		if (!prompt?.entryId || !leaf) throw new Error("Expected a persisted turn");
+
+		// An extension consumed the edit: nothing was appended, so the original branch returns.
+		await call("prompt", { sessionId: session.id, text: "handled", editEntryId: prompt.entryId });
+		expect(sdk.sessionManager.getLeafId()).toBe(leaf);
+		await expect(
+			call("prompt", { sessionId: session.id, text: "/tools", editEntryId: prompt.entryId }),
+		).rejects.toThrow("A slash command cannot replace a prompt.");
+		await expect(call("prompt", { sessionId: session.id, text: "not a prompt", editEntryId: leaf })).rejects.toThrow(
+			"Invalid entry ID for editing",
+		);
+		await expect(call("session.revision", { sessionId: session.id, entryId: leaf })).rejects.toThrow(
+			"Invalid entry ID for a prompt revision",
+		);
+
+		const running = call("prompt", { sessionId: session.id, text: "second question" });
+		for (let i = 0; i < 400 && control.prompts.length < 2; i++) await Bun.sleep(5);
+		await expect(
+			call("prompt", { sessionId: session.id, text: "too early", editEntryId: prompt.entryId }),
+		).rejects.toThrow("Edit the prompt after the current operation finishes.");
+		control.finishTurn("answer two");
+		await running;
+		expect((await conversation(snapshot)).map(message => message.text)).toEqual([
+			"first question",
+			"answer one",
+			"second question",
+			"answer two",
+		]);
+		expect(control.prompts).toHaveLength(2);
+	});
+});
+
+interface ControlledAgent {
+	agent: Agent;
+	started: Promise<void>;
+	prompts: string[];
+	readonly aborts: number;
+	finishTurn(response: string, failed?: boolean): void;
+	callTool(): Promise<void>;
+	releaseTool(): void;
+}

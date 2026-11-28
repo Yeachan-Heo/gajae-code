@@ -1,0 +1,1017 @@
+// TEST ONLY. Deterministic loopback provider for the manual desktop browser adapter.
+// This is an HTTP/SSE fixture, not a replacement AgentSession or provider serializer.
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+
+export const QA_PROVIDER = "desktop-qa-fixture";
+export const QA_KEY = "fixture-only-not-a-provider-secret";
+export const QA_MODEL_IDS = ["qa-reasoning", "qa-plain", "qa-discrete"] as const;
+/**
+ * The credential reference of the zero-model onboarding seed. Nothing ever sets it: the Host
+ * child's environment is built from scratch and `validateFixtureEnvironment` refuses extra keys,
+ * so the provider has no key until the app stores `QA_KEY` through `auth.setKey`.
+ */
+export const QA_UNREGISTERED_KEY_ENV = "GJC_DESKTOP_QA_FIXTURE_UNREGISTERED_KEY";
+/** Default per-collection completion cap; a long interactive run can raise it. */
+export const QA_DEFAULT_REQUEST_LIMIT = 64;
+export const QA_MAX_REQUEST_LIMIT = 512;
+const MAX_CALLS_PER_RESPONSE = 16;
+const MAX_CHAIN_STEPS = 16;
+const markerName = "qa-model-fixture.json";
+/** Project file the edit demonstrations change; seeded fresh into every owned project. */
+export const QA_EDIT_DEMO_FILE = "qa-edit-demo.txt";
+const QA_EDIT_DEMO_TEXT =
+	"# Release checklist (TEST ONLY fixture file)\nstatus: draft\nreviewer: none\nnotes: changed only by QA demonstrations\n";
+
+const todoDemoArguments = {
+	ops: [
+		{
+			op: "init",
+			list: [
+				{
+					phase: "Investigate",
+					items: ["Reproduce the expired-session sign-out", "Read the session refresh middleware"],
+				},
+				{
+					phase: "Fix",
+					items: ["Refresh the token before retrying the request", "Add a regression test for the retry"],
+				},
+				{ phase: "Verify", items: ["Run the auth test suite", "Check sign-in in the desktop app"] },
+			],
+		},
+		{ op: "done", task: "Reproduce the expired-session sign-out" },
+	],
+};
+
+export interface QaDemonstration {
+	/** Paste verbatim into the composer. */
+	prompt: string;
+	/** What the transcript should show. */
+	expect: string;
+}
+
+/**
+ * Ready-made prompts for a QA driver. The wrapper prints them in its bootstrap line and the
+ * Host tests run these exact strings. Paths are relative to the owned QA project.
+ */
+export const QA_DEMONSTRATIONS = {
+	failingRead: {
+		prompt: 'qa-tool-call:read:{"path":"qa-missing-file.txt"}',
+		expect: "One read row that fails because qa-missing-file.txt does not exist, then the closing text.",
+	},
+	slowShell: {
+		prompt: 'qa-tool-call:bash:{"command":"sleep 4; echo slow call finished"}',
+		expect: "One bash row that stays running for about four seconds, then shows 'slow call finished'.",
+	},
+	edit: {
+		prompt: `qa-tool-call:edit:${JSON.stringify({
+			path: QA_EDIT_DEMO_FILE,
+			edits: [{ old_text: "status: draft\nreviewer: none", new_text: "status: reviewed\nreviewer: desktop-qa" }],
+		})}`,
+		expect: `One edit row whose diff turns two lines of ${QA_EDIT_DEMO_FILE} from draft to reviewed. Single use: run editUndo before repeating it.`,
+	},
+	editUndo: {
+		prompt: `qa-tool-call:edit:${JSON.stringify({
+			path: QA_EDIT_DEMO_FILE,
+			edits: [{ old_text: "status: reviewed\nreviewer: desktop-qa", new_text: "status: draft\nreviewer: none" }],
+		})}`,
+		expect: `One edit row whose diff restores ${QA_EDIT_DEMO_FILE}; it fails as a not-found edit if edit has not run.`,
+	},
+	multiCall: {
+		prompt: `qa-tool-calls:${JSON.stringify([
+			{ name: "read", arguments: { path: QA_EDIT_DEMO_FILE } },
+			{ name: "find", arguments: { paths: ["*.move"] } },
+			{ name: "search", arguments: { pattern: "OWNED_DEFINITION_MARKER" } },
+		])}`,
+		expect: "One assistant response with three tool rows (read, find, search), then the closing text.",
+	},
+	searchThenTodo: {
+		prompt: `qa-tool-chain:${JSON.stringify([
+			{ name: "search_tool_bm25", arguments: { query: "todo", limit: 1 } },
+			{ name: "todo_write", arguments: todoDemoArguments },
+		])}`,
+		expect:
+			"A tool-search row that activates todo_write, then a todo_write row (the tool is offered only after the search); the task list has three phases with the first task done and the next in progress. Use a fresh conversation: a repeat finds nothing left to activate.",
+	},
+} as const satisfies Record<string, QaDemonstration>;
+
+export interface FixtureSessionObservation {
+	pid: number;
+	catalogSessionId: string;
+	sdkSessionId: string;
+	transcriptFile: string;
+	selectedLeafId: string | null;
+}
+
+export interface FixtureLayout {
+	root: string;
+	dataDir: string;
+	agentDir: string;
+	project: string;
+	artifactPath: string;
+	gateControlPath: string;
+	gateArtifactPath: string;
+}
+
+export function fixtureLayout(root: string): FixtureLayout {
+	const owned = path.resolve(root);
+	return {
+		root: owned,
+		dataDir: path.join(owned, "desktop-data"),
+		agentDir: path.join(owned, "desktop-data", "agent"),
+		project: path.join(owned, "qa-project"),
+		artifactPath: path.join(owned, "model-fixture-requests.json"),
+		gateControlPath: path.join(owned, "qa-gate-control.json"),
+		gateArtifactPath: path.join(owned, "workflow-gate-continuations.json"),
+	};
+}
+
+/** Construct from scratch: never inherit HOME, credentials, proxies, or SDK overrides. */
+export function fixtureEnvironment(
+	layout: FixtureLayout,
+	baseUrl: string,
+	providerToken: string,
+): Record<string, string> {
+	assertFixtureEndpoint(baseUrl);
+	return {
+		PATH: "/usr/bin:/bin",
+		HOME: path.join(layout.dataDir, "home"),
+		USERPROFILE: path.join(layout.dataDir, "home"),
+		TMPDIR: layout.root,
+		LANG: "en_US.UTF-8",
+		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_CONFIG_GLOBAL: os.devNull,
+		GIT_TERMINAL_PROMPT: "0",
+		GJC_CONFIG_DIR: ".gjc-desktop",
+		PI_CONFIG_DIR: ".gjc-desktop",
+		XDG_CONFIG_HOME: path.join(layout.dataDir, "config"),
+		XDG_DATA_HOME: path.join(layout.dataDir, "data"),
+		XDG_STATE_HOME: path.join(layout.dataDir, "state"),
+		XDG_CACHE_HOME: path.join(layout.dataDir, "cache"),
+		GJC_DESKTOP_DATA_DIR: layout.dataDir,
+		GJC_DESKTOP_AGENT_DIR: layout.agentDir,
+		GJC_CODING_AGENT_DIR: layout.agentDir,
+		PI_CODING_AGENT_DIR: layout.agentDir,
+		GJC_DESKTOP_ISOLATED: "1",
+		GJC_DESKTOP_QA_MODEL_FIXTURE: "1",
+		GJC_DESKTOP_QA_FIXTURE_ROOT: layout.root,
+		GJC_DESKTOP_QA_FIXTURE_URL: baseUrl,
+		GJC_DESKTOP_QA_FIXTURE_TOKEN: providerToken,
+	};
+}
+
+export function assertFixtureEndpoint(baseUrl: string): void {
+	const url = new URL(baseUrl);
+	if (
+		url.protocol !== "http:" ||
+		url.hostname !== "127.0.0.1" ||
+		!url.port ||
+		url.username ||
+		url.password ||
+		url.pathname !== "/v1" ||
+		url.search ||
+		url.hash ||
+		url.href !== baseUrl
+	)
+		throw new Error("Only the owned loopback fixture endpoint is permitted");
+}
+
+export function assertFixtureMode(environment: NodeJS.ProcessEnv): void {
+	if (environment.GJC_DESKTOP_QA_MODEL_FIXTURE !== "1" || environment.GJC_DESKTOP_QA_LIVE === "1")
+		throw new Error("Model fixture requires explicit fixture mode and forbids LIVE=1");
+}
+
+export interface SeedOptions {
+	/**
+	 * `literal` (the default) writes `QA_KEY` into models.yml, so the three models are available at
+	 * startup. `unregistered` points the provider at `QA_UNREGISTERED_KEY_ENV` instead: the Host
+	 * starts with no available models until `auth.setKey(QA_PROVIDER, QA_KEY)` stores the key in the
+	 * owned credential store, which makes exactly the three fixture models appear.
+	 */
+	credential?: "literal" | "unregistered";
+}
+
+export async function seedFixture(
+	layout: FixtureLayout,
+	baseUrl: string,
+	providerToken: string,
+	options: SeedOptions = {},
+): Promise<void> {
+	assertFixtureEndpoint(baseUrl);
+	for (const directory of [
+		layout.agentDir,
+		layout.project,
+		...["home", "config", "data", "state", "cache"].map(name => path.join(layout.dataDir, name)),
+	])
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const models = QA_MODEL_IDS.map(id => ({
+		id,
+		name: `TEST ONLY ${id}`,
+		reasoning: id !== "qa-plain",
+		...(id === "qa-plain"
+			? {}
+			: {
+					thinking: {
+						mode: "effort",
+						minLevel: "low",
+						maxLevel: id === "qa-discrete" ? "max" : "high",
+						defaultLevel: "low",
+						...(id === "qa-discrete" ? { levels: ["low", "high", "max"] } : {}),
+					},
+				}),
+		input: id === "qa-discrete" ? ["text", "image"] : ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 131072,
+		maxTokens: 1024,
+	}));
+	// This trusted user extension is owned by the fixture, not the project.
+	await fs.mkdir(path.join(layout.root, "session-observers"), { recursive: true, mode: 0o700 });
+	const extensionDir = path.join(layout.agentDir, "extensions");
+	await fs.mkdir(extensionDir, { recursive: true, mode: 0o700 });
+	await Bun.write(
+		path.join(extensionDir, "desktop-qa.ts"),
+		`
+import * as fs from "node:fs/promises";
+export default function(pi) {
+  let startupUi;
+  let observer;
+  let observed;
+  const observe = async ctx => {
+    observed = ctx.sessionManager;
+    if (!observer) observer = Bun.serve({
+      hostname: "127.0.0.1", port: 0, maxRequestBodySize: 16,
+      async fetch(request) {
+        const url = new URL(request.url);
+        if (url.origin !== "http://127.0.0.1:" + observer.port ||
+            request.headers.get("host") !== "127.0.0.1:" + observer.port ||
+            url.pathname !== "/observe" || url.search || request.method !== "POST" ||
+            request.headers.has("Origin") ||
+            request.headers.get("X-Desktop-QA-Fixture") !== ${JSON.stringify(providerToken)} ||
+            request.headers.get("Content-Type") !== "application/json")
+          return new Response("Forbidden fixture observation", {status: 403});
+        if (await request.text() !== "{}") return new Response("Invalid observation", {status: 400});
+        return Response.json({pid: process.pid, sdkSessionId: observed.getSessionId(),
+          transcriptFile: observed.getSessionFile(), selectedLeafId: observed.getLeafId()},
+          {headers: {"Cache-Control": "no-store"}});
+      }
+    });
+    await Bun.write(${JSON.stringify(path.join(layout.root, "session-observers"))} + "/" + observed.getSessionId() + ".json",
+      JSON.stringify({baseUrl: "http://127.0.0.1:" + observer.port, pid: process.pid}));
+  };
+  pi.on("session_shutdown", async () => { await observer?.stop(true); observer = undefined; });
+  pi.on("session_start", async (_event, ctx) => {
+    await observe(ctx);
+    startupUi = ctx.ui;
+    await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-starts.txt"))}, "start\\n");
+    if (await Bun.file(${JSON.stringify(path.join(layout.root, "extension-send"))}).exists()) {
+      await pi.sendUserMessage("TEST ONLY extension startup message");
+      await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-sent.txt"))}, "sent\\n");
+    }
+    if (await Bun.file(${JSON.stringify(path.join(layout.root, "extension-question"))}).exists()) {
+      const answer = await ctx.ui.input("TEST ONLY extension startup question");
+      await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-answers.txt"))}, String(answer) + "\\n");
+      ctx.ui.notify("TEST ONLY extension answered: " + String(answer), "info");
+    } else ctx.ui.notify("TEST ONLY extension started", "info");
+  });
+  pi.on("session_switch", async (_event, ctx) => {
+    await observe(ctx);
+    await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-switches.txt"))}, "switch\\n");
+  });
+  pi.on("input", async (event, ctx) => {
+    if (event.text !== "TEST ONLY generation probe") return;
+    startupUi.notify("TEST ONLY stale extension UI", "info");
+    const answer = await ctx.ui.input("TEST ONLY refreshed extension UI");
+    await fs.appendFile(${JSON.stringify(path.join(layout.root, "extension-generation-answers.txt"))}, String(answer) + "\\n");
+    throw new Error("TEST ONLY generation handler failure");
+  });
+}
+`,
+	);
+	// A project-local extension must never be imported by SDK discovery.
+	const projectExtensions = path.join(layout.project, ".gjc", "extensions");
+	await fs.mkdir(projectExtensions, { recursive: true, mode: 0o700 });
+	await Bun.write(
+		path.join(projectExtensions, "must-not-load.ts"),
+		`
+import * as fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(path.join(layout.root, "project-extension-loaded"))}, "unsafe");
+export default function() {}
+`,
+	);
+	// JSON is valid YAML. All paths and credentials here belong to this temporary fixture.
+	await Bun.write(
+		path.join(layout.agentDir, "models.yml"),
+		JSON.stringify({
+			providers: {
+				[QA_PROVIDER]: {
+					api: "openai-completions",
+					baseUrl,
+					...(options.credential === "unregistered" ? { apiKeyEnv: QA_UNREGISTERED_KEY_ENV } : { apiKey: QA_KEY }),
+					headers: { "X-Desktop-QA-Fixture": providerToken },
+					compat: { supportsReasoningEffort: true, thinkingFormat: "openai", supportsStore: false },
+					models,
+				},
+			},
+			profiles: Object.fromEntries(
+				QA_MODEL_IDS.map(id => [
+					id,
+					{
+						display_name: `TEST ONLY ${id}`,
+						required_providers: [QA_PROVIDER],
+						model_mapping: { default: `${QA_PROVIDER}/${id}${id === "qa-plain" ? "" : ":low"}` },
+					},
+				]),
+			),
+		}),
+	);
+	await Bun.write(
+		path.join(layout.agentDir, "config.yml"),
+		JSON.stringify({
+			modelRoles: { default: `${QA_PROVIDER}/qa-reasoning:low` },
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			lsp: { enabled: true },
+			// An unfinished task list would otherwise make the SDK append up to three hidden reminder
+			// turns, each answered with closing text, after every todo demonstration.
+			todo: { reminders: false },
+			// The qa-* model ids match no model family, so `auto` would pick hashline, whose anchors
+			// come from a prior read and cannot be scripted. Replace mode takes
+			// {path, edits: [{old_text, new_text}]}, which the edit demonstrations use.
+			edit: { mode: "replace" },
+		}),
+	);
+	// Reuse the SDK's real protocol fixture, copied into this run's owned root.
+	const lspServer = path.join(layout.root, "owned-lsp-server.ts");
+	const lspSource = await fs.readFile(
+		path.resolve(import.meta.dir, "../../coding-agent/test/fixtures/session-move-service-server.ts"),
+		"utf8",
+	);
+	await Bun.write(
+		lspServer,
+		`import * as fixtureFs from "node:fs";\nfixtureFs.appendFileSync(${JSON.stringify(path.join(layout.root, "lsp-lifecycle.jsonl"))}, JSON.stringify({ event: "start", pid: process.pid }) + "\\n");\nprocess.on("exit", () => fixtureFs.appendFileSync(${JSON.stringify(path.join(layout.root, "lsp-lifecycle.jsonl"))}, JSON.stringify({ event: "exit", pid: process.pid }) + "\\n"));\n${lspSource}`,
+	);
+	const lspConfigDir = path.join(layout.dataDir, "home", ".gjc-desktop", "agent");
+	await fs.mkdir(lspConfigDir, { recursive: true, mode: 0o700 });
+	await Bun.write(
+		path.join(lspConfigDir, "lsp.json"),
+		JSON.stringify({
+			servers: {
+				desktop_fixture: {
+					command: process.execPath,
+					args: [lspServer, "lsp"],
+					fileTypes: [".move"],
+					rootMarkers: [".move-root"],
+					warmupTimeoutMs: 5000,
+				},
+			},
+		}),
+	);
+	await Bun.write(path.join(layout.project, ".move-root"), "owned fixture\n");
+	await Bun.write(path.join(layout.project, "probe.move"), "probe_symbol\n");
+	await Bun.write(path.join(layout.project, "definition.move"), "OWNED_DEFINITION_MARKER\n");
+	await Bun.write(path.join(layout.project, QA_EDIT_DEMO_FILE), QA_EDIT_DEMO_TEXT);
+	await Bun.write(
+		path.join(layout.root, markerName),
+		JSON.stringify({ version: 1, root: layout.root, baseUrl, providerToken }),
+	);
+}
+
+/** Refuse direct invocation with arbitrary roots/endpoints or inherited install state. */
+export async function validateFixtureEnvironment(
+	environment: NodeJS.ProcessEnv,
+): Promise<{ layout: FixtureLayout; baseUrl: string; providerToken: string }> {
+	assertFixtureMode(environment);
+	const root = environment.GJC_DESKTOP_QA_FIXTURE_ROOT;
+	const baseUrl = environment.GJC_DESKTOP_QA_FIXTURE_URL;
+	const providerToken = environment.GJC_DESKTOP_QA_FIXTURE_TOKEN;
+	if (!root || !baseUrl || !providerToken || !/^[a-f0-9-]{36}$/.test(providerToken))
+		throw new Error("Missing owned fixture configuration");
+	assertFixtureEndpoint(baseUrl);
+	const canonical = await fs.realpath(root);
+	if (canonical !== root || !path.basename(root).startsWith("gjc-host-ui-qa-") || environment.TMPDIR !== root)
+		throw new Error("Fixture root must be a canonical QA-owned temporary directory");
+	const info = await fs.stat(root);
+	if ((info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid()))
+		throw new Error("Fixture root ownership is unsafe");
+	const marker = await Bun.file(path.join(root, markerName)).json();
+	if (
+		marker.version !== 1 ||
+		marker.root !== root ||
+		marker.baseUrl !== baseUrl ||
+		marker.providerToken !== providerToken
+	)
+		throw new Error("Fixture ownership marker does not match");
+	const layout = fixtureLayout(root);
+	const expected = fixtureEnvironment(layout, baseUrl, providerToken);
+	for (const [key, value] of Object.entries(expected)) {
+		if (environment[key] !== value) throw new Error(`Unsafe fixture environment: ${key}`);
+	}
+	for (const key of Object.keys(environment)) {
+		if (!(key in expected)) throw new Error(`Unexpected fixture environment: ${key}`);
+	}
+	for (const directory of [
+		layout.dataDir,
+		layout.agentDir,
+		layout.project,
+		...["home", "config", "data", "state", "cache"].map(name => path.join(layout.dataDir, name)),
+	]) {
+		if ((await fs.realpath(directory)) !== directory) throw new Error("Fixture roots cannot be symlinked");
+	}
+	return { layout, baseUrl, providerToken };
+}
+
+/** Read the live read-only SDK facade, never infer the selected branch from the last disk record. */
+export async function observeFixtureSession(
+	layout: FixtureLayout,
+	baseUrl: string,
+	providerToken: string,
+	catalogSessionId: string,
+	pid: number,
+): Promise<FixtureSessionObservation> {
+	await validateFixtureEnvironment(fixtureEnvironment(layout, baseUrl, providerToken));
+	if (!/^[a-f0-9-]{36}$/.test(catalogSessionId)) throw new Error("Invalid fixture session ID");
+	const catalogFile = path.join(layout.dataDir, "catalog.json");
+	if ((await fs.realpath(catalogFile)) !== catalogFile) throw new Error("Non-owned fixture catalog");
+	const catalog = (await Bun.file(catalogFile).json()) as {
+		projects: Array<{ id: string; path: string }>;
+		sessions: Array<{ id: string; projectId: string; file: string; scope?: string }>;
+	};
+	const session = catalog.sessions.find(entry => entry.id === catalogSessionId);
+	if (!session || !catalog.projects.some(entry => entry.id === session.projectId && entry.path === layout.project))
+		throw new Error("Unknown fixture session");
+	const transcriptRoot =
+		session.scope === "managed" ? path.join(layout.agentDir, "sessions") : path.join(layout.dataDir, "sessions");
+	const transcriptFile = path.resolve(transcriptRoot, session.file);
+	if (
+		!transcriptFile.startsWith(`${transcriptRoot}${path.sep}`) ||
+		(await fs.realpath(transcriptFile)) !== transcriptFile
+	)
+		throw new Error("Non-owned fixture transcript");
+	// Only read the bounded SDK header, not the whole transcript or credential-bearing state.
+	const reader = Bun.file(transcriptFile).stream().getReader();
+	let headerText = "";
+	try {
+		while (!headerText.includes("\n")) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			headerText += new TextDecoder().decode(value);
+			if (headerText.length > 1024 * 1024) throw new Error("Fixture header too large");
+		}
+	} finally {
+		await reader.cancel();
+	}
+	const header = JSON.parse(headerText.split("\n", 1)[0]!) as { type: string; id: string };
+	if (header.type !== "session" || !/^[a-f0-9-]{36}$/.test(header.id)) throw new Error("Invalid SDK identity");
+	const controlFile = path.join(layout.root, "session-observers", `${header.id}.json`);
+	if ((await fs.realpath(controlFile)) !== controlFile) throw new Error("Non-owned fixture observer");
+	const control = (await Bun.file(controlFile).json()) as { baseUrl: string; pid: number };
+	assertFixtureEndpoint(`${control.baseUrl}/v1`);
+	if (control.pid !== pid) throw new Error("Stale fixture observer");
+	const response = await fetch(`${control.baseUrl}/observe`, {
+		method: "POST",
+		redirect: "error",
+		signal: AbortSignal.timeout(5000),
+		headers: { "Content-Type": "application/json", "X-Desktop-QA-Fixture": providerToken },
+		body: "{}",
+	});
+	if (!response.ok) throw new Error("Fixture observation unavailable");
+	const observation = (await response.json()) as Omit<FixtureSessionObservation, "catalogSessionId">;
+	if (
+		observation.pid !== pid ||
+		observation.sdkSessionId !== header.id ||
+		observation.transcriptFile !== transcriptFile ||
+		!(observation.selectedLeafId === null || typeof observation.selectedLeafId === "string")
+	)
+		throw new Error("Fixture observation identity mismatch");
+	return {
+		pid: observation.pid,
+		catalogSessionId,
+		sdkSessionId: observation.sdkSessionId,
+		transcriptFile: observation.transcriptFile,
+		selectedLeafId: observation.selectedLeafId,
+	};
+}
+
+/** All SDK fetch traffic is fenced to one owned route; redirects cannot escape. */
+export function fixtureFetch(
+	baseUrl: string,
+	providerToken: string,
+	transport: typeof fetch,
+	mcpUrl?: string,
+): typeof fetch {
+	assertFixtureEndpoint(baseUrl);
+	if (mcpUrl) {
+		const url = new URL(mcpUrl);
+		if (
+			url.protocol !== "http:" ||
+			url.hostname !== "127.0.0.1" ||
+			!url.port ||
+			url.pathname !== "/mcp" ||
+			url.search ||
+			url.hash ||
+			url.username ||
+			url.password ||
+			url.href !== mcpUrl
+		)
+			throw new Error("Only the owned loopback MCP endpoint is permitted");
+	}
+	const guarded = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+		const request = input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
+		if (
+			mcpUrl &&
+			request.url === mcpUrl &&
+			["GET", "POST", "DELETE"].includes(request.method) &&
+			!request.headers.has("Origin") &&
+			request.headers.get("Authorization") === `Bearer ${providerToken}`
+		)
+			return transport(request, { redirect: "error" });
+		if (
+			request.url !== `${baseUrl}/chat/completions` ||
+			request.method !== "POST" ||
+			request.headers.get("X-Desktop-QA-Fixture") !== providerToken ||
+			request.headers.get("Authorization") !== `Bearer ${QA_KEY}`
+		)
+			throw new Error("TEST ONLY fixture refused non-owned network request");
+		return transport(request, { redirect: "error" });
+	};
+	return Object.assign(guarded, {
+		preconnect: () => {
+			throw new Error("Fixture preconnect is forbidden");
+		},
+	}) as typeof fetch;
+}
+
+export type FixtureGateKind = "approval" | "question" | "execution";
+export interface FixtureGateContinuation {
+	id: number;
+	sessionId: string;
+	kind: FixtureGateKind;
+	state: "pending" | "resolved" | "rejected";
+	/** True only when the genuine emitGate promise resolved; not an approval/grant. */
+	advanced: boolean;
+	answer?: unknown;
+	error?: string;
+}
+export interface FixtureGateSnapshot {
+	version: 1;
+	testOnly: true;
+	continuations: FixtureGateContinuation[];
+}
+
+/** The child advertises an exact loopback URL in an owned temporary file. */
+export async function readFixtureGateControl(layout: FixtureLayout): Promise<string> {
+	const value: unknown = await Bun.file(layout.gateControlPath).json();
+	if (!value || typeof value !== "object" || !("baseUrl" in value) || typeof value.baseUrl !== "string")
+		throw new Error("Invalid fixture gate control metadata");
+	assertFixtureEndpoint(`${value.baseUrl}/v1`);
+	return value.baseUrl;
+}
+
+export interface FixtureRequestRecord {
+	id: number;
+	method: "POST";
+	path: "/v1/chat/completions";
+	body: Record<string, unknown>;
+	/** `refused`: a qa-tool marker failed validation; answered with HTTP 400, never streamed or held. */
+	state: "held" | "completed" | "aborted" | "refused";
+	held: boolean;
+	released: boolean;
+	chunks: string[];
+	/** The refusal reason, also sent as the OpenAI-style error message. */
+	error?: string;
+}
+export interface FixtureSnapshot {
+	version: 1;
+	testOnly: true;
+	provider: string;
+	baseUrl: string;
+	models: string[];
+	holdNext: boolean;
+	/** Completions accepted per collection before the fixture answers 429. */
+	requestLimit: number;
+	/** Main and side-chat model turns; automatic title transactions do not consume these IDs or holds. */
+	requests: FixtureRequestRecord[];
+	/** Independently numbered title transactions, including their input digest and SSE chunks. */
+	titleRequests: FixtureRequestRecord[];
+}
+
+export interface ModelFixture {
+	baseUrl: string;
+	providerToken: string;
+	snapshot(): FixtureSnapshot;
+	holdNext(): void;
+	release(id: number): boolean;
+	flush(): Promise<void>;
+	close(): Promise<void>;
+}
+
+interface FixtureToolCall {
+	name: string;
+	/** Serialized JSON object, as OpenAI streams it. */
+	arguments: string;
+}
+
+/** A qa-tool marker the fixture will not answer; the completion fails with this reason. */
+class FixtureRefusal extends Error {}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function messageText(message: Record<string, unknown>): string {
+	// Wire content is either a string or an array of typed parts.
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content.map(part => (isRecord(part) && typeof part.text === "string" ? part.text : "")).join("\n");
+}
+
+function parseMarkerJson(text: string, label: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new FixtureRefusal(`${label} is not valid JSON; it must fill the rest of its line`);
+	}
+}
+
+function parseCalls(value: unknown, label: string): FixtureToolCall[] {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_CALLS_PER_RESPONSE)
+		throw new FixtureRefusal(`${label} must list 1 to ${MAX_CALLS_PER_RESPONSE} calls`);
+	return value.map((entry, index) => {
+		if (
+			!isRecord(entry) ||
+			typeof entry.name !== "string" ||
+			Object.keys(entry).some(key => key !== "name" && key !== "arguments") ||
+			(entry.arguments !== undefined && !isRecord(entry.arguments))
+		)
+			throw new FixtureRefusal(`${label} call ${index + 1} must be {"name": string, "arguments": object}`);
+		return { name: entry.name, arguments: JSON.stringify(entry.arguments ?? {}) };
+	});
+}
+
+function requireOffered(calls: FixtureToolCall[], offered: string[], label: string): FixtureToolCall[] {
+	for (const call of calls)
+		if (!offered.includes(call.name))
+			throw new FixtureRefusal(
+				`${label}: tool ${call.name} is not offered in this request (offered: ${offered.join(", ") || "none"})`,
+			);
+	return calls;
+}
+
+/**
+ * Test-only tool-call triggers, read from the newest user message of the request:
+ * - `qa-tool-call:<name>[:<json object>]` asks for one call while that message is the newest.
+ * - `qa-tool-calls:[{"name":…,"arguments":{…}},…]` asks for several calls in one response while
+ *   that message is the newest.
+ * - `qa-tool-chain:[step,…]` scripts a turn across completions: step k (0-based) answers the
+ *   request that has k assistant responses after the message, so with one call per step it fires
+ *   once k tool results follow. A step is one call object or an array of them. After the last step
+ *   the turn closes with text.
+ * The JSON must fill the rest of the marker's line. Every call is checked against the tools
+ * offered by THIS request, so a chain proves that an earlier step changed the tool list. A marker
+ * that fails a check is refused before anything streams.
+ */
+function plannedToolCalls(body: Record<string, unknown>): FixtureToolCall[] | null {
+	const messages = Array.isArray(body.messages) ? body.messages : [];
+	const userIndex = messages.findLastIndex(message => isRecord(message) && message.role === "user");
+	if (userIndex < 0) return null;
+	const text = messageText(messages[userIndex] as Record<string, unknown>);
+	const markers = [...text.matchAll(/qa-tool-(calls|call|chain):/g)];
+	if (markers.length === 0) return null;
+	if (markers.length > 1) throw new FixtureRefusal("A message may carry only one qa-tool marker");
+	const marker = markers[0]!;
+	const kind = marker[1] as "call" | "calls" | "chain";
+	const rest = text
+		.slice(marker.index + marker[0].length)
+		.split("\n", 1)[0]!
+		.trim();
+	const offered = (Array.isArray(body.tools) ? body.tools : [])
+		.map(tool => (isRecord(tool) && isRecord(tool.function) ? tool.function.name : undefined))
+		.filter((name): name is string => typeof name === "string");
+	const answered = messages.slice(userIndex + 1).filter(message => isRecord(message) && message.role === "assistant");
+	if (kind === "chain") {
+		const steps = parseMarkerJson(rest, "qa-tool-chain");
+		if (!Array.isArray(steps) || steps.length === 0 || steps.length > MAX_CHAIN_STEPS)
+			throw new FixtureRefusal(`qa-tool-chain must list 1 to ${MAX_CHAIN_STEPS} steps`);
+		const parsed = steps.map((step, index) =>
+			parseCalls(Array.isArray(step) ? step : [step], `qa-tool-chain step ${index + 1}`),
+		);
+		const step = answered.length;
+		if (step >= parsed.length) return null;
+		return requireOffered(parsed[step]!, offered, `qa-tool-chain step ${step + 1}`);
+	}
+	// A single response must not re-fire after its tool results have been returned.
+	if (userIndex !== messages.length - 1) return null;
+	if (kind === "calls")
+		return requireOffered(
+			parseCalls(parseMarkerJson(rest, "qa-tool-calls"), "qa-tool-calls"),
+			offered,
+			"qa-tool-calls",
+		);
+	const match = /^([a-z0-9_]+)(?::(.+))?/.exec(rest);
+	if (!match) throw new FixtureRefusal("qa-tool-call must name a tool: qa-tool-call:<name>[:<json object>]");
+	const argumentsValue = parseMarkerJson(match[2]?.trim() || "{}", "qa-tool-call arguments");
+	if (!isRecord(argumentsValue)) throw new FixtureRefusal("qa-tool-call arguments must be a JSON object");
+	return requireOffered([{ name: match[1]!, arguments: JSON.stringify(argumentsValue) }], offered, "qa-tool-call");
+}
+
+function isTitleRequest(body: Record<string, unknown>): boolean {
+	const choice = body.tool_choice;
+	if (!choice || typeof choice !== "object" || Array.isArray(choice)) return false;
+	const forced = choice as Record<string, unknown>;
+	if (
+		forced.type !== "function" ||
+		!forced.function ||
+		typeof forced.function !== "object" ||
+		Array.isArray(forced.function)
+	)
+		return false;
+	if ((forced.function as Record<string, unknown>).name !== "set_title") return false;
+	if (!Array.isArray(body.tools) || body.tools.length !== 1) return false;
+	const tool = body.tools[0];
+	if (
+		!tool ||
+		typeof tool !== "object" ||
+		tool.type !== "function" ||
+		!tool.function ||
+		typeof tool.function !== "object"
+	)
+		return false;
+	const fn = tool.function;
+	const parameters = fn.parameters;
+	if (
+		fn.name !== "set_title" ||
+		!parameters ||
+		typeof parameters !== "object" ||
+		parameters.type !== "object" ||
+		parameters.additionalProperties !== false
+	)
+		return false;
+	if (!Array.isArray(parameters.required) || parameters.required.length !== 1 || parameters.required[0] !== "title")
+		return false;
+	if (
+		!parameters.properties ||
+		typeof parameters.properties !== "object" ||
+		parameters.properties.title?.type !== "string"
+	)
+		return false;
+	if (!Array.isArray(body.messages) || body.messages.length !== 2) return false;
+	const [system, user] = body.messages;
+	return (
+		(system?.role === "system" || system?.role === "developer") &&
+		typeof system.content === "string" &&
+		system.content.startsWith("Generate a 3-6 word title for a coding session") &&
+		user?.role === "user" &&
+		typeof user.content === "string"
+	);
+}
+
+export interface ModelFixtureOptions {
+	/**
+	 * Hold the first main completion until `release(id)` (the default). False lets an interactive
+	 * run answer its first prompt at once; `holdNext()` still arms a hold for the next completion.
+	 */
+	initialHold?: boolean;
+	/** Completions accepted per collection (main and title) before 429; 1 to `QA_MAX_REQUEST_LIMIT`. */
+	requestLimit?: number;
+}
+
+export function startModelFixture(artifactPath: string, options: ModelFixtureOptions = {}): ModelFixture {
+	const limit = options.requestLimit ?? QA_DEFAULT_REQUEST_LIMIT;
+	if (!Number.isSafeInteger(limit) || limit < 1 || limit > QA_MAX_REQUEST_LIMIT)
+		throw new Error(`Fixture request limit must be an integer from 1 to ${QA_MAX_REQUEST_LIMIT}`);
+	const providerToken = crypto.randomUUID();
+	const records: FixtureRequestRecord[] = [];
+	const titleRecords: FixtureRequestRecord[] = [];
+	const held = new Map<number, () => void>();
+	let holdNext = options.initialHold ?? true;
+	let writes = Promise.resolve();
+	let writeError: unknown;
+	const encoder = new TextEncoder();
+	const snapshot = (): FixtureSnapshot => ({
+		version: 1,
+		testOnly: true,
+		provider: QA_PROVIDER,
+		baseUrl,
+		models: QA_MODEL_IDS.map(id => `${QA_PROVIDER}/${id}`),
+		holdNext,
+		requestLimit: limit,
+		requests: structuredClone(records),
+		titleRequests: structuredClone(titleRecords),
+	});
+	const persist = () => {
+		const text = JSON.stringify(snapshot(), null, 2);
+		writes = writes
+			.then(async () => {
+				await Bun.write(artifactPath, text);
+			})
+			.catch(error => {
+				writeError = error;
+			});
+	};
+	const server = Bun.serve<undefined>({
+		hostname: "127.0.0.1",
+		port: 0,
+		idleTimeout: 0,
+		maxRequestBodySize: 4 * 1024 * 1024,
+		async fetch(request) {
+			const url = new URL(request.url);
+			if (
+				url.origin !== `http://127.0.0.1:${server.port}` ||
+				request.headers.get("host") !== `127.0.0.1:${server.port}` ||
+				url.pathname !== "/v1/chat/completions" ||
+				url.search ||
+				request.method !== "POST" ||
+				request.headers.has("Origin") ||
+				request.headers.get("Authorization") !== `Bearer ${QA_KEY}` ||
+				request.headers.get("X-Desktop-QA-Fixture") !== providerToken
+			)
+				return new Response("Forbidden fixture request", { status: 403 });
+			if (records.length >= limit && titleRecords.length >= limit)
+				return new Response("Fixture request limit", { status: 429 });
+			let body: Record<string, unknown>;
+			try {
+				const value: unknown = await request.json();
+				if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid body");
+				body = value as Record<string, unknown>;
+				if (!QA_MODEL_IDS.some(id => id === body.model) || body.stream !== true || !Array.isArray(body.messages))
+					throw new Error("Invalid model or stream");
+			} catch {
+				return new Response("Invalid fixture completion", { status: 400 });
+			}
+			const title = isTitleRequest(body);
+			const collection = title ? titleRecords : records;
+			if (collection.length >= limit) return new Response("Fixture request limit", { status: 429 });
+			// Title transactions offer only set_title, so a marker in the prompt they quote is ignored.
+			let toolCalls: FixtureToolCall[] | null = null;
+			let refusal: string | undefined;
+			if (!title) {
+				try {
+					toolCalls = plannedToolCalls(body);
+				} catch (error) {
+					if (!(error instanceof FixtureRefusal)) throw error;
+					refusal = `TEST ONLY fixture refused the qa-tool marker: ${error.message}`;
+				}
+			}
+			const record: FixtureRequestRecord = {
+				id: collection.length + 1,
+				method: "POST",
+				path: "/v1/chat/completions",
+				body,
+				state: refusal ? "refused" : "held",
+				held: !title && !refusal && holdNext,
+				released: false,
+				chunks: [],
+				...(refusal ? { error: refusal } : {}),
+			};
+			// A refusal never streams, so it leaves the pending hold for the next completion.
+			if (!title && !refusal) holdNext = false;
+			collection.push(record);
+			if (refusal) {
+				persist();
+				return Response.json(
+					{ error: { message: refusal, type: "invalid_request_error", code: "qa_fixture_refused" } },
+					{ status: 400, headers: { "Cache-Control": "no-store" } },
+				);
+			}
+			let heartbeat: Timer | undefined;
+			let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+			const onAbort = () => {
+				abort();
+				streamController?.close();
+			};
+			const abort = () => {
+				if (record.state !== "held") return;
+				record.state = "aborted";
+				if (!title) held.delete(record.id);
+				if (heartbeat) clearInterval(heartbeat);
+				request.signal.removeEventListener("abort", onAbort);
+				persist();
+			};
+			const response = new ReadableStream<Uint8Array>({
+				start(controller) {
+					streamController = controller;
+					const send = (data: string) => {
+						record.chunks.push(data);
+						controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+					};
+					const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
+						JSON.stringify({
+							id: `qa-completion-${record.id}`,
+							object: "chat.completion.chunk",
+							created: 1700000000,
+							model: body.model,
+							choices: [{ index: 0, delta, finish_reason: finish }],
+						});
+					const finish = () => {
+						if (record.state !== "held") return;
+						if (heartbeat) clearInterval(heartbeat);
+						const calls = toolCalls;
+						if (calls) {
+							// One delta per call, as OpenAI streams parallel calls.
+							for (const [index, call] of calls.entries()) {
+								const id =
+									calls.length === 1 ? `qa-tool-call-${record.id}` : `qa-tool-call-${record.id}-${index + 1}`;
+								send(
+									chunk({
+										tool_calls: [
+											{
+												index,
+												id,
+												type: "function",
+												function: { name: call.name, arguments: call.arguments },
+											},
+										],
+									}),
+								);
+							}
+							send(chunk({}, "tool_calls"));
+						} else if (title) {
+							send(
+								chunk({
+									tool_calls: [
+										{
+											index: 0,
+											id: `qa-title-call-${record.id}`,
+											type: "function",
+											function: {
+												name: "set_title",
+												arguments: JSON.stringify({ title: "Fixture Generated Session Title" }),
+											},
+										},
+									],
+								}),
+							);
+							send(chunk({}, "tool_calls"));
+						} else {
+							send(chunk({ content: `Fixture turn ${record.id} complete.` }));
+							send(chunk({}, "stop"));
+						}
+						send(
+							JSON.stringify({
+								id: `qa-completion-${record.id}`,
+								object: "chat.completion.chunk",
+								created: 1700000000,
+								model: body.model,
+								choices: [],
+								usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
+							}),
+						);
+						send("[DONE]");
+						record.state = "completed";
+						if (!title) held.delete(record.id);
+						request.signal.removeEventListener("abort", onAbort);
+						controller.close();
+						persist();
+					};
+					send(chunk({ role: "assistant", content: "" }));
+					if (!title) {
+						if (body.model !== "qa-plain") send(chunk({ reasoning_content: `Fixture reasoning ${record.id}. ` }));
+						send(chunk({ content: `Fixture turn ${record.id} started. ` }));
+					}
+					request.signal.addEventListener("abort", onAbort, { once: true });
+					if (request.signal.aborted) onAbort();
+					else if (record.held) {
+						held.set(record.id, finish);
+						heartbeat = setInterval(() => controller.enqueue(encoder.encode(": fixture hold\n\n")), 1000);
+						persist();
+					} else finish();
+				},
+				cancel() {
+					abort();
+				},
+			});
+			return new Response(response, {
+				headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-store" },
+			});
+		},
+	});
+	const baseUrl = `http://127.0.0.1:${server.port}/v1`;
+	persist();
+	return {
+		baseUrl,
+		providerToken,
+		snapshot,
+		holdNext() {
+			holdNext = true;
+			persist();
+		},
+		release(id) {
+			const finish = held.get(id);
+			if (!finish) return false;
+			records[id - 1]!.released = true;
+			finish();
+			return true;
+		},
+		async flush() {
+			await writes;
+			if (writeError) throw writeError;
+		},
+		async close() {
+			for (const finish of held.values()) finish();
+			await server.stop(true);
+			await writes;
+			if (writeError) throw writeError;
+		},
+	};
+}

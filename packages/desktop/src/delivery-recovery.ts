@@ -1,0 +1,165 @@
+import type { DesktopDeliveryReceipt } from "@gajae-code/desktop-host/protocol";
+import type { DesktopAttachmentDraft } from "./AttachmentPicker";
+import { t } from "./i18n";
+
+export interface DeliveryRecovery {
+	id: string;
+	sessionId: string;
+	/** The conversation's title when the prompt was sent; names the card once the row is gone. */
+	title?: string;
+	text: string;
+	attachments: DesktopAttachmentDraft[];
+	disposition: DesktopDeliveryReceipt["disposition"];
+	error?: string;
+	restored?: boolean;
+	finalizing?: boolean;
+	prepared?: boolean;
+	/** Submission order on this device; records saved before it existed sort first. */
+	sequence?: number;
+}
+
+let lastSequence = 0;
+/** A strictly increasing submission order, so several restored drafts keep the order they were sent in. */
+export function nextDeliverySequence(): number {
+	lastSequence = Math.max(Date.now(), lastSequence + 1);
+	return lastSequence;
+}
+
+/**
+ * The card's account of a delivery. An orphan (its conversation is not in the list) cannot be
+ * restored, so its wording never mentions restoring.
+ */
+export function recoveryNotice(entry: DeliveryRecovery, unsentRepair: boolean, orphan = false): string | null {
+	if (unsentRepair) return t("support.deliveryRepairPending");
+	if (entry.finalizing) return null;
+	if (entry.disposition === "unknown")
+		return orphan ? t("recovery.orphanOutcomeUnknown") : t("support.deliveryOutcomeUnknown");
+	// A listed card shows no text of its own: Restore draft brings the text back to review.
+	if (entry.disposition === "failed") return orphan ? t("recovery.orphanFailed") : t("recovery.listedFailed");
+	return null;
+}
+
+/** A record's text is safe once it ran into the transcript or is back in the composer. */
+const textIsSafe = (entry: DeliveryRecovery) =>
+	entry.restored === true || entry.disposition === "completed" || entry.disposition === "cancelled";
+
+/**
+ * What deleting a conversation does to its delivery-recovery records: `dropped` is every record for
+ * it (all go with it), and `lost` the ones whose text goes too — neither in the transcript nor back
+ * in the composer, and not already being discarded. That covers an unknown or failed outcome, an
+ * input in flight or awaiting repair, and a refused or handed-back input whose automatic restore
+ * failed. The Delete dialog's warning and the drop both come from here, so they cannot drift apart.
+ */
+export function recoveriesDroppedWithConversation(
+	entries: readonly DeliveryRecovery[],
+	sessionId: string,
+): { dropped: DeliveryRecovery[]; lost: DeliveryRecovery[] } {
+	const dropped = entries.filter(entry => entry.sessionId === sessionId);
+	return { dropped, lost: dropped.filter(entry => !entry.finalizing && !textIsSafe(entry)) };
+}
+
+export interface DurableDraft {
+	sessionId: string;
+	text: string;
+	attachments: DesktopAttachmentDraft[];
+}
+
+let database: Promise<IDBDatabase> | undefined;
+function openDatabase(): Promise<IDBDatabase> {
+	if (database) return database;
+	const { promise, resolve, reject } = Promise.withResolvers<IDBDatabase>();
+	database = promise;
+	let rejected = false;
+	const fail = (error: Error) => {
+		if (rejected) return;
+		rejected = true;
+		if (database === promise) database = undefined;
+		reject(error);
+	};
+	let open: IDBOpenDBRequest;
+	try {
+		open = indexedDB.open("gjc.desktop.delivery-recovery", 2);
+	} catch (error) {
+		fail(error instanceof Error ? error : new Error(String(error)));
+		return promise;
+	}
+	open.onupgradeneeded = () => {
+		if (!open.result.objectStoreNames.contains("deliveries"))
+			open.result.createObjectStore("deliveries", { keyPath: "id" });
+		if (!open.result.objectStoreNames.contains("drafts"))
+			open.result.createObjectStore("drafts", { keyPath: "sessionId" });
+	};
+	open.onsuccess = () => {
+		const db = open.result;
+		if (rejected) {
+			db.close();
+			return;
+		}
+		db.onversionchange = () => {
+			db.close();
+			if (database === promise) database = undefined;
+		};
+		db.onclose = () => {
+			if (database === promise) database = undefined;
+		};
+		resolve(db);
+	};
+	open.onerror = () => fail(open.error ?? new Error(t("support.recoveryStoreOpenFailed")));
+	open.onblocked = () => fail(new Error(t("support.recoveryStoreBlocked")));
+	return promise;
+}
+
+function transactionResult<T>(tx: IDBTransaction, result: () => T): Promise<T> {
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	tx.oncomplete = () => resolve(result());
+	tx.onabort = () => reject(tx.error ?? new Error(t("support.recoveryStoreSaveFailed")));
+	return promise;
+}
+
+async function transact<T>(mode: IDBTransactionMode, action: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+	const db = await openDatabase();
+	const tx = db.transaction("deliveries", mode);
+	const operation = action(tx.objectStore("deliveries"));
+	return transactionResult(tx, () => operation.result);
+}
+
+/** Records come back in submission order; the store itself orders them by id. */
+export const loadDeliveries = async () =>
+	(await transact<DeliveryRecovery[]>("readonly", store => store.getAll())).sort(
+		(left, right) => (left.sequence ?? 0) - (right.sequence ?? 0),
+	);
+export const saveDelivery = (entry: DeliveryRecovery) => transact<IDBValidKey>("readwrite", store => store.put(entry));
+export const deleteDelivery = (id: string) => transact<undefined>("readwrite", store => store.delete(id));
+
+export async function loadDrafts(): Promise<DurableDraft[]> {
+	const db = await openDatabase();
+	const tx = db.transaction("drafts", "readonly");
+	const result = tx.objectStore("drafts").getAll();
+	return transactionResult(tx, () => result.result);
+}
+
+export async function saveDrafts(drafts: DurableDraft[]): Promise<void> {
+	const db = await openDatabase();
+	const tx = db.transaction("drafts", "readwrite");
+	try {
+		for (const draft of drafts) tx.objectStore("drafts").put(draft);
+	} catch (error) {
+		tx.abort();
+		throw error;
+	}
+	return transactionResult(tx, () => undefined);
+}
+
+/** The draft and delivery marker become durable together, or neither does. */
+export async function commitDraftAndDelivery(entry: DeliveryRecovery, draft: DurableDraft): Promise<void> {
+	const db = await openDatabase();
+	const tx = db.transaction(["deliveries", "drafts"], "readwrite");
+	try {
+		tx.objectStore("drafts").put(draft);
+		tx.objectStore("deliveries").put(entry);
+	} catch (error) {
+		tx.abort();
+		throw error;
+	}
+	return transactionResult(tx, () => undefined);
+}
