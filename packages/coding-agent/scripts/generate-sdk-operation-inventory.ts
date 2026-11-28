@@ -185,6 +185,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"test-only cancellation seam, not a user-facing SDK control seam",
 	"agent_session:awaitDisposeCompletion": "test-only disposal completion seam, not a user-facing SDK control seam",
 	"agent_session:setDisposeTimeoutForTests": "test-only disposal timeout seam, not a user-facing SDK control seam",
+	"agent_session:getSdkCommandContextForTests":
+		"test-only SDK command context accessor for testing SDK extension behavior, not a user-facing SDK control seam",
 	"agent_session:trackPostPromptTaskForTests": "test-only post-prompt task seam, not a user-facing SDK control seam",
 	"agent_session:requestWorkerIntegrationForTests":
 		"test-only worker integration seam, not a user-facing SDK control seam",
