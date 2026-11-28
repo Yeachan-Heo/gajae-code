@@ -1,0 +1,3 @@
+### Fixed
+
+- **github-cache**: Replace line-oriented regex scrubbing with a structural unified diff parser that correctly redacts credentials while preserving exact line counts, hunk headers, and all framing. The new parser handles JSON credentials crossing diff sides, headers with values on subsequent lines, and containers spanning hunk boundaries — cases that the regex approach could not close after extensive review iterations. Scrubbing now occurs at the storage boundary in `putCached`, ensuring credentials are redacted before rows reach SQLite and no canary values are served back on cache hits. See issue #7874.
