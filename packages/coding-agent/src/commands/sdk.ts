@@ -14,9 +14,11 @@ import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+import { selectAppendSystemPromptFile } from "../cli/append-system-prompt";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
+import { getConfigDirs } from "../config";
 import { FileLockAcquireError, isFileLockAcquireTimeout } from "../config/file-lock";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
@@ -1257,6 +1259,15 @@ export async function runSessionHost(
 			mcpStartupTimeoutMs = remaining;
 		}
 
+		// Discover user-level APPEND_SYSTEM.md, same as CLI does
+		const appendSystemPromptFile = await (async () => {
+			const candidates = getConfigDirs("", { existingOnly: false }).flatMap(entry => {
+				const filePath = path.join(entry.path, "APPEND_SYSTEM.md");
+				return nodeFs.existsSync(filePath) ? [{ level: entry.level, path: filePath }] : [];
+			});
+			return selectAppendSystemPromptFile(candidates);
+		})();
+
 		created = await beforeCutoff(
 			async () => {
 				sessionManagerTransferred = true;
@@ -1270,6 +1281,7 @@ export async function runSessionHost(
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),
+						...(appendSystemPromptFile ? { appendPrompt: appendSystemPromptFile } : {}),
 						lifecycleRequestId: effectMarker,
 					},
 					startupOwner,
