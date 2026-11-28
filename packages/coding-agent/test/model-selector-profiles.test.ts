@@ -1268,4 +1268,81 @@ describe("model selector profiles", () => {
 		expect(session.model).toBe(alternateModel);
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 	});
+
+	test("default role assignment during a running turn closes the selector before setModel settles", async () => {
+		const { ctx, session } = createControllerContext();
+		const idle = Promise.withResolvers<void>();
+
+		const setModelCalls: Array<{ model: Model; role: string }> = [];
+		let activeModelProfile: string | undefined;
+
+		Object.assign(session, {
+			isAwaitingIdle: true,
+			beginModelSelectionUsage: () => 0,
+			recordModelSelectionUsage: vi.fn(),
+			markUserModelSelection: vi.fn(),
+			setDefaultFallbackRuntimeModel: vi.fn(),
+			getConfiguredModelChainState: () => undefined,
+			getDefaultFallbackRuntimeState: () => ({ chain: { entries: [] } }),
+			getProfileInstalledOverrideState: () => ({
+				modelRoles: new Map(),
+				agentModelOverrides: new Map(),
+				installedModelRoles: new Map(),
+				installedAgentModelOverrides: new Map(),
+				manualModelRoles: new Set(),
+				manualAgentModelOverrides: new Set(),
+				configuredAgentModelOverrides: new Set(),
+			}),
+			markProfileRoleOverrideManual: vi.fn(),
+			getActiveModelProfile: () => activeModelProfile,
+			setActiveModelProfile: (name: string | undefined) => {
+				activeModelProfile = name;
+			},
+			async setThinkingLevelForSession(_level: ThinkingLevel) {},
+			async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+				await idle.promise;
+				return body();
+			},
+			async setModel(
+				model: Model,
+				role: string,
+				options?: {
+					onMutationStarted?: () => void;
+					recordUsage?: boolean;
+				},
+			) {
+				setModelCalls.push({ model, role });
+				options?.onMutationStarted?.();
+				this.model = model;
+			},
+			async restoreModelSelectionForRollback(model: Model | undefined) {
+				this.model = model;
+			},
+			sessionManager: {
+				buildSessionContext: () => ({
+					models: { default: undefined },
+				}),
+			},
+		});
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await Bun.sleep(10);
+		setThemeInstance(testTheme);
+
+		const selection = selector.__testSelectAssignment({
+			model: defaultModel,
+			role: "default",
+		});
+		await Bun.sleep(0);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model change queued until the agent is idle.");
+		expect(session.setModelTemporaryCalls).toEqual([]);
+
+		idle.resolve();
+		await selection;
+		expect(session.model).toBe(defaultModel);
+		expect(ctx.showStatus).toHaveBeenCalledWith(`Default model: ${defaultModel.id}`);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
 });

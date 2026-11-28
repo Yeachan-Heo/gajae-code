@@ -1924,6 +1924,14 @@ export class SelectorController {
 								this.ctx.session.credentialSessionId,
 							);
 							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+							// setModel waits for the running turn to go idle before it takes the selection
+							// admission. Close the selector first so it does not hold every key, Esc
+							// included, until the turn ends.
+							if (this.ctx.session.isAwaitingIdle) {
+								done();
+								this.ctx.showStatus("Default model change queued until the agent is idle.");
+								this.ctx.ui.requestRender();
+							}
 							let defaultMutationStarted = false;
 							let defaultUsageSequence: number | undefined;
 
