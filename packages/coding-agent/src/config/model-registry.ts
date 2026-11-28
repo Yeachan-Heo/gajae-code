@@ -7845,6 +7845,31 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Headers for one request, detached from the shared model that produced them.
+	 *
+	 * With `authHeader: true` the registry renders the resolved credential into the
+	 * model object a lookup received. Concurrent lookups for the same live model
+	 * therefore overwrite each other's generated `Authorization` after a request has
+	 * already resolved its key. Callers that send a request build a request-local
+	 * model from this method instead: the source's generated-header ownership is
+	 * copied to a private clone, `#applyEffectiveAuthHeader` rewrites only that clone,
+	 * and the returned headers carry no state shared with `model`.
+	 */
+	getRequestHeaders(model: Model<Api>, apiKey: string | undefined): Record<string, string> | undefined {
+		const requestModel: Model<Api> = {
+			...model,
+			headers: model.headers ? { ...model.headers } : undefined,
+		};
+		// Ownership of a generated Authorization lives in a WeakMap keyed by the exact
+		// model object, so the clone must inherit it or its own generated header would
+		// look like an explicit caller header on the next rewrite.
+		const generated = this.#generatedAuthHeaders.get(model);
+		if (generated !== undefined) this.#generatedAuthHeaders.set(requestModel, { ...generated });
+		this.#applyEffectiveAuthHeader(requestModel, apiKey);
+		return requestModel.headers;
+	}
+
+	/**
 	 * Get API key for a provider (e.g., "openai").
 	 */
 	async getApiKeyForProvider(
