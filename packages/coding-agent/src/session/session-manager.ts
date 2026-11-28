@@ -8139,14 +8139,14 @@ export class SessionManager {
 	/**
 	 * Permanent bar on resident-graph and whole-transcript rewrites. Latched once this
 	 * manager re-anchors to a committed transcript whose entries it did not import:
-	 * every canonical shared append.
+	 * the shared message and thinking-level appends.
 	 * Enforced at the write funnels (`#writeEntriesAtomicallySync`,
 	 * `#rewriteFileContents`, `#rewriteFileSync`), so recovery and close-time
 	 * escalations cannot bypass it.
 	 */
 	readonly #sharedRewriteBarSessionIds = new Set<string>();
 	/**
-	 * In-flight bar shared by control and one-shot publications. Every append and
+	 * In-flight bar for shared publications. Every append and
 	 * rewrite is refused until each concurrent publication has settled.
 	 */
 	readonly #activeSharedMutationSessionCounts = new Map<string, number>();
@@ -20830,7 +20830,7 @@ export class SessionManager {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
 	}
 
-	/** Additive legacy appends are safe once a control publication's transaction has settled. */
+	/** Additive legacy appends are safe once a shared publication's transaction has settled. */
 	assertLegacyAppendAllowed(operation: string): void {
 		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, false);
 	}
@@ -20849,14 +20849,10 @@ export class SessionManager {
 	 * this publication must leave latched after it settles.
 	 *
 	 * Latch matrix:
-	 * - Canonical shared appends (`appendMessageSharingSession`,
-	 *   `appendCustomMessageEntrySharingSession`, `appendCustomEntrySharingSession`,
-	 *   `appendCompactionSharingSession`) latch the append and rewrite bars: they
-	 *   publish this opener's own branch into a graph it did not import.
-	 * - One-shot control appends (`appendTemporaryModelChangeSharingSession`,
-	 *   `appendThinkingLevelChangeSharingSession`,
-	 *   `appendToolSelectionsSharingSession`) latch only rewrite authority: their
-	 *   additive entries are safe to continue from, but the adopted transcript
+	 * - `appendMessageSharingSession` latches the append and rewrite bars: it
+	 *   publishes this opener's own branch into a graph it did not import.
+	 * - `appendThinkingLevelChangeSharingSession` latches only rewrite authority:
+	 *   its additive entry is safe to continue from, but the adopted transcript
 	 *   identity is not.
 	 *
 	 * Both bars latch at entry, not at commit: a publication that is later refused
