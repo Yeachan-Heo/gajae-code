@@ -170,7 +170,7 @@ describe("broker startup heartbeat budget", () => {
 			},
 		});
 		try {
-			await expect(broker.start()).rejects.toThrow();
+			await expect(broker.start()).rejects.toThrow("Broker discovery record changed before retained publication.");
 			expect(broker.ownsDiscovery).toBe(false);
 			expect(await fs.readFile(file, "utf8")).toBe(successorRecord);
 			expect((await readBrokerDiscovery(dir))?.ownerId).toBe("successor-owner");
