@@ -95,4 +95,98 @@ describe("graph successors after root shared append", () => {
 		expect(manager.graphSuccessorRefusal({ leafId: "missing" })).toBe("unknown-entry");
 		await expect(manager.prepareBranchedSession("missing")).rejects.toThrow();
 	});
+
+	it("branches a mixed history that replays as the source does at the branch point", async () => {
+		const { manager, destination } = await fresh();
+		const forkParent = await mixedHistory(manager);
+		const source = manager.getSessionFile()!;
+		const sourceBytes = await bytesAt(source);
+		const stage = await manager.prepareBranchedSession(forkParent);
+		manager.commitPreparedNewSession(stage);
+		await manager.flush();
+		expect(await bytesAt(source)).toEqual(sourceBytes);
+		// The oracle is the source itself, reopened and moved to the branch point.
+		const oracle = await SessionManager.open(source, destination);
+		managers.push(oracle);
+		oracle.branch(forkParent);
+		const branched = await SessionManager.open(stage.sessionFile!, destination);
+		managers.push(branched);
+		// The branch re-emits a label as a fresh entry, so a label's own id is not compared; its
+		// target and text are.
+		const comparable = (entries: FileEntry[]) =>
+			entries.map(entry => ({
+				...entry,
+				id: entry.type === "label" ? undefined : "id" in entry ? entry.id : undefined,
+				parentId: undefined,
+				timestamp: undefined,
+			}));
+		const onPath = new Set(oracle.getBranch().map(entry => entry.id));
+		const sourcePath = (await readEntries(source)).filter(entry => "id" in entry && onPath.has(entry.id));
+		expect(comparable((await readEntries(stage.sessionFile!)).slice(1))).toEqual(comparable(sourcePath));
+		expect(branched.getEntries().map(entry => entry.type)).toEqual(oracle.getBranch().map(entry => entry.type));
+		expect(branched.buildSessionContext()).toEqual(oracle.buildSessionContext());
+		expect(branched.getBranch().map(entry => entry.type)).toEqual(
+			expect.arrayContaining(["model_change", "thinking_level_change", "compaction", "label"]),
+		);
+		expect(await Bun.file(stage.sessionFile!).text()).toContain("openaiResponsesHistory");
+	});
 });
+
+const IMAGE = Buffer.alloc(96 * 1024, 7).toString("base64");
+
+/**
+ * Thinking, a tool call and result, an image, compaction, model changes, a label and an
+ * OpenAI Responses reply with replay metadata, written through the legacy appends. Returns
+ * the label's id, the parent of the selected prompt.
+ */
+async function mixedHistory(manager: SessionManager): Promise<string> {
+	manager.appendModelChange("anthropic/test", "default");
+	manager.appendThinkingLevelChange("high");
+	const p1 = manager.appendMessage({
+		role: "user",
+		content: [
+			{ type: "text", text: "look at this" },
+			{ type: "image", data: IMAGE, mimeType: "image/png" },
+		],
+		timestamp: 1,
+	});
+	manager.appendMessage({
+		...assistant("calling a tool"),
+		content: [
+			{ type: "thinking", thinking: "private reasoning", thinkingSignature: "sig" },
+			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.txt" } },
+		],
+		stopReason: "toolUse",
+	});
+	const result = manager.appendMessage({
+		role: "toolResult",
+		toolCallId: "call-1",
+		toolName: "read",
+		content: [{ type: "text", text: "tool output" }],
+		isError: false,
+		timestamp: 3,
+	});
+	manager.appendCompaction("compacted", undefined, result, 1234);
+	manager.appendModelChange("openai/gpt", "temporary");
+	manager.appendMessage({
+		...assistant("r1"),
+		api: "openai-responses",
+		provider: "openai",
+		model: "gpt",
+		content: [
+			{ type: "thinking", thinking: "t", thinkingSignature: "sig" },
+			{ type: "text", text: "r1" },
+		],
+		providerPayload: {
+			type: "openaiResponsesHistory",
+			provider: "openai",
+			items: [{ type: "message", id: "msg_1" }],
+		},
+	} as Parameters<SessionManager["appendMessage"]>[0]);
+	const forkParent = manager.appendLabelChange(p1, "first prompt");
+	manager.appendMessage(user("selected prompt"));
+	manager.appendMessage(assistant("selected reply"));
+	await manager.ensureOnDisk();
+	await manager.flush();
+	return forkParent;
+}
