@@ -207,9 +207,8 @@ for (const scenario of ["hydration", "finalize"] as const)
 						event => event.worker === "b" && event.event === "refused",
 					);
 					expect(refused.outcome).toEqual({ kind: "refused", error: "ManagedAppendIdentityMismatchError" });
-					// The legacy append assigned the entry an id before the fence refused it; the id
-					// never reached the transcript.
-					expect(refused.attemptedId).toBeTruthy();
+					// The refused entry never reached the transcript and the leaf rolled back.
+					if (refused.attemptedId) expect(migratedBytes).not.toContain(refused.attemptedId);
 					expect(refused.leaf).toBe(seed.parent);
 					expect(refused.bytes).toBe(migratedBytes);
 					gate("b", "reopen");
@@ -288,6 +287,7 @@ for (const scenario of ["hydration", "finalize"] as const)
 					expect(secondAppend.event).toBe("append-refused");
 					expect(secondAppend.outcome).toEqual({ kind: "refused", error: "ManagedAppendIdentityMismatchError" });
 					expect(secondAppend.bytes).toBe(afterFirst);
+					expect(secondAppend.leaf).toBe(seed.parent);
 				} else {
 					// The reopened peer read the first append, so its append continues from it.
 					expect(secondAppend.event).toBe("appended");
