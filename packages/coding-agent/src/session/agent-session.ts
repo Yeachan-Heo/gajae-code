@@ -914,7 +914,7 @@ function sharedControlPublicationMessage(operation: string, outcome: SharedEntri
 		case "stale":
 			return `Could not ${operation}: the shared session changed before the update was written (${outcome.reason}). Nothing was changed; reopen the session and retry.`;
 		case "rejected":
-			return `Could not ${operation}: the shared session refused the update before writing it. Nothing was changed; retry.`;
+			return `Could not ${operation}: the session was replaced before the update was written. Nothing was changed; retry.`;
 		case "unknown":
 			return `Could not confirm ${operation} (entries ${outcome.ids.join(", ") || "none"}). The session was closed to protect its history; reopen it to see the result.`;
 		case "committed":
@@ -11966,11 +11966,8 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					// A rejected publication lets us retry with the reminder in
-					// memory only. Consume it in this live manager to avoid a repeatMode
-					// once interrupt loop, but do not persist a marker that would suppress
-					// the still-eligible rule when this session is reopened.
-					this.#markTtsrInjected(details.rules, publicationFailure === undefined, ttsrMessageCount);
+					// The reminder was appended above, so consumption gets a durable marker.
+					this.#markTtsrInjected(details.rules, true, ttsrMessageCount);
 				}
 				// The continuation inherits the held SDK terminal and its owner, like overflow retry and
 				// auto-retry: the resumed run settles the SDK prompt, and skip or failure releases the
