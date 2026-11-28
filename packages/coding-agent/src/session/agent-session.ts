@@ -34,6 +34,7 @@ import {
 	type AgentTerminalOwnerContext,
 	type AgentTool,
 	type AgentToolContext,
+	type ApiKeyResolution,
 	activeToolForCallName,
 	assertImagePlaceholdersHavePayload,
 	type BeforeToolCallContext,
@@ -110,6 +111,7 @@ import type {
 	Model,
 	ProviderDispatch,
 	ProviderSessionState,
+	ResolvedApiKey,
 	ServiceTier,
 	SimpleStreamOptions,
 	StopReason,
@@ -6919,7 +6921,7 @@ export class AgentSession {
 		const originalGetApiKey = this.agent.getApiKey;
 		if (originalGetApiKey) {
 			const invokeOriginalGetApiKey = originalGetApiKey.bind(this.agent);
-			const managedGetApiKey = async (provider: string): Promise<string | undefined> => {
+			const managedGetApiKey = async (provider: string): Promise<ApiKeyResolution> => {
 				const override = this.#managedFallbackNextCredentialOverride;
 				const model = this.model;
 				const controller = this.#defaultFallbackController;
@@ -6936,12 +6938,14 @@ export class AgentSession {
 				if (shouldCapture && modelKey) this.#managedFallbackActiveCredentialRows.delete(modelKey);
 				if (override && model && storageProvider === override.storageProvider && modelKey === override.modelKey) {
 					this.#managedFallbackNextCredentialOverride = undefined;
-					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
-						credentialSelector: { kind: "id", value: String(override.rowId) },
-					});
+					const { apiKey, credentialRowId } = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+						model,
+						this.credentialSessionId,
+						{ credentialSelector: { kind: "id", value: String(override.rowId) } },
+					);
 					if (isAuthenticated(apiKey)) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
-						return apiKey;
+						return credentialRowId === undefined ? apiKey : { apiKey, credentialId: credentialRowId };
 					}
 					// The preselected credential is no longer available; try to resolve another one of the same kind.
 					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(model, override.credentialKind);
@@ -6951,9 +6955,10 @@ export class AgentSession {
 					}
 					throw new Error("Selected managed fallback credential is no longer available");
 				}
-				const apiKey = await invokeOriginalGetApiKey(provider);
+				const resolution = await invokeOriginalGetApiKey(provider);
+				const apiKey = typeof resolution === "string" ? resolution : resolution?.apiKey;
 				if (shouldCapture && model && isAuthenticated(apiKey)) this.#captureManagedFallbackActiveCredential(model);
-				return apiKey;
+				return resolution;
 			};
 			this.agent.getApiKey = managedGetApiKey;
 			this.#restoreManagedFallbackGetApiKey = () => {
@@ -31516,7 +31521,7 @@ export class AgentSession {
 		model: Model,
 		credentialKind: string,
 		rowId?: number,
-	): Promise<string | undefined> {
+	): Promise<ResolvedApiKey | string | undefined> {
 		const authStorage = this.#modelRegistry.authStorage;
 		const storageProvider = resolveOAuthStorageProvider(model.provider);
 		const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
@@ -31531,10 +31536,13 @@ export class AgentSession {
 			)
 				continue;
 			let apiKey: string | undefined;
+			let credentialRowId: number | undefined;
 			try {
-				apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
-					credentialSelector: { kind: "id", value: String(credential.id) },
-				});
+				({ apiKey, credentialRowId } = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+					model,
+					this.credentialSessionId,
+					{ credentialSelector: { kind: "id", value: String(credential.id) } },
+				));
 			} catch (error) {
 				const currentCredential = inventory.find(row => row.id === credential.id);
 				if (!currentCredential?.disabled) throw error;
@@ -31548,7 +31556,9 @@ export class AgentSession {
 				currentCredential &&
 				!currentCredential.disabled
 			)
-				return apiKey;
+				// Attribute only when the row itself supplied the key; a runtime or
+				// config override returns early without moving the sticky pointer.
+				return credentialRowId === credential.id ? { apiKey, credentialId: credential.id } : apiKey;
 		}
 		return undefined;
 	}

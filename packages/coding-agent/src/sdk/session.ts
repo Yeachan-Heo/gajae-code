@@ -22,6 +22,7 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
+	type ResolvedApiKey,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	streamSimple,
@@ -5631,7 +5632,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const resolvedCredentialScopes = new Map<string, string | undefined>();
-		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<string> => {
+		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<ResolvedApiKey> => {
 			const liveModel = resolveLiveSessionApiKeyModel(sessionAgent?.state.model, model, provider);
 			const hasExplicitScopePolicy =
 				modelRegistry.authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
@@ -5645,7 +5646,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				signal,
 			);
 			resolvedCredentialScopes.set(provider, resolution.credentialSessionId);
-			return resolution.apiKey;
+			return resolution.credentialRowId === undefined
+				? { apiKey: resolution.apiKey }
+				: { apiKey: resolution.apiKey, credentialId: resolution.credentialRowId };
 		};
 		const resolvedCredentialType = (provider: string): "api_key" | "oauth" | undefined => {
 			const scope = resolvedCredentialScopes.has(provider)
@@ -5720,7 +5723,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							const replacementApiKey = await resolveAgentApiKey(provider, streamOptions?.signal);
+							const replacement = await resolveAgentApiKey(provider, streamOptions?.signal);
 							if (
 								!isStableSessionApiKeyCredentialType(
 									streamOptions?.authCredentialType,
@@ -5729,7 +5732,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							) {
 								return undefined;
 							}
-							return replacementApiKey;
+							return replacement;
 						},
 					});
 				try {

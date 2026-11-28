@@ -43,6 +43,7 @@ export * from "./usage/minimax-code";
 export * from "./usage/openai-codex";
 export * from "./usage/zai";
 export * from "./utils/anthropic-auth";
+export * from "./utils/credential-id";
 export * from "./utils/discovery";
 export * from "./utils/event-stream";
 export * from "./utils/fallback-transport";

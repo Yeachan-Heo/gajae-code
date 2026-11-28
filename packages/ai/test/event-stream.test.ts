@@ -47,6 +47,37 @@ describe("AssistantMessageEventStream", () => {
 		const iterator = stream[Symbol.asyncIterator]();
 		await expect(iterator.next()).rejects.toBe(error);
 	});
+
+	it("closeConsumers wakes a parked iterator and runs the consumer-close hook once", async () => {
+		let closes = 0;
+		const stream = new AssistantMessageEventStream(() => {
+			closes += 1;
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		const pending = iterator.next();
+
+		stream.closeConsumers();
+
+		expect(await pending).toEqual({ value: undefined, done: true });
+		expect(closes).toBe(1);
+	});
+
+	it("closeConsumers stops an iterator between events without yielding queued events", async () => {
+		let closes = 0;
+		const stream = new AssistantMessageEventStream(() => {
+			closes += 1;
+		});
+		const partial = createPartial();
+		stream.push({ type: "start", partial });
+		stream.push({ type: "text_start", contentIndex: 0, partial });
+		const iterator = stream[Symbol.asyncIterator]();
+		expect((await iterator.next()).value?.type).toBe("start");
+
+		stream.closeConsumers();
+
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
+		expect(closes).toBe(1);
+	});
 });
 
 describe("EventStream deque semantics", () => {
