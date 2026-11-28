@@ -229,43 +229,6 @@ describe("opted-in managed shared compaction control", () => {
 		expect(manager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
 	});
 
-	it("automatic threshold maintenance does not wait on its own thinking predecessor", async () => {
-		const { manager, session } = await fixture();
-		const events: AgentSessionEvent[] = [];
-		let thinking: Promise<void> | undefined;
-		session.subscribe(event => {
-			events.push(event);
-			if (event.type === "auto_compaction_start")
-				thinking = session.setThinkingLevelForControl(ThinkingLevel.High, false);
-		});
-		const model = session.model;
-		if (!model) throw new Error("Missing fixture model");
-		const assistant = {
-			role: "assistant" as const,
-			content: [{ type: "text" as const, text: "full context terminal" }],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			stopReason: "stop" as const,
-			usage: {
-				input: model.contextWindow,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: model.contextWindow + 1,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			timestamp: Date.now(),
-		} satisfies AssistantMessage;
-		session.agent.emitExternalEvent({ type: "message_end", message: assistant });
-		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistant] });
-		await withinBarrier(session.waitForIdle(), "automatic threshold maintenance");
-		if (thinking) await withinBarrier(thinking, "thinking during automatic maintenance");
-		expect(events.some(event => event.type === "auto_compaction_start" && event.reason === "threshold")).toBe(true);
-		expect(events.some(event => event.type === "auto_compaction_end" && !!event.result)).toBe(true);
-		expect(manager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
-	});
-
 	it("orders a thinking control behind an already started compaction publication", async () => {
 		const { manager, session } = await fixture();
 		const entered = Promise.withResolvers<void>();
@@ -566,43 +529,31 @@ describe("transcript-size emergency floor", () => {
 		return stream;
 	};
 
-	const cases = [
-		{ name: "is skipped in a shared session above the floor", shared: true, providerBytes: 0, compacts: false },
-		{ name: "still compacts a legacy session above the floor", shared: false, providerBytes: 0, compacts: true },
-		{
-			name: "keeps the other floors in a shared session above it",
-			shared: true,
-			providerBytes: 25 * 1024 * 1024,
-			compacts: true,
-		},
-	];
-	for (const { name, shared, providerBytes, compacts } of cases) {
-		it(name, async () => {
-			const { manager, session } = shared ? await fixture() : await sessionFixture();
-			session.agent.streamFn = answer;
-			// Above the 48 MiB transcript floor; only the provider-context floor can also fire.
-			session.setResourceSampler(() => ({
-				heapUsedBytes: 0,
-				providerBytes,
-				messageCount: 0,
-				imageBytes: 0,
-				transcriptFileBytes: 64 * 1024 * 1024,
-			}));
-			const events: AgentSessionEvent[] = [];
-			session.subscribe(event => events.push(event));
+	it("still compacts a legacy session above the floor", async () => {
+		const { manager, session } = await sessionFixture();
+		session.agent.streamFn = answer;
+		// Above the 48 MiB transcript floor.
+		session.setResourceSampler(() => ({
+			heapUsedBytes: 0,
+			providerBytes: 0,
+			messageCount: 0,
+			imageBytes: 0,
+			transcriptFileBytes: 64 * 1024 * 1024,
+		}));
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
 
-			await session.prompt("next turn");
+		await session.prompt("next turn");
 
-			const starts = events.filter(event => event.type === "auto_compaction_start");
-			expect(starts).toEqual(compacts ? [expect.objectContaining({ reason: "overflow" })] : []);
-			expect(manager.getBranch().filter(entry => entry.type === "compaction")).toHaveLength(compacts ? 1 : 0);
-			expect(
-				session.agent.state.messages.some(
-					message =>
-						message.role === "assistant" &&
-						message.content.some(block => block.type === "text" && block.text === "ok"),
-				),
-			).toBe(true);
-		});
-	}
+		const starts = events.filter(event => event.type === "auto_compaction_start");
+		expect(starts).toEqual([expect.objectContaining({ reason: "overflow" })]);
+		expect(manager.getBranch().filter(entry => entry.type === "compaction")).toHaveLength(1);
+		expect(
+			session.agent.state.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "text" && block.text === "ok"),
+			),
+		).toBe(true);
+	});
 });

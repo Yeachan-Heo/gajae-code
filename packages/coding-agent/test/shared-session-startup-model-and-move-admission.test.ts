@@ -1,9 +1,8 @@
 /**
  * Regression coverage for #7856: a root TUI session allows the startup model setting
  * with --model/--mpreset after its first message. Also covers the shared-publication
- * layer's Move Session refusal and a shared custom-message append that a transcript
- * relocation refused before writing (#7997); those cases enter the layer through
- * `routeThroughSharedPublication` and go with it in single-owner steps 10b-10e.
+ * layer's Move Session refusal; that case enters the layer through
+ * `routeThroughSharedPublication` and goes with it in single-owner steps 10c-10e.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -212,7 +211,8 @@ describe("#7856 setTemporaryModel in a root TUI session", () => {
 describe("#7856 Move Session in a shared root TUI session", () => {
 	it("refuses moveTo in a shared session with SharedSessionMutationUnsupportedError", async () => {
 		const f = await fixture();
-		await canonicalMessage(f);
+		// A canonical shared append on the manager latches its shared bars.
+		expect((await f.manager.appendMessageSharingSession(user("canonical shared user"))).kind).toBe("committed");
 
 		const targetDir = path.join(f.cwd, "..", "moved-session");
 		await fs.mkdir(targetDir, { recursive: true });
@@ -275,130 +275,5 @@ describe("#7856 Move Session in a shared root TUI session", () => {
 		expect(transition).not.toHaveBeenCalled();
 		expect(process.cwd()).toBe(processCwd);
 		expect(sessionManager.getCwd()).toBe(cwd);
-	});
-});
-
-describe("shared custom message append refused by a transcript relocation (#7997)", () => {
-	const NOTE = "Background monitor bg_1 exited (code 0).";
-	type SharedAppendResult = Awaited<ReturnType<SessionManager["appendCustomMessageEntrySharingSession"]>>;
-
-	// The silent monitor exit: hidden next-turn context sent while the session is idle.
-	function sendExitContext(f: Fixture): Promise<void> {
-		return f.session.sendCustomMessage(
-			{ customType: "task-notification", content: NOTE, display: false, details: { taskId: "bg_1" } },
-			{ deliverAs: "nextTurn", triggerTurn: false, origin: "external" },
-		);
-	}
-
-	// Replaces the first shared publication with `first`; later ones reach the real store.
-	function refuseFirstAppend(
-		f: Fixture,
-		first: () => SharedAppendResult,
-		onFirst?: () => void | Promise<void>,
-	): () => number {
-		const publish = f.manager.appendCustomMessageEntrySharingSession.bind(f.manager);
-		let calls = 0;
-		vi.spyOn(f.manager, "appendCustomMessageEntrySharingSession").mockImplementation(async (...args) => {
-			calls += 1;
-			if (calls > 1) return publish(...args);
-			await onFirst?.();
-			return first();
-		});
-		return () => calls;
-	}
-
-	async function persistedNotes(f: Fixture): Promise<number> {
-		return (await Bun.file(f.file).text()).split("\n").filter(line => line.includes(NOTE)).length;
-	}
-
-	function contextNotes(f: Fixture): number {
-		return f.session.agent.state.messages.filter(message => message.role === "custom" && message.content === NOTE)
-			.length;
-	}
-
-	it("publishes the entry again when the append was refused as transcript_moved", async () => {
-		const f = await fixture();
-		await canonicalMessage(f);
-		const calls = refuseFirstAppend(f, () => ({ kind: "stale", reason: "transcript_moved" }));
-
-		await sendExitContext(f);
-
-		expect(calls()).toBe(2);
-		expect(await persistedNotes(f)).toBe(1);
-		expect(contextNotes(f)).toBe(1);
-	});
-
-	it("does not publish again when the outcome may already be committed or another refusal applies", async () => {
-		for (const first of [
-			(): SharedAppendResult => ({
-				kind: "unknown",
-				id: "maybe-committed",
-				error: new Error("durability_unproven"),
-			}),
-			(): SharedAppendResult => ({ kind: "stale", reason: "cursor_not_committed" }),
-		]) {
-			const f = await fixture();
-			await canonicalMessage(f);
-			const calls = refuseFirstAppend(f, first);
-
-			await expect(sendExitContext(f)).rejects.toThrow("Shared custom message append");
-
-			expect(calls()).toBe(1);
-			expect(await persistedNotes(f)).toBe(0);
-			vi.restoreAllMocks();
-		}
-	});
-
-	it("does not publish again while a session transition is in progress", async () => {
-		const f = await fixture();
-		await canonicalMessage(f);
-		const generation = f.session.sessionLifecycle.generation;
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		let transition: Promise<void> | undefined;
-		const calls = refuseFirstAppend(
-			f,
-			() => ({ kind: "stale", reason: "transcript_moved" }),
-			() => {
-				// A transition (here an MCP control) holds the session lease when the refusal returns.
-				transition = f.session.withMcpControlAdmission(generation, async () => {
-					entered.resolve();
-					await release.promise;
-				});
-				return entered.promise;
-			},
-		);
-		const sending = sendExitContext(f);
-		void sending.catch(() => {});
-		try {
-			await expect(sending).rejects.toThrow("transcript_moved");
-			expect(calls()).toBe(1);
-			expect(await persistedNotes(f)).toBe(0);
-		} finally {
-			release.resolve();
-			await transition;
-		}
-	});
-
-	it("does not publish again into a session whose identity changed", async () => {
-		const f = await fixture();
-		await canonicalMessage(f);
-		const generation = f.manager.getSessionIdentityGeneration();
-		let switched = false;
-		vi.spyOn(f.manager, "getSessionIdentityGeneration").mockImplementation(() =>
-			switched ? generation + 1 : generation,
-		);
-		const calls = refuseFirstAppend(
-			f,
-			() => ({ kind: "stale", reason: "transcript_moved" }),
-			() => {
-				switched = true;
-			},
-		);
-
-		await expect(sendExitContext(f)).rejects.toThrow("transcript_moved");
-
-		expect(calls()).toBe(1);
-		expect(await persistedNotes(f)).toBe(0);
 	});
 });

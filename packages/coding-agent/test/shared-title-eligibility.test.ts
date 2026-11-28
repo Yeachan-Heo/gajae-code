@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai/models";
-import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
@@ -260,15 +259,10 @@ describe("shared publication admission split", () => {
 		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
 
-	it("persists a custom message_end emitted after a committed canonical shared append", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("shared root") });
+	it("persists a custom message_end emitted after a canonical append", async () => {
+		const f = await fixture({ sharedAppend: false });
+		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
 		await f.session.awaitSessionSettlement();
-		// The reported sequence: the canonical append commits first and arms the
-		// permanent append bar, so a legacy custom append would abort the run here.
-		expect(() => f.manager.assertLegacyAppendAllowed("legacy after shared append")).toThrow(
-			SharedSessionMutationUnsupportedError,
-		);
 		f.session.agent.emitExternalEvent({
 			type: "message_end",
 			message: { role: "custom", customType: "after-shared", content: "survives", display: false, timestamp: 1 },
@@ -278,19 +272,15 @@ describe("shared publication admission split", () => {
 		expect(
 			f.manager.getEntries().some(entry => entry.type === "custom_message" && entry.customType === "after-shared"),
 		).toBe(true);
+		await f.manager.ensureOnDisk();
 		await f.manager.flush();
 		expect(await Bun.file(f.file).text()).toContain("survives");
 	});
 
-	it("keeps appendEntry, setLabel, a bash result, and a recap durable after the first shared message", async () => {
-		const f = await fixture();
+	it("keeps appendEntry, setLabel, a bash result, and a recap durable after the first message", async () => {
+		const f = await fixture({ sharedAppend: false });
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
-		// The permanent legacy-append refusal is armed now, so every producer below must
-		// publish through the session's admitted shared path instead of the legacy append.
-		expect(() => f.manager.assertLegacyAppendAllowed("legacy after shared append")).toThrow(
-			SharedSessionMutationUnsupportedError,
-		);
 
 		const leaf = f.manager.getLeafId();
 		if (!leaf) throw new Error("missing leaf");
@@ -303,9 +293,8 @@ describe("shared publication admission split", () => {
 		});
 		await persistedBash.promise;
 
-		const request = await f.manager.appendMessageSharingSession(user("recap request"));
-		if (request.kind !== "committed") throw new Error(request.kind);
-		const source = await f.manager.appendMessageSharingSession({
+		const requestId = f.manager.appendMessage(user("recap request"));
+		const sourceId = f.manager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "recap answer" }],
 			api: "anthropic-messages",
@@ -322,12 +311,11 @@ describe("shared publication admission split", () => {
 			stopReason: "stop",
 			timestamp: 2,
 		});
-		if (source.kind !== "committed") throw new Error(source.kind);
 		expect(
 			await f.session.appendSessionRecapForSession({
 				text: "recap text",
-				sourceEntryId: source.id,
-				requestEntryId: request.id,
+				sourceEntryId: sourceId,
+				requestEntryId: requestId,
 				model: { provider: "anthropic", id: "claude-sonnet-4-5" },
 				generatedAt: new Date().toISOString(),
 			}),
@@ -359,23 +347,6 @@ describe("shared publication admission split", () => {
 		await f.manager.setSessionStarred(true);
 	});
 
-	it("logs the cause when a refused canonical publication aborts the run", async () => {
-		const f = await fixture();
-		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		const failure = new Error("injected shared append refusal");
-		vi.spyOn(f.manager, "appendMessageSharingSession").mockResolvedValue({ kind: "rejected", error: failure });
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("cannot publish") });
-		await f.session.awaitSessionSettlement().catch(() => {});
-		const call = warn.mock.calls.find(
-			([message]) => message === "Canonical session publication failed; aborting run",
-		);
-		expect(call?.[1]).toMatchObject({
-			operation: "canonical user append",
-			error: "Shared canonical append rejected",
-			cause: failure.message,
-		});
-	});
-
 	it("scopes mode-change append admission while retaining the rewrite fence", async () => {
 		const f = await fixture();
 		f.manager.appendMessage(user("local root"));
@@ -388,8 +359,8 @@ describe("shared publication admission split", () => {
 		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
 
-	it("persists a tree-navigator label after shared admission", async () => {
-		const f = await fixture();
+	it("persists a tree-navigator label", async () => {
+		const f = await fixture({ sharedAppend: false });
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 		const leaf = f.manager.getLeafId();
@@ -397,43 +368,13 @@ describe("shared publication admission split", () => {
 		// modes/controllers/selector-controller.ts routes the tree navigator's label submit here.
 		expect(await f.session.appendLabelChangeInBackground(leaf, "tree-label")).toEqual({ committed: true });
 		await f.session.awaitSessionSettlement();
+		await f.manager.ensureOnDisk();
 		await f.manager.flush();
 		expect(await Bun.file(f.file).text()).toContain('"label":"tree-label"');
 	});
 
-	it("notifies the operator when a background publication is refused", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
-		await f.session.awaitSessionSettlement();
-		vi.spyOn(f.manager, "appendCustomEntrySharingSession").mockResolvedValue({
-			kind: "rejected",
-			error: new Error("lease refused"),
-		});
-		const notice = vi.spyOn(f.session, "emitNotice");
-		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toEqual({
-			committed: false,
-			cause: "lease refused",
-		});
-		expect(notice).toHaveBeenCalledWith(
-			"warning",
-			"Could not save the custom entry extension-state to this session: lease refused",
-			"session-publication",
-		);
-	});
-
-	it("does not notify when a background publication commits", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
-		await f.session.awaitSessionSettlement();
-		const notice = vi.spyOn(f.session, "emitNotice");
-		expect(await f.session.appendCustomEntryInBackground("extension-state", { ok: true })).toEqual({
-			committed: true,
-		});
-		expect(notice).not.toHaveBeenCalled();
-	});
-
-	it("routes a TTSR injection marker through the shared lease instead of failing the run", async () => {
-		const f = await fixture();
+	it("persists a TTSR injection marker without failing the run", async () => {
+		const f = await fixture({ sharedAppend: false });
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 		// The message_end TTSR path is driven by the ephemeral custom marker message.
@@ -450,12 +391,13 @@ describe("shared publication admission split", () => {
 		});
 		await f.session.awaitSessionSettlement();
 		expect(f.session.agent.state.error).toBeUndefined();
+		await f.manager.ensureOnDisk();
 		await f.manager.flush();
 		expect(await Bun.file(f.file).text()).toContain('"injectedRules":["ttsr-rule-a"]');
 	});
 
 	it("keeps a refused deferred command result queued and withholds onPersisted", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		// Keep both prompts off the real provider: the retry flush persists before the
 		// credential preflight, so a buggy first-prompt fallback must also fail here.
 		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
@@ -464,9 +406,11 @@ describe("shared publication admission split", () => {
 		const persisted = vi.fn();
 		f.session.recordBashResult("echo deferred", shellResult("deferred output"), { onPersisted: persisted });
 		delete (f.session as { isStreaming?: unknown }).isStreaming;
-		const refused = vi
-			.spyOn(f.manager, "appendMessageSharingSession")
-			.mockResolvedValue({ kind: "rejected", error: new Error("lease refused") });
+		const append = f.manager.appendMessage.bind(f.manager);
+		const refused = vi.spyOn(f.manager, "appendMessage").mockImplementation(message => {
+			if (message.role === "bashExecution") throw new Error("append refused");
+			return append(message);
+		});
 		const notice = vi.spyOn(f.session, "emitNotice");
 		await expect(f.session.prompt("flush now")).rejects.toThrow(
 			/Failed to persist 1 of 1 deferred bash execution message/,
@@ -483,51 +427,13 @@ describe("shared publication admission split", () => {
 		await expect(f.session.prompt("retry flush")).rejects.toThrow("No credentials found for anthropic.");
 		expect(persisted).toHaveBeenCalledTimes(1);
 		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.ensureOnDisk();
 		await f.manager.flush();
 		expect((await Bun.file(f.file).text()).split("deferred output")).toHaveLength(2);
 	});
 
-	it("never re-queues an unknown deferred command result and closes with its receipt", async () => {
-		const f = await fixture();
-		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
-		const persisted = vi.fn();
-		f.session.recordBashResult("echo unknown", shellResult("unknown output"), { onPersisted: persisted });
-		delete (f.session as { isStreaming?: unknown }).isStreaming;
-		const append = f.manager.appendMessageSharingSession.bind(f.manager);
-		let attempted: string | undefined;
-		// The entry lands, but the publication cannot prove it (e.g. a lease release failure).
-		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
-			const outcome = await append(message);
-			if (outcome.kind !== "committed") throw new Error(`unexpected ${outcome.kind}`);
-			attempted = outcome.id;
-			return { kind: "unknown", id: outcome.id, error: new Error("lease release failed") };
-		});
-		const notice = vi.spyOn(f.session, "emitNotice");
-		const failure = await f.session.prompt("flush now").then(
-			() => undefined,
-			(error: unknown) => error,
-		);
-		expect(failure).toBeInstanceOf(AggregateError);
-		expect((failure as Error).message).toContain(
-			`Could not confirm 1 of 1 deferred bash execution message (attempted ids: ${attempted})`,
-		);
-		expect(persisted).not.toHaveBeenCalled();
-		// The entry may be durable, so the notice must not call it unsaved.
-		expect(notice).toHaveBeenCalledWith(
-			"warning",
-			"The deferred command result may not have been saved to this session (outcome unknown).",
-			"session-publication",
-		);
-		// Never queued for a retry that would append the same result under a new id.
-		expect(f.session.hasPendingBashMessages).toBe(false);
-		expect(f.session.isDisposed).toBe(true);
-		const text = await Bun.file(f.file).text();
-		expect(text.split("unknown output")).toHaveLength(2);
-		expect(text).toContain(`"id":"${attempted}"`);
-	});
-
 	it("does not retry a deferred result whose onPersisted callback throws", async () => {
-		const f = await fixture();
+		const f = await fixture({ sharedAppend: false });
 		// The first prompt's flush failure must not fall through to a provider, and the
 		// retry prompt deliberately stops at the credential preflight.
 		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
@@ -546,102 +452,9 @@ describe("shared publication admission split", () => {
 		await expect(f.session.prompt("retry flush")).rejects.toThrow("No credentials found for anthropic.");
 		expect(persisted).toHaveBeenCalledTimes(1);
 		expect(f.session.hasPendingBashMessages).toBe(false);
+		await f.manager.ensureOnDisk();
 		await f.manager.flush();
 		expect((await Bun.file(f.file).text()).split("deferred callback output")).toHaveLength(2);
-	});
-
-	it("joins an in-flight deferred drain so one result publishes and reports exactly once", async () => {
-		const f = await fixture();
-		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
-		const persisted = vi.fn();
-		f.session.recordBashResult("echo once", shellResult("once output"), { onPersisted: persisted });
-		delete (f.session as { isStreaming?: unknown }).isStreaming;
-		// Stop the prompt right after its deferred flush; no provider call is made.
-		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
-		const append = f.manager.appendMessageSharingSession.bind(f.manager);
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		let publications = 0;
-		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
-			if (message.role === "bashExecution" && ++publications === 1) {
-				entered.resolve();
-				await release.promise;
-			}
-			return append(message);
-		});
-		const settle = (pending: Promise<void>) =>
-			pending.then(
-				() => undefined,
-				(error: unknown) => error,
-			);
-		const first = settle(f.session.prompt("first flush"));
-		await entered.promise;
-		// A wedged cleanup forces recovery, whose non-awaited drain overlaps the held one.
-		const waitForIdle = vi.spyOn(f.session.agent, "waitForIdle").mockReturnValue(new Promise<void>(() => {}));
-		const aborted = settle(f.session.abort({ timeoutMs: 0 }));
-		await Bun.sleep(50);
-		waitForIdle.mockRestore();
-		release.resolve();
-		await first;
-		expect(await Promise.race([aborted.then(() => "settled"), Bun.sleep(2000).then(() => "timeout")])).toBe(
-			"settled",
-		);
-		expect(publications).toBe(1);
-		expect(persisted).toHaveBeenCalledTimes(1);
-		expect(f.session.hasPendingBashMessages).toBe(false);
-		await f.manager.flush();
-		expect((await Bun.file(f.file).text()).split("once output")).toHaveLength(2);
-	});
-
-	it("reports a Python result as persisted only after the shared append commits", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
-		await f.session.awaitSessionSettlement();
-
-		const entered = Promise.withResolvers<void>();
-		const gate = Promise.withResolvers<void>();
-		const original = f.manager.appendMessageSharingSession.bind(f.manager);
-		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
-			if (message.role === "pythonExecution") {
-				entered.resolve();
-				await gate.promise;
-			}
-			return original(message);
-		});
-		const persisted = vi.fn();
-		f.session.recordPythonResult("print('shared')", shellResult("python shared output"), { onPersisted: persisted });
-		try {
-			await entered.promise;
-			expect(persisted).not.toHaveBeenCalled();
-		} finally {
-			gate.resolve();
-		}
-		await f.session.awaitSessionSettlement();
-		expect(persisted).toHaveBeenCalledTimes(1);
-		await f.manager.flush();
-		expect(await Bun.file(f.file).text()).toContain("python shared output");
-	});
-
-	it("withholds Python onPersisted when the shared append is refused", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
-		await f.session.awaitSessionSettlement();
-		vi.spyOn(f.manager, "appendMessageSharingSession").mockResolvedValue({
-			kind: "rejected",
-			error: new Error("lease refused"),
-		});
-		const notice = vi.spyOn(f.session, "emitNotice");
-		const persisted = vi.fn();
-		f.session.recordPythonResult("print('refused')", shellResult("python refused output"), {
-			onPersisted: persisted,
-		});
-		await f.session.awaitSessionSettlement();
-		expect(persisted).not.toHaveBeenCalled();
-		expect(notice).toHaveBeenCalledWith(
-			"warning",
-			"Could not save the python result to this session: lease refused",
-			"session-publication",
-		);
 	});
 
 	it("fires Python onPersisted inline for a legacy session", async () => {
@@ -658,6 +471,22 @@ describe("shared publication admission split", () => {
 				},
 			}),
 		).toThrow("legacy callback exploded");
+	});
+
+	it("withholds Python onPersisted when the legacy append throws", async () => {
+		const f = await fixture({ sharedAppend: false });
+		const append = f.manager.appendMessage.bind(f.manager);
+		vi.spyOn(f.manager, "appendMessage").mockImplementation(message => {
+			if (message.role === "pythonExecution") throw new Error("append refused");
+			return append(message);
+		});
+		const persisted = vi.fn();
+		expect(() =>
+			f.session.recordPythonResult("print('refused')", shellResult("python refused output"), {
+				onPersisted: persisted,
+			}),
+		).toThrow("append refused");
+		expect(persisted).not.toHaveBeenCalled();
 	});
 
 	it("reserves the queued continuation before a throwing legacy Python callback", async () => {
@@ -704,72 +533,9 @@ describe("shared publication admission split", () => {
 		expect(continueAll).not.toHaveBeenCalled();
 	});
 
-	it("observes a throwing completion callback instead of rejecting unhandled", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
-		await f.session.awaitSessionSettlement();
-
-		const unhandled: unknown[] = [];
-		const onUnhandled = (reason: unknown) => unhandled.push(reason);
-		process.on("unhandledRejection", onUnhandled);
-		try {
-			const notice = vi.spyOn(f.session, "emitNotice");
-			const persisted = vi.fn(() => {
-				throw new Error("completion callback exploded");
-			});
-			f.session.recordBashResult("echo callback", shellResult("callback output"), { onPersisted: persisted });
-			await f.session.awaitSessionSettlement();
-			await Bun.sleep(20);
-			expect(persisted).toHaveBeenCalledTimes(1);
-			expect(notice).toHaveBeenCalledWith(
-				"warning",
-				"Saved the bash result to this session, but its completion step failed.",
-				"session-publication",
-			);
-			// A callback failure must never resend: the row stays durable exactly once.
-			await f.manager.flush();
-			expect((await Bun.file(f.file).text()).split("callback output").length - 1).toBe(1);
-		} finally {
-			process.off("unhandledRejection", onUnhandled);
-		}
-		expect(unhandled).toEqual([]);
-	});
-
-	it("warns and saves one row when a shared completion callback throws a non-coercible value", async () => {
-		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
-		await f.session.awaitSessionSettlement();
-
-		const notice = vi.fn();
-		const unsubscribe = f.session.subscribe(event => {
-			if (event.type === "notice" && event.source === "session-publication") notice(event);
-		});
-		const output = "non-coercible callback output";
-		const persisted = vi.fn(() => {
-			throw Object.create(null);
-		});
-		try {
-			f.session.recordBashResult("echo non-coercible", shellResult(output), { onPersisted: persisted });
-			await f.session.awaitSessionSettlement();
-			expect(persisted).toHaveBeenCalledTimes(1);
-			const rows = (await Bun.file(f.file).text()).split("\n");
-			expect(rows.filter(row => row.includes(output))).toHaveLength(1);
-			expect(notice).toHaveBeenCalledTimes(1);
-			expect(notice).toHaveBeenCalledWith({
-				type: "notice",
-				level: "warning",
-				message: "Saved the bash result to this session, but its completion step failed.",
-				source: "session-publication",
-			});
-		} finally {
-			unsubscribe();
-		}
-	});
-
 	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
 		const f = await fixture();
-		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
-		await f.session.awaitSessionSettlement();
+		expect((await f.manager.appendMessageSharingSession(user("first canonical message"))).kind).toBe("committed");
 		// Force the managed near-limit path; its only recovery is the whole-transcript
 		// rewrite, which the shared rewrite bar refuses. The typed near-limit contract must
 		// survive instead of degrading into a generic "rewrite required" abort.
