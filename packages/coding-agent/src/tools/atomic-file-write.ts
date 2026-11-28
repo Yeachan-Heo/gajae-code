@@ -45,7 +45,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
-import { LocalProtocolHandler } from "../internal-urls/local-protocol";
+import { LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls/local-protocol";
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
@@ -119,6 +119,14 @@ export interface WriteFileAtomicallyOptions {
 	 * lexical destination under `<tmpdir>/gjc-local/<session-id>`.
 	 */
 	trustBoundary?: string;
+	/**
+	 * The calling session's own `local://` binding, used to identify the explicit
+	 * `<artifacts>/local` trust root. Pass it whenever the caller resolves
+	 * `local://` against its own root: with more than one live session the
+	 * process-global lookup names a different session's root, which would leave
+	 * this session's explicit local writes without containment.
+	 */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Platform override used by deterministic retry tests. */
 	platform?: NodeJS.Platform;
 	/** Sleep seam used by deterministic retry tests. */
@@ -237,8 +245,8 @@ function sessionLocalRootFor(lexicalDest: string): string | undefined {
  * inside it. That root is not under `<tmpdir>/gjc-local`, so the tmp helper
  * above would leave the write unbounded. Managed sessions keep the tmp root.
  */
-function explicitLocalRootFor(lexicalDest: string): string | undefined {
-	const options = LocalProtocolHandler.resolveOptions();
+function explicitLocalRootFor(lexicalDest: string, callerOptions?: LocalProtocolOptions): string | undefined {
+	const options = callerOptions ?? LocalProtocolHandler.resolveOptions();
 	if (!options || options.isManagedDestination?.()) return undefined;
 	const artifactsDir = options.getArtifactsDir?.();
 	if (!artifactsDir) return undefined;
@@ -247,8 +255,8 @@ function explicitLocalRootFor(lexicalDest: string): string | undefined {
 	return root;
 }
 
-function trustBoundaryForDestination(lexicalDest: string): string | undefined {
-	return explicitLocalRootFor(lexicalDest) ?? sessionLocalRootFor(lexicalDest);
+function trustBoundaryForDestination(lexicalDest: string, callerOptions?: LocalProtocolOptions): string | undefined {
+	return explicitLocalRootFor(lexicalDest, callerOptions) ?? sessionLocalRootFor(lexicalDest);
 }
 
 /**
@@ -560,7 +568,7 @@ export async function writeFileAtomically(
 	try {
 		const platform = options.platform ?? process.platform;
 		const sleep = options.sleep ?? (async (delayMs: number): Promise<void> => await Bun.sleep(delayMs));
-		const trustBoundary = options.trustBoundary ?? trustBoundaryForDestination(dest);
+		const trustBoundary = options.trustBoundary ?? trustBoundaryForDestination(dest, options.localProtocolOptions);
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
 		// Boundary first, then create parents. A dangling symlink inside a trusted

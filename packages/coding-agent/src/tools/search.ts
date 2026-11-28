@@ -342,6 +342,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const scope = await resolveToolSearchScope({
 					rawPaths: resolvedPaths,
 					cwd: this.session.cwd,
+					settings: this.session.settings,
+					localProtocolOptions: this.session.getLocalProtocolOptions?.(),
 					getArtifactsDir: this.session.getArtifactsDir,
 					mcpManager: this.session.getMcpManager?.(),
 					getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,

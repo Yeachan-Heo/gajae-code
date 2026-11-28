@@ -1365,6 +1365,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	async #prepareBashExecution(
 		input: { command: string; env?: Record<string, string>; timeout?: number; cwd?: string },
 		ctx?: AgentToolContext,
+		signal?: AbortSignal,
 	): Promise<{
 		command: string;
 		commandCwd: string;
@@ -1476,7 +1477,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const internalUrlOptions: InternalUrlExpansionOptions = {
 			skills: this.session.skills ?? [],
 			internalRouter: InternalUrlRouter.instance(),
-			localOptions: {
+			cwd: this.session.cwd,
+			settings: this.session.settings,
+			signal,
+			localOptions: this.session.getLocalProtocolOptions?.() ?? {
 				getArtifactsDir: this.session.getArtifactsDir,
 				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,
@@ -1882,6 +1886,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const prepared = await this.#prepareBashExecution(
 			{ command: rawCommand, env: rawEnv, timeout: rawTimeout, cwd },
 			ctx,
+			signal,
 		);
 		const {
 			command,

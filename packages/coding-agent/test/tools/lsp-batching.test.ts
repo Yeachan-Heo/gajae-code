@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { LocalProtocolHandler } from "@gajae-code/coding-agent/internal-urls";
 import { createLspWritethrough, writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import * as lspConfig from "@gajae-code/coding-agent/lsp/config";
 import { TempDir } from "@gajae-code/utils";
@@ -142,5 +144,50 @@ describe("createLspWritethrough batching", () => {
 			destUnchanged: true,
 			publicationState: "not_published",
 		});
+	});
+
+	it.skipIf(process.platform === "win32")("keeps each staged entry's own local binding at flush", async () => {
+		const artifacts = path.join(tempDir.path(), "explicit-artifacts");
+		const globalArtifacts = path.join(tempDir.path(), "global-artifacts");
+		const localRoot = path.join(artifacts, "local");
+		const outside = path.join(tempDir.path(), "outside.ts");
+		const link = path.join(localRoot, "alias.ts");
+		await fs.mkdir(localRoot, { recursive: true });
+		await fs.mkdir(path.join(globalArtifacts, "local"), { recursive: true });
+		await fs.writeFile(outside, "outside\n");
+		await fs.symlink(outside, link);
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([]);
+		// The batch is seeded by a callback without a binding (the edit tool
+		// before its getter was threaded), then a bound writer stages the same
+		// id. Flush must publish that entry against its own root, not the
+		// seeder's or the process-global one.
+		LocalProtocolHandler.setOverride({
+			getArtifactsDir: () => globalArtifacts,
+			isManagedDestination: () => false,
+			getSessionId: () => "global-root",
+		});
+		try {
+			const unbound = createLspWritethrough(tempDir.path(), { enableFormat: true });
+			const bound = createLspWritethrough(tempDir.path(), {
+				enableFormat: true,
+				getLocalProtocolOptions: () => ({
+					getArtifactsDir: () => artifacts,
+					isManagedDestination: () => false,
+					getSessionId: () => "caller-root",
+				}),
+			});
+			const batchId = `batch-authority-${Date.now()}`;
+			await unbound(path.join(tempDir.path(), "seed.ts"), "const seed = 1;\n", undefined, undefined, {
+				id: batchId,
+				flush: false,
+			});
+			await expect(
+				bound(link, "must-not-write\n", undefined, undefined, { id: batchId, flush: true }),
+			).rejects.toThrow(/outside trust boundary/);
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+		} finally {
+			LocalProtocolHandler.setOverride(undefined);
+		}
 	});
 });

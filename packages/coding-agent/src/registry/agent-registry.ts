@@ -62,6 +62,17 @@ export class AgentRegistry {
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
 
+	/**
+	 * Insert or replace one ref.
+	 *
+	 * This is a plain map write: the LAST writer for an id wins. Callers that
+	 * claim a process-shared identity (`0-Main` and every subagent id minted by
+	 * a root) must therefore admit the id before calling this — see
+	 * `planOccupiedAgentId` in `sdk/session.ts`, which rejects an explicit
+	 * collision, isolates a default-id collision, and remints only a newcomer
+	 * on an explicitly shared registry. The registry itself is not the
+	 * arbiter of identity.
+	 */
 	register(input: RegisterInput): AgentRef {
 		const now = Date.now();
 		const ref: AgentRef = {
@@ -79,6 +90,20 @@ export class AgentRegistry {
 		this.#refs.set(ref.id, ref);
 		this.#emit({ type: "registered", ref });
 		return ref;
+	}
+
+	/**
+	 * Insert a ref under an id that must still be free, or throw.
+	 *
+	 * `register` replaces silently; callers that claim a process-shared identity
+	 * (`0-Main` and every subagent id minted by a root) use this instead so the
+	 * ownership check and the insert cannot be separated by a later writer.
+	 */
+	claim(input: RegisterInput): AgentRef {
+		if (this.#refs.has(input.id)) {
+			throw new Error(`Agent id is already registered: ${input.id}`);
+		}
+		return this.register(input);
 	}
 
 	setStatus(id: string, status: AgentStatus): void {

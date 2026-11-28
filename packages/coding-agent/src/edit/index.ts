@@ -188,7 +188,11 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableLsp = session.enableLsp ?? true;
 	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
 	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
-	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
+	const getLocalProtocolOptions = () => session.getLocalProtocolOptions?.();
+	return enableLsp
+		? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics, getLocalProtocolOptions })
+		: (dst, content, signal, file) =>
+				writethroughNoop(dst, content, signal, file, undefined, undefined, getLocalProtocolOptions);
 }
 
 type PatchGuardFailure = { path: string; errorText: string };
