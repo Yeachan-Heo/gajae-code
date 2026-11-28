@@ -14,7 +14,7 @@ import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
-import { discoverAppendSystemPromptFile } from "../cli/append-system-prompt";
+import { discoverAppendSystemPromptFile, readAppendSystemPromptFile } from "../cli/append-system-prompt";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -96,7 +96,6 @@ import { type AgentSession, isSessionDisposalIncompleteError } from "../session/
 import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
 import { setSessionOwnerSurface } from "../session/session-ownership";
 import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
-import { resolvePromptInput } from "../system-prompt";
 
 export async function lifecycleArgs(
 	request: SessionLifecycleLaunchRequest,
@@ -1261,8 +1260,12 @@ export async function runSessionHost(
 			mcpStartupTimeoutMs = remaining;
 		}
 
-		// Discover user-level APPEND_SYSTEM.md, same as CLI does
-		const resolvedAppendPrompt = await resolvePromptInput(discoverAppendPromptFile(), "append system prompt");
+		// User-level APPEND_SYSTEM.md, as the CLI appends it. The read stays inside the startup deadline.
+		const resolvedAppendPrompt = await beforeCutoff(
+			() => readAppendSystemPromptFile(discoverAppendPromptFile()),
+			undefined,
+			{ processLocalOnly: true },
+		);
 
 		created = await beforeCutoff(
 			async () => {
