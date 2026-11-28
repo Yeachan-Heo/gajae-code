@@ -552,6 +552,37 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("requesty-ai")?.id).toBe("requesty");
 	});
 
+	it("adds AIGROW with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "aigrow", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.aigrow;
+
+		expect(result.providerId).toBe("aigrow");
+		expect(result.presetName).toBe("AIGROW");
+		expect(provider).toMatchObject({
+			baseUrl: "https://aigrow.gg/v1",
+			api: "openai-completions",
+			apiKeyEnv: "AIGROW_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("aigrow-gg")?.id).toBe("aigrow");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
