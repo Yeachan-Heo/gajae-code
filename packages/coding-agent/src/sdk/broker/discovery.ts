@@ -242,15 +242,33 @@ function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBroke
 	}
 }
 
+function isExactPublishedRecord(raw: unknown, discovery: BrokerDiscovery): boolean {
+	if (!raw || typeof raw !== "object") return false;
+	const record = raw as BrokerDiscovery;
+	return (
+		record.ownerId === discovery.ownerId &&
+		record.pid === discovery.pid &&
+		record.incarnation === discovery.incarnation &&
+		record.token === discovery.token &&
+		record.startedAt === discovery.startedAt &&
+		record.heartbeatAt === discovery.heartbeatAt
+	);
+}
+
+/**
+ * Prove the named record is still the one this broker wrote. This is an owner
+ * identity check, not consumer discovery: `readBrokerDiscovery` would also drop
+ * a record whose startup heartbeat aged past the TTL during a slow checkpoint,
+ * and the broker would then roll back its own valid publication.
+ */
 async function requirePublishedDiscovery(agentDir: string, expected: BrokerDiscovery): Promise<void> {
-	const current = await readBrokerDiscovery(agentDir);
-	if (
-		!current ||
-		current.ownerId !== expected.ownerId ||
-		current.pid !== expected.pid ||
-		current.incarnation !== expected.incarnation ||
-		current.token !== expected.token
-	)
+	let raw: unknown = null;
+	try {
+		raw = JSON.parse(await fs.readFile(brokerDiscoveryPath(agentDir), "utf8"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+	}
+	if (!isExactPublishedRecord(raw, expected))
 		throw new Error("Broker discovery record changed before retained publication.");
 }
 
@@ -258,17 +276,7 @@ async function rollbackPublishedBrokerDiscovery(agentDir: string, discovery: Bro
 	const file = brokerDiscoveryPath(agentDir);
 	try {
 		const raw: unknown = JSON.parse(await fs.readFile(file, "utf8"));
-		if (
-			!raw ||
-			typeof raw !== "object" ||
-			(raw as BrokerDiscovery).ownerId !== discovery.ownerId ||
-			(raw as BrokerDiscovery).pid !== discovery.pid ||
-			(raw as BrokerDiscovery).incarnation !== discovery.incarnation ||
-			(raw as BrokerDiscovery).token !== discovery.token ||
-			(raw as BrokerDiscovery).startedAt !== discovery.startedAt ||
-			(raw as BrokerDiscovery).heartbeatAt !== discovery.heartbeatAt
-		)
-			return;
+		if (!isExactPublishedRecord(raw, discovery)) return;
 		await fs.unlink(file);
 		await syncDirectory(path.dirname(file));
 	} catch (error) {
