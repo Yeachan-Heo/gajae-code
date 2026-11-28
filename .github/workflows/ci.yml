@@ -1016,27 +1016,40 @@ jobs:
                     '{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}' \
                     > "$records_dir/$(printf '%03d' "$index").json"
               }
-              # npm takes minutes to accept each publish, so packages within a wave
-              # publish concurrently; a wave starts only after every package of the
-              # previous wave is visible, which keeps dependencies ahead of dependents.
+              # npm publish returns in seconds, but registry visibility takes minutes
+              # per package, and npm does not resolve dependencies at publish time.
+              # Waiting for visibility between every wave serialized ~6 waits into
+              # ~43 minutes (v0.22.1). Only the last wave holds the user-facing
+              # entry, so every earlier wave publishes concurrently and the single
+              # barrier sits before the last wave: it starts only after every
+              # earlier package is visible, so the entry never resolves to an
+              # invisible dependency, and a failure there leaves the entry unpublished.
               index=0
               wave_count="$(jq '.waves | length' "$order_file")"
-              for wave in $(seq 0 $((wave_count - 1))); do
-                 pids=()
-                 for name in $(jq -r --argjson wave "$wave" '.waves[$wave][]' "$order_file"); do
-                    ( publish_one "$name" "$index" ) &
-                    pids+=("$!")
-                    index=$((index + 1))
+              last_wave=$((wave_count - 1))
+              run_waves() {
+                 local first="$1" last="$2" wave name pid failed=0
+                 local -a pids=()
+                 for wave in $(seq "$first" "$last"); do
+                    for name in $(jq -r --argjson wave "$wave" '.waves[$wave][]' "$order_file"); do
+                       ( publish_one "$name" "$index" ) &
+                       pids+=("$!")
+                       index=$((index + 1))
+                    done
                  done
-                 failed=0
                  for pid in "${pids[@]}"; do
                     wait "$pid" || failed=1
                  done
-                 if [ "$failed" -ne 0 ]; then
-                    echo "Publish wave $wave failed; later waves were not started" >&2
-                    exit 1
-                 fi
-              done
+                 return "$failed"
+              }
+              if [ "$last_wave" -gt 0 ] && ! run_waves 0 $((last_wave - 1)); then
+                 echo "Publish waves 0..$((last_wave - 1)) failed; later waves were not started" >&2
+                 exit 1
+              fi
+              if ! run_waves "$last_wave" "$last_wave"; then
+                 echo "Publish wave $last_wave failed" >&2
+                 exit 1
+              fi
               if [ "$(jq -r '.name' "$records_dir"/*.json | sort)" != "$(jq -r '.packages[].name' "$expected" | sort)" ]; then
                  echo "Publish receipt records do not cover exactly the expected package set" >&2
                  exit 1
