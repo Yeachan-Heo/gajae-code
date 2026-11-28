@@ -8,6 +8,7 @@ import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	type AutocompleteSuggestionKind,
+	buildAutocompleteFuzzyDiscoveryProfile,
 	CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
 } from "@gajae-code/tui/autocomplete";
@@ -432,6 +433,13 @@ describe("CombinedAutocompleteProvider", () => {
 			const result = await provider.getSuggestions([line], 0, line.length);
 			const values = result?.items.map(item => item.value) ?? [];
 			expect(values).toContain(`@${hangulName}`);
+		});
+
+		it("bounds the fuzzy walk so a symlinked tree cannot freeze the popup", () => {
+			// The native walk follows symlinks with no depth bound and no deadline when
+			// `timeoutMs` is unset; the editor restarts it on every keystroke, so an unbounded
+			// walk never settles. The profile must carry a deadline.
+			expect(buildAutocompleteFuzzyDiscoveryProfile("widget", baseDir).timeoutMs).toBeGreaterThan(0);
 		});
 	});
 });

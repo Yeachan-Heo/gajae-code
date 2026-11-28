@@ -3377,14 +3377,21 @@ class CodexWebSocketConnection {
 	}
 
 	close(reason = "done"): void {
-		this.#localCloseReason = reason;
-		if (
-			this.#socket &&
-			(this.#socket.readyState === WebSocket.OPEN || this.#socket.readyState === WebSocket.CONNECTING)
-		) {
-			this.#socket.close(1000, reason);
-		}
+		const socket = this.#socket;
 		this.#socket = null;
+		this.#localCloseReason = reason;
+		if (!socket || (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING)) {
+			return;
+		}
+		try {
+			socket.close(1000, reason);
+		} catch (error) {
+			CODEX_DEBUG &&
+				logger.debug("[codex] codex websocket close failed", {
+					error: error instanceof Error ? error.message : String(error),
+					reason,
+				});
+		}
 	}
 
 	async connect(signal?: AbortSignal): Promise<void> {
@@ -3409,7 +3416,7 @@ class CodexWebSocketConnection {
 			if (signal) signal.removeEventListener("abort", onAbort);
 		};
 		const onAbort = () => {
-			socket.close(1000, "aborted");
+			this.close("aborted");
 			if (!settled) {
 				settled = true;
 				clearPending();
@@ -3425,7 +3432,7 @@ class CodexWebSocketConnection {
 		}
 		if (!settled) {
 			timeout = setTimeout(() => {
-				socket.close(1000, "connect-timeout");
+				this.close("connect-timeout");
 				if (!settled) {
 					settled = true;
 					clearPending();

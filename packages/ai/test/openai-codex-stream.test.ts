@@ -8,7 +8,14 @@ import {
 	prewarmOpenAICodexResponses,
 	streamOpenAICodexResponses,
 } from "@gajae-code/ai/providers/openai-codex-responses";
-import type { AssistantMessageEvent, Context, Model, ProviderSessionState, Tool } from "@gajae-code/ai/types";
+import type {
+	AssistantMessageEvent,
+	Context,
+	FetchImpl,
+	Model,
+	ProviderSessionState,
+	Tool,
+} from "@gajae-code/ai/types";
 import { getAgentDir, logger, setAgentDir, TempDir } from "@gajae-code/utils";
 import { getBundledModel } from "../src/models";
 import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
@@ -386,6 +393,7 @@ function encodeWebSocketMessage(value: Record<string, unknown>): Uint8Array {
 }
 
 type WsHeaders = Record<string, string>;
+type WsOptions = { headers?: WsHeaders };
 type WsEventType = "open" | "message" | "error" | "close";
 
 const DEFAULT_USAGE = {
@@ -418,7 +426,7 @@ class MockWebSocket {
 
 	constructor(
 		public readonly url: string,
-		public readonly options?: { headers?: WsHeaders },
+		public readonly options?: WsOptions,
 	) {}
 
 	send(_data: string): void {}
@@ -7232,6 +7240,110 @@ describe("openai-codex streaming", () => {
 		expect(transportDetails.websocketConnected).toBe(true);
 		expect(transportDetails.prewarmed).toBe(true);
 		expect(transportDetails.canAppend).toBe(true);
+	});
+
+	it("does not throw when closing a stale socket", async () => {
+		const tempDir = trackedTempDir("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+		let closeCalls = 0;
+
+		class StaleOpenWebSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				this.emitCodexResponse({
+					messageId: "msg_stale_open",
+					responseId: "resp_stale_open",
+					text: "Done",
+				});
+			}
+
+			override close(): void {
+				closeCalls += 1;
+				throw Object.assign(new Error("Socket is closed"), { code: "ERR_SOCKET_CLOSED" });
+			}
+		}
+
+		global.WebSocket = StaleOpenWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			fetch: fetchMock as FetchImpl,
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-close-error-session",
+			providerSessionState,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(() => {
+			for (const state of providerSessionState.values()) state.close();
+		}).not.toThrow();
+		expect(closeCalls).toBe(1);
+		expect(
+			getOpenAICodexTransportDetails(model, {
+				sessionId: "ws-close-error-session",
+				providerSessionState,
+			}).websocketConnected,
+		).toBe(false);
+	});
+
+	it("ignores a closed socket's late close event after a reconnect", async () => {
+		const tempDir = trackedTempDir("@pi-codex-stream-stale-close-");
+		setAgentDir(tempDir.path());
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+		const sockets: MockWebSocket[] = [];
+
+		class ReplaceableWebSocket extends MockWebSocket {
+			constructor(url: string, options?: WsOptions) {
+				super(url, options);
+				sockets.push(this);
+				this.scheduleOpen();
+			}
+
+			override send(): void {
+				const id = sockets.indexOf(this) + 1;
+				this.emitCodexResponse({ messageId: `msg_${id}`, responseId: `resp_${id}`, text: `socket ${id}` });
+			}
+		}
+
+		global.WebSocket = ReplaceableWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			fetch: fetchMock as FetchImpl,
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-stale-close-session",
+			providerSessionState,
+		};
+		const details = () =>
+			getOpenAICodexTransportDetails(model, { sessionId: options.sessionId, providerSessionState });
+
+		await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		// Local close: the mock does not deliver the close event yet, like a real socket mid-handshake.
+		for (const state of providerSessionState.values()) state.close();
+		const second = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		expect(second.content).toContainEqual(expect.objectContaining({ text: "socket 2" }));
+		expect(sockets).toHaveLength(2);
+
+		// The first socket's close event arrives only now, after socket 2 is live.
+		sockets[0]!.emit("close", { code: 1000 } as unknown as Event);
+		expect(details().websocketConnected).toBe(true);
+
+		const third = await streamOpenAICodexResponses(model, createCodexTestContext(), options).result();
+		expect(third.stopReason).toBe("stop");
+		expect(sockets).toHaveLength(2);
+		expect(fetchMock).not.toHaveBeenCalled();
+		for (const state of providerSessionState.values()) state.close();
 	});
 
 	it("disables websocket after a fatal prewarm handshake failure", async () => {

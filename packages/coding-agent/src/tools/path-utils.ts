@@ -93,6 +93,19 @@ function fileExists(filePath: string): boolean {
 	}
 }
 
+/**
+ * Kind of a non-regular, non-directory file, or undefined. Reading one in-process can block
+ * forever (a FIFO, `/dev/stdin` on the TUI's terminal) or never end (`/dev/zero`).
+ */
+export function specialFileKind(stat: fs.Stats): string | undefined {
+	if (stat.isFile() || stat.isDirectory()) return undefined;
+	if (stat.isCharacterDevice()) return "character device";
+	if (stat.isBlockDevice()) return "block device";
+	if (stat.isFIFO()) return "FIFO";
+	if (stat.isSocket()) return "socket";
+	return "special file";
+}
+
 function normalizeAtPrefix(filePath: string): string {
 	if (!filePath.startsWith("@")) return filePath;
 
@@ -143,6 +156,13 @@ export function expandTilde(filePath: string, home?: string): string {
 export function expandPath(filePath: string): string {
 	const normalized = stripFileUrl(normalizeUnicodeSpaces(normalizeAtPrefix(filePath)));
 	return expandTilde(normalized);
+}
+
+/** Read a file's text, refusing FIFOs, devices and sockets, whose reads can block forever or never end. */
+export async function readTextFromDisk(filePath: string): Promise<string> {
+	const kind = specialFileKind(await fs.promises.stat(filePath));
+	if (kind) throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
+	return Bun.file(filePath).text();
 }
 
 export function splitPathAndSel(rawPath: string): { path: string; sel?: string } {

@@ -19,6 +19,7 @@ import type {
 	WorkspaceEdit,
 } from "./types";
 
+export { readTextFromDisk, specialFileKind } from "../tools/path-utils";
 export { detectLanguageId } from "../utils/lang-from-path";
 
 // =============================================================================

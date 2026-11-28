@@ -161,6 +161,18 @@ function getForcedImageProtocol(): ImageProtocol | null | undefined {
 }
 
 /**
+ * Paseo (getpaseo/paseo) hardcodes `TERM_PROGRAM=kitty` into every PTY
+ * (`buildTerminalEnvironment`) while its xterm.js renderer implements neither
+ * Kitty graphics nor Unicode placeholders — trusting the advertisement turns
+ * image previews into literal PUA garbage (getpaseo/paseo#3850). Paseo
+ * injects `PASEO_TERMINAL_ID` into every terminal it hosts, which makes a
+ * reliable embedder signal.
+ */
+export function isPaseoEmbedder(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return Boolean(env.PASEO_TERMINAL_ID);
+}
+
+/**
  * Returns whether PI_FORCE_IMAGE_PROTOCOL explicitly configures the image
  * protocol, including an explicit "off". An explicit configuration is
  * authoritative: runtime capability probes must not override it.
@@ -293,6 +305,16 @@ export const TERMINAL = (() => {
 			resolved.imageProtocol,
 			resolved.trueColor,
 			false,
+			resolved.notifyProtocol,
+		);
+	}
+	// Paseo's xterm.js renderer draws neither Kitty APC nor placeholders.
+	if (resolved.imageProtocol !== null && isPaseoEmbedder(Bun.env)) {
+		resolved = new TerminalInfo(
+			resolved.id,
+			null,
+			resolved.trueColor,
+			resolved.hyperlinks,
 			resolved.notifyProtocol,
 		);
 	}
