@@ -171,10 +171,7 @@ import {
 	publishManagedFileNoReplaceSync,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
-import {
-	type ManagedSessionTransactionScope,
-	withManagedSessionTransaction,
-} from "./internal/managed-session-transaction";
+import { withManagedSessionTransaction } from "./internal/managed-session-transaction";
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
 import {
 	attemptSessionClaim,
@@ -19382,22 +19379,7 @@ export class SessionManager {
 			session,
 			starred,
 			this.destination.kind === "explicit" ? this.destination.directory : undefined,
-			this.#publishedSharedSession(session.id),
 			this.#scopedClaimOwnership(),
-		);
-	}
-
-	/**
-	 * Whether this manager ever published `sessionId` through shared admission, or has a
-	 * shared publication of it in flight. After `/new` such a predecessor may still be
-	 * live in a peer, so its star must follow the shared header-patch protocol (#7824).
-	 */
-	#publishedSharedSession(sessionId: string): boolean {
-		return (
-			this.#sharedAppendBarSessionIds.has(sessionId) ||
-			this.#sharedRewriteBarSessionIds.has(sessionId) ||
-			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0 ||
-			(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) > 0
 		);
 	}
 
@@ -19523,23 +19505,15 @@ export class SessionManager {
 			session,
 			starred,
 			explicitSessionDir,
-			false,
 			resolveSessionOwnership(ownership),
 		);
 	}
 
-	/**
-	 * Star a non-live picker candidate, under a scoped claim of its id (design §1 row 17).
-	 * A `shared` candidate (a predecessor this manager
-	 * published through shared admission) is patched only by an append under its managed
-	 * session transaction lease, like a shared title; a whole-transcript header upgrade
-	 * is refused because it would move a live peer's transcript identity.
-	 */
+	/** Star a non-live picker candidate, under a scoped claim of its id (design §1 row 17). */
 	static async #setPickerCandidateStar(
 		session: SessionInfo,
 		starred: boolean,
 		explicitSessionDir: string | undefined,
-		shared: boolean,
 		ownership: ResolvedSessionOwnership,
 	): Promise<void> {
 		if (isStagedSessionPath(session.path)) throw new Error("Staged session paths are not resumable");
@@ -19562,24 +19536,11 @@ export class SessionManager {
 				throw new Error("Session is not an authorized managed candidate.");
 		}
 		await withScopedSessionClaim(ownership, session.id, starred ? "star" : "unstar", async () => {
-			if (!shared) {
-				SessionManager.#writePickerCandidateStar(session, starred, directory);
-				return;
-			}
-			const locksDirectory = managedSessionTransactionLocksDirectory(directory);
-			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-			await withManagedSessionTransaction({ locksDirectory, sessionId: session.id }, scope =>
-				SessionManager.#writePickerCandidateStar(session, starred, directory, scope),
-			);
+			SessionManager.#writePickerCandidateStar(session, starred, directory);
 		});
 	}
 
-	static #writePickerCandidateStar(
-		session: SessionInfo,
-		starred: boolean,
-		directory: string,
-		sharedScope?: ManagedSessionTransactionScope,
-	): void {
+	static #writePickerCandidateStar(session: SessionInfo, starred: boolean, directory: string): void {
 		const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
 		try {
 			const relativePath = path.basename(session.path);
@@ -19604,10 +19565,6 @@ export class SessionManager {
 
 			const patch = `${JSON.stringify({ type: "header_patch", patch: { starred } })}\n`;
 			const appendOnly = rawHeader.starredPatchVersion === 1 && Number(rawHeader.version) >= 4;
-			if (sharedScope && !appendOnly)
-				throw new Error(
-					"Selected session is shared; shared session star requires an append-only header patch. Resume it to upgrade its format.",
-				);
 			let bytes: Uint8Array;
 			if (appendOnly) {
 				bytes = Buffer.from(`${content.endsWith("\n") ? "" : "\n"}${patch}`);
@@ -19619,7 +19576,6 @@ export class SessionManager {
 					`${JSON.stringify(rawHeader)}\n${body}${body && !body.endsWith("\n") ? "\n" : ""}${patch}`,
 				);
 			}
-			sharedScope?.assertOwned();
 			if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
 			else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
 			const committedDescriptor = authority.descriptorExpected(relativePath);
