@@ -533,8 +533,17 @@ describe("authHeader credential race through a real session", () => {
 		const firstReplacement = dispatches[1];
 		const afterBackoff = dispatches[2];
 		const terminal = dispatches[3];
-		if (!first || !firstReplacement || !afterBackoff || !terminal) {
-			throw new Error("Expected four provider dispatches");
+		if (
+			!first ||
+			!firstReplacement ||
+			!afterBackoff ||
+			!terminal ||
+			!first.apiKey ||
+			!firstReplacement.apiKey ||
+			!afterBackoff.apiKey ||
+			!terminal.apiKey
+		) {
+			throw new Error("Expected four provider dispatches with API keys");
 		}
 
 		// `streamSimple`'s native rotation reuses one provider model; the outer
