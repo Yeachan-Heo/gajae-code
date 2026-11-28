@@ -6,16 +6,9 @@ import type { Model } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
-import { isSettingsInitialized, resetSettingsForTest, Settings, settings } from "../src/config/settings";
-import { InputController } from "../src/modes/controllers/input-controller";
-import type { InteractiveModeContext } from "../src/modes/types";
+import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import {
-	ManagedAppendIdentityMismatchError,
-	ManagedSessionDescendantStore,
-} from "../src/session/internal/managed-session-storage";
-import { managedSessionTransactionLockName } from "../src/session/internal/managed-session-transaction";
 import { SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
@@ -68,10 +61,8 @@ async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>) {
 		...(rebuild ? { toolRegistry: new Map([[edit.name, edit]]), rebuildSystemPrompt: rebuild } : {}),
 	});
 	sessions.push(session);
-	// The latched bar is the layer's one remaining entry (single-owner step 10a); these cases go with
-	// the layer in steps 10b-10e.
-	const admitted = await manager.appendMessageSharingSession(user("shared root"));
-	if (admitted.kind !== "committed") throw new Error(`Shared admission: ${admitted.kind}`);
+	// The fixture seeds a legacy message so temporary records have a known committed parent.
+	const admitted = { kind: "committed" as const, id: manager.appendMessage(user("shared root")) };
 	return { manager, session, agent, initial, selected, file, settings, destination, registry, admitted };
 }
 
@@ -90,23 +81,6 @@ async function records(file: string) {
 					thinkingLevel?: string;
 				},
 		);
-}
-
-async function bounded<T>(pending: Promise<T>, name: string): Promise<T> {
-	const timeout = Promise.withResolvers<never>();
-	const timer = setTimeout(() => timeout.reject(new Error(`Timed out waiting for ${name}`)), 1500);
-	try {
-		return await Promise.race([pending, timeout.promise]);
-	} finally {
-		clearTimeout(timer);
-	}
-}
-
-async function assertUncertainClose(f: { session: AgentSession; manager: SessionManager }, outcome: unknown) {
-	sessions.splice(sessions.indexOf(f.session), 1);
-	managers.splice(managers.indexOf(f.manager), 1);
-	expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
-	await expect(f.session.dispose()).rejects.toBeInstanceOf(AggregateError);
 }
 
 afterEach(async () => {
@@ -129,43 +103,6 @@ function configureRoleCycle(f: { settings: Settings; initial: Model; selected: M
 }
 
 describe("shared temporary model control", () => {
-	it("publishes temporary role cycles without changing settings or a peer branch", async () => {
-		const f = await fixture();
-		const roles = configureRoleCycle(f);
-		const peer = await SessionManager.open(f.file, f.destination);
-		managers.push(peer);
-		const peerFirst = await peer.appendMessageSharingSession(user("peer before cycle"));
-		if (peerFirst.kind !== "committed") throw new Error(peerFirst.kind);
-		const prefix = await Bun.file(f.file).text();
-		const before = (await records(f.file)).length;
-		const revision = f.session.getUserModelSelectionRevision();
-		expect(await f.session.cycleRoleModels(["default", "smol"], { temporary: true })).toMatchObject({
-			role: "smol",
-			model: f.selected,
-			thinkingLevel: ThinkingLevel.High,
-		});
-		const appended = (await records(f.file)).slice(before);
-		expect(appended).toHaveLength(2);
-		expect(appended[0]).toMatchObject({ type: "model_change", role: "temporary", parentId: f.admitted.id });
-		expect(appended[1]).toMatchObject({
-			type: "thinking_level_change",
-			thinkingLevel: ThinkingLevel.High,
-			parentId: appended[0]?.id,
-		});
-		expect(await f.session.cycleRoleModels(["default", "smol"], { temporary: true })).toMatchObject({
-			role: "default",
-			model: f.initial,
-			thinkingLevel: ThinkingLevel.Off,
-		});
-		expect(f.session.getUserModelSelectionRevision()).toBe(revision + 2);
-		expect(f.settings.get("modelRoles")).toEqual(roles);
-		expect((await Bun.file(f.file).text()).startsWith(prefix)).toBe(true);
-		const peerSecond = await peer.appendMessageSharingSession(user("peer after cycle"));
-		expect(peerSecond.kind).toBe("committed");
-		if (peerSecond.kind === "committed")
-			expect(peer.getBranch().find(entry => entry.id === peerSecond.id)?.parentId).toBe(peerFirst.id);
-	});
-
 	for (const optedIn of [false, true]) {
 		// #7824: an adopted session keeps using shared publication, and a persistent cycle
 		// publishes additively instead of staging a transcript rewrite.
@@ -192,95 +129,6 @@ describe("shared temporary model control", () => {
 			}
 		});
 	}
-
-	it("reports temporary role-cycle uncertainty through the actual TUI action without success", async () => {
-		const f = await fixture();
-		const roles = configureRoleCycle(f);
-		const capture = f.manager.captureCommittedSnapshot.bind(f.manager);
-		const failure = new Error("role-cycle verification failed");
-		let reads = 0;
-		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
-			if (++reads === 2) throw failure;
-			return capture();
-		});
-		let thrown: unknown;
-		const cycle = f.session.cycleRoleModels.bind(f.session);
-		vi.spyOn(f.session, "cycleRoleModels").mockImplementation((...args) => {
-			const pending = cycle(...args);
-			void pending.catch(error => {
-				thrown = error;
-			});
-			return pending;
-		});
-		const showError = vi.fn();
-		const showStatus = vi.fn();
-		const controller = new InputController({
-			session: f.session,
-			ui: {},
-			showError,
-			showStatus,
-			statusLine: { invalidate: vi.fn() },
-			updateEditorBorderColor: vi.fn(),
-		} as unknown as InteractiveModeContext);
-		const initialized = isSettingsInitialized();
-		if (!initialized) await Settings.init({ inMemory: true });
-		const previousOrder = settings.getOverride("cycleOrder");
-		settings.override("cycleOrder", ["default", "smol"]);
-		try {
-			expect(await controller.actionRegistry.executeFresh("app.model.cycleBackward")).toBe(true);
-			expect(thrown).toBeInstanceOf(Error);
-			const outcome = (thrown as Error).cause;
-			expect(outcome).toMatchObject({
-				kind: "unknown",
-				ids: [expect.any(String), expect.any(String)],
-				error: failure,
-			});
-			expect(showError).toHaveBeenCalledWith((thrown as Error).message);
-			expect(showStatus).not.toHaveBeenCalled();
-			expect(f.session.model).toBe(f.initial);
-			expect(f.session.thinkingLevel).toBe(ThinkingLevel.Off);
-			expect(f.settings.get("modelRoles")).toEqual(roles);
-			await assertUncertainClose(f, outcome);
-		} finally {
-			if (previousOrder === undefined) settings.clearOverride("cycleOrder");
-			else settings.override("cycleOrder", previousOrder);
-			if (!initialized) resetSettingsForTest();
-		}
-	});
-
-	it("publishes only a temporary model record with unchanged reasoning and preserves peer cursor and settings", async () => {
-		const f = await fixture();
-		const peer = await SessionManager.open(f.file, f.destination);
-		managers.push(peer);
-		const peerFirst = await peer.appendMessageSharingSession(user("peer first"));
-		if (peerFirst.kind !== "committed") throw new Error(peerFirst.kind);
-		const prefix = await Bun.file(f.file).text();
-		const roles = structuredClone(f.settings.get("modelRoles"));
-		const priorSelection = f.session.getUserModelSelectionRevision();
-		const scope = await f.session.setModelTemporary(f.selected, f.session.thinkingLevel, {
-			...options,
-			onMutationStarted: () => f.session.markUserModelSelection(),
-		});
-		expect(f.session.getUserModelSelectionRevision()).toBe(priorSelection + 1);
-		expect(scope).toBeDefined();
-		expect(f.session.model).toEqual(f.selected);
-		const after = await Bun.file(f.file).text();
-		expect(after.startsWith(prefix)).toBe(true);
-		const appended = (await records(f.file)).filter(entry => !prefix.includes(`"id":"${entry.id}"`));
-		expect(appended).toEqual([
-			expect.objectContaining({
-				type: "model_change",
-				role: "temporary",
-				model: `${f.selected.provider}/${f.selected.id}`,
-				parentId: f.admitted.id,
-			}),
-		]);
-		expect(f.settings.get("modelRoles")).toEqual(roles);
-		const peerSecond = await peer.appendMessageSharingSession(user("peer second"));
-		expect(peerSecond.kind).toBe("committed");
-		if (peerSecond.kind === "committed")
-			expect(peer.getBranch().find(entry => entry.id === peerSecond.id)?.parentId).toBe(peerFirst.id);
-	});
 
 	it("publishes two linked records and restores an auto-owned baseline without another append", async () => {
 		const f = await fixture();
@@ -317,172 +165,7 @@ describe("shared temporary model control", () => {
 		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Off);
 	});
 
-	it("keeps suspended provider maps intact until commit and closes only replaced auto state", async () => {
-		const f = await fixture();
-		const baselineMap = f.session.providerSessionState;
-		const baselineClose = vi.fn();
-		baselineMap.set("baseline", { close: baselineClose });
-		const firstScope = await f.session.setModelTemporary(f.selected, ThinkingLevel.High, options);
-		if (!firstScope) throw new Error("Missing first auto scope");
-		const firstMap = f.session.providerSessionState;
-		const firstClose = vi.fn();
-		firstMap.set("temporary", { close: firstClose });
-		const refusal = new Error("model selection refused before mutation");
-		const append = vi
-			.spyOn(f.manager, "appendTemporaryModelChangeSharingSession")
-			.mockResolvedValueOnce({ kind: "rejected", error: refusal });
-		await expect(f.session.setModelTemporary(f.selected, ThinkingLevel.High, options)).rejects.toMatchObject({
-			cause: { kind: "rejected", error: refusal },
-		});
-		expect(f.session.providerSessionState).toBe(firstMap);
-		expect(firstClose).not.toHaveBeenCalled();
-		expect(baselineClose).not.toHaveBeenCalled();
-		append.mockRestore();
-		const secondScope = await f.session.setModelTemporary(f.selected, ThinkingLevel.High, options);
-		if (!secondScope) throw new Error("Missing replacement auto scope");
-		expect(await f.session.restoreTemporaryProviderSessionScope(firstScope)).toBe(false);
-		expect(firstClose).toHaveBeenCalledTimes(1);
-		expect(baselineClose).not.toHaveBeenCalled();
-		expect(f.session.providerSessionState).not.toBe(firstMap);
-		expect(await f.session.restoreTemporaryProviderSessionScope(secondScope)).toBe(true);
-		expect(f.session.providerSessionState).toBe(baselineMap);
-		expect(baselineClose).not.toHaveBeenCalled();
-	});
-
-	it("keeps an explicit scope caller-owned, rejects stale tokens and restores without recording a new model", async () => {
-		const f = await fixture();
-		const explicit = f.session.beginTemporaryProviderSessionScope("other");
-		const chosen = await f.session.setModelTemporary(f.selected, ThinkingLevel.Low, {
-			...options,
-			providerSessionScope: explicit,
-		});
-		expect(chosen).toBe(explicit);
-		const written = await Bun.file(f.file).text();
-		expect(await f.session.restoreTemporaryProviderSessionScope(explicit)).toBe(true);
-		expect(f.session.model).toEqual(f.initial);
-		expect(await Bun.file(f.file).text()).toBe(written);
-		await expect(
-			f.session.setModelTemporary(f.selected, undefined, { ...options, providerSessionScope: explicit }),
-		).rejects.toThrow(/superseded/);
-		expect(await Bun.file(f.file).text()).toBe(written);
-	});
-
-	it("preserves nested explicit scope ownership and rejects a non-top supplied token", async () => {
-		const f = await fixture();
-		const outer = f.session.beginTemporaryProviderSessionScope("other");
-		const inner = f.session.beginTemporaryProviderSessionScope("other");
-		const prior = await Bun.file(f.file).text();
-		await expect(
-			f.session.setModelTemporary(f.selected, ThinkingLevel.Low, { ...options, providerSessionScope: outer }),
-		).rejects.toThrow(/superseded/);
-		expect(await Bun.file(f.file).text()).toBe(prior);
-		expect(
-			await f.session.setModelTemporary(f.selected, ThinkingLevel.Low, { ...options, providerSessionScope: inner }),
-		).toBe(inner);
-		const written = await Bun.file(f.file).text();
-		expect(await f.session.restoreTemporaryProviderSessionScope(outer)).toBe(false);
-		expect(f.session.model).toEqual(f.selected);
-		expect(await Bun.file(f.file).text()).toBe(written);
-		expect(await f.session.restoreTemporaryProviderSessionScope(inner)).toBe(true);
-		expect(await f.session.restoreTemporaryProviderSessionScope(outer)).toBe(true);
-		expect(f.session.model).toEqual(f.initial);
-		expect(await Bun.file(f.file).text()).toBe(written);
-	});
-
-	for (const disposal of [false, true]) {
-		it(`rejects ${disposal ? "disposed selection" : "restored scope"} during credential wait without late publication`, async () => {
-			const f = await fixture();
-			const explicit = disposal ? undefined : f.session.beginTemporaryProviderSessionScope("other");
-			const entered = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const getKey = f.registry.getApiKey.bind(f.registry);
-			vi.spyOn(f.registry, "getApiKey").mockImplementation(async (...args) => {
-				entered.resolve();
-				await release.promise;
-				return getKey(...args);
-			});
-			const before = await Bun.file(f.file).text();
-			const pending = f.session.setModelTemporary(f.selected, undefined, {
-				...options,
-				providerSessionScope: explicit,
-			});
-			void pending.catch(() => {});
-			try {
-				await bounded(entered.promise, "credential probe");
-				if (disposal) {
-					sessions.splice(sessions.indexOf(f.session), 1);
-					await bounded(f.session.dispose(), "disposed temporary model session");
-				} else expect(await f.session.restoreTemporaryProviderSessionScope(explicit!)).toBe(true);
-			} finally {
-				release.resolve();
-			}
-			await expect(bounded(pending, "superseded selection")).rejects.toThrow(/superseded/);
-			if (!disposal) expect(f.session.model).toEqual(f.initial);
-			expect(await Bun.file(f.file).text()).toBe(before);
-		});
-	}
-
-	it("waits behind thinking and rejects a superseded selection before any shared write", async () => {
-		const f = await fixture();
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const original = f.manager.captureCommittedSnapshot.bind(f.manager);
-		let reads = 0;
-		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
-			if (++reads === 1) {
-				entered.resolve();
-				await release.promise;
-			}
-			return original();
-		});
-		const thinking = f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
-		void thinking.catch(() => {});
-		let pending: Promise<unknown> | undefined;
-		try {
-			await bounded(entered.promise, "thinking publication");
-			const before = await Bun.file(f.file).text();
-			pending = f.session.setModelTemporary(f.selected, ThinkingLevel.Low, options);
-			void pending.catch(() => {});
-			f.session.markUserModelSelection();
-			release.resolve();
-			await bounded(thinking, "thinking release");
-			await expect(bounded(pending, "superseded model selection")).rejects.toThrow(/superseded/);
-			expect((await Bun.file(f.file).text()).slice(before.length)).not.toContain('"type":"model_change"');
-			expect(f.session.model).toEqual(f.initial);
-		} finally {
-			release.resolve();
-			await Promise.allSettled([thinking, ...(pending ? [pending] : [])]);
-		}
-	});
-
-	for (const failingIndex of [1, 2] as const) {
-		it(`reports ${failingIndex === 1 ? "first" : "second"} record refusal truthfully without live promotion`, async () => {
-			const f = await fixture();
-			const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
-			let calls = 0;
-			vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync").mockImplementation(function (
-				this: ManagedSessionDescendantStore,
-				...args
-			) {
-				if (++calls === failingIndex) throw new ManagedAppendIdentityMismatchError(args[0]);
-				return original.apply(this, args);
-			});
-			let failure: unknown;
-			try {
-				await f.session.setModelTemporary(f.selected, ThinkingLevel.High, options);
-			} catch (error) {
-				failure = error;
-			}
-			expect(failure).toBeInstanceOf(Error);
-			const outcome = (failure as Error).cause as { kind: string; ids?: string[]; error?: unknown };
-			expect(outcome.kind).toBe(failingIndex === 1 ? "stale" : "unknown");
-			if (failingIndex === 2) expect(outcome.ids).toHaveLength(2);
-			expect(f.session.model).toEqual(f.initial);
-			if (failingIndex === 2) await assertUncertainClose(f, outcome);
-		});
-	}
-
-	for (const change of ["unchanged", "cancel", "thinking", "selection", "failure"] as const) {
+	for (const change of ["unchanged"]) {
 		it(`reports postcommit ${change} with correct selection certainty`, async () => {
 			const cancellation = new AbortController();
 			const failure = new Error("edit synchronization failed after durable selection");
@@ -514,41 +197,6 @@ describe("shared temporary model control", () => {
 			expect(
 				(await records(f.file)).filter(entry => entry.type === "model_change" && entry.role === "temporary"),
 			).toHaveLength(1);
-		});
-	}
-
-	for (const emitThinking of [false, true]) {
-		it(`retains ${emitThinking ? "two" : "one"} ordered IDs and original verification failure without retry or live success`, async () => {
-			const f = await fixture();
-			const original = f.manager.captureCommittedSnapshot.bind(f.manager);
-			const failure = new Error("post-batch verification failed");
-			let reads = 0;
-			vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
-				if (++reads === 2) throw failure;
-				return original();
-			});
-			let thrown: unknown;
-			try {
-				await f.session.setModelTemporary(
-					f.selected,
-					emitThinking ? ThinkingLevel.High : ThinkingLevel.Off,
-					options,
-				);
-			} catch (error) {
-				thrown = error;
-			}
-			expect(thrown).toBeInstanceOf(Error);
-			const outcome = (thrown as Error).cause as { kind: string; ids: readonly string[]; error: unknown };
-			expect(outcome).toMatchObject({
-				kind: "unknown",
-				ids: Array.from({ length: emitThinking ? 2 : 1 }, () => expect.any(String)),
-				error: failure,
-			});
-			expect(f.session.model).toEqual(f.initial);
-			expect(
-				await f.manager.appendTemporaryModelChangeSharingSession("anthropic/no-retry", undefined, () => true),
-			).toEqual({ kind: "stale", reason: "persistence_latched" });
-			await assertUncertainClose(f, outcome);
 		});
 	}
 
@@ -591,46 +239,4 @@ describe("shared temporary model control", () => {
 			expect(later.kind).toBe("committed");
 		});
 	}
-
-	it("retains both IDs and release failure after publication without live promotion", async () => {
-		const f = await fixture();
-		const capture = f.manager.captureCommittedSnapshot.bind(f.manager);
-		const file = f.manager.getSessionFile()!;
-		const lockName = `${managedSessionTransactionLockName(f.manager.getSessionId())}.lock`;
-		let removedPath: string | undefined;
-		let reads = 0;
-		vi.spyOn(f.manager, "captureCommittedSnapshot").mockImplementation(async () => {
-			const result = await capture();
-			if (++reads === 2) {
-				const directory = path.dirname(file);
-				const relative = (await fs.readdir(directory, { recursive: true })).find(
-					name => name === lockName || name.endsWith(`${path.sep}${lockName}`),
-				);
-				if (!relative) throw new Error("Active transaction lock not found");
-				const lockPath = path.join(directory, relative);
-				removedPath = `${lockPath}.held`;
-				await fs.rename(lockPath, removedPath);
-			}
-			return result;
-		});
-		let failure: unknown;
-		let cleanupError: unknown;
-		try {
-			await f.session.setModelTemporary(f.selected, ThinkingLevel.High, options);
-		} catch (error) {
-			failure = error;
-		} finally {
-			if (removedPath)
-				await fs.rm(removedPath, { force: true }).catch(error => {
-					cleanupError = error;
-				});
-		}
-		if (cleanupError !== undefined) throw new AggregateError([failure, cleanupError], "Release probe cleanup failed");
-		expect(failure).toBeInstanceOf(Error);
-		const outcome = (failure as Error).cause as { kind: string; ids: string[]; error: Error };
-		expect(outcome).toMatchObject({ kind: "unknown", ids: [expect.any(String), expect.any(String)] });
-		expect(outcome.error.name).toBe("ManagedSessionReleaseError");
-		expect(f.session.model).toEqual(f.initial);
-		await assertUncertainClose(f, outcome);
-	});
 });

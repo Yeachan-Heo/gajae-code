@@ -77,10 +77,9 @@ import {
 	type RoutingSettingsService,
 } from "../../sdk/routing-settings";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
-import {
-	type AgentSessionProfileInstalledOverrideState,
-	type DefaultFallbackRuntimeState,
-	SharedControlPublicationError,
+import type {
+	AgentSessionProfileInstalledOverrideState,
+	DefaultFallbackRuntimeState,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
 import { probeHeldSessions, resolveSessionOwnership } from "../../session/internal/session-claim-set";
@@ -340,18 +339,8 @@ export class SelectorController {
 		restoreProfileState: boolean = true,
 	): Promise<never> {
 		if (!restoreLiveModel && !restoreProfileState) throw error;
-		// An unknown or committed-but-unapplied shared outcome already closed the session:
-		// its transcript may hold the forward write, so nothing is compensated over it (#7824).
-		if (
-			this.ctx.session.sessionLifecycle?.disposed ||
-			(error instanceof SharedControlPublicationError &&
-				(error.code === "unknown" || error.code === "committed_not_applied"))
-		)
-			throw error;
-		// A shared session restores the chain, resume default and live model as one admitted
-		// publication of only what actually differs, so a forward write known not to have
-		// happened leaves nothing to compensate.
-		const sharedCompensation = this.ctx.session.usesSharedControlPublication?.() === true;
+		// A closed session is never compensated over.
+		if (this.ctx.session.sessionLifecycle?.disposed) throw error;
 		// Validate the durable owner under the same lock as compensation: the
 		// in-memory settings may not have seen another process's winning commit.
 		try {
@@ -412,32 +401,16 @@ export class SelectorController {
 				? this.ctx.settings.clearOverride("modelProfile.default")
 				: this.ctx.settings.override("modelProfile.default", snapshot.profileOverride),
 		);
-		if (sharedCompensation) {
-			try {
-				await this.ctx.session.restoreModelSelectionForRollback(
-					restoreLiveModel ? snapshot.model : this.ctx.session.model,
-					restoreLiveModel ? snapshot.thinkingLevel : this.ctx.session.thinkingLevel,
-					{
-						defaultChain: restoreProfileState ? { state: snapshot.chain } : undefined,
-						resumeDefault: restoreLiveModel ? { selector: snapshot.resumeDefaultSelector } : undefined,
-					},
-				);
-			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
-			}
-		}
 		if (restoreProfileState) {
-			if (!sharedCompensation) {
-				restore(() =>
-					this.ctx.session.setConfiguredModelChain(
-						"default",
-						snapshot.chain?.entries ?? [],
-						snapshot.chain?.origin ?? "rollback",
-						snapshot.chain?.identity,
-						snapshot.chain?.explicitHead ?? true,
-					),
-				);
-			}
+			restore(() =>
+				this.ctx.session.setConfiguredModelChain(
+					"default",
+					snapshot.chain?.entries ?? [],
+					snapshot.chain?.origin ?? "rollback",
+					snapshot.chain?.identity,
+					snapshot.chain?.explicitHead ?? true,
+				),
+			);
 			restore(() => this.ctx.session.restoreDefaultFallbackRuntimeState(snapshot.fallbackRuntimeState));
 			restore(() => {
 				if (snapshot.canonicalVariant) {
@@ -450,7 +423,7 @@ export class SelectorController {
 				}
 			});
 		}
-		if (restoreLiveModel && !sharedCompensation) {
+		if (restoreLiveModel) {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
@@ -464,7 +437,7 @@ export class SelectorController {
 		} catch (rollbackError) {
 			rollbackErrors.push(rollbackError);
 		}
-		if (restoreLiveModel && !sharedCompensation) {
+		if (restoreLiveModel) {
 			try {
 				await this.ctx.session.restoreModelSelectionForRollback(snapshot.model, snapshot.thinkingLevel);
 			} catch (rollbackError) {
@@ -3127,9 +3100,9 @@ export class SelectorController {
 							{
 								accountProviderId: selectedProviderId,
 								// The selector fires these callbacks with `void`, so a rejection here is an
-								// unhandled rejection (a recorded GJC crash). Shared sessions refuse a
-								// credential write with SharedControlPublicationError (#7824); report every
-								// failure and keep the selector open so the user can retry or pick another row.
+								// unhandled rejection (a recorded GJC crash). A refused credential write
+								// (#7824) is reported and the selector stays open so the user can retry or
+								// pick another row.
 								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
 									try {
 										await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);

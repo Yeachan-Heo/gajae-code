@@ -6011,17 +6011,6 @@
 		}
 	},
 	{
-		"sourceId": "agent_session:setConfiguredModelChainForControl",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal shared-publication wrapper over profile and fallback-chain state for controls that already committed settings, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
 		"sourceId": "agent_session:setConfiguredModelChain",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
@@ -6159,50 +6148,6 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal staged model-selection preparation for profile activation, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
-		"sourceId": "agent_session:usesSharedControlPublication",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal shared-publication eligibility query for in-process control paths, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
-		"sourceId": "agent_session:withModelProfilePublication",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal shared publication scope behind the reviewed model.profile.set seam, not an independent public SDK operation",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
-		"sourceId": "agent_session:appendModelProfileActivationForControl",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal shared transcript append behind the reviewed model.profile.set seam, not an independent public SDK operation",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
-		"sourceId": "agent_session:publishCommittedModelProfileSessionState",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal receipt-bound live-state publication behind the reviewed model.profile.set seam, not an independent public SDK operation",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

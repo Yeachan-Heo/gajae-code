@@ -119,22 +119,6 @@ const ROUTES = [
 ] as const;
 
 describe.skipIf(!supported)("the root session write route", () => {
-	it("a shared bar latched by an older code path still wins in the funnel", async () => {
-		const place = await workspace();
-		SessionOwnershipTestHooks.mode = "enforce";
-		const sessionManager = await manager(place.cwd, place.managed, "enforce");
-		const session = await rootSession(sessionManager, place.root);
-		expect(session.usesSharedControlPublication()).toBe(false);
-		// A canonical shared append latches the append and rewrite bars for this manager's lifetime.
-		const outcome = await sessionManager.appendMessageSharingSession({
-			role: "user",
-			content: "published shared",
-			timestamp: Date.now(),
-		});
-		expect(outcome.kind).toBe("committed");
-		expect(session.usesSharedControlPublication()).toBe(true);
-	});
-
 	it("enforce: a session_switch handler that writes during /resume lands on the switched-to session", async () => {
 		const place = await workspace();
 		SessionOwnershipTestHooks.mode = "enforce";
@@ -154,7 +138,7 @@ describe.skipIf(!supported)("the root session write route", () => {
 			emit: async (event: { type: string }) => {
 				if (event.type !== "session_switch" || !session) return;
 				await session.appendCustomEntryForSession("switch-hook", { wrote: true });
-				seen.push(session.usesSharedControlPublication());
+				seen.push(sessionManager.requiresSharedMutationAdmission());
 			},
 		} as unknown as ExtensionRunner;
 		session = await rootSession(sessionManager, place.root, extensionRunner);
@@ -187,7 +171,7 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 			failOpenLocks(failOpen);
 		const sessionManager = await manager(place.cwd, place.managed, mode);
 		const session = await rootSession(sessionManager, place.root);
-		expect(session.usesSharedControlPublication()).toBe(false);
+		expect(sessionManager.requiresSharedMutationAdmission()).toBe(false);
 		await session.prompt("first prompt");
 		await session.prompt("second prompt");
 		await sessionManager.flush();
@@ -217,7 +201,7 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		expect(sessionManager.getSessionId()).not.toBe(sourceId);
 		// The direct route names the parent by its transcript path, as dev's legacy branch does.
 		expect(sessionManager.getHeader()?.parentSession).toBe(sourceFile);
-		expect(session.usesSharedControlPublication()).toBe(false);
+		expect(sessionManager.requiresSharedMutationAdmission()).toBe(false);
 	});
 
 	/** A writer the holder cannot see (ownership off, an older binary) appends to the transcript. */
