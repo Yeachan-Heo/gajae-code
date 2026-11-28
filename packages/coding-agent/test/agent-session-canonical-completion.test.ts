@@ -178,6 +178,73 @@ describe("AgentSession canonical completion", () => {
 		});
 	}
 
+	for (const behavior of ["steer", "followUp"] as const) {
+		it(`records one busy ${behavior} workflow entry before queueing on a managed session`, async () => {
+			const entered = Promise.withResolvers<void>();
+			const releaseTool = Promise.withResolvers<void>();
+			const mock = createMockModel({
+				responses: [
+					{ content: [{ type: "toolCall", id: "held-tool", name: "probe", arguments: {} }] },
+					{ content: ["first complete"] },
+					{ content: ["queued complete"] },
+				],
+			});
+			const tool: AgentTool = {
+				name: "probe",
+				label: "Probe",
+				description: "Probe",
+				parameters: z.object({}),
+				execute: async () => {
+					entered.resolve();
+					await releaseTool.promise;
+					return { content: [{ type: "text", text: "ok" }] };
+				},
+			};
+			const { agent, manager, session } = await setup({ managed: true, streamFn: mock.stream, tools: [tool] });
+			const workflowEntries = () =>
+				manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff");
+			let first: Promise<void> | undefined;
+			try {
+				first = session.prompt("first ordinary prompt");
+				void first.catch(() => {});
+				await withTimeout(entered.promise, 5_000, "First turn did not enter its tool");
+				expect(workflowEntries()).toHaveLength(1);
+				await withTimeout(
+					session.prompt("busy queued input", { streamingBehavior: behavior }),
+					5_000,
+					"Busy submission was not accepted",
+				);
+				// The record is in the transcript before the input is queued behind the busy run.
+				expect(workflowEntries()).toHaveLength(2);
+				expect(agent.hasQueuedMessages()).toBe(true);
+				releaseTool.resolve();
+				await withTimeout(first, 5_000, "First turn did not become idle");
+				await withTimeout(session.waitForIdle(), 5_000, "Queued input did not settle");
+				expect(workflowEntries()).toHaveLength(2);
+				const branch = manager.getBranch();
+				const custom = workflowEntries().at(-1);
+				const user = branch.find(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						JSON.stringify(entry.message.content).includes("busy queued input"),
+				);
+				expect(user?.type).toBe("message");
+				const byId = new Map(branch.map(entry => [entry.id, entry]));
+				let cursor = user?.parentId;
+				const ancestors = new Set<string>();
+				while (cursor && !ancestors.has(cursor)) {
+					ancestors.add(cursor);
+					cursor = byId.get(cursor)?.parentId;
+				}
+				expect(ancestors.has(custom!.id)).toBe(true);
+			} finally {
+				releaseTool.resolve();
+				if (first) await withTimeout(Promise.allSettled([first]), 5_000, "Busy prompt cleanup did not settle");
+			}
+		});
+	}
+
 	it("keeps the legacy synchronous workflow entry for a non-opted-in session", async () => {
 		const mock = createMockModel({ handler: { content: ["completed"] } });
 		const { manager, session } = await setup({ streamFn: mock.stream });

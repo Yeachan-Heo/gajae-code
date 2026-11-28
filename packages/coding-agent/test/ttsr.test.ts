@@ -1157,7 +1157,10 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		return { entered: entered.promise, release: release.resolve, restore: () => spy.mockRestore() };
 	}
 
-	it("continues ordinary managed TTSR discard retry and persists its reminder", async () => {
+	it.each([
+		"keep",
+		"discard",
+	] as const)("continues ordinary managed TTSR %s retry and persists its reminder", async contextMode => {
 		const callContent = "export default 1;\n";
 		const agentDir = path.join(tempDir, "managed-agent");
 		await fsPromises.mkdir(agentDir, { mode: 0o700 });
@@ -1167,7 +1170,7 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			[new WriteTool(createToolSession())],
 			[[writeCall("managed-write", "managed.ts", callContent)]],
 			[defaultExportRule({ repeatMode: "once" })],
-			{ interruptMode: "always", contextMode: "discard", sessionManager: manager },
+			{ interruptMode: "always", contextMode, sessionManager: manager },
 		);
 		const notices: { level: string; message: string }[] = [];
 		const unsubscribe = target.session.subscribe(event => {
@@ -1218,7 +1221,23 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			await prompt;
 			await target.session.waitForIdle();
 			await manager.flush();
-			expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(true);
+			if (contextMode === "discard") {
+				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(true);
+			} else {
+				// keep: no retry rewrite; the aborted partial output stays in live history.
+				expect(replace.mock.calls.some(([, options]) => options?.historyRewrite?.reason === "retry")).toBe(false);
+				const live = target.session.agent.state.messages;
+				const abortedIndex = live.findIndex(
+					message => message.role === "assistant" && message.stopReason === "aborted",
+				);
+				const reminderIndexes = live.flatMap((message, index) =>
+					message.role === "custom" && message.customType === "ttsr-injection" ? [index] : [],
+				);
+				expect(abortedIndex).toBeGreaterThanOrEqual(0);
+				// One reminder, appended after the kept partial output.
+				expect(reminderIndexes).toHaveLength(1);
+				expect(reminderIndexes[0]).toBeGreaterThan(abortedIndex);
+			}
 			// The retry ran: a second model call that carries the reminder.
 			expect(target.modelMessages).toHaveLength(calls + 1);
 			expect(JSON.stringify(target.modelMessages[1])).toContain(RULE_CONTENT);
