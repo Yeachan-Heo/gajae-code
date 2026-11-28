@@ -16189,6 +16189,10 @@ export class AgentSession {
 		this.#pendingAppliedToolSignature = undefined;
 	}
 
+	async #refreshBaseSystemPromptAfterTransition(): Promise<void> {
+		await this.refreshBaseSystemPrompt();
+	}
+
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
 		const backend = await this.memoryBackend.get("agent-start-prompt");
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
