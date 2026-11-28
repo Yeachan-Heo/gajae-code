@@ -60,7 +60,7 @@
       "symbol": "generateDiffString -> Diff.diffLines (npm 'diff')",
       "category": "diff-myers-pure-js",
       "complexity": "O(n*d) Myers in pure JS, plus per-line output assembly",
-      "trigger": "every edit preview, edit apply, and hashline recovery",
+      "trigger": "every edit preview and edit apply",
       "nativeCandidate": true,
       "recommendedAction": "Rust N-API line-diff (e.g. similar/imara-diff) replacing npm 'diff'",
       "evidence": "import * as Diff from 'diff'; diffLines used in generateDiffString",
@@ -98,22 +98,6 @@
       "evidence": "Array.from(n+1) of Array(m+1) plus double loop building table",
       "status": "partial",
       "resolution": "v3 #558: legacy dense DP retained — Hunt-Szymanski produced byte-different rendered diffs (red-team repro) and was reverted per byte-parity principle; MAX_LCS_LINES cap bounds the cost"
-    },
-    {
-      "id": "H06",
-      "rank": 6,
-      "package": "coding-agent",
-      "file": "packages/coding-agent/src/hashline/hash.ts",
-      "lines": "126-135, 170-173",
-      "symbol": "formatHashLines / computeLineHash per-line loop",
-      "category": "per-line-format-loop",
-      "complexity": "O(lines): regex .replace(/\\r/g,'') + trimEnd + hash + string build per line over whole files",
-      "trigger": "every read, search, and edit display that emits LINE+HASH anchors",
-      "nativeCandidate": true,
-      "recommendedAction": "Rust N-API: whole-text hash+format in one pass (hash already native, loop/alloc is the cost)",
-      "evidence": "computeLineHash uses native xxHash32 but allocates per line; formatHashLines loops all lines",
-      "status": "resolved",
-      "resolution": "v1: native whole-text hash+format"
     },
     {
       "id": "H07",
@@ -278,10 +262,9 @@
       "suite": "optimization-suite-v1 (#356)",
       "resolved": [
         "H01",
-        "H02",
-        "H06"
+        "H02"
       ],
-      "note": "native H06 + H02, byte-identical >=2x; H01 native fuzzy extraction (d9cccda4)"
+      "note": "native H02, byte-identical >=2x; H01 native fuzzy extraction (d9cccda4)"
     },
     {
       "suite": "optimization-suite-v2 (#530)",

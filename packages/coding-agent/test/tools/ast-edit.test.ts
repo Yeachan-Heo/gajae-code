@@ -61,7 +61,7 @@ describe("ast_edit tool schema", () => {
 		expect(strict.strict).toBe(true);
 	});
 
-	it("renders +/- lines with aligned hashline prefixes", async () => {
+	it("renders +/- lines with aligned line:column prefixes", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-render-"));
 		try {
 			const filePath = path.join(tempDir, "legacy.ts");
@@ -82,9 +82,8 @@ describe("ast_edit tool schema", () => {
 
 			expect(removedLine).toBeDefined();
 			expect(addedLine).toBeDefined();
-			expect(removedLine).toMatch(/^-\d+[a-z]{2}\|/);
-			expect(addedLine).toMatch(/^\+\d+[a-z]{2}\|/);
-			expect(removedLine?.split("|", 1)[0].length).toBe(addedLine?.split("|", 1)[0].length);
+			expect(removedLine).toBe("-1:1 legacyWrap(x, value)");
+			expect(addedLine).toBe("+1:1 modernWrap(x, value)");
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

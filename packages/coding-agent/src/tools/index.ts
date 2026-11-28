@@ -245,7 +245,7 @@ export interface ToolSession {
 	promptTemplates?: PromptTemplate[];
 	/** Whether LSP integrations are enabled */
 	enableLsp?: boolean;
-	/** Whether an edit-capable tool is available in this session (controls hashline output) */
+	/** Whether an edit-capable tool is available in this session */
 	hasEditTool?: boolean;
 	/** Event bus for tool/extension communication */
 	eventBus?: EventBus;
@@ -444,12 +444,6 @@ export interface ToolSession {
 	getCheckpointState?: () => CheckpointState | undefined;
 	/** Set or clear active checkpoint state. */
 	setCheckpointState?: (state: CheckpointState | null) => void;
-
-	/** Per-session cache of file contents as last shown to the model by
-	 *  `read`/`search`. Used by hashline anchor-stale recovery to reconstruct
-	 *  the version the model authored anchors against when the file changed
-	 *  out-of-band. Lazily initialized by `getFileReadCache`. */
-	fileReadCache?: import("../edit/file-read-cache").FileReadCache;
 
 	/** Per-session log of unresolved git merge conflict regions surfaced by
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`

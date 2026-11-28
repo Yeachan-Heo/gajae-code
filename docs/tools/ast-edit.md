@@ -11,8 +11,7 @@
   - `packages/coding-agent/src/tools/path-utils.ts` — path/glob parsing and multi-path resolution
   - `packages/coding-agent/src/tools/resolve.ts` — preview/apply queueing
   - `packages/coding-agent/src/tools/render-utils.ts` — parse-error dedupe and display caps
-  - `packages/coding-agent/src/utils/file-display-mode.ts` — hashline vs line-number diff references
-  - `packages/coding-agent/src/hashline/hash.ts` — stable hashline diff anchors
+  - `packages/coding-agent/src/utils/file-display-mode.ts` — output display mode
   - `packages/natives/native/index.d.ts` — JS-visible native binding contract
 
 ## Inputs
@@ -33,7 +32,7 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 ## Outputs
 - Single-shot preview result from `ast_edit` itself.
 - Model-facing `content` is one text block showing proposed edits, grouped by file for directory/multi-file runs.
-  - Each change renders as two lines: `-REF|before` and `+REF|after` in hashline mode, or `-LINE:COLUMN before` / `+LINE:COLUMN after` when hashlines are off.
+  - Each change renders as two lines: `-LINE:COLUMN before` and `+LINE:COLUMN after`.
   - Only the first line of each `before`/`after` snippet is shown, truncated to 120 characters in the wrapper.
   - `Limit reached; narrow paths.` and formatted parse issues are appended when applicable.
 - If no rewrites match, text is `No replacements made` plus formatted parse issues when present.
@@ -72,7 +71,6 @@ Shared AST pattern grammar and language catalog: see [`ast_grep`](./ast-grep.md#
 - Internal URL inputs: only supported when the router resolves them to a backing file path.
 - Preview mode: always the direct `ast_edit` tool result.
 - Apply mode: only reachable through the queued `resolve` callback after a preview.
-- Hashline output mode vs plain line/column mode: controlled by `resolveFileDisplayMode()`.
 
 ## Side Effects
 - Filesystem

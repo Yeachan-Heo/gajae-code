@@ -13,21 +13,12 @@
  * the injected `editMode` rather than probing argument shape.
  */
 
-import { sanitizeText } from "@gajae-code/utils";
-import {
-	ABORT_MARKER,
-	BEGIN_PATCH_MARKER,
-	computeHashlineDiff,
-	computeHashlineSectionDiff,
-	containsRecognizableHashlineOperations,
-	END_PATCH_MARKER,
-	type HashlineInputSection,
-	HL_FILE_PREFIX,
-	HL_OP_CHARS,
-	splitHashlineInputs,
-} from "../hashline";
+// Patch envelope markers (apply_patch mode)
+const BEGIN_PATCH_MARKER = "*** Begin Patch";
+const END_PATCH_MARKER = "*** End Patch";
+const ABORT_MARKER = "*** Abort";
+
 import type { Theme } from "../modes/theme/theme";
-import { replaceTabs, truncateToWidth } from "../tools/render-utils";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { computeEditDiff, type DiffError, type DiffResult } from "./diff";
 import { type ApplyPatchEntry, expandApplyPatchToEntries, expandApplyPatchToPreviewEntries } from "./modes/apply-patch";
@@ -46,10 +37,9 @@ export interface StreamingDiffContext {
 	signal: AbortSignal;
 	fuzzyThreshold?: number;
 	allowFuzzy?: boolean;
-	hashlineAutoDropPureInsertDuplicates?: boolean;
 	/**
 	 * True while the tool's arguments are still streaming in. Strategies that
-	 * accept free-form text input (apply_patch, hashline) trim the trailing
+	 * accept free-form text input (apply_patch) trim the trailing
 	 * partial line so per-character growth of an in-flight `+added` line does
 	 * not flicker in the preview.
 	 */
@@ -118,25 +108,6 @@ function extractTrailingPartialJsonPath(partialJson: string | undefined): string
 	return trailingPath;
 }
 
-function normalizeHashlineTargetPath(rawPath: string): string {
-	const trimmed = rawPath.trim();
-	if (trimmed.length < 2) return trimmed;
-	const first = trimmed[0];
-	const last = trimmed[trimmed.length - 1];
-	return (first === '"' || first === "'") && first === last ? trimmed.slice(1, -1) : trimmed;
-}
-
-function getHashlineTargetPaths(input: string): string[] {
-	const stripped = input.startsWith("\uFEFF") ? input.slice(1) : input;
-	const paths: string[] = [];
-	for (const rawLine of stripped.split("\n")) {
-		const trimmed = rawLine.replace(/\r$/, "").trimEnd();
-		if (trimmed === END_PATCH_MARKER || trimmed === ABORT_MARKER) break;
-		if (isHashlineHeaderLine(trimmed)) paths.push(normalizeHashlineTargetPath(parseHashlineHeaderPath(trimmed)));
-	}
-	return paths.filter(Boolean);
-}
-
 /**
  * `apply_patch` carries operation metadata inside the envelope rather than in structured `edits`,
  * so the collapsed card has to read op/rename off the first parsed entry to stay accurate while live.
@@ -166,14 +137,6 @@ export function getEditRequestTargetInventory(
 				: undefined;
 	const edits = Array.isArray(values.edits) ? values.edits : [];
 
-	if (editMode === "hashline") {
-		const input = typeof values.input === "string" ? values.input : "";
-		const headerPaths = getHashlineTargetPaths(input);
-		// `path` is only the target for headerless input; explicit §PATH headers are the full target set.
-		if (headerPaths.length > 0) return { paths: orderedDistinctPaths(headerPaths) };
-		return { paths: orderedDistinctPaths([topLevelPath]) };
-	}
-
 	// Legacy call sites render the shared edit card without threading `renderContext.editMode`;
 	// a free-form `input` string is only ever an apply_patch envelope there.
 	if (editMode === "apply_patch" || (editMode === undefined && typeof values.input === "string")) {
@@ -195,63 +158,6 @@ export function getEditRequestTargetInventory(
 	});
 	const partialPath = options.isPartial ? extractTrailingPartialJsonPath(partialJson) : undefined;
 	return { paths: orderedDistinctPaths([topLevelPath, ...editPaths, partialPath]) };
-}
-
-const STREAMING_PLACEHOLDER_LINES = 12;
-const STREAMING_PLACEHOLDER_WIDTH = 80;
-
-function isHashlineHeaderLine(line: string): boolean {
-	return line.trimEnd().startsWith(HL_FILE_PREFIX);
-}
-
-function parseHashlineHeaderPath(line: string): string {
-	const trimmed = line.trimEnd();
-	let prefixEnd = 0;
-	while (prefixEnd < trimmed.length && trimmed[prefixEnd] === HL_FILE_PREFIX) prefixEnd++;
-	return trimmed.slice(prefixEnd).trim();
-}
-
-function isHashlineOpLine(line: string): boolean {
-	const first = line[0];
-	return first !== undefined && HL_OP_CHARS.includes(first);
-}
-
-function isHashlineEnvelopeMarkerLine(line: string): boolean {
-	const trimmed = line.trimEnd();
-	return trimmed === BEGIN_PATCH_MARKER || trimmed === END_PATCH_MARKER || trimmed === ABORT_MARKER;
-}
-
-function trimHashlineStreamingSyntax(lines: string[]): string[] {
-	let index = lines.findIndex(line => line.trim().length > 0);
-	if (index === -1) return [];
-
-	if (lines[index].trimEnd() === BEGIN_PATCH_MARKER) {
-		index++;
-		while (index < lines.length && lines[index].trim().length === 0) index++;
-	}
-	if (index < lines.length && isHashlineHeaderLine(lines[index])) {
-		index++;
-	}
-
-	return lines.slice(index).filter(line => !isHashlineEnvelopeMarkerLine(line));
-}
-
-function renderHashlineInputPlaceholder(input: string, uiTheme: Theme): string {
-	const lines = trimHashlineStreamingSyntax(sanitizeText(input).split("\n"));
-	if (!lines.some(line => line.trim().length > 0)) return "";
-
-	const displayLines = lines.slice(-STREAMING_PLACEHOLDER_LINES);
-	const hidden = lines.length - displayLines.length;
-	let text = "\n\n";
-	text += displayLines
-		.map(line => uiTheme.fg("toolOutput", truncateToWidth(replaceTabs(line), STREAMING_PLACEHOLDER_WIDTH)))
-		.join("\n");
-	if (hidden > 0) {
-		text += uiTheme.fg("dim", `\n… (streaming +${hidden} lines)`);
-	} else {
-		text += uiTheme.fg("dim", "\n(streaming)");
-	}
-	return text;
 }
 
 // -----------------------------------------------------------------------------
@@ -410,18 +316,12 @@ const patchStrategy: EditStreamingStrategy<PatchArgs> = {
 	},
 };
 
-interface HashlineArgs {
-	input?: string;
-	path?: string;
-	__partialJson?: string;
-}
-
 /**
- * While streaming a free-form text payload (apply_patch envelope, hashline
- * input), trim the trailing partial line so per-character growth of an
- * in-flight `+added` line does not cause the diff preview to flicker. The
- * full line will show on the next streaming tick once its `\n` arrives.
- * Returns `text` unchanged when not streaming or when no newline is present.
+ * While streaming a free-form text payload (apply_patch envelope), trim the
+ * trailing partial line so per-character growth of an in-flight `+added` line
+ * does not cause the diff preview to flicker. The full line will show on the
+ * next streaming tick once its `\n` arrives. Returns `text` unchanged when not
+ * streaming or when no newline is present.
  */
 function trimTrailingPartialLine(text: string, isStreaming: boolean | undefined): string {
 	if (!isStreaming) return text;
@@ -492,109 +392,6 @@ function buildApplyPatchNaturalOrderPreviews(input: string): PerFileDiffPreview[
 	return previews.length > 0 ? previews : null;
 }
 
-/**
- * Hashline equivalent: emit each payload line as a `+added` line in the
- * order the model typed it. We deliberately omit op headers and removal
- * targets from the streaming preview because their content lives in the file
- * and would require a costly re-apply per tick; the complete unified diff is
- * shown once streaming finishes.
- */
-function buildHashlineNaturalOrderPreviews(
-	input: string,
-	defaultPath: string | undefined,
-): PerFileDiffPreview[] | null {
-	const lines = input.split("\n");
-	const groups = new Map<string, string[]>();
-	let currentPath = defaultPath ?? "";
-	const ensure = (path: string): string[] => {
-		let bucket = groups.get(path);
-		if (!bucket) {
-			bucket = [];
-			groups.set(path, bucket);
-		}
-		return bucket;
-	};
-	for (const raw of lines) {
-		if (isHashlineEnvelopeMarkerLine(raw)) continue;
-		if (isHashlineHeaderLine(raw)) {
-			currentPath = parseHashlineHeaderPath(raw);
-			if (currentPath) ensure(currentPath);
-			continue;
-		}
-		if (isHashlineOpLine(raw) || !currentPath) continue;
-		ensure(currentPath).push(`+${raw}`);
-	}
-	if (groups.size === 0) return null;
-	const previews: PerFileDiffPreview[] = [];
-	for (const [path, body] of groups) {
-		if (body.length === 0) continue;
-		previews.push({ path, diff: body.join("\n") });
-	}
-	return previews.length > 0 ? previews : null;
-}
-
-const hashlineStrategy: EditStreamingStrategy<HashlineArgs> = {
-	extractCompleteEdits(args) {
-		return args;
-	},
-	async computeDiffPreview(args, ctx) {
-		if (typeof args.input !== "string" || args.input.length === 0) return null;
-		const input = trimTrailingPartialLine(args.input, ctx.isStreaming);
-		if (input.length === 0) return null;
-		if (ctx.isStreaming) {
-			// Skip the costly per-tick re-apply and avoid `Diff.structuredPatch`
-			// reordering by showing payload lines in input order.
-			return buildHashlineNaturalOrderPreviews(input, args.path);
-		}
-		ctx.signal.throwIfAborted();
-
-		let sections: HashlineInputSection[];
-		try {
-			sections = splitHashlineInputs(input, { cwd: ctx.cwd, path: args.path });
-		} catch {
-			// Single-section handling keeps the original error rendering for the
-			// "haven't typed `§ PATH` yet" case.
-			const result = await computeHashlineDiff({ input, path: args.path }, ctx.cwd, {
-				autoDropPureInsertDuplicates: ctx.hashlineAutoDropPureInsertDuplicates,
-			});
-			ctx.signal.throwIfAborted();
-			if ("error" in result && !args.path) return [{ path: "", error: result.error }];
-			return [toPerFilePreview(args.path ?? "", result)];
-		}
-		if (sections.length === 0) return null;
-
-		// While the trailing section is still being typed (no operations yet)
-		// skip it so its empty/parse-error result doesn't replace previews of
-		// already-completed sections with an opaque header.
-		const lastIndex = sections.length - 1;
-		const trailingIncomplete =
-			sections.length > 1 && !containsRecognizableHashlineOperations(sections[lastIndex].diff);
-		const sectionsToProcess = trailingIncomplete ? sections.slice(0, -1) : sections;
-		const trailingProcessedIndex = sectionsToProcess.length - 1;
-
-		const previews: PerFileDiffPreview[] = [];
-		for (let i = 0; i < sectionsToProcess.length; i++) {
-			ctx.signal.throwIfAborted();
-			const section = sectionsToProcess[i];
-			const result = await computeHashlineSectionDiff(section, ctx.cwd, {
-				autoDropPureInsertDuplicates: ctx.hashlineAutoDropPureInsertDuplicates,
-			});
-			ctx.signal.throwIfAborted();
-			// In a multi-section preview, ignore parse/apply errors from the
-			// last section: it's still streaming and the partial op may not
-			// parse yet. Earlier sections are stable and stay rendered.
-			if (sectionsToProcess.length > 1 && i === trailingProcessedIndex && "error" in result) {
-				continue;
-			}
-			previews.push(toPerFilePreview(section.path, result));
-		}
-		return previews.length > 0 ? previews : null;
-	},
-	renderStreamingPlaceholder(args, uiTheme) {
-		return typeof args.input === "string" ? renderHashlineInputPlaceholder(args.input, uiTheme) : "";
-	},
-};
-
 interface ApplyPatchArgs {
 	input?: string;
 }
@@ -664,7 +461,6 @@ const vimStrategy: EditStreamingStrategy<unknown> = {
 export const EDIT_MODE_STRATEGIES: Record<EditMode, EditStreamingStrategy<unknown>> = {
 	replace: replaceStrategy as EditStreamingStrategy<unknown>,
 	patch: patchStrategy as EditStreamingStrategy<unknown>,
-	hashline: hashlineStrategy as EditStreamingStrategy<unknown>,
 	apply_patch: applyPatchStrategy as EditStreamingStrategy<unknown>,
 	vim: vimStrategy,
 };

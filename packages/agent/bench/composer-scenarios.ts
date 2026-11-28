@@ -4,7 +4,6 @@
  */
 
 export type ScenarioId =
-	| "read-edit-hashline"
 	| "three-turn-tools"
 	| "bash-discipline"
 	| "file-discovery-discipline"
@@ -53,8 +52,8 @@ export const MIN_COMPARABLE_TRACE_SCENARIOS = 3;
 /** Public L2 claim: minimum scenarios with both roles represented in trace corpus. */
 export const L2_MIN_SCENARIO_COVERAGE = 10;
 
-export const COMPOSER_SCENARIOS_V1_COUNT = 13;
-export const TOTAL_SCENARIO_COUNT = 18;
+export const COMPOSER_SCENARIOS_V1_COUNT = 12;
+export const TOTAL_SCENARIO_COUNT = 17;
 
 export const COMPOSER_SCENARIOS_VERSION = "v2";
 
@@ -96,12 +95,6 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 				expectedEditText: "recovered-anchor-ok",
 				requireSuccess: true,
 			};
-		case "read-edit-hashline":
-			return {
-				targetPath: "fixtures/workspace/src/foo.ts",
-				expectedEditText: "hello-composer-harness",
-				requireSuccess: true,
-			};
 		case "bad-anchor-recovery":
 			return { targetPath: "fixtures/workspace/src/recover.ts", expectedEditText: "ok", requireSuccess: true };
 		case "multi-turn-yield-discipline":
@@ -134,7 +127,6 @@ export function traceExpectationForScenario(scenarioId: ScenarioId): TraceExpect
 }
 
 export const COMPOSER_SCENARIOS_V1_IDS = [
-	"read-edit-hashline",
 	"three-turn-tools",
 	"bash-discipline",
 	"file-discovery-discipline",
@@ -150,17 +142,6 @@ export const COMPOSER_SCENARIOS_V1_IDS = [
 ] as const satisfies readonly ScenarioId[];
 
 export const COMPOSER_SCENARIOS: ScenarioDefinition[] = [
-	{
-		id: "read-edit-hashline",
-		description: "Read anchored file contents, then apply one hashline edit.",
-		turns: "2-3",
-		fixture: "fixtures/workspace/src/foo.ts",
-		obligation: "final file matches golden and file IO uses read/edit tools only",
-		userPrompt:
-			"In this repo workspace, read fixtures/workspace/src/foo.ts with the read tool, then change the exported greeting string to exactly `hello-composer-harness` using the edit tool and hashline anchors from your read output. Do not use shell commands to read or write files.",
-		failureClass: "bad-anchor-unrecovered",
-		recovery: false,
-	},
 	{
 		id: "three-turn-tools",
 		description: "Chain read, search, and edit across three tool turns.",
@@ -256,7 +237,7 @@ export const COMPOSER_SCENARIOS: ScenarioDefinition[] = [
 		fixture: "fixtures/workspace/src/recover.ts",
 		obligation: "failed edit is followed by re-anchor read and successful edit",
 		userPrompt:
-			"Edit fixtures/workspace/src/recover.ts to set STATUS to `ok` using hashline edit. If anchors mismatch, use the rejection message's fresh anchors or re-read before retrying.",
+			"Edit fixtures/workspace/src/recover.ts to set STATUS to `ok` using the edit tool. If the edit is rejected, re-read the file before retrying.",
 		failureClass: "bad-anchor-unrecovered",
 		recovery: true,
 	},

@@ -401,14 +401,13 @@ describe("column cap plain-secret cut", () => {
 		expect(dumped.output).toContain("2".repeat(8));
 	});
 
-	test("wrapped ReadTool clips configured secrets but preserves raw and hashline output", async () => {
+	test("wrapped ReadTool clips configured secrets but preserves raw output", async () => {
 		const { settings, root } = await loadSettings(true);
 		const cwd = join(root, "project");
 		const file = join(cwd, "secret.txt");
 		const source = `${FILLER.repeat(760)}${CANARY}${FILLER.repeat(30)}\n`;
 		settings.set("tools.outputMaxColumns", COLUMN_CAP);
 		settings.set("read.summarize.enabled", false);
-		settings.set("readHashLines", false);
 		writeFileSync(file, source);
 		const tool = wrappedReadTool(settings, cwd);
 		const context = { settings } as AgentToolContext;
@@ -420,11 +419,6 @@ describe("column cap plain-secret cut", () => {
 			const raw = textOf(await tool.execute("read-raw", { path: `${file}:raw` }, undefined, undefined, context));
 			expect(raw).toContain(CANARY);
 			expect(raw).toContain(FILLER.repeat(30));
-
-			settings.set("readHashLines", true);
-			const hashline = textOf(await tool.execute("read-hashline", { path: file }, undefined, undefined, context));
-			expect(hashline).toContain(CANARY);
-			expect(hashline).toContain(FILLER.repeat(30));
 		} finally {
 			await settings.close();
 			rmSync(root, { recursive: true, force: true });
@@ -438,7 +432,6 @@ describe("column cap plain-secret cut", () => {
 		const file = join(cwd, "multiline-secret.txt");
 		settings.set("tools.outputMaxColumns", COLUMN_CAP);
 		settings.set("read.summarize.enabled", false);
-		settings.set("readHashLines", false);
 		writeFileSync(file, `${FILLER.repeat(750)}line1\nmiddle\n${"2".repeat(900)}${FILLER.repeat(2000)}`);
 		const tool = wrappedReadTool(settings, cwd);
 		try {

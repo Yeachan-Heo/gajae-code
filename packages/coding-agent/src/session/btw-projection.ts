@@ -87,8 +87,8 @@ function bashProgramTarget(value: unknown): string | undefined {
 
 /**
  * Per-tool allow-list of the one argument that names the target, taken from the
- * real tool schemas: `read`/`write` `path`; `edit` `path` (replace, patch and
- * hashline modes) or `file` (vim mode; apply_patch has neither, so no target);
+ * real tool schemas: `read`/`write` `path`; `edit` `path` (replace and
+ * patch modes) or `file` (vim mode; apply_patch has neither, so no target);
  * `find`/`search` `paths` only when it holds exactly one entry; `bash`
  * `command`, reduced to a bare first command word. Any other tool gets no
  * target.

@@ -8,7 +8,6 @@ import {
 import { EditTool } from "@gajae-code/coding-agent/edit";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import {
-	DEFAULT_EDIT_MODE,
 	detectModelEditFamily,
 	type EditMode,
 	type EditModeSessionLike,
@@ -79,18 +78,18 @@ describe("detectModelEditFamily", () => {
 		["gitlab-duo/duo-chat-gpt-5-2-codex", "codex", "apply_patch"],
 		["venice/openai-gpt-52-codex", "codex", "apply_patch"],
 		["custom/qwen3-coder", "qwen", "replace"],
-		["minimax-code/minimax-m2.5", "minimax", "hashline"],
-		["zai/glm-4.7", "glm", "hashline"],
-		["moonshotai/kimi-k2.5", "kimi", "hashline"],
-		["custom/moonshot-v1-code", "kimi", "hashline"],
-		["custom/not-a-codex-model", "unknown", "hashline"],
-		["custom/gpt-not-a-codex-model", "unknown", "hashline"],
-		["custom/gptx-codex", "unknown", "hashline"],
-		["custom/not-gpt-5-codex", "unknown", "hashline"],
-		["custom/gpt-5foo", "unknown", "hashline"],
-		["custom/gpt-5foo-bar", "unknown", "hashline"],
-		["custom/company-code-model", "unknown", "hashline"],
-		["custom/not-a-glm-model", "unknown", "hashline"],
+		["minimax-code/minimax-m2.5", "minimax", "replace"],
+		["zai/glm-4.7", "glm", "replace"],
+		["moonshotai/kimi-k2.5", "kimi", "replace"],
+		["custom/moonshot-v1-code", "kimi", "replace"],
+		["custom/not-a-codex-model", "unknown", "replace"],
+		["custom/gpt-not-a-codex-model", "unknown", "replace"],
+		["custom/gptx-codex", "unknown", "replace"],
+		["custom/not-gpt-5-codex", "unknown", "replace"],
+		["custom/gpt-5foo", "unknown", "replace"],
+		["custom/gpt-5foo-bar", "unknown", "replace"],
+		["custom/company-code-model", "unknown", "replace"],
+		["custom/not-a-glm-model", "unknown", "replace"],
 	];
 
 	for (const [modelId, family, mode] of cases) {
@@ -122,7 +121,7 @@ describe("resolveEditModeDetails precedence", () => {
 		Bun.env.GJC_EDIT_VARIANT = "vim";
 		const session = makeSession({
 			editMode: "replace",
-			modelVariants: { "gpt-5.4": "hashline" },
+			modelVariants: { "gpt-5.4": "replace" },
 			model: "openai/gpt-5.4",
 			catalogEditMode: "patch",
 		});
@@ -147,11 +146,11 @@ describe("resolveEditModeDetails precedence", () => {
 	test("matching modelVariants beats explicit edit.mode", () => {
 		const session = makeSession({
 			editMode: "replace",
-			modelVariants: { "gpt-5.4": "hashline" },
+			modelVariants: { "gpt-5.4": "replace" },
 			model: "custom-company/gpt-5.4",
 		});
 		const details = resolveEditModeDetails(session);
-		expect(details.mode).toBe("hashline");
+		expect(details.mode).toBe("replace");
 		expect(details.source).toBe("model-override");
 		expect(details.matchedRule).toBe("gpt-5.4");
 	});
@@ -186,16 +185,16 @@ describe("resolveEditModeDetails precedence", () => {
 		expect(details.family).toBe("claude");
 	});
 
-	test("unknown model falls back to hashline", () => {
+	test("unknown model falls back to default replace", () => {
 		const details = resolveEditModeDetails(makeSession({ editMode: "auto", model: "custom/company-code-model" }));
-		expect(details.mode).toBe(DEFAULT_EDIT_MODE);
+		expect(details.mode).toBe("replace");
 		expect(details.source).toBe("fallback");
 		expect(details.family).toBe("unknown");
 	});
 
-	test("missing model falls back to hashline under auto", () => {
+	test("missing model falls back to replace under auto", () => {
 		const details = resolveEditModeDetails(makeSession({ editMode: "auto" }));
-		expect(details.mode).toBe("hashline");
+		expect(details.mode).toBe("replace");
 		expect(details.source).toBe("fallback");
 	});
 
@@ -203,8 +202,8 @@ describe("resolveEditModeDetails precedence", () => {
 		// Schema default is now `auto`; no explicit edit.mode configured.
 		expect(resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toBe("apply_patch");
 		expect(resolveEditMode(makeSession({ model: "deepseek/deepseek-v3.2" }))).toBe("replace");
-		expect(resolveEditMode(makeSession({ model: "zai/glm-4.7" }))).toBe("hashline");
-		expect(resolveEditMode(makeSession({}))).toBe("hashline");
+		expect(resolveEditMode(makeSession({ model: "zai/glm-4.7" }))).toBe("replace");
+		expect(resolveEditMode(makeSession({}))).toBe("replace");
 	});
 
 	test("invalid environment value fails fast", () => {
@@ -256,8 +255,8 @@ describe("resolveEditModeDetails precedence", () => {
 });
 
 test("edit.modelVariants is a typed published setting with enum-validated values", () => {
-	const settings = Settings.isolated({ "edit.modelVariants": { "gpt-5.4": "hashline" } });
-	expect(settings.get("edit.modelVariants")).toEqual({ "gpt-5.4": "hashline" });
+	const settings = Settings.isolated({ "edit.modelVariants": { "gpt-5.4": "replace" } });
+	expect(settings.get("edit.modelVariants")).toEqual({ "gpt-5.4": "replace" });
 	expect(validateSettingPatch({ "edit.modelVariants": { "gpt-5.4": "apply_patch" } })).toEqual([]);
 	expect(validateSettingPatch({ "edit.modelVariants": { "gpt-5.4": 42 } })).toEqual([
 		{ path: "edit.modelVariants.gpt-5.4", detail: "Expected string-enum." },
@@ -297,13 +296,13 @@ describe("Settings.matchEditVariantForModel", () => {
 
 	test("resolver consumes Settings match with model-override provenance", () => {
 		const settings = Settings.isolated({
-			"edit.modelVariants": { "qwen3-coder-small": "hashline" },
+			"edit.modelVariants": { "qwen3-coder-small": "replace" },
 		});
 		const details = resolveEditModeDetails({
 			settings,
 			getActiveModelString: () => "local/qwen3-coder-small",
 		});
-		expect(details.mode).toBe("hashline");
+		expect(details.mode).toBe("replace");
 		expect(details.source).toBe("model-override");
 		expect(details.matchedRule).toBe("qwen3-coder-small");
 	});
@@ -343,12 +342,12 @@ describe("EditTool automatic routing", () => {
 		expect(tool.parameters).not.toBe(replaceParameters);
 
 		model = "minimax-code/minimax-m2.5";
-		expect(tool.mode).toBe("hashline");
+		expect(tool.mode).toBe("replace");
 		expect(tool.customWireName).toBeUndefined();
-		expect(tool.customFormat?.syntax).toBe("lark");
+		expect(tool.customFormat?.syntax).toBeUndefined();
 
 		model = "custom/company-code-model";
-		expect(tool.mode).toBe("hashline");
+		expect(tool.mode).toBe("replace");
 	});
 
 	test("explicit edit.mode pins the tool across model switches", () => {
@@ -372,12 +371,12 @@ describe("EditTool automatic routing", () => {
 	});
 
 	test("environment force pins the tool across model switches", () => {
-		Bun.env.GJC_EDIT_VARIANT = "hashline";
+		Bun.env.GJC_EDIT_VARIANT = "replace";
 		let model = "anthropic/claude-sonnet-4-6";
 		const tool = new EditTool(makeToolSession(() => model));
-		expect(tool.mode).toBe("hashline");
+		expect(tool.mode).toBe("replace");
 		model = "openai/gpt-5.4";
-		expect(tool.mode).toBe("hashline");
+		expect(tool.mode).toBe("replace");
 	});
 
 	test("invalid env variant fails fast at construction", () => {

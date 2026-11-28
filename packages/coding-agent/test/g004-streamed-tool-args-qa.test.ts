@@ -72,7 +72,6 @@ function makeCtx(tools: Record<string, AgentTool> = {}) {
 				if (key === "terminal.showImages") return false;
 				if (key === "edit.fuzzyMatch") return false;
 				if (key === "edit.fuzzyThreshold") return undefined;
-				if (key === "edit.hashlineAutoDropPureInsertDuplicates") return false;
 				if (key === "read.toolResultPreview") return false;
 				return undefined;
 			},
@@ -254,7 +253,7 @@ describe("G004 streamed tool args QA", () => {
 
 	it("COALESCE-SKIP recomputes and renders same-length changed edit previews", async () => {
 		const editModule = await import("../src/edit/index");
-		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
+		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).replace;
 		const originalCompute = strategy.computeDiffPreview;
 		const pending: Array<{ resolve: (value: unknown) => void }> = [];
 		strategy.computeDiffPreview = () => {
@@ -267,7 +266,7 @@ describe("G004 streamed tool args QA", () => {
 			"edit",
 			args,
 			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as any,
+			{ name: "edit", label: "Edit", mode: "replace" } as any,
 			ui,
 		);
 		component.setExpanded(true);
@@ -300,7 +299,7 @@ describe("G004 streamed tool args QA", () => {
 
 	it("COALESCE-SKIP retains a preview for an unchanged streamed payload", async () => {
 		const editModule = await import("../src/edit/index");
-		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
+		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).replace;
 		const originalCompute = strategy.computeDiffPreview;
 		const pending: Array<{ resolve: (value: unknown) => void }> = [];
 		strategy.computeDiffPreview = () => {
@@ -313,7 +312,7 @@ describe("G004 streamed tool args QA", () => {
 			"edit",
 			args,
 			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as any,
+			{ name: "edit", label: "Edit", mode: "replace" } as any,
 			ui,
 		);
 		try {

@@ -13,7 +13,6 @@ import { expandPromptTemplate, type PromptTemplate } from "@gajae-code/coding-ag
 import { expandSlashCommand, type FileSlashCommand } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { parseCommandArgs, substituteArgs } from "@gajae-code/coding-agent/utils/command-args";
 import browserDescription from "../src/prompts/tools/browser.md" with { type: "text" };
-import hashlineDescription from "../src/prompts/tools/hashline.md" with { type: "text" };
 
 // ============================================================================
 // substituteArgs
@@ -236,52 +235,6 @@ describe("parseCommandArgs + substituteArgs integration", () => {
 	});
 });
 
-// ============================================================================
-// Hashline prompt helpers
-// ============================================================================
-
-describe("hashline prompt helpers", () => {
-	function createPromptTemplate(content: string): PromptTemplate {
-		return {
-			name: "test-template",
-			description: "Test template",
-			content,
-			source: "test",
-		};
-	}
-
-	function expandPrompt(content: string): string {
-		return expandPromptTemplate("/test-template", [createPromptTemplate(content)]);
-	}
-
-	test("href and hrefr should reuse anchors remembered from hline", () => {
-		const result = expandPrompt(
-			'{{hline 2 "const timeout = 5000;"}}\nquoted={{href 2}}\nraw={{hrefr 2}}\nlast={{hrefr}}',
-		);
-		const [line, quoted, raw, last] = result.split("\n");
-		const ref = line.split("|", 1)[0];
-
-		expect(line).toBe(`${ref}|const timeout = 5000;`);
-		expect(quoted).toBe(`quoted="${ref}"`);
-		expect(raw).toBe(`raw=${ref}`);
-		expect(last).toBe(`last=${ref}`);
-	});
-
-	test("href and hrefr should still support explicit content without hline state", () => {
-		const result = expandPrompt('quoted={{href 5 "\treturn clean;"}}\nraw={{hrefr 5 "\treturn clean;"}}');
-		const [quoted, raw] = result.split("\n");
-		const ref = raw.slice("raw=".length);
-
-		expect(quoted).toBe(`quoted="${ref}"`);
-		expect(ref).toMatch(/^5[a-z]{2}$/);
-	});
-
-	test("href should not reuse hline state across prompt renders", () => {
-		expect(expandPrompt('{{hline 1 "const x = 1;"}}\n{{hrefr}}')).toMatch(/^1[a-z]{2}\|const x = 1;\n1[a-z]{2}$/);
-		expect(() => expandPrompt("{{hrefr}}")).toThrow("previous {{hline}}");
-	});
-});
-
 describe("tool prompt descriptions", () => {
 	test("retains browser safety, structured-action, and shipped-reference contracts", () => {
 		expect(browserDescription).toContain("MUST call `open` before `run` or `act`");
@@ -295,17 +248,6 @@ describe("tool prompt descriptions", () => {
 		expect(browserDescription).toContain("cookies and authenticated accounts");
 		expect(browserDescription).toContain("gjc://tools/browser.md");
 		expect(browserDescription).toContain('"action":"run"');
-	});
-
-	test("retains hashline anchor, boundary, and operation-discovery contracts", () => {
-		expect(hashlineDescription).toContain("Anchors reference the file as last read");
-		expect(hashlineDescription).toContain("replay past B");
-		expect(hashlineDescription).toContain("Touching a multiline construct? Widen to the whole thing");
-		expect(hashlineDescription).toContain("To keep a blank line, include one explicit empty payload line");
-		expect(hashlineDescription).toContain("`»{{hrefr 4}}`");
-		expect(hashlineDescription).toContain("`«{{hrefr 5}}`");
-		expect(hashlineDescription).toContain("`≔{{hrefr 5}}`");
-		expect(hashlineDescription).toContain("Copy anchors verbatim");
 	});
 });
 

@@ -1,9 +1,8 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { EDIT_MODE_STRATEGIES } from "@gajae-code/coding-agent/edit";
 import { editToolRenderer } from "@gajae-code/coding-agent/edit/renderer";
-import { getEditRequestTargetInventory, type PerFileDiffPreview } from "@gajae-code/coding-agent/edit/streaming";
+import { getEditRequestTargetInventory } from "@gajae-code/coding-agent/edit/streaming";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import type { TUI } from "@gajae-code/tui";
@@ -41,7 +40,6 @@ describe("editToolRenderer", () => {
 		const cases = [
 			["replace", { path: "a.ts", newText: "SECRET_BODY" }],
 			["patch", { path: "a.ts", diff: "SECRET_BODY", op: "update" }],
-			["hashline", { input: "§a.ts\nSECRET_BODY" }],
 			["apply_patch", { input: "*** Begin Patch\n*** Add File: a.ts\n+SECRET_BODY" }],
 		] as const;
 		for (const [editMode, args] of cases) {
@@ -65,12 +63,6 @@ describe("editToolRenderer", () => {
 				editMode: "patch" as const,
 				args: { edits: [{ path: "a.ts" }, { path: "b.ts" }], patch: "expanded patch" },
 				expectedDetail: "expanded patch",
-			},
-			{
-				editMode: "hashline" as const,
-				args: { input: "§a.ts\n§b.ts\nexpanded hashline" },
-				expectedDetail: "expanded hashline fallback",
-				editStreamingFallback: "expanded hashline fallback",
 			},
 			{
 				editMode: "apply_patch" as const,
@@ -110,15 +102,7 @@ describe("editToolRenderer", () => {
 				},
 			).paths,
 		).toEqual(["a", "b", "c"]);
-		expect(getEditRequestTargetInventory({ input: "§'a'\n§b\n§a" }, "hashline", { isPartial: true }).paths).toEqual([
-			"a",
-			"b",
-		]);
-		expect(
-			getEditRequestTargetInventory({ path: "fallback.ts", input: "§actual.ts\n»BOF\n+x" }, "hashline", {
-				isPartial: true,
-			}).paths,
-		).toEqual(["actual.ts"]);
+
 		expect(
 			getEditRequestTargetInventory(
 				{ input: "*** Begin Patch\n*** Update File: a\n@@\n-old\n+new\n*** Update File: b" },
@@ -143,20 +127,6 @@ describe("editToolRenderer", () => {
 		expect(Bun.stripANSI(del.render(160).join("\n"))).toContain("Delete");
 	});
 
-	it("uses hashline input headers for streaming call path without apply_patch errors", async () => {
-		const uiTheme = await getUiTheme();
-		const component = editToolRenderer.renderCall(
-			{
-				input: "§packages/coding-agent/src/edit/renderer.ts\n»EOF\n// preview",
-			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
-			uiTheme,
-		);
-
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("packages/coding-agent/src/edit/renderer.ts");
-		expect(rendered).not.toContain("The first line of the patch must be");
-	});
 	it("suppresses only the missing end marker while apply_patch arguments are partial", async () => {
 		const uiTheme = await getUiTheme();
 		const args = { input: "*** Begin Patch\n*** Add File: a.ts\n+preview" };
@@ -173,103 +143,6 @@ describe("editToolRenderer", () => {
 
 		expect(Bun.stripANSI(partial.render(160).join("\n"))).not.toContain("*** End Patch");
 		expect(Bun.stripANSI(complete.render(160).join("\n"))).toContain("*** End Patch");
-	});
-	it("hides hashline envelope input while the live card is collapsed", async () => {
-		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const hashlineTool = { name: "edit", label: "Edit", mode: "hashline" } as unknown as AgentTool;
-		const component = new ToolExecutionComponent(
-			"edit",
-			{
-				input: ["*** Begin Patch", "§crates/pi-natives/src/shell.rs", "»EOF", "pub fn streaming_preview() {"].join(
-					"\n",
-				),
-			},
-			{},
-			hashlineTool,
-			uiStub,
-		);
-
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("crates/pi-natives/src/shell.rs");
-		expect(rendered).not.toContain("»EOF");
-		expect(rendered).not.toContain("pub fn streaming_preview() {");
-		expect(rendered).not.toContain("*** Begin Patch");
-	});
-
-	it("recognizes compact and quoted hashline input headers", async () => {
-		const uiTheme = await getUiTheme();
-		const compactComponent = editToolRenderer.renderCall(
-			{
-				input: "§foo bar.ts\n»BOF\n// preview",
-			},
-			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
-			uiTheme,
-		);
-
-		const quotedComponent = editToolRenderer.renderCall(
-			{
-				input: "§'baz qux.ts'\n»BOF\n// preview",
-			},
-			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
-			uiTheme,
-		);
-
-		const compactRendered = Bun.stripANSI(compactComponent.render(160).join("\n"));
-		const quotedRendered = Bun.stripANSI(quotedComponent.render(160).join("\n"));
-		expect(compactRendered).toContain("foo bar.ts");
-		expect(quotedRendered).toContain("baz qux.ts");
-	});
-
-	it("strips canonical `§` and longer `§` runs from hashline input headers", async () => {
-		const uiTheme = await getUiTheme();
-
-		// Canonical `§PATH` form — the parser strips the marker and the
-		// renderer keeps the title clean.
-		const canonical = editToolRenderer.renderCall(
-			{
-				input: "§packages/coding-agent/src/slash-commands/builtin-registry.ts\n»BOF\n// preview",
-			},
-			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
-			uiTheme,
-		);
-
-		// Even longer runs should still produce the clean path.
-		const triple = editToolRenderer.renderCall(
-			{ input: "§§§a/b/c.ts\n»BOF\n// preview" },
-			{ expanded: true, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "hashline" } },
-			uiTheme,
-		);
-
-		const canonicalRendered = Bun.stripANSI(canonical.render(160).join("\n"));
-		const tripleRendered = Bun.stripANSI(triple.render(160).join("\n"));
-
-		expect(canonicalRendered).toContain("packages/coding-agent/src/slash-commands/builtin-registry.ts");
-		expect(canonicalRendered).not.toMatch(/§packages\/coding-agent/);
-		expect(tripleRendered).toContain("a/b/c.ts");
-		expect(tripleRendered).not.toMatch(/§+a\/b\/c\.ts/);
-	});
-
-	it("uses hashline input headers for completed single-file result path", async () => {
-		const uiTheme = await getUiTheme();
-		const component = editToolRenderer.renderResult(
-			{
-				content: [{ type: "text", text: "Updated packages/coding-agent/src/edit/renderer.ts" }],
-				details: {
-					diff: "+1|// preview",
-					op: "update",
-				},
-			},
-			{ expanded: false, isPartial: false, renderContext: { editMode: "hashline" } },
-			uiTheme,
-			{
-				input: "§packages/coding-agent/src/edit/renderer.ts\n»EOF\n// preview",
-			},
-		);
-
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("packages/coding-agent/src/edit/renderer.ts");
-		expect(rendered).not.toContain(" …");
 	});
 	it("uses result-owned collapsed receipts and keeps failure detail expanded", async () => {
 		const uiTheme = await getUiTheme();
@@ -311,20 +184,6 @@ describe("editToolRenderer", () => {
 		);
 		expect(Bun.stripANSI(component.render(160).join("\n"))).toContain("full failure detail");
 	});
-	it("renders a represented partial file and pending target through the execution component", async () => {
-		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const tool = { name: "edit", label: "Edit", mode: "hashline" } as unknown as AgentTool;
-		const component = new ToolExecutionComponent("edit", { input: "§a.ts\n»EOF\n§b.ts" }, {}, tool, uiStub);
-		component.updateResult(
-			{ content: [], details: { diff: "", perFileResults: [{ path: "a.ts", diff: "+done" }] } },
-			true,
-		);
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("a.ts");
-		expect(rendered).toContain("1 more file pending");
-	});
-
 	it("deduplicates represented paths and keeps mixed per-file receipts independent of a call preview", async () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderResult(
@@ -342,10 +201,10 @@ describe("editToolRenderer", () => {
 			{
 				expanded: false,
 				isPartial: true,
-				renderContext: { editMode: "hashline", editDiffPreview: { diff: "", firstChangedLine: 99 } },
+				renderContext: { editMode: "patch", editDiffPreview: { diff: "", firstChangedLine: 99 } },
 			},
 			uiTheme,
-			{ input: "§a.ts\n§b.ts\n§c.ts" },
+			{ edits: [{ path: "a.ts" }, { path: "b.ts" }, { path: "c.ts" }], patch: "" },
 		);
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 		expect(rendered).toContain("a.ts:3");
@@ -354,24 +213,6 @@ describe("editToolRenderer", () => {
 		expect(rendered).toContain("failed b");
 		expect(rendered).toContain("1 more file pending");
 	});
-	it("uses separate requested and represented cardinalities for pending files", async () => {
-		const uiTheme = await getUiTheme();
-		const component = editToolRenderer.renderResult(
-			{
-				content: [],
-				details: {
-					perFileResults: [{ path: "a", diff: "+done" }],
-					diff: "",
-				},
-			},
-			{ expanded: false, isPartial: true, renderContext: { editMode: "hashline" } },
-			uiTheme,
-			{ input: "§a\n»EOF\n§a\n»EOF\n§b" },
-		);
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("1 more file pending");
-	});
-
 	it("uses per-file matching preview and narrowed request metadata fallbacks", async () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderResult(
@@ -475,13 +316,13 @@ describe("editToolRenderer", () => {
 
 	it("changes live detail only when expanded", async () => {
 		const uiTheme = await getUiTheme();
-		const args = { input: "§a.ts\nstream lifecycle detail" };
+		const args = { input: "*** Begin Patch\n*** Add File: a.ts\n+stream lifecycle detail" };
 		const collapsed = editToolRenderer.renderCall(
 			args,
 			{
 				expanded: false,
 				isPartial: true,
-				renderContext: { editMode: "hashline", editStreamingFallback: "stream lifecycle detail" },
+				renderContext: { editMode: "apply_patch", editStreamingFallback: "stream lifecycle detail" },
 			},
 			uiTheme,
 		);
@@ -490,57 +331,12 @@ describe("editToolRenderer", () => {
 			{
 				expanded: true,
 				isPartial: true,
-				renderContext: { editMode: "hashline", editStreamingFallback: "stream lifecycle detail" },
+				renderContext: { editMode: "apply_patch", editStreamingFallback: "stream lifecycle detail" },
 			},
 			uiTheme,
 		);
 		expect(Bun.stripANSI(collapsed.render(160).join("\n"))).not.toContain("stream lifecycle detail");
 		expect(Bun.stripANSI(expanded.render(160).join("\n"))).toContain("stream lifecycle detail");
-	});
-	it("keeps a single-path preview for a boxed partial result", async () => {
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const strategy = EDIT_MODE_STRATEGIES.hashline;
-		const originalCompute = strategy.computeDiffPreview;
-		const pending = Promise.withResolvers<PerFileDiffPreview[] | null>();
-		strategy.computeDiffPreview = () => pending.promise;
-		const component = new ToolExecutionComponent(
-			"edit",
-			{ input: "§a.ts\n§b.ts" },
-			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as unknown as AgentTool,
-			uiStub,
-		);
-		try {
-			component.updateResult(
-				{ content: [], details: { diff: "", perFileResults: [{ path: "a.ts", diff: "" }] } },
-				true,
-			);
-			pending.resolve([{ path: "a.ts", diff: "", firstChangedLine: 7 }]);
-			for (let attempt = 0; attempt < 20; attempt++) await Promise.resolve();
-			expect(Bun.stripANSI(component.render(160).join("\n"))).toContain("a.ts:7");
-		} finally {
-			strategy.computeDiffPreview = originalCompute;
-			component.dispose();
-		}
-	});
-
-	it("reports only visible streaming deltas through the transcript mutation handle", () => {
-		const uiStub = { requestRender() {} } as unknown as TUI;
-		const component = new ToolExecutionComponent(
-			"edit",
-			{ input: "§a.ts\nhidden one" },
-			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as unknown as AgentTool,
-			uiStub,
-		);
-		component.consumeVisibleTranscriptChange();
-		component.updateArgs({ input: "§a.ts\nhidden two" });
-		expect(component.consumeVisibleTranscriptChange()).toBe(false);
-		component.setExpanded(true);
-		component.consumeVisibleTranscriptChange();
-		component.updateArgs({ input: "§a.ts\nvisible three" });
-		expect(component.consumeVisibleTranscriptChange()).toBe(true);
-		component.dispose();
 	});
 	it("reports diagnostics as availability without rendering their content while collapsed", async () => {
 		const uiTheme = await getUiTheme();
@@ -561,7 +357,7 @@ describe("editToolRenderer", () => {
 		expect(rendered).toContain("Diagnostics available");
 		expect(rendered).not.toContain("0 diagnostics");
 	});
-	it("keeps trailing partial targets and ignores hashline headers after terminators", () => {
+	it("keeps trailing partial targets in partial JSON payload", () => {
 		expect(
 			getEditRequestTargetInventory(
 				{
@@ -572,11 +368,6 @@ describe("editToolRenderer", () => {
 				{ isPartial: true },
 			).paths,
 		).toEqual(["a.ts", "b.ts"]);
-		expect(
-			getEditRequestTargetInventory({ input: "§a.ts\n*** End Patch\n§not-a-target.ts" }, "hashline", {
-				isPartial: true,
-			}).paths,
-		).toEqual(["a.ts"]);
 	});
 
 	it("uses details-first identity and keeps rich details expanded", async () => {
@@ -655,39 +446,6 @@ describe("editToolRenderer", () => {
 		const rendered = component.render(160).join("\n");
 		expect(rendered).not.toContain("https://bad");
 		expect(rendered).not.toContain("\x1b]8;;");
-	});
-
-	it("treats the top-level path as a hashline fallback only when no explicit headers exist", () => {
-		const explicitSingle = getEditRequestTargetInventory(
-			{ path: "default.ts", input: "§actual.ts\n»BOF\n+x" },
-			"hashline",
-			{ isPartial: false },
-		);
-		const explicitMulti = getEditRequestTargetInventory(
-			{ path: "default.ts", input: "§a.ts\n»BOF\n+x\n§b.ts\n»BOF\n+y" },
-			"hashline",
-			{ isPartial: false },
-		);
-		const headerless = getEditRequestTargetInventory({ path: "default.ts", input: "»BOF\n+x" }, "hashline", {
-			isPartial: false,
-		});
-
-		expect(explicitSingle.paths).toEqual(["actual.ts"]);
-		expect(explicitMulti.paths).toEqual(["a.ts", "b.ts"]);
-		expect(headerless.paths).toEqual(["default.ts"]);
-	});
-
-	it("does not advertise extra targets for single-header hashline input with a fallback path", async () => {
-		const uiTheme = await getUiTheme();
-		const component = editToolRenderer.renderCall(
-			{ path: "default.ts", input: "§actual.ts\n»BOF\n+x" },
-			{ expanded: false, isPartial: true, renderContext: { editMode: "hashline" } },
-			uiTheme,
-		);
-		const rendered = Bun.stripANSI(component.render(160).join("\n"));
-		expect(rendered).toContain("actual.ts");
-		expect(rendered).not.toContain("more)");
-		expect(rendered).not.toContain("default.ts");
 	});
 
 	it("keeps apply_patch operation and rename metadata on live cards", async () => {

@@ -9,7 +9,6 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
-import { FileReadCache } from "../src/edit/file-read-cache";
 import { writeFileAtomically } from "../src/tools/atomic-file-write";
 
 function createSession(cwd: string, extras: Partial<ToolSession> = {}): ToolSession {
@@ -175,15 +174,6 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		await expect(
 			new ReadTool(createSession(tmpDir, { getClientBridge: () => bridge })).execute("denied", { path: dest }),
 		).rejects.toThrow(/permission denied by client/);
-	});
-
-	it("invalidates the file-read cache after a successful write", async () => {
-		const dest = path.join(tmpDir, "cached.ts");
-		const cache = new FileReadCache();
-		cache.recordContiguous(dest, 1, ["old line"]);
-		const session = createSession(tmpDir, { fileReadCache: cache });
-		await new WriteTool(session).execute("cache-write", { path: dest, content: "new line\n" });
-		expect(cache.get(dest)).toBeNull();
 	});
 
 	it("writes through a destination symlink without replacing the link", async () => {

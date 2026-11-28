@@ -139,7 +139,7 @@ fn diff_lines_impl(old_text: &[u16], new_text: &[u16]) -> Vec<DiffChange> {
 /// `diffArrays` semantics (exact code-unit equality, empty lines preserved),
 /// returning only run lengths.
 ///
-/// Callers that map line numbers — like hashline recovery — need the counts,
+/// Callers that map line numbers need the counts,
 /// not another copy of the text.
 #[napi]
 pub fn diff_line_runs(old_text: JsString, new_text: JsString) -> Result<Vec<DiffRun>> {

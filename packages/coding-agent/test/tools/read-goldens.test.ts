@@ -5,8 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { EditTool, getFileReadCache } from "@gajae-code/coding-agent/edit";
-import { computeLineHash } from "@gajae-code/coding-agent/hashline/hash";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { wrapToolWithMetaNotice } from "@gajae-code/coding-agent/tools/output-meta";
@@ -27,7 +25,6 @@ const GOLDEN_BUCKETS_TO_CHECK: readonly Bucket[] =
 	FORCE_TRUNCATION === "head" ? ["invariant"] : ["invariant", "changed", "surface"];
 
 type Bucket = "invariant" | "changed" | "surface";
-type Variant = "hl" | "plain";
 
 const EXPECTED_MANIFEST_COUNTS: Record<Bucket, number> = {
 	invariant: 29,
@@ -80,7 +77,7 @@ const EXPECTED_MANIFEST_NAMES: Record<Bucket, readonly string[]> = {
 	],
 	surface: ["docs-read-flow-line", "cli-read-help", "prompt-read-default-surface", "prompt-read-head-surface"],
 };
-const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 58; // phase 0 only has invariant (29 * 2 variants)
+const EXPECTED_PHASE_ZERO_GOLDEN_FILES = 29; // phase 0 only has invariant
 type Request = { path: string; [key: string]: unknown };
 type Entry = {
 	bucket: Bucket;
@@ -89,7 +86,6 @@ type Entry = {
 	request: Request;
 	capturedAs?: Request;
 	settings?: Record<string, unknown>;
-	hashLines: boolean[];
 	reason?: string;
 };
 type Captured = {
@@ -119,12 +115,8 @@ let urlPageSpy: ReturnType<typeof vi.spyOn> | undefined;
 let markitConvertSpy: { mockRestore(): void } | undefined;
 let artifactCounter = 0;
 
-function variantFor(hashLines: boolean): Variant {
-	return hashLines ? "hl" : "plain";
-}
-
-function goldenPath(bucket: Bucket, name: string, variant: Variant): string {
-	return path.join(GOLDEN_ROOT, bucket, `${name}.${variant}.json`);
+function goldenPath(bucket: Bucket, name: string): string {
+	return path.join(GOLDEN_ROOT, bucket, `${name}.json`);
 }
 
 function stableJson(value: unknown): string {
@@ -135,7 +127,7 @@ function deepEqual(left: unknown, right: unknown): boolean {
 	return stableJson(left) === stableJson(right);
 }
 
-function writeGolden(bucket: Bucket, name: string, variant: Variant, value: Captured): void {
+function writeGolden(bucket: Bucket, name: string, value: Captured): void {
 	if (bucket !== "changed") {
 		throw new Error(
 			`refusing to write ${bucket}/${name}: update mode may only write changed/. Drift here is an implementation bug, not a golden bug.`,
@@ -143,58 +135,57 @@ function writeGolden(bucket: Bucket, name: string, variant: Variant, value: Capt
 	}
 	if (!UPDATE) throw new Error("writeGolden called without GJC_UPDATE_READ_GOLDENS=1");
 	fs.mkdirSync(path.join(GOLDEN_ROOT, bucket), { recursive: true });
-	fs.writeFileSync(goldenPath(bucket, name, variant), `${stableJson(value)}\n`);
+	fs.writeFileSync(goldenPath(bucket, name), `${stableJson(value)}\n`);
 }
 
-function seedGolden(bucket: Bucket, name: string, variant: Variant, value: Captured): void {
+function seedGolden(bucket: Bucket, name: string, value: Captured): void {
 	if (bucket === "changed") throw new Error(`seeding is not allowed for changed/${name}`);
 	if (!SEED_INVARIANT) throw new Error("seedGolden called without GJC_SEED_READ_GOLDENS=1");
-	const target = goldenPath(bucket, name, variant);
-	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing ${bucket}/${name}.${variant}.json`);
+	const target = goldenPath(bucket, name);
+	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing ${bucket}/${name}.json`);
 	fs.mkdirSync(path.join(GOLDEN_ROOT, bucket), { recursive: true });
 	fs.writeFileSync(target, `${stableJson(value)}\n`);
 }
 
-function seedSurfaceGolden(name: string, variant: Variant, value: Captured): void {
+function seedSurfaceGolden(name: string, value: Captured): void {
 	if (!SEED_SURFACE) throw new Error("seedSurfaceGolden called without GJC_SEED_READ_SURFACE_GOLDENS=1");
-	const target = goldenPath("surface", name, variant);
-	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing surface/${name}.${variant}.json`);
+	const target = goldenPath("surface", name);
+	if (fs.existsSync(target)) throw new Error(`refusing to overwrite existing surface/${name}.json`);
 	fs.mkdirSync(path.join(GOLDEN_ROOT, "surface"), { recursive: true });
 	fs.writeFileSync(target, `${stableJson(value)}\n`);
 }
 
 function compareGolden(
 	entry: Entry,
-	variant: Variant,
 	value: Captured,
 	currentPhase: 0 | 1,
 ): "compared" | "seeded" | "updated" | "skipped" {
-	const target = goldenPath(entry.bucket, entry.name, variant);
+	const target = goldenPath(entry.bucket, entry.name);
 	const exists = fs.existsSync(target);
 	if (!exists && entry.phase === 1 && currentPhase === 0) return "skipped";
 	if (!exists) {
 		if (entry.bucket === "surface" && SEED_SURFACE) {
-			seedSurfaceGolden(entry.name, variant, value);
+			seedSurfaceGolden(entry.name, value);
 			return "seeded";
 		}
 		if (entry.bucket !== "changed" && SEED_INVARIANT) {
-			seedGolden(entry.bucket, entry.name, variant, value);
+			seedGolden(entry.bucket, entry.name, value);
 			return "seeded";
 		}
 		if (entry.bucket === "changed" && UPDATE) {
-			writeGolden(entry.bucket, entry.name, variant, value);
+			writeGolden(entry.bucket, entry.name, value);
 			return "updated";
 		}
-		throw new Error(`missing golden ${entry.bucket}/${entry.name}.${variant}.json`);
+		throw new Error(`missing golden ${entry.bucket}/${entry.name}.json`);
 	}
 
 	const expected = JSON.parse(fs.readFileSync(target, "utf8")) as Captured;
 	if (!deepEqual(expected, value)) {
 		if (entry.bucket === "changed" && UPDATE) {
-			writeGolden(entry.bucket, entry.name, variant, value);
+			writeGolden(entry.bucket, entry.name, value);
 			return "updated";
 		}
-		throw new Error(`golden drift in ${entry.bucket}/${entry.name}.${variant}.json`);
+		throw new Error(`golden drift in ${entry.bucket}/${entry.name}.json`);
 	}
 	return "compared";
 }
@@ -221,16 +212,6 @@ function textOf(result: ReadResult): string {
 		.filter(block => block.type === "text")
 		.map(block => block.text ?? "")
 		.join("\n");
-}
-
-type HashlineAnchor = { line: number; hash: string; content: string };
-
-function parseHashlineAnchors(text: string): HashlineAnchor[] {
-	return text
-		.split("\n")
-		.map(line => /^(\d+)([a-z]{2})\|(.*)$/.exec(line))
-		.filter((match): match is RegExpExecArray => match !== null)
-		.map(match => ({ line: Number(match[1]), hash: match[2], content: match[3] }));
 }
 
 function createSession(cwd: string, settings: Settings, artifactDir: string, bridgeText?: string): ToolSession {
@@ -308,7 +289,7 @@ function expectedGoldenFiles(currentPhase: GoldenPhase): Map<Bucket, Set<string>
 	]);
 	for (const entry of manifest.filter(candidate => candidate.phase <= currentPhase)) {
 		const files = expected.get(entry.bucket)!;
-		for (const hashLines of entry.hashLines) files.add(`${entry.name}.${variantFor(hashLines)}.json`);
+		files.add(`${entry.name}.json`);
 	}
 	return expected;
 }
@@ -316,9 +297,7 @@ function expectedGoldenFiles(currentPhase: GoldenPhase): Map<Bucket, Set<string>
 function phaseOneGoldensReady(): boolean {
 	return manifest
 		.filter(entry => entry.phase === 1)
-		.every(entry =>
-			entry.hashLines.every(hashLines => fs.existsSync(goldenPath(entry.bucket, entry.name, variantFor(hashLines)))),
-		);
+		.every(entry => fs.existsSync(goldenPath(entry.bucket, entry.name)));
 }
 const REQUESTED_PHASE = process.env.GJC_READ_GOLDENS_PHASE;
 const CURRENT_PHASE: GoldenPhase =
@@ -510,39 +489,33 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 			continue;
 		}
 		assertRunnable(entry, currentPhase);
-		for (const hashLines of entry.hashLines) {
-			const variant = variantFor(hashLines);
-			const settings = Settings.isolated({
-				// Goldens pin the read tool's own rendering. The universal inline-result
-				// backstop is a separate wrapper layer with its own tests
-				// (inline-result-backstop.test.ts); entries opt in via entry.settings.
-				"tools.maxInlineResultBytes": 0,
-				...(entry.settings ?? {}),
-				...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
-				readHashLines: hashLines,
-			});
-			const bridgeText =
-				entry.name === "acp-bare-parity"
-					? fs.readFileSync(path.join(fixture.root, "prose.txt"), "utf8")
-					: undefined;
-			const session = createSession(fixture.root, settings, fixture.artifactDir, bridgeText);
-			const tool = wrapToolWithMetaNotice(new ReadTool(session));
-			const value =
-				entry.bucket === "surface"
-					? await captureSurface(entry, new ReadTool(session))
-					: capture(
-							(await tool.execute(
-								`read-golden-${entry.name}-${variant}`,
-								materializeRequest(entry.capturedAs ?? entry.request) as Parameters<
-									InstanceType<typeof ReadTool>["execute"]
-								>[1],
-								undefined,
-								undefined,
-								createContext(settings),
-							)) as ReadResult,
-						);
-			compareGolden(entry, variant, value, currentPhase);
-		}
+		const settings = Settings.isolated({
+			// Goldens pin the read tool's own rendering. The universal inline-result
+			// backstop is a separate wrapper layer with its own tests
+			// (inline-result-backstop.test.ts); entries opt in via entry.settings.
+			"tools.maxInlineResultBytes": 0,
+			...(entry.settings ?? {}),
+			...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
+		});
+		const bridgeText =
+			entry.name === "acp-bare-parity" ? fs.readFileSync(path.join(fixture.root, "prose.txt"), "utf8") : undefined;
+		const session = createSession(fixture.root, settings, fixture.artifactDir, bridgeText);
+		const tool = wrapToolWithMetaNotice(new ReadTool(session));
+		const value =
+			entry.bucket === "surface"
+				? await captureSurface(entry, new ReadTool(session))
+				: capture(
+						(await tool.execute(
+							`read-golden-${entry.name}`,
+							materializeRequest(entry.capturedAs ?? entry.request) as Parameters<
+								InstanceType<typeof ReadTool>["execute"]
+							>[1],
+							undefined,
+							undefined,
+							createContext(settings),
+						)) as ReadResult,
+					);
+		compareGolden(entry, value, currentPhase);
 	}
 	return skipped;
 }
@@ -606,93 +579,18 @@ describe("read truncation golden harness", () => {
 		}
 
 		expect(manifest).toHaveLength(43);
-		const phaseZeroGoldenFiles = manifest
-			.filter(entry => entry.phase === 0)
-			.reduce((total, entry) => total + entry.hashLines.length, 0);
+		const phaseZeroGoldenFiles = manifest.filter(entry => entry.phase === 0).length;
 		expect(phaseZeroGoldenFiles).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 		expect(actualGoldenFiles("invariant").size).toBe(EXPECTED_PHASE_ZERO_GOLDEN_FILES);
 	});
 
-	it("keeps hashline golden variants anchored and distinct from plain variants", () => {
-		const hashline = JSON.parse(fs.readFileSync(goldenPath("changed", "local-bare-tail", "hl"), "utf8")) as Captured;
-		const plain = JSON.parse(fs.readFileSync(goldenPath("changed", "local-bare-tail", "plain"), "utf8")) as Captured;
-		expect(hashline.text).toMatch(/(?:^|\n)\d+[a-z]{2}\|/);
-		expect(plain.text).not.toMatch(/(?:^|\n)\d+[a-z]{2}\|/);
-		expect(hashline.text).not.toBe(plain.text);
-	});
-
 	it("keeps archive range fixtures above line and byte budgets", () => {
-		for (const variant of ["hl", "plain"] as const) {
-			const large = JSON.parse(
-				fs.readFileSync(goldenPath("invariant", "archive-large-ranged", variant), "utf8"),
-			) as Captured;
-			const bytes = JSON.parse(
-				fs.readFileSync(goldenPath("invariant", "archive-bytes-ranged", variant), "utf8"),
-			) as Captured;
-			expect(large.text.length).toBeGreaterThan(0);
-			expect((large.truncation as { totalLines: number }).totalLines).toBe(3_200);
-			expect(bytes.text.length).toBeGreaterThan(0);
-			expect((bytes.truncation as { totalBytes: number }).totalBytes).toBeGreaterThanOrEqual(60 * 1024);
-		}
-	});
-
-	it("round-trips tail hashline anchors through ReadTool, cache, and EditTool", async () => {
-		const relativePath = "anchor-roundtrip.txt";
-		const absolutePath = path.join(fixture.root, relativePath);
-		const sourceLines = Array.from({ length: 20 }, () => "duplicate");
-		fs.writeFileSync(absolutePath, sourceLines.join("\n"));
-
-		const settings = Settings.isolated({
-			"read.summarize.enabled": false,
-			"read.receiptBudgetLines": 6,
-			"read.receiptBudgetBytes": 1024,
-			readHashLines: true,
-			readLineNumbers: false,
-		});
-		const session = createSession(fixture.root, settings, fixture.artifactDir);
-		session.enableLsp = false;
-		const previousPiVariant = Bun.env.PI_EDIT_VARIANT;
-		const previousGjcVariant = Bun.env.GJC_EDIT_VARIANT;
-		Bun.env.PI_EDIT_VARIANT = "hashline";
-		Bun.env.GJC_EDIT_VARIANT = "hashline";
-
-		try {
-			const readResult = (await new ReadTool(session).execute("anchor-roundtrip-read", {
-				path: relativePath,
-			})) as ReadResult;
-			const anchors = parseHashlineAnchors(textOf(readResult));
-			expect(anchors.map(anchor => anchor.line)).toEqual([15, 16, 17, 18, 19, 20]);
-			expect(anchors.every(anchor => anchor.content === "duplicate")).toBe(true);
-			expect(anchors.every(anchor => computeLineHash(anchor.line, anchor.content) === anchor.hash)).toBe(true);
-
-			const snapshot = getFileReadCache(session).get(absolutePath);
-			expect(snapshot).not.toBeNull();
-			expect([...snapshot!.lines.entries()]).toEqual(anchors.map(anchor => [anchor.line, anchor.content]));
-
-			await Settings.init({ inMemory: true, cwd: fixture.root });
-
-			const editTool = new EditTool(session);
-			const targets = [anchors[0]!, anchors[2]!, anchors.at(-1)!];
-			const expectedChanges = new Map<number, string>();
-			for (const target of targets) {
-				const replacement = `edited-${target.line}`;
-				expectedChanges.set(target.line, replacement);
-				await editTool.execute("anchor-roundtrip-edit", {
-					input: [`§${relativePath}`, `≔${target.line}${target.hash}`, replacement].join("\n"),
-				});
-
-				const diskLines = fs.readFileSync(absolutePath, "utf8").split("\n");
-				expect(diskLines[target.line - 1]).toBe(replacement);
-				for (const [lineNumber, line] of diskLines.entries()) {
-					expect(line).toBe(expectedChanges.get(lineNumber + 1) ?? "duplicate");
-				}
-			}
-		} finally {
-			if (previousPiVariant === undefined) delete Bun.env.PI_EDIT_VARIANT;
-			else Bun.env.PI_EDIT_VARIANT = previousPiVariant;
-			if (previousGjcVariant === undefined) delete Bun.env.GJC_EDIT_VARIANT;
-			else Bun.env.GJC_EDIT_VARIANT = previousGjcVariant;
-		}
+		const large = JSON.parse(fs.readFileSync(goldenPath("invariant", "archive-large-ranged"), "utf8")) as Captured;
+		const bytes = JSON.parse(fs.readFileSync(goldenPath("invariant", "archive-bytes-ranged"), "utf8")) as Captured;
+		expect(large.text.length).toBeGreaterThan(0);
+		expect((large.truncation as { totalLines: number }).totalLines).toBe(3_200);
+		expect(bytes.text.length).toBeGreaterThan(0);
+		expect((bytes.truncation as { totalBytes: number }).totalBytes).toBeGreaterThanOrEqual(60 * 1024);
 	});
 
 	it("rejects phase-1 entries when a phase-0 runner attempts to execute them", () => {
@@ -702,11 +600,7 @@ describe("read truncation golden harness", () => {
 	});
 
 	it("keeps writeGolden restricted to changed/ and update mode", () => {
-		expect(() => writeGolden("invariant", "guard", "hl", {} as Captured)).toThrow(
-			/refusing to write invariant\/guard/,
-		);
-		expect(() => writeGolden("surface", "guard", "plain", {} as Captured)).toThrow(
-			/refusing to write surface\/guard/,
-		);
+		expect(() => writeGolden("invariant", "guard", {} as Captured)).toThrow(/refusing to write invariant\/guard/);
+		expect(() => writeGolden("surface", "guard", {} as Captured)).toThrow(/refusing to write surface\/guard/);
 	});
 });

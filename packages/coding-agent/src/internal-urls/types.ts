@@ -27,9 +27,9 @@ export interface InternalResource {
 	notes?: string[];
 	/**
 	 * True when the resolved content cannot be edited by the agent (e.g. sealed
-	 * artifacts, harness docs, machine-generated memory summaries). Hashline
-	 * anchors and similar edit affordances are suppressed for immutable
-	 * resources. Mutable resources (e.g. local://) behave like editable files.
+	 * artifacts, harness docs, machine-generated memory summaries). Edit
+	 * affordances are suppressed for immutable resources. Mutable resources
+	 * (e.g. local://) behave like editable files.
 	 */
 	immutable?: boolean;
 }
@@ -91,8 +91,8 @@ export interface ProtocolHandler {
 	readonly scheme: string;
 	/**
 	 * Whether resources produced by this handler are immutable (cannot be
-	 * edited by the agent). When true, callers suppress hashline anchors and
-	 * other edit affordances. When false, resources behave like editable files.
+	 * edited by the agent). When true, callers suppress edit affordances.
+	 * When false, resources behave like editable files.
 	 */
 	readonly immutable: boolean;
 	/**

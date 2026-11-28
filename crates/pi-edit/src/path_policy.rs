@@ -59,13 +59,13 @@ pub struct PathPolicy {
 }
 
 impl PathPolicy {
-	/// The internal URL `authored` names: the hashline-header-unwrapped
+	/// The internal URL `authored` names: the header-unwrapped
 	/// target (minus one leading `@` mention marker) when it starts with a
 	/// registered `scheme://` (case-insensitive), with the single-slash
 	/// `scheme:/x` spelling of an alias scheme rewritten to `scheme://x`.
 	/// This is the resolution table key and the URL handed to the host.
 	pub fn url_target<'a>(&self, authored: &'a str) -> Option<Cow<'a, str>> {
-		self.url_key(unwrap_hashline_header_path(authored))
+		self.url_key(unwrap_header_path(authored))
 	}
 
 	/// True when `authored` names a registered internal URL scheme.
@@ -88,7 +88,7 @@ impl PathPolicy {
 		authored: &str,
 		urls: &HashMap<String, UrlResolution>,
 	) -> EditResult<Resolved> {
-		let display = unwrap_hashline_header_path(authored).to_owned();
+		let display = unwrap_header_path(authored).to_owned();
 		let absolute = match self.address(&display) {
 			Address::Url(url) => {
 				let resolution = urls
@@ -231,7 +231,7 @@ impl PathPolicy {
 		if op == FileOp::Delete {
 			return Err(EditError::Plan("Plan mode: deleting files is not allowed.".into()));
 		}
-		let display = unwrap_hashline_header_path(display);
+		let display = unwrap_header_path(display);
 		let writable = match self.address(display) {
 			Address::Url(url) => urls
 				.get(url.as_ref())
@@ -262,10 +262,10 @@ impl PathPolicy {
 		})
 	}
 
-	/// Whether hashline tag recovery may rebind `authored` onto `recovered`.
+	/// Whether tag recovery may rebind `authored` onto `recovered`.
 	/// Only filesystem paths rebind; URL-shaped targets never do.
 	pub fn allow_tag_path_recovery(&self, authored: &str, recovered: &Path) -> bool {
-		if !matches!(self.address(unwrap_hashline_header_path(authored)), Address::Path) {
+		if !matches!(self.address(unwrap_header_path(authored)), Address::Path) {
 			return false;
 		}
 		let recovered = lexical_absolute(recovered, &self.cwd);
@@ -311,8 +311,8 @@ fn unknown_uri_target(display: &str, suggestion: Option<&str>) -> String {
 	)
 }
 
-/// Strip a strict `[path]` / `[path#XXXX]` hashline header wrapper.
-pub fn unwrap_hashline_header_path(target: &str) -> &str {
+/// Strip a strict `[path]` / `[path#XXXX]` header wrapper.
+pub fn unwrap_header_path(target: &str) -> &str {
 	let trimmed = target.trim_end();
 	let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
 		return target;
@@ -695,11 +695,11 @@ mod tests {
 	}
 
 	#[test]
-	fn unwraps_only_strict_hashline_headers() {
-		assert_eq!(unwrap_hashline_header_path("[src/a.ts#Ab12]  \n"), "src/a.ts");
-		assert_eq!(unwrap_hashline_header_path("[src/a.ts]"), "src/a.ts");
-		assert_eq!(unwrap_hashline_header_path("[src/a.ts#bad]"), "[src/a.ts#bad]");
-		assert_eq!(unwrap_hashline_header_path("[a#b#1234]"), "[a#b#1234]");
+	fn unwraps_only_strict_headers() {
+		assert_eq!(unwrap_header_path("[src/a.ts#Ab12]  \n"), "src/a.ts");
+		assert_eq!(unwrap_header_path("[src/a.ts]"), "src/a.ts");
+		assert_eq!(unwrap_header_path("[src/a.ts#bad]"), "[src/a.ts#bad]");
+		assert_eq!(unwrap_header_path("[a#b#1234]"), "[a#b#1234]");
 	}
 
 	#[test]

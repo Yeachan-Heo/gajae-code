@@ -5,7 +5,6 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { isEnoent, isRecord, pathIsWithin, prompt, sanitizeText, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { stripHashlinePrefixes } from "../edit";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -14,7 +13,6 @@ import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/t
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { formatFileWriteError, writeFileAtomically } from "./atomic-file-write";
@@ -70,22 +68,6 @@ export type WriteToolInput = z.infer<typeof writeSchema>;
 export interface WriteToolDetails {
 	diagnostics?: FileDiagnosticsResult;
 	meta?: OutputMeta;
-}
-
-/**
- * Strip hashline display prefixes from write content.
- *
- * Only active when hashline edit mode is enabled — the model sees `LINE+ID|`
- * prefixes in read output and sometimes copies them into write content.
- */
-function stripWriteContent(session: ToolSession, content: string): { text: string; stripped: boolean } {
-	if (!resolveFileDisplayMode(session).hashLines) {
-		return { text: content, stripped: false };
-	}
-	const lines = content.split("\n");
-	const cleaned = stripHashlinePrefixes(lines);
-	if (cleaned === lines) return { text: content, stripped: false };
-	return { text: cleaned.join("\n"), stripped: true };
 }
 
 /**
@@ -497,7 +479,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #resolveConflict(
 		entry: ConflictEntry,
 		replacementContent: string,
-		stripped: boolean,
 		signal: AbortSignal | undefined,
 		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
@@ -514,17 +495,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const batchRequest = getLspBatchRequest(context?.toolCall);
 		const diagnostics = await this.#writethrough(absolutePath, newContent, signal, undefined, batchRequest);
 		invalidateFsScanAfterWrite(absolutePath);
-		this.session.fileReadCache?.invalidate(absolutePath);
 		this.session.conflictHistory?.invalidate(entry.id);
 
 		const range =
 			entry.startLine === entry.endLine
 				? `line ${entry.startLine}`
 				: `lines ${entry.startLine}\u2013${entry.endLine}`;
-		let resultText = `Resolved conflict #${entry.id} at ${range} in ${entry.displayPath}.`;
-		if (stripped) {
-			resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
-		}
+		const resultText = `Resolved conflict #${entry.id} at ${range} in ${entry.displayPath}.`;
 
 		if (!diagnostics) {
 			return {
@@ -550,7 +527,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #resolveSingleConflictById(
 		id: number,
 		replacementContent: string,
-		stripped: boolean,
 		signal: AbortSignal | undefined,
 		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
@@ -560,7 +536,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				`Conflict #${id} not found. Conflict ids are registered when \`read\` surfaces a marker block; re-read the file to get a current id.`,
 			);
 		}
-		return this.#resolveConflict(entry, replacementContent, stripped, signal, context);
+		return this.#resolveConflict(entry, replacementContent, signal, context);
 	}
 
 	/**
@@ -580,7 +556,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	 */
 	async #resolveAllConflicts(
 		replacementContent: string,
-		stripped: boolean,
 		signal: AbortSignal | undefined,
 		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
@@ -636,7 +611,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			const diagnostics = await this.#writethrough(absolutePath, text, signal, undefined, batchRequest);
 			invalidateFsScanAfterWrite(absolutePath);
-			this.session.fileReadCache?.invalidate(absolutePath);
 			for (const entry of fileEntries) history.invalidate(entry.id);
 			succeededFiles.push({ displayPath: sample.displayPath, count: fileEntries.length });
 			totalResolvedIds += fileEntries.length;
@@ -661,9 +635,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			for (const file of failedFiles) {
 				summaryLines.push(`  ${file.displayPath}: ${file.count} ${conflictWord(file.count)} (${file.error})`);
 			}
-		}
-		if (stripped) {
-			summaryLines.push("Note: auto-stripped hashline display prefixes from content before writing.");
 		}
 		const resultText = summaryLines.join("\n");
 
@@ -696,19 +667,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		return untilAborted(signal, async () => {
-			// Strip hashline display prefixes (LINE+ID|) if the model copied them from read output
-			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
 			const internalRouter = InternalUrlRouter.instance();
 			if (internalRouter.canHandle(path)) {
 				const parsed = parseInternalUrl(path);
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
 				const handler = internalRouter.getHandler(scheme);
 				if (handler?.write) {
-					await handler.write(parsed, cleanContent, { cwd: this.session.cwd, signal });
-					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
-					if (stripped) {
-						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
-					}
+					await handler.write(parsed, content, { cwd: this.session.cwd, signal });
+					const resultText = `Successfully wrote ${content.length} bytes to ${path}`;
 					return { content: [{ type: "text", text: resultText }], details: {} };
 				}
 				// Schemes without a `write` hook fall through to existing logic
@@ -725,8 +691,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 				const result =
 					conflictUri.id === "*"
-						? await this.#resolveAllConflicts(cleanContent, stripped, signal, context)
-						: await this.#resolveSingleConflictById(conflictUri.id, cleanContent, stripped, signal, context);
+						? await this.#resolveAllConflicts(content, signal, context)
+						: await this.#resolveSingleConflictById(conflictUri.id, content, signal, context);
 				if (conflictUri.recoveredPrefix !== undefined) {
 					appendNoteToResult(
 						result,
@@ -741,34 +707,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
 
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
-				if (stripped) {
-					const firstText = archiveResult.content.find(
-						(block): block is { type: "text"; text: string } =>
-							block.type === "text" && typeof block.text === "string",
-					);
-					if (firstText) {
-						firstText.text += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
-					}
-				}
-				return archiveResult;
+				return this.#writeArchiveEntry(content, resolvedArchivePath);
 			}
 
 			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 
-				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath, signal);
-				if (stripped) {
-					const firstText = sqliteResult.content.find(
-						(block): block is { type: "text"; text: string } =>
-							block.type === "text" && typeof block.text === "string",
-					);
-					if (firstText) {
-						firstText.text += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
-					}
-				}
-				return sqliteResult;
+				return this.#writeSqliteRow(path, content, resolvedSqlitePath, signal);
 			}
 
 			enforcePlanModeWrite(this.session, path, { op: "create" });
@@ -781,7 +727,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 
 			// Try ACP bridge first — no disk write when client handles it
-			const bridgePromise = this.#routeWriteThroughBridge(absolutePath, cleanContent);
+			const bridgePromise = this.#routeWriteThroughBridge(absolutePath, content);
 			if (bridgePromise !== undefined) {
 				try {
 					await bridgePromise;
@@ -789,29 +735,21 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					throw new ToolError(formatFileWriteError(error, absolutePath));
 				}
 				invalidateFsScanAfterWrite(absolutePath);
-				this.session.fileReadCache?.invalidate(absolutePath);
 				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
-				let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
-				if (stripped) {
-					resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
-				}
+				const resultText = `Successfully wrote ${content.length} bytes to ${displayPath}`;
 				return { content: [{ type: "text", text: resultText }], details: {} };
 			}
 
 			let diagnostics: FileDiagnosticsResult | undefined;
 			try {
-				diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+				diagnostics = await this.#writethrough(absolutePath, content, signal, undefined, batchRequest);
 			} catch (error) {
 				throw new ToolError(formatFileWriteError(error, absolutePath));
 			}
 			invalidateFsScanAfterWrite(absolutePath);
-			this.session.fileReadCache?.invalidate(absolutePath);
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
-			let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
-			if (stripped) {
-				resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
-			}
+			const resultText = `Successfully wrote ${content.length} bytes to ${displayPath}`;
 			if (!diagnostics) {
 				return {
 					content: [{ type: "text", text: resultText }],

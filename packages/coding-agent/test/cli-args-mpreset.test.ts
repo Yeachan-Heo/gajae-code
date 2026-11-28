@@ -105,7 +105,7 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 				previousModel: session.model,
 				previousThinkingLevel: session.thinkingLevel,
 				previousThinkingLevelMutationRevision: 0,
-				previousEditMode: "hashline",
+				previousEditMode: "replace",
 				signal,
 			};
 		},

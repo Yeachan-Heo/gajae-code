@@ -141,7 +141,7 @@ const FILE_DISCOVERY_COMMAND_PATTERN = /(?:^|[;&|\s])(?:git(?:\s+-C\s+\S+)?\s+ls
 const FILE_SCRIPT_READ_COMMAND_PATTERN = /(?:^|[;&|\s])(?:python3?|node|bun)\s+(?:-\s*<<|-c\b|-e\b|--eval\b).*?(?:read_text|readFile|readFileSync|Bun\.file|fs\.readFile|open\s*\([^)]*\)\.read)/s;
 const FILE_WRITE_COMMAND_PATTERN = /(?:^|[;&|\s])(?:sed\s+-i|perl\s+-pi)\b|(?:^|[;&|\s])(?:python3?|node|bun)\s+(?:-\s*<<|-c\b|-e\b|--eval\b).*?(?:write_text|writeFile|Bun\.write|fs\.writeFile|open\s*\([^)]*,\s*["'][wa]["'][^)]*\)\.write)|(?:^|[;&|\s])tee(?:\s+-a)?\s+[\w./~:-]+|(?:^|[^<])>>?\s*[\w./~:-]+/s;
 const COMMAND_CONTAMINATION_PATTERN = /```|^\s*(?:I\s+(?:will|need|am going)|We\s+(?:need|will)|First[, ]|Now[, ]|Let's)\b/im;
-const ANCHOR_ERROR_PATTERN = /(?:anchor|hashline|stale).{0,80}(?:mismatch|do not match|rejected|invalid|bad)|(?:edit rejected).{0,80}(?:anchor|hashline)/i;
+const ANCHOR_ERROR_PATTERN = /(?:anchor|stale).{0,80}(?:mismatch|do not match|rejected|invalid|bad)|(?:edit rejected).{0,80}anchor/i;
 const MALFORMED_ARGS_PATTERN = /(?:malformed|invalid|contaminated).{0,80}(?:json|argument|args|tool)|schema validation|failed to parse/i;
 const SANITIZE_PATTERN = /sanitize(?:d|r)?\s+(?:payload|replay|output)?\s*(?:failed|failure|error|regression)|harmony|protocol leak|to=functions|contaminated tool/i;
 const TIMEOUT_PATTERN = /timeout|timed out|deadline/i;

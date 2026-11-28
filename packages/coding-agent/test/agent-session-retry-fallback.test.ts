@@ -1896,9 +1896,9 @@ describe("AgentSession retry fallback", () => {
 	it("rebuilds real tool metadata after awaited model transitions", async () => {
 		const replaceModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const codexModel = getBundledModel("openai-codex", "gpt-5.5");
-		const hashlineModel = getBundledModel("zai", "glm-4.7");
-		if (!replaceModel || !codexModel || !hashlineModel) {
-			throw new Error("Expected bundled replace, Codex, and hashline models");
+		const replaceModel2 = getBundledModel("zai", "glm-4.7");
+		if (!replaceModel || !codexModel || !replaceModel2) {
+			throw new Error("Expected bundled replace and Codex models");
 		}
 		authStorage.setRuntimeApiKey("openai-codex", "openai-codex-test-key");
 		authStorage.setRuntimeApiKey("zai", "zai-test-key");
@@ -1989,24 +1989,15 @@ describe("AgentSession retry fallback", () => {
 		expect(codexCapture.tools.read.description).not.toContain("copy it verbatim");
 		expect(codexCapture.tools.search.description).not.toContain("2-char suffix is a content fingerprint");
 
-		await liveSession.setModel(hashlineModel);
+		await liveSession.setModel(replaceModel2);
 		expect(captures).toHaveLength(3);
-		const hashlineCapture = captures[2];
-		expect(hashlineCapture).toMatchObject({
-			model: `${hashlineModel.provider}/${hashlineModel.id}`,
-			tools: { edit: { mode: "hashline", customWireName: undefined } },
-		});
-		expect(hashlineCapture.tools.edit.description).not.toBe(codexCapture.tools.edit.description);
-		expect(hashlineCapture.tools.edit.parameters).not.toBe(codexCapture.tools.edit.parameters);
-		expect(hashlineCapture.tools.read.description).toContain("copy it verbatim");
-		expect(hashlineCapture.tools.search.description).toContain("2-char suffix is a content fingerprint");
-
-		await liveSession.setModel(replaceModel);
-		expect(captures).toHaveLength(4);
-		expect(captures[3]).toMatchObject({
-			model: `${replaceModel.provider}/${replaceModel.id}`,
+		const replaceCapture2 = captures[2];
+		expect(replaceCapture2).toMatchObject({
+			model: `${replaceModel2.provider}/${replaceModel2.id}`,
 			tools: { edit: { mode: "replace", customWireName: undefined } },
 		});
+		expect(replaceCapture2.tools.edit.description).toBe(replaceCapture.tools.edit.description);
+		expect(replaceCapture2.tools.edit.parameters).toBe(replaceCapture.tools.edit.parameters);
 	});
 	it("normalizes suppression by base selector and clears it on model refresh", async () => {
 		const future = Date.now() + 60_000;

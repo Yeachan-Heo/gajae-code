@@ -31,7 +31,6 @@ interface NativeSmokeBindings {
 		eof: boolean,
 		allowFuzzy: boolean,
 	) => { index?: number; confidence: number; strategy?: string };
-	h06FormatHashLines(text: string, startLine?: number): string;
 	diffLines(oldText: string, newText: string): NativeSmokeDiffChange[];
 	diffLineRuns(oldText: string, newText: string): NativeSmokeDiffRun[];
 	structuredPatchHunks(oldText: string, newText: string, context?: number): NativeSmokePatchHunk[];
@@ -83,14 +82,6 @@ export async function runNativeSmokeTest(): Promise<void> {
 		await import("../../../natives/native/loader-state.js")
 	).loadNative() as unknown as NativeSmokeBindings;
 
-	if (typeof native.h06FormatHashLines !== "function") {
-		throw new Error("smoke-test: native h06FormatHashLines export missing from embedded addon");
-	}
-
-	const hashed = native.h06FormatHashLines("a\nb", 1);
-	if (hashed.split("\n").length !== 2) {
-		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);
-	}
 	if (typeof native.editFindMatch !== "function" || typeof native.editSeekSequence !== "function") {
 		throw new Error("smoke-test: native pi-edit matcher exports missing from embedded addon");
 	}

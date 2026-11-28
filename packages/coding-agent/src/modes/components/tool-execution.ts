@@ -471,7 +471,7 @@ function previewPayloadKey(args: unknown): string | undefined {
 /**
  * Drop trailing removal/hunk-header lines that appear in a streaming diff
  * before the matching `+added` lines have arrived. Without this, a partial
- * apply_patch / hashline preview shows `-old` first and then visibly grows
+ * apply_patch preview shows `-old` first and then visibly grows
  * the `+new` block beneath it — the "removals first, additions catching up"
  * jitter. Once the next streaming tick brings the additions in, the trailing
  * block reappears alongside them.
@@ -540,7 +540,6 @@ export interface ToolExecutionOptions {
 	showImages?: boolean; // default: true (only used if terminal supports images)
 	editFuzzyThreshold?: number;
 	editAllowFuzzy?: boolean;
-	hashlineAutoDropPureInsertDuplicates?: boolean;
 	/** Internal observer for visible asynchronous renderer mutations. */
 	onVisibleTranscriptMutation?: () => void;
 }
@@ -592,7 +591,6 @@ export class ToolExecutionComponent extends Container {
 	#showImages: boolean;
 	#editFuzzyThreshold: number | undefined;
 	#editAllowFuzzy: boolean | undefined;
-	#hashlineAutoDropPureInsertDuplicates: boolean | undefined;
 	#isPartial = true;
 	#tool?: AgentTool;
 	#ui: TUI;
@@ -658,7 +656,6 @@ export class ToolExecutionComponent extends Container {
 		this.#showImages = options.showImages ?? true;
 		this.#editFuzzyThreshold = options.editFuzzyThreshold;
 		this.#editAllowFuzzy = options.editAllowFuzzy;
-		this.#hashlineAutoDropPureInsertDuplicates = options.hashlineAutoDropPureInsertDuplicates;
 		this.#onVisibleTranscriptMutation = options.onVisibleTranscriptMutation;
 
 		this.#tool = tool;
@@ -760,7 +757,6 @@ export class ToolExecutionComponent extends Container {
 				signal: controller.signal,
 				fuzzyThreshold: this.#editFuzzyThreshold,
 				allowFuzzy: this.#editAllowFuzzy,
-				hashlineAutoDropPureInsertDuplicates: this.#hashlineAutoDropPureInsertDuplicates,
 				isStreaming,
 			});
 			if (this.#disposed || controller.signal.aborted) return;

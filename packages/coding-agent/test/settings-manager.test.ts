@@ -390,12 +390,12 @@ describe("Settings", () => {
 	});
 
 	describe("migrations", () => {
-		it("maps removed atom edit mode settings to hashline", async () => {
+		it("maps removed hashline edit mode settings to auto", async () => {
 			await writeSettings({
 				edit: {
-					mode: "atom",
+					mode: "hashline",
 					modelVariants: {
-						"claude-opus": "atom",
+						"claude-opus": "hashline",
 						"gpt-5": "apply_patch",
 					},
 				},
@@ -403,8 +403,33 @@ describe("Settings", () => {
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
-			expect(settings.get("edit.mode")).toBe("hashline");
-			expect(settings.getEditVariantForModel("claude-opus-4-5")).toBe("hashline");
+			expect(settings.get("edit.mode")).toBe("auto");
+			expect(settings.getEditVariantForModel("claude-opus-4-5")).toBe("replace");
+			expect(settings.getEditVariantForModel("gpt-5.2")).toBe("apply_patch");
+		});
+
+		it("migrates project-scoped hashline edit mode settings to replace", async () => {
+			const projectConfigPath = path.join(getProjectAgentDir(projectDir), "config.yml");
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify(
+					{
+						edit: {
+							modelVariants: {
+								"claude-opus": "hashline",
+								"gpt-5": "apply_patch",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// Project-scoped hashline values should be migrated to replace
+			expect(settings.getEditVariantForModel("claude-opus-4-5")).toBe("replace");
 			expect(settings.getEditVariantForModel("gpt-5.2")).toBe("apply_patch");
 		});
 
@@ -1172,7 +1197,7 @@ describe("Settings", () => {
 		});
 		await Bun.write(
 			path.join(getProjectAgentDir(projectDir), "config.yml"),
-			YAML.stringify({ edit: { mode: "hashline" } }, null, 2),
+			YAML.stringify({ edit: { mode: "auto" } }, null, 2),
 		);
 		const settings = await Settings.loadReadonly({ cwd: projectDir, agentDir });
 		const changedPaths: string[] = [];
@@ -1191,7 +1216,7 @@ describe("Settings", () => {
 			expect(candidate.getGlobal("display.tabWidth")).toBe(7);
 			expect(candidate.get("display.tabWidth")).toBe(7);
 			expect(candidate.getGlobal("edit.mode")).toBe("vim");
-			expect(candidate.get("edit.mode")).toBe("hashline");
+			expect(candidate.get("edit.mode")).toBe("auto");
 			expect(candidate.getGlobal("theme.dark")).toBe("red-claw");
 			expect(candidate.get("theme.dark")).toBe("blue-crab");
 			expect(candidate.getGlobal("theme.light")).toBe("blue-crab");
@@ -1202,7 +1227,7 @@ describe("Settings", () => {
 
 			expect(settings.get("display.tabWidth")).toBe(7);
 			expect(settings.getGlobal("edit.mode")).toBe("vim");
-			expect(settings.get("edit.mode")).toBe("hashline");
+			expect(settings.get("edit.mode")).toBe("auto");
 			expect(settings.get("theme.dark")).toBe("blue-crab");
 			expect(settings.getGlobal("theme.light")).toBe("blue-crab");
 			expect(getDefaultTabWidth()).toBe(3);

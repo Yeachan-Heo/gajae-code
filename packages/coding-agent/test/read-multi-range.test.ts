@@ -8,7 +8,6 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import type { ReadToolDetails } from "@gajae-code/coding-agent/tools/read";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
-import { getFileReadCache } from "../src/edit/file-read-cache";
 
 function textOutput(result: AgentToolResult<ReadToolDetails>): string {
 	return result.content
@@ -170,12 +169,10 @@ describe("read tool multi-range selector", () => {
 		for (const truncation of [undefined, "head", "last", "both"] as const) {
 			const diskSession = createSession(tmpDir);
 			diskSession.settings.set("readLineNumbers", true);
-			diskSession.settings.set("readHashLines", false);
 			const bridgeSession = createSession(tmpDir, {
 				capabilities: { readTextFile: true },
 				readTextFile: async () => source,
 			});
-			bridgeSession.settings.set("readHashLines", false);
 			bridgeSession.settings.set("readLineNumbers", true);
 			const request = {
 				path: `${filePath}:10-20,50-200`,
@@ -191,16 +188,6 @@ describe("read tool multi-range selector", () => {
 			else expect(textOutput(diskResult)).not.toContain(`200|200|${"x".repeat(20)}`);
 			if (truncation === "last") expect(textOutput(diskResult)).not.toContain(`50|50|${"x".repeat(20)}`);
 			else expect(textOutput(diskResult)).toContain(`50|50|${"x".repeat(20)}`);
-
-			const diskSnapshot = getFileReadCache(diskSession).get(filePath);
-			const bridgeSnapshot = getFileReadCache(bridgeSession).get(filePath);
-			expect(diskSnapshot?.lines).toBeDefined();
-			expect(bridgeSnapshot?.lines).toBeDefined();
-			expect([...bridgeSnapshot!.lines.keys()]).toEqual([...diskSnapshot!.lines.keys()]);
-			for (const [lineNumber, line] of diskSnapshot!.lines) {
-				expect(line).toBe(sourceLines[lineNumber - 1]);
-				expect(bridgeSnapshot!.lines.get(lineNumber)).toBe(line);
-			}
 		}
 	});
 
@@ -235,53 +222,36 @@ describe("read tool multi-range selector", () => {
 			await new Bun.Archive({ "docs/partial-disclosure.txt": source }, { compress: "gzip" }).bytes(),
 		);
 
-		for (const hashline of [false, true]) {
-			const configure = (session: ToolSession) => {
-				session.settings.set("readHashLines", hashline);
-				session.settings.set("readLineNumbers", !hashline);
-				return session;
-			};
-			const diskSession = configure(createSession(tmpDir));
-			const acpSession = configure(
-				createSession(tmpDir, {
-					capabilities: { readTextFile: true },
-					readTextFile: async () => source,
-				}),
-			);
-			const archiveSession = configure(createSession(tmpDir));
-			const cases = [
-				{ name: "disk", session: diskSession, path: `${filePath}:1-2,4-4` },
-				{ name: "ACP", session: acpSession, path: `${filePath}:1-2,4-4` },
-				{ name: "archive", session: archiveSession, path: `${archivePath}:docs/partial-disclosure.txt:1-2,4-4` },
-			] as const;
+		const diskSession = createSession(tmpDir);
+		const acpSession = createSession(tmpDir, {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => source,
+		});
+		const archiveSession = createSession(tmpDir);
+		const cases = [
+			{ name: "disk", session: diskSession, path: `${filePath}:1-2,4-4` },
+			{ name: "ACP", session: acpSession, path: `${filePath}:1-2,4-4` },
+			{ name: "archive", session: archiveSession, path: `${archivePath}:docs/partial-disclosure.txt:1-2,4-4` },
+		] as const;
 
-			for (const testCase of cases) {
-				const result = await new ReadTool(testCase.session).execute(`partial-${testCase.name}`, {
-					path: testCase.path,
-					truncation: "both",
-				});
-				const text = textOutput(result);
-				if (hashline) expect(text).toContain("Hashline output requires full lines");
-				else expect(text).toContain("Showing last");
-				expect(text).toContain("delta");
-				expect(text).not.toContain("0 lines elided");
-				expect(text).not.toContain("omitted lines 2-1");
-				const omittedRange = /omitted lines (\d+)-(\d+)/.exec(text);
-				expect(omittedRange === null || Number(omittedRange[1]) <= Number(omittedRange[2])).toBe(true);
-				if (!hashline) {
-					const partialLine = text.split("\n").find(line => line.startsWith("Z"));
-					expect(partialLine).toBeDefined();
-					expect(partialLine).not.toMatch(/^\d+\|/);
-				}
-				expect(text).not.toMatch(/^\d+[a-z]{2}\|Z/m);
-				expect(result.details?.meta?.limits?.columnTruncated?.maxColumn).toBe(768);
-				expect(result.details?.spillEligible).toBe(false);
-				if (testCase.name !== "archive") {
-					const snapshot = getFileReadCache(testCase.session).get(filePath);
-					expect(snapshot?.lines.has(2)).toBe(false);
-					expect(snapshot?.lines.get(4)).toBe("delta");
-				}
-			}
+		for (const testCase of cases) {
+			const result = await new ReadTool(testCase.session).execute(`partial-${testCase.name}`, {
+				path: testCase.path,
+				truncation: "both",
+			});
+			const text = textOutput(result);
+			expect(text).toContain("Showing last");
+			expect(text).toContain("delta");
+			expect(text).not.toContain("0 lines elided");
+			expect(text).not.toContain("omitted lines 2-1");
+			const omittedRange = /omitted lines (\d+)-(\d+)/.exec(text);
+			expect(omittedRange === null || Number(omittedRange[1]) <= Number(omittedRange[2])).toBe(true);
+			const partialLine = text.split("\n").find(line => line.startsWith("Z"));
+			expect(partialLine).toBeDefined();
+			expect(partialLine).not.toMatch(/^\d+\|/);
+			expect(text).not.toMatch(/^\d+[a-z]{2}\|Z/m);
+			expect(result.details?.meta?.limits?.columnTruncated?.maxColumn).toBe(768);
+			expect(result.details?.spillEligible).toBe(false);
 		}
 	});
 

@@ -34,9 +34,9 @@ import * as path from "node:path";
  * The range is `raw` because a plain `:N+K` deliberately pads with one leading
  * and three trailing context lines: helpful for a human reading a snippet,
  * wrong for a caller that asked for exactly `limit` lines from `offset`. The
- * wire result is an opaque `output` string, so the hashline and line-number
- * gutter that `raw` also drops carry nothing the frame's contract needs.
- * A range-free read keeps the ordinary form — whole-file reads want them.
+ * wire result is an opaque `output` string, so the formatting that `raw`
+ * drops carry nothing the frame's contract needs. A range-free read keeps the
+ * ordinary form — whole-file reads want them.
  */
 export function piReadPath(readPath: string, offset?: number, limit?: number): string | null {
 	if (limit !== undefined && Math.floor(limit) <= 0) return null;

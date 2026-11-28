@@ -2,7 +2,7 @@
 // a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
 //! Mode-neutral engine contract.
 //!
-//! Every edit mode (`replace`, `patch`, `apply_patch`, `hashline`, `sloppy`)
+//! Every edit mode (`replace`, `patch`, `apply_patch`, `sloppy`)
 //! implements [`ModeEngine`]: a pure, in-memory transformation from a parsed
 //! argument snapshot plus target file contents into staged file states.
 //! Nothing here touches the filesystem for writes; the [`crate::session`]
@@ -18,19 +18,16 @@ pub enum EditMode {
 	Replace,
 	Patch,
 	ApplyPatch,
-	Hashline,
 	Sloppy,
 }
 
 impl EditMode {
-	/// Wire/settings name (`replace`, `patch`, `apply_patch`, `hashline`,
-	/// `sloppy`).
+	/// Wire/settings name (`replace`, `patch`, `apply_patch`, `sloppy`).
 	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::Replace => "replace",
 			Self::Patch => "patch",
 			Self::ApplyPatch => "apply_patch",
-			Self::Hashline => "hashline",
 			Self::Sloppy => "sloppy",
 		}
 	}
@@ -41,7 +38,6 @@ impl EditMode {
 			"replace" => Self::Replace,
 			"patch" => Self::Patch,
 			"apply_patch" => Self::ApplyPatch,
-			"hashline" => Self::Hashline,
 			"sloppy" => Self::Sloppy,
 			_ => return None,
 		})
@@ -84,9 +80,6 @@ pub enum HeaderKind {
 	/// `[<display>]`.
 	#[default]
 	Path,
-	/// `[<display>#TAG]` where TAG hashes the text that actually landed on
-	/// disk (hashline).
-	HashlineTag,
 }
 
 /// One file's fully computed post-edit state, ready to be written.
@@ -97,7 +90,7 @@ pub struct StagedFile {
 	/// Absolute target path.
 	pub absolute:           PathBuf,
 	pub op:                 FileOp,
-	/// Destination for a rename (`*** Move to:` / hashline `MV`). The write
+	/// Destination for a rename (`*** Move to:`). The write
 	/// request becomes a `move`; the result reports `Moved to <display>`.
 	pub move_to:            Option<Resolved>,
 	/// Whether the target existed before the edit.
@@ -120,20 +113,18 @@ pub struct StagedFile {
 	pub preview_diff:       Option<String>,
 	pub first_changed_line: Option<u32>,
 	pub header:             HeaderKind,
-	/// Lines rendered between the header and the preview (hashline block
-	/// resolutions).
+	/// Lines rendered between the header and the preview.
 	pub before_preview:     Vec<String>,
 	/// Lines rendered after the preview (sloppy recovery notes).
 	pub after_preview:      Vec<String>,
 	/// Rendered under a trailing `Warnings:` block.
 	pub warnings:           Vec<String>,
-	/// Replaces the whole rendered text (hashline no-op diagnostic).
+	/// Replaces the whole rendered text (e.g., no-op diagnostic).
 	pub text_override:      Option<String>,
 	/// Record a fresh snapshot of the written text in the store after the
-	/// write lands (hashline) and warn when the persisted text drifted.
+	/// write lands and warn when the persisted text drifted.
 	pub record_snapshot:    bool,
-	/// Clipboard state to publish once this file's write lands (hashline
-	/// `CUT`/`PUT` registers).
+	/// Clipboard state to publish once this file's write lands.
 	pub clipboard_after:    Option<crate::store::Clipboard>,
 }
 

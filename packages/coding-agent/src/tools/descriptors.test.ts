@@ -244,7 +244,7 @@ describe("tool descriptor compatibility gate", () => {
 		(raw as any).renderResult = () => "result";
 		(raw as any).mergeCallAndResult = true;
 		(raw as any).inline = true;
-		(raw as any).mode = "hashline";
+		(raw as any).mode = "replace";
 		const descriptor: ToolDescriptor = {
 			metadata: { name: "synthetic", loadMode: "discoverable" },
 			presentation: { label: "Synthetic", summary: "synthetic summary" },
@@ -274,7 +274,7 @@ describe("tool descriptor compatibility gate", () => {
 		expect(facade.renderResult?.({} as never, {} as never, {} as never)).toBe("result");
 		expect(facade.mergeCallAndResult).toBe(true);
 		expect(facade.inline).toBe(true);
-		expect(facade.mode).toBe("hashline");
+		expect(facade.mode).toBe("replace");
 		expect(facade.descriptor).toBe(descriptor);
 		await facade.execute("call", { value: 1 });
 		expect(calls).toEqual(["synthetic", { value: 1 }]);

@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { formatHashLines } from "../../src/hashline/hash";
 import {
 	formatMiddleElisionMarker,
 	type ReadSegment,
@@ -136,11 +135,8 @@ function headWindowFromStream(result: Awaited<ReturnType<typeof streamLinesFromF
 	);
 }
 
-function renderWindow(window: ReadWindow, hashLines: boolean): string {
-	const render = (segment: ReadSegment): string =>
-		hashLines && segment.kind === "lines"
-			? formatHashLines(segment.content, segment.origin.startLine)
-			: segment.content;
+function renderWindow(window: ReadWindow): string {
+	const render = (segment: ReadSegment): string => segment.content;
 	if (window.kind === "full") return window.head ? render(window.head) : "";
 	if (window.kind === "head-only") return window.head ? render(window.head) : "";
 	if (window.kind === "tail-only") return window.tail ? render(window.tail) : "";
@@ -288,23 +284,21 @@ describe("streaming ReadWindow parity with truncateMiddleWindows and directional
 
 	for (const fixture of fixtures) {
 		for (const direction of ["head", "last", "both"] as const) {
-			for (const hashLines of [false, true]) {
-				test(`${fixture.name}/${direction}/hashline-${hashLines ? "on" : "off"}`, async () => {
-					const filePath = path.join(tempDir, `${fixture.name}.txt`);
-					await fs.writeFile(filePath, fixture.content);
-					const actual = await collectWindow(filePath, direction, fixture);
-					const expected = oracleFor(
-						fixture.content,
-						direction,
-						fixture.maxLines,
-						fixture.maxBytes,
-						fixture.startLine ?? 0,
-						fixture.endExclusive,
-					);
-					expect(windowShape(actual)).toEqual(windowShape(expected));
-					expect(renderWindow(actual, hashLines)).toBe(renderWindow(expected, hashLines));
-				});
-			}
+			test(`${fixture.name}/${direction}`, async () => {
+				const filePath = path.join(tempDir, `${fixture.name}.txt`);
+				await fs.writeFile(filePath, fixture.content);
+				const actual = await collectWindow(filePath, direction, fixture);
+				const expected = oracleFor(
+					fixture.content,
+					direction,
+					fixture.maxLines,
+					fixture.maxBytes,
+					fixture.startLine ?? 0,
+					fixture.endExclusive,
+				);
+				expect(windowShape(actual)).toEqual(windowShape(expected));
+				expect(renderWindow(actual)).toBe(renderWindow(expected));
+			});
 		}
 	}
 

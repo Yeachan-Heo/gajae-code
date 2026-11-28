@@ -31,8 +31,7 @@
 The tool returns a single text block in `content[0].text` plus structured `details`.
 
 - Match lines are formatted by `formatMatchLine()` as `*<anchor>|<line>` for matches and ` <anchor>|<line>` for context.
-  - Hashline mode: `*5th|content`, ` 9x}|content`.
-  - Plain mode: `*5|content`, ` 9|content`.
+  - Line anchors are line numbers: `*5|content`, ` 9|content`.
 - Directory results are grouped by file, with `# <path>` headings and blank lines between groups.
 - `details` may include:
   - `scopePath` — formatted search scope.
@@ -55,7 +54,7 @@ The tool returns a single text block in `content[0].text` plus structured `detai
 3. Internal URLs are resolved through `session.internalRouter`:
    - glob metacharacters (`*`, `?`, `[`, `{`) are rejected for internal URLs;
    - URLs without `resource.sourcePath` fail;
-   - immutable sources are tracked so output can suppress editable hashline anchors per file.
+   - immutable sources are tracked to suppress edit markers per file.
 4. For multi-path calls, `partitionExistingPaths()` skips only ENOENT entries. If every entry is missing, the tool errors.
 5. Path resolution branches:
    - one entry: `parseSearchPath()` splits `basePath` and optional glob;
@@ -141,4 +140,4 @@ The tool returns a single text block in `content[0].text` plus structured `detai
 - `hidden:true` is hard-coded in `search.ts`; there is no model-facing flag to exclude dotfiles.
 - `gitignore:false` only affects native directory traversal. It does not disable the tool's own path normalization or explicit-file handling.
 - When `paths` resolves to multiple exact files, `search.ts` does not apply the native `500` match cap and reports `totalMatches` internally as the post-skip length for that branch.
-- The anchor suffix in hashline mode comes from `computeLineHash()` in `packages/coding-agent/src/hashline/hash.ts`; `search` itself only formats it.
+- Output is formatted with optional line numbers based on session settings.

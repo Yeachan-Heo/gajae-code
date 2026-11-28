@@ -1,11 +1,10 @@
 // Vendored from oh-my-pi (MIT) crates/pi-edit/src/modes/mod.rs @
 // a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
-//! The five edit-mode engines.
+//! The four edit-mode engines.
 
 use crate::engine::{EditMode, ModeEngine};
 
 pub mod apply_patch;
-pub mod hashline;
 pub mod patch;
 pub mod replace;
 pub mod sloppy;
@@ -15,7 +14,7 @@ pub fn engine_for(
 	mode: EditMode,
 	allow_fuzzy: bool,
 	fuzzy_threshold: f64,
-	enforce_seen_lines: bool,
+	_enforce_seen_lines: bool,
 ) -> Box<dyn ModeEngine> {
 	match mode {
 		EditMode::Replace => Box::new(replace::ReplaceEngine { allow_fuzzy, fuzzy_threshold }),
@@ -23,7 +22,6 @@ pub fn engine_for(
 		EditMode::ApplyPatch => {
 			Box::new(apply_patch::ApplyPatchEngine { allow_fuzzy, fuzzy_threshold })
 		},
-		EditMode::Hashline => Box::new(hashline::HashlineEngine { enforce_seen_lines }),
 		EditMode::Sloppy => Box::new(sloppy::SloppyEngine { allow_fuzzy, fuzzy_threshold }),
 	}
 }

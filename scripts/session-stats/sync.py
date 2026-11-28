@@ -3,8 +3,8 @@
 Sync ~/.gjc/agent/sessions/**/*.jsonl into ~/.gjc/stats.db (ss_* tables).
 
 Incremental: per-file byte offset + mtime is tracked in ss_sessions. Only new
-bytes are parsed on re-runs. Tokenization (o200k_base) and the hashline edit
-parser/detectors are computed once and persisted, so analyses become pure SQL
+bytes are parsed on re-runs. Tokenization (o200k_base) and edit result
+classification are computed once and persisted, so analyses become pure SQL
 plus tiny Python loops.
 
 Schema (all tables prefixed `ss_` to avoid collision with packages/stats):
@@ -15,8 +15,6 @@ Schema (all tables prefixed `ss_` to avoid collision with packages/stats):
   ss_assistant_msgs   one row per assistant message (text + thinking blobs)
   ss_user_msgs        one row per user message (text blob)
   ss_edit_calls       one row per edit toolCall (success + warnings paired in)
-  ss_edit_sections    one row per §PATH section inside an edit toolCall, with
-                      precomputed detector outputs (longest_repeat_*, dup_anchors)
 
 Run:
   python3 scripts/session-stats/sync.py
@@ -35,7 +33,6 @@ import sqlite3
 import sys
 import threading
 import time
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,8 +50,8 @@ SESSIONS_ROOT = Path.home() / ".gjc" / "agent" / "sessions"
 DB_PATH = Path.home() / ".gjc" / "stats.db"
 TOKENIZER_NAME = "o200k_base"
 SCHEMA_VERSION = 3
-# Bump whenever parse_hashline_input / find_longest_repeat / duplicated_anchors
-# / looks_successful / extract_warnings semantics change. Bump invalidates
+# Bump whenever looks_successful / extract_warnings semantics change.
+# Bump invalidates
 # previously-stored ss_edit_* rows on next sync.
 EDIT_PARSER_VERSION = 4
 
@@ -154,30 +151,6 @@ CREATE TABLE IF NOT EXISTS ss_edit_calls (
 CREATE INDEX IF NOT EXISTS ss_ec_sess_seq ON ss_edit_calls(session_file, seq);
 CREATE INDEX IF NOT EXISTS ss_ec_success  ON ss_edit_calls(success);
 
-CREATE TABLE IF NOT EXISTS ss_edit_sections (
-    id                       INTEGER PRIMARY KEY,
-    session_file             TEXT NOT NULL,
-    call_id                  TEXT NOT NULL,
-    seq                      INTEGER NOT NULL,
-    section_idx              INTEGER NOT NULL,
-    target_file              TEXT NOT NULL,
-    op_count                 INTEGER NOT NULL,
-    deleted_lines            INTEGER NOT NULL,
-    payload_count            INTEGER NOT NULL,
-    change_size              INTEGER NOT NULL,
-    min_line                 INTEGER,
-    max_line                 INTEGER,
-    payload_blocks           TEXT NOT NULL DEFAULT '[]', -- JSON list[list[str]]
-    op_anchors               TEXT NOT NULL DEFAULT '[]', -- JSON list[str]
-    longest_repeat_len       INTEGER NOT NULL DEFAULT 0,
-    longest_repeat_block_idx INTEGER,
-    longest_repeat_sample    TEXT,
-    dup_anchors              TEXT NOT NULL DEFAULT '[]', -- JSON list[[anchor,count]]
-    parser_version           INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(session_file, call_id, section_idx)
-);
-CREATE INDEX IF NOT EXISTS ss_es_target  ON ss_edit_sections(session_file, target_file, seq);
-CREATE INDEX IF NOT EXISTS ss_es_repeat  ON ss_edit_sections(longest_repeat_len);
 """
 
 
@@ -227,169 +200,7 @@ def batch_count_tokens(strings: list[str]) -> list[int]:
 
 
 # --------------------------------------------------------------------------- #
-# Hashline edit parser (port of cmd_followups.rs::parse_hashline_input).
-
-_RANGE_RE = re.compile(r"^\s*(\d+)[a-z*]+(?:\.\.(\d+)[a-z*]+)?\s*$")
-_SINGLE_ANCHOR_RE = re.compile(r"^\s*(\d+)[a-z*]+\s*$")
-_HASHLINE_OP_RE = re.compile(r"^([«»≔])\s*(\S+)\s*$")
-_HASHLINE_ENVELOPE_MARKERS = {"*** Begin Patch", "*** End Patch", "*** Abort"}
-
-
-def _parse_range(raw: str) -> tuple[int, tuple[int, int] | None]:
-    """Returns (range_size, optional (start_line, end_line)). Size >= 1."""
-    m = _RANGE_RE.match(raw.strip())
-    if not m:
-        return (1, None)
-    start = int(m.group(1))
-    end_raw = m.group(2)
-    end = int(end_raw) if end_raw else start
-    size = max(end - start + 1, 1)
-    lines = (start, max(end, start)) if start > 0 else None
-    return (size, lines)
-
-
-def _parse_anchor_line(raw: str) -> int | None:
-    m = _SINGLE_ANCHOR_RE.match(raw.strip())
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
-
-
-@dataclass
-class EditSection:
-    target_file: str = ""
-    payload_blocks: list[list[str]] = field(default_factory=list)
-    op_anchors: list[str] = field(default_factory=list)
-    deleted_lines: int = 0
-    op_count: int = 0
-    min_line: int | None = None
-    max_line: int | None = None
-
-    def touch(self, line: int) -> None:
-        self.min_line = line if self.min_line is None else min(self.min_line, line)
-        self.max_line = line if self.max_line is None else max(self.max_line, line)
-
-    @property
-    def payload_count(self) -> int:
-        return sum(len(b) for b in self.payload_blocks)
-
-    @property
-    def change_size(self) -> int:
-        return self.payload_count + self.deleted_lines
-
-
-def parse_hashline_input(input_str: str) -> list[EditSection]:
-    sections: list[EditSection] = []
-    cur: EditSection | None = None
-    open_idx: int | None = None  # current open payload block in cur
-
-    def open_new(s: EditSection) -> int:
-        s.payload_blocks.append([])
-        return len(s.payload_blocks) - 1
-
-    for raw_line in input_str.split("\n"):
-        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
-        trimmed_end = line.rstrip()
-
-        if trimmed_end in _HASHLINE_ENVELOPE_MARKERS:
-            if trimmed_end != "*** Begin Patch":
-                break
-            continue
-
-        if line.startswith("§"):
-            if cur is not None:
-                sections.append(cur)
-            prefix_end = 0
-            while prefix_end < len(line) and line[prefix_end] == "§":
-                prefix_end += 1
-            cur = EditSection(target_file=line[prefix_end:].strip())
-            open_idx = None
-            continue
-        if cur is None:
-            continue
-
-        op_match = _HASHLINE_OP_RE.match(line)
-        if op_match:
-            op = op_match.group(1)
-            body = op_match.group(2)
-            if op in ("«", "»"):
-                anchor_trimmed = body.strip()
-                if anchor_trimmed and anchor_trimmed not in ("BOF", "EOF"):
-                    cur.op_anchors.append(anchor_trimmed)
-                line_no = _parse_anchor_line(body)
-                if line_no is not None:
-                    cur.touch(line_no)
-                open_idx = open_new(cur)
-                cur.op_count += 1
-                continue
-            if op == "≔":
-                size, lines = _parse_range(body)
-                cur.deleted_lines += size
-                if lines is not None:
-                    cur.touch(lines[0])
-                    cur.touch(lines[1])
-                for part in body.strip().split(".."):
-                    t = part.strip()
-                    if t:
-                        cur.op_anchors.append(t)
-                cur.op_count += 1
-                open_idx = open_new(cur)
-                continue
-
-        if open_idx is not None:
-            cur.payload_blocks[open_idx].append(line)
-        elif not line.strip():
-            continue
-
-    if cur is not None:
-        sections.append(cur)
-    return sections
-
-
-def find_longest_repeat(block: list[str], min_len: int = 4) -> tuple[int, int] | None:
-    """Returns (start_index, repeat_len) if a repeat of >= min_len with at least
-    half meaningful lines exists. O(n^2) per block — fine for typical edits."""
-    n = len(block)
-    if n < 2 * min_len:
-        return None
-    best: tuple[int, int] | None = None
-    for i in range(n - min_len + 1):
-        for j in range(i + min_len, n - min_len + 1):
-            k = 0
-            while i + k < j and j + k < n and block[i + k] == block[j + k]:
-                k += 1
-            if k < min_len:
-                continue
-            meaningful = sum(1 for s in block[i : i + k] if len(s.strip()) >= 4)
-            if meaningful < max((k + 1) // 2, 2):
-                continue
-            if best is None or k > best[1]:
-                best = (i, k)
-    return best
-
-
-def duplicated_anchors(sections: list[EditSection]) -> list[list]:
-    """Returns [[anchor, count, target_file], ...] for anchors referenced
-    by >= 2 ops within one section. Skips BOF/EOF/* anchors."""
-    out: list[list] = []
-    for sec in sections:
-        counts: dict[str, int] = defaultdict(int)
-        for a in sec.op_anchors:
-            if a in ("BOF", "EOF") or "*" in a:
-                continue
-            counts[a] += 1
-        for anchor, c in counts.items():
-            if c >= 2:
-                out.append([anchor, c, sec.target_file])
-    out.sort(key=lambda r: -r[1])
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Edit result classification (port of cmd_followups.rs success/warnings).
+# Edit result classification.
 
 _RE_FAILURE_HEAD = re.compile(
     r"^(edit rejected|error\b|failed\b|invalid\b|unrecognized\b|cannot\b|"
@@ -471,7 +282,6 @@ def session_meta_from_path(path: Path) -> tuple[str, bool, str | None, str | Non
 
 
 def _is_edit_call(name: str) -> bool:
-    # cmd_followups.rs targets `edit` only (hashline).
     return name == "edit"
 
 
@@ -484,7 +294,6 @@ class SessionRecords:
     user_msgs: list[list] = field(default_factory=list)
     edit_calls: list[tuple] = field(default_factory=list)        # initial stub on toolCall
     edit_call_results: list[tuple] = field(default_factory=list) # success+warnings on toolResult
-    edit_sections: list[tuple] = field(default_factory=list)     # one row per section
     pending_tokens: list[tuple] = field(default_factory=list)    # (row, field_idx, text)
     starting_seq: int = 0
     full_rebuild: bool = False
@@ -645,7 +454,7 @@ def _ingest_assistant(rec, path, seq, entry_id, ts, msg, content) -> None:
 
 
 def _ingest_edit_call(rec, sf, seq, ts, call_id, arg_obj, arg_json) -> None:
-    """Parse the hashline `input` and emit ss_edit_calls + ss_edit_sections rows."""
+    """Record edit input size; pair success and warnings when results arrive."""
     # Recover `input` from arg_obj (preferred) or arg_json (legacy).
     input_str: str | None = None
     if isinstance(arg_obj, dict):
@@ -668,46 +477,6 @@ def _ingest_edit_call(rec, sf, seq, ts, call_id, arg_obj, arg_json) -> None:
     rec.edit_calls.append(
         (sf, call_id, seq, ts, raw_input_len, EDIT_PARSER_VERSION)
     )
-
-    if not any(line.startswith("§") for line in input_str.lstrip("\ufeff").splitlines()):
-        # Vim-mode or other shape — no sections to record.
-        return
-
-    sections = parse_hashline_input(input_str)
-    for idx, sec in enumerate(sections):
-        repeat = None
-        repeat_block_idx: int | None = None
-        for bi, block in enumerate(sec.payload_blocks):
-            r = find_longest_repeat(block, 4)
-            if r is None:
-                continue
-            start_i, k = r
-            if repeat is None or k > repeat[1]:
-                repeat = (start_i, k)
-                repeat_block_idx = bi
-        if repeat is not None and repeat_block_idx is not None:
-            blk = sec.payload_blocks[repeat_block_idx]
-            sample_line = blk[repeat[0]] if repeat[0] < len(blk) else ""
-            sample = (sample_line[:80] + "…") if len(sample_line) > 80 else sample_line
-            longest_repeat_len = repeat[1]
-        else:
-            sample = None
-            longest_repeat_len = 0
-
-        dups = duplicated_anchors([sec])
-
-        rec.edit_sections.append(
-            (
-                sf, call_id, seq, idx, sec.target_file,
-                sec.op_count, sec.deleted_lines, sec.payload_count, sec.change_size,
-                sec.min_line, sec.max_line,
-                json.dumps(sec.payload_blocks, ensure_ascii=False),
-                json.dumps(sec.op_anchors, ensure_ascii=False),
-                longest_repeat_len, repeat_block_idx, sample,
-                json.dumps(dups, ensure_ascii=False),
-                EDIT_PARSER_VERSION,
-            )
-        )
 
 
 def _ingest_tool_result(rec, path, seq, entry_id, ts, msg) -> None:
@@ -772,7 +541,7 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
             for tbl in (
                 "ss_tool_calls", "ss_tool_results",
                 "ss_assistant_msgs", "ss_user_msgs",
-                "ss_edit_calls", "ss_edit_sections",
+                "ss_edit_calls",
             ):
                 cur.execute(f"DELETE FROM {tbl} WHERE session_file = ?", (sf,))
 
@@ -831,18 +600,6 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
                 [(sf_, cid, succ, warn, EDIT_PARSER_VERSION)
                  for (sf_, cid, succ, warn) in rec.edit_call_results],
             )
-        if rec.edit_sections:
-            cur.executemany(
-                "INSERT OR REPLACE INTO ss_edit_sections "
-                "(session_file, call_id, seq, section_idx, target_file, "
-                " op_count, deleted_lines, payload_count, change_size, "
-                " min_line, max_line, payload_blocks, op_anchors, "
-                " longest_repeat_len, longest_repeat_block_idx, longest_repeat_sample, "
-                " dup_anchors, parser_version) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                rec.edit_sections,
-            )
-
         m = rec.session_meta
         cur.execute(
             "INSERT INTO ss_sessions "

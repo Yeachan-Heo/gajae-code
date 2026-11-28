@@ -222,7 +222,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 				previousModel: this.model,
 				previousThinkingLevel: this.thinkingLevel,
 				previousThinkingLevelMutationRevision: 0,
-				previousEditMode: "hashline",
+				previousEditMode: "replace",
 				signal,
 			};
 		},
@@ -2165,7 +2165,7 @@ describe("model profile activation", () => {
 				previousModel: baseSession.model,
 				previousThinkingLevel: baseSession.thinkingLevel,
 				previousThinkingLevelMutationRevision: 0,
-				previousEditMode: "hashline",
+				previousEditMode: "replace",
 				signal,
 			}),
 			commitPreparedProfileModelSelection: (selection: PreparedProfileModelSelection) => {

@@ -8,11 +8,7 @@
     },
     "settings": {
       "read.summarize.enabled": true
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -23,11 +19,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -38,11 +30,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -53,11 +41,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -68,11 +52,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -83,11 +63,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -98,11 +74,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -113,11 +85,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -133,11 +101,7 @@
     "settings": {
       "read.summarize.enabled": false,
       "read.truncation": "head"
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -149,11 +113,7 @@
     "settings": {
       "read.summarize.enabled": false,
       "fetch.enabled": true
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -164,11 +124,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -179,11 +135,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -194,11 +146,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -209,11 +157,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -224,11 +168,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -239,11 +179,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -254,11 +190,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -269,11 +201,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -284,11 +212,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -299,11 +223,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -314,11 +234,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -329,11 +245,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -344,11 +256,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -359,11 +267,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -374,11 +278,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -389,11 +289,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -404,11 +300,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -419,11 +311,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "invariant",
@@ -434,11 +322,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "changed",
@@ -450,10 +334,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "The default bare-read window changes from the first lines to the last lines."
   },
   {
@@ -466,10 +346,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "Archive member bare reads adopt tail truncation and a new recovery footer."
   },
   {
@@ -482,10 +358,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "ACP-backed bare reads use the baseline 3000-line/50 KiB directional budget; disk receipts retain their 50-line/10 KiB budget."
   },
   {
@@ -498,10 +370,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "The wrapper no longer owns the bare-read truncation notice."
   },
   {
@@ -514,10 +382,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "A 6000-emoji single line changes to a tail snippet instead of a head snippet."
   },
   {
@@ -531,10 +395,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "Bare reads gain the new both-direction truncation mode."
   },
   {
@@ -548,10 +408,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "Tail-partial mode changes oversized single-line output semantics."
   },
   {
@@ -565,10 +421,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "An explicit range with truncation=last retains the end of the selected window."
   },
   {
@@ -581,10 +433,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "The default read output snapshot is kept separate from its prompt description."
   },
   {
@@ -599,10 +447,6 @@
       "read.summarize.enabled": false,
       "read.truncation": "head"
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "The head-truncated read output snapshot is kept separate from its prompt description."
   },
   {
@@ -615,10 +459,6 @@
     "settings": {
       "read.summarize.enabled": false
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "Keep the default read tool description pinned independently from result snapshots."
   },
   {
@@ -633,10 +473,6 @@
       "read.summarize.enabled": false,
       "read.truncation": "head"
     },
-    "hashLines": [
-      true,
-      false
-    ],
     "reason": "Keep the head-truncation read tool description pinned independently from result snapshots."
   },
   {
@@ -648,11 +484,7 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   },
   {
     "bucket": "surface",
@@ -663,10 +495,6 @@
     },
     "settings": {
       "read.summarize.enabled": false
-    },
-    "hashLines": [
-      true,
-      false
-    ]
+    }
   }
 ]

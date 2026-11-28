@@ -2,7 +2,7 @@
 
 This document describes how coding-agent reads and edits Jupyter notebooks (`.ipynb`) and how that relates to Python execution.
 
-The critical distinction: **there is no dedicated `notebook` tool, and nothing automatically executes notebook cells**. The notebook-aware `read` route and the `replace`, `patch`, `hashline`, and `apply_patch` edit modes convert a notebook to an editable plain-text cell representation and serialize those edits back to notebook JSON; `vim` and `write` use their ordinary text paths described below. Running Python goes through the `eval` tool (`language: "py"`) or the `python` tool. Neither automatically loads notebook cells, though supplied Python code can use ordinary filesystem APIs to read or write files.
+The critical distinction: **there is no dedicated `notebook` tool, and nothing automatically executes notebook cells**. The notebook-aware `read` route and the `replace`, `patch`, and `apply_patch` edit modes convert a notebook to an editable plain-text cell representation and serialize those edits back to notebook JSON; `vim` and `write` use their ordinary text paths described below. Running Python goes through the `eval` tool (`language: "py"`) or the `python` tool. Neither automatically loads notebook cells, though supplied Python code can use ordinary filesystem APIs to read or write files.
 
 ## Implementation files
 
@@ -39,7 +39,7 @@ df = pd.read_csv("data.csv")
 
 ### `edit`
 
-For `.ipynb` updates, the `replace`, `patch`, and `hashline` edit modes and `apply_patch` updates route existing-file content through `readEditFileText()` and serialize edits through `serializeEditFileText()`. An `apply_patch` create operation skips the read step but still uses the serializer when writing the new `.ipynb` file.
+For `.ipynb` updates, the `replace`, `patch`, and `apply_patch` edit modes route existing-file content through `readEditFileText()` and serialize edits through `serializeEditFileText()`. An `apply_patch` create operation skips the read step but still uses the serializer when writing the new `.ipynb` file.
 
 - On the existing-file read path, `readEditFileText()` enforces the `MAX_EDIT_FILE_BYTES` (8 MiB) guard **before** notebook conversion, so an oversized notebook fails fast instead of being parsed on the main thread.
 - For `.ipynb`, the edit mode then operates on the editable text, and `serializeEditFileText()` maps the edited text back to notebook JSON via `serializeEditedNotebookText()`.

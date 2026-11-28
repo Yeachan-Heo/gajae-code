@@ -53,7 +53,6 @@ pub const fn description(mode: EditMode) -> &'static str {
 		EditMode::Replace => include_str!("../prompts/replace.md"),
 		EditMode::Patch => include_str!("../prompts/patch.md"),
 		EditMode::ApplyPatch => include_str!("../prompts/apply_patch.md"),
-		EditMode::Hashline => include_str!("../prompts/hashline.md"),
 		EditMode::Sloppy => include_str!("../prompts/sloppy.md"),
 	}
 }
@@ -62,7 +61,6 @@ pub const fn description(mode: EditMode) -> &'static str {
 pub const fn grammar(mode: EditMode) -> Option<&'static str> {
 	match mode {
 		EditMode::ApplyPatch => Some(include_str!("../grammars/apply_patch.lark")),
-		EditMode::Hashline => Some(include_str!("../grammars/hashline.lark")),
 		EditMode::Sloppy => Some(include_str!("../grammars/sloppy.lark")),
 		EditMode::Replace | EditMode::Patch => None,
 	}

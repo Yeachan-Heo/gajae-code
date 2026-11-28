@@ -2,12 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, StopReason, ToolCall, ToolResultMessage, Usage } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	applyPatchSchema,
-	hashlineEditParamsSchema,
-	patchEditSchema,
-	replaceEditSchema,
-} from "@gajae-code/coding-agent/edit";
+import { applyPatchSchema, patchEditSchema, replaceEditSchema } from "@gajae-code/coding-agent/edit";
 import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import {
 	BTW_MAX_TOOL_STATUS_LINE_UTF8_BYTES,
@@ -154,20 +149,7 @@ describe("btw projection: allow-listed targets from real tool schemas", () => {
 			accepts: patchEditSchema,
 			line: "[tool] edit src/d.ts: ok",
 		},
-		{
-			label: "edit hashline mode with path",
-			name: "edit",
-			args: { path: "src/e.ts", input: "PRIVATE_HASHLINE" },
-			accepts: hashlineEditParamsSchema,
-			line: "[tool] edit src/e.ts: ok",
-		},
-		{
-			label: "edit hashline mode without path",
-			name: "edit",
-			args: { input: "PRIVATE_HASHLINE" },
-			accepts: hashlineEditParamsSchema,
-			line: "[tool] edit: ok",
-		},
+
 		{
 			label: "edit apply_patch mode has no target field",
 			name: "edit",

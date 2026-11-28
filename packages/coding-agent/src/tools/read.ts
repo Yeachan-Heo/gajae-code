@@ -8,11 +8,10 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { getFileReadCache } from "../edit/file-read-cache";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getActiveSkills } from "../extensibility/skills";
-import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
+
 import { InternalUrlRouter } from "../internal-urls";
 import { normalizeInternalUrlInput, parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
@@ -142,13 +141,7 @@ function prependLineNumbers(text: string, startNum: number): string {
 	return textLines.map((line, i) => `${startNum + i}|${line}`).join("\n");
 }
 
-function formatTextWithMode(
-	text: string,
-	startNum: number,
-	shouldAddHashLines: boolean,
-	shouldAddLineNumbers: boolean,
-): string {
-	if (shouldAddHashLines) return formatHashLines(text, startNum);
+function formatTextWithMode(text: string, startNum: number, shouldAddLineNumbers: boolean): string {
 	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum);
 	return text;
 }
@@ -173,13 +166,7 @@ function canMergeBracePair(headLine: string, tailLine: string): boolean {
 	return BRACE_TAIL_TRAILING_RE.test(tail.slice(closer.length));
 }
 
-function formatSingleLine(
-	line: number,
-	text: string,
-	shouldAddHashLines: boolean,
-	shouldAddLineNumbers: boolean,
-): string {
-	if (shouldAddHashLines) return formatHashLine(line, text);
+function formatSingleLine(line: number, text: string, shouldAddLineNumbers: boolean): string {
 	if (shouldAddLineNumbers) return `${line}|${text}`;
 	return text;
 }
@@ -189,15 +176,9 @@ function formatMergedBraceLine(
 	endLine: number,
 	headText: string,
 	tailText: string,
-	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
 ): { model: string; display: string } {
 	const merged = `${headText.trimEnd()} .. ${tailText.trim()}`;
-	if (shouldAddHashLines) {
-		const start = formatLineHash(startLine, headText);
-		const end = formatLineHash(endLine, tailText);
-		return { model: `${start}-${end}${HL_BODY_SEP}${merged}`, display: merged };
-	}
 	if (shouldAddLineNumbers) {
 		return { model: `${startLine}-${endLine}|${merged}`, display: merged };
 	}
@@ -249,18 +230,11 @@ function rebaseWindow(window: ReadWindow, offset: number): ReadWindow {
 	return rebased;
 }
 
-function renderReadWindow(
-	window: ReadWindow,
-	shouldAddHashLines: boolean,
-	shouldAddLineNumbers: boolean,
-	maxColumns = 0,
-): string {
+function renderReadWindow(window: ReadWindow, shouldAddLineNumbers: boolean, maxColumns = 0): string {
 	const renderSegment = (segment: ReadSegment): string => {
-		const hash = shouldAddHashLines && segment.kind === "lines";
-		const numbers = !hash && shouldAddLineNumbers;
 		const renderContent =
-			!hash && maxColumns > 0 ? truncateTextWithSecretAwareness(segment.content, maxColumns).text : segment.content;
-		return formatTextWithMode(renderContent, segment.origin.startLine, hash, numbers);
+			maxColumns > 0 ? truncateTextWithSecretAwareness(segment.content, maxColumns).text : segment.content;
+		return formatTextWithMode(renderContent, segment.origin.startLine, shouldAddLineNumbers);
 	};
 	const marker = formatMiddleElisionMarker(window.elidedLines, window.elidedBytes);
 	if (window.kind === "full") return window.head ? renderSegment(window.head) : "";
@@ -428,16 +402,6 @@ function formatDirectionalFooter(readPath: string, window: ReadWindow): string {
 	}
 	const shown = head?.lines ?? 0;
 	return `[Showing first ${shown} of ${total} lines (~${Math.ceil(shownBytes / 1024)} KiB); re-read ${readPath}:1-${total} or ${readPath}:raw for the full file]`;
-}
-
-function formatOversizedLineWarning(
-	readPath: string,
-	lineNumber: number,
-	lineBytes: number,
-	maxBytes: number,
-	fullFileLines: number,
-): string {
-	return `[Line ${lineNumber} is ${formatBytes(lineBytes)}, exceeds ${formatBytes(maxBytes)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview. Re-read ${readPath}:1-${fullFileLines} or ${readPath}:raw for the full file]`;
 }
 
 function formatListingTruncationNotice(
@@ -1281,8 +1245,8 @@ export interface ReadToolDetails {
 	spillEligible?: boolean;
 
 	/** Raw text + start line for user-visible TUI rendering, set when content is text-like.
-	 * Mirrors the same lines the model receives but without hashline/line-number prefixes,
-	 * so the TUI can render the file content with its own gutter without re-parsing the formatted text. */
+	 * Mirrors the same lines the model receives without formatting prefixes,
+	 * so the TUI can render the file content with its own gutter without re-parsing. */
 	displayContent?: { text: string; startLine: number };
 	summary?: { lines: number; elidedSpans: number; elidedLines: number };
 	/** Number of unresolved git conflicts surfaced by this read (TUI uses for inline `⚠ N` badge). */
@@ -1477,8 +1441,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			TRUNCATION_DEFAULT: configuredReadTruncation(this.session.settings.get("read.truncation")),
 			RECEIPT_LINES: String(this.#receiptLines()),
 			RECEIPT_KIB: String(this.#receiptKib()),
-			IS_HL_MODE: displayMode.hashLines,
-			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
+			IS_LINE_NUMBER_MODE: displayMode.lineNumbers,
 		});
 	}
 	readonly parameters = readSchema;
@@ -1617,7 +1580,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			truncationMetadataBodyRelative?: boolean;
 			/** Preserve this leading URL preamble while truncating only the selected body. */
 			protectedPrefixChars?: number;
-			cacheLinesFor?: string;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
@@ -1657,7 +1619,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const direction = options.truncationDirection ?? "head";
 		const receipt = options.receiptPath !== undefined;
-		const exposeReceiptHeadMeta = receipt && options.cacheLinesFor !== undefined;
 		const bodyFooterPath = options.receiptPath ?? options.bodyFooterPath;
 		const preservePrefix =
 			direction !== "head" && options.protectedPrefixChars !== undefined && options.protectedPrefixChars > 0;
@@ -1703,19 +1664,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			options.truncationMetadataBodyRelative || (offset !== undefined && direction !== "head")
 				? "window"
 				: undefined;
-		const shouldAddHashLines = displayMode.hashLines;
-		const shouldAddLineNumbers = !shouldAddHashLines && displayMode.lineNumbers;
+		const shouldAddLineNumbers = displayMode.lineNumbers;
 		const maxColumns = options.raw ? 0 : resolveOutputMaxColumns(this.session.settings);
-		const bodyRawWindow = renderReadWindow(window, false, false, maxColumns);
-		const bodyRenderedWindow = renderReadWindow(window, shouldAddHashLines, shouldAddLineNumbers, maxColumns);
+		const bodyRawWindow = renderReadWindow(window, false, maxColumns);
+		const bodyRenderedWindow = renderReadWindow(window, shouldAddLineNumbers, maxColumns);
 		const rawWindow = preservePrefix ? `${protectedPrefix}${bodyRawWindow}` : bodyRawWindow;
 		const renderedWindow = preservePrefix ? `${protectedPrefix}${bodyRenderedWindow}` : bodyRenderedWindow;
-		const partialTail = partialTailOf(window);
-		const partialTailWarning = partialTail !== undefined && shouldAddHashLines && bodyFooterPath !== undefined;
-		if (partialTailWarning) {
-			Object.defineProperty(metadataWindow, "outputLinesOverride", { value: 0, enumerable: false });
-			Object.defineProperty(metadataWindow, "outputBytesOverride", { value: 0, enumerable: false });
-		}
 		const selectedContent = windowSegments(window)
 			.map(segment => segment.content)
 			.join("\n");
@@ -1727,17 +1681,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		};
 
 		let usedLegacyHeadTruncation = false;
-		let outputText = partialTailWarning
-			? formatOversizedLineWarning(
-					bodyFooterPath!,
-					partialTail!.origin.startLine,
-					partialTail!.sourceLineBytes,
-					budgetBytes,
-					totalLines,
-				)
-			: renderedWindow;
+		let outputText = renderedWindow;
 		let truncationResult: TruncationResult | undefined;
-		if (window.kind !== "full" && (!receipt || direction !== "head" || exposeReceiptHeadMeta)) {
+		if (window.kind !== "full" && (!receipt || direction !== "head")) {
 			const windowResult = makeWindowResult(metadataWindow, selectedContent);
 			const baseTruncation =
 				!receipt && direction === "head"
@@ -1746,15 +1692,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							truncated: true,
 						}
 					: windowResult;
-			truncationResult = partialTailWarning
-				? { ...baseTruncation, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
-				: baseTruncation;
+			truncationResult = baseTruncation;
 			details.truncation = truncationResult;
 		}
 
 		// Preserve the historical head byte-cap oversized-line behavior. The
 		// directional window model is used for tail/both; head remains the old
-		// oracle so existing hashline and snippet contracts stay byte-identical.
+		// oracle so existing snippet contracts stay byte-identical.
 		if (!receipt && direction === "head" && legacyHeadByteCeiling !== undefined) {
 			const legacy = truncateHead(rangeText, {
 				maxBytes: legacyHeadByteCeiling,
@@ -1767,24 +1711,20 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const firstLine = allLines[startLine] ?? "";
 				const firstLineBytes = Buffer.byteLength(firstLine, "utf-8");
 				const snippet = truncateHeadBytes(firstLine, legacyHeadByteCeiling);
-				if (shouldAddHashLines) {
-					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(legacyHeadByteCeiling)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
-				} else {
-					outputText = formatTextWithMode(snippet.text, startLineDisplay, false, shouldAddLineNumbers);
-				}
+				outputText = formatTextWithMode(snippet.text, startLineDisplay, shouldAddLineNumbers);
 				if (snippet.text.length === 0) {
 					outputText = `[Line ${startLineDisplay} is ${formatBytes(firstLineBytes)}, exceeds ${formatBytes(legacyHeadByteCeiling)} limit. Unable to display a valid UTF-8 snippet.]`;
 				}
 				details.displayContent = { text: snippet.text, startLine: startLineDisplay };
 			} else if (legacy.truncated) {
-				outputText = formatTextWithMode(legacy.content, startLineDisplay, shouldAddHashLines, shouldAddLineNumbers);
+				outputText = formatTextWithMode(legacy.content, startLineDisplay, shouldAddLineNumbers);
 			} else {
-				outputText = formatTextWithMode(rangeText, startLineDisplay, shouldAddHashLines, shouldAddLineNumbers);
+				outputText = formatTextWithMode(rangeText, startLineDisplay, shouldAddLineNumbers);
 			}
 		}
 
 		const userLimitedLines = limit !== undefined ? endLine - startLine : undefined;
-		if (bodyFooterPath !== undefined && window.kind !== "full" && !partialTailWarning) {
+		if (bodyFooterPath !== undefined && window.kind !== "full") {
 			// A head window only owns a body footer on the historical receipt paths.
 			// Archive members and internal URLs reach here through `bodyFooterPath`
 			// alone; adding a head footer there would emit a second notice beside the
@@ -1818,19 +1758,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		details.spillEligible =
 			options.spillEligible === true && selectedContent.length > 0 && !windowHasPartialSegment(window);
-		if (options.cacheLinesFor && !windowHasPartialSegment(window)) {
-			for (const segment of windowSegments(window)) {
-				if (segment.kind === "lines" && segment.lines > 0) {
-					getFileReadCache(this.session).recordContiguous(
-						options.cacheLinesFor,
-						segment.origin.startLine,
-						linesOfSegment(segment),
-					);
-				}
-			}
-		}
 		resultBuilder.text(options.wrapUntrusted ? wrapUntrustedContent(outputText) : outputText);
-		if (window.kind !== "full" && (!receipt || direction !== "head" || exposeReceiptHeadMeta)) {
+		if (window.kind !== "full" && (!receipt || direction !== "head")) {
 			const receiptHead = receipt && direction === "head";
 			if (receiptHead && truncationResult?.truncated) {
 				const diskLike = {
@@ -1888,15 +1817,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			immutable?: boolean;
 			wrapUntrusted?: boolean;
 			truncationDirection?: TruncationDirection;
-			cacheLinesFor?: string;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
 		const details = options.details ?? {};
 		const allLines = text.split("\n");
 		const totalLines = allLines.length;
-		const shouldAddHashLines = displayMode.hashLines;
-		const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
+		const shouldAddLineNumbers = displayMode.lineNumbers;
 		const maxColumns = resolveOutputMaxColumns(this.session.settings);
 		const direction = options.truncationDirection ?? "head";
 		let columnTruncated = 0;
@@ -1910,17 +1837,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			window: ReadWindow,
 		): { text: string; partialTail?: Extract<ReadSegment, { kind: "partial-line" }> } => {
 			const renderSegment = (segment: ReadSegment): string => {
-				const hash = shouldAddHashLines && segment.kind === "lines";
 				// A partial line is a byte suffix, not a complete source line. Never
-				// give it an anchor that could make the preview look fully readable.
-				const numbers = !hash && shouldAddLineNumbers && segment.kind === "lines";
+				// give it line numbers that could make the preview look fully readable.
+				const numbers = shouldAddLineNumbers && segment.kind === "lines";
 				let renderContent = segment.content;
-				if (!options.raw && !hash && maxColumns > 0) {
+				if (!options.raw && maxColumns > 0) {
 					const result = truncateTextWithSecretAwareness(segment.content, maxColumns);
 					if (result.wasTruncated) columnTruncated = maxColumns;
 					renderContent = result.text;
 				}
-				return formatTextWithMode(renderContent, segment.origin.startLine, hash, numbers);
+				return formatTextWithMode(renderContent, segment.origin.startLine, numbers);
 			};
 			let text = "";
 			if (window.kind === "full") text = window.head ? renderSegment(window.head) : "";
@@ -1960,28 +1886,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (rendered.partialTail) {
 				const disclosurePath =
 					options.sourceInternal ?? options.sourceUrl ?? options.sourcePath ?? options.entityLabel;
-				blockOutput = shouldAddHashLines
-					? formatOversizedLineWarning(
-							disclosurePath,
-							rendered.partialTail.origin.startLine,
-							rendered.partialTail.sourceLineBytes,
-							blockMaxBytes,
-							totalLines,
-						)
-					: `${blockOutput}\n\n${formatDirectionalFooter(disclosurePath, window)}`;
+				blockOutput = `${blockOutput}\n\n${formatDirectionalFooter(disclosurePath, window)}`;
 			}
 			parts.push(blockOutput);
-			if (options.cacheLinesFor && !windowHasPartialSegment(window)) {
-				for (const segment of windowSegments(window)) {
-					if (segment.kind === "lines" && segment.lines > 0) {
-						getFileReadCache(this.session).recordContiguous(
-							options.cacheLinesFor,
-							segment.origin.startLine,
-							linesOfSegment(segment),
-						);
-					}
-				}
-			}
 		}
 
 		const outputText = parts.length > 0 ? parts.join("\n\n…\n\n") : "";
@@ -2008,7 +1915,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		absolutePath: string,
 		ranges: readonly LineRange[],
 		parsed: ParsedSelector,
-		displayMode: { hashLines: boolean; lineNumbers: boolean },
+		displayMode: { lineNumbers: boolean },
 		suffixResolution: { from: string; to: string } | undefined,
 		signal: AbortSignal | undefined,
 		direction: TruncationDirection,
@@ -2031,7 +1938,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					entityLabel: "file",
 					raw: rawSelector,
 					truncationDirection: direction,
-					cacheLinesFor: absolutePath,
 				});
 				if (suffixResolution) {
 					const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
@@ -2056,7 +1962,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				entityLabel: "file",
 				raw: rawSelector,
 				truncationDirection: direction,
-				cacheLinesFor: absolutePath,
 			});
 			const firstText = result.content.find((content): content is TextContent => content.type === "text");
 			if (suffixResolution && firstText) {
@@ -2066,8 +1971,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			return { outputText: "", contentLineCount: 0, columnTruncated: 0, bridgeResult: result };
 		}
 
-		const shouldAddHashLines = !rawSelector && displayMode.hashLines;
-		const shouldAddLineNumbers = rawSelector ? false : shouldAddHashLines ? false : displayMode.lineNumbers;
+		const shouldAddLineNumbers = rawSelector ? false : displayMode.lineNumbers;
 		const maxColumns = resolveOutputMaxColumns(this.session.settings);
 
 		const blocks: string[] = [];
@@ -2098,8 +2002,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			const collectedLines = streamResult.lines;
-			const cacheLines = collectedLines.slice();
-			if (!rawSelector && !shouldAddHashLines && maxColumns > 0) {
+			if (!rawSelector && maxColumns > 0) {
 				const clipped = truncateTextWithSecretAwareness(collectedLines.join("\n"), maxColumns);
 				if (clipped.wasTruncated) {
 					collectedLines.splice(0, collectedLines.length, ...clipped.text.split("\n"));
@@ -2108,12 +2011,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 
 			contentLineCount += collectedLines.length;
-			if (cacheLines.length > 0) {
-				getFileReadCache(this.session).recordContiguous(absolutePath, range.startLine, cacheLines);
-			}
 
 			const blockText = collectedLines.join("\n");
-			blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddHashLines, shouldAddLineNumbers));
+			blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddLineNumbers));
 		}
 
 		let outputText = blocks.join("\n\n…\n\n");
@@ -2154,7 +2054,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const output = results.length > 0 ? results.join("\n") : "(empty archive directory)";
 		const window = selectReadWindow(output, results, direction, Number.MAX_SAFE_INTEGER, DEFAULT_MAX_BYTES);
-		const rendered = prependSuffixResolutionNotice(renderReadWindow(window, false, false), details.suffixResolution);
+		const rendered = prependSuffixResolutionNotice(renderReadWindow(window, false), details.suffixResolution);
 		const directoryDetails: ReadToolDetails = {
 			...details,
 			isDirectory: true,
@@ -2307,7 +2207,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						DEFAULT_MAX_BYTES,
 					);
 					const rendered = prependSuffixResolutionNotice(
-						renderReadWindow(window, false, false),
+						renderReadWindow(window, false),
 						resolvedSqlitePath.suffixResolution,
 					);
 					details.truncation = window.kind !== "full" ? makeWindowResult(window, body) : undefined;
@@ -2446,7 +2346,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					entityLabel: "file",
 					raw: isRawSelector(parsed),
 					truncationDirection: direction,
-					cacheLinesFor: absolutePath,
 				});
 			}
 			const { offset, limit } = selToOffsetLimit(parsed);
@@ -2455,7 +2354,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				sourcePath: absolutePath,
 				entityLabel: "file",
 				raw: isRawSelector(parsed),
-				cacheLinesFor: absolutePath,
 				truncationDirection: direction,
 			});
 		} catch (error) {
@@ -2510,8 +2408,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		omissionNotice: string;
 	} {
 		const displayMode = resolveFileDisplayMode(this.session);
-		const shouldAddHashLines = displayMode.hashLines;
-		const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
+		const shouldAddLineNumbers = displayMode.lineNumbers;
 
 		// Flatten segments into per-line units so we can merge a kept-head /
 		// elided / kept-tail sandwich into a single brace-pair line when the
@@ -2579,14 +2476,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					unit.endLine,
 					unit.headText,
 					unit.tailText,
-					shouldAddHashLines,
 					shouldAddLineNumbers,
 				);
 				model = formatted.model;
 				display = formatted.display;
 				implicitElidedLines = Math.max(0, unit.endLine - unit.startLine - 1);
 			} else {
-				model = formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers);
+				model = formatSingleLine(unit.line, unit.text, shouldAddLineNumbers);
 				display = unit.text;
 			}
 			return { model, display, implicitElidedLines };
@@ -3042,7 +2938,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								sourcePath: absolutePath,
 								entityLabel: "file",
 								raw: isRawSelector(parsed),
-								cacheLinesFor: absolutePath,
 								truncationDirection: localDirection,
 							});
 							if (suffixResolution) {
@@ -3130,12 +3025,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						directionalNoticeOwner = isBareReceipt ? "body" : undefined;
 						directionalRangeBase = offset !== undefined && localDirection !== "head" ? "window" : undefined;
 						const directionalPartial = windowHasPartialSegment(window);
-						const shouldAddDirectionalHashLines = !rawSelector && displayMode.hashLines;
-						const shouldAddDirectionalLineNumbers = rawSelector
-							? false
-							: !shouldAddDirectionalHashLines && displayMode.lineNumbers;
+						const shouldAddDirectionalLineNumbers = rawSelector ? false : displayMode.lineNumbers;
 						const directionalMaxColumns = rawSelector ? 0 : resolveOutputMaxColumns(this.session.settings);
-						if (!rawSelector && !shouldAddDirectionalHashLines && directionalMaxColumns > 0) {
+						if (!rawSelector && directionalMaxColumns > 0) {
 							for (const segment of windowSegments(window)) {
 								if (truncateTextWithSecretAwareness(segment.content, directionalMaxColumns).wasTruncated) {
 									columnTruncated = directionalMaxColumns;
@@ -3146,38 +3038,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const selectedContent = windowSegments(window)
 							.map(segment => segment.content)
 							.join("\n");
-						const partialTail = partialTailOf(window);
-						const partialTailWarning = partialTail !== undefined && shouldAddDirectionalHashLines;
-						if (partialTailWarning) {
-							Object.defineProperty(window, "outputLinesOverride", { value: 0, enumerable: false });
-							Object.defineProperty(window, "outputBytesOverride", { value: 0, enumerable: false });
-							Object.defineProperty(metadataWindow, "outputLinesOverride", { value: 0, enumerable: false });
-							Object.defineProperty(metadataWindow, "outputBytesOverride", { value: 0, enumerable: false });
-						}
-						const baseWindowResult =
-							window.kind === "full" ? undefined : makeWindowResult(metadataWindow, selectedContent);
 						const windowResult =
-							baseWindowResult && partialTailWarning
-								? { ...baseWindowResult, outputLines: 0, outputBytes: 0, lastLineExceedsLimit: true }
-								: baseWindowResult;
-						const rawWindow = renderReadWindow(window, false, false, directionalMaxColumns);
-						let outputText = partialTailWarning
-							? formatOversizedLineWarning(
-									localReadPath,
-									partialTail.origin.startLine,
-									partialTail.sourceLineBytes,
-									maxBytesForRead,
-									totalFileLines,
-								)
-							: renderReadWindow(
-									window,
-									shouldAddDirectionalHashLines,
-									shouldAddDirectionalLineNumbers,
-									directionalMaxColumns,
-								);
+							window.kind === "full" ? undefined : makeWindowResult(metadataWindow, selectedContent);
+						const rawWindow = renderReadWindow(window, false, directionalMaxColumns);
+						let outputText = renderReadWindow(window, shouldAddDirectionalLineNumbers, directionalMaxColumns);
 						const windowEnd = Math.min(collectEndExclusive ?? totalFileLines, totalFileLines);
 						let bodyFooter: string | undefined;
-						if (isBareReceipt && window.kind !== "full" && !partialTailWarning) {
+						if (isBareReceipt && window.kind !== "full") {
 							const footer = formatDirectionalFooter(localReadPath, metadataWindow);
 							if (footer) {
 								outputText += `\n\n${footer}`;
@@ -3208,51 +3075,39 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							spillEligible: !isBareReceipt && selectedContent.length > 0 && !directionalPartial,
 						};
 						if (bodyFooter) rememberBodyTruncationFooter(details, bodyFooter);
-						if (!directionalPartial) {
-							for (const segment of windowSegments(window)) {
-								if (segment.kind === "lines" && segment.lines > 0) {
-									getFileReadCache(this.session).recordContiguous(
-										absolutePath,
-										segment.origin.startLine,
-										linesOfSegment(segment),
-									);
-								}
-							}
-						}
-						if (!partialTailWarning) {
-							const conflictBlocks = windowSegments(window).flatMap(segment =>
-								segment.kind === "lines"
-									? scanConflictLines(linesOfSegment(segment), segment.origin.startLine)
-									: [],
-							);
-							if (conflictBlocks.length > 0) {
-								const history = getConflictHistory(this.session);
-								const displayPathForWarning = formatPathRelativeToCwd(absolutePath, this.session.cwd);
-								const entries = conflictBlocks.map(block =>
-									history.register({
-										absolutePath,
-										displayPath: displayPathForWarning,
-										...block,
-									}),
-								);
-								// Cheap full-file scan only when the window already showed
-								// at least one conflict — otherwise pay nothing on clean files.
-								let totalInFile = entries.length;
-								let scanTruncated = false;
-								try {
-									const fileScan = await scanFileForConflicts(absolutePath);
-									totalInFile = Math.max(entries.length, fileScan.blocks.length);
-									scanTruncated = fileScan.scanTruncated;
-								} catch {
-									// Best-effort enrichment; fall back to window-only count.
-								}
-								outputText += formatConflictWarning(entries, {
-									totalInFile,
+
+						const conflictBlocks = windowSegments(window).flatMap(segment =>
+							segment.kind === "lines"
+								? scanConflictLines(linesOfSegment(segment), segment.origin.startLine)
+								: [],
+						);
+						if (conflictBlocks.length > 0) {
+							const history = getConflictHistory(this.session);
+							const displayPathForWarning = formatPathRelativeToCwd(absolutePath, this.session.cwd);
+							const entries = conflictBlocks.map(block =>
+								history.register({
+									absolutePath,
 									displayPath: displayPathForWarning,
-									scanTruncated,
-								});
-								details.conflictCount = entries.length;
+									...block,
+								}),
+							);
+							// Cheap full-file scan only when the window already showed
+							// at least one conflict — otherwise pay nothing on clean files.
+							let totalInFile = entries.length;
+							let scanTruncated = false;
+							try {
+								const fileScan = await scanFileForConflicts(absolutePath);
+								totalInFile = Math.max(entries.length, fileScan.blocks.length);
+								scanTruncated = fileScan.scanTruncated;
+							} catch {
+								// Best-effort enrichment; fall back to window-only count.
 							}
+							outputText += formatConflictWarning(entries, {
+								totalInFile,
+								displayPath: displayPathForWarning,
+								scanTruncated,
+							});
+							details.conflictCount = entries.length;
 						}
 						sourcePath = absolutePath;
 						content = [{ type: "text", text: outputText }];
@@ -3262,9 +3117,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						// counts in `truncation` keep reflecting the source, not the trimmed
 						// view — column truncation surfaces separately via `.limits()`.
 
-						const shouldAddHashLines = !rawSelector && displayMode.hashLines;
 						const maxColumns = resolveOutputMaxColumns(this.session.settings);
-						if (!rawSelector && !shouldAddHashLines && maxColumns > 0) {
+						if (!rawSelector && maxColumns > 0) {
 							const clipped = truncateTextWithSecretAwareness(collectedLines.join("\n"), maxColumns);
 							if (clipped.wasTruncated) {
 								collectedLines.splice(0, collectedLines.length, ...clipped.text.split("\n"));
@@ -3293,19 +3147,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							firstLineExceedsLimit,
 						};
 
-						if (collectedLines.length > 0 && !firstLineExceedsLimit) {
-							getFileReadCache(this.session).recordContiguous(absolutePath, startLineDisplay, collectedLines);
-						}
-
-						const shouldAddLineNumbers = rawSelector
-							? false
-							: shouldAddHashLines
-								? false
-								: displayMode.lineNumbers;
+						const shouldAddLineNumbers = rawSelector ? false : displayMode.lineNumbers;
 						let capturedDisplayContent: { text: string; startLine: number } | undefined;
 						const formatText = (text: string, startNum: number): string => {
 							capturedDisplayContent = { text, startLine: startNum };
-							return formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
+							return formatTextWithMode(text, startNum, shouldAddLineNumbers);
 						};
 
 						let outputText: string;
@@ -3314,13 +3160,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							const firstLineBytes = firstLineByteLength ?? 0;
 							const snippet = firstLinePreview ?? { text: "", bytes: 0 };
 
-							if (shouldAddHashLines) {
-								outputText = `[Line ${startLineDisplay} is ${formatBytes(
-									firstLineBytes,
-								)}, exceeds ${formatBytes(maxBytesForRead)} limit. Hashline output requires full lines; cannot compute hashes for a truncated preview.]`;
-							} else {
-								outputText = formatText(snippet.text, startLineDisplay);
-							}
+							outputText = formatText(snippet.text, startLineDisplay);
 							if (snippet.text.length === 0) {
 								outputText = `[Line ${startLineDisplay} is ${formatBytes(
 									firstLineBytes,
@@ -3443,8 +3283,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	/**
 	 * Render a `conflict://<N>` (or `conflict://<N>/<scope>`) region as
 	 * regular file content. The lines are emitted with their original
-	 * file line numbers so hashline anchors line up with the source
-	 * file, and no truncation footer is appended.
+	 * file line numbers, and no truncation footer is appended.
 	 */
 	async #readConflictRegion(id: number, scope: ConflictScope | undefined): Promise<AgentToolResult<ReadToolDetails>> {
 		const entry: ConflictEntry | undefined = getConflictHistory(this.session).get(id);
@@ -3456,11 +3295,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const region = renderConflictRegion(entry, scope);
 		const displayMode = resolveFileDisplayMode(this.session);
-		const shouldAddHashLines = displayMode.hashLines;
-		const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
+		const shouldAddLineNumbers = displayMode.lineNumbers;
 
 		const rawText = region.lines.join("\n");
-		const formattedText = formatTextWithMode(rawText, region.startLine, shouldAddHashLines, shouldAddLineNumbers);
+		const formattedText = formatTextWithMode(rawText, region.startLine, shouldAddLineNumbers);
 
 		const details: ReadToolDetails = {
 			resolvedPath: entry.absolutePath,
@@ -3632,7 +3470,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const shownSegments = windowSegments(window);
 		const shownBytes =
 			shownSegments.reduce((sum, segment) => sum + segment.bytes, 0) + Math.max(0, shownSegments.length - 1);
-		let output = renderReadWindow(window, false, false);
+		let output = renderReadWindow(window, false);
 		if (window.kind !== "full" || tree.truncated) {
 			output += `\n\n${formatListingTruncationNotice(shownLines, shownBytes, absolutePath, direction)}`;
 		}
@@ -3729,7 +3567,7 @@ export const readToolRenderer = {
 		const details = result.details;
 		const rawText = result.content?.find(c => c.type === "text")?.text ?? "";
 		// Prefer structured `displayContent` from details when available so the TUI
-		// shows clean file content (no model-only hashline anchors) without parsing the formatted text.
+		// shows clean file content without parsing the formatted text.
 		// Fall back to the raw text, but strip the LLM-facing notice so it doesn't
 		// echo next to the styled warning line below.
 		const contentText = details?.displayContent?.text ?? stripOutputNotice(rawText, details?.meta);

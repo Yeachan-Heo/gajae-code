@@ -53,9 +53,6 @@ export interface EditToolPerFileResult {
 	move?: string;
 	isError?: boolean;
 	errorText?: string;
-	/** TUI-friendly error text. When present, rendered to the user instead of `errorText`.
-	 * Set when the underlying error carries a `displayMessage` (e.g. {@link HashlineMismatchError}). */
-	displayErrorText?: string;
 	meta?: OutputMeta;
 	/** Source-of-truth content before the edit; `undefined` for create operations. */
 	oldText?: string;
@@ -142,11 +139,10 @@ export interface EditRenderArgs {
 	rename?: string;
 	diff?: string;
 	/**
-	 * Computed preview diff (used when tool args don't include a diff, e.g. hashline mode).
+	 * Computed preview diff (used when tool args don't include a diff).
 	 */
 	previewDiff?: string;
 	__partialJson?: string;
-	// Hashline mode fields
 	edits?: EditRenderEntry[];
 }
 
@@ -527,10 +523,8 @@ function renderSingleFileResult(
 ): Component {
 	const details = result.details;
 	const isError = result.isError ?? (details && "isError" in details ? details.isError : false);
-	const displayErrorText = isError && details && "displayErrorText" in details ? details.displayErrorText : undefined;
 	const errorText = isError
-		? displayErrorText ||
-			(details && "errorText" in details && details.errorText) ||
+		? (details && "errorText" in details && details.errorText) ||
 			(result.content?.find(c => c.type === "text")?.text ?? "")
 		: "";
 	const baseIdentity = resolveCompletedEditIdentity(details, args, options.renderContext?.editMode, options.isPartial);

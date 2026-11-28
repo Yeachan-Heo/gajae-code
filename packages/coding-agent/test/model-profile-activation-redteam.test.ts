@@ -81,7 +81,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 				previousModel: this.model,
 				previousThinkingLevel: this.thinkingLevel,
 				previousThinkingLevelMutationRevision: 0,
-				previousEditMode: "hashline",
+				previousEditMode: "replace",
 				signal,
 			};
 		},

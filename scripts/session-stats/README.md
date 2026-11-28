@@ -10,7 +10,7 @@ scripts.
 ```
 scripts/session-stats/
   sync.py       # walks ~/.gjc/agent/sessions/ and populates ss_* tables
-  analyze.py    # tools | edits | followups subcommands over the synced db
+  analyze.py    # tools | edits subcommands over the synced db
 ```
 
 ## One-time prep
@@ -47,7 +47,6 @@ All tables are prefixed `ss_` to avoid collision with `packages/stats`.
 |`ss_assistant_msgs`|per assistant message text + thinking blobs and token counts|
 |`ss_user_msgs`|per user message text and token count|
 |`ss_edit_calls`|per `edit` call: `success`, `warnings`, `raw_input_len`|
-|`ss_edit_sections`|per `§PATH` section in an edit; precomputed `longest_repeat_*`, `dup_anchors`|
 
 Indexes on `(tool_name, timestamp)` and `(session_file, seq)` make per-tool
 aggregations and ordered session walks cheap.
@@ -58,13 +57,11 @@ aggregations and ordered session walks cheap.
 bun run stats:tools                        # per-tool token totals
 bun run stats:tools -- --by d --top 8      # bucket by day, top 8 tools each
 bun run stats:edits                        # edit-tool reliability audit
-bun run stats:followups                    # five hashline-edit detectors
-bun run stats:followups -- --max-fix 2 --min-dup 8 --show 20
 ```
 
-All three accept `-n N` / `--folder SUBSTR` to scope the query.
+Both accept `-n N` / `--folder SUBSTR` to scope the query.
 
 The Rust crate that previously lived here was retired in favor of this
 SQLite-backed flow. The schema persists everything the analyses used to
-recompute on every run (token counts, hashline parse output, success flags),
+recompute on every run (token counts and success flags),
 so subsequent invocations are sub-second over the full corpus.

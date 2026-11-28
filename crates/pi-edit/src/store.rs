@@ -68,7 +68,7 @@ impl Clipboard {
 	}
 }
 
-/// Compute the four-hex uppercase hashline content tag.
+/// Compute the four-hex uppercase content tag.
 pub fn file_hash(text: &str) -> String {
 	let mut normalized = String::with_capacity(text.len());
 	for segment in text.split_inclusive('\n') {
@@ -86,9 +86,9 @@ pub fn payload_hash(text: &str) -> u64 {
 	xxh64(text.as_bytes(), 0)
 }
 
-/// Parse displayed boundary line numbers from a hashline-formatted body.
+/// Parse displayed boundary line numbers from a line-numbered body.
 pub fn seen_lines_from_body(body: &str) -> Vec<u32> {
-	let prefix = Regex::new(r"^[ *]?(\d+)(?:-(\d+))?:").expect("valid hashline prefix regex");
+	let prefix = Regex::new(r"^[ *]?(\d+)(?:-(\d+))?:").expect("valid line-number prefix regex");
 	let mut seen = Vec::new();
 	for row in body.split('\n') {
 		let Some(captures) = prefix.captures(row) else {

@@ -6,7 +6,7 @@
 //! A fixture file (`tests/fixtures/<mode>/<group>.json`) holds
 //! `{ "cases": [ … ] }`. Each case builds a temp workspace from `files`,
 //! records optional `snapshots` into the store (so `{{tag:<path>}}` in the
-//! args expands to the minted hashline tag), runs one [`Session`] through a
+//! args expands to the minted content tag), runs one [`Session`] through a
 //! disk-backed writer, and compares written files / error text / result text
 //! against `expect`.
 //!

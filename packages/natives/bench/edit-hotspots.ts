@@ -7,13 +7,12 @@
 // synchronously (pre-native TS) or asynchronously (native first-use load).
 import { generateDiffString } from "../../coding-agent/src/edit/diff";
 import { findMatch, seekSequence } from "../../coding-agent/src/edit/modes/replace";
-import { formatHashLines } from "../../coding-agent/src/hashline/hash";
 
 const DEFAULT_ITERATIONS = Number(Bun.env.EDIT_HOTSPOTS_BENCH_ITERATIONS ?? "200");
 const WARMUP = Number(Bun.env.EDIT_HOTSPOTS_BENCH_WARMUP ?? "100");
 const SCHEMA = "gjc.native-bench-ab/1";
 
-type CandidateId = "H01" | "H02" | "H03" | "H06";
+type CandidateId = "H01" | "H02" | "H03";
 type BenchFn = () => unknown;
 
 interface Candidate {
@@ -36,12 +35,6 @@ const editedContent = editLines
 	.map((line, index) => (index % 53 === 0 ? `${line} // edited ${index}` : line))
 	.filter((_, index) => index % 211 !== 7)
 	.join("\n");
-const hashText = Array.from({ length: 2500 }, (_, index) => {
-	if (index % 97 === 0) return "";
-	if (index % 89 === 0) return `tabs\tand unicode “quotes” ${index}`;
-	if (index % 83 === 0) return `${"z".repeat(1024)} ${index}`;
-	return `hash line ${index} trailing   `;
-}).join("\n");
 
 const candidates: Candidate[] = [
 	{
@@ -64,13 +57,6 @@ const candidates: Candidate[] = [
 		fixture: "edit preview corpus",
 		dimensions: { lines: editLines.length, bytes: Buffer.byteLength(editContent), editedBytes: Buffer.byteLength(editedContent) },
 		run: () => generateDiffString(editContent, editedContent),
-	},
-	{
-		id: "H06",
-		name: "formatHashLines hotspot",
-		fixture: "hashline display corpus",
-		dimensions: { lines: hashText.split("\n").length, bytes: Buffer.byteLength(hashText), startLine: 37 },
-		run: () => formatHashLines(hashText, 37),
 	},
 ];
 

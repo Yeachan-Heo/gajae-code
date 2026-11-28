@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { type EditMode, EditTool } from "@gajae-code/coding-agent/edit";
-import { computeLineHash } from "@gajae-code/coding-agent/hashline";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 
@@ -49,21 +48,6 @@ describe("edit matcher hooks", () => {
 		expect(tool.matcherEntries({ path: "a.ts", edits: [{ op: "create", diff }] })).toEqual([
 			{ path: "a.ts", digest: diff },
 		]);
-	});
-
-	// Ported from oh-my-pi crates/pi-edit/src/modes/hashline/mod.rs
-	// `inspect_extracts_paths_and_added_lines_from_partial_input`. Upstream input
-	// `[*** Update File: src/a.ts#ABCD]\nPUT 1.=1:\n+new\n[src/b.ts]\nCUT 2.=2` is
-	// omp's hashline grammar; this is the same payload in gajae's grammar: an
-	// insertion into src/a.ts followed by a src/b.ts section whose deletion op is
-	// still streaming. Expected entries are identical to upstream.
-	test("inspect_extracts_paths_and_added_lines_from_partial_input (oh-my-pi parity)", () => {
-		const tool = new EditTool(makeSession(), "hashline");
-		const anchor = computeLineHash(1, "existing");
-		for (const tail of ["≔2", "≔", ""]) {
-			const input = `§src/a.ts\n»1${anchor}\nnew\n§src/b.ts\n${tail}`;
-			expect(tool.matcherEntries({ input })).toEqual([{ path: "src/a.ts", digest: "new" }]);
-		}
 	});
 
 	test("replace projects new_text from each edit, never old_text or the argument encoding", () => {
@@ -125,41 +109,6 @@ describe("edit matcher hooks", () => {
 		}
 		expect(tool.matcherEntries({ path: "a.ts", edits: [{ diff: "@@\n+" }] })).toEqual([{ path: "a.ts", digest: "" }]);
 		expect(tool.matcherDigest({ path: "a.ts", edits: [{ diff: "@@\n+" }] })).toBeUndefined();
-	});
-
-	test("hashline isolates multi-file sections, including repeated paths and replacement payloads", () => {
-		const tool = new EditTool(makeSession(), "hashline");
-		const args = {
-			input: [
-				"§src/a.ts",
-				"»EOF",
-				"const first = 1;",
-				"§notes.md",
-				"«BOF",
-				"# Only Markdown",
-				"§src/a.ts",
-				"≔1aa..2bb",
-				"const second = 2;",
-			].join("\n"),
-		};
-		expect(tool.matcherEntries(args)).toEqual([
-			{ path: "src/a.ts", digest: "const first = 1;\nconst second = 2;" },
-			{ path: "notes.md", digest: "# Only Markdown" },
-		]);
-		expect(tool.matcherDigest(args)).toBe("const first = 1;\nconst second = 2;\n# Only Markdown");
-	});
-
-	test("hashline honors fallback paths, inline insertions, and anchor echoes", () => {
-		const tool = new EditTool(makeSession(), "hashline");
-		expect(tool.matcherEntries({ path: "fallback.ts", input: "»EOF|inline()" })).toEqual([
-			{ path: "fallback.ts", digest: "inline()" },
-		]);
-		const oldText = "unchanged()";
-		const hash = computeLineHash(1, oldText);
-		expect(tool.matcherEntries({ input: `§a.ts\n»1${hash}|${oldText}\nintroduced()` })).toEqual([
-			{ path: "a.ts", digest: "introduced()" },
-		]);
-		expect(tool.matcherEntries({ input: `§a.ts\n≔1${hash}|${oldText}` })).toBeUndefined();
 	});
 
 	test("apply_patch includes full Add File content, update additions, and move destination, never deletions", () => {
@@ -232,7 +181,7 @@ describe("edit matcher hooks", () => {
 		);
 	});
 
-	for (const mode of ["replace", "patch", "hashline", "apply_patch", "vim"] satisfies EditMode[]) {
+	for (const mode of ["replace", "patch", "apply_patch", "vim"] satisfies EditMode[]) {
 		test(`${mode} returns undefined for missing, malformed, and unusable partial arguments`, () => {
 			const tool = new EditTool(makeSession(), mode);
 			for (const args of [

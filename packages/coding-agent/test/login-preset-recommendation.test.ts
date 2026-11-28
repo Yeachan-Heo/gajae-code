@@ -94,7 +94,7 @@ function createControllerContext(
 				previousModel: this.model,
 				previousThinkingLevel: this.thinkingLevel,
 				previousThinkingLevelMutationRevision: 0,
-				previousEditMode: "hashline",
+				previousEditMode: "replace",
 				signal,
 			};
 		},

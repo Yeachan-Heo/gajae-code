@@ -2784,7 +2784,7 @@ function b() {
 
 			const output = getTextOutput(result);
 			expect(output).not.toContain("# example.txt");
-			// PI_EDIT_VARIANT=replace in beforeEach disables hashlines; expect line-number mode
+			// PI_EDIT_VARIANT=replace in beforeEach sets output mode; expect line-number format
 			expect(output).toMatch(/\*2\|match line/);
 		});
 

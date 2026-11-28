@@ -304,7 +304,7 @@ def line_spans(text: str) -> list[tuple[str, int, int]]:
     return out
 
 def parse_legacy_diff_boundary(text: str, *, loose_tail: bool = False) -> EditBoundary:
-    """Best-effort parser for pre-hashline edit inputs.
+    """Best-effort parser for legacy edit inputs.
 
     Older sessions used `---path` followed by compact hash/range operations
     whose replacement payload was raw text, not `~`-prefixed. That format is
