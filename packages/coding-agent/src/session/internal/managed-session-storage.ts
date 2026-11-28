@@ -85,7 +85,7 @@ export class ManagedAppendIdentityMismatchError extends Error {
 	readonly code = "managed_append_identity_mismatch";
 	readonly relativePath: string;
 	readonly operatorMessage =
-		"Another process changed this session's transcript, so this process stopped saving to it. To continue, reopen the session with /resume (or gjc --resume), or fork it with /fork (or gjc --fork).";
+		"Another process changed this session's transcript, so this process stopped saving to it. To continue, reopen the session with /resume (or gjc --resume), or fork it with gjc --fork.";
 
 	constructor(relativePath: string) {
 		super("managed_append_identity_mismatch");
