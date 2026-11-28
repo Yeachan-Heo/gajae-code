@@ -4595,12 +4595,15 @@ fn replace_managed(
 	candidate_parent
 		.sync_all()
 		.map_err(|_| "rollback_unavailable")?;
-	let terminal_completed =
-		statat(&candidate_parent, &completed_candidate_name).map_err(|_| "identity_mismatch")?;
+	// These check the displaced predecessor's recovery file, not the live
+	// transcript: the rewrite has already landed, so a failure is not a refusal
+	// before the write.
+	let terminal_completed = statat(&candidate_parent, &completed_candidate_name)
+		.map_err(|_| "identity_changed_after_write")?;
 	if !stat_matches_regular_identity_after_rename(&terminal_completed, &displaced_identity)
 		|| !reaper_owner_file_stat(&terminal_completed)
 	{
-		return Err("identity_mismatch");
+		return Err("identity_changed_after_write");
 	}
 	// Publication is committed and the displaced object remains recoverable under
 	// a terminal name. The reaper retains it for the configured TTL, then removes
