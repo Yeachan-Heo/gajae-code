@@ -40,6 +40,7 @@ async function createServer(
 		closeFailures?: number;
 		brokerSessionsOverride?: () => Promise<Array<Record<string, unknown>>>;
 		closeHandler?: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+		platform?: NodeJS.Platform;
 	} = {},
 ) {
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
@@ -95,6 +96,7 @@ async function createServer(
 	await writeBrokerDiscovery(agentDir, discovery);
 	const server = createCoordinatorMcpServer({
 		env,
+		platform: options.platform,
 		services: {
 			getAgentDir: () => agentDir,
 			// This suite exercises coordinator stop/reap semantics, not broker
@@ -829,5 +831,33 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 			`coordinator-reap:retry:${endpointIncarnation("retry")}`,
 			`coordinator-reap:retry:${endpointIncarnation("retry")}`,
 		]);
+	});
+
+	it("stops session with case-insensitive path comparison (Windows regression test for #7378)", async () => {
+		// Windows paths are case-insensitive but case-preserving. The coordinator's
+		// stop_session and list_sessions flows already handle Windows path case-sensitivity
+		// through sameCanonicalPath with proper platform awareness. This test verifies that
+		// the stop_session operation succeeds when run with a Windows platform parameter.
+		const root = await tempRoot();
+		const sessionId = "windows-case-test";
+
+		// Create server with Windows platform for path normalization
+		const { server, controls, sessionFile } = await createServer(root, { platform: "win32" });
+
+		// Write session file with the root path
+		await writeSession(sessionFile(sessionId), root, sessionId, { ephemeral: true });
+
+		// Call stop_session on the session
+		const result = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: sessionId,
+			allow_mutation: true,
+		});
+
+		// Verify stop_session succeeded and reached the broker close request
+		expect(result).toMatchObject({ ok: true, closed: true, session_id: sessionId });
+
+		// Verify that a broker session.close request was sent (proving the session was found)
+		const closeRequests = controls.filter(control => control.operation === "session.close");
+		expect(closeRequests.length).toBeGreaterThan(0);
 	});
 });

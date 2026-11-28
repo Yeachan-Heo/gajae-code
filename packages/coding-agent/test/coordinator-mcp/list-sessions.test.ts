@@ -43,7 +43,7 @@ function serverEnv(root: string): NodeJS.ProcessEnv {
 async function createServerWithSessions(
 	root: string,
 	brokerSessions: Array<Record<string, unknown>>,
-	options: { registerFirst?: boolean; env?: NodeJS.ProcessEnv } = {},
+	options: { registerFirst?: boolean; env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform } = {},
 ) {
 	const agentDir = path.join(root, "agent-global");
 	const env = options.env ?? serverEnv(root);
@@ -64,6 +64,7 @@ async function createServerWithSessions(
 	await writeBrokerDiscovery(agentDir, discovery);
 	const server = createCoordinatorMcpServer({
 		env,
+		platform: options.platform,
 		services: {
 			getAgentDir: () => agentDir,
 			ensureBroker: async () => discovery,
@@ -343,5 +344,39 @@ describe("gjc_coordinator_list_sessions registration marker", () => {
 		expect(listSessions?.description).toContain("registered");
 		expect(listSessions?.description).toContain("not_found");
 		expect(listSessions?.description).toContain("unknown_session");
+	});
+
+	it("matches sessions with case-insensitive path comparison (Windows regression test for #7378)", async () => {
+		const root = await coordinatorFixtureRoot(tempDirs);
+		// Simulate a case-sensitive path mismatch that can occur on Windows when
+		// fs.realpath returns different casing on different calls.
+		// This tests the fix in scopeMatchesLocator to use normalizePathForComparison.
+		const lowerCaseRoot = root.toLowerCase();
+		const mixedCaseRoot =
+			lowerCaseRoot.length > 0 ? lowerCaseRoot[0]!.toUpperCase() + lowerCaseRoot.slice(1) : lowerCaseRoot;
+		const brokerSessionWithDifferentCasing = {
+			sessionId: BROKER_ONLY_ID,
+			locator: {
+				cwd: mixedCaseRoot,
+				worktreeRoot: null,
+				stateRoot: path.join(mixedCaseRoot, ".gjc", "state"),
+			},
+			live: true,
+		};
+		const server = await createServerWithSessions(root, [brokerSessionWithDifferentCasing], {
+			registerFirst: false,
+			platform: "win32",
+		});
+
+		const listed = (await server.callTool("gjc_coordinator_list_sessions", {})) as {
+			ok: boolean;
+			sessions: Array<{ session_id?: string; registered?: boolean; live?: boolean }>;
+		};
+
+		// The session should be found even though the cwd casing differs.
+		expect(listed.ok).toBe(true);
+		const foundSession = listed.sessions.find(s => s.session_id === BROKER_ONLY_ID);
+		expect(foundSession).toBeDefined();
+		expect(foundSession?.live).toBe(true);
 	});
 });
