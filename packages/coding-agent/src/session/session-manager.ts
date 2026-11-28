@@ -17432,10 +17432,7 @@ export class SessionManager {
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
 							// resident transcript. Any present-but-different identity still fails
-							// closed so a concurrent successor is never overwritten, and stops the
-							// writer as every fence refusal does.
-							if (isManagedReplaceIdentityMismatch(err))
-								throw new ManagedAppendIdentityMismatchError(relativePath);
+							// closed so a concurrent successor is never overwritten.
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
 							store.replaceSync(relativePath, bytes);
@@ -17456,6 +17453,9 @@ export class SessionManager {
 							capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
 						});
 					}
+					// Another writer changed the transcript under this rewrite: stop as every fence
+					// refusal does.
+					if (isManagedReplaceIdentityMismatch(err)) throw new ManagedAppendIdentityMismatchError(relativePath);
 					throw err;
 				}
 				const descriptor = store.descriptorExpected(relativePath);
@@ -20181,7 +20181,13 @@ export class SessionManager {
 				try {
 					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
 				} catch (err) {
-					const predecessorMissing = store.descriptorExpected(relativePath) === null;
+					let predecessorMissing = false;
+					try {
+						predecessorMissing = store.descriptorExpected(relativePath) === null;
+					} catch (descriptorError) {
+						// A transcript still changing under the read is present, not missing.
+						if (!isManagedReplaceIdentityMismatch(descriptorError)) throw descriptorError;
+					}
 					if (!isEnoent(err) && (!isManagedReplaceIdentityMismatch(err) || !predecessorMissing))
 						// A writer that lost a race to another process stops as every fence refusal does.
 						throw isManagedReplaceIdentityMismatch(err)
@@ -20193,7 +20199,14 @@ export class SessionManager {
 					this.#rewriteFileSync();
 					return;
 				}
-			} else receipt = store.appendSync(relativePath, bytes);
+			} else {
+				try {
+					receipt = store.appendSync(relativePath, bytes);
+				} catch (err) {
+					// The transcript changed between this append's look at it and its write.
+					throw isManagedReplaceIdentityMismatch(err) ? new ManagedAppendIdentityMismatchError(relativePath) : err;
+				}
+			}
 			this.#managedPersistExpectedIdentity = receipt.identity;
 			this.#publishSessionCommitMarkerSync(receipt.descriptor);
 		});
