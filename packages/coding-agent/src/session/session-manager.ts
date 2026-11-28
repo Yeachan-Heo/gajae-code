@@ -2016,14 +2016,24 @@ const MANAGED_PRE_WRITE_REFUSAL_MESSAGES = new Set([
 
 /**
  * The managed store's cross-process identity fence refused this write before writing it: another
- * writer changed the transcript. The message is its only channel; the native append's refusal
- * arrives wrapped as an uncertain committed mutation. The managed append and rewrite convert it
- * to {@link ManagedAppendIdentityMismatchError}, the operator stop.
+ * writer changed the transcript. The message is its only channel, and only a raw (unwrapped)
+ * refusal counts: a {@link ManagedCommittedMutationError} means the write may have landed (on
+ * macOS a `source_changed` can come from the check after publication), so it stays uncertain.
+ * The managed append and rewrite convert a refusal to {@link ManagedAppendIdentityMismatchError},
+ * the operator stop.
  */
 function isPreWriteIdentityRefusal(error: unknown): boolean {
 	if (error instanceof ManagedAppendIdentityMismatchError) return true;
-	if (error instanceof ManagedCommittedMutationError) return isPreWriteIdentityRefusal(error.cause);
+	if (error instanceof ManagedCommittedMutationError) return false;
 	return error instanceof Error && MANAGED_PRE_WRITE_REFUSAL_MESSAGES.has(error.message);
+}
+
+/**
+ * The native write gave up waiting for another writer's hold on the transcript, before writing
+ * anything. A retryable refusal: it neither latches a persistence failure nor stops the writer.
+ */
+function isTranscriptBusy(error: unknown): boolean {
+	return error instanceof Error && error.message === "transcript_busy";
 }
 
 /**
@@ -13391,6 +13401,8 @@ export class SessionManager {
 		// Enforce's write gate refused the write before it wrote anything: not a persistence failure,
 		// so nothing latches and the next write is judged on its own.
 		if (isOwnershipWriteRefusal(normalized)) return normalized;
+		// So is a bounded wait for another writer that ran out: nothing was written.
+		if (isTranscriptBusy(normalized)) return normalized;
 		if (!this.#persistError) this.#persistError = normalized;
 		if (!this.#persistErrorReported) {
 			this.#persistErrorReported = true;
@@ -20638,6 +20650,8 @@ export class SessionManager {
 			// So is enforce's write gate: another process holds the session, or its claim failed
 			// (nothing was written).
 			if (isOwnershipWriteRefusal(error)) throw error;
+			// A busy transcript wrote nothing either; the next write tries again.
+			if (isTranscriptBusy(error)) throw error;
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,

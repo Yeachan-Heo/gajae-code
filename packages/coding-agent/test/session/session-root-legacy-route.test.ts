@@ -257,16 +257,12 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		expect(before).toContain("peer entry");
 	});
 
-	// How the fence refuses the loser of a write race varies with the platform and the moment: the
-	// native append reports its refusal as an uncertain committed append, a rewrite as a failed
-	// replace. Each must stop the writer with the operator message, keep stopping it, and let /resume
-	// leave the transcript and reload the peer's entries.
+	// How the fence refuses the loser of a write race before it writes varies with the platform and the
+	// moment: the native append's `identity_mismatch`, Darwin's `source_changed`, a failed replace.
+	// Each must stop the writer with the operator message, keep stopping it, and let /resume leave
+	// the transcript and reload the peer's entries.
 	it.each([
-		[
-			"an append",
-			"appendExpectedSync",
-			() => new ManagedCommittedMutationError("append", new Error("identity_mismatch")),
-		],
+		["an append", "appendExpectedSync", () => new Error("identity_mismatch")],
 		["an append", "appendExpectedSync", () => new Error("source_changed")],
 		["a rewrite", "replaceExpectedIdentitySync", () => new Error("managed_replace_failed:identity_mismatch")],
 		["a rewrite", "replaceExpectedIdentitySync", () => new Error("identity_mismatch")],
@@ -300,10 +296,12 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 
 	// Failures that are not a refusal before writing keep the uncertain committed-append handling:
 	// no operator stop, the entry stays in memory, and the next persist rewrites the whole transcript.
+	// A wrapped `source_changed` is one: on macOS it can come from the check after publication.
 	it.each([
 		["io_error", false],
 		["fsync_failed", false],
 		["identity_changed_after_write", true],
+		["source_changed", true],
 	] as const)(
 		"an append that fails with %s is not the operator stop; the entry stays for a full rewrite",
 		async (code, written) => {
@@ -337,6 +335,31 @@ describe.skipIf(!supported)("a root session's controls after its first messages"
 		},
 		30_000,
 	);
+
+	// The native write gave up waiting for another writer's hold before writing anything: a
+	// retryable refusal. No operator stop and nothing latched, so the next write goes through.
+	it.each([
+		"appendExpectedSync",
+		"replaceExpectedIdentitySync",
+	] as const)("transcript_busy from %s is retryable, not a stop", async method => {
+		const { sessionManager, file } = await prompted("observe");
+		vi.spyOn(ManagedSessionDescendantStore.prototype, method).mockImplementationOnce(() => {
+			throw new Error("transcript_busy");
+		});
+		const before = await Bun.file(file).text();
+		if (method === "appendExpectedSync") {
+			expect(() =>
+				sessionManager.appendMessage({ role: "user", content: "busy entry", timestamp: Date.now() }),
+			).toThrow("transcript_busy");
+			// Not committed: the entry was rolled back.
+			expect(JSON.stringify(sessionManager.getEntries())).not.toContain("busy entry");
+		} else await expect(sessionManager.rewriteEntries()).rejects.toThrow("transcript_busy");
+		expect(await Bun.file(file).text()).toBe(before);
+		expect(sessionManager.getAppendIdentityMismatch()).toBeUndefined();
+		sessionManager.appendMessage({ role: "user", content: "after busy", timestamp: Date.now() });
+		await sessionManager.flush();
+		expect(await Bun.file(file).text()).toContain("after busy");
+	});
 
 	it("a rewrite adopts only its own bytes; an append right after it fails later writes closed", async () => {
 		const { sessionManager, file } = await prompted("enforce");

@@ -160,9 +160,23 @@ export class ManagedCommittedMutationError extends Error {
 	}
 }
 
+/**
+ * Codes the native append returns only before it writes: nothing reached the transcript, so they
+ * are plain refusals, not an uncertain committed append. `identity_mismatch` is the identity
+ * fence's refusal (a change found after the write is `identity_changed_after_write`), and
+ * `transcript_busy` a bounded wait for another writer that ran out.
+ */
+const MANAGED_APPEND_PRE_WRITE_CODES = new Set([
+	"content_too_large",
+	"too_large",
+	"header_patch_write_failed",
+	"identity_mismatch",
+	"transcript_busy",
+]);
+
 function managedAppendFailure(code: string | undefined): Error {
 	const error = new Error(code ?? "managed_append_failed");
-	return code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed"
+	return code !== undefined && MANAGED_APPEND_PRE_WRITE_CODES.has(code)
 		? error
 		: new ManagedCommittedMutationError("append", error);
 }
