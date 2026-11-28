@@ -9,6 +9,7 @@ import {
 	artifactManifest,
 	artifactTreeSnapshot,
 	bindingFor,
+	bindManagedCandidateDigest,
 	CLEANUP_RECEIPT_REPLAY_MAX_BYTES,
 	type CleanupReceiptReplayBudget,
 	canonicalizeTrustedPath,
@@ -20,6 +21,7 @@ import {
 	inspectCandidate,
 	isBinding,
 	isRetiredIn,
+	type ListedManagedCandidate,
 	listManagedCandidates,
 	MANAGED_INTERNAL_DIRECTORY,
 	MANAGED_RECEIPTS_DIRECTORY,
@@ -48,6 +50,7 @@ import {
 	validateBindingRaw,
 	validateExistingBinding,
 	verifyExistingManagedScopeDirectory,
+	withContentDigest,
 } from "../../sdk/session-readonly/scope";
 
 type NativeManagedScope = Pick<
@@ -6429,7 +6432,7 @@ async function openManagedCandidateForWriteInternal(
 			heldLock.assertOwned();
 			revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		};
-		if (existing && existing.identity.sha256 !== afterLock.identity.sha256) {
+		if (existing && bindManagedCandidateDigest(existing)?.identity.sha256 !== afterLock.identity.sha256) {
 			return {
 				kind: "error",
 				code: "destination_conflict",
@@ -6674,17 +6677,20 @@ async function openManagedCandidateForWriteInternal(
  */
 export async function openManagedCandidateForWrite(
 	scope: ManagedScope,
-	candidate: ManagedCandidate,
+	candidate: ListedManagedCandidate,
 	expectedIdentityOrMigrationPolicy: ResumeSessionIdentity | ManagedMigrationPolicy = "copy-retain",
 	migrationPolicy: ManagedMigrationPolicy = typeof expectedIdentityOrMigrationPolicy === "string"
 		? expectedIdentityOrMigrationPolicy
 		: "copy-retain",
 	authority?: ManagedCandidateWriteAuthority,
 ): Promise<ManagedOpenCandidateResult> {
+	const bound = withContentDigest(candidate);
+	if (!bound)
+		return { kind: "error", code: "source_changed", message: "The managed candidate changed after it was listed." };
 	try {
 		return await openManagedCandidateForWriteInternal(
 			scope,
-			candidate,
+			bound,
 			expectedIdentityOrMigrationPolicy,
 			migrationPolicy,
 			authority,
@@ -7180,10 +7186,13 @@ async function deleteManagedSessionCandidateInternal(
 /** Tombstone a verified managed candidate before exact-identity deletion. */
 export async function deleteManagedSessionCandidate(
 	scope: ManagedScope,
-	candidate: ManagedCandidate,
+	candidate: ListedManagedCandidate,
 ): Promise<ManagedDeleteCandidateResult> {
+	const bound = withContentDigest(candidate);
+	if (!bound)
+		return { kind: "error", code: "source_changed", message: "The managed candidate changed before deletion." };
 	try {
-		return await deleteManagedSessionCandidateInternal(scope, candidate);
+		return await deleteManagedSessionCandidateInternal(scope, bound);
 	} catch (error) {
 		const code = expectedFailure(error);
 		if (code === "migration_busy")

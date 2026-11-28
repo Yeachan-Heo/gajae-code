@@ -104,6 +104,7 @@ import {
 	type SessionMetadata,
 } from "../sdk/session-readonly/metadata";
 import {
+	bindManagedCandidateDigest,
 	canonicalizeTrustedPath,
 	listManagedCandidates,
 	type ManagedScope,
@@ -23817,10 +23818,13 @@ export class SessionManager {
 		assertManagedDestinationBound();
 		if (listing.kind !== "complete") throw new Error(`Managed session scan failed: ${listing.message}`);
 
-		const candidate = listing.owned.find(item => path.resolve(item.path) === resolvedPath);
-		if (!candidate) throw new Error("Session is inside managed storage but is not an authorized managed candidate.");
+		const listed = listing.owned.find(item => path.resolve(item.path) === resolvedPath);
+		if (!listed) throw new Error("Session is inside managed storage but is not an authorized managed candidate.");
+		// The listing carries only the stat identity; bind the digest of the file it listed now.
+		const candidate = bindManagedCandidateDigest(listed);
 		const revalidated = inspectTranscriptBounded(filePath, storage);
 		if (
+			!candidate ||
 			!revalidated.ok ||
 			!sameResumeIdentity(inspected.identity, revalidated.inspection.identity) ||
 			candidate.identity.dev !== inspected.identity.dev ||
