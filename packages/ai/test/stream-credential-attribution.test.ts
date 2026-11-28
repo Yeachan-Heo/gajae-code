@@ -85,17 +85,65 @@ function eventMessage(event: AssistantMessageEvent): AssistantMessage | undefine
 async function collect(stream: AssistantMessageEventStream): Promise<{
 	events: AssistantMessageEvent[];
 	snapshots: Array<number | undefined>;
+	partialSnapshots: Array<number | undefined>;
 	result: AssistantMessage;
 }> {
 	const events: AssistantMessageEvent[] = [];
 	const snapshots: Array<number | undefined> = [];
+	const partialSnapshots: Array<number | undefined> = [];
 	for await (const event of stream) {
 		events.push(event);
 		// Snapshot at delivery time: a later stamp on a shared object must not
 		// make an early event look attributed.
 		snapshots.push(eventMessage(event)?.credentialId);
+		// A terminal error's optional `partial` is a second object; snapshot it
+		// inside iteration so a post-completion stamp cannot masquerade as
+		// delivery-time attribution.
+		partialSnapshots.push("partial" in event ? event.partial?.credentialId : undefined);
 	}
-	return { events, snapshots, result: await stream.result() };
+	return { events, snapshots, partialSnapshots, result: await stream.result() };
+}
+
+type TerminalErrorPartial = AssistantMessage | "shared" | "absent" | "explicit-undefined";
+
+/**
+ * Emits `start`, then one terminal `error` for `error`. Some providers attach
+ * the partial they already streamed as a distinct second object; the partial
+ * can also be absent, explicitly `undefined`, or the same object as `error`.
+ */
+function terminalErrorStream(
+	error: AssistantMessage,
+	options: { reason?: "error" | "aborted"; partial?: TerminalErrorPartial } = {},
+): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		stream.push({ type: "start", partial: assistant(["start"]) });
+		const reason = options.reason ?? "error";
+		const partial = options.partial;
+		if (partial === "shared") {
+			stream.push({ type: "error", reason, error, partial: error });
+		} else if (partial === "explicit-undefined") {
+			stream.push({ type: "error", reason, error, partial: undefined });
+		} else if (partial === undefined || partial === "absent") {
+			stream.push({ type: "error", reason, error });
+		} else {
+			stream.push({ type: "error", reason, error, partial });
+		}
+	});
+	return stream;
+}
+
+function terminalErrorEvent(events: AssistantMessageEvent[]): Extract<AssistantMessageEvent, { type: "error" }> {
+	const event = events.at(-1);
+	if (event?.type !== "error") {
+		throw new Error(`Expected a terminal error event, received ${event?.type ?? "none"}`);
+	}
+	return event;
+}
+
+function requireTerminalPartial(event: Extract<AssistantMessageEvent, { type: "error" }>): AssistantMessage {
+	if (!event.partial) throw new Error("Expected the terminal error event to carry a partial");
+	return event.partial;
 }
 
 describe("streamSimple credential attribution", () => {
@@ -127,6 +175,182 @@ describe("streamSimple credential attribution", () => {
 		expect(snapshots).toEqual([5, 5]);
 		expect(result.stopReason).toBe("error");
 		expect(result.credentialId).toBe(5);
+	});
+
+	it("records the credential row on a distinct terminal error partial after a provider response", async () => {
+		const error = assistant();
+		error.stopReason = "error";
+		error.errorMessage = "429 rate limited";
+		error.errorStatus = 429;
+		registerCustomApi(API, () => terminalErrorStream(error, { partial: assistant(["partial output"]) }), SOURCE_ID);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 41 }),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		const partial = requireTerminalPartial(terminal);
+		expect(partial).not.toBe(terminal.error);
+		expect(partial.content).toEqual([{ type: "text", text: "partial output" }]);
+		// `start` precedes the response, so only the terminal pair is attributed.
+		expect(snapshots).toEqual([undefined, 41]);
+		expect(partialSnapshots).toEqual([undefined, 41]);
+		expect(result).toBe(error);
+		expect(result.credentialId).toBe(41);
+	});
+
+	it("records the credential row on a distinct terminal error partial backed by structured response evidence", async () => {
+		const error = assistant();
+		error.stopReason = "error";
+		error.errorMessage = "stream interrupted after the provider response";
+		// No legacy `errorStatus`; the transport facts are the only response evidence.
+		error.transportFailure = { kind: "transport", status: 429 };
+		registerCustomApi(API, () => terminalErrorStream(error, { partial: assistant(["partial output"]) }), SOURCE_ID);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 22 }),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		expect(terminal.error.errorStatus).toBeUndefined();
+		expect(requireTerminalPartial(terminal)).not.toBe(terminal.error);
+		expect(snapshots).toEqual([undefined, 22]);
+		expect(partialSnapshots).toEqual([undefined, 22]);
+		expect(result.credentialId).toBe(22);
+	});
+
+	it("records the credential row on a terminal error with an absent partial", async () => {
+		const error = assistant();
+		error.stopReason = "error";
+		error.errorMessage = "429 rate limited";
+		error.errorStatus = 429;
+		registerCustomApi(API, () => terminalErrorStream(error, { partial: "absent" }), SOURCE_ID);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 5 }),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		expect("partial" in terminal).toBe(false);
+		expect(snapshots).toEqual([undefined, 5]);
+		expect(partialSnapshots).toEqual([undefined, undefined]);
+		expect(result.credentialId).toBe(5);
+	});
+
+	it("records the credential row on a terminal error whose partial is explicitly undefined", async () => {
+		const error = assistant();
+		error.stopReason = "error";
+		error.errorMessage = "429 rate limited";
+		error.errorStatus = 429;
+		registerCustomApi(API, () => terminalErrorStream(error, { partial: "explicit-undefined" }), SOURCE_ID);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 6 }),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		expect("partial" in terminal).toBe(true);
+		expect(terminal.partial).toBeUndefined();
+		expect(snapshots).toEqual([undefined, 6]);
+		expect(partialSnapshots).toEqual([undefined, undefined]);
+		expect(result.credentialId).toBe(6);
+	});
+
+	it("records the credential row on a shared terminal error and partial object", async () => {
+		const error = assistant();
+		error.stopReason = "error";
+		error.errorMessage = "429 rate limited";
+		error.errorStatus = 429;
+		registerCustomApi(API, () => terminalErrorStream(error, { partial: "shared" }), SOURCE_ID);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 7 }),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		expect(terminal.partial).toBe(terminal.error);
+		expect(snapshots).toEqual([undefined, 7]);
+		expect(partialSnapshots).toEqual([undefined, 7]);
+		expect(result).toBe(terminal.error);
+		expect(result.credentialId).toBe(7);
+	});
+
+	it.each([
+		{ name: "a transport failure", stopReason: "error" as const, errorMessage: "fetch failed: ECONNREFUSED" },
+		{ name: "an abort", stopReason: "aborted" as const, errorMessage: "Request was aborted" },
+	])("leaves a content-bearing terminal error partial unattributed on $name before any provider response", async ({
+		stopReason,
+		errorMessage,
+	}) => {
+		const error = assistant();
+		error.stopReason = stopReason;
+		error.errorMessage = errorMessage;
+		error.transportFailure = { kind: "transport" };
+		registerCustomApi(
+			API,
+			() => terminalErrorStream(error, { reason: stopReason, partial: assistant(["partial output"]) }),
+			SOURCE_ID,
+		);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, { apiKey: "stored-key", credentialId: 6 }),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		const partial = requireTerminalPartial(terminal);
+		expect(partial.content).toEqual([{ type: "text", text: "partial output" }]);
+		expect(snapshots).toEqual([undefined, undefined]);
+		expect(partialSnapshots).toEqual([undefined, undefined]);
+		expect("credentialId" in terminal.error).toBe(false);
+		expect("credentialId" in partial).toBe(false);
+		expect(result.stopReason).toBe(stopReason);
+		expect("credentialId" in result).toBe(false);
+	});
+
+	it("attributes an auth-retry terminal error and its distinct partial to the replacement credential row", async () => {
+		const attempts: Array<{ apiKey?: string; credentialId?: number }> = [];
+		const failedError = assistant();
+		failedError.stopReason = "error";
+		failedError.errorMessage = "401 authentication_error";
+		failedError.errorStatus = 401;
+		const retryError = assistant();
+		retryError.stopReason = "error";
+		retryError.errorMessage = "429 rate limited";
+		retryError.errorStatus = 429;
+		const retryPartial = assistant(["partial output"]);
+		registerCustomApi(
+			API,
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				attempts.push({ apiKey: options?.apiKey, credentialId: options?.credentialId });
+				return options?.apiKey === "first-key"
+					? terminalErrorStream(failedError, { partial: assistant(["failed attempt"]) })
+					: terminalErrorStream(retryError, { partial: retryPartial });
+			},
+			SOURCE_ID,
+		);
+
+		const { events, snapshots, partialSnapshots, result } = await collect(
+			streamSimple(model(), context, {
+				apiKey: "first-key",
+				credentialId: 1,
+				onAuthError: async () => ({ apiKey: "second-key", credentialId: 2 }),
+			}),
+		);
+
+		const terminal = terminalErrorEvent(events);
+		expect(attempts).toEqual([
+			{ apiKey: "first-key", credentialId: 1 },
+			{ apiKey: "second-key", credentialId: 2 },
+		]);
+		// The failed attempt's buffered start and terminal error are discarded;
+		// the consumer only observes the replacement attempt.
+		expect(events.map(event => event.type)).toEqual(["start", "error"]);
+		expect(terminal.error).toBe(retryError);
+		expect(requireTerminalPartial(terminal)).toBe(retryPartial);
+		expect(snapshots).toEqual([undefined, 2]);
+		expect(partialSnapshots).toEqual([undefined, 2]);
+		expect(result).toBe(retryError);
+		expect(result.credentialId).toBe(2);
 	});
 
 	it.each([
