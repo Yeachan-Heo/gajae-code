@@ -630,6 +630,79 @@ describe("ordinary attended ask public bridge", () => {
 });
 
 describe("AskTool execution integrity", () => {
+	it("reports the current UI state instead of the session startup snapshot", () => {
+		let uiAttached = true;
+		const tool = new AskTool(
+			createSession({
+				hasUI: true,
+				getToolUIContext: () => ({ hasUI: uiAttached, ui: uiAttached ? {} : undefined }),
+			}),
+		);
+
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+		uiAttached = false;
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		uiAttached = true;
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+	});
+
+	it("reports and enforces whether a headless answer channel is available", async () => {
+		const gateEmitter = new BrokerWorkflowGateEmitter("ask-answer-channel-test", new MemoryGateStore());
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => gateEmitter,
+			}),
+		);
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		await expect(
+			tool.execute(
+				"headless-without-answer-channel",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toBeInstanceOf(ToolAbortError);
+		expect(gateEmitter.listPendingGates()).toEqual([]);
+
+		const disposeObserver = gateEmitter.onGateEmitted(() => {});
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		const disposeResponder = gateEmitter.registerRemoteGateAnswerChannel();
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+		disposeResponder();
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		disposeObserver();
+		gateEmitter.fence();
+	});
+
+	it("rechecks a workflow-gate answer channel immediately before opening the gate", async () => {
+		const hasAnswerChannel = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValueOnce(false);
+		const emitGate = vi.fn(async () => ({ selected: ["Yes"] }));
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => ({
+					supportsRemoteGateAnswers: () => true,
+					hasRemoteGateAnswerChannel: hasAnswerChannel,
+					emitGate,
+				}),
+			}),
+		);
+
+		await expect(
+			tool.execute(
+				"channel-disappeared",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "Yes" }] }] },
+				undefined,
+				undefined,
+				undefined,
+			),
+		).rejects.toThrow("active workflow-gate answer channel");
+		expect(hasAnswerChannel).toHaveBeenCalledTimes(3);
+		expect(emitGate).not.toHaveBeenCalled();
+	});
+
 	it("rejects empty ordinary bodies before local or remote UI side effects", async () => {
 		const select = vi.fn(async () => "yes");
 		const awaitAnswer = vi.fn(async () => "yes");
@@ -1035,6 +1108,43 @@ describe("AskTool cancellation", () => {
 		expect(select.mock.calls[0]?.[2]?.timeout).toBeGreaterThan(0);
 	});
 
+	it("does not turn a timed-out explicit-answer question into a selection", async () => {
+		const tool = new AskTool(
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+			}),
+		);
+		const abort = vi.fn();
+		const select = vi.fn(
+			async (_prompt: string, _options: string[], dialogOptions?: { timeout?: number; onTimeout?: () => void }) => {
+				expect(dialogOptions?.timeout).toBeUndefined();
+				dialogOptions?.onTimeout?.();
+				return undefined;
+			},
+		);
+
+		await expect(
+			tool.execute(
+				"explicit-answer-timeout",
+				{
+					questions: [
+						{
+							id: "handoff",
+							question: "How should the research continue?",
+							options: [{ label: "ralplan" }, { label: "stop" }],
+							requireExplicitAnswer: true,
+						},
+					],
+				},
+				undefined,
+				undefined,
+				createContext({ select, abort }),
+			),
+		).rejects.toThrow("Ask timed out without an explicit user answer");
+		expect(abort).toHaveBeenCalledTimes(1);
+		expect(select).toHaveBeenCalledTimes(1);
+	});
+
 	it("does not mark a single option as recommended", async () => {
 		const tool = new AskTool(createSession());
 		const select = vi.fn(async (_prompt: string, options: string[], dialogOptions) => {
@@ -1390,6 +1500,57 @@ describe("AskTool remote semantic settlements", () => {
 				}),
 			abort,
 		});
+
+	it("does not forward ask.timeout to a remote channel for explicit-answer questions", async () => {
+		const requests: AskAnswerRequest[] = [];
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				requests.push(request);
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "ralplan" },
+					settle: async () => ({
+						kind: "committed" as const,
+						ack: { status: "delivered" as const, messageId: 12 },
+					}),
+				});
+			},
+		};
+		const context = {
+			hasUI: false,
+			ui: undefined,
+			abort: vi.fn(),
+		} as unknown as AgentToolContext;
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getAskAnswerSource: () => source,
+			}),
+		);
+
+		const result = await tool.execute(
+			"remote-explicit-answer",
+			{
+				questions: [
+					{
+						id: "handoff",
+						question: "How should the research continue?",
+						options: [{ label: "ralplan" }, { label: "stop" }],
+						requireExplicitAnswer: true,
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.timeoutMs).toBeUndefined();
+		expect(result.details?.selectedOptions).toEqual(["ralplan"]);
+	});
 
 	it("bounds repeated remote whitespace custom answers and explains the retry", async () => {
 		const requests: AskAnswerRequest[] = [];
@@ -3647,6 +3808,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		record.mockClear();
 		const emitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Execute with ultragoal"] })),
 		};
 		const remote = await new AskTool(
@@ -4095,6 +4257,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Timeline"] })),
 		};
 		await new AskTool(
@@ -4123,6 +4286,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 		const defaultGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		await new AskTool(
@@ -4149,6 +4313,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 		const ralplanGateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			onGateEmitted: (onGate: (gate: WorkflowGate) => void) => {
 				listener = onGate;
 				return stopObservation;
@@ -4238,6 +4403,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("omits single-option recommendations from workflow gates", async () => {
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Keep current"] })),
 		};
 
@@ -4523,6 +4689,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		// selector instead of stranding on emitGate() waiting for a remote responder.
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["no"] })),
 		};
 		const select = vi.fn(async () => "yes");
@@ -4560,6 +4727,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		const tool = new AskTool(
@@ -4587,7 +4755,11 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("bounds the complete legacy and multi-question ask payload before any gate emission", async () => {
-		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn(async () => ({ selected: ["A"] })) };
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["A"] })),
+		};
 		const tool = new AskTool(
 			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
 		);
@@ -4615,6 +4787,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	it("forwards bounded inert adapter context through the canonical gate", async () => {
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Continue"] })),
 		};
 		const adapterContext = {
@@ -4870,7 +5043,12 @@ describe("AskTool Round-0 intent recovery", () => {
 
 	it("normalizes strict-provider null placeholders and preserves bounded adapter context before exact Round-0 recovery", () => {
 		const pair = roundZeroPair();
-		Object.assign(pair.questions[0], { multi: null, recommended: null, workflowGate: null });
+		Object.assign(pair.questions[0], {
+			multi: null,
+			recommended: null,
+			requireExplicitAnswer: null,
+			workflowGate: null,
+		});
 		Object.assign(pair.questions[0].deepInterview, {
 			round_id: null,
 			confused_terms: ["eventual consistency"],
@@ -4890,6 +5068,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(question.deepInterview).not.toHaveProperty("round_id");
 		expect(question).not.toHaveProperty("multi");
 		expect(question).not.toHaveProperty("recommended");
+		expect(question).not.toHaveProperty("requireExplicitAnswer");
 		expect(question).not.toHaveProperty("workflowGate");
 	});
 
@@ -4912,6 +5091,54 @@ describe("AskTool Round-0 intent recovery", () => {
 		});
 
 		expect(result.questions[0]).not.toHaveProperty("deepInterview");
+	});
+
+	it("accepts requireExplicitAnswer: null on Round-0 topology ask and strips it", () => {
+		const pair = roundZeroPair();
+		Object.assign(pair.questions[0], { requireExplicitAnswer: null });
+		const question = validateAsk(pair).questions[0];
+		expect(question).not.toHaveProperty("requireExplicitAnswer");
+		expect(question).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+	});
+
+	it("accepts requireExplicitAnswer: true on Round-0 topology ask and preserves it", () => {
+		const pair = roundZeroPair();
+		Object.assign(pair.questions[0], { requireExplicitAnswer: true });
+		const question = validateAsk(pair).questions[0];
+		expect(question).toHaveProperty("requireExplicitAnswer", true);
+		expect(question).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+	});
+
+	it("accepts requireExplicitAnswer: null on post-topology intent_review ask and strips it", () => {
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		Object.assign(postRoundReview.questions[0], { requireExplicitAnswer: null });
+		const question = validateAsk(postRoundReview, "post-topology").questions[0];
+		expect(question).not.toHaveProperty("requireExplicitAnswer");
+		expect(question).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
+	});
+
+	it("accepts requireExplicitAnswer: true on post-topology intent_review ask and preserves it", () => {
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		Object.assign(postRoundReview.questions[0], { requireExplicitAnswer: true });
+		const question = validateAsk(postRoundReview, "post-topology").questions[0];
+		expect(question).toHaveProperty("requireExplicitAnswer", true);
+		expect(question).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
 	});
 
 	it("returns bounded corrections for strict-wire intent constraints that local validation must enforce", () => {
@@ -5069,6 +5296,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
 			supportsRemoteGateAnswers: () => true,
+			hasRemoteGateAnswerChannel: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Looks right"] })),
 		};
 		const tool = new AskTool(

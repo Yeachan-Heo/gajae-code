@@ -13321,4 +13321,32 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			events: [expect.objectContaining({ kind: "report.written", report_id: expect.any(String) })],
 		});
 	});
+
+	it("coordinator client negotiates gate responder capability", async () => {
+		const root = await tempRoot();
+		const receivedCapabilities: string[][] = [];
+		const server = await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {
+			connectBroker: async (url, token, options) => {
+				if (options?.capabilities) {
+					receivedCapabilities.push(options.capabilities as string[]);
+				}
+				// Return a mock client that accepts workflow.gate_answer
+				return {
+					dispatch: async () => ({ ok: true, result: { status: "accepted", resolved_at: "2026-11-27T00:00:00Z" } }),
+					request: async () => ({}),
+					global: async () => ({}),
+					close: async () => {},
+				} as any;
+			},
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "test prompt",
+		});
+		expect(sent.ok).toBe(true);
+		// Verify that the coordinator passed the gate_responder_v1 capability when connecting
+		const brokerConnections = receivedCapabilities.filter(caps => caps.includes("gate_responder_v1"));
+		expect(brokerConnections.length).toBeGreaterThan(0);
+	});
 });

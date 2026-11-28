@@ -183,6 +183,16 @@ function formatCause(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function normalizeCatalogDescription(name: string, description: string | undefined): string | undefined {
+	if (typeof description !== "string") return description;
+	if (name === "task") return description.replace(/\n# reviewer\n[^\n]*\n\n/g, "");
+	if (name === "ask") {
+		// The catalog is session-agnostic; the live AskTool description reports this status.
+		return description.replace(/\n\n<answer-channel-status>\n[\s\S]*?\n<\/answer-channel-status>/, "");
+	}
+	return description;
+}
+
 function readToolProperty(toolName: string, tool: unknown, key: string): unknown {
 	try {
 		return (tool as Record<string, unknown> | undefined)?.[key];
@@ -461,10 +471,7 @@ export async function generateToolCatalogData(
 			const entry: GeneratedToolCatalogEntry = {
 				name,
 				label: choose("label", descriptor.presentation.label),
-				description:
-					name === "task" && typeof description === "string"
-						? description.replace(/\n# reviewer\n[^\n]*\n\n/g, "")
-						: description,
+				description: normalizeCatalogDescription(name, description),
 				parameters: serializeCatalogValue(name, "parameters", parameters) as Record<string, unknown>,
 				strict: choose("strict", descriptor.metadata.strict),
 				hidden: choose("hidden", descriptor.metadata.hidden),

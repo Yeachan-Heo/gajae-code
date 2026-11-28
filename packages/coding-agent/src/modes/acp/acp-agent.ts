@@ -5070,7 +5070,7 @@ export class AcpAgent implements Agent {
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
 				this.#brokerEndpoint = { connection: pending, url: discovery.url, token: discovery.token };
-				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
+				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT, capabilities: ["gate_responder_v1"] });
 				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
 					if (this.#broker === pending) this.#broker = undefined;

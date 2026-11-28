@@ -41,6 +41,19 @@ function attachTerminalController(emitter: WorkflowGateEmitter): void {
 	});
 }
 
+it("does not count passive gate listeners as answer channels but tracks polling responders", () => {
+	const emitter = new BrokerWorkflowGateEmitter("run-answer-channel", new MemoryGateStore());
+	expect(emitter.hasRemoteGateAnswerChannel()).toBe(false);
+	const disposeObserver = emitter.onGateEmitted(() => {});
+	expect(emitter.hasRemoteGateAnswerChannel()).toBe(false);
+
+	const disposeResponder = emitter.registerRemoteGateAnswerChannel();
+	expect(emitter.hasRemoteGateAnswerChannel()).toBe(true);
+	disposeResponder();
+	expect(emitter.hasRemoteGateAnswerChannel()).toBe(false);
+	disposeObserver();
+});
+
 it("does not settle a non-matching workflow-gate emitter after continuation loss", () => {
 	const expectedEmitter = {} as WorkflowGateEmitter;
 	const successorEmitter = {} as WorkflowGateEmitter;
@@ -81,7 +94,11 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		});
 		try {
 			const emitGate = vi.fn(async (input: OpenGateInput) => ({ selected: [input.options?.[0]?.label ?? ""] }));
-			session.setWorkflowGateEmitter({ supportsRemoteGateAnswers: () => true, emitGate });
+			session.setWorkflowGateEmitter({
+				supportsRemoteGateAnswers: () => true,
+				hasRemoteGateAnswerChannel: () => true,
+				emitGate,
+			});
 			const ask = session.getToolByName("ask");
 			if (!ask) throw new Error("Expected real SDK ask tool");
 			expect(session.getDeepInterviewAskStage()).toBe("topology");
@@ -266,6 +283,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			});
 			const emitter: WorkflowGateEmitter = {
 				supportsRemoteGateAnswers: () => true,
+				hasRemoteGateAnswerChannel: () => true,
 				emitGate: input => {
 					received.push(input);
 					return Promise.resolve({ selected: ["JWT"], other: false });
@@ -323,6 +341,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			const received: OpenGateInput[] = [];
 			const emitter: WorkflowGateEmitter = {
 				supportsRemoteGateAnswers: () => true,
+				hasRemoteGateAnswerChannel: () => true,
 				emitGate: input => {
 					received.push(input);
 					return Promise.resolve({ selected: ["JWT"], other: false });
@@ -828,6 +847,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			const emitter = session.getWorkflowGateEmitter();
 			expect(emitter).toBeDefined();
 			attachTerminalController(emitter!);
+			const disposeAnswerChannel = emitter!.registerRemoteGateAnswerChannel!();
 			await Bun.sleep(0);
 			expect(session.getToolByName("ask")).toBeDefined();
 			let gate: { gate_id: string } | undefined;
@@ -853,6 +873,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(await emitter!.resolveGate!(response)).toMatchObject({ status: "accepted" });
 			expect(JSON.stringify((await result).details)).toContain("JWT");
 			dispose();
+			disposeAnswerChannel();
 		} finally {
 			await session.dispose();
 		}

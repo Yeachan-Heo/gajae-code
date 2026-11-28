@@ -20,6 +20,7 @@ interface StageInput {
 	stage: string;
 	stageN: number;
 	body: string;
+	autoHandoff?: Record<string, unknown>;
 	/** Override the recorded hash so a test can simulate a rewritten artifact. */
 	recordedSha?: string;
 	/** Write the row for a path that is never created. */
@@ -28,7 +29,13 @@ interface StageInput {
 
 async function writeRun(
 	stages: StageInput[],
-	options: { phase?: string; autoHandoff?: string; skipState?: boolean } = {},
+	options: {
+		phase?: string;
+		autoHandoff?: string;
+		executionBoundary?: "plan-only" | "approval-required";
+		admission?: Record<string, unknown>;
+		skipState?: boolean;
+	} = {},
 ): Promise<void> {
 	await fs.mkdir(runDir, { recursive: true });
 	const statePath = modeStatePath(cwd, SESSION, "ralplan");
@@ -36,7 +43,14 @@ async function writeRun(
 	if (!options.skipState) {
 		await Bun.write(
 			statePath,
-			`${JSON.stringify({ run_id: path.basename(runDir), skill: "ralplan", active: true, current_phase: options.phase ?? "final" })}\n`,
+			`${JSON.stringify({
+				run_id: path.basename(runDir),
+				skill: "ralplan",
+				active: true,
+				current_phase: options.phase ?? "final",
+				...(options.executionBoundary ? { execution_boundary: options.executionBoundary } : {}),
+				...(options.admission ? { auto_handoff: options.admission } : {}),
+			})}\n`,
 		);
 	}
 	if (options.autoHandoff) {
@@ -57,6 +71,7 @@ async function writeRun(
 				path: filePath,
 				created_at: "2026-01-01T00:00:00.000Z",
 				sha256: stage.recordedSha ?? sha256(stage.body),
+				...(stage.autoHandoff ? { auto_handoff: stage.autoHandoff } : {}),
 			}),
 		);
 	}
@@ -118,6 +133,34 @@ describe("resolveRalplanCurrentFinal", () => {
 		expect(resolution.ok).toBe(false);
 		if (resolution.ok) return;
 		expect(resolution.refusal.code).toBe("auto_handoff_enabled");
+	});
+
+	it("allows only the recorded approval-required boundary when config enables auto handoff", async () => {
+		const admission = {
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "execution_boundary",
+			source: path.join(cwd, ".gjc", "config.yml"),
+			executionBoundary: "approval-required",
+		};
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+		await Bun.write(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: ultragoal\n");
+		await writeRun(
+			reviewed.map(stage => (stage.stage === "final" ? { ...stage, autoHandoff: admission } : stage)),
+			{ executionBoundary: "approval-required", admission },
+		);
+
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId: SESSION });
+		expect(resolution.ok).toBe(true);
+	});
+
+	it("never offers execution approval for a plan-only run", async () => {
+		await writeRun(reviewed, { executionBoundary: "plan-only" });
+		const resolution = await resolveRalplanCurrentFinal({ cwd, sessionId: SESSION });
+		expect(resolution).toMatchObject({
+			ok: false,
+			refusal: { code: "execution_boundary_plan_only" },
+		});
 	});
 
 	it("refuses a final that a later revision superseded", async () => {

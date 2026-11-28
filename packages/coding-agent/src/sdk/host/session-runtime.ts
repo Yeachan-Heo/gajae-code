@@ -138,7 +138,7 @@ import {
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
 import { ExternalPermissionRuntime } from "./external-permissions";
-import { SessionSdkHost, type SessionSdkHostOptions, TURN_STREAM_CAPABILITY } from "./host";
+import { GATE_RESPONDER_CAPABILITY, SessionSdkHost, type SessionSdkHostOptions, TURN_STREAM_CAPABILITY } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -572,6 +572,7 @@ export class SessionSdkSessionRuntime {
 	readonly #capabilitiesDisposer?: () => void;
 	#transportStarted = false;
 	#transportStartPromise?: Promise<{ url: string }>;
+	readonly #connectionStateListeners = new Set<() => void>();
 
 	constructor(options: SessionSdkRuntimeOptions) {
 		this.transport = options.transport;
@@ -621,6 +622,7 @@ export class SessionSdkSessionRuntime {
 							connectionId,
 							new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...frame.capabilities]),
 						);
+						this.#notifyConnectionStateChanged();
 					}
 					handler(connectionId, frame);
 				}),
@@ -631,6 +633,7 @@ export class SessionSdkSessionRuntime {
 			for (const controller of this.#btwControllers.get(connectionId) ?? []) controller.abort();
 			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
+			this.#notifyConnectionStateChanged();
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
 			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
@@ -639,6 +642,7 @@ export class SessionSdkSessionRuntime {
 				connectionId,
 				new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...negotiated]),
 			);
+			this.#notifyConnectionStateChanged();
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
 			this.host.handleMalformedFrame(connectionId, message);
@@ -811,6 +815,37 @@ export class SessionSdkSessionRuntime {
 			throw error;
 		}
 		if (hostError !== undefined) throw hostError;
+	}
+
+	/**
+	 * Returns whether any connected client has the gate-responder capability,
+	 * indicating that workflow gates (autoresearch asks, ralplan approvals) can be answered.
+	 * Passive clients that only poll query endpoints do not negotiate this capability.
+	 */
+	hasRemoteGateAnswerChannel(): boolean {
+		return [...this.#connectionIds].some(
+			connectionId => this.#connectionCapabilitiesProvider(connectionId)?.has(GATE_RESPONDER_CAPABILITY) === true,
+		);
+	}
+
+	/**
+	 * Register a listener that is called whenever the set of connected clients or their
+	 * capabilities changes. This allows callers to monitor whether a gate-answer channel
+	 * becomes available or unavailable.
+	 */
+	onConnectionStateChanged(listener: () => void): () => void {
+		this.#connectionStateListeners.add(listener);
+		return () => this.#connectionStateListeners.delete(listener);
+	}
+
+	#notifyConnectionStateChanged(): void {
+		for (const listener of this.#connectionStateListeners) {
+			try {
+				listener();
+			} catch (error) {
+				logger.warn("Connection state listener threw", { error });
+			}
+		}
 	}
 
 	async registerWithBroker(writer: BrokerIndexWriter): Promise<void> {

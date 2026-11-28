@@ -5659,7 +5659,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 		let client: SdkClient;
 		try {
-			client = await (services.connectBroker ?? ((url, token) => SdkClient.connect(url, token)))(
+			client = await (services.connectBroker ?? ((url, token) => SdkClient.connect(url, token, { capabilities: ["gate_responder_v1"] })))(
 				discovery.url,
 				discovery.token,
 			);

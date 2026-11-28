@@ -1926,10 +1926,12 @@ describe("SessionSdkSessionRuntime", () => {
 			connectionCapabilities: connectionId =>
 				connectionId === "observer"
 					? new Set([TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY])
-					: new Set(),
+					: undefined,
 		});
 		await runtime.start();
 		transport.feed("observer", { type: "event_replay", id: "replay", sinceSeq: 0 });
+		transport.feed("unregistered", { type: "event_replay", id: "unregistered", sinceSeq: 0 });
+		expect(runtime.hasRemoteGateAnswerChannel()).toBe(false);
 		runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY], {
 			type: "event",
 			kind: "message_update",
@@ -1937,6 +1939,49 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		expect(transport.sent).toContainEqual({ type: "event", kind: "message_update", payload: {} });
 		await runtime.stop();
+	});
+	test("excludes passive SDK observers from live workflow-gate answer channels", async () => {
+		const transport = memoryTransport();
+		let closeConnection: ((connectionId: string) => void) | undefined;
+		let negotiateCapabilities: ((connectionId: string, capabilities: readonly string[]) => void) | undefined;
+		const hookedTransport: SessionSdkTransport = {
+			...transport,
+			onConnectionClose(handler) {
+				closeConnection = handler;
+				return () => {
+					if (closeConnection === handler) closeConnection = undefined;
+				};
+			},
+			onNegotiatedCapabilities(handler) {
+				negotiateCapabilities = handler;
+				return () => {
+					if (negotiateCapabilities === handler) negotiateCapabilities = undefined;
+				};
+			},
+		};
+		const runtime = new SessionSdkSessionRuntime({ transport: hookedTransport });
+		const availability: boolean[] = [];
+		const disposeListener = runtime.onConnectionStateChanged(() =>
+			availability.push(runtime.hasRemoteGateAnswerChannel()),
+		);
+		await runtime.start();
+		try {
+			if (!closeConnection || !negotiateCapabilities)
+				throw new Error("transport connection callbacks were not registered");
+			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false);
+			negotiateCapabilities("passive-observer", [SESSION_HOST_OBSERVER_CAPABILITY]);
+			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false);
+			negotiateCapabilities("polling-client", []);
+			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false); // empty capabilities = passive client
+			negotiateCapabilities("gate-responder", ["gate_responder_v1"]);
+			expect(runtime.hasRemoteGateAnswerChannel()).toBe(true);
+			closeConnection("gate-responder");
+			expect(runtime.hasRemoteGateAnswerChannel()).toBe(false);
+			expect(availability).toEqual([false, false, false, true, false]);
+		} finally {
+			disposeListener();
+			await runtime.stop();
+		}
 	});
 	test("applies authoritative replay capabilities before live delivery when the native callback lags", async () => {
 		const replayResponse = Promise.withResolvers<SdkFrame>();

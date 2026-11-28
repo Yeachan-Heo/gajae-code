@@ -11,10 +11,12 @@
  * refuse targets outside the project `.gjc/` tree.
  *
  * Intake contract (AC-14..AC-16): two entrypoints write the one mission
- * artifact. Spec intake (`intake --spec <path>`, or the bare `--spec` flag) consumes a persisted deep-interview
- * spec and asks zero clarification questions; cold intake (positional goal or
- * bare invocation) signals that goal/constraints/deliverables clarification must
- * run before research begins and writes nothing. The mission mode is one of
+ * artifact. Spec intake (`intake --spec <path>`, or the bare `--spec` flag)
+ * consumes a persisted deep-interview spec without runtime questions; the skill
+ * owns pre-write ambiguity checks. Cold intake (positional goal or bare
+ * invocation) signals that question/success-criterion/scope and
+ * constraints/deliverables clarification must run before research begins and
+ * writes nothing. The mission mode is one of
  * `web` / `mixed` / `data` and is always supplied explicitly — the write
  * boundary REJECTS a missing or invalid mode and never infers one from the
  * presence of a data file.
@@ -36,6 +38,7 @@ import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/ha
 import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
 import {
 	AutoresearchRunsStore,
+	autoresearchRunsPaths,
 	buildAutoresearchExperimentState,
 	createAutoresearchExperimentConfig,
 	type MetricDirection,
@@ -79,6 +82,7 @@ export interface AutoresearchMission {
 	mode: AutoresearchMode;
 	deliverables: string[];
 	constraints: string[];
+	assumptions: string[];
 	slug: string;
 	intake: AutoresearchIntakeKind;
 	createdAt: string;
@@ -170,7 +174,7 @@ export interface AutoresearchClearReceipt {
 	ok: true;
 	cleared: boolean;
 	missionPath: string;
-	ledgerEvent: AutoresearchLedgerEvent;
+	ledgerEvent?: AutoresearchLedgerEvent;
 	/** Where the retired mission's artifacts were quarantined, when one existed. */
 	retiredTo?: string;
 }
@@ -261,6 +265,7 @@ function normalizeAutoresearchMission(value: unknown): AutoresearchMission {
 		mode: record.mode,
 		deliverables: requireStringArray(record.deliverables ?? [], "mission.json deliverables"),
 		constraints: requireStringArray(record.constraints ?? [], "mission.json constraints"),
+		assumptions: requireStringArray(record.assumptions ?? [], "mission.json assumptions"),
 		slug,
 		intake,
 		createdAt,
@@ -434,6 +439,7 @@ export async function autoresearchWrite(input: {
 	mode: AutoresearchMode;
 	deliverables?: string[];
 	constraints?: string[];
+	assumptions?: string[];
 	slug: string;
 	sessionId?: string | null;
 	primaryMetric?: string;
@@ -459,13 +465,23 @@ export async function autoresearchWrite(input: {
 		mode: input.mode,
 		deliverables: dedupeStrings(input.deliverables ?? []),
 		constraints: dedupeStrings(input.constraints ?? []),
+		assumptions: dedupeStrings(input.assumptions ?? []),
 		slug,
 		intake: "cold",
-		createdAt: existing?.createdAt ?? now,
+		createdAt: existing?.slug === slug ? existing.createdAt : now,
 		updatedAt: now,
 		...metric,
 	};
 	await persistAutoresearchMission({ cwd: input.cwd, sessionId: resolvedSessionId, mission });
+	// Create the runs.jsonl file if it doesn't exist
+	const runsPaths = autoresearchRunsPaths(input.cwd, resolvedSessionId);
+	try {
+		await fs.stat(runsPaths.runsPath);
+	} catch (error) {
+		if (isEnoent(error)) {
+			await Bun.write(runsPaths.runsPath, "");
+		}
+	}
 	let ledgerEvent: AutoresearchLedgerEvent | undefined;
 	if (existing === null) {
 		ledgerEvent = await appendAutoresearchLedger(
@@ -509,22 +525,76 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
-	// Close out the outgoing ledger first so the retired copy ends with its clear.
-	const ledgerEvent = await appendAutoresearchLedger(
-		cwd,
-		{ event: "mission_cleared", slug: existing?.slug ?? "" },
-		resolvedSessionId,
-	);
-	const retiredTo = existing ? await retireAutoresearchMissionArtifacts(paths, existing.slug) : undefined;
-	const deleted = existing !== null;
+
+	let retiredTo: string | undefined;
+	let deleted = false;
+	let ledgerEvent: AutoresearchLedgerEvent | undefined;
+
+	if (existing) {
+		// Close out the outgoing ledger BEFORE retiring so the retired copy ends with its clear.
+		ledgerEvent = await appendAutoresearchLedger(
+			cwd,
+			{ event: "mission_cleared", slug: existing.slug },
+			resolvedSessionId,
+		);
+		// Mission exists, retire it
+		retiredTo = await retireAutoresearchMissionArtifacts(paths, existing.slug);
+		deleted = true;
+	} else {
+		// If mission.json is missing but other artifacts remain, it means a prior clear
+		// was interrupted mid-move. Retry moving any remaining artifacts to recovery.
+		// Use a generic slug for the recovery directory since mission metadata is unavailable.
+		const hasArtifacts = await checkHasAnyArtifacts(paths);
+		if (hasArtifacts) {
+			// Append the ledger event for recovery BEFORE retiring
+			ledgerEvent = await appendAutoresearchLedger(
+				cwd,
+				{ event: "mission_cleared", slug: "recovered" },
+				resolvedSessionId,
+			);
+			retiredTo = await retireAutoresearchMissionArtifacts(paths, "recovered");
+			deleted = true;
+		}
+	}
 	await reconcileAutoresearchState(cwd, existing, resolvedSessionId, { active: false, phase: "complete" });
 	return {
 		ok: true,
 		cleared: deleted,
 		missionPath: paths.missionPath,
-		ledgerEvent,
+		...(ledgerEvent ? { ledgerEvent } : {}),
 		...(retiredTo ? { retiredTo } : {}),
 	};
+}
+
+function belongsToAutoresearchMission(event: AutoresearchLedgerEvent, mission: AutoresearchMission): boolean {
+	if (typeof event.slug === "string" && event.slug !== mission.slug) return false;
+	const eventTime = Date.parse(event.timestamp);
+	// Rewrites advance updatedAt; createdAt remains the identity boundary for this mission.
+	const missionCreatedAt = Date.parse(mission.createdAt);
+	return Number.isFinite(eventTime) && Number.isFinite(missionCreatedAt) && eventTime >= missionCreatedAt;
+}
+
+/** Retire a conclusive mission's full working set after its canonical skill handoff was dispatched. */
+export async function autoresearchRetireConclusiveMissionAfterHandoff(
+	cwd: string,
+	sessionId?: string | null,
+): Promise<AutoresearchClearReceipt | undefined> {
+	const state = await autoresearchRead(cwd, sessionId);
+	const mission = state.mission;
+	if (!mission) return undefined;
+	const latestVerdict = [...state.ledger]
+		.reverse()
+		.find(
+			event =>
+				event.event === "verdict_issued" && event.verdictReceipt && belongsToAutoresearchMission(event, mission),
+		);
+	const verdictReceipt = latestVerdict?.verdictReceipt as AutoresearchVerdictReceipt | undefined;
+	if (verdictReceipt?.status.disposition !== "conclusive") return undefined;
+	const retirement = await autoresearchClear(cwd, state.sessionId);
+	if (!retirement.cleared) {
+		throw new AutoresearchCommandError(1, "conclusive autoresearch mission was not retired after handoff");
+	}
+	return retirement;
 }
 
 /**
@@ -563,6 +633,29 @@ async function moveIfPresent(from: string, to: string): Promise<void> {
 	}
 }
 
+/**
+ * Check if any autoresearch mission artifacts remain in the working directory.
+ * Used to detect incomplete retirement when mission.json has already been moved.
+ */
+async function checkHasAnyArtifacts(paths: AutoresearchPaths): Promise<boolean> {
+	for (const name of AUTORESEARCH_MISSION_ARTIFACTS) {
+		try {
+			await fs.stat(path.join(paths.dir, name));
+			return true; // Found at least one artifact
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+	// Also check for the runs subdirectory
+	try {
+		await fs.stat(path.join(paths.dir, AUTORESEARCH_RUNS_SUBDIR));
+		return true; // Found the runs directory
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	return false; // No artifacts found
+}
+
 /* ---------------------------- spec intake ---------------------------- */
 
 const AUTORESEARCH_MODE_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-mode\s*:\s*(web|mixed|data)\s*$/i;
@@ -579,6 +672,7 @@ interface ParsedAutoresearchSpec {
 	mode: AutoresearchMode;
 	deliverables: string[];
 	constraints: string[];
+	assumptions: string[];
 	slug: string;
 	primaryMetric?: string;
 	metricUnit?: string;
@@ -668,6 +762,7 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 			? deliverables
 			: acceptanceCriteria.map(text => ACCEPTANCE_CRITERIA_DELIVERABLE_RE.exec(text)?.[1]?.trim() ?? text);
 	const constraints = sectionBullets(lines, ["constraints"]);
+	const assumptions = sectionBullets(lines, ["assumptions"]);
 	const interviewIdLine = lines.find(line => INTERVIEW_ID_RE.test(line.trim()));
 	const interviewId = interviewIdLine ? INTERVIEW_ID_RE.exec(interviewIdLine.trim())?.[1]?.trim() : undefined;
 	const slug = sanitizeSpecSlug(interviewId ?? path.basename(specPath, path.extname(specPath)));
@@ -676,15 +771,17 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 		mode,
 		deliverables: finalDeliverables,
 		constraints,
+		assumptions,
 		slug,
 		...metric,
 	};
 }
 
-/** Spec intake (`intake --spec <path>` or bare `--spec`): read the spec, write the mission, ask zero questions. The persisted intake kind stays "handoff" (seeded by a deep-interview handoff). */
+/** Spec intake (`intake --spec <path>` or bare `--spec`): read the spec and write the mission without runtime questions. The persisted intake kind stays "handoff" (seeded by a deep-interview handoff). */
 export async function autoresearchIntake(input: {
 	cwd: string;
 	specPath: string;
+	assumptions?: string[];
 	sessionId?: string | null;
 }): Promise<AutoresearchIntakeReceipt> {
 	const resolvedSpecPath = path.resolve(input.cwd, input.specPath);
@@ -709,9 +806,10 @@ export async function autoresearchIntake(input: {
 		mode: parsed.mode,
 		deliverables: parsed.deliverables,
 		constraints: parsed.constraints,
+		assumptions: dedupeStrings([...parsed.assumptions, ...(input.assumptions ?? [])]),
 		slug: parsed.slug,
 		intake: "handoff",
-		createdAt: existing?.createdAt ?? now,
+		createdAt: existing?.slug === parsed.slug ? existing.createdAt : now,
 		updatedAt: now,
 		specPath: resolvedSpecPath,
 		handedOffAt: now,
@@ -720,6 +818,15 @@ export async function autoresearchIntake(input: {
 		...(parsed.metricDirection === undefined ? {} : { metricDirection: parsed.metricDirection }),
 	};
 	await persistAutoresearchMission({ cwd: input.cwd, sessionId: resolvedSessionId, mission });
+	// Create the runs.jsonl file if it doesn't exist
+	const intakeRunsPaths = autoresearchRunsPaths(input.cwd, resolvedSessionId);
+	try {
+		await fs.stat(intakeRunsPaths.runsPath);
+	} catch (error) {
+		if (isEnoent(error)) {
+			await Bun.write(intakeRunsPaths.runsPath, "");
+		}
+	}
 	let ledgerEvent: AutoresearchLedgerEvent | undefined;
 	if (existing === null) {
 		ledgerEvent = await appendAutoresearchLedger(
@@ -827,6 +934,10 @@ export async function autoresearchRecordCritic(input: {
 	const caveats = requireStringArray(input.caveats, "critic caveats");
 	const evaluator = input.evaluator.trim();
 	if (!evaluator) throw new AutoresearchCommandError(2, "autoresearch critic evaluator is required");
+	const sessionId =
+		input.sessionId?.trim() ||
+		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
 	const receipt: AutoresearchCriticReceipt = {
 		criticId: crypto.randomUUID(),
 		status: input.status,
@@ -839,10 +950,10 @@ export async function autoresearchRecordCritic(input: {
 		input.cwd,
 		{
 			event: "critic_recorded",
-			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
+			...(input.slug?.trim() || mission?.slug ? { slug: input.slug?.trim() || mission?.slug } : {}),
 			criticReceipt: receipt,
 		},
-		input.sessionId,
+		sessionId,
 	);
 	return receipt;
 }
@@ -866,9 +977,20 @@ export async function autoresearchIssueVerdict(input: {
 	const sessionId =
 		input.sessionId?.trim() ||
 		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
 	const ledger = await readAutoresearchLedger(input.cwd, sessionId);
-	const latestCritic = [...ledger].reverse().find(event => event.event === "critic_recorded" && event.criticReceipt)
-		?.criticReceipt as AutoresearchCriticReceipt | undefined;
+	const latestCriticEvent = mission
+		? [...ledger]
+				.reverse()
+				.find(
+					event =>
+						event.event === "critic_recorded" &&
+						event.criticReceipt &&
+						belongsToAutoresearchMission(event, mission),
+				)
+		: undefined;
+	const latestCritic = latestCriticEvent?.criticReceipt as AutoresearchCriticReceipt | undefined;
+	const slug = input.slug?.trim() || mission?.slug;
 	const receipt: AutoresearchVerdictReceipt = {
 		receiptId: crypto.randomUUID(),
 		status: input.status,
@@ -882,12 +1004,11 @@ export async function autoresearchIssueVerdict(input: {
 		input.cwd,
 		{
 			event: "verdict_issued",
-			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
+			...(slug ? { slug } : {}),
 			verdictReceipt: receipt,
 		},
 		sessionId,
 	);
-	const mission = await readAutoresearchMission(input.cwd, sessionId);
 	if (mission) await reconcileAutoresearchState(input.cwd, mission, sessionId, { phase: "verdict" });
 	return receipt;
 }
@@ -909,22 +1030,24 @@ function renderAutoresearchHelp(): string {
 		"",
 		"USAGE",
 		"  $ gjc autoresearch [--spec <path>] [--json] [goal...]",
-		"  $ gjc autoresearch intake --spec <path> [--json]",
+		"  $ gjc autoresearch intake --spec <path> [--assumption <text>] [--json]",
 		"  $ gjc autoresearch read [--json]",
 		"  $ gjc autoresearch clear [--json]",
-		"  $ gjc autoresearch write --goal <goal> --mode <web|mixed|data> --slug <slug> [--deliverable <text>] [--constraint <text>] [--json]",
+		"  $ gjc autoresearch write --goal <goal> --mode <web|mixed|data> --slug <slug> [--deliverable <text>] [--constraint <text>] [--assumption <text>] [--json]",
 		"  $ gjc autoresearch log-run --run-id <id> --status <status> --description <text> [--metric <number>] [--json]",
 		"  $ gjc autoresearch verdict --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
 		"  $ gjc autoresearch critic --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
 		"",
 		"INTAKE",
 		"  intake --spec    Spec intake: read a persisted deep-interview spec and start research",
-		"                   with zero clarification questions. The spec must declare its mission",
+		"                   without clarification when complete. The spec must declare its mission",
 		"                   mode explicitly (a line like `autoresearch-mode: web`).",
-		"  positional goal  Cold intake: signals that goal/constraints/deliverables clarification",
-		"                   must run before research begins.",
+		"                   Repeat --assumption to record intake assumptions in mission.json.",
+		"  positional goal  Cold intake: signals that question/success-criterion/scope, constraints,",
+		"                   and deliverables clarification must run before research begins.",
 		"  bare invocation  Cold intake (no goal text).",
 		"  write            Persist a clarified cold-intake mission. Mode and slug are required.",
+		"                   Repeat --assumption to record stated assumptions in mission.json.",
 		"  read             Read the current mission and append-only ledger.",
 		"  clear            Clear the mission artifact and retire its working set.",
 		"  log-run          Append one research run receipt to the mission ledger.",
@@ -1020,7 +1143,7 @@ function renderColdIntakeText(goal: string): string {
 	return [
 		"autoresearch intake=cold clarification_required=true",
 		...(goal ? [`goal=${goal}`] : []),
-		"next=run goal, constraints, and deliverables clarification before research begins",
+		"next=clarify research question, success criterion, scope, constraints, and deliverables before research begins",
 		"",
 	].join("\n");
 }
@@ -1135,6 +1258,7 @@ export async function runNativeAutoresearchCommand(
 				"--slug",
 				"--deliverable",
 				"--constraint",
+				"--assumption",
 				"--primary-metric",
 				"--metric-unit",
 				"--metric-direction",
@@ -1153,6 +1277,7 @@ export async function runNativeAutoresearchCommand(
 				slug,
 				deliverables: repeatedFlagValues(args, "--deliverable"),
 				constraints: repeatedFlagValues(args, "--constraint"),
+				assumptions: repeatedFlagValues(args, "--assumption"),
 				primaryMetric: flagValue(args, "--primary-metric"),
 				metricUnit: flagValue(args, "--metric-unit"),
 				metricDirection: flagValue(args, "--metric-direction"),
@@ -1231,13 +1356,17 @@ export async function runNativeAutoresearchCommand(
 			);
 		}
 		if (verb === "intake") {
-			assertOnlyAutoresearchFlags(args.slice(1), ["--spec", "--json"]);
+			assertOnlyAutoresearchFlags(args.slice(1), ["--spec", "--assumption", "--json"]);
 			const intakeSpecPath = requiredFlagValue(args, "--spec").trim();
 			if (intakeSpecPath === "") {
 				return { status: 2, stderr: "--spec requires a non-empty path\n" };
 			}
 			const json = hasFlag(args, "--json");
-			const receipt = await autoresearchIntake({ cwd, specPath: intakeSpecPath });
+			const receipt = await autoresearchIntake({
+				cwd,
+				specPath: intakeSpecPath,
+				assumptions: repeatedFlagValues(args, "--assumption"),
+			});
 			await reconcileAutoresearchState(cwd, receipt.mission);
 			return {
 				status: 0,
@@ -1261,7 +1390,11 @@ export async function runNativeAutoresearchCommand(
 				return { status: 2, stderr: "--spec requires a non-empty path\n" };
 			}
 			const json = hasFlag(args, "--json");
-			const receipt = await autoresearchIntake({ cwd, specPath: specPath.trim() });
+			const receipt = await autoresearchIntake({
+				cwd,
+				specPath: specPath.trim(),
+				assumptions: repeatedFlagValues(args, "--assumption"),
+			});
 			await reconcileAutoresearchState(cwd, receipt.mission);
 			return {
 				status: 0,
@@ -1286,7 +1419,7 @@ export async function runNativeAutoresearchCommand(
 			intake: "cold",
 			clarification_required: true,
 			...(goal ? { goal } : {}),
-			next: "run goal, constraints, and deliverables clarification before research begins",
+			next: "clarify research question, success criterion, scope, constraints, and deliverables before research begins",
 		};
 		return {
 			status: 0,

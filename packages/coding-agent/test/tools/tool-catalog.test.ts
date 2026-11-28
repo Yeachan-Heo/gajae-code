@@ -24,6 +24,13 @@ describe("generated tool catalog", () => {
 			});
 		}
 	});
+	test("ask catalog description omits session-specific answer-channel status", () => {
+		const description = TOOL_CATALOG.ask?.description ?? "";
+		expect(description).toContain("Asks user when you need clarification");
+		expect(description).not.toContain("<answer-channel-status>");
+		expect(description).not.toContain("No interactive or remote answer channel is available");
+		expect(description).not.toContain("An interactive or remote answer channel is available");
+	});
 	test("move_session is generated with essential loadMode and exclusive non-abortable metadata", () => {
 		expect(TOOL_CATALOG.move_session?.loadMode).toBe("essential");
 		expect(TOOL_CATALOG.move_session?.deferrable).toBe(false);

@@ -163,6 +163,33 @@ describe("InteractiveMode goal mode integration", () => {
 		);
 	});
 
+	it("does not re-nudge while a handoff ask waits on the matching paused goal", async () => {
+		await harness.mode.goalModeController.handleCommand("Wait for the autoresearch handoff choice");
+		const pause = await new GoalTool(harness.toolSession).execute("call-pause-for-ask", { op: "pause" });
+		expect(pause.details?.goal?.status).toBe("paused");
+		const state = harness.session.getGoalModeState();
+		if (!state) throw new Error("expected paused goal state");
+		// The harness does not call mode.init(), which wires this session event in production.
+		await harness.mode.goalModeController.handleSessionEvent({ type: "goal_updated", goal: state.goal, state });
+		expect(harness.mode.goalModeController.paused).toBe(true);
+
+		const startPending = vi.spyOn(harness.mode, "startPendingSubmission");
+		vi.useFakeTimers();
+		try {
+			// Model the pending ask interval as waiting for user input; the skill pauses the goal before asking.
+			void harness.mode.getUserInput().catch(error => {
+				if (error instanceof Error && "code" in error && error.code === "cancelled") return;
+				throw error;
+			});
+			for (let i = 0; i < 5; i++) vi.advanceTimersByTime(800);
+
+			const nudges = startPending.mock.calls.filter(call => call[0]?.customType === "goal-continuation");
+			expect(nudges).toHaveLength(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps internal goal and plan tool swaps outside MCP selection authority", async () => {
 		expect(harness.session.hasMCPToolSelectionAuthority()).toBe(false);
 
