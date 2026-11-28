@@ -5,4 +5,4 @@
 
 ### Changed
 
-- SDK embedders: `SharedControlPublicationError` is renamed `SessionControlReplacedError`, after the one refusal it reports: a control whose session was replaced (a fork) while it awaited. Its constructor takes only the operation, and the `outcome` field is gone. `code` stays `rejected` and the message is unchanged.
+- SDK embedders: `SharedControlPublicationError` is renamed `SessionControlReplacedError`, after the one refusal it reports: a control whose session was replaced (a fork) while it awaited. Its constructor takes only the operation, and the `outcome` field and the error `cause` are gone. `code` stays `rejected` and the message is unchanged.
