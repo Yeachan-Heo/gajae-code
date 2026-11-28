@@ -25,6 +25,7 @@ import type {
 	Model,
 	SimpleStreamOptions,
 } from "../types";
+import { stripCredentialIds } from "../utils/credential-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 
 /**
@@ -37,6 +38,8 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"signal",
 	"apiKey",
+	// Local stored-row id; the gateway authenticates upstream with its own rows.
+	"credentialId",
 	"onStreamCreated",
 	"fetch",
 	"onPayload",
@@ -56,11 +59,18 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
  * `JSON.stringify` throw outright, and the rest is dead weight the gateway
  * re-derives from its own tool registry. Only the protocol-meaningful,
  * JSON-safe `Tool` fields cross the wire.
+ *
+ * Prior assistant messages lose their local `credentialId`: the gateway
+ * authenticates upstream with its own rows, so the local row id never leaves.
  */
 function buildWireContext(context: Context): Context {
-	if (!context.tools || context.tools.length === 0) return context;
+	const messages = stripCredentialIds(context.messages);
+	if (!context.tools || context.tools.length === 0) {
+		return messages === context.messages ? context : { ...context, messages };
+	}
 	return {
 		...context,
+		messages,
 		tools: context.tools.map(tool => ({
 			name: tool.name,
 			description: tool.description,

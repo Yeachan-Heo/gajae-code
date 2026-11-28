@@ -378,6 +378,8 @@ export interface ServerConfig {
 export interface OpenFile {
 	version: number;
 	languageId: string;
+	/** When a gjc operation last used this document; long-unused documents close before the next open. */
+	lastUsedAt: number;
 }
 
 export interface PendingRequest {

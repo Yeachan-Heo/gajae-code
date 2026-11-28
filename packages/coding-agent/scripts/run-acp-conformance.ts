@@ -51,6 +51,16 @@ export type ConformanceReport = {
 	totals: { cases: number; passed: number; failed: number };
 };
 
+/**
+ * A HOME for the agent command. Unset, the run gives it a temporary HOME and removes it
+ * afterwards, so a local run writes no user state (session owners, broker state) to the
+ * caller's real home.
+ */
+export const AGENT_HOME_ENV = "GJC_ACP_CONFORMANCE_HOME";
+
+/** `home` is the HOME the upstream runner and the agent command it spawns run under. */
+export type RunnerOptions = { command: string[]; cwd: string; sessionCwd?: string; home: string };
+
 export interface RunAcpConformanceOptions {
 	agentCommand: string;
 	reportPath: string;
@@ -59,7 +69,7 @@ export interface RunAcpConformanceOptions {
 	profile?: string;
 	fetchMetadata?: () => Promise<AcpxMetadata>;
 	checkout?: () => Promise<AcpxCheckout>;
-	runRunner?: (options: { command: string[]; cwd: string; sessionCwd?: string }) => Promise<void>;
+	runRunner?: (options: RunnerOptions) => Promise<void>;
 	readReport?: (reportPath: string) => Promise<unknown>;
 	writeReport?: (reportPath: string, report: ConformanceReport) => Promise<void>;
 }
@@ -138,10 +148,26 @@ export async function runAcpConformance(options: RunAcpConformanceOptions): Prom
 	// A failing run still writes its report. Preserve that matrix as CI evidence before
 	// surfacing the failure, so the uploaded artifact explains what actually broke.
 	let runnerFailure: unknown;
+	const callerHomeSetting = process.env[AGENT_HOME_ENV]?.trim();
+	// Resolved here: the runner's child runs in the acpx checkout, not the caller's cwd.
+	const callerHome = callerHomeSetting ? path.resolve(callerHomeSetting) : undefined;
+	const home =
+		callerHome ?? (await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-conformance-home-"))));
 	try {
-		await (options.runRunner ?? runRunner)({ command, cwd: checkout.root, sessionCwd: options.cwd ?? process.cwd() });
+		await (options.runRunner ?? runRunner)({
+			command,
+			cwd: checkout.root,
+			sessionCwd: options.cwd ?? process.cwd(),
+			home,
+		});
 	} catch (error) {
 		runnerFailure = error;
+	} finally {
+		// Cleanup must never fail the run: lingering session hosts may still be writing logs here.
+		if (!callerHome)
+			await fs.rm(home, { recursive: true, force: true, maxRetries: 3 }).catch(error => {
+				process.stderr.write(`acp conformance: could not remove the agent HOME ${home}: ${String(error)}\n`);
+			});
 	}
 	const upstream = await (options.readReport ?? readReport)(upstreamReportPath).catch(() => undefined);
 	if (runnerFailure !== undefined) {
@@ -233,13 +259,13 @@ async function checkoutAcpxSource(): Promise<AcpxCheckout> {
 	return { root, head: await commandOutput(["git", "rev-parse", "HEAD"], root) };
 }
 
-async function runRunner(options: { command: string[]; cwd: string; sessionCwd?: string }): Promise<void> {
-	// The fixture seeds the corpus scratch workspace; the runner only creates it.
-	await commandOutput(
-		options.command,
-		options.cwd,
-		options.sessionCwd ? { GJC_ACP_CONFORMANCE_CWD: options.sessionCwd } : undefined,
-	);
+async function runRunner(options: RunnerOptions): Promise<void> {
+	await commandOutput(options.command, options.cwd, {
+		HOME: options.home,
+		USERPROFILE: options.home,
+		// The fixture seeds the corpus scratch workspace; the runner only creates it.
+		...(options.sessionCwd ? { GJC_ACP_CONFORMANCE_CWD: options.sessionCwd } : {}),
+	});
 }
 async function readReport(reportPath: string): Promise<unknown> {
 	return await Bun.file(reportPath).json();
@@ -277,7 +303,7 @@ function parseCli(argv: string[]): RunAcpConformanceOptions {
 	}
 	if (!values.agentCommand || !values.reportPath)
 		throw new Error(
-			"Usage: conformance:run --agent-command <command> --format json --report <path> [--cwd <path>] [--profile acp-core-v1]",
+			`Usage: conformance:run --agent-command <command> --format json --report <path> [--cwd <path>] [--profile acp-core-v1]\nThe agent command runs under a temporary HOME; set ${AGENT_HOME_ENV} to choose one.`,
 		);
 	return values as RunAcpConformanceOptions;
 }

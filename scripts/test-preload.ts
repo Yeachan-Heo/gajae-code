@@ -1,13 +1,24 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { getAgentProfileAuthority, getTrustedHomeDir, resetAgentDirFromEnvironment } from "../packages/utils/src/dirs";
-import { installRuntimeDeletionGuard, registerOwnedDeletionRoot, safeRmSync } from "./safe-cleanup";
+import {
+	getDefaultSafeCleanupWorld,
+	installRuntimeDeletionGuard,
+	registerOwnedDeletionRoot,
+	safeRmSync,
+} from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
+import { applyIsolatedHome, createIsolatedHomeDirectories, decideHomeIsolation, isolatedHomeEnv } from "./test-home-isolation";
 import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+// The environment this process started with, before any isolation below edits
+// it. `Bun.spawn` without an `env` option still hands children exactly this, so
+// the HOME isolation further down overlays its keys onto it.
+const startupEnvironment = { ...process.env };
 
 // Fail fast in a fresh `git worktree add` checkout (issue #5484). Without
 // installed workspace dependencies every test file dies on a bare
@@ -219,8 +230,10 @@ try {
 // records in that sink were ACP prompt-watchdog fixture output, which makes the
 // operator's own log useless for diagnosing real failures.
 //
-// Setting this on `process.env` also reaches spawned child fixtures, which is
-// intended: they inherit the same isolated sink.
+// Setting this on `process.env` reaches children spawned through
+// `node:child_process`, `Bun.$`, or an env built from `{ ...process.env }`, which
+// is intended: they inherit the same isolated sink. A `Bun.spawn` without an
+// `env` option does not: it gets the environment this process started with.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
 // on log content), so that is honored untouched when the child replaced its
@@ -280,6 +293,39 @@ if (logIsolation.action === "isolate") {
 // Propagate the selected value so a nested preload can distinguish a pin it
 // inherited from its parent from a value the child explicitly supplied.
 process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
+
+// Isolate HOME for every child this test process spawns. The isolation above
+// covers in-process code only; a spawned `gjc`, broker, session host, or tmux
+// TUI resolves user state from HOME, so a plain `bun test` (outside the shard
+// runner, which already gives each file a private HOME) would have it write
+// session-owner claims, stats, and logs under the operator's live `~/.gjc`.
+//
+// The layout and the marker come from ./test-home-isolation.ts, which the shard
+// runner uses too, so a runner-isolated process is recognized and left alone.
+// In-process `os.homedir()` keeps the startup home (Bun resolves it once, and
+// the imports above already did); in-process state is covered by the agent-dir,
+// log-dir and ownership pins instead.
+//
+// FAIL CLOSED: without a temp home, children would use the live one.
+const safeCleanupWorld = getDefaultSafeCleanupWorld();
+const homeIsolation = decideHomeIsolation({
+	env: process.env,
+	realHomeAliases: safeCleanupWorld.homeAliases,
+	caseInsensitive: safeCleanupWorld.caseInsensitive,
+});
+if (homeIsolation.action === "isolate") {
+	try {
+		const isolatedHome = isolatedHomeEnv(createIsolatedTempDir("gjc-test-home-"));
+		createIsolatedHomeDirectories(isolatedHome);
+		applyIsolatedHome(isolatedHome, startupEnvironment);
+	} catch (error) {
+		cleanupAfterInitializationFailure(
+			new Error(
+				`Test HOME isolation failed (${homeIsolation.reason}); refusing to let spawned children use the live home: ${String(error)}`,
+			),
+		);
+	}
+}
 
 // Isolate session ownership claims for every test process. A claim locks a file
 // under `<trusted home>/.gjc/runtime/session-owners`, and the trusted home is the

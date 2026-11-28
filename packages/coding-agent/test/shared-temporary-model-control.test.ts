@@ -26,7 +26,7 @@ const registries: ModelRegistry[] = [];
 const user = (content: string) => ({ role: "user" as const, content, timestamp: 1 });
 const options = { cause: "temporary-operation" as const, reason: "other" as const };
 
-async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>, rootInteractiveSharedAppend = true) {
+async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>) {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-temporary-model-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -64,11 +64,12 @@ async function fixture(rebuild?: () => Promise<{ systemPrompt: string[] }>, root
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry,
-		rootInteractiveSharedAppend,
 		thinkingLevel: ThinkingLevel.Off,
 		...(rebuild ? { toolRegistry: new Map([[edit.name, edit]]), rebuildSystemPrompt: rebuild } : {}),
 	});
 	sessions.push(session);
+	// The latched bar is the layer's one remaining entry (single-owner step 10a); these cases go with
+	// the layer in steps 10b-10e.
 	const admitted = await manager.appendMessageSharingSession(user("shared root"));
 	if (admitted.kind !== "committed") throw new Error(`Shared admission: ${admitted.kind}`);
 	return { manager, session, agent, initial, selected, file, settings, destination, registry, admitted };
@@ -166,10 +167,10 @@ describe("shared temporary model control", () => {
 	});
 
 	for (const optedIn of [false, true]) {
-		// #7824: an adopted non-root session keeps using shared publication, and a
-		// persistent cycle publishes additively instead of staging a transcript rewrite.
-		it(`publishes ${optedIn ? "persistent root" : "adopted non-root temporary"} role cycles additively`, async () => {
-			const f = await fixture(undefined, optedIn);
+		// #7824: an adopted session keeps using shared publication, and a persistent cycle
+		// publishes additively instead of staging a transcript rewrite.
+		it(`publishes ${optedIn ? "persistent" : "temporary"} role cycles of an adopted session additively`, async () => {
+			const f = await fixture();
 			const roles = configureRoleCycle(f);
 			const before = await Bun.file(f.file).text();
 			const leaf = f.manager.getLeafId();

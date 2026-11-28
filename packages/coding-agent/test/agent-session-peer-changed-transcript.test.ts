@@ -228,7 +228,9 @@ describe("AgentSession on a transcript another process changed", () => {
 
 		expect(refusal).toBe(latched);
 		expect(operatorErrorMessage(refusal)).toContain("/resume");
-		expect(operatorErrorMessage(refusal)).toContain("/fork");
+		// The in-TUI `/fork` is refused on a stopped writer, so the message names only `gjc --fork`.
+		expect(operatorErrorMessage(refusal)).toContain("gjc --fork");
+		expect(operatorErrorMessage(refusal)).not.toContain("with /fork");
 		expect(harness.counts()).toEqual(before);
 		expect(events).toEqual([]);
 		expect(memoryMessages(harness.session.messages)).toEqual(memoryBefore);

@@ -17,6 +17,7 @@ import {
 	type SharedEntriesAppendOutcome,
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -63,7 +64,7 @@ afterEach(async () => {
 	if (failures.length > 0) throw new AggregateError(failures, "Shared profile fixture cleanup failed");
 });
 
-async function fixture(rootInteractiveSharedAppend = true): Promise<ProfileFixture> {
+async function fixture(shared = true): Promise<ProfileFixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-profile-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -149,8 +150,8 @@ async function fixture(rootInteractiveSharedAppend = true): Promise<ProfileFixtu
 		settings,
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
-		rootInteractiveSharedAppend,
 	});
+	if (shared) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
 	return { session, manager, registry, settings, file, cwd, agentDir };

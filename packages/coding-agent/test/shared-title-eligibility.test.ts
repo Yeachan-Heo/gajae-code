@@ -16,6 +16,7 @@ import {
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -84,9 +85,9 @@ async function fixture(options?: { sharedAppend?: boolean }) {
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: options?.sharedAppend ?? true,
 		thinkingLevel: ThinkingLevel.Off,
 	});
+	if (options?.sharedAppend ?? true) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	return { session, manager, file: manager.getSessionFile()!, destination };
 }
@@ -501,6 +502,7 @@ describe("shared publication admission split", () => {
 			attempted = outcome.id;
 			return { kind: "unknown", id: outcome.id, error: new Error("lease release failed") };
 		});
+		const notice = vi.spyOn(f.session, "emitNotice");
 		const failure = await f.session.prompt("flush now").then(
 			() => undefined,
 			(error: unknown) => error,
@@ -510,6 +512,12 @@ describe("shared publication admission split", () => {
 			`Could not confirm 1 of 1 deferred bash execution message (attempted ids: ${attempted})`,
 		);
 		expect(persisted).not.toHaveBeenCalled();
+		// The entry may be durable, so the notice must not call it unsaved.
+		expect(notice).toHaveBeenCalledWith(
+			"warning",
+			"The deferred command result may not have been saved to this session (outcome unknown).",
+			"session-publication",
+		);
 		// Never queued for a retry that would append the same result under a new id.
 		expect(f.session.hasPendingBashMessages).toBe(false);
 		expect(f.session.isDisposed).toBe(true);

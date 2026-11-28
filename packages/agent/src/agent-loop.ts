@@ -2071,6 +2071,7 @@ const LOSSLESS_SNAPSHOT_KEYS = [
 	"model",
 	"responseId",
 	"serviceTier",
+	"credentialId",
 	"usage",
 	"stopReason",
 	"errorMessage",
@@ -4815,6 +4816,13 @@ async function runLoopBody(
 				stream.end(newMessages);
 				return;
 			}
+			// Step boundary: the loop is about to call the model again for this turn,
+			// so asynchronous results queued meanwhile ride along now instead of
+			// forcing an extra iteration after the final answer.
+			if (hasMoreToolCalls && config.getStepBoundaryMessages) {
+				const boundaryMessages = config.getStepBoundaryMessages();
+				if (boundaryMessages.length > 0) pendingMessages = boundaryMessages;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
@@ -4987,8 +4995,13 @@ async function streamAssistantResponse(
 	// Resolve API key (important for expiring tokens) — do this before resolving
 	// metadata so that the session-sticky credential recorded by getApiKey is
 	// visible to metadataResolver (e.g. for the correct account_uuid in metadata.user_id).
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+	const apiKeyResolution = config.getApiKey ? await config.getApiKey(config.model.provider) : undefined;
+	const resolvedKey = typeof apiKeyResolution === "string" ? apiKeyResolution : apiKeyResolution?.apiKey;
+	// The stored row id only describes the resolved key; a static `config.apiKey`
+	// fallback is an external key and carries no attribution.
+	const resolvedApiKey = resolvedKey || config.apiKey;
+	const resolvedCredentialId =
+		resolvedKey && typeof apiKeyResolution === "object" ? apiKeyResolution.credentialId : undefined;
 
 	// Re-resolve metadata after credential selection so the per-request value
 	// reflects the credential actually used, not the snapshot from AgentLoopConfig construction.
@@ -5108,6 +5121,7 @@ async function streamAssistantResponse(
 						attemptScope: scope,
 						fallbackAttempt,
 						apiKey: resolvedApiKey,
+						credentialId: resolvedCredentialId,
 						authCredentialType,
 						metadata: resolvedMetadata,
 						sessionId: config.providerSessionId ?? config.sessionId,
@@ -5445,6 +5459,9 @@ function emitAbortedAssistantMessage(
 		errorMessage,
 		timestamp: now,
 	};
+	// A partial proves the request reached the provider with that credential;
+	// without one the request may never have been sent, so stay unattributed.
+	if (partialMessage?.credentialId !== undefined) abortedMessage.credentialId = partialMessage.credentialId;
 	if (addedPartial) {
 		context.messages.pop();
 	} else {

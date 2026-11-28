@@ -140,6 +140,10 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	// (a required `sessionPath`, for one), and it is never rendered, so the class is named here.
 	lifecycle_input_refused:
 		"The broker refused the request as invalid input. Correct the request payload and reconcile existing lifecycle state before deciding whether another request is safe.",
+	// A resume refused with `live_session` naming a holder (under `enforce`): the holder's name rides
+	// in the broker message, which is never rendered.
+	lifecycle_session_held:
+		"Another gjc process holds this session for writing and has not published an SDK endpoint to attach to, so no session host was launched. Try again with a new idempotency key once that process is ready (the same key replays this answer), or fork the session.",
 	// Fixed text only: the lock path and the broker's own message stay out of the
 	// envelope; `gjc sdk broker run` prints them to its own stderr.
 	broker_cleanup_unverified:

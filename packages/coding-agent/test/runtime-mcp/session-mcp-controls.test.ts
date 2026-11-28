@@ -823,33 +823,41 @@ describe("session MCP controls on AgentSession", () => {
 		const c = makeCase();
 		writeStandard(c);
 		const h = await openSession(c);
-		const manager = h.result.mcpManager;
-		if (!manager) throw new Error("expected an MCP manager");
-		// The manager disconnects the server and then reports a cleanup error.
-		const original = manager.disconnectServer.bind(manager);
-		manager.disconnectServer = async name => {
-			manager.disconnectServer = original;
-			await original(name);
-			throw new Error("cleanup failed");
-		};
-		await expect(control(h, "disconnect", "fakeon")).rejects.toThrow("cleanup failed");
-		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("disconnected");
-		const spawns = spawnCount(c, "fakeon");
-		const barriers: Promise<void>[] = [];
-		const extend = h.session.extendStartupTurnBarrier.bind(h.session);
-		h.session.extendStartupTurnBarrier = barrier => {
-			barriers.push(barrier);
-			extend(barrier);
-		};
-		await h.session.newSession();
-		expect(barriers).toHaveLength(1);
-		// Wait for the whole restore, not just "connected": the manager reports a
-		// server connected before its tools/list returns, and ending the test there
-		// lets teardown abort that request and fail the restore.
-		await barriers[0];
-		expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("connected");
-		expect(mcpToolsOf(h.session.getActiveToolNames(), "fakeon").length).toBe(1);
-		expect(spawnCount(c, "fakeon")).toBe(spawns + 1);
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			const manager = h.result.mcpManager;
+			if (!manager) throw new Error("expected an MCP manager");
+			// The manager disconnects the server and then reports a cleanup error.
+			const original = manager.disconnectServer.bind(manager);
+			manager.disconnectServer = async name => {
+				manager.disconnectServer = original;
+				await original(name);
+				throw new Error("cleanup failed");
+			};
+			await expect(control(h, "disconnect", "fakeon")).rejects.toThrow("cleanup failed");
+			expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("disconnected");
+			const spawns = spawnCount(c, "fakeon");
+			const barriers: Promise<void>[] = [];
+			const extend = h.session.extendStartupTurnBarrier.bind(h.session);
+			h.session.extendStartupTurnBarrier = barrier => {
+				barriers.push(barrier);
+				extend(barrier);
+			};
+			await h.session.newSession();
+			expect(barriers).toHaveLength(1);
+			// Wait for the whole restore, not just "connected": the manager reports a
+			// server connected before its tools/list returns, and ending the test there
+			// lets teardown abort that request and fail the restore.
+			await barriers[0];
+			expect(h.result.mcpManager?.getConnectionStatus("fakeon")).toBe("connected");
+			expect(mcpToolsOf(h.session.getActiveToolNames(), "fakeon").length).toBe(1);
+			expect(spawnCount(c, "fakeon")).toBe(spawns + 1);
+		} finally {
+			process.removeListener("unhandledRejection", onUnhandledRejection);
+		}
+		expect(unhandledRejections).toEqual([]);
 	}, 30_000);
 
 	test("dispose survives a /new restore that settles while disconnectAll is pending", async () => {

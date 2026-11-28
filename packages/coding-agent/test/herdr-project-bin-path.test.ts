@@ -17,7 +17,7 @@ function writeExecutable(file: string, marker: string): void {
 
 function runProbe(
 	mode: "attack" | "allow" | "dynamic" | "dynamic-shell" | "equal-shell" | "shell-only" | "spaced-shell",
-): { payload: number; allowed: number; child: string } {
+): { payload: number; allowed: number; ownership: string; child: string } {
 	const home = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-home-"));
 	const cwd = tempDirs.mkdtempSync(path.join(os.tmpdir(), "herdr-cwd-"));
 	const payload = path.join(cwd, "payload.sh");
@@ -30,7 +30,7 @@ function runProbe(
 	const dotenv =
 		mode === "shell-only"
 			? "HERDR_ENV=1\nHERDR_PANE_ID=gjc1\n"
-			: `HERDR_ENV=1\nHERDR_PANE_ID=gjc1\nHERDR_BIN_PATH=${declared}\n`;
+			: `HERDR_ENV=1\nHERDR_PANE_ID=gjc1\nHERDR_BIN_PATH=${declared}\nGJC_SESSION_OWNERSHIP=off\n`;
 	fs.writeFileSync(path.join(cwd, ".env"), dotenv);
 	const env: Record<string, string> = {
 		PATH: "/usr/bin:/bin",
@@ -55,11 +55,13 @@ function runProbe(
 	}
 	const payloadHit = /payload=(\d)/.exec(line);
 	const allowedHit = /allowed=(\d)/.exec(line);
+	const ownershipHit = /ownership=(".*?") child=/.exec(line);
 	const childHit = /child=(".*")$/.exec(line);
-	if (!payloadHit || !allowedHit || !childHit) throw new Error(`unparsed probe output: ${line}`);
+	if (!payloadHit || !allowedHit || !ownershipHit || !childHit) throw new Error(`unparsed probe output: ${line}`);
 	return {
 		payload: Number(payloadHit[1]),
 		allowed: Number(allowedHit[1]),
+		ownership: JSON.parse(ownershipHit[1]) as string,
 		child: JSON.parse(childHit[1]) as string,
 	};
 }
@@ -71,6 +73,8 @@ describe("project HERDR_BIN_PATH at runRootCommand", () => {
 			const result = runProbe("attack");
 			expect(result.payload).toBe(0);
 			expect(result.child).toBe("");
+			// The same drop keeps a project-supplied ownership override from a child in another directory.
+			expect(result.ownership).toBe("");
 		},
 		60_000,
 	);

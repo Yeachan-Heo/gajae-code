@@ -22,6 +22,7 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
+	type ResolvedApiKey,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	streamSimple,
@@ -193,9 +194,12 @@ import {
 	type SessionMcpDeclaredServer,
 } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
+import { sessionClaimSetOf } from "../session/internal/session-claim-set";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { primaryControlSurfaceFor } from "../session/primary-control-surface";
 import { createReadonlySessionManager, SessionManager, sessionArtifactCapability } from "../session/session-manager";
+import { type SessionOwnerSurface, sessionOwnerSurface } from "../session/session-ownership";
+import { sessionOwnershipModeFor } from "../session/session-ownership-mode";
 import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -203,6 +207,7 @@ import {
 	startupAuthConfigError,
 } from "../session/startup-auth-config";
 import {
+	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	type OwnedCompletionEnvelope,
@@ -272,6 +277,8 @@ type AsyncResultEntry = {
 	durationMs: number | undefined;
 	/** Exact owned-completion origin when the job is registered left-running work of a terminal turn. */
 	ownedCompletion?: OwnedCompletionEnvelope;
+	/** The result carries a fold receipt for the wake turn that completes the folded task. */
+	foldReceipt?: boolean;
 };
 
 type AsyncResultJobDetails = {
@@ -683,6 +690,15 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+
+	/**
+	 * How this process is named to others while it holds the session it creates (design §3.4).
+	 * Default: `sdk`. A supplied `sessionManager` keeps the surface its factory claimed under; pass
+	 * the same `{ surface }` as that factory's ownership argument. When the session is open for
+	 * writing in another process, under `session.ownership.mode: enforce`, the factories and this
+	 * function throw `SessionHeldError`.
+	 */
+	owner?: { readonly surface: SessionOwnerSurface };
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -1691,6 +1707,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Default factory-created managers remain on the existing fresh bootstrap path.
 	const suppliedSessionManager = options.sessionManager;
 	if (suppliedSessionManager) {
+		// Enforce's refusal comes before the pending rewrite below, the first write to the transcript.
+		// The caller's manager stays the caller's: it holds no claim for a refused session.
+		const suppliedClaims = sessionClaimSetOf(suppliedSessionManager);
+		const refusal = suppliedClaims.claiming ? await suppliedClaims.refusal() : undefined;
+		if (refusal) throw refusal;
 		const writableOpen = await suppliedSessionManager.finalizePendingWritableOpen();
 		switch (writableOpen) {
 			case "published":
@@ -2085,9 +2106,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager =
 			suppliedSessionManager ??
 			(await logger.time("sessionManager", async () => {
-				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+				// The mode comes from this session's settings, like createSessionManager's: a broker-launched
+				// host or an embedding may have no global Settings.
+				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir), undefined, {
+					surface: options.owner?.surface ?? sessionOwnerSurface(),
+					mode: sessionOwnershipModeFor(settings.getGlobal("session.ownership.mode")),
+				});
 			}));
 		liveSessionManager = sessionManager;
+		// The claim gate for the manager created here (a supplied one was checked on entry): `create`
+		// claims its fresh id in the background, and enforce refuses a failed claim now, before any
+		// write. The manager is ours, so it is closed; `create` wrote nothing.
+		const createdClaims = sessionClaimSetOf(sessionManager);
+		if (!suppliedSessionManager && createdClaims.claiming) {
+			const refusal = await createdClaims.refusal();
+			if (refusal) {
+				await sessionManager.close();
+				throw refusal;
+			}
+		}
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
@@ -2829,6 +2866,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								result: deliveredResult,
 								job,
 								durationMs,
+								...(foldDisposition.kind === "receipt" ? { foldReceipt: true } : {}),
 								...(ownedCompletion
 									? {
 											ownedCompletion: {
@@ -3494,6 +3532,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return promise;
 			},
 			getSessionId: () => sessionManager.getSessionId(),
+			getSessionIdentityGeneration: () => sessionManager.getSessionIdentityGeneration(),
 			// Subagents inherit the parent's manager; its registered endpoint is
 			// authoritative for owned-registration keying and endpoint-first
 			// manager lookup (the child's own id is never registered), so tools
@@ -3547,6 +3586,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getSdkPermissionMode: () => session?.sdkPermissionMode ?? "allow",
 			getSdkPermissionProvider: () => session?.getSdkPermissionProvider(),
 			getClientBridge: () => session?.clientBridge,
+			isSessionDisposed: () => session?.isDisposed ?? false,
 			getCompactContext: () => session.formatCompactContext(),
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
@@ -5592,7 +5632,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const resolvedCredentialScopes = new Map<string, string | undefined>();
-		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<string> => {
+		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<ResolvedApiKey> => {
 			const liveModel = resolveLiveSessionApiKeyModel(sessionAgent?.state.model, model, provider);
 			const hasExplicitScopePolicy =
 				modelRegistry.authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
@@ -5606,7 +5646,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				signal,
 			);
 			resolvedCredentialScopes.set(provider, resolution.credentialSessionId);
-			return resolution.apiKey;
+			return resolution.credentialRowId === undefined
+				? { apiKey: resolution.apiKey }
+				: { apiKey: resolution.apiKey, credentialId: resolution.credentialRowId };
 		};
 		const resolvedCredentialType = (provider: string): "api_key" | "oauth" | undefined => {
 			const scope = resolvedCredentialScopes.has(provider)
@@ -5681,7 +5723,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							const replacementApiKey = await resolveAgentApiKey(provider, streamOptions?.signal);
+							const replacement = await resolveAgentApiKey(provider, streamOptions?.signal);
 							if (
 								!isStableSessionApiKeyCredentialType(
 									streamOptions?.authCredentialType,
@@ -5690,7 +5732,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							) {
 								return undefined;
 							}
-							return replacementApiKey;
+							return replacement;
 						},
 					});
 				try {
@@ -5922,8 +5964,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		session = new AgentSession({
 			agent,
-			rootInteractiveSharedAppend:
-				primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession,
 			thinkingLevel,
 			sessionManager,
 			settings,
@@ -6114,6 +6154,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
+				// Completions that classify "ordinary" reach a running turn at its next
+				// tool step. That includes jobs launched by a tool call of a turn that
+				// was never terminal-aborted: they carry an ownership envelope whose
+				// terminal scope does not exist. A "fresh" envelope needs the follow-up
+				// path's resume admission (new lineage), a "drop" envelope must never
+				// reach the agent, and a fold receipt belongs to the wake turn, so
+				// those stay on the before-yield/idle path. The classification is
+				// read in the same synchronous tick in which the loop commits the
+				// built message, so it cannot change before delivery.
+				deliverAtStepBoundary: entry =>
+					entry.foldReceipt !== true &&
+					(entry.ownedCompletion === undefined || classifyOwnedEnvelope(entry.ownedCompletion) === "ordinary"),
 				build: entries => {
 					try {
 						return buildAsyncResultBatchMessage(entries);
@@ -6124,6 +6176,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {
+			deliverAtStepBoundary: () => true,
 			build: buildMcpNotificationBatchMessage,
 		});
 

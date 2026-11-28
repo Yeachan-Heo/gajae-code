@@ -16,6 +16,7 @@ import type { ModelProfileErrorDetails } from "../../config/model-profile-contra
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
 import { SessionManager } from "../../session/session-manager";
+import type { SessionOwnerHolderSummary } from "../../session/session-ownership";
 import type {
 	TaskArtifactOwnerDeletionEvidence,
 	TaskArtifactOwnerRetirementContinuation,
@@ -84,6 +85,7 @@ import {
 	hasSessionLifecycleStartupCommit,
 	isCanonicalSessionId,
 	type LifecycleFailureArtifact,
+	markLifecycleRequestReceived,
 	prepareSpawnChildHostLaunch,
 	processIncarnationForBroker,
 	readSessionLifecycleFailure,
@@ -405,6 +407,8 @@ export type BrokerResponse =
 				code: BrokerErrorCode;
 				message: string;
 				details?: ModelProfileErrorDetails | SpawnSubstrateFailure;
+				/** `live_session` from `session.resume` or `session.delete`: the process that holds the session (single-owner). */
+				holder?: SessionOwnerHolderSummary;
 				endpoint?: "unavailable";
 				cleanup?: BrokerCleanupEvidence;
 			};
@@ -474,6 +478,21 @@ function publicLifecycleLookupInput(
 	const target = objectRecord(input.target);
 	if (!target) return error("invalid_input", "session.lookup target must be an object");
 	return { operation: "session.create", target };
+}
+/**
+ * A `session.delete` refusal that leaves its key retryable, when the caller has also seen that the
+ * attempt left the ledger row as it found it (every delete effect is preceded by an `effect_started`
+ * transition). Before that transition the delete path emits these codes only for a live or held
+ * session (`live_session`) and a claim that could not be checked (`unavailable`); its other
+ * `unavailable` refusals follow an effect. A fresh request keeps its `accepted` binding. A cleanup
+ * replay keeps its pending or uncertain receipt, which resumes once the holder is gone.
+ */
+function isRetryableDeleteRefusal(operation: string, response: BrokerResponse): boolean {
+	return (
+		operation === "session.delete" &&
+		!response.ok &&
+		(response.error.code === "live_session" || response.error.code === "unavailable")
+	);
 }
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
@@ -6252,6 +6271,7 @@ export class Broker {
 			createHash("sha256")
 				.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
 				.digest("hex");
+		markLifecycleRequestReceived(this, input);
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));
@@ -6309,8 +6329,10 @@ export class Broker {
 					}
 					return replay;
 				}
+				const anchor = this.ledger.get(identity);
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				if (isRetryableDeleteRefusal(operation, response) && this.ledger.get(identity) === anchor) return response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(operation === "session.delete" &&
@@ -6337,8 +6359,10 @@ export class Broker {
 				const cleanup = (replay ? cleanupFromResponse(replay) : undefined) ?? reconstructedDeleteCleanup;
 				if (!cleanup)
 					return replay ?? error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
+				const anchor = this.ledger.get(identity);
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				if (isRetryableDeleteRefusal(operation, response) && this.ledger.get(identity) === anchor) return response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
@@ -6360,8 +6384,11 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			let response = outcome.response;
-			if (operation === "session.close" && !response.ok && response.error.code === "busy") {
-				await this.ledger.retryCloseRefusal(identity);
+			if (
+				(operation === "session.close" && !response.ok && response.error.code === "busy") ||
+				(isRetryableDeleteRefusal(operation, response) && this.ledger.get(identity)?.state === "accepted")
+			) {
+				await this.ledger.retryRefusal(identity);
 				return response;
 			}
 			if (operation === "session.close" && input.ifIdle === true && response.ok) {

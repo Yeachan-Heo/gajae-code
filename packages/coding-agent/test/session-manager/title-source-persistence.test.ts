@@ -500,7 +500,9 @@ describe("session title source persistence", () => {
 			expect((await loadEntriesFromFile(originalFile!, storage))[0]).toMatchObject({ cwd });
 		});
 
-		for (const failureCode of ["identity_mismatch", "not_found"] as const) {
+		// A committed append reports its post-write identity failure as `identity_changed_after_write`
+		// (#8123); a bare `identity_mismatch` is a pre-write refusal and is covered by the legacy-route suite.
+		for (const failureCode of ["identity_changed_after_write", "not_found"] as const) {
 			it.skipIf(process.platform !== "linux")(
 				`retains the uncertain ${failureCode} classification without retry after the cwd patch append commits`,
 				async () => {

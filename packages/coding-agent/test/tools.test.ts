@@ -1399,7 +1399,7 @@ function b() {
 					new BashTool(
 						createTestToolSession(
 							testDir,
-							Settings.isolated({ "tools.artifactHeadBytes": 8, "tools.artifactTailBytes": 8 }),
+							Settings.isolated({ "tools.bashOutputHeadBytes": 8, "tools.bashOutputTailBytes": 8 }),
 							{ getArtifactManager: undefined, allocateOutputArtifact: undefined },
 							manager,
 						),
@@ -1688,8 +1688,8 @@ function b() {
 				};
 				const successorInventoryBefore = await readSuccessorInventory();
 				const settings = Settings.isolated({
-					"tools.artifactTailBytes": 8,
-					"tools.artifactHeadBytes": 8,
+					"tools.bashOutputTailBytes": 8,
+					"tools.bashOutputHeadBytes": 8,
 				});
 				const bridgeFor = (): ClientBridge =>
 					({
@@ -1793,8 +1793,8 @@ function b() {
 					const settings = Settings.isolated({
 						"async.enabled": mode === "async-background" || mode === "monitor",
 						"bash.autoBackground.enabled": false,
-						"tools.artifactHeadBytes": 8,
-						"tools.artifactTailBytes": 8,
+						"tools.bashOutputHeadBytes": 8,
+						"tools.bashOutputTailBytes": 8,
 					});
 					const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
 					const expectedOutput = (label: string): string => `${label}\n${"界".repeat(400)}\nEND\n`;
@@ -2144,7 +2144,7 @@ function b() {
 			const configuredTool = new BashTool(
 				createTestToolSession(
 					testDir,
-					Settings.isolated({ "tools.artifactTailBytes": 8, "tools.artifactHeadBytes": 8 }),
+					Settings.isolated({ "tools.bashOutputTailBytes": 8, "tools.bashOutputHeadBytes": 8 }),
 				),
 			);
 			let caught: unknown;

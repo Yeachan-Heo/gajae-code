@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	compareUnreleasedEdit,
 	consumeFragments,
+	findOrphanFragments,
 	foldFragmentsIntoChangelog,
 	fragmentDirectoryFor,
 	listFragmentFilesInDirectory,
@@ -265,5 +266,78 @@ describe("CLI entrypoints", () => {
 		const backmerged = await run(["bun", historyGuardPath, "--base", base], root);
 		expect(backmerged.stderr).toBe("");
 		expect(backmerged.exitCode).toBe(0);
+	});
+
+	test("check rejects orphan fragments outside packages/*/changelog.d", async () => {
+		const root = await tempDir();
+		await init(root);
+		// Create an orphan fragment in crates/pi-natives/changelog.d
+		const orphanPath = "crates/pi-natives/changelog.d/orphan.md";
+		await put(root, orphanPath, "### Fixed\n\n- Orphan fix.\n");
+		await commit(root, "orphan fragment");
+
+		const orphans = await findOrphanFragments(root);
+		expect(orphans.length).toBeGreaterThan(0);
+		expect(orphans[0].file).toContain("crates/pi-natives/changelog.d/orphan.md");
+		expect(orphans[0].message).toContain("orphan fragment outside packages/*/changelog.d");
+	});
+
+	test("check rejects orphan fragments in any directory outside packages/*/changelog.d", async () => {
+		const root = await tempDir();
+		await init(root);
+		// Create orphan fragments in multiple non-package directories
+		const orphanPaths = [
+			"changelog.d/root-orphan.md",
+			"plugins/something/changelog.d/plugin-orphan.md",
+			"nested/path/changelog.d/nested-orphan.md",
+		];
+		for (const orphanPath of orphanPaths) {
+			await put(root, orphanPath, "### Fixed\n\n- Orphan fix.\n");
+		}
+		await commit(root, "multiple orphan fragments");
+
+		const orphans = await findOrphanFragments(root);
+		expect(orphans.length).toBe(3);
+		for (const orphan of orphans) {
+			expect(orphan.message).toContain("orphan fragment outside packages/*/changelog.d");
+		}
+	});
+
+	test("guard rejects committed orphan fragments outside packages/*/changelog.d", async () => {
+		const root = await tempDir();
+		await init(root);
+		const base = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+
+		// Create an orphan fragment outside packages/*/changelog.d
+		await git(root, ["checkout", "-q", "-b", "feature"]);
+		await put(root, "changelog.d/orphan.md", "### Fixed\n\n- Orphan fix.\n");
+		await commit(root, "add orphan fragment");
+
+		// The guard should detect this orphan
+		const guarded = await run(["bun", historyGuardPath, "--base", base], root);
+		expect(guarded.exitCode).toBe(1);
+		expect(guarded.stderr).toContain("orphan fragment outside packages/*/changelog.d");
+	});
+
+	test("findOrphanFragments detects untracked orphan fragments", async () => {
+		const root = await tempDir();
+		await init(root);
+
+		// Create untracked orphan fragments
+		const orphanPaths = [
+			"changelog.d/untracked-orphan.md",
+			"plugins/something/changelog.d/untracked-plugin-orphan.md",
+			"nested/changelog.d/untracked-nested-orphan.md",
+		];
+		for (const orphanPath of orphanPaths) {
+			await put(root, orphanPath, "### Fixed\n\n- Untracked orphan fix.\n");
+		}
+		// Do NOT commit them - they should still be detected
+
+		const orphans = await findOrphanFragments(root);
+		expect(orphans.length).toBe(3);
+		for (const orphan of orphans) {
+			expect(orphan.message).toContain("orphan fragment outside packages/*/changelog.d");
+		}
 	});
 });

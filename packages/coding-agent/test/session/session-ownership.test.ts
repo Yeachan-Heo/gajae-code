@@ -29,6 +29,7 @@ const {
 	sessionOwnerHolderPhrase,
 	sessionOwnerKey,
 	sessionOwnersDirectory,
+	sessionOwnershipCounters,
 } = ownership;
 
 const supported = process.platform === "linux" || process.platform === "darwin";
@@ -530,22 +531,27 @@ describe("narrow fail-open", () => {
 		expect(warnings).toEqual([]);
 	});
 
-	it.if(supported)("timed_out skips that one claim and the next claim tries again", async () => {
-		let first = true;
-		const calls = backend(sidecar => {
-			if (!first) return tryAcquireFileLock(sidecar);
-			first = false;
-			return { status: FileLockAcquireStatus.TimedOut, code: "timed_out" };
-		});
-		expect(await claimSessionOwner("f4", { surface: "terminal" })).toEqual({
-			status: "skipped",
-			reason: "timed_out",
-			code: "timed_out",
-		});
-		const claim = await claimed("f4");
-		expect(claim.shared).toBe(false);
-		expect(calls.acquire).toBe(2);
-		expect(warnings).toEqual(["Session ownership claim timed out; this claim is skipped"]);
+	it("a timeout skips that one claim only: the next claim tries again and can succeed (design §2.7)", async () => {
+		let stalled = true;
+		const calls = backend(async sidecar =>
+			stalled ? { status: FileLockAcquireStatus.TimedOut, code: "timed_out" } : tryAcquireFileLock(sidecar, 2_000),
+		);
+		for (const id of ["f4", "f4", "f4-new"])
+			expect(await claimSessionOwner(id, { surface: "terminal" })).toEqual({
+				status: "skipped",
+				reason: "timed_out",
+				code: "timed_out",
+			});
+		expect(calls.acquire).toBe(3);
+		expect(sessionOwnershipCounters().fail_open).toBe(3);
+		expect(await probeSessionOwner("f4")).toEqual({ state: "free" });
+		stalled = false;
+		const claimed = await claimSessionOwner("f4", { surface: "terminal" });
+		if (claimed.status !== "claimed") throw new Error(`expected a claim, got ${claimed.status}`);
+		expect(await probeSessionOwner("f4")).toMatchObject({ state: "held", self: true });
+		claimed.claim.release();
+		expect(sessionOwnershipCounters().fail_open).toBe(3);
+		expect(warnings).not.toContain("Session ownership is unavailable; claims are off for this process");
 	});
 
 	it("any other lock failure refuses, open/permission EACCES included", async () => {
@@ -575,13 +581,14 @@ describe("SessionHeldError", () => {
 		expect(error.message).toBe("session_held");
 		expect(error.code).toBe("session_held");
 		expect(error.holder).toEqual({ surface: "terminal", pid: 4242 });
+		// The SDK wording (design §3.3) names no CLI command: an embedder has none to run.
 		expect(error.operatorMessage).toBe(
-			"Session 3f9a1c2e is open for writing in another terminal (pid 4242). Only one process can write a session at a time. Close it there, or fork it to continue in a copy.",
+			"Session 3f9a1c2e is open for writing in another process (terminal, pid 4242). Only one process can write a session at a time.",
 		);
 
 		const unsafe = new SessionHeldError(`${home}/session.jsonl`);
 		expect(unsafe.operatorMessage).toBe(
-			"This session is open for writing in another gjc process. Only one process can write a session at a time. Close it there, or fork it to continue in a copy.",
+			"This session is open for writing in another gjc process. Only one process can write a session at a time.",
 		);
 		expect(unsafe.operatorMessage).not.toContain(home);
 	});
@@ -598,6 +605,19 @@ describe("SessionHeldError", () => {
 		expect(phrase("terminal (subagent)")).toBe("a subagent of another terminal (pid 7)");
 		expect(phrase("terminal", "build-box")).toBe("a gjc process on build-box (pid 7)");
 		expect(sessionOwnerHolderPhrase(undefined)).toBe("another gjc process");
+	});
+
+	it("prints a fork command that resolves where the session was found, quoted for the shell", () => {
+		const id = "01a21a7f-82ff-7332-bee3-31b605a15de0";
+		const fork = ownership.sessionHeldForkCommand;
+		expect(fork(id)).toBe(`gjc --fork ${id}`);
+		expect(fork(id, { sessionDir: "/work/sessions" })).toBe(`gjc --session-dir /work/sessions --fork ${id}`);
+		expect(fork(id, { print: true, source: "/work/a b/it's.jsonl" })).toBe(
+			`gjc -p --fork '/work/a b/it'\\''s.jsonl' "<message>"`,
+		);
+		// A path no terminal should print gets no command at all.
+		expect(fork(id, { source: "/work/\u001b[31mred.jsonl" })).toBeUndefined();
+		expect(fork(id, { sessionDir: "/work/‮sessions" })).toBeUndefined();
 	});
 
 	it("never renders a malformed holder a caller built", () => {
@@ -621,9 +641,13 @@ describe("dormant", () => {
 		};
 		expect(manifest.exports["./session/session-ownership"]).toBeNull();
 		expect(manifest.exports["./session/session-ownership.js"]).toBeNull();
+		expect(manifest.exports["./session/session-owner-holder"]).toBeNull();
+		expect(manifest.exports["./session/session-owner-holder.js"]).toBeNull();
 		for (const specifier of [
 			"@gajae-code/coding-agent/session/session-ownership",
 			"@gajae-code/coding-agent/session/session-ownership.js",
+			"@gajae-code/coding-agent/session/session-owner-holder",
+			"@gajae-code/coding-agent/session/session-owner-holder.js",
 		]) {
 			expect(() => Bun.resolveSync(specifier, import.meta.dir)).toThrow();
 		}

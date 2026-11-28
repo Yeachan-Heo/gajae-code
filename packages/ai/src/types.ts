@@ -417,6 +417,17 @@ export interface ProviderDispatch {
 }
 
 /**
+ * API key paired with the stored credential row that supplied it.
+ *
+ * `credentialId` is the opaque, non-secret row id; it is omitted for
+ * external, env, or otherwise unknown keys.
+ */
+export interface ResolvedApiKey {
+	apiKey: string;
+	credentialId?: number;
+}
+
+/**
  * Credential returned by an auth retry resolver.
  *
  * The optional admission callback lets an authority-bearing caller retain a
@@ -424,8 +435,7 @@ export interface ProviderDispatch {
  * admitted. Ordinary callers can continue returning a string from
  * {@link StreamOptions.onAuthError}.
  */
-export interface AuthRetryCredential {
-	apiKey: string;
+export interface AuthRetryCredential extends ResolvedApiKey {
 	onStreamCreated?: () => void;
 }
 
@@ -455,6 +465,12 @@ export interface StreamOptions {
 	endpointConfiguration?: EndpointConfiguration;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/**
+	 * Stored credential row id that supplied `apiKey`. `streamSimple` records it
+	 * as {@link AssistantMessage.credentialId} on every emitted message; leave it
+	 * unset for external, env, or otherwise unknown keys.
+	 */
+	credentialId?: number;
 	/** Disables all transport-level replay; the fallback controller owns retries. */
 	fallbackManaged?: boolean;
 	/** Opaque token returned by beginAttempt for a managed transport invocation. */
@@ -989,6 +1005,12 @@ export interface AssistantMessage {
 	ttft?: number; // Time to first token in milliseconds
 	/** Prompt-prefix fingerprint of the request that produced this message. */
 	promptPrefix?: PromptPrefixTelemetry;
+	/**
+	 * Stored credential row id that authenticated the request producing this
+	 * message. An opaque, non-secret number only; absent for external, env, or
+	 * unknown keys.
+	 */
+	credentialId?: number;
 }
 
 export interface GoogleGeminiCliDiagnostics {

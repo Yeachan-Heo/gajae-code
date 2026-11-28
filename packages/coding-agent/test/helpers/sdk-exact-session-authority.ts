@@ -89,6 +89,31 @@ export async function publishExactSessionAuthority(
 	else await Bun.write(indexPath, line);
 }
 
+/** Appends the host's `host_unregistered` row, as a host that exits between turns does. */
+export async function retireExactSessionAuthority(
+	options: ExactSessionAuthorityOptions & { indexSeq: number },
+	authority: ExactSessionAuthorityFixture,
+): Promise<void> {
+	const stateRoot = path.join(options.cwd, ".gjc", "state");
+	const hostIncarnation = processIncarnation(authority.pid);
+	const unsigned = {
+		type: "host_unregistered" as const,
+		sessionId: authority.sessionId,
+		locator: { cwd: options.cwd, worktreeRoot: null, stateRoot },
+		endpointGeneration: authority.endpointGeneration,
+		pid: authority.pid,
+		processIncarnation: processIncarnation(process.pid),
+		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
+		version: SESSION_INDEX_EVENT_VERSION,
+		indexSeq: options.indexSeq,
+		ts: Date.now(),
+	} satisfies Omit<SessionIndexEvent, "checksum">;
+	await fs.appendFile(
+		path.join(options.agentDir, "sdk", "sessions", "index.jsonl"),
+		`${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) })}\n`,
+	);
+}
+
 export async function registerExactSessionAuthority(
 	options: ExactSessionAuthorityOptions,
 ): Promise<ExactSessionAuthorityFixture> {

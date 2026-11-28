@@ -379,15 +379,20 @@ function controlErrors(id: string): string[] {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
 		// refuses a session with no selected model before admission. The code is
 		// appended: ACP machine-only mapping reads errorCodes[0].
+		// Every turn-starting operation (C01, C03, C05, C09) also refuses, under
+		// session ownership `enforce`, a turn on a session another process now
+		// holds, with the broker's `live_session` and its holder; appended too.
 		C01: [
 			"client_ref_conflict",
 			"reconciliation_capacity",
 			"reconciliation_persist_failed",
 			"model_not_selected",
 			"image_upload_unavailable",
+			"live_session",
 		],
 		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
-		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
+		C03: ["invalid_request", "busy", "live_session"],
+		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed", "live_session"],
 		C06: ["stale_request"],
 		C07: ["action_claimed", "terminal_uncertain"],
 		C05: [
@@ -398,6 +403,7 @@ function controlErrors(id: string): string[] {
 			"client_ref_conflict",
 			"reconciliation_capacity",
 			"reconciliation_persist_failed",
+			"live_session",
 		],
 		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],

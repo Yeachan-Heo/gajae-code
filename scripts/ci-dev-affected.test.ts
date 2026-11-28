@@ -262,6 +262,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
+		expect(windowsJob).toContain(
+			"bun test ./packages/coding-agent/test/session/session-ownership.windows.test.ts\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+		);
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
 		const authorityRegressionCommand = "bun test ./packages/coding-agent/test/sdk-secure-local-authority.windows.test.ts";
@@ -1444,6 +1447,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
 			"packages/natives/test/windows-shell-path.windows.test.ts",
 			"packages/natives/test/windows-runtime-install.windows.test.ts",
+			// Session ownership fails open on Windows (no native lock); only windows-latest runs it.
+			"packages/coding-agent/src/session/session-ownership.ts",
+			"packages/coding-agent/src/session/session-ownership-mode.ts",
+			"packages/coding-agent/src/session/internal/session-claim-set.ts",
+			"packages/coding-agent/test/session/session-ownership.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1452,6 +1460,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(isWindowsSessionPathRegressionPath("packages/utils/src/logger.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/utils/test/env.test.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
+		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-owners-layout.json")).toBe(false);
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
@@ -1535,16 +1544,17 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const keys = tasks.map(task => task.key);
 		expect(keys).toEqual([
 			"test:packages/coding-agent/test/startup-update-contract.test.ts",
+			"test:packages/coding-agent/test/session-owner-remote-attach.test.ts",
 			"check:@gajae-code/coding-agent",
 			"cli-smoke",
 			"native-linux-x64",
 		]);
 		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/coding-agent/test/startup-update-contract.test.ts"]);
-		expect(tasks[1]).toMatchObject({
+		expect(tasks[2]).toMatchObject({
 			command: ["bun", "run", "check"],
 			cwd: resolvePackageCwd("packages/coding-agent"),
 		});
-		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
+		expect(tasks[3]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 	test("model selector changes schedule adjacent preset and smart-routing regressions", () => {
@@ -1763,6 +1773,55 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");
 	});
+	test("ownership, SDK host, broker, Router, ACP and SDK CLI changes select the owner-attach e2e test", () => {
+		const testKey = "test:packages/coding-agent/test/session-owner-remote-attach.test.ts";
+		for (const source of [
+			"packages/coding-agent/src/main.ts",
+			"packages/coding-agent/src/session/session-ownership.ts",
+			"packages/coding-agent/src/session/session-ownership-mode.ts",
+			"packages/coding-agent/src/session/session-owners-layout.ts",
+			"packages/coding-agent/src/session/internal/session-claim-set.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/src/cli/session-owners-cli.ts",
+			"packages/coding-agent/src/commands/session.ts",
+			"packages/coding-agent/src/commands/acp.ts",
+			"packages/coding-agent/src/commands/sdk.ts",
+			"packages/coding-agent/src/session/agent-session.ts",
+			"packages/coding-agent/src/sdk/startup-capability.ts",
+			"packages/coding-agent/src/sdk/session-activation.ts",
+			"packages/coding-agent/src/modes/interactive-mode.ts",
+			"packages/coding-agent/src/sdk/lifecycle/client.ts",
+			"packages/coding-agent/src/sdk/lifecycle/broker-client.ts",
+			"crates/pi-natives/src/file_lock/mod.rs",
+			"crates/pi-natives/src/file_lock/unix.rs",
+			"packages/stats/src/session-ownership.ts",
+			"packages/coding-agent/src/sdk/session.ts",
+			"packages/coding-agent/src/sdk/host/host.ts",
+			"packages/coding-agent/src/sdk/host/control/dispatch.ts",
+			"packages/coding-agent/src/sdk/bus/index.ts",
+			"packages/coding-agent/src/sdk/broker/broker.ts",
+			"packages/coding-agent/src/sdk/broker/discovery.ts",
+			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
+			"packages/coding-agent/src/sdk/router/session-router.ts",
+			"packages/coding-agent/src/sdk/client/client.ts",
+			"packages/coding-agent/src/sdk/transport/index.ts",
+			"packages/coding-agent/src/sdk/acp/adapter.ts",
+			"packages/coding-agent/src/sdk/cli/session-cli.ts",
+			"packages/coding-agent/src/modes/acp/acp-agent.ts",
+			"packages/coding-agent/src/modes/acp/acp-mode.ts",
+		]) {
+			const tasks = targeted([source]);
+			expect(tasks.filter(task => task.key === testKey).map(task => task.command)).toEqual([
+				["bun", "test", "packages/coding-agent/test/session-owner-remote-attach.test.ts"],
+			]);
+		}
+		for (const unrelated of [
+			"packages/coding-agent/src/session/session-storage.ts",
+			"packages/coding-agent/src/tools/read.ts",
+			"packages/coding-agent/src/modes/components/model-selector.ts",
+		])
+			expect(targeted([unrelated]).map(task => task.key)).not.toContain(testKey);
+	});
 	test("broker lifecycle changes select the lifecycle e2e suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/broker/lifecycle.ts"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts");
@@ -1815,6 +1874,20 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:scripts/clean.test.ts");
 		expect(keys).toContain("root-check");
 	});
+	// The deleted path alone must select the guard, even with test existence validation.
+	test("deleted release-simplified entrypoint selects its anti-resurrection guard", () => {
+		const tasks = planTargetedTasks(
+			["scripts/release-simplified.ts"],
+			targetingPackages,
+			["scripts/release-policy.test.ts"],
+			true,
+		);
+		const guardTasks = tasks.filter(task => task.key === "test:scripts/release-policy.test.ts");
+		expect(guardTasks).toHaveLength(1);
+		expect(guardTasks[0]?.command).toEqual(["bun", "test", "scripts/release-policy.test.ts"]);
+		expect(tasks.map(task => task.key)).toContain("root-check");
+	});
+
 	test("cache-eval fixture adds its focused AI test without bypassing root fallback coverage", () => {
 		const tasks = targeted(["packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json"]);
 		expect(tasks.map(task => task.key)).toEqual([

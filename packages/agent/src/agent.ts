@@ -45,6 +45,7 @@ import type {
 	AgentState,
 	AgentTool,
 	AgentToolContext,
+	GetApiKeyFn,
 	ManagedAttemptContinuation,
 	ManagedAttemptContinuationOwnership,
 	ManagedAttemptDecision,
@@ -353,7 +354,7 @@ export interface AgentOptions {
 	 * Resolves an API key dynamically for each LLM call.
 	 * Useful for expiring tokens (e.g., GitHub Copilot OAuth).
 	 */
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: GetApiKeyFn;
 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;
 
 	/**
@@ -603,6 +604,7 @@ export class Agent {
 	#onToolChoiceIncapability?: AgentLoopConfig["onToolChoiceIncapability"];
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
+	#stepBoundaryMessageProvider?: () => AgentMessage[];
 	#shouldPause?: AgentLoopConfig["shouldPause"];
 	/** While set and returning true, the run does not DEQUEUE steering (admission is unaffected). */
 	#steeringAdmissionFence?: () => boolean;
@@ -648,7 +650,7 @@ export class Agent {
 	}
 
 	streamFn: StreamFn;
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: GetApiKeyFn;
 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;
 	/**
 	 * Hook invoked after tool arguments are validated and before execution.
@@ -1013,6 +1015,16 @@ export class Agent {
 
 	setOnBeforeYield(fn: (() => Promise<void> | void) | undefined): void {
 		this.#onBeforeYield = fn;
+	}
+
+	/**
+	 * Supplies asynchronous messages to deliver at the next step boundary of the
+	 * active run (see {@link AgentLoopConfig.getStepBoundaryMessages}). The
+	 * provider is not consulted while steering admission is fenced or once the
+	 * run is aborted, so it never drains work the run cannot deliver.
+	 */
+	setStepBoundaryMessageProvider(fn: (() => AgentMessage[]) | undefined): void {
+		this.#stepBoundaryMessageProvider = fn;
 	}
 
 	setShouldPause(fn: AgentLoopConfig["shouldPause"] | undefined): void {
@@ -2409,6 +2421,14 @@ export class Agent {
 			onBeforeYield: async () => {
 				if (this.#activeRunId !== runId) return;
 				await this.#onBeforeYield?.();
+			},
+			getStepBoundaryMessages: () => {
+				if (this.#activeRunId !== runId) return [];
+				// Same gates as the steering poll: a fenced (folding) or aborted run
+				// cannot deliver, so the entries stay queued for their existing path.
+				if (this.#steeringAdmissionFence?.() === true) return [];
+				if (abortController.signal.aborted) return [];
+				return this.#stepBoundaryMessageProvider?.() ?? [];
 			},
 			shouldPause: () => {
 				if (this.#activeRunId !== runId) return false;

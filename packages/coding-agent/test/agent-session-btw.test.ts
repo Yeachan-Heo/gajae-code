@@ -137,6 +137,19 @@ function completeControlledStream(call: ControlledStreamCall, text: string): voi
 }
 const sessions: AgentSession[] = [];
 
+/** Resolves once streamed bash output contains `marker`; the sink may split it across chunks. */
+function waitForBashOutput(marker: string): { onChunk: (chunk: string) => void; seen: Promise<void> } {
+	const seen = Promise.withResolvers<void>();
+	let output = "";
+	return {
+		onChunk: chunk => {
+			output += chunk;
+			if (output.includes(marker)) seen.resolve();
+		},
+		seen: seen.promise,
+	};
+}
+
 it("idle close refuses a btw credential preflight", async () => {
 	const key = Promise.withResolvers<string>();
 	const { session } = createHarness({ getApiKey: () => key.promise });
@@ -170,11 +183,9 @@ it("idle close refuses a running btw provider", async () => {
 
 it("idle close refuses a real foreground bash command", async () => {
 	const { session } = createHarness();
-	const entered = Promise.withResolvers<void>();
-	const pending = session.executeBash("printf started; sleep 30", chunk => {
-		if (chunk.includes("started")) entered.resolve();
-	});
-	await Promise.race([entered.promise, pending]);
+	const entered = waitForBashOutput("started");
+	const pending = session.executeBash("printf started; sleep 30", entered.onChunk);
+	await Promise.race([entered.seen, pending]);
 	try {
 		expect(session.isBashRunning).toBe(true);
 		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
@@ -186,6 +197,39 @@ it("idle close refuses a real foreground bash command", async () => {
 				throw new Error("foreground bash did not settle after abort");
 			}),
 		]);
+	}
+});
+
+it("idle close sees foreground bash output split across chunks", async () => {
+	if (process.platform === "win32") return;
+	const worker = [
+		"let token = '';",
+		"let runId;",
+		"let input = '';",
+		"const write = response => process.stdout.write(JSON.stringify({ ...response, token }) + '\\n');",
+		"process.stdin.on('data', chunk => {",
+		"input += chunk;",
+		"for (const line of input.split('\\n').slice(0, -1)) {",
+		"const request = JSON.parse(line);",
+		"if (request.type === 'init') { token = request.token; write({ type: 'ready' }); }",
+		"if (request.type === 'run') { runId = request.id; write({ type: 'chunk', id: runId, chunk: 's' }); write({ type: 'chunk', id: runId, chunk: 'tarted' }); }",
+		"if (request.type === 'abort') { write({ type: 'result', id: runId, result: { cancelled: true, timedOut: false } }); write({ type: 'void', id: request.id }); }",
+		"if (request.type === 'close') process.stdout.write(JSON.stringify({ type: 'void', id: request.id, token }) + '\\n', () => process.exit(0));",
+		"}",
+		"input = input.slice(input.lastIndexOf('\\n') + 1);",
+		"});",
+	].join(" ");
+	setShellFactoryForTests(options => new IsolatedShell(options, { workerArgv: [process.execPath, "-e", worker] }));
+	const { session } = createHarness();
+	const entered = waitForBashOutput("started");
+	const pending = session.executeBash("printf started; sleep 30", entered.onChunk);
+	await Promise.race([entered.seen, pending]);
+	try {
+		expect(session.isBashRunning).toBe(true);
+		expect(() => session.prepareCloseIfIdle()).toThrow("Session is not idle");
+	} finally {
+		session.abortBash();
+		expect((await pending).cancelled).toBe(true);
 	}
 });
 

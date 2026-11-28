@@ -1,8 +1,12 @@
 /**
- * Regression coverage for #7823 and #7824: once a trusted root interactive TUI session
- * publishes through canonical shared append, user controls (model presets, /fast and the
- * settings effort control) must continue through admitted shared publication instead of
- * failing on the sticky legacy-mutation guard.
+ * Regression coverage for #7823 and #7824: after a root interactive TUI session's first
+ * messages, user controls (model presets, /fast, the settings effort control, model, tool and
+ * /rename, profile reloads, /fork) keep working. Since single-owner step 10a a root TUI writes on
+ * the legacy route, and these cases run there.
+ *
+ * Cases built with `{ shared: true }` cover the shared-publication layer's own protocol (its
+ * refusals, unknown outcomes, peer siblings and leases). They enter the layer through
+ * `routeThroughSharedPublication` and go with it in steps 10b-10e.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -24,6 +28,7 @@ import { managedSessionTransactionLocksDirectory } from "../src/session/internal
 import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { type SessionInfo, SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 import { loadTestTheme } from "./helpers/test-theme";
 
 const roots: string[] = [];
@@ -99,7 +104,7 @@ function modelsConfig(profileDefault: readonly string[]): string {
 	});
 }
 
-async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<Fixture> {
+async function fixture(options: { streamFn?: Agent["streamFn"]; shared?: boolean } = {}): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-root-control-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -161,9 +166,8 @@ async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<
 		settings,
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
-		// Mirrors sdk/session.ts for a trusted root interactive CLI TUI session (#7711).
-		rootInteractiveSharedAppend: true,
 	});
+	if (options.shared) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
 	if (options.streamFn) {
@@ -178,7 +182,7 @@ async function fixture(options: { streamFn?: Agent["streamFn"] } = {}): Promise<
 	return { session, manager, registry, settings, file, cwd, agentDir };
 }
 
-/** Ordinary root TUI conversation: the canonical message publishes through shared append. */
+/** Ordinary root TUI conversation: the canonical message is persisted (shared append under `shared`). */
 async function canonicalMessage(f: Fixture, text = "canonical shared user"): Promise<void> {
 	f.session.agent.emitExternalEvent({ type: "message_end", message: user(text) });
 	await f.session.awaitSessionSettlement();
@@ -312,12 +316,14 @@ describe("#7824 settings effort in a shared root TUI session", () => {
 	it("applies the settings-screen default thinking level after an ordinary message", async () => {
 		const f = await fixture();
 		await canonicalMessage(f);
-		const leaf = f.manager.getLeafId();
 		await selectorController(f.session).handleSettingChange("defaultThinkingLevel", ThinkingLevel.High);
 		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(f.settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		// The session follows the persisted default: the transcript records an inherit marker.
-		expect(f.manager.getLeafEntry()).toMatchObject({ type: "thinking_level_change", parentId: leaf });
+		expect(f.manager.getLeafEntry()).toMatchObject({
+			type: "thinking_level_change",
+			thinkingLevel: ThinkingLevel.Inherit,
+		});
 		const reopened = await reopen(f);
 		expect(reopened.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.Inherit);
 		expect(reopened.buildSessionContext().messages.at(-1)).toMatchObject({ content: "canonical shared user" });
@@ -371,7 +377,7 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 	});
 
 	it("publishes credential AUTO before changing the live selection", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const leaf = f.manager.getLeafId();
 		const auth = f.registry.authStorage;
@@ -389,7 +395,7 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 	});
 
 	it("leaves the live credential selection unchanged when the shared write is refused", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const bytes = await Bun.file(f.file).text();
 		const live = vi.spyOn(f.registry.authStorage, "setSessionCredentialAuto");
@@ -406,7 +412,7 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 	});
 
 	it("/rename publishes the title through admitted shared publication", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const showError = vi.fn();
 		const showStatus = vi.fn();
@@ -428,7 +434,7 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 	});
 
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const sessionId = f.session.sessionId;
 		const bytes = await Bun.file(f.file).text();
@@ -471,7 +477,7 @@ describe("#7824 profile assignment materialization in a shared root TUI session"
 	});
 
 	it("fails closed without a legacy write when the chain publication is refused after the settings commit", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await activatePreset(f);
 		await canonicalMessage(f);
 		const bytes = await Bun.file(f.file).text();
@@ -540,7 +546,7 @@ describe("#7824 configuration reload that changes the active profile in a shared
 	});
 
 	it("rolls back only the staged catalog when the reload publication is refused", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await activatePreset(f);
 		await canonicalMessage(f);
 		const bytes = await Bun.file(f.file).text();
@@ -568,7 +574,7 @@ describe("#7824 default fallback resolution in a shared root TUI session", () =>
 		createMockModel({ responses: [{ content: ["fallback reply"] }] }).stream(model, context, options);
 
 	it("publishes the thinking change of a fallback switch before switching the model", async () => {
-		const f = await fixture({ streamFn });
+		const f = await fixture({ streamFn, shared: true });
 		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
 		await canonicalMessage(f);
 		const before = await Bun.file(f.file).text();
@@ -588,7 +594,7 @@ describe("#7824 default fallback resolution in a shared root TUI session", () =>
 	});
 
 	it("leaves model and fallback state untouched when the thinking publication is refused", async () => {
-		const f = await fixture({ streamFn });
+		const f = await fixture({ streamFn, shared: true });
 		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
 		await canonicalMessage(f);
 		const fallbackState = f.session.getDefaultFallbackRuntimeState();
@@ -615,7 +621,7 @@ describe("#7824 /clear in a shared root TUI session", () => {
 	}
 
 	it("publishes a parentless context_clear root additively and keeps the unseen sibling", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const siblingId = await peerSibling(f);
 		const before = await Bun.file(f.file).text();
@@ -653,7 +659,7 @@ describe("#7824 /clear in a shared root TUI session", () => {
 	});
 
 	it("refuses /clear before resetting when the shared transcript moved", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const messages = structuredClone(f.session.agent.state.messages);
 		const bytes = await Bun.file(f.file).text();
@@ -670,7 +676,7 @@ describe("#7824 /clear in a shared root TUI session", () => {
 	});
 
 	it("closes the session instead of resetting when the /clear outcome is unknown", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const messages = structuredClone(f.session.agent.state.messages);
 		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
@@ -689,7 +695,7 @@ describe("#7824 /clear in a shared root TUI session", () => {
 
 describe("#7824 selector compensation in a shared root TUI session", () => {
 	it("publishes only the differing model and thinking before restoring them live", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const before = await Bun.file(f.file).text();
 		const leaf = f.manager.getLeafId();
@@ -714,7 +720,7 @@ describe("#7824 selector compensation in a shared root TUI session", () => {
 	});
 
 	it("restores a changed chain and resume default in the same publication", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const selected = f.registry.find(provider, "selected")!;
 		const initial = f.session.model;
@@ -741,7 +747,7 @@ describe("#7824 selector compensation in a shared root TUI session", () => {
 	});
 
 	it("writes nothing when the captured state already matches", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const bytes = await Bun.file(f.file).text();
 		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
@@ -754,7 +760,7 @@ describe("#7824 selector compensation in a shared root TUI session", () => {
 	});
 
 	it("leaves the live model untouched when the compensation publication is refused", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const before = f.session.model;
 		const bytes = await Bun.file(f.file).text();
@@ -772,7 +778,7 @@ describe("#7824 selector compensation in a shared root TUI session", () => {
 	});
 
 	it("closes the session instead of restoring when the compensation outcome is unknown", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const before = f.session.model;
 		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
@@ -802,7 +808,7 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 	}
 
 	it("stars the predecessor append-only so its live peer keeps publishing", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		const { peer, candidate } = await predecessorAfterNew(f);
 		const before = await Bun.file(candidate.path).text();
 		await f.manager.setSessionStarredForPicker(candidate, true);
@@ -816,7 +822,7 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 	});
 
 	it("waits for the predecessor's shared transaction lease before appending the star", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		const { candidate } = await predecessorAfterNew(f);
 		const before = await Bun.file(candidate.path).text();
 		const held = Promise.withResolvers<void>();
@@ -843,7 +849,7 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 	});
 
 	it("refuses a whole-transcript header upgrade of a shared predecessor", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		const { candidate } = await predecessorAfterNew(f);
 		// A predecessor header without the star-patch capability would need a whole-file rewrite.
 		const original = await Bun.file(candidate.path).text();
@@ -947,13 +953,15 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 		await canonicalMessage(f, "first shared prompt");
 		await canonicalMessage(f, "second shared prompt");
 		const sourceId = f.manager.getSessionId();
+		const sourceFile = f.manager.getSessionFile();
 		const bytes = await Bun.file(f.file).bytes();
 		const selected = f.session.getUserMessagesForBranching().find(message => message.text === "second shared prompt");
 		if (!selected) throw new Error("missing selectable prompt");
 		const result = await f.session.branch(selected.entryId);
 		expect(result).toEqual({ selectedText: "second shared prompt", cancelled: false });
 		expect(f.manager.getSessionId()).not.toBe(sourceId);
-		expect(f.manager.getHeader()?.parentSession).toBe(sourceId);
+		// The legacy route names the parent by its transcript path.
+		expect(f.manager.getHeader()?.parentSession).toBe(sourceFile);
 		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
 		expect(f.manager.getEntries().some(entry => JSON.stringify(entry).includes('"second shared prompt"'))).toBe(
 			false,
@@ -990,7 +998,7 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 	});
 
 	it("refuses beside a peer sibling before any branch effect", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f, "first shared prompt");
 		const peer = await SessionManager.open(f.file, SessionManager.managedDestination(f.cwd, f.agentDir));
 		managers.push(peer);
@@ -1018,7 +1026,7 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 	});
 
 	it("refuses Move Session before the cwd transition and flush, and star before any write", async () => {
-		const f = await fixture();
+		const f = await fixture({ shared: true });
 		await canonicalMessage(f);
 		const bytes = await Bun.file(f.file).bytes();
 		const target = path.join(path.dirname(f.cwd), "move-target");

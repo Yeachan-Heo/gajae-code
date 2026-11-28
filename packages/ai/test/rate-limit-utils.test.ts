@@ -99,6 +99,17 @@ describe("isUsageLimitError", () => {
 		expect(isUsageLimitError("429 rate limit exceeded retry-after-ms=5000")).toBe(false);
 	});
 
+	it("detects Anthropic per-model usage-credit gating so another account can be tried", () => {
+		// Observed on an OAuth account whose org disabled paid usage for Fable: the
+		// same account never succeeds, but other accounts in the pool can.
+		expect(
+			isUsageLimitError(
+				'429 {"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for this model.","details":{"error_code":"credits_required","disabled_reason":"org_level_disabled","model":"claude-fable-5-2"}}}',
+			),
+		).toBe(true);
+		expect(isUsageLimitError("Usage credits are required for this model.")).toBe(true);
+	});
+
 	it("detects ZAI weekly/monthly limit exhaustion as persistent usage exhaustion", () => {
 		expect(
 			isUsageLimitError(

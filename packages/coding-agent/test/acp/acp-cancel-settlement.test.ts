@@ -12,6 +12,7 @@ import {
 	type ExactSessionAuthorityOptions,
 	prepareExactSessionAuthority,
 	publishExactSessionAuthority,
+	retireExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
 import { trackTempDirs } from "../helpers/tracked-temp-dirs";
 
@@ -53,6 +54,10 @@ type Fixture = {
 	/** Releases a previously hung session/update transport. */
 	releaseSessionUpdates(): void;
 	sendIdle(): void;
+	/** Retires the host's index row, as a host that exits between turns does. */
+	retireHost(): Promise<void>;
+	/** Makes the broker's exact saved-session lookup omit the session (`undefined` restores it). */
+	omitSavedSession(omission: { reason: string; detailCode?: string } | undefined): void;
 	dispose(): void;
 	queryCalls: string[];
 	sendTerminal(frame: Record<string, unknown>): void;
@@ -124,6 +129,8 @@ export function createFixture(
 		let pendingPromptAck: { socket: TestSocket; id: unknown } | undefined;
 		let deferredPromptAckUsed = false;
 		let hangUpdates = false;
+		/** While set, the broker's exact saved-session lookup omits the session for this reason. */
+		let savedSessionOmission: { reason: string; detailCode?: string } | undefined;
 		let promptNumber = 0;
 		let lastPromptClientRef: string | undefined;
 		let watchdogNow = 0;
@@ -241,10 +248,12 @@ export function createFixture(
 						let result: unknown;
 						if (frame.operation === "session.list") {
 							result = resolvingSavedSession
-								? {
-										sessions: [],
-										savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
-									}
+								? savedSessionOmission
+									? { sessions: [], savedSessionOmission: { sessionId, ...savedSessionOmission } }
+									: {
+											sessions: [],
+											savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
+										}
 								: {
 										sessions: [
 											{
@@ -489,6 +498,12 @@ export function createFixture(
 			sendIdle,
 			queryCalls,
 			sendTerminal,
+			retireHost: async () => {
+				await retireExactSessionAuthority({ ...authorityOptions, indexSeq: authorityIndexSeq++ }, authority);
+			},
+			omitSavedSession: omission => {
+				savedSessionOmission = omission;
+			},
 			dispose: () => {
 				releaseHang.resolve();
 				abort.abort();
@@ -3552,6 +3567,32 @@ test("cancel in flight before follow-up admission still settles the cancelled pr
 		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		abortGate.resolve();
+		fixture.dispose();
+	}
+});
+
+// Session single-owner step 6: after the host closes between turns (Continue here), a prompt
+// re-attaches the session in place. A saved-session lookup that is only busy (a migration in
+// progress) must not end the session: that prompt fails undelivered and the next one recovers.
+test("a re-attach that meets a busy saved-session lookup keeps the session for the next prompt", async () => {
+	const fixture = await createFixture();
+	try {
+		const first = prompt(fixture, "before the host closes");
+		await bounded(fixture.promptDelivered, "first prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(first, "first prompt")).toEqual({ stopReason: "end_turn" });
+
+		await fixture.retireHost();
+		fixture.omitSavedSession({ reason: "scope_unavailable", detailCode: "migration_busy" });
+		await expect(bounded(prompt(fixture, "during the migration"), "prompt during migration")).rejects.toThrow();
+		expect(fixture.promptDeliveryCount()).toBe(1);
+
+		fixture.omitSavedSession(undefined);
+		const recovered = prompt(fixture, "after the migration");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "recovered prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(recovered, "recovered prompt")).toEqual({ stopReason: "end_turn" });
+	} finally {
 		fixture.dispose();
 	}
 });

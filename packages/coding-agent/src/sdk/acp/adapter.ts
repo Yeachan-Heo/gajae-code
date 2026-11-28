@@ -156,6 +156,8 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"uncertain_after_send",
 	// Attach-only refusal: raised by ensureBroker before any lifecycle request or MCP server.
 	"broker_unavailable",
+	// Resume refused before any launch: another process holds the session (single-owner).
+	"live_session",
 ]);
 
 /**

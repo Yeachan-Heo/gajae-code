@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	ACP_CORE_V1_CASE_IDS,
 	ACPX_GIT_HEAD,
 	ACPX_VERSION,
+	AGENT_HOME_ENV,
 	runAcpConformance,
 	type UpstreamReport,
 } from "../scripts/run-acp-conformance";
@@ -102,5 +105,42 @@ describe("runAcpConformance", () => {
 			}),
 		);
 		expect(written).toEqual(result);
+	});
+	test("runs the agent command under a temporary HOME, removed afterwards", async () => {
+		let home = "";
+		let existed = false;
+		await runAcpConformance({
+			...options(successfulReport()),
+			runRunner: async runner => {
+				home = runner.home;
+				existed = (await fs.stat(home)).isDirectory();
+			},
+		});
+		expect([existed, home === os.homedir(), path.dirname(home)]).toEqual([
+			true,
+			false,
+			await fs.realpath(os.tmpdir()),
+		]);
+		await expect(fs.stat(home)).rejects.toThrow();
+	});
+	test(`runs the agent command under ${AGENT_HOME_ENV} when set, and keeps it`, async () => {
+		const chosen = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-conformance-test-home-"));
+		const previous = process.env[AGENT_HOME_ENV];
+		process.env[AGENT_HOME_ENV] = chosen;
+		try {
+			let home = "";
+			await runAcpConformance({
+				...options(successfulReport()),
+				runRunner: async runner => {
+					home = runner.home;
+				},
+			});
+			expect(home).toBe(chosen);
+			expect((await fs.stat(chosen)).isDirectory()).toBe(true);
+		} finally {
+			if (previous === undefined) delete process.env[AGENT_HOME_ENV];
+			else process.env[AGENT_HOME_ENV] = previous;
+			await fs.rm(chosen, { recursive: true, force: true });
+		}
 	});
 });

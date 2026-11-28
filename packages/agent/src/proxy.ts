@@ -10,6 +10,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 	type StopReason,
+	stripCredentialIds,
 	type ToolCall,
 } from "@gajae-code/ai";
 import { calculateCost } from "@gajae-code/ai/models";
@@ -155,7 +156,8 @@ export function streamProxy(model: Model, context: Context, options: ProxyStream
 				},
 				body: JSON.stringify({
 					model,
-					context,
+					// The local stored-credential row id means nothing to the proxy server.
+					context: { ...context, messages: stripCredentialIds(context.messages) },
 					options: {
 						temperature: options.temperature,
 						topP: options.topP,

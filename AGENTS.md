@@ -175,6 +175,8 @@ Test externally observable contracts: behavior, output shape, state transitions,
 
 Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicated coverage, long-lived global mutations, and `mock.module()`. Prefer `vi.spyOn(...)` with cleanup. Compile-time guarantees belong in type checks, not runtime tests.
 
+- Under `bun test`, `process.env.HOME` (what children see) may differ from `os.homedir()` (what in-process code uses). Build in-process expectations from `os.homedir()`, and pass `env.HOME` explicitly to give a child a specific home.
+
 ## Commit, changelog, release
 
 - Always commit incrementally; atomic commits are preferred. One logical change per commit — never batch unrelated work.

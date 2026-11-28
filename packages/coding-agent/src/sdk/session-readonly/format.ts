@@ -40,6 +40,16 @@ export interface EntryPatchRecord<TMessage = unknown> {
 
 export type StoredSessionPatchRecord = HeaderPatchRecord | EntryPatchRecord;
 
+/**
+ * True when a directory entry name can be a session transcript. Transcripts are
+ * named `<timestamp>_<sessionId>.jsonl`; a dot-prefixed `.jsonl` file is an
+ * in-flight staging copy (such as an unpromoted memory-guard restore) and never
+ * a session of its own, even when a crash leaves it behind.
+ */
+export function isSessionTranscriptFileName(name: string): boolean {
+	return name.endsWith(".jsonl") && !name.startsWith(".");
+}
+
 export function isSupportedSessionVersion(version: unknown): boolean {
 	return (
 		version === undefined ||

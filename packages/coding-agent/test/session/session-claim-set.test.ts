@@ -7,7 +7,12 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionClaimSet, sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
+import {
+	SessionClaimSet,
+	SessionWriteWithoutClaimError,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import { type SessionDestination, SessionManager } from "../../src/session/session-manager";
 import {
 	claimSessionOwner,
@@ -186,44 +191,6 @@ describe.if(supported)("the claim set's release table (design §2.5)", () => {
 		expect(await held(id)).toBe(false);
 	});
 
-	it("cold-sidecar manager swap of one session: the claim moves, and the old manager's close unlocks nothing", async () => {
-		const previous = await persisted();
-		const id = previous.manager.getSessionId();
-		previous.claims.add(await claim(id));
-		const successor = await SessionManager.open(previous.manager.getSessionFile()!, previous.destination);
-		managers.push(successor);
-		const successorClaims = sessionClaimSetOf(successor);
-		previous.claims.moveTo(successorClaims);
-		expect(previous.claims.sessionIds).toEqual([]);
-		await previous.manager.close();
-		expect(await held(id)).toBe(true);
-		expect(successorClaims.sessionIds).toEqual([id]);
-		await successor.close();
-		expect(await held(id)).toBe(false);
-	});
-
-	it("swap to a fork's manager: the predecessor is released once moved, unless a deferred hold keeps it", async () => {
-		const previous = await persisted();
-		const predecessor = previous.manager.getSessionId();
-		previous.claims.add(await claim(predecessor));
-		const fork = await persisted("managed", previous);
-		fork.claims.add(await claim(fork.manager.getSessionId()));
-		previous.claims.moveTo(fork.claims);
-		expect(await held(predecessor)).toBe(false);
-		expect(fork.claims.sessionIds).toEqual([fork.manager.getSessionId()]);
-
-		const held2 = await persisted("managed", previous);
-		const heldId = held2.manager.getSessionId();
-		held2.claims.add(await claim(heldId));
-		const finalization = Promise.withResolvers<void>();
-		held2.claims.holdUntil(heldId, finalization.promise);
-		held2.claims.moveTo(fork.claims);
-		expect(await held(heldId)).toBe(true);
-		finalization.resolve();
-		await finalization.promise;
-		expect(await held(heldId)).toBe(false);
-	});
-
 	it("deferred owner shutdown: the predecessor waits for finalization, at most the cap", async () => {
 		const { manager, claims } = await persisted();
 		const predecessor = manager.getSessionId();
@@ -310,6 +277,16 @@ async function explicitWithFault(fault: CloseFault) {
 }
 
 describe.if(supported)("the claim set on every close path", () => {
+	it("a manager dropped after a retryable close failure keeps its claim until its retry owner closes it", async () => {
+		const { manager, id } = await explicitWithFault("retryable_once");
+		await expect(manager.close()).rejects.toThrow();
+		expect(await held(id)).toBe(true);
+		manager.retryCloseInBackground();
+		const deadline = Date.now() + 10_000;
+		while ((await held(id)) && Date.now() < deadline) await Bun.sleep(20);
+		expect(await held(id)).toBe(false);
+	});
+
 	for (const method of ["closeStrict", "flushAndCloseStrict"] as const) {
 		it(`${method}: closed and close_unknown release the claims`, async () => {
 			const closed = await explicitWithFault("none");
@@ -386,6 +363,36 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 		expect(claims.sessionIds).toEqual([]);
 	});
 
+	it("a re-attempt that lands after the manager left its session releases it and records no claim", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const gate = Promise.withResolvers<void>();
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				await gate.promise;
+				return tryAcquireFileLock(sidecar, timeoutMs);
+			},
+			probe: probeFileLock,
+		};
+		const set = new SessionClaimSet();
+		try {
+			set.bind("left-a");
+			// Enforce re-attempts a held session at every turn, with no backoff.
+			set.noteOutcome("left-a", { status: "held" });
+			const reclaim = set.reclaimCurrent();
+			set.bind("current-b");
+			gate.resolve();
+			expect(await reclaim).toEqual({ status: "none" });
+			expect(await held("left-a")).toBe(false);
+			set.bind("left-a");
+			expect(await set.settled()).toBeUndefined();
+		} finally {
+			gate.resolve();
+			set.releaseAll();
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.lockBackend;
+		}
+	});
+
 	it("setSessionFile settles on its own: the predecessor is released once the switch returns", async () => {
 		const other = await persisted();
 		const otherFile = other.manager.getSessionFile()!;
@@ -410,6 +417,7 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 describe("missed-release signals", () => {
 	it("counts an id change outside any transition, only when ownership is on", () => {
 		const count = () => sessionOwnershipCounters().bind_outside_transition;
+		SessionOwnershipTestHooks.mode = "off";
 		const off = new SessionClaimSet();
 		off.bind("a");
 		off.bind("b");
@@ -433,6 +441,7 @@ describe("missed-release signals", () => {
 
 	it.if(supported)("counts a target staged outside any transition, only when ownership is on", async () => {
 		const count = () => sessionOwnershipCounters().target_staged_outside_transition;
+		SessionOwnershipTestHooks.mode = "off";
 		const off = new SessionClaimSet();
 		off.bind("staged-current");
 		off.add(await claim("staged-off"));
@@ -476,6 +485,72 @@ describe("missed-release signals", () => {
 		expect(sessionOwnershipCounters().claims_abandoned).toBe(1);
 		// The lock stays until the process exits; release it here for the next test.
 		kept?.release();
+	});
+});
+
+describe("the detector uses the mode its factory read", () => {
+	it("checks a named id before the first bind and the bound id after it, under one mode", () => {
+		const count = () => sessionOwnershipCounters().session_write_without_claim;
+		// Ownership off: nothing is counted, bound or not, whatever the mode is later.
+		SessionOwnershipTestHooks.mode = "off";
+		const off = new SessionClaimSet();
+		SessionOwnershipTestHooks.mode = "observe";
+		try {
+			off.checkWrite("pre-bind", "fork-id");
+			expect(count()).toBe(0);
+			const set = new SessionClaimSet();
+			set.checkWrite("no id");
+			expect(count()).toBe(0);
+			set.checkWrite("pre-bind", "fork-id");
+			expect(count()).toBe(1);
+			SessionOwnershipTestHooks.strictWriteDetection = true;
+			expect(() => set.checkWrite("pre-bind", "fork-id")).toThrow(SessionWriteWithoutClaimError);
+			delete SessionOwnershipTestHooks.strictWriteDetection;
+			// A settings change after the factory does not change the manager's mode.
+			set.bind("fork-id");
+			SessionOwnershipTestHooks.mode = "off";
+			set.checkWrite("bound");
+			expect(count()).toBe(3);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.strictWriteDetection;
+		}
+	});
+});
+
+describe.if(supported)("the detector after a claim that did not lock", () => {
+	it("is quiet for a fail-open or failed claim, and still counts a session held elsewhere", async () => {
+		const count = () => sessionOwnershipCounters().session_write_without_claim;
+		// A failed claim first: an `unavailable` answer latches, and later claims would not ask again.
+		const answers = [FileLockAcquireStatus.Failed, FileLockAcquireStatus.Unavailable];
+		SessionOwnershipTestHooks.mode = "observe";
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => ({ status: answers.shift() ?? FileLockAcquireStatus.Held, code: "ENOLCK" }),
+			probe: async () => ({ state: FileLockProbeState.Free }),
+		};
+		try {
+			const outcomes: string[] = [];
+			for (const id of ["failed", "fail-open"]) {
+				const set = new SessionClaimSet();
+				outcomes.push(await set.claim(id));
+				set.bind(id);
+				set.checkWrite("managed append");
+				set.checkWrite("rewrite", id);
+			}
+			expect(outcomes).toEqual(["failed", "none"]);
+			expect(count()).toBe(0);
+			// A session another process holds is the case the detector exists for: still counted.
+			resetSessionOwnershipForTests();
+			answers.splice(0, answers.length, FileLockAcquireStatus.Held);
+			const held = new SessionClaimSet();
+			expect(await held.claim("held")).toBe("held");
+			held.bind("held");
+			held.checkWrite("managed append");
+			expect(count()).toBe(1);
+		} finally {
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.lockBackend;
+		}
 	});
 });
 
@@ -530,7 +605,7 @@ describe("the identity helper", () => {
 	});
 });
 
-describe("with ownership off (the default)", () => {
+describe("with ownership off", () => {
 	it("a full session lifecycle makes no claim, no lock call and no owners directory", async () => {
 		const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-claim-set-off-")));
 		roots.push(home);
@@ -538,6 +613,7 @@ describe("with ownership off (the default)", () => {
 		const lockCalls: string[] = [];
 		const exitListeners = process.listenerCount("exit");
 		SessionOwnershipTestHooks.homeOverride = home;
+		SessionOwnershipTestHooks.mode = "off";
 		SessionOwnershipTestHooks.lockBackend = {
 			tryAcquire: async sidecar => {
 				lockCalls.push(`acquire ${sidecar}`);
@@ -575,6 +651,7 @@ describe("with ownership off (the default)", () => {
 			expect(process.listenerCount("exit")).toBe(exitListeners);
 		} finally {
 			SessionOwnershipTestHooks.homeOverride = preloadHome;
+			delete SessionOwnershipTestHooks.mode;
 			delete SessionOwnershipTestHooks.lockBackend;
 		}
 	});
