@@ -312,7 +312,7 @@ describe("shared session fast controls", () => {
 		).toEqual(["service_tier_change", "thinking_level_change", "message"]);
 	});
 
-	it("untouched root=false remains legacy, then adopted root=false routes fast/effort/canonical through shared admission", async () => {
+	it("untouched root=false remains legacy, then adopted root=false routes fast/effort through shared admission", async () => {
 		const f = await fixture(false);
 		expect(f.session.usesSharedControlPublication()).toBe(false);
 		const shared = vi.spyOn(f.manager, "appendServiceTierChangeSharingSession");
@@ -328,14 +328,13 @@ describe("shared session fast controls", () => {
 		expect(f.session.usesSharedControlPublication()).toBe(true);
 		await f.session.setFastMode(false);
 		await f.session.setThinkingLevelForControl(ThinkingLevel.High, false);
-		await canonical(f.session, "shared canonical after control");
 		expect(shared).toHaveBeenCalledTimes(1);
 		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(
 			f.manager
 				.getBranch()
-				.slice(-3)
+				.slice(-2)
 				.map(entry => entry.type),
-		).toEqual(["service_tier_change", "thinking_level_change", "message"]);
+		).toEqual(["service_tier_change", "thinking_level_change"]);
 	});
 });

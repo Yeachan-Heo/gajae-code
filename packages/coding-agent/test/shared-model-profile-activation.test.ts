@@ -260,19 +260,14 @@ describe("shared model profile activation", () => {
 		expect(await Bun.file(f.file).text()).toContain("SDK message after profile");
 	});
 
-	it("continues adopted non-root SDK profile, effort and canonical publications through the shared path", async () => {
+	it("continues adopted non-root SDK profile and effort publications through the shared path", async () => {
 		const f = await fixture(false);
 		expect((await f.manager.appendMessageSharingSession(user("SDK shared adoption"))).kind).toBe("committed");
 		expect(f.session.usesSharedControlPublication()).toBe(true);
 		await activate(f);
 		await f.session.setThinkingLevelForControl(ThinkingLevel.Medium, false);
-		await canonicalMessage(f);
 		const reopened = await reopen(f);
 		expectProfileState(f, reopened, ThinkingLevel.Medium);
-		expect(reopened.getBranch().at(-1)).toMatchObject({
-			type: "message",
-			message: { content: "canonical shared user" },
-		});
 		expect(f.manager.requiresSharedMutationAdmission()).toBe(true);
 	});
 

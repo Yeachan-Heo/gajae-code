@@ -190,6 +190,13 @@ async function canonicalMessage(f: Fixture, text = "canonical shared user"): Pro
 	expect(await Bun.file(f.file).text()).toContain(JSON.stringify(text));
 }
 
+/** A canonical shared append on the manager itself, which latches its shared bars. */
+async function sharedCanonicalMessage(f: Fixture, text = "canonical shared user"): Promise<void> {
+	expect((await f.manager.appendMessageSharingSession(user(text))).kind).toBe("committed");
+	expect(f.manager.getLeafEntry()).toMatchObject({ type: "message", message: { role: "user", content: text } });
+	expect(await Bun.file(f.file).text()).toContain(JSON.stringify(text));
+}
+
 async function title(f: Fixture): Promise<void> {
 	const leaf = f.manager.getLeafId();
 	expect(await f.session.setSessionName("Shared root control title", "user")).toBe(true);
@@ -435,7 +442,7 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
 		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
+		await sharedCanonicalMessage(f);
 		const sessionId = f.session.sessionId;
 		const bytes = await Bun.file(f.file).text();
 		await expect(f.session.newSession({ drop: true })).rejects.toThrow(
@@ -590,7 +597,6 @@ describe("#7824 default fallback resolution in a shared root TUI session", () =>
 		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
 		const reopened = (await reopen(f)).buildSessionContext();
 		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
-		expect(reopened.messages.map(message => message.role)).toEqual(["user", "user", "user", "assistant"]);
 	});
 
 	it("leaves model and fallback state untouched when the thinking publication is refused", async () => {
@@ -796,7 +802,7 @@ describe("#7824 selector compensation in a shared root TUI session", () => {
 
 describe("#7824 picker star after /new against a live shared predecessor", () => {
 	async function predecessorAfterNew(f: Fixture): Promise<{ peer: SessionManager; candidate: SessionInfo }> {
-		await canonicalMessage(f);
+		await sharedCanonicalMessage(f);
 		const predecessorId = f.session.sessionId;
 		const peer = await reopen(f);
 		expect((await peer.appendMessageSharingSession(user("peer before /new"))).kind).toBe("committed");
@@ -999,11 +1005,11 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 
 	it("refuses beside a peer sibling before any branch effect", async () => {
 		const f = await fixture({ shared: true });
-		await canonicalMessage(f, "first shared prompt");
+		await sharedCanonicalMessage(f, "first shared prompt");
 		const peer = await SessionManager.open(f.file, SessionManager.managedDestination(f.cwd, f.agentDir));
 		managers.push(peer);
 		expect((await peer.appendMessageSharingSession(user("peer sibling"))).kind).toBe("committed");
-		await canonicalMessage(f, "second shared prompt");
+		await sharedCanonicalMessage(f, "second shared prompt");
 		const sourceId = f.manager.getSessionId();
 		const bytes = await Bun.file(f.file).bytes();
 		const selected = f.session.getUserMessagesForBranching().find(message => message.text === "second shared prompt");
@@ -1022,12 +1028,12 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 		await expect(f.manager.prepareBranchedSession(selected.entryId)).rejects.toThrow(
 			"Cannot fork this session: another gjc process has written to this session.",
 		);
-		await canonicalMessage(f, "still usable after the refusal");
+		await sharedCanonicalMessage(f, "still usable after the refusal");
 	});
 
 	it("refuses Move Session before the cwd transition and flush, and star before any write", async () => {
 		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
+		await sharedCanonicalMessage(f);
 		const bytes = await Bun.file(f.file).bytes();
 		const target = path.join(path.dirname(f.cwd), "move-target");
 		await fs.mkdir(target);

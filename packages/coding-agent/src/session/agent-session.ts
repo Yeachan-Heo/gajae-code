@@ -2683,9 +2683,6 @@ const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
  */
 const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
 const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
-// A shared custom-message append refused as `stale/transcript_moved` committed nothing and is published again
-// against the relocated transcript; bounded so repeated relocations cannot loop.
-const SHARED_CUSTOM_APPEND_RELOCATION_RETRIES = 2;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -9511,26 +9508,11 @@ export class AgentSession {
 				event.message.role === "toolResult" ||
 				event.message.role === "fileMention"
 			) {
-				const sharedAppend = this.#usesSharedSessionPublication();
 				try {
-					let appendedEntryId: string;
-					if (sharedAppend) {
-						const outcome = await this.sessionManager.appendMessageSharingSession(event.message);
-						if (outcome.kind !== "committed") {
-							throw new Error(
-								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-								{ cause: outcome },
-							);
-						}
-						appendedEntryId = outcome.id;
-					} else {
-						appendedEntryId = this.sessionManager.appendMessage(event.message);
-					}
+					const appendedEntryId = this.sessionManager.appendMessage(event.message);
 					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
 					canonicalAdmission?.fail(error);
-					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
-					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -11433,14 +11415,6 @@ export class AgentSession {
 		if (ruleNames.length > 0) {
 			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
 			const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-			// A shared session refuses the legacy append; record through the admitted path
-			// like #markTtsrInjected (#7824).
-			if (this.#usesSharedSessionPublication()) {
-				void this.#publishInBackground("ttsr injection", () =>
-					this.sessionManager.appendTtsrInjectionSharingSession(ruleNames, records, ttsrMessageCount),
-				);
-				return;
-			}
 			// This runs inside the synchronous agent listener entry: a failed record
 			// write must not abort canonical handling of the published result. The
 			// reminder was delivered, so the claim stays consumed in memory.
@@ -11547,15 +11521,7 @@ export class AgentSession {
 		if (!persistMarker) return;
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
 		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-		// A shared session refuses the legacy append once admission is armed. Publish durable
-		// markers through the admitted path so message_end handling and committed retries work.
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
-			return;
-		}
-		void this.#publishInBackground("ttsr injection", () =>
-			this.sessionManager.appendTtsrInjectionSharingSession(uniqueRuleNames, records, ttsrMessageCount),
-		);
+		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
 	}
 
 	/** Parse only finalized, tool-provided source digests, before dispatch. */
@@ -11946,9 +11912,8 @@ export class AgentSession {
 				const liveLengthBefore = this.agent.state.messages.length;
 				const liveTailBefore = this.agent.state.messages.at(-1);
 				if (injection && details) {
-					// Persist before any live mutation. A shared session refuses the legacy append,
-					// so publish through the admitted path like other in-turn custom messages
-					// (#7815). Only a typed rejected result permits retrying in memory.
+					// Persist before any live mutation. Only a typed rejected result permits
+					// retrying in memory.
 					try {
 						await this.#appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
 					} catch (error) {
@@ -14212,27 +14177,6 @@ export class AgentSession {
 				nextSelectedDiscoveredBuiltinToolNames,
 			);
 		if (!mcpSelectionChanged && !discoveredBuiltinSelectionChanged) return;
-		// Internal refreshes (MCP catalog, /ssh, plugin/subskill tools) are synchronous
-		// producers: in a shared session their selection is published through admitted
-		// background publication instead of the refused legacy append (#7824).
-		if (this.#usesSharedSessionPublication()) {
-			const manager = this.sessionManager;
-			const identityGeneration = manager.getSessionIdentityGeneration();
-			void this.#publishInBackground("tool selection", async () => {
-				const outcome = await manager.appendToolSelectionsSharingSession(
-					mcpSelectionChanged ? nextSelectedMCPToolNames : undefined,
-					discoveredBuiltinSelectionChanged ? nextSelectedDiscoveredBuiltinToolNames : undefined,
-					() =>
-						!this.#isDisposed &&
-						this.sessionManager === manager &&
-						manager.getSessionIdentityGeneration() === identityGeneration,
-				);
-				if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids.at(-1) ?? "" };
-				if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids.join(","), error: outcome.error };
-				return outcome;
-			});
-			return;
-		}
 		const mutationCorrelationId =
 			mcpSelectionChanged && discoveredBuiltinSelectionChanged ? crypto.randomUUID() : undefined;
 		if (mcpSelectionChanged) {
@@ -15388,12 +15332,10 @@ export class AgentSession {
 				return tool !== undefined && isMCPBridgeTool(tool);
 			});
 			if (activated.length > 0) {
-				if (!this.#usesSharedSessionPublication())
-					this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
+				this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
-					sharedPublication: true,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
 					persistedMCPToolNames:
 						activatedMCPToolNames.length > 0
@@ -15726,7 +15668,6 @@ export class AgentSession {
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
-			sharedPublication?: boolean;
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
@@ -15737,9 +15678,8 @@ export class AgentSession {
 			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
-		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
 		const assertControlMutationAllowed = () => {
-			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedDiscovery) {
+			if (options?.explicitActiveToolSelectionGeneration !== undefined) {
 				this.sessionManager.assertLegacyMutationAllowed("select active tools");
 			}
 		};
@@ -15789,102 +15729,6 @@ export class AgentSession {
 		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
-		if (sharedDiscovery) {
-			const manager = this.sessionManager;
-			const sessionId = manager.getSessionId();
-			const file = manager.getSessionFile();
-			const identityGeneration = manager.getSessionIdentityGeneration();
-			const transitionGeneration = this.#sessionTransitionGeneration;
-			let promptGeneration: number | undefined;
-			const current = () =>
-				!this.#isDisposed &&
-				!this.#sessionAdmissionClosing &&
-				!this.#sessionAdmissionClosed &&
-				this.#sessionTransitionKind === undefined &&
-				transitionGeneration === this.#sessionTransitionGeneration &&
-				this.sessionManager === manager &&
-				manager.getSessionId() === sessionId &&
-				manager.getSessionFile() === file &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				selectionIsCurrent() &&
-				mcpCatalogGeneration === this.#mcpCatalogGeneration &&
-				validToolNames.every((name, index) => this.#toolRegistry.get(name) === tools[index]) &&
-				(promptGeneration === undefined || promptGeneration === this.#baseSystemPromptGeneration);
-			let builtPrompt: string[] | undefined;
-			if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
-				promptGeneration = this.#reserveBaseSystemPromptGeneration();
-				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
-				);
-				builtPrompt = built.systemPrompt;
-			}
-			if (!current()) return undefined;
-			const persistedMCPNames = options?.persistedMCPToolNames ?? [...nextSelectedMCPToolNames];
-			const selectedBuiltinNames = this.#selectRestorableDiscoveredBuiltinToolNames(
-				nextSelectedDiscoveredBuiltinToolNames,
-			).filter(name => activeNameSet.has(name));
-			const mcpChanged =
-				(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
-				!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, persistedMCPNames);
-			const builtinChanged =
-				this.#resolveEffectiveDiscoveryMode() === "all" &&
-				!this.#selectedMCPToolNamesMatch(previousSelectedDiscoveredBuiltinToolNames, selectedBuiltinNames);
-			const promote = () => {
-				if (builtPrompt) {
-					this.#baseSystemPrompt = builtPrompt;
-					this.agent.setSystemPrompt(builtPrompt);
-				}
-				if (promptRelevantToolsChanged) {
-					this.#lastAppliedToolSignature = signature;
-					this.#pendingAppliedToolSignature = undefined;
-					this.#defaultModelSelectionMutationRevision++;
-				}
-				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
-				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
-				this.#invalidateDiscoveryCaches();
-			};
-			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
-				promote();
-			} else {
-				const operation = "select active tools";
-				let promoted = false;
-				let promotionError: unknown;
-				const outcome = await this.#withStartedSharedControlPublication(
-					() => {
-						if (!current()) throw new Error("Shared tool selection superseded");
-					},
-					async () => {
-						const result = await manager.appendToolSelectionsSharingSession(
-							mcpChanged ? persistedMCPNames : undefined,
-							builtinChanged ? selectedBuiltinNames : undefined,
-							current,
-						);
-						// No await between the committed receipt and live promotion.
-						if (result.kind === "committed" && current()) {
-							try {
-								promote();
-								promoted = true;
-							} catch (error) {
-								promotionError = error;
-							}
-						}
-						return result;
-					},
-				);
-				// A possibly durable selection this session did not apply keeps its receipt and
-				// closes the session instead of running on tools its transcript no longer names.
-				if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-				if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-				if (!promoted)
-					return this.#failClosedSharedControl(
-						operation,
-						outcome,
-						promotionError ?? new Error("Committed shared tool selection superseded"),
-					);
-			}
-			return this.#activeToolSelectionRevision;
-		}
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			while (true) {
 				const generation = this.#reserveBaseSystemPromptGeneration();
@@ -16026,10 +15870,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: { explicit?: boolean; persistMCPSelection?: boolean; retryOnMcpCatalogChange?: boolean },
 	): Promise<void> {
-		// Shared sessions publish the selection and promote prompt/tools together through the
-		// admitted tool-selection path; legacy sessions keep the legacy refusal.
 		const assertPublicationMode = this.#controlPublicationModeFence("select active tools");
-		const sharedPublication = this.#usesSharedSessionPublication();
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
 		const shouldPersistMCPSelectionIfUnchanged =
@@ -16052,7 +15893,6 @@ export class AgentSession {
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
-				sharedPublication,
 			});
 			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
 				if (sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
@@ -16082,7 +15922,6 @@ export class AgentSession {
 							sessionTransitionGeneration,
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
-							sharedPublication,
 						},
 					);
 					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {
@@ -16097,12 +15936,8 @@ export class AgentSession {
 					!sessionContext.hasPersistedMCPToolSelection ||
 					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
 				) {
-					if (sharedPublication)
-						await this.#publishSharedMCPToolSelection(selectedMCPToolNames, assertPublicationMode);
-					else {
-						assertPublicationMode();
-						this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
-					}
+					assertPublicationMode();
+					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
 				}
 			}
 			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
@@ -17881,161 +17716,52 @@ export class AgentSession {
 		observationId?: string,
 	): Promise<string | undefined> {
 		if (this.#isEphemeralCustomMessageType(customType)) return undefined;
-		// A session that publishes canonical messages through the shared lease arms
-		// shared admission, which refuses every later legacy append.
-		if (!this.#usesSharedSessionPublication()) {
-			return this.sessionManager.appendCustomMessageEntry(
-				customType,
-				content,
-				display,
-				details,
-				attribution,
-				observationId,
-			);
-		}
-		const manager = this.sessionManager;
-		const sessionId = manager.getSessionId();
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const publish = () =>
-			manager.appendCustomMessageEntrySharingSession(
-				customType,
-				content,
-				display,
-				details,
-				attribution,
-				observationId,
-			);
-		let outcome = await publish();
-		// A relocation of this session's transcript (a task child following its parent's session move) between the
-		// append capturing its path and its transaction refuses the append before any write. Nothing was committed, so
-		// it is published again against the relocated transcript; the caller's in-memory message is not touched. Only
-		// for the same manager, session id and identity generation, and outside every session transition: a switch or
-		// copy reports the same reason and must not receive this entry, and while it is being adopted the successor's
-		// transcript can already be in place before the id or generation changes. Every other outcome stays final,
-		// since an `unknown` one may already be committed.
-		for (
-			let retry = 0;
-			retry < SHARED_CUSTOM_APPEND_RELOCATION_RETRIES &&
-			outcome.kind === "stale" &&
-			outcome.reason === "transcript_moved" &&
-			this.#sessionTransitionKind === undefined &&
-			!this.#handoffTransitionActive &&
-			this.sessionManager === manager &&
-			manager.getSessionId() === sessionId &&
-			manager.getSessionIdentityGeneration() === identityGeneration;
-			retry++
-		) {
-			outcome = await publish();
-		}
-		if (outcome.kind !== "committed") {
-			throw new Error(
-				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-				{ cause: outcome },
-			);
-		}
-		return outcome.id;
-	}
-
-	/**
-	 * Publish an additive custom entry at this opener's admitted branch cursor.
-	 *
-	 * A shared-append session refuses legacy appends once a canonical shared publication
-	 * adopted an identity this opener did not import, so every in-turn producer publishes
-	 * through the shared lease instead (the custom-message path does the same). Throws when
-	 * the publication is refused: a silently dropped entry is worse than a loud failure.
-	 */
-	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendCustomEntry(customType, data);
-		const outcome = await this.sessionManager.appendCustomEntrySharingSession(customType, data);
-		assertSharedAppendCommitted(`Shared ${customType} entry append`, outcome);
-		return outcome.id;
-	}
-
-	/**
-	 * Publish a custom entry from a synchronous call site.
-	 *
-	 * A shared-append session publishes through its admitted path in the background and
-	 * logs a refusal, because such a caller cannot await a transaction and a refusal must
-	 * not abort its turn. The legacy form throws inline exactly as before.
-	 */
-	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendCustomEntry(customType, data);
-			return Promise.resolve({ committed: true });
-		}
-		return this.#publishInBackground(`custom entry ${customType}`, () =>
-			this.sessionManager.appendCustomEntrySharingSession(customType, data),
+		return this.sessionManager.appendCustomMessageEntry(
+			customType,
+			content,
+			display,
+			details,
+			attribution,
+			observationId,
 		);
+	}
+
+	/** Append an additive custom entry to this session; throws inline when the append is refused. */
+	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
+		return this.sessionManager.appendCustomEntry(customType, data);
+	}
+
+	/** Append a custom entry from a synchronous call site; throws inline when the append is refused. */
+	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
+		this.sessionManager.appendCustomEntry(customType, data);
+		return Promise.resolve({ committed: true });
 	}
 
 	/** Publish a message from a synchronous call site. */
 	appendMessageInBackground(message: SessionPersistedMessage): Promise<BackgroundPublicationResult> {
-		return this.#publishMessageInBackground("session message", message);
+		return this.#publishMessageInBackground(message);
 	}
 
-	/** Publish a message at this opener's admitted branch cursor. */
+	/** Append a message to this session. */
 	async appendMessageForSession(message: SessionPersistedMessage): Promise<string> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendMessage(message);
-		const outcome = await this.sessionManager.appendMessageSharingSession(message);
-		assertSharedAppendCommitted("Shared message append", outcome);
-		return outcome.id;
+		return this.sessionManager.appendMessage(message);
 	}
 
-	/** Publish a session recap at this opener's admitted branch cursor. */
+	/** Append a session recap to this session. */
 	async appendSessionRecapForSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendSessionRecap(input);
-		return this.sessionManager.appendSessionRecapSharingSession(input);
+		return this.sessionManager.appendSessionRecap(input);
 	}
 
-	/** Publish a label change from a synchronous call site. */
+	/** Append a label change from a synchronous call site. */
 	appendLabelChangeInBackground(targetId: string, label: string | undefined): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendLabelChange(targetId, label);
-			return Promise.resolve({ committed: true });
-		}
-		return this.#publishInBackground("label change", () =>
-			this.sessionManager.appendLabelChangeSharingSession(targetId, label),
-		);
+		this.sessionManager.appendLabelChange(targetId, label);
+		return Promise.resolve({ committed: true });
 	}
 
-	/** Publish a mode change from a synchronous call site. */
+	/** Append a mode change from a synchronous call site. */
 	appendModeChangeInBackground(mode: string, data?: Record<string, unknown>): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendModeChange(mode, data);
-			return Promise.resolve({ committed: true });
-		}
-		return this.#publishInBackground("mode change", () =>
-			this.sessionManager.appendModeChangeSharingSession(mode, data),
-		);
-	}
-
-	/**
-	 * Run one background publication.
-	 *
-	 * Returns the real outcome: `false` means nothing was committed, and the caller must
-	 * treat the entry as not persisted. A refusal never throws into the turn (a synchronous
-	 * producer cannot await a transaction and must not abort the run), so the cause is
-	 * logged here with the operation and the promise is registered for settlement joining.
-	 */
-	#publishInBackground(
-		operation: string,
-		publish: () => Promise<SharedAppendOutcome>,
-	): Promise<BackgroundPublicationResult> {
-		const task = publish()
-			.then((outcome): BackgroundPublicationResult => {
-				if (outcome.kind === "committed") return { committed: true };
-				const cause = describeSharedAppendFailure(outcome);
-				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
-				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
-				return { committed: false, cause: cause.reason };
-			})
-			.catch((error: unknown): BackgroundPublicationResult => {
-				const reason = error instanceof Error ? error.message : String(error);
-				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
-				this.#reportBackgroundRefusal(operation, reason);
-				return { committed: false, cause: reason };
-			});
-		return this.#trackBackgroundPublication(task);
+		this.sessionManager.appendModeChange(mode, data);
+		return Promise.resolve({ committed: true });
 	}
 
 	/**
@@ -18065,115 +17791,36 @@ export class AgentSession {
 	}
 
 	/**
-	 * Persist one message from a synchronous call site.
+	 * Persist one message from a synchronous call site; throws inline when the append is refused.
 	 *
-	 * The legacy form throws inline as before. The shared form publishes in the background:
-	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
-	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
-	 *
-	 * On the shared path `onCommitted` fires only after the entry committed, so it means the
-	 * entry is durable. On the legacy path it fires right after `SessionManager.appendMessage`,
-	 * which only admits the entry: `_persist` deliberately returns before writing a transcript
-	 * until the session is ensured on disk or holds its first assistant entry. A legacy
-	 * callback therefore means "recorded in this session's graph", not "durable after a reload".
-	 *
-	 * On the shared path the callback runs after the durable write. A synchronous throw is
-	 * reported through the operator-notice seam and structured log, not treated as a refusal
-	 * or a reason to publish again. The task tracks callback invocation only; callbacks must
-	 * be synchronous and their return values are ignored.
+	 * `onCommitted` fires right after `SessionManager.appendMessage`, which only admits the
+	 * entry: `_persist` deliberately returns before writing a transcript until the session is
+	 * ensured on disk or holds its first assistant entry. The callback therefore means
+	 * "recorded in this session's graph", not "durable after a reload".
 	 */
 	#publishMessageInBackground(
-		label: string,
 		message: SessionPersistedMessage,
 		onCommitted?: () => void,
 	): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendMessage(message);
-			onCommitted?.();
-			return Promise.resolve({ committed: true });
-		}
-		const publication = this.#publishInBackground(label, () =>
-			this.sessionManager.appendMessageSharingSession(message),
-		);
-		return this.#trackBackgroundPublication(
-			publication.then(result => {
-				if (result.committed) {
-					try {
-						onCommitted?.();
-					} catch (error) {
-						this.#reportBackgroundFollowUpFailure(label, error);
-					}
-				}
-				return result;
-			}),
-		);
-	}
-
-	/**
-	 * Report a completion callback that threw after its entry was already durable.
-	 *
-	 * The entry is saved and must not be published again, so this is neither a refusal nor
-	 * an uncertainty: the operator only needs to know the follow-up step did not run.
-	 */
-	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
-		logger.warn("A durable shared publication's completion callback failed", {
-			operation,
-			error: safeErrorDescription(error),
-		});
-		if (this.#isDisposed) return;
-		this.emitNotice(
-			"warning",
-			`Saved the ${operation} to this session, but its completion step failed.`,
-			"session-publication",
-		);
+		this.sessionManager.appendMessage(message);
+		onCommitted?.();
+		return Promise.resolve({ committed: true });
 	}
 
 	/**
 	 * Persist one deferred command result and throw when it was not committed.
 	 *
 	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
-	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
-	 * cannot express that, so this path awaits the lease and converts every non-committed
-	 * outcome into a throw carrying the cause. An `unknown` outcome may already be durable,
-	 * so it throws a {@link SharedControlPublicationError} with code `unknown` that carries
-	 * the attempted id: the caller must never re-append it under a new id.
+	 * can keep the entry queued for retry and withhold `onPersisted`; every failed save is
+	 * reported, so a row the caller drops is never dropped silently.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
-		// Every failed save is reported, so a row the caller drops is never dropped silently.
-		const reportThrown = (error: unknown): never => {
+		try {
+			this.sessionManager.appendMessage(message);
+		} catch (error) {
 			this.#reportBackgroundRefusal(label, error instanceof Error ? error.message : String(error));
 			throw error;
-		};
-		if (!this.#usesSharedSessionPublication()) {
-			try {
-				this.sessionManager.appendMessage(message);
-			} catch (error) {
-				reportThrown(error);
-			}
-			return;
 		}
-		const outcome = await this.#trackBackgroundPublication(
-			this.sessionManager.appendMessageSharingSession(message),
-		).catch(reportThrown);
-		if (outcome.kind === "unknown") {
-			// The entry may already be durable: do not report it as unsaved.
-			if (!this.#isDisposed)
-				this.emitNotice(
-					"warning",
-					`The ${label} may not have been saved to this session (outcome unknown).`,
-					"session-publication",
-				);
-		} else if (outcome.kind !== "committed") {
-			const cause = describeSharedAppendFailure(outcome);
-			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
-		}
-		if (outcome.kind === "unknown")
-			throw new SharedControlPublicationError(`record the ${label}`, {
-				kind: "unknown",
-				ids: [outcome.id],
-				error: outcome.error,
-			});
-		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
 	}
 
 	/**
@@ -33859,35 +33506,6 @@ export class AgentSession {
 	 * exact receipt, never retry or compensate, and close the session so it cannot keep
 	 * running on state that diverges from its transcript.
 	 */
-	/** Make an already-live MCP selection durable in a shared session (no runtime change). */
-	async #publishSharedMCPToolSelection(selected: string[], assertMode: () => void): Promise<void> {
-		const operation = "select active tools";
-		const manager = this.sessionManager;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.#selectedMCPToolNamesMatch(this.getSelectedMCPToolNames(), selected)
-			);
-		};
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() => manager.appendToolSelectionsSharingSession(selected, undefined, current),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-	}
-
 	#failClosedSharedControl(
 		operation: string,
 		outcome: Extract<SharedEntriesAppendOutcome, { kind: "committed" | "unknown" }>,
@@ -34259,7 +33877,7 @@ export class AgentSession {
 			this.agent.appendMessage(bashMessage);
 
 			// Save to session
-			void this.#publishMessageInBackground("bash result", bashMessage, options?.onPersisted);
+			void this.#publishMessageInBackground(bashMessage, options?.onPersisted);
 		}
 	}
 
@@ -34458,12 +34076,7 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			const shared = this.#usesSharedSessionPublication();
-			if (shared) {
-				void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
-			} else {
-				this.sessionManager.appendMessage(pythonMessage);
-			}
+			this.sessionManager.appendMessage(pythonMessage);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -34471,8 +34084,8 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
-			// Reserve queued work before invoking the legacy callback, which may throw inline.
-			if (!shared) options?.onPersisted?.();
+			// Reserve queued work before invoking the callback, which may throw inline.
+			options?.onPersisted?.();
 		}
 	}
 
@@ -37807,18 +37420,6 @@ interface BackgroundPublicationResult {
 	readonly cause?: string;
 }
 
-/** Flatten a non-committed shared outcome into log/report fields. */
-function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: string; reason?: string } {
-	if (outcome.kind === "stale") return { outcome: outcome.kind, reason: outcome.reason };
-	if (outcome.kind === "rejected")
-		return {
-			outcome: outcome.kind,
-			reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
-		};
-	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
-	return { outcome: outcome.kind };
-}
-
 type SharedAppendFailureOutcome = Extract<SharedAppendOutcome, { kind: "unknown" | "stale" | "rejected" }>;
 
 /** Preserve only recognized failure receipts carried by the custom-append wrapper. */
@@ -37842,23 +37443,6 @@ function getSharedAppendFailureOutcome(error: unknown): SharedAppendFailureOutco
 	}
 	if (record.kind === "rejected" && Object.hasOwn(record, "error")) return cause as SharedAppendFailureOutcome;
 	return undefined;
-}
-
-/**
- * Narrow a shared publication outcome to `committed` or throw with its cause.
- *
- * Used by every AgentSession seam that replaces a legacy append: the refusal must be
- * loud, because a silently dropped entry is worse than a surfaced failure.
- */
-function assertSharedAppendCommitted(
-	operation: string,
-	outcome: SharedAppendOutcome,
-): asserts outcome is Extract<SharedAppendOutcome, { kind: "committed" }> {
-	if (outcome.kind === "committed") return;
-	throw new Error(
-		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-		{ cause: outcome },
-	);
 }
 
 async function awaitBtwSettlement(pending: Promise<void>): Promise<void> {
