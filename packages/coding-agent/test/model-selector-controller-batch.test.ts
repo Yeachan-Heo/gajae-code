@@ -22,10 +22,9 @@ import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/comp
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { TempDir } from "@gajae-code/utils";
-import {
-	type AgentSessionProfileInstalledOverrideState,
-	type ModelSelectionRollbackDurableState,
-	SharedControlPublicationError,
+import type {
+	AgentSessionProfileInstalledOverrideState,
+	ModelSelectionRollbackDurableState,
 } from "../src/session/agent-session";
 import { loadTestTheme } from "./helpers/test-theme";
 
@@ -349,61 +348,6 @@ describe("SelectorController model batch assignments", () => {
 		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("post-selection synchronization failed"));
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 		expect(session.getProfileInstalledOverrideState().manualModelRoles).toEqual(new Set());
-	});
-
-	test("an unknown shared outcome is never compensated over", async () => {
-		const { ctx, session } = createControllerContext();
-		const before = session.model;
-		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
-		session.setModel = async (nextModel, _role, options) => {
-			options?.onMutationStarted?.();
-			session.model = nextModel;
-			throw new SharedControlPublicationError("set default model", {
-				kind: "unknown",
-				ids: ["forward"],
-				error: new Error("durability_unproven"),
-			});
-		};
-		const selector = await openReadySelector(ctx);
-
-		selectMenuAction(selector, 0);
-		await settleSelectorInput();
-
-		expect(restoreModel).not.toHaveBeenCalled();
-		expect(session.model).not.toBe(before);
-		expect(ctx.showError).toHaveBeenCalledTimes(1);
-		expect(ctx.showError.mock.calls[0]![0]).not.toContain("rollback");
-	});
-
-	test("a shared session compensates through one durable-aware restore", async () => {
-		const { ctx, session } = createControllerContext();
-		const before = session.model;
-		const beforeThinking = session.thinkingLevel;
-		const restoreModel = vi.spyOn(session, "restoreModelSelectionForRollback");
-		Object.assign(session, { usesSharedControlPublication: () => true });
-		session.setModel = async (nextModel, _role, options) => {
-			options?.onMutationStarted?.();
-			session.model = nextModel;
-			throw new Error("post-selection synchronization failed");
-		};
-		const selector = await openReadySelector(ctx);
-
-		selectMenuAction(selector, 0);
-		await settleSelectorInput();
-
-		expect(restoreModel).toHaveBeenCalledTimes(1);
-		expect(restoreModel.mock.calls[0]).toEqual([
-			before,
-			beforeThinking,
-			{
-				defaultChain: { state: undefined },
-				resumeDefault: { selector: "provider-a/original-default:medium" },
-			},
-		]);
-		// The legacy chain and resume-default writes are not issued for a shared session.
-		expect(session.setConfiguredModelChain).not.toHaveBeenCalled();
-		expect(session.recordResumeDefaultModel).not.toHaveBeenCalled();
-		expect(session.model).toBe(before);
 	});
 
 	test("failed assignment never restores a stale projection over a newer committed owner", async () => {

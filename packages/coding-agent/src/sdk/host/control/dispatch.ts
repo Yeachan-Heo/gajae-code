@@ -4,6 +4,11 @@ import {
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
 import { findOperatorMessage } from "../../../session/operator-error-message";
+import {
+	SessionHeldError,
+	type SessionOwnerHolderSummary,
+	sessionOwnerHolderSummary,
+} from "../../../session/session-owner-holder";
 import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { isSecureLocalOperation } from "../../protocol/client-control-contracts";
@@ -41,6 +46,8 @@ export interface ControlError {
 	message: string;
 	currentRevision?: string;
 	details?: ControlValue;
+	/** The process that holds the session, on a `live_session` refusal (as the broker reports it). */
+	holder?: SessionOwnerHolderSummary;
 }
 
 export interface ControlResponse {
@@ -475,6 +482,17 @@ function errorResponse(id: string, row: Operation, error: unknown): ControlRespo
 			? ({ handoffDocument: candidate.handoffDocument } as ControlValue)
 			: undefined;
 	if (error instanceof BusyError) return failure(id, "busy", message, undefined, details);
+	// Under enforce a turn (or a later write) on a session another process now holds is refused
+	// with `SessionHeldError`. Remote clients get the broker's `live_session` outcome for a held
+	// session, with the same holder summary, not an opaque `internal`.
+	if (error instanceof SessionHeldError) {
+		const holder = sessionOwnerHolderSummary(error.holder);
+		return {
+			id,
+			ok: false,
+			error: { code: "live_session", message: error.operatorMessage, ...(holder ? { holder } : {}) },
+		};
+	}
 	if (code === "default_model_selection_recovery" && row.errorCodes.includes(code)) {
 		const recovery = parseDefaultModelSelectionRecovery(candidate.recovery) ?? {
 			message: DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { isRecord } from "@gajae-code/utils";
+import { type SessionOwnerHolderSummary, sessionOwnerHolderSummary } from "../../session/session-owner-holder";
 import {
 	resolvedScopeV1,
 	resolveScopeRequest,
@@ -365,6 +366,8 @@ export interface SessionLifecycleLookupFailure {
 export interface SessionLifecycleError {
 	readonly code: string;
 	readonly message: string;
+	/** The process that holds the session, when a resume was refused under `enforce` (`live_session`). */
+	readonly holder?: SessionOwnerHolderSummary;
 }
 
 export type SessionCreateFailure = {
@@ -1076,6 +1079,20 @@ function brokerErrorFromThrown(value: unknown): { code: string; message: string;
 	return { code, message, ...(requestSent === undefined ? {} : { requestSent }) };
 }
 
+/** The holder a broker refusal names, from a response or a thrown client error, checked field by field. */
+function brokerErrorHolder(value: unknown): SessionOwnerHolderSummary | undefined {
+	if (!isRecord(value)) return undefined;
+	const error = isRecord(value.error) ? value.error : isRecord(value.details) ? value.details : undefined;
+	return sessionOwnerHolderSummary(error?.holder);
+}
+
+function withHolder<T extends { readonly error: SessionLifecycleError }>(
+	outcome: T,
+	holder: SessionOwnerHolderSummary | undefined,
+): T {
+	return holder ? { ...outcome, error: { ...outcome.error, holder } } : outcome;
+}
+
 function unavailableScopedList(scope: SdkSearchResultV1["scope"]): SessionListFailure {
 	return {
 		ok: false,
@@ -1391,22 +1408,28 @@ export class SessionLifecycleService {
 		} catch (thrown) {
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
 			return error
-				? failure(
-						operation,
-						certaintyForThrownError(error),
-						operation === "session.revise" ? revisionErrorCode(error.code, normalizedTarget) : error.code,
-						operation === "session.revise" ? "lifecycle broker revision request failed" : error.message,
+				? withHolder(
+						failure(
+							operation,
+							certaintyForThrownError(error),
+							operation === "session.revise" ? revisionErrorCode(error.code, normalizedTarget) : error.code,
+							operation === "session.revise" ? "lifecycle broker revision request failed" : error.message,
+						),
+						brokerErrorHolder(thrown),
 					)
 				: failure(operation, "retryable", "unavailable", "lifecycle broker request was unavailable");
 		}
 
 		const error = brokerError(response);
 		if (error)
-			return failure(
-				operation,
-				certaintyForBrokerCode(error.code),
-				operation === "session.revise" ? revisionErrorCode(error.code, normalizedTarget) : error.code,
-				operation === "session.revise" ? "lifecycle broker revision request failed" : error.message,
+			return withHolder(
+				failure(
+					operation,
+					certaintyForBrokerCode(error.code),
+					operation === "session.revise" ? revisionErrorCode(error.code, normalizedTarget) : error.code,
+					operation === "session.revise" ? "lifecycle broker revision request failed" : error.message,
+				),
+				brokerErrorHolder(response),
 			);
 		if (operation === "session.revise") {
 			const parsed = revisionResult(brokerSuccess(response), normalizedTarget);

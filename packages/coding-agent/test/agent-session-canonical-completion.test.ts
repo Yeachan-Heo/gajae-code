@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
@@ -10,7 +11,7 @@ import { initializeLocalRoot } from "@gajae-code/coding-agent/internal-urls/loca
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir, withTimeout } from "@gajae-code/utils";
+import { logger, TempDir, withTimeout } from "@gajae-code/utils";
 
 function assistant(): AssistantMessage {
 	return {
@@ -54,7 +55,7 @@ describe("AgentSession canonical completion", () => {
 		onAuthRemoval?: () => void;
 		streamFn?: Agent["streamFn"];
 		tools?: AgentTool[];
-		sharedManaged?: boolean;
+		managed?: boolean;
 	}) {
 		tempDir = TempDir.createSync("@gjc-canonical-completion-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
@@ -68,7 +69,8 @@ describe("AgentSession canonical completion", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: options?.tools ?? [], messages: [] },
 			...(options?.streamFn ? { streamFn: options.streamFn, getApiKey: () => "test-key" } : {}),
 		});
-		const manager = options?.sharedManaged
+		const managed = options?.managed === true;
+		const manager = managed
 			? SessionManager.create(tempDir.path(), SessionManager.managedDestination(tempDir.path(), tempDir.path()))
 			: SessionManager.inMemory(tempDir.path());
 		const settings = Settings.isolated({
@@ -81,9 +83,8 @@ describe("AgentSession canonical completion", () => {
 			sessionManager: manager,
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
-			rootInteractiveSharedAppend: options?.sharedManaged === true,
 		});
-		if (options?.sharedManaged) {
+		if (managed) {
 			// A managed prompt resolves local:// synchronously; settle the real legacy
 			// migration gate before entering the accepted-prompt path.
 			await initializeLocalRoot({
@@ -96,92 +97,10 @@ describe("AgentSession canonical completion", () => {
 		return { agent, manager, session };
 	}
 
-	it("stops before provider on uncertain shared workflow admission without reappending", async () => {
-		let providerCalls = 0;
-		const mock = createMockModel({ handler: { content: ["unexpected provider call"] } });
-		const { manager, session } = await setup({
-			sharedManaged: true,
-			streamFn: (...args) => {
-				providerCalls++;
-				return mock.stream(...args);
-			},
-		});
-		const original = new Error("uncertain workflow publication");
-		const attempt = { kind: "unknown" as const, id: "attempted-custom-id", error: original };
-		const publication = Promise.withResolvers<typeof attempt>();
-		const enteredPublication = Promise.withResolvers<void>();
-		const shared = vi.spyOn(manager, "appendCustomEntrySharingSession").mockImplementation(() => {
-			enteredPublication.resolve();
-			return publication.promise;
-		});
-		const legacy = vi.spyOn(manager, "appendCustomEntry");
-		const prompt = session.prompt("second ordinary user prompt");
-		void prompt.catch(() => {});
-		let cleanupFailure: unknown;
-		try {
-			await withTimeout(enteredPublication.promise, 5_000, "Workflow publication was not requested");
-			expect(providerCalls).toBe(0);
-			publication.resolve(attempt);
-			await expect(withTimeout(prompt, 5_000, "Workflow admission did not settle")).rejects.toMatchObject({
-				message: expect.stringContaining(attempt.id),
-				cause: attempt,
-			});
-			expect(shared).toHaveBeenCalledTimes(1);
-			expect(legacy).not.toHaveBeenCalled();
-			expect(providerCalls).toBe(0);
-			expect(
-				manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
-			).toHaveLength(0);
-		} finally {
-			publication.resolve(attempt);
-			try {
-				await withTimeout(Promise.allSettled([prompt]), 5_000, "Workflow prompt cleanup did not settle");
-			} catch (error) {
-				cleanupFailure = error;
-			}
-		}
-		if (cleanupFailure !== undefined) throw cleanupFailure;
-	});
-
-	for (const failure of ["stale", "rejected", "acquisition"] as const) {
-		it(`does not run or retry a provider after ${failure} workflow publication`, async () => {
-			let providerCalls = 0;
-			const mock = createMockModel({ handler: { content: ["unexpected provider call"] } });
-			const { manager, session } = await setup({
-				sharedManaged: true,
-				streamFn: (...args) => {
-					providerCalls++;
-					return mock.stream(...args);
-				},
-			});
-			const original = new Error("original publication failure");
-			const append = vi.spyOn(manager, "appendCustomEntrySharingSession");
-			if (failure === "stale") append.mockResolvedValue({ kind: "stale", reason: "cursor_not_committed" });
-			else if (failure === "rejected") append.mockResolvedValue({ kind: "rejected", error: original });
-			else append.mockRejectedValue(original);
-			await expect(
-				withTimeout(session.prompt("ordinary workflow prompt"), 5_000, "Failure did not settle"),
-			).rejects.toMatchObject({
-				cause:
-					failure === "acquisition"
-						? original
-						: failure === "stale"
-							? { kind: "stale", reason: "cursor_not_committed" }
-							: { kind: "rejected", error: original },
-			});
-			expect(append).toHaveBeenCalledTimes(1);
-			expect(providerCalls).toBe(0);
-		});
-	}
-
 	for (const behavior of ["steer", "followUp"] as const) {
-		it(`publishes one busy ${behavior} workflow record before queueing, even when the run becomes idle`, async () => {
+		it(`records one busy ${behavior} workflow entry before queueing on a managed session`, async () => {
 			const entered = Promise.withResolvers<void>();
 			const releaseTool = Promise.withResolvers<void>();
-			const releasePublication = Promise.withResolvers<void>();
-			const enteredPublication = Promise.withResolvers<void>();
-			const queuedUser = Promise.withResolvers<void>();
-			const queuedAssistant = Promise.withResolvers<void>();
 			const mock = createMockModel({
 				responses: [
 					{ content: [{ type: "toolCall", id: "held-tool", name: "probe", arguments: {} }] },
@@ -200,61 +119,35 @@ describe("AgentSession canonical completion", () => {
 					return { content: [{ type: "text", text: "ok" }] };
 				},
 			};
-			const { agent, manager, session } = await setup({ sharedManaged: true, streamFn: mock.stream, tools: [tool] });
-			const unsubscribe = session.subscribe(event => {
-				if (event.type !== "message_end") return;
-				if (event.message.role === "user" && JSON.stringify(event.message.content).includes("busy queued input"))
-					queuedUser.resolve();
-				if (event.message.role === "assistant" && JSON.stringify(event.message.content).includes("queued complete"))
-					queuedAssistant.resolve();
-			});
+			const { agent, manager, session } = await setup({ managed: true, streamFn: mock.stream, tools: [tool] });
+			const workflowEntries = () =>
+				manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff");
 			let first: Promise<void> | undefined;
-			let queued: Promise<void> | undefined;
-			let cleanupFailure: unknown;
 			try {
 				first = session.prompt("first ordinary prompt");
 				void first.catch(() => {});
 				await withTimeout(entered.promise, 5_000, "First turn did not enter its tool");
-				const original = manager.appendCustomEntrySharingSession.bind(manager);
-				const shared = vi.spyOn(manager, "appendCustomEntrySharingSession").mockImplementation(async (...args) => {
-					enteredPublication.resolve();
-					await releasePublication.promise;
-					return original(...args);
-				});
-				queued = session.prompt("busy queued input", { streamingBehavior: behavior });
-				void queued.catch(() => {});
-				await withTimeout(enteredPublication.promise, 5_000, "Busy workflow publication was not requested");
-				expect(agent.hasQueuedMessages()).toBe(false);
-				expect(
-					manager
-						.getBranch()
-						.filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
-				).toHaveLength(1);
+				expect(workflowEntries()).toHaveLength(1);
+				await withTimeout(
+					session.prompt("busy queued input", { streamingBehavior: behavior }),
+					5_000,
+					"Busy submission was not accepted",
+				);
+				// The record is in the transcript before the input is queued behind the busy run.
+				expect(workflowEntries()).toHaveLength(2);
+				expect(agent.hasQueuedMessages()).toBe(true);
 				releaseTool.resolve();
 				await withTimeout(first, 5_000, "First turn did not become idle");
-				releasePublication.resolve();
-				await withTimeout(queued, 5_000, "Busy submission was not accepted");
-				await withTimeout(queuedUser.promise, 5_000, "Queued user message was not published");
-				await withTimeout(queuedAssistant.promise, 5_000, "Queued assistant did not complete");
-				await withTimeout(session.waitForIdle(), 5_000, "Queued turn did not become idle");
-				expect(mock.calls).toHaveLength(3);
-				expect(shared).toHaveBeenCalledTimes(1);
-				expect(
-					manager
-						.getBranch()
-						.filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
-				).toHaveLength(2);
+				await withTimeout(session.waitForIdle(), 5_000, "Queued input did not settle");
+				expect(workflowEntries()).toHaveLength(2);
 				const branch = manager.getBranch();
-				const custom = branch.findLast(
-					entry => entry.type === "custom" && entry.customType === "workflow-intent-diff",
-				);
+				const custom = workflowEntries().at(-1);
 				const user = branch.find(
 					entry =>
 						entry.type === "message" &&
 						entry.message.role === "user" &&
 						JSON.stringify(entry.message.content).includes("busy queued input"),
 				);
-				expect(custom?.type).toBe("custom");
 				expect(user?.type).toBe("message");
 				const byId = new Map(branch.map(entry => [entry.id, entry]));
 				let cursor = user?.parentId;
@@ -266,103 +159,8 @@ describe("AgentSession canonical completion", () => {
 				expect(ancestors.has(custom!.id)).toBe(true);
 			} finally {
 				releaseTool.resolve();
-				releasePublication.resolve();
-				unsubscribe();
-				try {
-					await withTimeout(
-						Promise.allSettled([first, queued].filter((run): run is Promise<void> => run !== undefined)),
-						5_000,
-						"Busy success prompt cleanup did not settle",
-					);
-				} catch (error) {
-					cleanupFailure = error;
-				}
+				if (first) await withTimeout(Promise.allSettled([first]), 5_000, "Busy prompt cleanup did not settle");
 			}
-			if (cleanupFailure !== undefined) throw cleanupFailure;
-		});
-	}
-
-	for (const failure of ["unknown", "stale", "rejected", "acquisition"] as const) {
-		it(`refuses busy input before queue/provider when shared workflow append is ${failure}`, async () => {
-			const entered = Promise.withResolvers<void>();
-			const releaseTool = Promise.withResolvers<void>();
-			const mock = createMockModel({
-				responses: [
-					{ content: [{ type: "toolCall", id: "held-tool", name: "probe", arguments: {} }] },
-					{ content: ["first complete"] },
-				],
-			});
-			const tool: AgentTool = {
-				name: "probe",
-				label: "Probe",
-				description: "Probe",
-				parameters: z.object({}),
-				execute: async () => {
-					entered.resolve();
-					await releaseTool.promise;
-					return { content: [{ type: "text", text: "ok" }] };
-				},
-			};
-			const { agent, manager, session } = await setup({ sharedManaged: true, streamFn: mock.stream, tools: [tool] });
-			const releasePublication = Promise.withResolvers<void>();
-			const enteredPublication = Promise.withResolvers<void>();
-			let first: Promise<void> | undefined;
-			let queued: Promise<void> | undefined;
-			let cleanupFailure: unknown;
-			try {
-				const firstRun = session.prompt("first ordinary prompt");
-				first = firstRun;
-				void firstRun.catch(() => {});
-				await withTimeout(entered.promise, 5_000, "First turn did not become busy");
-				const original = new Error("original busy publication failure");
-				const outcome =
-					failure === "unknown"
-						? { kind: "unknown" as const, id: "busy-attempt-id", error: original }
-						: failure === "stale"
-							? { kind: "stale" as const, reason: "cursor_not_committed" as const }
-							: { kind: "rejected" as const, error: original };
-				const shared = vi.spyOn(manager, "appendCustomEntrySharingSession").mockImplementation(async () => {
-					enteredPublication.resolve();
-					await releasePublication.promise;
-					if (failure === "acquisition") throw original;
-					return outcome;
-				});
-				const queuedRun = session.prompt("busy refused input", { streamingBehavior: "followUp" });
-				queued = queuedRun;
-				void queuedRun.catch(() => {});
-				await withTimeout(enteredPublication.promise, 5_000, "Busy publication did not start");
-				expect(agent.hasQueuedMessages()).toBe(false);
-				expect(mock.calls).toHaveLength(1);
-				releasePublication.resolve();
-				await expect(withTimeout(queuedRun, 5_000, "Busy refusal did not settle")).rejects.toMatchObject({
-					cause: failure === "acquisition" ? original : outcome,
-				});
-				expect(shared).toHaveBeenCalledTimes(1);
-				expect(agent.hasQueuedMessages()).toBe(false);
-				expect(mock.calls).toHaveLength(1);
-				releaseTool.resolve();
-				await withTimeout(firstRun, 5_000, "First turn did not settle");
-				await withTimeout(session.waitForIdle(), 5_000, "Session did not become idle");
-				expect(mock.calls).toHaveLength(2);
-				expect(
-					manager
-						.getBranch()
-						.filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
-				).toHaveLength(1);
-			} finally {
-				releasePublication.resolve();
-				releaseTool.resolve();
-				try {
-					await withTimeout(
-						Promise.allSettled([first, queued].filter((run): run is Promise<void> => run !== undefined)),
-						5_000,
-						"Busy failure prompt cleanup did not settle",
-					);
-				} catch (error) {
-					cleanupFailure = error;
-				}
-			}
-			if (cleanupFailure !== undefined) throw cleanupFailure;
 		});
 	}
 
@@ -377,8 +175,8 @@ describe("AgentSession canonical completion", () => {
 		).toHaveLength(1);
 	});
 
-	it("persists a custom message after a shared canonical append without leaving the shared path", async () => {
-		const { agent, manager, session } = await setup({ sharedManaged: true });
+	it("persists a custom message after a canonical append on a managed session", async () => {
+		const { agent, manager, session } = await setup({ managed: true });
 		const failures: unknown[] = [];
 		agent.emitExternalEvent({
 			type: "message_end",
@@ -454,6 +252,44 @@ describe("AgentSession canonical completion", () => {
 				.map(entry => entry.message.role),
 		).toEqual(["assistant"]);
 		expect(removed).toEqual(["removed"]);
+	});
+
+	it("finishes post-turn handling and keeps the Copilot credential when its invalidation cannot be written", async () => {
+		const { agent, manager, session } = await setup();
+		const warnings: string[] = [];
+		vi.spyOn(logger, "warn").mockImplementation((message: string) => {
+			warnings.push(message);
+		});
+		await authStorage!.set("github-copilot", { type: "api_key", key: "stale-copilot-token" });
+		const admin = new Database(path.join(tempDir!.path(), "auth.db"));
+		try {
+			admin.run(
+				"CREATE TRIGGER fail_disable BEFORE UPDATE OF disabled_cause ON auth_credentials WHEN NEW.disabled_cause IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disable rejected by test trigger'); END",
+			);
+		} finally {
+			admin.close();
+		}
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: { role: "user", content: "committed", timestamp: Date.now() },
+		});
+		const terminal = assistant();
+		agent.emitExternalEvent({ type: "message_end", message: terminal });
+		agent.emitExternalEvent({ type: "agent_end", messages: [terminal] });
+		await withTimeout(session.awaitSessionSettlement(), 5_000, "Failed Copilot invalidation blocked settlement");
+
+		// The failed invalidation is reported where it happens, and the agent_end handler
+		// continues past it instead of aborting the rest of post-turn handling.
+		expect(warnings).toContain("Failed to invalidate GitHub Copilot credentials after an auth failure");
+		expect(warnings).not.toContain("Agent event handler failed");
+		// The row is still active on disk, so memory keeps it as well.
+		expect(authStorage!.has("github-copilot")).toBe(true);
+		expect(
+			manager
+				.getBranch()
+				.filter(entry => entry.type === "message")
+				.map(entry => entry.message.role),
+		).toEqual(["user", "assistant"]);
 	});
 
 	it("joins its own pending admission, not only the already released predecessor", async () => {

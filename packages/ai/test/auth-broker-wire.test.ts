@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -482,6 +483,51 @@ describe("auth-broker wire surface", () => {
 		expect(afterResult.snapshot.credentials).toHaveLength(0);
 
 		await expect(client.refreshCredential(id)).rejects.toThrow();
+	});
+
+	test("POST /v1/credential/:id/disable answers 500, not 200 or 404, when the broker store cannot write", async () => {
+		const dbPath = path.join(tempDir, "read-only-broker.db");
+		const db = new Database(dbPath);
+		const localStore = new SqliteAuthCredentialStore(db);
+		localStore.saveOAuth("anthropic", mintOAuthCredential("ro", Date.now() + 60_000));
+		const localStorage = new AuthStorage(localStore);
+		await localStorage.reload();
+		const disabledEvents: string[] = [];
+		localStorage.onCredentialDisabled(event => {
+			disabledEvents.push(event.disabledCause);
+		});
+		const localToken = "read-only-bearer";
+		const localHandle = startAuthBroker({
+			storage: localStorage,
+			bind: "127.0.0.1:0",
+			bearerTokens: [localToken],
+			disableRefresher: true,
+		});
+		try {
+			const [entry] = localStorage.exportSnapshot().credentials;
+			if (!entry) throw new Error("expected credential");
+			expect(typeof entry.revision).toBe("number");
+			db.run("PRAGMA query_only = ON");
+			const disable = (body: Record<string, unknown>) =>
+				fetch(`${localHandle.url}/v1/credential/${entry.id}/disable`, {
+					method: "POST",
+					headers: { Authorization: `Bearer ${localToken}`, "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				});
+
+			const plain = await disable({ cause: "revoked by user" });
+			expect(plain.status).toBe(500);
+			const revisioned = await disable({ cause: "revoked by user", expectedRevision: entry.revision });
+			expect(revisioned.status).toBe(500);
+
+			expect(disabledEvents).toEqual([]);
+			expect(localStorage.exportSnapshot().credentials.map(row => row.id)).toEqual([entry.id]);
+			expect(localStore.listAuthCredentials("anthropic").map(row => row.id)).toEqual([entry.id]);
+		} finally {
+			await localHandle.close();
+			localStorage.close();
+			localStore.close();
+		}
 	});
 
 	test("Unknown route returns 404", async () => {

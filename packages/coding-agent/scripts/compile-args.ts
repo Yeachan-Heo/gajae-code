@@ -14,9 +14,12 @@ export const compileAutoloadDisableFlags = [
 	"--no-compile-autoload-package-json",
 ];
 
-const compiledDefineFlags = ['process.env.PI_COMPILED="true"'];
-const releaseDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="release"'];
-const devDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="dev"'];
+// `bun build --compile` inlines `process.env.NODE_ENV` as "development" when it is not
+// defined, which made every shipped binary run development/test-only branches. Keep it
+// a runtime read: `Bun.env` is not substituted, so the process environment decides.
+const compiledDefineFlags = ['process.env.PI_COMPILED="true"', "process.env.NODE_ENV=Bun.env.NODE_ENV"];
+export const releaseDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="release"'];
+export const devDefineFlags = [...compiledDefineFlags, 'process.env.GJC_BUILD_CHANNEL="dev"'];
 
 export const releaseEntrypoints = [
 	"./packages/coding-agent/src/cli.ts",

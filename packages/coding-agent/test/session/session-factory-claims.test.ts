@@ -5,25 +5,50 @@
  * file pins the rules they cannot see: sync factories, refusal-free outcomes, a fork's legacy
  * source, the successor claim before the artifact copy, and subagent and staged children.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
-import { getAgentDir } from "@gajae-code/utils";
+import { Container, getTerminalId, TUI } from "@gajae-code/tui";
+import { getAgentDir, getTerminalSessionsDir } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
+import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
 import type { Args } from "../../src/cli/args";
+import { deleteSessionPickerCandidate } from "../../src/cli/session-picker";
+import { ModelRegistry } from "../../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
-import { createSessionManager, operatorFacingSessionOpenMessage } from "../../src/main";
+import {
+	createSessionManager,
+	operatorFacingSessionOpenMessage,
+	SessionResumeCancelledError,
+	submitInteractiveInput,
+} from "../../src/main";
+import { type HeldSessionChoice, heldSessionWarningDialog } from "../../src/modes/components/session-held-warning";
+import { SelectorController } from "../../src/modes/controllers/selector-controller";
+import { initTheme } from "../../src/modes/theme/theme";
+import type { InteractiveModeContext } from "../../src/modes/types";
 import { createAgentSession, probeSessionOwners } from "../../src/sdk";
+import { AgentSession, type AgentSessionEvent } from "../../src/session/agent-session";
+import { AuthStorage } from "../../src/session/auth-storage";
 import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
-import { sessionClaimSetOf } from "../../src/session/internal/session-claim-set";
+import {
+	probeHeldSessions,
+	RECLAIM_BACKOFF_BASE_MS,
+	RECLAIM_HELD_FLOOR_MS,
+	sessionClaimSetOf,
+} from "../../src/session/internal/session-claim-set";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
+	claimSessionOwner,
 	inspectSessionOwners,
 	probeSessionOwner,
 	resetSessionOwnershipForTests,
 	SessionHeldError,
+	type SessionOwnerClaim,
 	type SessionOwnerLockBackend,
 	SessionOwnershipError,
 	SessionOwnershipTestHooks,
@@ -32,10 +57,13 @@ import {
 } from "../../src/session/session-ownership";
 import { liveSessionOwnershipMode, sessionOwnershipMode } from "../../src/session/session-ownership-mode";
 import { FileSessionStorage } from "../../src/session/session-storage";
+import { createAssistantMessage } from "../helpers/agent-session-setup";
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 const roots: string[] = [];
 const managers: SessionManager[] = [];
+
+beforeAll(() => initTheme());
 
 beforeEach(() => {
 	SessionOwnershipTestHooks.mode = "observe";
@@ -43,6 +71,9 @@ beforeEach(() => {
 
 afterEach(async () => {
 	try {
+		setSystemTime();
+		for (const session of turnSessions.splice(0)) await session.dispose();
+		for (const auth of authStores.splice(0)) auth.close();
 		for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
 		for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 	} finally {
@@ -484,11 +515,238 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		expect(operatorFacingSessionOpenMessage(new SessionHeldError(id, holder), { print: true })).toBe(
 			`error: session ${id.slice(0, 8)} is open for writing in another terminal (pid ${pid}).\nOnly one process can write a session at a time. Close it there, or continue in a copy:\n  gjc -p --fork ${id} "<message>"`,
 		);
-		// The SDK factory's gate: a manager whose rotation reached the held session (a rotation itself
-		// never refuses in 5a) is refused before createAgentSession's first write.
+		// A standalone rotation onto the held session is refused before it changes anything (design §1
+		// row 9): the manager stays on its own session.
 		const rotated = keep(SessionManager.create(place.cwd, place.destination));
+		const own = rotated.getSessionId();
+		await expect(rotated.setSessionFile(file)).rejects.toMatchObject({ code: "session_held", holder });
+		expect(rotated.getSessionId()).toBe(own);
+		// The SDK factory's gate: a manager whose rotation reached the held session while the live mode
+		// was lowered is refused before createAgentSession's first write once enforce is back.
+		SessionOwnershipTestHooks.mode = "observe";
 		await rotated.setSessionFile(file);
+		SessionOwnershipTestHooks.mode = "enforce";
 		await expect(createAgentSession({ sessionManager: rotated })).rejects.toMatchObject({ code: "session_held" });
+	});
+
+	it("a switch onto a held target is refused before any event; a free target opens and stays claimed (design §1 row 9)", async () => {
+		const place = await workspace();
+		const heldTarget = await committed(place);
+		const freeTarget = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const pid = await holdInAnotherProcess(heldTarget.id);
+		const events: string[] = [];
+		const { session } = await createAgentSession({
+			cwd: place.cwd,
+			agentDir: path.join(place.root, "agent"),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => {
+						events.push("session_before_switch");
+					});
+				},
+			],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		});
+		try {
+			const own = session.sessionManager.getSessionId();
+			await expect(session.switchSession(heldTarget.file)).rejects.toMatchObject({
+				code: "session_held",
+				holder: { surface: "terminal", pid },
+			});
+			expect(events).toEqual([]);
+			expect(session.sessionManager.getSessionId()).toBe(own);
+			// A free target opens; its admission claim is gone once the switch's own claim holds it.
+			expect(await session.switchSession(freeTarget.file)).toBe(true);
+			expect(events).toEqual(["session_before_switch"]);
+			expect(session.sessionManager.getSessionId()).toBe(freeTarget.id);
+			expect(sessionClaimSetOf(session.sessionManager).sessionIds).toEqual([freeTarget.id]);
+		} finally {
+			await session.dispose();
+		}
+		expect((await probeSessionOwners([freeTarget.id])).get(freeTarget.id)).toEqual({ state: "free" });
+	});
+
+	it("picker star and delete of a session another process holds are refused; observe writes as before (design §1 row 17)", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		const agentDir = path.join(place.root, "agent");
+		const row = async () => {
+			const found = (await SessionManager.listManagedForResumePickerReadOnly(place.cwd, agentDir)).find(
+				session => session.id === id,
+			);
+			if (!found) throw new Error("the session is not listed");
+			return found;
+		};
+		const starred = async () => (await row()).starred === true;
+		SessionOwnershipTestHooks.mode = "enforce";
+		const tui = keep(SessionManager.create(place.cwd, place.destination));
+		const pid = await holdInAnotherProcess(id);
+		const before = await tree(place.root);
+		const held = `it is open in another terminal (pid ${pid}).`;
+		// The bare `--resume` picker and the in-TUI `/resume` picker.
+		await expect(
+			SessionManager.setSessionStarredForPicker(await row(), true, undefined, { surface: "terminal" }),
+		).rejects.toThrow(`Can't star this session: ${held}`);
+		await expect(deleteSessionPickerCandidate(file)).rejects.toThrow(`Can't delete this session: ${held}`);
+		// The `--session-dir` delete claims the id its header names.
+		await expect(SessionManager.deleteExplicitCandidate(file, { surface: "terminal" })).rejects.toThrow(
+			`Can't delete this session: ${held}`,
+		);
+		await expect(tui.setSessionStarredForPicker(await row(), true)).rejects.toThrow(
+			`Can't star this session: ${held}`,
+		);
+		await expect(tui.dropSession(file)).rejects.toThrow(`Can't delete this session: ${held}`);
+		// An in-memory TUI's manager claims nothing itself, but its picker still writes other sessions' files.
+		const memory = keep(SessionManager.inMemory(place.cwd));
+		await expect(memory.setSessionStarredForPicker(await row(), true)).rejects.toThrow(
+			`Can't star this session: ${held}`,
+		);
+		expect(await tree(place.root)).toEqual(before);
+		expect((await inspectSessionOwners()).held.filter(sidecar => sidecar.self && sidecar.sessionId === id)).toEqual(
+			[],
+		);
+		// Observe: the write goes ahead as on dev, and the conflict is counted.
+		SessionOwnershipTestHooks.mode = "observe";
+		const conflicts = sessionOwnershipCounters().claim_conflict;
+		await SessionManager.setSessionStarredForPicker(await row(), true, undefined, { surface: "terminal" });
+		expect(await starred()).toBe(true);
+		expect(sessionOwnershipCounters().claim_conflict).toBe(conflicts + 1);
+		// The holder quits: a session this process holds is its own, so its picker writes go ahead.
+		for (const child of holders.splice(0)) {
+			child.kill("SIGKILL");
+			await child.exited;
+		}
+		SessionOwnershipTestHooks.mode = "enforce";
+		const own = keep(await SessionManager.open(file, place.destination));
+		await own.setSessionStarredForPicker(await row(), false);
+		expect(await starred()).toBe(false);
+		await own.dropSession(file);
+		expect(await Bun.file(file).exists()).toBe(false);
+		expect(own.getSessionId()).not.toBe(id);
+		expect(await state(id)).toBe("free");
+	});
+
+	it("observe adds no await: the switch admission and the held probes return undefined at once, even for a held session", async () => {
+		const place = await workspace();
+		const target = await committed(place);
+		await holdInAnotherProcess(target.id);
+		const manager = keep(SessionManager.create(place.cwd, place.destination));
+		const observe = { surface: "terminal" as const, mode: "observe" as const };
+		expect(manager.switchTargetAdmission(target.file)).toBeUndefined();
+		expect(SessionManager.probeHeldTranscript(target.file, observe)).toBeUndefined();
+		expect(probeHeldSessions(observe, [target.id])).toBeUndefined();
+		// The same calls under enforce see the holder.
+		SessionOwnershipTestHooks.mode = "enforce";
+		await expect(
+			SessionManager.probeHeldTranscript(target.file, { ...observe, mode: "enforce" }),
+		).resolves.toBeInstanceOf(SessionHeldError);
+	});
+
+	it("/resume Fork whose switch a hook cancels deletes the copy; breadcrumb, session and source stay as they were", async () => {
+		const place = await workspace();
+		const source = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		await holdInAnotherProcess(source.id);
+		// A terminal id, whatever runs the test: tmux and a stdin TTY take precedence over kitty's id,
+		// so clear tmux's and read the breadcrumb path back from the same resolver gjc uses.
+		const terminalEnv = ["TMUX", "TMUX_PANE", "KITTY_WINDOW_ID"].map(key => [key, process.env[key]] as const);
+		const restoreTerminalEnv = () => {
+			for (const [key, value] of terminalEnv) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		};
+		delete process.env.TMUX;
+		delete process.env.TMUX_PANE;
+		process.env.KITTY_WINDOW_ID = "held-fork-test";
+		const terminal = getTerminalId();
+		const breadcrumb = terminal && path.join(getTerminalSessionsDir(), terminal);
+		if (!breadcrumb) {
+			restoreTerminalEnv();
+			throw new Error("expected a terminal id");
+		}
+		const previousBreadcrumb = (await Bun.file(breadcrumb).exists()) ? await Bun.file(breadcrumb).text() : undefined;
+		const { session } = await createAgentSession({
+			cwd: place.cwd,
+			agentDir: path.join(place.root, "agent"),
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			extensions: [
+				api => {
+					api.on("session_before_switch", async () => ({ cancel: true }));
+				},
+			],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		}).catch(error => {
+			restoreTerminalEnv();
+			throw error;
+		});
+		const ui = new TUI(new VirtualTerminal(80, 12));
+		try {
+			session.sessionManager.appendMessage(user("own"));
+			await session.sessionManager.ensureOnDisk();
+			await session.sessionManager.flush();
+			await Bun.write(breadcrumb, "before\n");
+			const own = session.sessionManager.getSessionId();
+			const sourceBytes = await Bun.file(source.file).bytes();
+			const transcripts = async () =>
+				(await fs.readdir(path.dirname(source.file))).filter(name => name.endsWith(".jsonl")).sort();
+			const before = await transcripts();
+			const statuses: string[] = [];
+			const fork = heldSessionWarningDialog(new SessionHeldError(source.id)).options[0];
+			const context = {
+				ui,
+				statusContainer: new Container(),
+				pendingMessagesContainer: new Container(),
+				compactionQueuedMessages: [],
+				pendingTools: new Map(),
+				session,
+				sessionManager: session.sessionManager,
+				settings: { get: () => undefined, getAgentDir },
+				showHookSelector: async () => fork,
+				showStatus: (message: string) => statuses.push(message),
+				resetIrcSidebarSession: () => {},
+				resetAssistantTextPresentation: () => {},
+				updateEditorBorderColor: () => {},
+				rebuildInitialMessages: () => {},
+				reloadTodos: async () => undefined,
+			} as unknown as InteractiveModeContext;
+			const controller = new SelectorController(context);
+			await controller.handleResumeSession(source.file);
+
+			expect(await transcripts()).toEqual(before);
+			expect(await Bun.file(breadcrumb).text()).toBe("before\n");
+			expect(session.sessionManager.getSessionId()).toBe(own);
+			expect(await Bun.file(source.file).bytes()).toEqual(sourceBytes);
+			expect(statuses).not.toContain("Resumed session");
+			// The guard was released: a second /resume runs (and its copy goes the same way).
+			await controller.handleResumeSession(source.file);
+			expect(statuses).not.toContain("Resume already in progress");
+			expect(await transcripts()).toEqual(before);
+		} finally {
+			ui.stop();
+			restoreTerminalEnv();
+			if (previousBreadcrumb === undefined) await fs.rm(breadcrumb, { force: true });
+			else await Bun.write(breadcrumb, previousBreadcrumb);
+			await session.dispose();
+		}
 	});
 
 	it("a failed claim refuses too, but a fork reads a source it cannot claim in place", async () => {
@@ -561,6 +819,56 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		const args = {} as Args;
 		const auto = keep((await createSessionManager(args, place.cwd, settings, "print", print))!);
 		expect([auto.getSessionId() === newest.id, args.continue, notices.length]).toEqual([false, undefined, 2]);
+	});
+
+	it.each([
+		"id",
+		"path",
+	] as const)("an interactive --resume <%s> of a held session warns before the folder question: Fork copies it, Cancel opens nothing (design §1 row 1)", async form => {
+		const place = await workspace();
+		const settings = Settings.isolated();
+		// The session belongs to another folder, so a free one would get the y/N fork question first.
+		const elsewhere = path.join(place.root, "elsewhere");
+		await fs.mkdir(elsewhere);
+		const destination = SessionManager.managedDestination(elsewhere, settings.getAgentDir());
+		if (destination.kind !== "managed") throw new Error("expected a managed destination");
+		const source = await committed({ ...place, cwd: elsewhere, destination });
+		SessionOwnershipTestHooks.mode = "enforce";
+		const pid = await holdInAnotherProcess(source.id);
+		const bytes = await Bun.file(source.file).bytes();
+		const warned: (number | undefined)[] = [];
+		const forked: string[] = [];
+		const tui = (choice: HeldSessionChoice) => ({
+			interactive: true,
+			notice: () => {},
+			held: {
+				choose: async (error: SessionHeldError) => {
+					warned.push(error.holder?.pid);
+					return choice;
+				},
+				forked: (message: string) => forked.push(message),
+			},
+		});
+		const resume = () => ({ resume: form === "id" ? source.id : source.file }) as Args;
+		await expect(
+			createSessionManager(resume(), place.cwd, settings, "terminal", tui("cancel")),
+		).rejects.toBeInstanceOf(SessionResumeCancelledError);
+		const copy = keep((await createSessionManager(resume(), place.cwd, settings, "terminal", tui("fork")))!);
+		expect([copy.getSessionId() === source.id, copy.getHeader()?.parentSession, copy.getCwd()]).toEqual([
+			false,
+			source.id,
+			place.cwd,
+		]);
+		expect(warned).toEqual([pid, pid]);
+		expect(forked).toEqual([`Forked into a new session. The original stays with another terminal (pid ${pid}).`]);
+		expect(await Bun.file(source.file).bytes()).toEqual(bytes);
+		// Without a terminal to ask on, the open itself refuses, as in 5a.
+		await expect(
+			createSessionManager({ resume: source.file } as Args, place.cwd, settings, "terminal", {
+				interactive: true,
+				notice: () => {},
+			}),
+		).rejects.toMatchObject({ code: "session_held", holder: { pid } });
 	});
 
 	it("continueRecent skips a held bounded candidate it could not continue, and stops at one it could", async () => {
@@ -652,10 +960,11 @@ describe.if(supported)("enforce refusals (5a)", () => {
 			throw new Error("expected no config.yml in the isolated agent directory");
 		// A refusal's reread never changes the mode later factories read once.
 		resetSettingsForTest();
-		expect(sessionOwnershipMode()).toBe("observe");
+		// No config.yml: the default mode, which the factory then keeps.
+		expect(sessionOwnershipMode()).toBe("enforce");
 		await Bun.write(processConfig, "session:\n  ownership:\n    mode: off\n");
 		expect(liveSessionOwnershipMode()).toBe("off");
-		expect(sessionOwnershipMode()).toBe("observe");
+		expect(sessionOwnershipMode()).toBe("enforce");
 		expect(await decisions(processConfig)).toEqual(expected);
 		// With process settings (the TUI, -p): their agent directory's file, read again past their cache.
 		const agentDir = path.join(place.root, "agent");
@@ -733,3 +1042,583 @@ describe.if(supported)("enforce refusals (5a)", () => {
 		}
 	});
 });
+
+const turnSessions: AgentSession[] = [];
+const authStores: AuthStorage[] = [];
+
+/** An AgentSession on `manager` whose model answers every turn, counting the turns that reach it. */
+async function turnSession(manager: SessionManager) {
+	const auth = await AuthStorage.create(path.join(roots.at(-1)!, `auth-${authStores.length}.db`));
+	authStores.push(auth);
+	auth.setRuntimeApiKey("anthropic", "test-key");
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("expected a bundled model");
+	let turns = 0;
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+		streamFn: () => {
+			turns += 1;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = { ...createAssistantMessage("ok"), timestamp: Date.now() };
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		},
+	});
+	const session = new AgentSession({
+		agent,
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: new ModelRegistry(auth, path.join(roots.at(-1)!, "models.yml")),
+	});
+	turnSessions.push(session);
+	const notices: string[] = [];
+	session.subscribe((event: AgentSessionEvent) => {
+		if (event.type === "notice" && event.source === "session-ownership") notices.push(event.message);
+	});
+	return { session, notices, turns: () => turns };
+}
+
+/** The native locks, except that every claim times out while `stall.on` is set. */
+function stallingLocks(stall: { on: boolean }): SessionOwnerLockBackend {
+	return {
+		tryAcquire: (sidecar, timeoutMs) =>
+			stall.on
+				? Promise.resolve({ status: FileLockAcquireStatus.TimedOut, code: "timed_out" })
+				: tryAcquireFileLock(sidecar, timeoutMs),
+		probe: probeFileLock,
+	};
+}
+
+async function stopHolder(): Promise<void> {
+	const child = holders.at(-1);
+	if (!child) throw new Error("no holder to stop");
+	child.kill("SIGKILL");
+	await child.exited;
+}
+
+const ownedHere = async (sessionId: string) =>
+	(await inspectSessionOwners()).held.some(sidecar => sidecar.sessionId === sessionId && sidecar.self);
+
+// Design §2.7 and §13.1 (timeout-latch policy): turn start re-attempts a claim the open did not take.
+describe.if(supported)("turn start re-attempts the current session's claim", () => {
+	it("observe: a session held at open runs unclaimed; once the holder exits, the next turn after the backoff claims it", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		await holdInAnotherProcess(id);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const claims = sessionClaimSetOf(manager);
+		expect(await claims.settled()).toBe("held");
+		const conflicts = sessionOwnershipCounters().claim_conflict;
+		const { session, turns } = await turnSession(manager);
+
+		// Past the open's backoff the turn re-attempts in the background; the same outcome again is not
+		// counted again, so the counters count the open, not the turns.
+		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
+		await session.prompt("while held");
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([1, "held", false]);
+		expect(sessionOwnershipCounters().claim_conflict).toBe(conflicts);
+		await stopHolder();
+		// Within the backoff no lock call is made: the turn runs unclaimed, as observe never refuses.
+		await session.prompt("inside the backoff");
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([2, "held", false]);
+		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
+		await session.prompt("after the holder exited");
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([3, "claimed", true]);
+		expect(await fs.readFile(file, "utf8")).toContain("after the holder exited");
+	});
+
+	it("observe: a turn never waits on a stalled lock; the re-attempt runs beside it and claims once the lock recovers", async () => {
+		const place = await workspace();
+		const { id, file } = await committed(place);
+		const STALL_MS = 1_500;
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				if (!stall.on) return tryAcquireFileLock(sidecar, timeoutMs);
+				await Bun.sleep(STALL_MS);
+				return { status: FileLockAcquireStatus.TimedOut, code: "timed_out" };
+			},
+			probe: probeFileLock,
+		};
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const claims = sessionClaimSetOf(manager);
+		expect(await claims.settled()).toBe("none");
+		const failOpen = sessionOwnershipCounters().fail_open;
+		const { session, turns } = await turnSession(manager);
+
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		const started = performance.now();
+		await session.prompt("beside a stall");
+		expect(performance.now() - started).toBeLessThan(STALL_MS - 500);
+		expect(turns()).toBe(1);
+		expect(await claims.settled()).toBe("none");
+		expect(sessionOwnershipCounters().fail_open).toBe(failOpen);
+		stall.on = false;
+		setSystemTime(Date.now() + 2 * RECLAIM_BACKOFF_BASE_MS + 1);
+		await session.prompt("after the stall");
+		expect([turns(), await claims.settled(), await ownedHere(id)]).toEqual([2, "claimed", true]);
+	});
+
+	it("enforce: a claim that timed out at open leaves claims on; the turn runs with a notice, and a later turn claims", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		expect(await sessionClaimSetOf(manager).settled()).toBe("none");
+		const { session, notices, turns } = await turnSession(manager);
+
+		const failOpen = sessionOwnershipCounters().fail_open;
+
+		// The open's own timeout seeds the backoff: the first turn does not stall on the lock again.
+		await session.prompt("right after the open");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([1, 0, false]);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await session.prompt("while stalled");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([2, 1, false]);
+		expect(sessionOwnershipCounters().fail_open).toBe(failOpen);
+		stall.on = false;
+		await session.prompt("inside the backoff");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([3, 1, false]);
+		// A re-attempt that fails is refused as at open, at every turn: no backoff lets a turn through.
+		SessionOwnershipTestHooks.lockBackend = failingFor(id);
+		setSystemTime(Date.now() + 2 * RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("failed")).rejects.toBeInstanceOf(SessionOwnershipError);
+		await expect(session.prompt("failed again")).rejects.toBeInstanceOf(SessionOwnershipError);
+		expect(turns()).toBe(3);
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		await session.prompt("after the stall");
+		expect([turns(), notices.length, await ownedHere(id)]).toEqual([4, 1, true]);
+	});
+
+	it("enforce: a turn that starts while a re-attempt is in flight waits for it, then refuses the held outcome", async () => {
+		const place = await workspace();
+		const { file } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = stallingLocks({ on: true });
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const { session, turns } = await turnSession(manager);
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let attempts = 0;
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async () => {
+				attempts += 1;
+				entered.resolve();
+				await gate.promise;
+				return { status: FileLockAcquireStatus.Held };
+			},
+			probe: probeFileLock,
+		};
+		try {
+			// Another re-attempt, started before the turn: the turn must join it, not start its own.
+			setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+			const inFlight = sessionClaimSetOf(manager).reclaimCurrent();
+			await entered.promise;
+			let settled = false;
+			const turn = session.prompt("joins the re-attempt").finally(() => {
+				settled = true;
+			});
+			turn.catch(() => undefined);
+			await Bun.sleep(50);
+			expect([settled, turns(), attempts]).toEqual([false, 0, 1]);
+			gate.resolve();
+			await expect(turn).rejects.toBeInstanceOf(SessionHeldError);
+			expect((await inFlight)?.refusal).toBeInstanceOf(SessionHeldError);
+			expect([turns(), attempts]).toEqual([0, 1]);
+		} finally {
+			gate.resolve();
+		}
+	});
+
+	it("enforce: a turn on a session another process now holds is refused before it writes, and the TUI shows the held warning", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const { session, turns } = await turnSession(manager);
+		stall.on = false;
+		// Unclaimed after the stall, so another process could claim it.
+		const pid = await holdInAnotherProcess(id);
+		const before = await fs.readFile(file);
+
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("refused")).rejects.toMatchObject({
+			code: "session_held",
+			holder: { surface: "terminal", pid },
+		});
+		expect(turns()).toBe(0);
+		expect(await fs.readFile(file)).toEqual(before);
+		// The turn gate found the holder; the write path enforces it for writers outside a turn.
+		let written: unknown;
+		try {
+			manager.appendCustomEntry("reclaim-test", { note: "outside a turn" });
+		} catch (error) {
+			written = error;
+		}
+		expect(written).toBeInstanceOf(SessionHeldError);
+		// A refused header patch (a rename, an auto-title) is undone in memory too, so no later rewrite
+		// writes it.
+		const name = manager.getSessionName();
+		await expect(manager.setSessionName("renamed while held", "user")).rejects.toBeInstanceOf(SessionHeldError);
+		expect([manager.getSessionName(), manager.getHeader()?.title]).toEqual([name, name]);
+		expect(await fs.readFile(file)).toEqual(before);
+		// A held session is checked at every turn (no backoff), and the TUI routes the refusal.
+		const refused: unknown[] = [];
+		const errors: string[] = [];
+		await submitInteractiveInput(
+			{
+				markPendingSubmissionStarted: () => true,
+				finishPendingSubmission: () => {},
+				showError: message => errors.push(message),
+				checkShutdownRequested: async () => {},
+				waitForAgentEnd: () => ({ promise: Promise.withResolvers<void>().promise, dispose: () => {} }),
+				handleRefusedSessionTurn: error => refused.push(error),
+			},
+			session,
+			{ text: "refused again", cancelled: false, started: false },
+		);
+		expect([refused.length, refused[0] instanceof SessionHeldError, errors, turns()]).toEqual([1, true, [], 0]);
+
+		// The TUI's warning is /resume's flow for the session's own file, Fork and Cancel only; Cancel
+		// keeps the session here, unsent.
+		const heldWarning = await resumeOwnFile(session, manager, file, "cancel");
+		expect([heldWarning.offered, heldWarning.status, manager.getSessionId()]).toEqual([2, "Not sent", id]);
+		expect(await fs.readFile(file)).toEqual(before);
+
+		// The holder gone, the next enforce turn claims (no backoff), and the write gate lifts.
+		await stopHolder();
+		await session.prompt("after the holder exited");
+		expect([turns(), await ownedHere(id)]).toEqual([1, true]);
+		manager.appendCustomEntry("reclaim-test", { note: "claimed now" });
+		await manager.flush();
+		expect(await fs.readFile(file, "utf8")).toContain("claimed now");
+	});
+
+	it("enforce: header patches queued together leave memory matching the transcript in every order, refused or with the gate lifting between them", async () => {
+		/** The header as the transcript records it: the header line with its patches applied. */
+		const diskHeader = async (file: string) => {
+			const records = (await fs.readFile(file, "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			const header = { ...records[0] } as { title?: string; titleSource?: string; starred?: boolean };
+			for (const record of records)
+				if (record.type === "header_patch") Object.assign(header, record.patch as object);
+			return { title: header.title, titleSource: header.titleSource, starred: header.starred === true };
+		};
+		const memoryHeader = (manager: SessionManager) => {
+			const header = manager.getHeader();
+			expect(manager.getSessionName()).toBe(header?.title);
+			return { title: header?.title, titleSource: header?.titleSource, starred: manager.isSessionStarred() };
+		};
+		const settle = () => Bun.sleep(10);
+		// Each order queues its patches while the first waits (a title waits on its hook; star-first patches
+		// are queued back to back), and with `liftAt` the gate lifts at that write.
+		const orders: {
+			readonly name: string;
+			readonly liftAt: number;
+			readonly run: (manager: SessionManager, releaseTitle: () => void) => Promise<unknown>[];
+		}[] = [
+			{
+				name: "title then star",
+				liftAt: 2,
+				run: (manager, release) => {
+					const title = manager.setSessionName("queued title", "user");
+					return [
+						title,
+						settle().then(() => manager.setSessionStarred(true)),
+						settle().then(settle).then(release),
+					];
+				},
+			},
+			{
+				name: "star then title",
+				liftAt: 2,
+				run: (manager, release) => {
+					release();
+					return [manager.setSessionStarred(true), manager.setSessionName("queued title", "user")];
+				},
+			},
+			{
+				name: "star, star, star (true, false, true) behind a held title",
+				liftAt: 3,
+				run: (manager, release) => {
+					const blocker = manager.setSessionName("queued title", "user");
+					const stars = (async () => {
+						const outcomes: unknown[] = [];
+						for (const starred of [true, false, true]) {
+							await settle();
+							outcomes.push(manager.setSessionStarred(starred).catch(error => error));
+						}
+						await settle();
+						release();
+						return Promise.all(outcomes);
+					})();
+					return [blocker, stars];
+				},
+			},
+		];
+		try {
+			for (const order of orders) {
+				for (const lift of [false, true]) {
+					const place = await workspace();
+					const { file, id } = await committed(place);
+					SessionOwnershipTestHooks.mode = "enforce";
+					const stall = { on: true };
+					SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+					const manager = keep(await SessionManager.open(file, place.destination));
+					const { session } = await turnSession(manager);
+					stall.on = false;
+					await holdInAnotherProcess(id);
+					setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+					await expect(session.prompt("refused")).rejects.toBeInstanceOf(SessionHeldError);
+					const before = memoryHeader(manager);
+					expect(await diskHeader(file)).toEqual(before);
+					let lifted: SessionOwnerClaim | undefined;
+					if (lift) {
+						await stopHolder();
+						const taken = await claimSessionOwner(id, { surface: "terminal" });
+						if (taken.status !== "claimed") throw new Error(`expected a claim, got ${taken.status}`);
+						lifted = taken.claim;
+					}
+					const titleWaits = Promise.withResolvers<void>();
+					SessionManagerTestHooks.beforeTitlePatchPersistence = () => titleWaits.promise;
+					let fences = 0;
+					SessionManagerTestHooks.beforePersistPatchFence = () => {
+						fences += 1;
+						if (fences === order.liftAt && lifted) sessionClaimSetOf(manager).add(lifted);
+					};
+					await Promise.allSettled(order.run(manager, () => titleWaits.resolve()));
+					const memory = memoryHeader(manager);
+					expect({ order: order.name, lift, disk: await diskHeader(file) }).toEqual({
+						order: order.name,
+						lift,
+						disk: memory,
+					});
+					if (!lift) expect({ order: order.name, memory }).toEqual({ order: order.name, memory: before });
+					lifted?.release();
+					delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+					delete SessionManagerTestHooks.beforePersistPatchFence;
+				}
+			}
+		} finally {
+			delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+			delete SessionManagerTestHooks.beforePersistPatchFence;
+		}
+	});
+
+	it("enforce: a legacy-starred header upgraded for a star that is then refused stays unstarred, and a later title writes no star", async () => {
+		const place = await workspace();
+		const directory = path.join(place.root, "explicit");
+		const destination = SessionManager.explicitDestination(directory);
+		SessionOwnershipTestHooks.mode = "off";
+		const seed = SessionManager.create(place.cwd, destination);
+		seed.appendMessage(user("question"));
+		await seed.ensureOnDisk();
+		await seed.flush();
+		const file = seed.getSessionFile()!;
+		const id = seed.getSessionId();
+		await seed.close();
+		// A legacy header: `starred` in the header line, no star patch version.
+		const lines = (await fs.readFile(file, "utf8")).split("\n");
+		const legacy = JSON.parse(lines[0]) as Record<string, unknown>;
+		delete legacy.starredPatchVersion;
+		legacy.starred = true;
+		lines[0] = JSON.stringify(legacy);
+		await Bun.write(file, lines.join("\n"));
+		SessionOwnershipTestHooks.mode = "enforce";
+		SessionOwnershipTestHooks.lockBackend = stallingLocks({ on: true });
+		const manager = keep(await SessionManager.open(file, destination));
+		const claims = sessionClaimSetOf(manager);
+		await manager.setSessionName("first title", "user");
+		try {
+			// The star's upgrade rewrites the file without the legacy `starred`; then the star patch itself
+			// meets a held session.
+			SessionManagerTestHooks.beforePersistPatchFence = () => claims.noteOutcome(id, { status: "held" });
+			await expect(manager.setSessionStarred(true)).rejects.toBeInstanceOf(SessionHeldError);
+		} finally {
+			delete SessionManagerTestHooks.beforePersistPatchFence;
+		}
+		expect([manager.isSessionStarred(), manager.getHeader()?.starred]).toEqual([false, undefined]);
+		expect((await transcriptHeader(file)).starred).toBe(false);
+		// The gate lifts; the next title's star companion comes from what the transcript holds.
+		claims.noteOutcome(id, { status: "none", skipped: "timed_out" });
+		await manager.setSessionName("second title", "user");
+		await manager.flush();
+		expect(await transcriptHeader(file)).toMatchObject({ title: "second title", starred: false });
+		expect(manager.isSessionStarred()).toBe(false);
+	});
+
+	it("a write failure on the first of queued star toggles leaves the last one's value, then the transcript's", async () => {
+		// No ownership here: the latched write failure keeps close() from releasing a claim.
+		for (const sequence of [
+			[true, false, true],
+			[true, false],
+		]) {
+			const place = await workspace();
+			const { file } = await committed(place);
+			SessionOwnershipTestHooks.mode = "off";
+			const manager = keep(await SessionManager.open(file, place.destination));
+			const titleWaits = Promise.withResolvers<void>();
+			let fences = 0;
+			let atFirstFailure: boolean | undefined;
+			SessionManagerTestHooks.beforeTitlePatchPersistence = () => titleWaits.promise;
+			SessionManagerTestHooks.beforePersistPatchFence = () => {
+				fences += 1;
+				if (fences === 2) throw new Error("injected write failure");
+			};
+			try {
+				const blocker = manager.setSessionName("blocker", "user");
+				const toggles: Promise<unknown>[] = [];
+				for (const starred of sequence) {
+					await Bun.sleep(10);
+					const toggle = manager.setSessionStarred(starred);
+					if (toggles.length === 0)
+						toggle.catch(() => {
+							atFirstFailure = manager.isSessionStarred();
+						});
+					toggles.push(toggle);
+				}
+				await Bun.sleep(10);
+				titleWaits.resolve();
+				const outcomes = await Promise.allSettled([blocker, ...toggles]);
+				const expected: string[] = ["fulfilled", ...sequence.map(() => "rejected")];
+				expect(outcomes.map(outcome => outcome.status as string)).toEqual(expected);
+			} finally {
+				delete SessionManagerTestHooks.beforeTitlePatchPersistence;
+				delete SessionManagerTestHooks.beforePersistPatchFence;
+			}
+			// The first's failure left the last toggle's value; every toggle failed, so memory ends where
+			// the transcript is.
+			expect({ sequence, atFirstFailure }).toEqual({ sequence, atFirstFailure: sequence.at(-1) });
+			expect({ sequence, starred: manager.isSessionStarred() }).toEqual({
+				sequence,
+				starred: (await transcriptHeader(file)).starred,
+			});
+		}
+	});
+
+	it("enforce: Fork from a refused turn continues in a copy and leaves the original to its holder", async () => {
+		const place = await workspace();
+		const { file, id } = await committed(place);
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, place.destination));
+		const { session, turns } = await turnSession(manager);
+		stall.on = false;
+		await holdInAnotherProcess(id);
+		const before = await fs.readFile(file);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("refused")).rejects.toBeInstanceOf(SessionHeldError);
+
+		expect((await resumeOwnFile(session, manager, file, "fork")).offered).toBe(2);
+		const forkId = manager.getSessionId();
+		expect(forkId).not.toBe(id);
+		await session.prompt("in the fork");
+		expect([turns(), await ownedHere(forkId), await ownedHere(id)]).toEqual([1, true, false]);
+		expect(await fs.readFile(file)).toEqual(before);
+	});
+
+	it("enforce: an append through an already-open transcript writer is refused once another process holds the session", async () => {
+		const place = await workspace();
+		const directory = path.join(place.root, "explicit");
+		const destination = SessionManager.explicitDestination(directory);
+		SessionOwnershipTestHooks.mode = "off";
+		const seed = SessionManager.create(place.cwd, destination);
+		seed.appendMessage(user("question"));
+		await seed.ensureOnDisk();
+		await seed.flush();
+		const file = seed.getSessionFile()!;
+		const id = seed.getSessionId();
+		await seed.close();
+		SessionOwnershipTestHooks.mode = "enforce";
+		const stall = { on: true };
+		SessionOwnershipTestHooks.lockBackend = stallingLocks(stall);
+		const manager = keep(await SessionManager.open(file, destination));
+		const { session, turns } = await turnSession(manager);
+		// The unclaimed turn after the stalled open opens the transcript writer.
+		await session.prompt("opens the writer");
+		await manager.flush();
+		expect(turns()).toBe(1);
+		stall.on = false;
+		const pid = await holdInAnotherProcess(id);
+		setSystemTime(Date.now() + RECLAIM_BACKOFF_BASE_MS + 1);
+		await expect(session.prompt("refused")).rejects.toMatchObject({ code: "session_held", holder: { pid } });
+		const before = await fs.readFile(file);
+		let written: unknown;
+		try {
+			manager.appendCustomEntry("reclaim-test", { note: "through the open writer" });
+		} catch (error) {
+			written = error;
+		}
+		expect(written).toBeInstanceOf(SessionHeldError);
+		await manager.flush();
+		expect(await fs.readFile(file)).toEqual(before);
+
+		// A refused write re-attempts in the background, so once the holder exits the gate lifts
+		// without a turn.
+		await stopHolder();
+		setSystemTime(Date.now() + RECLAIM_HELD_FLOOR_MS + 1);
+		expect(() => manager.appendCustomEntry("reclaim-test", { note: "stale held" })).toThrow();
+		await Bun.sleep(0);
+		expect(await sessionClaimSetOf(manager).settled()).toBe("claimed");
+		manager.appendCustomEntry("reclaim-test", { note: "after the gate lifted" });
+		await manager.flush();
+		expect(await fs.readFile(file, "utf8")).toContain("after the gate lifted");
+	});
+});
+
+/** The header as a transcript records it: the header line with its header patches applied. */
+async function transcriptHeader(file: string) {
+	const records = (await fs.readFile(file, "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as Record<string, unknown>);
+	const header = { ...records[0] } as { title?: string; titleSource?: string; starred?: boolean };
+	for (const record of records) if (record.type === "header_patch") Object.assign(header, record.patch as object);
+	return { title: header.title, titleSource: header.titleSource, starred: header.starred === true };
+}
+
+/** `/resume`'s flow for the session's own file, choosing Fork or Cancel on the held-session warning. */
+async function resumeOwnFile(session: AgentSession, manager: SessionManager, file: string, choice: "fork" | "cancel") {
+	let offered = 0;
+	let status: string | undefined;
+	const ui = new TUI(new VirtualTerminal(80, 12));
+	try {
+		const controller = new SelectorController({
+			ui,
+			statusContainer: new Container(),
+			pendingMessagesContainer: new Container(),
+			compactionQueuedMessages: [],
+			pendingTools: new Map(),
+			session,
+			sessionManager: manager,
+			settings: { get: () => undefined, getAgentDir },
+			showHookSelector: async (_title: string, options: string[]) => {
+				offered = options.length;
+				return choice === "fork" ? options[0] : options.at(-1);
+			},
+			showStatus: (message: string) => {
+				status = message;
+			},
+			resetIrcSidebarSession: () => {},
+			resetAssistantTextPresentation: () => {},
+			updateEditorBorderColor: () => {},
+			rebuildInitialMessages: () => {},
+			reloadTodos: async () => undefined,
+		} as unknown as InteractiveModeContext);
+		await controller.handleResumeSession(file, { cancelledStatus: "Not sent", continueHere: false });
+	} finally {
+		ui.stop();
+	}
+	return { offered, status };
+}

@@ -564,12 +564,22 @@ export interface AuthCredentialStore {
 		organizationId: string,
 		organizationName: string,
 	): AuthCredential | undefined;
+	/**
+	 * Soft-deletes row `id`; a no-op for an already-disabled row. Throws when the write fails. A remote store always
+	 * throws: it is read-only on the client.
+	 */
 	deleteAuthCredential(id: number, disabledCause: string): void;
+	/**
+	 * Local stores return `false` only when no active row matched and throw when the write fails. A remote store
+	 * cannot disable synchronously and always returns `false`; callers reach the broker via `disableAuthCredentialRemote`.
+	 */
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
+	/** Returns `false` only when no active row matched; throws when the write fails. Absent on remote stores. */
 	tryDisableAuthCredentialIfRevision?(id: number, expectedRevision: number, disabledCause: string): boolean;
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[];
 	upsertAuthCredentialForProvider(provider: string, credential: AuthCredential): StoredAuthCredential[];
 	upsertAuthCredentialForProviderIfAbsent(provider: string, credential: AuthCredential): AuthCredentialIfAbsentResult;
+	/** Soft-deletes every active row of `provider`. Throws when the write fails; a remote store always throws. */
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
@@ -3242,17 +3252,23 @@ export class AuthStorage {
 			else kept.push(entry);
 		}
 		if (removed.length === 0) return kept;
+		// A remote store's snapshot is the broker's truth and its synchronous delete can only throw: the broker owns
+		// deduplication, so this client keeps the rows as served instead of failing (and warning) on every reload.
+		if (this.#store.disableAuthCredentialRemote) return entries;
+		// A duplicate whose delete failed is still active on disk, so it stays in memory too: this process never
+		// publishes a pruned view that a reload would contradict.
+		const stillActive = new Set<number>();
 		for (const entry of removed) {
-			this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
-		}
-		const stillActive = this.#credentialsStillActive(provider, removed);
-		if (stillActive.size > 0) {
-			// The store swallows delete failures. A duplicate that is still active on disk stays in memory too, so this
-			// process never publishes a pruned view that a reload would contradict.
-			logger.warn("Deduplicated credentials are still active in the store; keeping them", {
-				provider,
-				credentialIds: [...stillActive],
-			});
+			try {
+				this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
+			} catch (error) {
+				stillActive.add(entry.id);
+				logger.warn("Could not retire a deduplicated credential; keeping it", {
+					provider,
+					credentialId: entry.id,
+					error: String(error),
+				});
+			}
 		}
 		const pruned = removed.filter(entry => !stillActive.has(entry.id));
 		if (pruned.length === 0) return entries;
@@ -3260,21 +3276,6 @@ export class AuthStorage {
 		this.#clearSelectorsForRemovedCredential(provider, prunedIds, entries);
 		this.#resetProviderAssignments(provider);
 		return stillActive.size > 0 ? entries.filter(entry => !prunedIds.has(entry.id)) : kept;
-	}
-
-	/**
-	 * Ids of `removed` rows the local store still lists as active after their deletion was requested. A remote snapshot
-	 * store applies deletions asynchronously, so it is not checked; a failed read keeps every row.
-	 */
-	#credentialsStillActive(provider: string, removed: readonly StoredCredential[]): Set<number> {
-		if (this.#store.refreshSnapshot) return new Set();
-		try {
-			const active = new Set(this.#store.listAuthCredentials(provider).map(entry => entry.id));
-			return new Set(removed.filter(entry => active.has(entry.id)).map(entry => entry.id));
-		} catch (error) {
-			logger.warn("Could not confirm the deletion of deduplicated credentials", { provider, error: String(error) });
-			return new Set(removed.map(entry => entry.id));
-		}
 	}
 
 	/** Returns all credentials for a provider as an array */
@@ -4022,7 +4023,8 @@ export class AuthStorage {
 	/**
 	 * Soft-deletes a row by id, bypassing the data-equality CAS. Only safe when the
 	 * caller has confirmed the row still holds the credential it attempted to
-	 * refresh, so no peer rotation can be clobbered.
+	 * refresh, so no peer rotation can be clobbered. The store write runs first:
+	 * when it throws, memory, selectors, and listeners are left untouched.
 	 */
 	#disableCredentialById(provider: string, credentialId: number, disabledCause: string): void {
 		this.#store.deleteAuthCredential(credentialId, disabledCause);
@@ -4258,6 +4260,7 @@ export class AuthStorage {
 
 	/**
 	 * Remove credential for a provider.
+	 * Throws when the store write fails; memory is cleared only after it succeeds.
 	 */
 	async remove(provider: string): Promise<void> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
@@ -4303,6 +4306,7 @@ export class AuthStorage {
 		return false;
 	}
 
+	/** Returns `false` for a lost revision check or an unknown row; throws when the store write fails. */
 	disableCredentialByIdIfRevision(id: number, expectedRevision: number, disabledCause: string): boolean {
 		const cause = normalizeDisabledCause(disabledCause);
 		if (this.#store.tryDisableAuthCredentialIfRevision?.(id, expectedRevision, cause) !== true) return false;
@@ -7441,13 +7445,31 @@ export class AuthStorage {
 				// Use a CAS-style disable conditioned on the row still containing the stale credential
 				// we tried to refresh, so a peer rotation that lands between the pre-check above and
 				// this disable doesn't soft-delete the freshly-rotated row.
-				const disabled = this.#tryDisableCredentialAtIfMatches(
-					provider,
-					selection.index,
-					selection.credential,
-					`oauth refresh failed: ${errorMsg}`,
-					attemptedCredentialId,
-				);
+				let disabled: boolean;
+				try {
+					disabled = this.#tryDisableCredentialAtIfMatches(
+						provider,
+						selection.index,
+						selection.credential,
+						`oauth refresh failed: ${errorMsg}`,
+						attemptedCredentialId,
+					);
+				} catch (disableError) {
+					// A failed store write is not a lost CAS: the row is still active on disk,
+					// so keep it in memory and surface the original authentication failure.
+					logger.warn("OAuth refresh disable failed in the store", {
+						provider,
+						credentialId: attemptedCredentialId,
+						error: String(disableError),
+					});
+					if (sessionSelector && sessionId) {
+						this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
+					}
+					// Keep other sessions in this process off the revoked credential until a
+					// later disable succeeds.
+					this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
+					throw error;
+				}
 				if (sessionSelector && sessionId) {
 					this.markSessionCredentialUnavailable(sessionId, provider, sessionSelector);
 				}
@@ -7502,7 +7524,19 @@ export class AuthStorage {
 								throw error;
 							}
 						} else {
-							this.#disableCredentialById(provider, attemptedCredentialId, disabledCause);
+							try {
+								this.#disableCredentialById(provider, attemptedCredentialId, disabledCause);
+							} catch (disableError) {
+								// Same contract as the remote branch: the store write failed, the row
+								// stays active and in memory, and the original failure is reported.
+								logger.warn("OAuth refresh disable by id failed in the store", {
+									provider,
+									credentialId: attemptedCredentialId,
+									error: String(disableError),
+								});
+								this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
+								throw error;
+							}
 						}
 					} else {
 						logger.debug("OAuth refresh disable lost CAS; reloading after peer rotation", {
@@ -8168,6 +8202,9 @@ export class AuthStorage {
 	 * Disable the credential with the given id and emit a
 	 * {@link CredentialDisabledEvent}. Used by the auth-broker server to honour
 	 * `POST /v1/credential/:id/disable`. Returns `false` when no such row exists.
+	 * Throws when the store write fails; memory, selectors, and listeners are
+	 * updated only after it succeeds. A row a peer already disabled on disk is
+	 * left as the peer wrote it and is dropped from memory (returns `true`).
 	 */
 	disableCredentialById(id: number, disabledCause: string): boolean {
 		const cause = normalizeDisabledCause(disabledCause);
@@ -8531,7 +8568,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
 		this.#deleteStmt = this.#prepareOwnedStatement(
-			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
+			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND disabled_cause IS NULL`,
 		);
 		this.#deleteIfMatchesStmt = this.#prepareOwnedStatement(
 			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
@@ -9310,48 +9347,41 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		return update.immediate();
 	}
 
+	/**
+	 * Soft-deletes one row. Throws when the write fails, so no caller treats a row
+	 * that is still active on disk as disabled. A row that is already disabled is
+	 * left unchanged (it keeps its first `disabled_cause` and revision), and the
+	 * call still succeeds because the row is not active.
+	 */
 	deleteAuthCredential(id: number, disabledCause: string): void {
-		try {
-			this.#deleteStmt.run(normalizeDisabledCause(disabledCause), id);
-		} catch {
-			// Ignore delete failures
-		}
+		this.#deleteStmt.run(normalizeDisabledCause(disabledCause), id);
 	}
 
 	/**
 	 * CAS-style disable: only soft-deletes the row when its `data` column still
 	 * matches `expectedData` and the row has not already been disabled. Used by
 	 * the OAuth refresh-failure path to avoid clobbering a peer that rotated the
-	 * row between our pre-check and the disable.
+	 * row between our pre-check and the disable. Returns `false` only when no row
+	 * matched the predicate; a failed write throws.
 	 */
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean {
-		try {
-			const result = this.#deleteIfMatchesStmt.run(normalizeDisabledCause(disabledCause), id, expectedData) as {
-				changes: number;
-			};
-			return result.changes === 1;
-		} catch {
-			return false;
-		}
+		const result = this.#deleteIfMatchesStmt.run(normalizeDisabledCause(disabledCause), id, expectedData) as {
+			changes: number;
+		};
+		return result.changes === 1;
 	}
 
+	/** Revision-checked disable. Returns `false` only when no row matched; a failed write throws. */
 	tryDisableAuthCredentialIfRevision(id: number, expectedRevision: number, disabledCause: string): boolean {
-		try {
-			const result = this.#deleteIfRevisionStmt.run(normalizeDisabledCause(disabledCause), id, expectedRevision) as {
-				changes: number;
-			};
-			return result.changes === 1;
-		} catch {
-			return false;
-		}
+		const result = this.#deleteIfRevisionStmt.run(normalizeDisabledCause(disabledCause), id, expectedRevision) as {
+			changes: number;
+		};
+		return result.changes === 1;
 	}
 
+	/** Soft-deletes every active row of a provider. Throws when the write fails. */
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void {
-		try {
-			this.#deleteByProviderStmt.run(normalizeDisabledCause(disabledCause), provider);
-		} catch {
-			// Ignore delete failures
-		}
+		this.#deleteByProviderStmt.run(normalizeDisabledCause(disabledCause), provider);
 	}
 
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null {

@@ -22,11 +22,13 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
+	type ResolvedApiKey,
 	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	streamSimple,
 	type ToolResultMessage,
 } from "@gajae-code/ai/core";
+import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 import type { Component } from "@gajae-code/tui";
 import {
 	$flag,
@@ -5631,7 +5633,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		const resolvedCredentialScopes = new Map<string, string | undefined>();
-		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<string> => {
+		const resolveAgentApiKey = async (provider: string, signal?: AbortSignal): Promise<ResolvedApiKey> => {
 			const liveModel = resolveLiveSessionApiKeyModel(sessionAgent?.state.model, model, provider);
 			const hasExplicitScopePolicy =
 				modelRegistry.authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
@@ -5645,7 +5647,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				signal,
 			);
 			resolvedCredentialScopes.set(provider, resolution.credentialSessionId);
-			return resolution.apiKey;
+			return resolution.credentialRowId === undefined
+				? { apiKey: resolution.apiKey }
+				: { apiKey: resolution.apiKey, credentialId: resolution.credentialRowId };
 		};
 		const resolvedCredentialType = (provider: string): "api_key" | "oauth" | undefined => {
 			const scope = resolvedCredentialScopes.has(provider)
@@ -5704,8 +5708,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
-				const startProviderStream = (providerOptions: SimpleStreamOptions) =>
-					streamSimple(streamModel, context, {
+				// Detach the shared model before any deferred work. A registry lookup renders
+				// its generated `Authorization` into the model object it resolves against, so a
+				// concurrent lookup on this session's model must not rewrite the header of a
+				// request that already resolved its own credential.
+				const requestClone = {
+					...streamModel,
+					headers: modelRegistry.getRequestHeaders(streamModel, streamOptions?.apiKey),
+				};
+				// Preserve catalog trust across the detach so first-party adapters keep
+				// their safety-stop authority. An untrusted model stays on the plain clone.
+				const requestModel = registerFinalizedModelClone(streamModel, requestClone) ?? requestClone;
+				const startProviderStream = (providerOptions: SimpleStreamOptions) => {
+					// An observer or gateway can supply the key actually dispatched, so the final
+					// provider-local model materializes its headers from that key. `streamSimple`'s
+					// internal 401 retry reuses this exact object, which is what lets `onAuthError`
+					// refresh its headers in place before handing back the replacement credential.
+					const providerClone = {
+						...requestModel,
+						headers: modelRegistry.getRequestHeaders(requestModel, providerOptions.apiKey),
+					};
+					const providerModel = registerFinalizedModelClone(requestModel, providerClone) ?? providerClone;
+					return streamSimple(providerModel, context, {
 						...providerOptions,
 						onAuthError: async (provider, oldKey, error) => {
 							const resolvedScope = resolvedCredentialScopes.has(provider)
@@ -5720,7 +5744,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							const replacementApiKey = await resolveAgentApiKey(provider, streamOptions?.signal);
+							const replacement = await resolveAgentApiKey(provider, streamOptions?.signal);
 							if (
 								!isStableSessionApiKeyCredentialType(
 									streamOptions?.authCredentialType,
@@ -5729,14 +5753,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							) {
 								return undefined;
 							}
-							return replacementApiKey;
+							// The retry re-dispatches this same model object, so its generated header must
+							// follow the replacement row. streamSimple permits one auth replacement on
+							// this object; an outer backoff re-enters streamFn with fresh request models.
+							providerModel.headers = modelRegistry.getRequestHeaders(providerModel, replacement.apiKey);
+							return replacement;
 						},
 					});
+				};
 				try {
 					// The session captures the exact dispatched request and the terminal result so /btw can
 					// extend the main provider prefix; the returned stream is the provider's own stream.
 					stream = session
-						? await session.observeMainProviderStream(streamModel, context, streamOptions, startProviderStream)
+						? await session.observeMainProviderStream(requestModel, context, streamOptions, startProviderStream)
 						: await startProviderStream(streamOptions ?? {});
 				} catch (error) {
 					const prewarm = await runtimeServices.networkPrewarm.get("first-request");
@@ -5961,8 +5990,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		session = new AgentSession({
 			agent,
-			rootInteractiveSharedAppend:
-				primaryControlSurface === "cli" && options.hasUI === true && !isCanonicalSubSession,
 			thinkingLevel,
 			sessionManager,
 			settings,

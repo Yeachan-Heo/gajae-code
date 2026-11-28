@@ -1,18 +1,13 @@
 /**
  * Regression coverage for #8015: `/resume` inside a root interactive TUI session.
  *
- * The shared-publication bars are latched per SessionManager instance and keyed by
- * session id, and they are never cleared. A TUI keeps one manager across `/new` and
- * `/resume` (`AgentSession.switchSession` -> `SessionManager.setSessionFile`), so a
- * session that published through canonical shared append is still barred when the same
- * manager loads it again. A fresh manager from `openExistingStrict` has no bars, which
- * is why a fresh-open test cannot reproduce the failure.
- *
+ * A TUI keeps one manager across `/new` and `/resume` (`AgentSession.switchSession` ->
+ * `SessionManager.setSessionFile`), so the same manager loads a session it already wrote.
  * Loading a transcript sanitizes stale OpenAI Responses replay metadata. On a managed
- * destination that sanitation is resident-only, so it must not need shared admission
- * and must not change the transcript.
+ * destination that sanitation is resident-only, so it must not change the transcript,
+ * and the resumed session keeps accepting ordinary turns.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
@@ -62,6 +57,7 @@ interface Fixture {
 }
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	const failures: unknown[] = [];
 	const cleanup: Array<() => unknown> = [
 		...sessions.splice(0).map(session => () => session.dispose()),
@@ -167,8 +163,6 @@ async function fixture(): Promise<Fixture> {
 		settings,
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
-		// Mirrors sdk/session.ts for a trusted root interactive CLI TUI session (#7711).
-		rootInteractiveSharedAppend: true,
 	});
 	sessions.push(session);
 	await manager.flush();
@@ -183,30 +177,28 @@ function expectSanitized(manager: SessionManager, staleId: string): void {
 	expect(entry.message.content[0]).not.toHaveProperty("thinkingSignature", "stale-signature");
 }
 
-/** An ordinary root TUI turn: the canonical message publishes through shared append and latches the bars. */
+/** An ordinary root TUI turn: the canonical message lands in the transcript. */
 async function canonicalMessage(f: Fixture, text: string): Promise<void> {
 	f.session.agent.emitExternalEvent({ type: "message_end", message: user(text) });
 	await f.session.awaitSessionSettlement();
+	await f.manager.flush();
 	expect(f.manager.getLeafEntry()).toMatchObject({ type: "message", message: { role: "user", content: text } });
 	expect(await Bun.file(f.file).text()).toContain(JSON.stringify(text));
 }
 
-describe("#8015 /resume of a shared root TUI session with stale OpenAI Responses replay metadata", () => {
+describe("#8015 /resume of a root TUI session with stale OpenAI Responses replay metadata", () => {
 	it("resumes the predecessor after /new on the same manager without writing to its transcript", async () => {
 		const f = await fixture();
 		const sessionId = f.session.sessionId;
-		await canonicalMessage(f, "first shared turn");
-		expect(f.manager.requiresSharedMutationAdmission()).toBe(true);
+		await canonicalMessage(f, "first turn");
 		const before = await fs.readFile(f.file);
 		expect(before.toString()).toContain("openaiResponsesHistory");
 
 		expect(await f.session.newSession()).toBe(true);
 		expect(f.session.sessionId).not.toBe(sessionId);
-		// The bars for the predecessor id survive the transition on this manager.
 		expect(await f.session.switchSession(f.file)).toBe(true);
 
 		expect(f.session.sessionId).toBe(sessionId);
-		expect(f.manager.requiresSharedMutationAdmission()).toBe(true);
 		expectSanitized(f.manager, f.staleId);
 		// The agent context rebuilt by the switch carries the sanitized replay entry.
 		const replayed = f.session.agent.state.messages.find(message => message.role === "assistant");
@@ -215,14 +207,13 @@ describe("#8015 /resume of a shared root TUI session with stale OpenAI Responses
 		expect(await fs.readFile(f.file)).toEqual(before);
 		expect((await fs.readFile(f.file)).toString()).not.toContain('"entry_patch"');
 
-		// The resumed session keeps publishing through shared append.
+		// The resumed session keeps accepting ordinary turns.
 		await canonicalMessage(f, "turn after resume");
 	});
 
-	it("reloads the current shared session in place without writing to its transcript", async () => {
+	it("reloads the current session in place without writing to its transcript", async () => {
 		const f = await fixture();
-		await canonicalMessage(f, "first shared turn");
-		expect(f.manager.requiresSharedMutationAdmission()).toBe(true);
+		await canonicalMessage(f, "first turn");
 		const before = await fs.readFile(f.file);
 
 		expect(await f.session.switchSession(f.file)).toBe(true);

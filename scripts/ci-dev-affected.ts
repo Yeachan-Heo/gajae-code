@@ -244,6 +244,11 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	// mapping misses its Linux-only regressions on lifecycle changes (#6145 review).
 	"packages/coding-agent/src/sdk/broker/lifecycle.ts": ["packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts"],
 	"packages/coding-agent/src/session/session-ownership.ts": [SESSION_OWNER_ATTACH_TEST],
+	// The holder text and SessionHeldError moved out of session-ownership.ts; keep the suites that cover them.
+	"packages/coding-agent/src/session/session-owner-holder.ts": [
+		SESSION_OWNER_ATTACH_TEST,
+		"packages/coding-agent/test/session/session-ownership.test.ts",
+	],
 	"packages/coding-agent/src/session/session-ownership-mode.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/session/session-owners-layout.ts": [SESSION_OWNER_ATTACH_TEST],
 	"packages/coding-agent/src/session/internal/session-claim-set.ts": [SESSION_OWNER_ATTACH_TEST],
@@ -294,6 +299,8 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
+	// Keep the absence guard scheduled for deletion or isolated resurrection.
+	"scripts/release-simplified.ts": ["scripts/release-policy.test.ts"],
 	"scripts/test-preload.ts": ["scripts/test-home-isolation.test.ts"],
 	"scripts/test-home-isolation.ts": ["scripts/test-home-isolation.test.ts"],
 	"scripts/test-home-isolation.test.ts": ["scripts/test-home-isolation.test.ts"],

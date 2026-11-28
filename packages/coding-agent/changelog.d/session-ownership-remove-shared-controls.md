@@ -1,0 +1,3 @@
+### Removed
+
+- SDK embedders: `AgentSession` no longer has `usesSharedControlPublication()`, `withModelProfilePublication()`, `appendModelProfileActivationForControl()`, `publishCommittedModelProfileSessionState()` or `setConfiguredModelChainForControl()`, and the `auto_compaction_end` event no longer has a `publicationError` field. `config/model-profile-activation` no longer exports `ModelProfilePublicationError`, `buildModelProfileTranscriptPlan` or `CommittedModelProfileSessionPublication`. These served the removed shared-publication path, which no session uses since every session writes its transcript directly.

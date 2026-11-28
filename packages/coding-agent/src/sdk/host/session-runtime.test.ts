@@ -40,6 +40,7 @@ import type {
 	ClientBridgePermissionToolCall,
 } from "../../session/client-bridge";
 import { SessionManager } from "../../session/session-manager";
+import { SessionHeldError } from "../../session/session-owner-holder";
 import {
 	registerOwnedRegistration,
 	resetTerminalAbortRegistriesForTests,
@@ -10567,6 +10568,47 @@ describe("post-acceptance invocation terminalization", () => {
 			const rejectedPage = status.result as { commandId?: unknown; turnId?: unknown };
 			expect(rejectedPage.commandId).toEqual(expect.any(String));
 			expect(rejectedPage.turnId).toEqual(expect.any(String));
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a turn refused because another process holds the session answers live_session with the holder", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-held-"));
+		try {
+			const refusal = new SessionHeldError("held-session-1", {
+				surface: "terminal",
+				pid: 4242,
+				host: "build-box",
+				gjcVersion: "0.0.0",
+			});
+			const harness = await invocationHarness("terminalize-held", cwd, {
+				sendUserMessage: async () => {
+					throw refusal;
+				},
+			});
+			// The response a remote client (ACP, `gjc sdk`) reads: the broker's held-session code and
+			// holder summary (surface and pid only), never `internal`.
+			expect(await harness.control("turn.prompt", { text: "hello", clientRef: "held-ref" })).toMatchObject({
+				ok: false,
+				error: {
+					code: "live_session",
+					message: refusal.operatorMessage,
+					holder: { surface: "terminal", pid: 4242 },
+				},
+			});
+			const rejected = await harness.control("turn.prompt", { text: "again", clientRef: "held-ref-2" });
+			expect(Object.keys(rejected.error as object).sort()).toEqual(["code", "holder", "message"]);
+			expect((rejected.error as { holder?: object }).holder).toEqual({ surface: "terminal", pid: 4242 });
+			// The submission status agrees with the response.
+			const status = await harness.query("turn.prompt_status", { clientRef: "held-ref" });
+			expect(status.result as Record<string, unknown>).toMatchObject({
+				status: "failed",
+				receiptState: "missing",
+				error: { code: "live_session" },
+			});
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);

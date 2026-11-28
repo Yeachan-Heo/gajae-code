@@ -7,7 +7,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { FileLockAcquireStatus, FileLockProbeState } from "@gajae-code/natives";
+import { FileLockAcquireStatus, FileLockProbeState, probeFileLock, tryAcquireFileLock } from "@gajae-code/natives";
 import {
 	SessionClaimSet,
 	SessionWriteWithoutClaimError,
@@ -361,6 +361,36 @@ describe.if(supported)("claim-set guards and the rotating methods' settle", () =
 		expect(late.released).toBe(true);
 		expect(await held("after-close")).toBe(false);
 		expect(claims.sessionIds).toEqual([]);
+	});
+
+	it("a re-attempt that lands after the manager left its session releases it and records no claim", async () => {
+		SessionOwnershipTestHooks.mode = "enforce";
+		const gate = Promise.withResolvers<void>();
+		SessionOwnershipTestHooks.lockBackend = {
+			tryAcquire: async (sidecar, timeoutMs) => {
+				await gate.promise;
+				return tryAcquireFileLock(sidecar, timeoutMs);
+			},
+			probe: probeFileLock,
+		};
+		const set = new SessionClaimSet();
+		try {
+			set.bind("left-a");
+			// Enforce re-attempts a held session at every turn, with no backoff.
+			set.noteOutcome("left-a", { status: "held" });
+			const reclaim = set.reclaimCurrent();
+			set.bind("current-b");
+			gate.resolve();
+			expect(await reclaim).toEqual({ status: "none" });
+			expect(await held("left-a")).toBe(false);
+			set.bind("left-a");
+			expect(await set.settled()).toBeUndefined();
+		} finally {
+			gate.resolve();
+			set.releaseAll();
+			delete SessionOwnershipTestHooks.mode;
+			delete SessionOwnershipTestHooks.lockBackend;
+		}
 	});
 
 	it("setSessionFile settles on its own: the predecessor is released once the switch returns", async () => {

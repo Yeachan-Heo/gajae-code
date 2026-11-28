@@ -206,6 +206,33 @@ describe("streamPiNative request shape", () => {
 		expect(body.options.maxTokens).toBe(1024);
 	});
 
+	it("never sends a local stored-credential row id to the gateway", async () => {
+		const captured: { body?: string } = {};
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			captured.body = init?.body as string;
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+		const priorTurn = baseAssistant({ content: [{ type: "text", text: "earlier answer" }], credentialId: 5 });
+		const context: Context = {
+			...baseContext,
+			messages: [...baseContext.messages, priorTurn, { role: "user", content: "next", timestamp: 1 }],
+		};
+
+		await streamPiNative(fakeModel(), context, { apiKey: "gw-bearer", fetch: fetchImpl, credentialId: 7 }).result();
+
+		expect(captured.body).toBeDefined();
+		expect(captured.body).not.toContain("credentialId");
+		const body = JSON.parse(captured.body as string) as { context: Context };
+		expect(body.context.messages).toHaveLength(3);
+		expect(body.context.messages[1]).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "earlier answer" }],
+		});
+		// The caller's history is not mutated.
+		expect(priorTurn.credentialId).toBe(5);
+		expect(context.messages[1]).toBe(priorTurn);
+	});
+
 	it("normalizes trailing slashes on `baseUrl` so the endpoint never double-slashes", async () => {
 		const captured: { url?: string } = {};
 		const fetchImpl: FetchImpl = (async (input, _init) => {

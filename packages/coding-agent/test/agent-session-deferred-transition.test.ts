@@ -9,15 +9,13 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
-import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 
-// A `!`/`$` result recorded while a turn streams is deferred and published through the
-// shared lease when the turn ends. A transition that leaves the session (`/new`,
-// `/resume`) must land those results once in the session they were recorded in, even
-// while a peer holds the lease, and never in its successor.
+// A `!`/`$` result recorded while a turn streams is deferred and saved when the turn ends.
+// A transition that leaves the session (`/new`, `/resume`, fork, branch, handoff, tree
+// navigation) must land those results once in the session they were recorded in, and
+// never in its successor.
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -48,12 +46,12 @@ const shellResult = (output: string) => ({
 });
 
 /**
- * A root interactive shared-append session whose model replies to a turn after
- * `replyDelayMs`. `ownerShutdown` adds the agent id and owned async job manager that
- * `createAgentSession` installs, which routes `/new` through its owner-shutdown branch.
+ * A managed session whose model replies to a turn after `replyDelayMs`. `ownerShutdown` adds
+ * the agent id and owned async job manager that `createAgentSession` installs, which routes
+ * `/new` through its owner-shutdown branch.
  */
 async function fixture(replyDelayMs: number, ownerShutdown: boolean) {
-	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-abort-deferred-"));
+	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-deferred-transition-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
@@ -96,7 +94,6 @@ async function fixture(replyDelayMs: number, ownerShutdown: boolean) {
 		sessionManager: manager,
 		settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: true,
 		...(ownerShutdown
 			? {
 					agentId: "deferred-transition",
@@ -110,49 +107,6 @@ async function fixture(replyDelayMs: number, ownerShutdown: boolean) {
 	return { session, manager };
 }
 
-/**
- * When the first deferred command result starts publishing, take the session's real
- * transaction lock as a peer writer would, so the publication waits inside the lease.
- */
-function contendLeaseOnFirstDeferredResult(manager: SessionManager) {
-	const append = manager.appendMessageSharingSession.bind(manager);
-	const attempts = new Map<string, number>();
-	const contended = Promise.withResolvers<void>();
-	const release = Promise.withResolvers<void>();
-	let held: Promise<void> | undefined;
-	vi.spyOn(manager, "appendMessageSharingSession").mockImplementation(async message => {
-		if (message.role === "pythonExecution") {
-			attempts.set(message.code, (attempts.get(message.code) ?? 0) + 1);
-			// The peer's lease refuses this kind outright.
-			if (message.code === "refused") return { kind: "rejected", error: new Error("lease refused") };
-		}
-		if (message.role === "bashExecution" && !held) {
-			const acquired = Promise.withResolvers<void>();
-			held = withManagedSessionTransaction(
-				{
-					locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(manager.getSessionFile()!)),
-					sessionId: manager.getSessionId(),
-				},
-				async () => {
-					acquired.resolve();
-					await release.promise;
-				},
-			);
-			await acquired.promise;
-			contended.resolve();
-		}
-		return append(message);
-	});
-	return {
-		attempts,
-		contended: contended.promise,
-		release: async () => {
-			release.resolve();
-			await held;
-		},
-	};
-}
-
 async function until(predicate: () => boolean, label: string): Promise<void> {
 	const deadline = Date.now() + 5_000;
 	while (!predicate()) {
@@ -162,10 +116,17 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
 }
 
 const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
-const ROWS = ["first deferred output", "second deferred output"];
+const ROWS = ["first deferred output", "second deferred output", "deferred python output"];
+
+/** Record the two bash results and the Python result that `ROWS` names. */
+function recordRows(session: AgentSession): void {
+	session.recordBashResult("first", shellResult(ROWS[0]!));
+	session.recordBashResult("second", shellResult(ROWS[1]!));
+	session.recordPythonResult("third", shellResult(ROWS[2]!));
+}
 
 describe.each([
-	{ branch: "no-lease", ownerShutdown: false },
+	{ branch: "plain", ownerShutdown: false },
 	{ branch: "owner-shutdown", ownerShutdown: true },
 ])("deferred command results across a session transition ($branch)", ({ ownerShutdown }) => {
 	for (const shape of ["mid-stream", "after the turn ended"] as const) {
@@ -179,26 +140,17 @@ describe.each([
 					resumeTarget = f.manager.getSessionFile()!;
 					expect(await f.session.newSession()).toBe(true);
 				}
+				// A completed turn puts the recorded session on disk before the turn under test.
+				await f.session.prompt("seed the recorded session");
+				await f.session.awaitSessionSettlement();
 				const recordedIn = f.manager.getSessionFile()!;
 				const turn = f.session.prompt("start a turn").catch((error: unknown) => error);
 				await until(() => f.session.isStreaming, "the turn to stream");
-				const lease = contendLeaseOnFirstDeferredResult(f.manager);
-				const notices: string[] = [];
-				f.session.subscribe(event => {
-					if (event.type === "notice") notices.push(event.message);
-				});
-				f.session.recordBashResult("first", shellResult(ROWS[0]!));
-				f.session.recordBashResult("second", shellResult(ROWS[1]!));
-				// A Python result the lease refuses, and one queued behind it.
-				f.session.recordPythonResult("refused", shellResult("refused python output"));
-				f.session.recordPythonResult("behind", shellResult("behind python output"));
-				// Mid-stream, the transition's abort ends the turn; otherwise the turn ends
-				// on its own and its deferred results are already publishing.
-				if (shape === "after the turn ended") await lease.contended;
+				recordRows(f.session);
+				// Mid-stream, the transition's abort ends the turn; otherwise the turn ends on
+				// its own and saves its deferred results first.
+				if (shape === "after the turn ended") await turn;
 				const switched = transition === "/new" ? f.session.newSession() : f.session.switchSession(resumeTarget!);
-				await lease.contended;
-				await Bun.sleep(300);
-				await lease.release();
 				expect(await switched).toBe(true);
 				await turn;
 				await f.session.awaitSessionSettlement();
@@ -217,68 +169,32 @@ describe.each([
 					expect(occurrences(successorAgent, row)).toBe(0);
 				}
 				expect(f.session.hasPendingBashMessages).toBe(false);
-				// Refused since the transition began (by its abort or the drain it joined), the
-				// Python kind is not attempted again: the row behind is dropped with its notice.
-				expect({ behind: lease.attempts.get("behind") ?? 0, notices }).toEqual({
-					behind: 0,
-					notices: [
-						"Could not save the deferred command result to this session: lease refused",
-						"Could not save the deferred command result to this session: an earlier command result could not be saved",
-					],
-				});
 			});
 		}
 	}
 
 	it("/new saves still-queued results to the session they were recorded in", async () => {
 		const f = await fixture(20, ownerShutdown);
-		const append = f.manager.appendMessageSharingSession.bind(f.manager);
-		let refusedAttempts = 0;
-		vi.spyOn(f.manager, "appendMessageSharingSession").mockImplementation(async message => {
-			if (message.role === "pythonExecution" && message.code === "throwing") throw new Error("lease writer crashed");
-			if (message.role !== "bashExecution" || message.command !== "refused") return append(message);
-			refusedAttempts++;
-			return { kind: "rejected", error: new Error("lease refused") };
-		});
-		// A prompt's drain refuses one result (its notice is the report) and keeps the
-		// result after it queued behind it, unattempted...
-		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
-		f.session.recordBashResult("refused", shellResult("refused deferred output"));
-		f.session.recordBashResult("blocked", shellResult("blocked deferred output"));
-		Reflect.deleteProperty(f.session, "isStreaming");
-		await expect(f.session.prompt("drain the refused result")).rejects.toThrow(/Failed to persist 2 of 2/);
-		// ...and a later result is deferred that no drain has claimed yet.
+		await f.session.prompt("seed the recorded session");
+		await f.session.awaitSessionSettlement();
+		// Results deferred while a turn streams that no drain has claimed yet.
 		Object.defineProperty(f.session, "isStreaming", { configurable: true, value: true });
 		const persisted = vi.fn();
 		f.session.recordBashResult("queued", shellResult("queued deferred output"), { onPersisted: persisted });
-		// Two Python results the transition cannot save: one whose save throws, one behind it.
-		f.session.recordPythonResult("throwing", shellResult("throwing python output"));
-		f.session.recordPythonResult("behind", shellResult("behind python output"));
+		f.session.recordPythonResult("queued", shellResult("queued python output"));
 		Reflect.deleteProperty(f.session, "isStreaming");
 		expect(f.session.hasPendingBashMessages).toBe(true);
 		const recordedIn = f.manager.getSessionFile()!;
-		const attemptsBeforeNew = refusedAttempts;
-		const notices: string[] = [];
-		f.session.subscribe(event => {
-			if (event.type === "notice") notices.push(event.message);
-		});
 		expect(await f.session.newSession()).toBe(true);
 		expect(f.session.hasPendingBashMessages).toBe(false);
 		expect(persisted).toHaveBeenCalledTimes(1);
-		// The transition does not retry the refused result, but saves the one blocked behind it.
-		expect(refusedAttempts).toBe(attemptsBeforeNew);
-		// Each Python result it could not save is reported, the thrown save included.
-		expect(notices).toEqual([
-			"Could not save the deferred command result to this session: lease writer crashed",
-			"Could not save the deferred command result to this session: an earlier command result could not be saved",
-		]);
 		await f.session.prompt("first prompt in the new session");
 		await f.session.awaitSessionSettlement();
 		await f.manager.flush();
 		const recorded = await Bun.file(recordedIn).text();
 		const successor = await Bun.file(f.manager.getSessionFile()!).text();
 		const successorAgent = JSON.stringify(f.session.agent.state.messages);
-		for (const row of ["blocked deferred output", "queued deferred output"]) {
+		for (const row of ["queued deferred output", "queued python output"]) {
 			expect(occurrences(recorded, row)).toBe(1);
 			expect(occurrences(successor, row)).toBe(0);
 			expect(occurrences(successorAgent, row)).toBe(0);
@@ -292,24 +208,13 @@ describe.each([
 			const recordedIn = f.manager.getSessionFile()!;
 			const turn = f.session.prompt("start a turn").catch((error: unknown) => error);
 			await until(() => f.session.isStreaming, "the turn to stream");
-			// Fork and branch refuse while a save is in flight, so they follow a turn whose
-			// results have been saved; handoff has no such guard and meets a held save.
-			const lease = transition === "handoff" ? contendLeaseOnFirstDeferredResult(f.manager) : undefined;
-			f.session.recordBashResult("first", shellResult(ROWS[0]!));
-			f.session.recordBashResult("second", shellResult(ROWS[1]!));
-			if (lease) await lease.contended;
-			else await turn;
-			const switched =
-				transition === "fork"
-					? f.session.fork()
-					: transition === "branch"
-						? f.session.branch(f.session.getUserMessagesForBranching()[0]!.entryId)
-						: f.session.handoff();
-			if (lease) {
-				await Bun.sleep(300);
-				await lease.release();
-			}
-			await switched;
+			recordRows(f.session);
+			await turn;
+			await (transition === "fork"
+				? f.session.fork()
+				: transition === "branch"
+					? f.session.branch(f.session.getUserMessagesForBranching()[0]!.entryId)
+					: f.session.handoff());
 			await turn;
 			await f.session.awaitSessionSettlement();
 			await f.session.sessionManager.flush();
@@ -337,19 +242,13 @@ describe.each([
 		const file = f.manager.getSessionFile()!;
 		const turn = f.session.prompt("start a turn").catch((error: unknown) => error);
 		await until(() => f.session.isStreaming, "the turn to stream");
-		const lease = contendLeaseOnFirstDeferredResult(f.manager);
-		f.session.recordBashResult("first", shellResult(ROWS[0]!));
-		f.session.recordBashResult("second", shellResult(ROWS[1]!));
-		await lease.contended;
-		// Navigate back to the turn's prompt while its deferred results are still saving.
+		recordRows(f.session);
+		await turn;
+		// Navigate back to the turn's prompt after its deferred results were saved.
 		const prompt = f.manager
 			.getEntries()
 			.findLast(entry => entry.type === "message" && entry.message.role === "user")!;
-		const navigated = f.session.navigateTree(prompt.id, { summarize: false });
-		await Bun.sleep(300);
-		await lease.release();
-		expect((await navigated).cancelled).toBe(false);
-		await turn;
+		expect((await f.session.navigateTree(prompt.id, { summarize: false })).cancelled).toBe(false);
 		await f.session.awaitSessionSettlement();
 		await f.manager.flush();
 

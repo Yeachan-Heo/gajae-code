@@ -34,6 +34,7 @@ import {
 	type AgentTerminalOwnerContext,
 	type AgentTool,
 	type AgentToolContext,
+	type ApiKeyResolution,
 	activeToolForCallName,
 	assertImagePlaceholdersHavePayload,
 	type BeforeToolCallContext,
@@ -110,6 +111,7 @@ import type {
 	Model,
 	ProviderDispatch,
 	ProviderSessionState,
+	ResolvedApiKey,
 	ServiceTier,
 	SimpleStreamOptions,
 	StopReason,
@@ -255,12 +257,9 @@ import type { ConfigHotReloadCandidate, ConfigHotReloadPaths } from "../config/c
 import {
 	applyModelProfileRuntimeBindings,
 	applyPreparedModelProfileActivation,
-	buildModelProfileTranscriptPlan,
-	type CommittedModelProfileSessionPublication,
 	finishPreparedModelProfileActivation,
 	getModelAssignmentPatches,
 	getModelProfileAssignmentMaterializationPatches,
-	ModelProfilePublicationError,
 	materializeActiveModelProfileAssignment,
 	type PreparedModelProfileActivation,
 	prepareModelProfileActivation,
@@ -569,7 +568,7 @@ import {
 	FoldCoordinator,
 	type ForegroundFoldOutcome,
 } from "./fold-coordinator";
-import { sessionClaimSetOf } from "./internal/session-claim-set";
+import { reclaimCurrentSession, sessionClaimSetOf } from "./internal/session-claim-set";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -596,7 +595,6 @@ import type {
 	DefaultModelSelectionEntriesOptions,
 	DefaultModelSelectionPromotion,
 	DefaultModelSelectionStage,
-	ModelProfileTranscriptPlan,
 	NewSessionOptions,
 	PreparedNewSession,
 	RecoveryHydrationContext,
@@ -606,8 +604,6 @@ import type {
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
-	SharedAppendOutcome,
-	SharedControlEntry,
 	SharedEntriesAppendOutcome,
 } from "./session-manager";
 import {
@@ -622,7 +618,6 @@ import {
 	SessionManager,
 	SessionNearLimitAppendError,
 	SessionTitlePersistenceStaleError,
-	SharedSessionMutationUnsupportedError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -875,11 +870,11 @@ export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" |
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
 /**
- * A session control could not complete its admitted shared publication (#7823, #7824).
+ * A session control was refused before any effect (#7823, #7824).
  *
- * `rejected`/`stale` prove nothing was written and nothing live changed. `unknown`
- * and `committed_not_applied` mean the transcript may hold (or holds) the change while
- * this session did not apply it; the session is closed instead of compensating.
+ * Since single-owner step 10c the only thrower is the control fence: a control whose
+ * session manager was replaced while it awaited is refused as `rejected`
+ * (`publication_mode_changed`). The other codes go with the shared layer in 10d/10e.
  */
 export class SharedControlPublicationError extends Error {
 	readonly code: "rejected" | "stale" | "unknown" | "committed_not_applied";
@@ -919,21 +914,11 @@ function sharedControlPublicationMessage(operation: string, outcome: SharedEntri
 		case "stale":
 			return `Could not ${operation}: the shared session changed before the update was written (${outcome.reason}). Nothing was changed; reopen the session and retry.`;
 		case "rejected":
-			return `Could not ${operation}: the shared session refused the update before writing it. Nothing was changed; retry.`;
+			return `Could not ${operation}: the session was replaced before the update was written. Nothing was changed; retry.`;
 		case "unknown":
 			return `Could not confirm ${operation} (entries ${outcome.ids.join(", ") || "none"}). The session was closed to protect its history; reopen it to see the result.`;
 		case "committed":
 			return `The change (${operation}) was saved to the session history but could not be applied here. The session was closed; reopen it to continue.`;
-	}
-}
-
-class SharedCompactionPublicationError extends Error {
-	constructor(readonly outcome: Exclude<SharedAppendOutcome, { kind: "committed" }>) {
-		super(
-			`Shared compaction publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-			{ cause: outcome },
-		);
-		this.name = "SharedCompactionPublicationError";
 	}
 }
 
@@ -981,8 +966,6 @@ export type AgentSessionEvent =
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
-			/** Original publication failure, including the attempted ID when durability is uncertain. */
-			publicationError?: unknown;
 			/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
 			skipped?: boolean;
 			continuationSkipReason?: AutoCompactionContinuationSkipReason;
@@ -1124,8 +1107,6 @@ export interface AgentSessionLifecycleState {
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
-	/** Internal root-TUI experiment only; never inherited by child sessions. */
-	rootInteractiveSharedAppend?: boolean;
 	settings: Settings;
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
@@ -2698,9 +2679,6 @@ const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
  */
 const COORDINATOR_PERSIST_CONTENTION_RETRIES = 3;
 const COORDINATOR_PERSIST_RETRY_DELAY_MS = 2_000;
-// A shared custom-message append refused as `stale/transcript_moved` committed nothing and is published again
-// against the relocated transcript; bounded so repeated relocations cannot loop.
-const SHARED_CUSTOM_APPEND_RELOCATION_RETRIES = 2;
 
 export type WorkerIntegrationOutcome =
 	| { status: "completed" }
@@ -4479,18 +4457,6 @@ export class AgentSession {
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
-	#profilePublicationReceipts = new WeakMap<
-		Extract<SharedEntriesAppendOutcome, { kind: "committed" }>,
-		{
-			manager: SessionManager;
-			sessionId: string;
-			identityGeneration: number;
-			leaf: string | null;
-			parent: string | null;
-			ids: readonly string[];
-			plan: ModelProfileTranscriptPlan;
-		}
-	>();
 	#defaultFallbackController: FallbackChainController | undefined;
 	#activeProfileConfiguredDefaultChain: readonly string[] | undefined;
 	#startupRecoveryBindingsRequired = false;
@@ -4800,7 +4766,6 @@ export class AgentSession {
 	}
 
 	#turnIndex = 0;
-	#rootInteractiveSharedAppend = false;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler | undefined;
 	#workerIntegrationRequestedForTurn = false;
 	// First-party internal before-agent-start contributors (not user hooks).
@@ -4969,6 +4934,13 @@ export class AgentSession {
 	#ttsrRetryToken = 0;
 	#ttsrResumePromise: Promise<void> | undefined = undefined;
 	#ttsrResumeResolve: (() => void) | undefined = undefined;
+	/**
+	 * SDK terminal of a run a TTSR interrupt aborted, held for the resume that continues it.
+	 * Reserved by the agent_end handler while the resume is pending; the owning resume either
+	 * hands it to its continuation or releases it, so the original terminal publishes when no
+	 * continuation runs.
+	 */
+	#ttsrResumeAgentEndHold: { hold: symbol; sdkOwnership: SdkContinuationOwnership } | undefined = undefined;
 
 	/** One-shot flag set in InteractiveMode.#approvePlan(compactBeforeExecute=true)
 	 *  before the plan-mode → compaction transition. Consumed inside
@@ -5237,7 +5209,6 @@ export class AgentSession {
 			this.#sessionAdmissionQueue.length > 0 ||
 			this.#startupPromptWaiters.size > 0 ||
 			this.#pendingSelectionFences > 0 ||
-			this.#pendingFastControls.size > 0 ||
 			this.#sessionTransitionKind !== undefined ||
 			this.#handoffTransitionActive ||
 			this.#cancelAndSubmitInProgress ||
@@ -6266,9 +6237,6 @@ export class AgentSession {
 
 	#isSessionSettlementPending(ignoreSelectionFenceGeneration?: number): boolean {
 		return (
-			[...this.#pendingFastControls.values()].some(
-				generation => ignoreSelectionFenceGeneration === undefined || generation < ignoreSelectionFenceGeneration,
-			) ||
 			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
@@ -6715,7 +6683,6 @@ export class AgentSession {
 		});
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
-		this.#rootInteractiveSharedAppend = config.rootInteractiveSharedAppend === true;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
@@ -6937,7 +6904,7 @@ export class AgentSession {
 		const originalGetApiKey = this.agent.getApiKey;
 		if (originalGetApiKey) {
 			const invokeOriginalGetApiKey = originalGetApiKey.bind(this.agent);
-			const managedGetApiKey = async (provider: string): Promise<string | undefined> => {
+			const managedGetApiKey = async (provider: string): Promise<ApiKeyResolution> => {
 				const override = this.#managedFallbackNextCredentialOverride;
 				const model = this.model;
 				const controller = this.#defaultFallbackController;
@@ -6954,12 +6921,14 @@ export class AgentSession {
 				if (shouldCapture && modelKey) this.#managedFallbackActiveCredentialRows.delete(modelKey);
 				if (override && model && storageProvider === override.storageProvider && modelKey === override.modelKey) {
 					this.#managedFallbackNextCredentialOverride = undefined;
-					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
-						credentialSelector: { kind: "id", value: String(override.rowId) },
-					});
+					const { apiKey, credentialRowId } = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+						model,
+						this.credentialSessionId,
+						{ credentialSelector: { kind: "id", value: String(override.rowId) } },
+					);
 					if (isAuthenticated(apiKey)) {
 						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
-						return apiKey;
+						return credentialRowId === undefined ? apiKey : { apiKey, credentialId: credentialRowId };
 					}
 					// The preselected credential is no longer available; try to resolve another one of the same kind.
 					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(model, override.credentialKind);
@@ -6969,9 +6938,10 @@ export class AgentSession {
 					}
 					throw new Error("Selected managed fallback credential is no longer available");
 				}
-				const apiKey = await invokeOriginalGetApiKey(provider);
+				const resolution = await invokeOriginalGetApiKey(provider);
+				const apiKey = typeof resolution === "string" ? resolution : resolution?.apiKey;
 				if (shouldCapture && model && isAuthenticated(apiKey)) this.#captureManagedFallbackActiveCredential(model);
-				return apiKey;
+				return resolution;
 			};
 			this.agent.getApiKey = managedGetApiKey;
 			this.#restoreManagedFallbackGetApiKey = () => {
@@ -7092,6 +7062,22 @@ export class AgentSession {
 					if (settleIfDisposing()) return;
 					if (this.isStreaming) {
 						await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
+						if (settleIfDisposing()) return;
+					}
+					// An idle delivery starts a turn without #promptWithMessage: the same ownership gate. A
+					// refused delivery is dropped (the yield queue logs the rejection), so say so.
+					const ownershipGate = this.#sessionOwnershipTurnGate();
+					if (ownershipGate) {
+						try {
+							await ownershipGate;
+						} catch (error) {
+							this.emitNotice(
+								"warning",
+								`A background result was not delivered: ${operatorErrorMessage(error)}`,
+								"session-ownership",
+							);
+							throw error;
+						}
 						if (settleIfDisposing()) return;
 					}
 					if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
@@ -8569,6 +8555,28 @@ export class AgentSession {
 		this.#emit({ type: "notice", level, message, source });
 	}
 
+	/**
+	 * Turn start's ownership gate (single-owner design §2.7, §13.1), before the turn writes anything:
+	 * a current session whose claim was not taken (another process held it, or the lock timed out or
+	 * failed) is claimed again, with backoff. Under enforce, a turn on a session another process now
+	 * holds is refused with its `SessionHeldError`, and the holder keeps the session; a lock that times
+	 * out again lets this one turn run unclaimed, with a notice. `undefined`, with nothing awaited, when
+	 * there is nothing to re-attempt (off, an exempt child, a claimed session), so ordering is unchanged.
+	 */
+	#sessionOwnershipTurnGate(): Promise<void> | undefined {
+		const reclaim = reclaimCurrentSession(this.sessionManager);
+		return reclaim?.then(result => {
+			if (result.refusal) throw result.refusal;
+			const ownership = this.sessionManager.ownershipDecision;
+			if (result.status === "timed_out" && ownership !== "exempt" && ownership.mode === "enforce")
+				this.emitNotice(
+					"warning",
+					"gjc could not check whether another process has this session open (the lock timed out), so this turn runs without a claim. It tries again on a later turn.",
+					"session-ownership",
+				);
+		});
+	}
+
 	#queuedExtensionEvents: Promise<void> = Promise.resolve();
 
 	#queueExtensionEvent(
@@ -8652,20 +8660,8 @@ export class AgentSession {
 	}
 
 	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
-	#thinkingControlAdmissionGroup:
-		| {
-				predecessor: CanonicalMessageAdmissionSlot;
-				workflowPredecessors: Promise<void>[];
-				completion: CanonicalMessageAdmissionSlot;
-				release: () => void;
-				members: number;
-		  }
-		| undefined;
-	#startedSharedControlPublications = new Set<Promise<void>>();
 	/** Background shared publications that teardown must join before the manager goes away. */
 	#backgroundPublications = new Set<Promise<void>>();
-	#fastControlTail: Promise<void> = Promise.resolve();
-	#pendingFastControls = new Map<Promise<void>, number>();
 
 	#reserveCanonicalSchedulingSlot() {
 		const predecessor = this.#canonicalMessageAdmissionTail;
@@ -8681,26 +8677,6 @@ export class AgentSession {
 				settled.resolve();
 			},
 		};
-	}
-
-	async #withThinkingControlScheduling<T>(body: () => Promise<T>): Promise<T> {
-		this.#thinkingControlAdmissionGroup ??= {
-			...this.#reserveCanonicalSchedulingSlot(),
-			workflowPredecessors: [...this.#startedSharedControlPublications],
-			members: 0,
-		};
-		const group = this.#thinkingControlAdmissionGroup;
-		group.members++;
-		try {
-			if (!group.predecessor.released || group.workflowPredecessors.length)
-				await Promise.all([group.predecessor.promise, ...group.workflowPredecessors]);
-			return await body();
-		} finally {
-			if (--group.members === 0) {
-				if (this.#thinkingControlAdmissionGroup === group) this.#thinkingControlAdmissionGroup = undefined;
-				group.release();
-			}
-		}
 	}
 
 	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
@@ -9490,26 +9466,11 @@ export class AgentSession {
 				event.message.role === "toolResult" ||
 				event.message.role === "fileMention"
 			) {
-				const sharedAppend = this.#usesSharedSessionPublication();
 				try {
-					let appendedEntryId: string;
-					if (sharedAppend) {
-						const outcome = await this.sessionManager.appendMessageSharingSession(event.message);
-						if (outcome.kind !== "committed") {
-							throw new Error(
-								`Shared canonical append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-								{ cause: outcome },
-							);
-						}
-						appendedEntryId = outcome.id;
-					} else {
-						appendedEntryId = this.sessionManager.appendMessage(event.message);
-					}
+					const appendedEntryId = this.sessionManager.appendMessage(event.message);
 					if (event.message.role === "user") this.#noteSessionRecapUserMessage(event.message, appendedEntryId);
 				} catch (error) {
 					canonicalAdmission?.fail(error);
-					// Shared outcomes cannot pass through the legacy todo recovery/reappend path.
-					if (sharedAppend) this.#abortRunForPublicationFailure(`canonical ${event.message.role} append`, error);
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this
 					// entry. The edit/effect itself may already be committed; surface a
@@ -9649,6 +9610,20 @@ export class AgentSession {
 		}
 
 		await this.#emitSessionEvent(displayEvent, eventLease);
+		// A TTSR interrupt ended this SDK run only to resume it. Hold its terminal for that resume,
+		// like the other continuations, so the SDK prompt is not settled as cancelled while the
+		// agent continues. The owning resume hands the hold to its continuation or releases it.
+		if (
+			event.type === "agent_end" &&
+			ttsrResumePendingAtTerminal &&
+			this.#ttsrAbortPending &&
+			event.stopReason === "cancelled" &&
+			terminalSdkOwnership
+		) {
+			this.#releaseTtsrResumeAgentEndHold();
+			const hold = this.#reserveDeferredAgentEndForContinuation(attemptScope);
+			if (hold) this.#ttsrResumeAgentEndHold = { hold, sdkOwnership: terminalSdkOwnership };
+		}
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#assistantAttemptScopes.set(event.message, {
 				scope: attemptScope,
@@ -10010,7 +9985,15 @@ export class AgentSession {
 				msg.provider === "github-copilot" &&
 				msg.errorMessage?.includes("GitHub Copilot authentication failed")
 			) {
-				await this.#modelRegistry.authStorage.remove("github-copilot");
+				try {
+					await this.#modelRegistry.authStorage.remove("github-copilot");
+				} catch (error) {
+					// The credential is still stored; the next authentication failure retries the
+					// invalidation. Post-turn handling must still run.
+					logger.warn("Failed to invalidate GitHub Copilot credentials after an auth failure", {
+						error: String(error),
+					});
+				}
 			}
 
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
@@ -10332,6 +10315,19 @@ export class AgentSession {
 		this.#ttsrResumeResolve();
 		this.#ttsrResumeResolve = undefined;
 		this.#ttsrResumePromise = undefined;
+	}
+
+	/** Take the held interrupted SDK terminal for the resume that continues it. */
+	#takeTtsrResumeAgentEndHold(): { hold: symbol; sdkOwnership: SdkContinuationOwnership } | undefined {
+		const held = this.#ttsrResumeAgentEndHold;
+		this.#ttsrResumeAgentEndHold = undefined;
+		return held;
+	}
+
+	/** A TTSR resume that will not continue publishes the interrupted terminal it held. */
+	#releaseTtsrResumeAgentEndHold(): void {
+		const held = this.#takeTtsrResumeAgentEndHold();
+		if (held) this.#releaseDeferredAgentEndContinuation(held.hold);
 	}
 
 	/**
@@ -11377,14 +11373,6 @@ export class AgentSession {
 		if (ruleNames.length > 0) {
 			const records = this.#ttsrManager?.getInjectedRecords().filter(record => ruleNames.includes(record.name));
 			const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-			// A shared session refuses the legacy append; record through the admitted path
-			// like #markTtsrInjected (#7824).
-			if (this.#usesSharedSessionPublication()) {
-				void this.#publishInBackground("ttsr injection", () =>
-					this.sessionManager.appendTtsrInjectionSharingSession(ruleNames, records, ttsrMessageCount),
-				);
-				return;
-			}
 			// This runs inside the synchronous agent listener entry: a failed record
 			// write must not abort canonical handling of the published result. The
 			// reminder was delivered, so the claim stays consumed in memory.
@@ -11491,15 +11479,7 @@ export class AgentSession {
 		if (!persistMarker) return;
 		const records = this.#ttsrManager?.getInjectedRecords().filter(record => uniqueRuleNames.includes(record.name));
 		const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
-		// A shared session refuses the legacy append once admission is armed. Publish durable
-		// markers through the admitted path so message_end handling and committed retries work.
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
-			return;
-		}
-		void this.#publishInBackground("ttsr injection", () =>
-			this.sessionManager.appendTtsrInjectionSharingSession(uniqueRuleNames, records, ttsrMessageCount),
-		);
+		this.sessionManager.appendTtsrInjection(uniqueRuleNames, records, ttsrMessageCount);
 	}
 
 	/** Parse only finalized, tool-provided source digests, before dispatch. */
@@ -11762,8 +11742,25 @@ export class AgentSession {
 		// The resume continues this request. Captured by identity so that whichever way the resume ends, a
 		// late cleanup can only end the request it was scheduled for, never a newer admission's.
 		const recapRequest = this.#recapRequest;
+		// A throw before the continuation takes over (for example a failed injection marker append)
+		// must not strand the held SDK terminal or leave the interrupt pending.
+		const releaseOnThrow =
+			(task: (signal: AbortSignal) => Promise<void>) =>
+			async (signal: AbortSignal): Promise<void> => {
+				try {
+					await task(signal);
+				} catch (error) {
+					if (this.#ttsrRetryToken === retryToken) {
+						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
+						this.#resolveTtsrResume();
+						this.#endSessionRecapRequestIf(recapRequest);
+					}
+					throw error;
+				}
+			};
 		this.#schedulePostPromptTask(
-			async signal => {
+			releaseOnThrow(async signal => {
 				if (this.#ttsrRetryToken !== retryToken) {
 					// A newer interrupt owns the resume (and the same request); leave the request to it.
 					this.#resolveTtsrResume();
@@ -11773,6 +11770,7 @@ export class AgentSession {
 					this.#ttsrAbortPending = false;
 					this.#pendingTtsrInjections = [];
 					this.#releasePerToolTtsrInjections();
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 					return;
@@ -11866,28 +11864,27 @@ export class AgentSession {
 				// rules are marked at, so reopen reconciliation restores it instead of the current count.
 				const ttsrMessageCount = this.#ttsrManager?.getMessageCount();
 				const details = injection ? { rules: ruleNames, messageCount: ttsrMessageCount } : undefined;
-				let publicationFailure: { error: unknown; outcome: SharedAppendFailureOutcome | undefined } | undefined;
+				let publicationFailure: { error: unknown } | undefined;
 				// Live-history identity before the await: an abort advances the prompt generation without a
 				// successor, so delivery after an abort is fenced on this history being untouched instead.
 				const liveLengthBefore = this.agent.state.messages.length;
 				const liveTailBefore = this.agent.state.messages.at(-1);
 				if (injection && details) {
-					// Persist before any live mutation. A shared session refuses the legacy append,
-					// so publish through the admitted path like other in-turn custom messages
-					// (#7815). Only a typed rejected result permits retrying in memory.
+					// Persist before any live mutation.
 					try {
 						await this.#appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
 					} catch (error) {
-						publicationFailure = { error, outcome: getSharedAppendFailureOutcome(error) };
+						publicationFailure = { error };
 					}
 				}
 				// The publication awaited: an abort, dispose, or newer prompt/interrupt may have landed
-				// meanwhile. Classify the outcome first so an uncertain append still fails closed (#7838).
+				// meanwhile. Handle a failed append first so it still fails closed (#7838).
 				const ownsRetry = () => this.#ttsrRetryToken === retryToken;
 				const endRetry = () => {
 					if (!ownsRetry()) return;
 					this.#ttsrAbortPending = false;
 					releaseCarriedTtsr();
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 				};
@@ -11898,79 +11895,30 @@ export class AgentSession {
 					!this.#ttsrAbortPending ||
 					this.#promptGeneration !== generation;
 				if (publicationFailure) {
-					const { error, outcome } = publicationFailure;
-					// Stale and unknown outcomes require different handling:
-					// - Stale: persistent conditions (latched persistence, rewrite debt, uncommitted cursor)
-					//   make later shared writes uncommittable, so retry must stop and reopen (#7838).
-					// - Unknown: may have committed; require session close to prevent duplicate (#7838).
-					// - Rejected: definite non-commit; safe to retry in memory.
-					// Both fail-closed paths apply even after an abort or a newer interrupt, because the
-					// persistence state they report belongs to this session, not to the retry.
-					if (outcome?.kind === "stale") {
-						logger.warn("TTSR retry requires session reopen after stale shared append", {
-							rules: details?.rules,
-							reason: outcome.reason,
-							error: error instanceof Error ? error.message : String(error),
-						});
-						endRetry();
-						// Stale conditions are persistent; shared writes will remain uncommittable.
-						// Require reopening to clear the persistent state.
-						void this.dispose().catch(() => {
-							logger.warn("Stale TTSR reminder teardown failed", {
-								code: "ttsr_stale_publication_teardown_failed",
-								reason: outcome.reason,
-							});
-						});
-						this.emitNotice(
-							"warning",
-							`TTSR reminder publication failed with ${outcome.reason}; session requires reopening to continue.`,
-							"ttsr",
-						);
-						return;
-					}
-					if (outcome?.kind !== "rejected") {
-						const attemptedId = outcome?.kind === "unknown" ? outcome.id : undefined;
-						logger.warn("TTSR injection publication may have committed; stopping retry", {
-							rules: details?.rules,
-							outcome: outcome?.kind ?? "unclassified",
-							attemptedId,
-							error: error instanceof Error ? error.message : String(error),
-						});
-						endRetry();
-						// An unknown append may already be in the transcript, but it does not
-						// prove the model received the reminder. Do not persist consumption or
-						// let a later prompt bypass it through another match path or repeat gap.
-						// Close this live session instead; attempted-entry reconciliation on reopen is separate.
-						void this.dispose().catch(() => {
-							logger.warn("Uncertain TTSR reminder teardown failed", {
-								code: "ttsr_uncertain_publication_teardown_failed",
-								attemptedId,
-							});
-						});
-						this.emitNotice(
-							"warning",
-							attemptedId
-								? `TTSR reminder publication outcome is unknown (attempted id: ${attemptedId}); retry stopped and the session was closed because the reminder may already be in the session transcript.`
-								: "TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
-							"ttsr",
-						);
-						return;
-					}
-					// Rejected: nothing was committed, so an invalidated retry only releases its claims.
-					if (retryInvalidated()) {
-						endRetry();
-						return;
-					}
-					logger.warn("TTSR injection message could not be persisted", {
+					const { error } = publicationFailure;
+					// A failed append does not prove nothing was committed. This applies even after an
+					// abort or a newer interrupt, because the persistence state belongs to this session,
+					// not to the retry.
+					logger.warn("TTSR injection publication may have committed; stopping retry", {
 						rules: details?.rules,
-						outcome: outcome.kind,
+						outcome: "unclassified",
 						error: error instanceof Error ? error.message : String(error),
+					});
+					endRetry();
+					// The append may already be in the transcript, but it does not prove the model
+					// received the reminder. Do not persist consumption or let a later prompt bypass it
+					// through another match path or repeat gap. Close this live session instead.
+					void this.dispose().catch(() => {
+						logger.warn("Uncertain TTSR reminder teardown failed", {
+							code: "ttsr_uncertain_publication_teardown_failed",
+						});
 					});
 					this.emitNotice(
 						"warning",
-						"TTSR reminder could not be saved to the session transcript; retrying with it in memory only.",
+						"TTSR reminder persistence failed without confirming it was not committed; retry stopped and the session was closed because the reminder may already be in the session transcript.",
 						"ttsr",
 					);
+					return;
 				} else if (retryInvalidated()) {
 					// The retry will not run. Without a committed reminder it only releases its claims.
 					if (!injection || !details) {
@@ -12043,36 +11991,43 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					// A rejected publication lets us retry with the reminder in
-					// memory only. Consume it in this live manager to avoid a repeatMode
-					// once interrupt loop, but do not persist a marker that would suppress
-					// the still-eligible rule when this session is reopened.
-					this.#markTtsrInjected(details.rules, publicationFailure === undefined, ttsrMessageCount);
+					// The reminder was appended above, so consumption gets a durable marker.
+					this.#markTtsrInjected(details.rules, true, ttsrMessageCount);
 				}
+				// The continuation inherits the held SDK terminal and its owner, like overflow retry and
+				// auto-retry: the resumed run settles the SDK prompt, and skip or failure releases the
+				// hold so the interrupted terminal still publishes.
+				const heldTerminal = this.#takeTtsrResumeAgentEndHold();
 				await this.#scheduleAgentContinue({
 					delayMs: 0,
 					generation,
+					predecessorAgentEndHold: heldTerminal?.hold,
+					sdkOwnership: heldTerminal?.sdkOwnership,
 					// Owner-guarded like the outer onSkip: a newer interrupt may own the resume.
 					shouldContinue: () => {
 						if (this.#ttsrRetryToken !== retryToken) return false;
 						this.#ttsrAbortPending = false;
+						// A terminal reserved after the hold was taken has no continuation to inherit it.
+						this.#releaseTtsrResumeAgentEndHold();
 						return true;
 					},
 					onSkip: () => {
 						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					onError: () => {
 						if (this.#ttsrRetryToken !== retryToken) return;
 						this.#ttsrAbortPending = false;
+						this.#releaseTtsrResumeAgentEndHold();
 						this.#resolveTtsrResume();
 						this.#endSessionRecapRequestIf(recapRequest);
 					},
 					resourceRunId: activePromptHandle,
 				});
-			},
+			}),
 			{
 				delayMs: 50,
 				resourceRunId: activePromptHandle,
@@ -12081,6 +12036,7 @@ export class AgentSession {
 				onSkip: () => {
 					if (this.#ttsrRetryToken !== retryToken) return;
 					this.#ttsrAbortPending = false;
+					this.#releaseTtsrResumeAgentEndHold();
 					this.#resolveTtsrResume();
 					this.#endSessionRecapRequestIf(recapRequest);
 				},
@@ -13467,7 +13423,6 @@ export class AgentSession {
 			Promise.allSettled([...this.#autoCompactionCompletions]).then(() => {}),
 			true,
 		);
-		await awaitDisposeStep("fast controls", this.#fastControlTail, true);
 		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
 		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
 		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
@@ -14133,27 +14088,6 @@ export class AgentSession {
 				nextSelectedDiscoveredBuiltinToolNames,
 			);
 		if (!mcpSelectionChanged && !discoveredBuiltinSelectionChanged) return;
-		// Internal refreshes (MCP catalog, /ssh, plugin/subskill tools) are synchronous
-		// producers: in a shared session their selection is published through admitted
-		// background publication instead of the refused legacy append (#7824).
-		if (this.#usesSharedSessionPublication()) {
-			const manager = this.sessionManager;
-			const identityGeneration = manager.getSessionIdentityGeneration();
-			void this.#publishInBackground("tool selection", async () => {
-				const outcome = await manager.appendToolSelectionsSharingSession(
-					mcpSelectionChanged ? nextSelectedMCPToolNames : undefined,
-					discoveredBuiltinSelectionChanged ? nextSelectedDiscoveredBuiltinToolNames : undefined,
-					() =>
-						!this.#isDisposed &&
-						this.sessionManager === manager &&
-						manager.getSessionIdentityGeneration() === identityGeneration,
-				);
-				if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids.at(-1) ?? "" };
-				if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids.join(","), error: outcome.error };
-				return outcome;
-			});
-			return;
-		}
 		const mutationCorrelationId =
 			mcpSelectionChanged && discoveredBuiltinSelectionChanged ? crypto.randomUUID() : undefined;
 		if (mcpSelectionChanged) {
@@ -15309,12 +15243,10 @@ export class AgentSession {
 				return tool !== undefined && isMCPBridgeTool(tool);
 			});
 			if (activated.length > 0) {
-				if (!this.#usesSharedSessionPublication())
-					this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
+				this.sessionManager.assertLegacyMutationAllowed("activate discovered tools");
 				const appliedRevision = await this.#applyActiveToolsByName(nextActiveToolNames, {
 					previousSelectedMCPToolNames,
 					previousSelectedDiscoveredBuiltinToolNames,
-					sharedPublication: true,
 					nextSelectedDiscoveredBuiltinToolNames: [...nextSelectedDiscoveredBuiltinToolNames],
 					persistedMCPToolNames:
 						activatedMCPToolNames.length > 0
@@ -15647,7 +15579,6 @@ export class AgentSession {
 		toolNames: string[],
 		options?: {
 			persistMCPSelection?: boolean;
-			sharedPublication?: boolean;
 			previousSelectedMCPToolNames?: string[];
 			previousSelectedDiscoveredBuiltinToolNames?: string[];
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
@@ -15658,9 +15589,8 @@ export class AgentSession {
 			fence?: SessionViewRestoreFence;
 		},
 	): Promise<number | undefined> {
-		const sharedDiscovery = options?.sharedPublication === true && this.#usesSharedSessionPublication();
 		const assertControlMutationAllowed = () => {
-			if (options?.explicitActiveToolSelectionGeneration !== undefined && !sharedDiscovery) {
+			if (options?.explicitActiveToolSelectionGeneration !== undefined) {
 				this.sessionManager.assertLegacyMutationAllowed("select active tools");
 			}
 		};
@@ -15710,102 +15640,6 @@ export class AgentSession {
 		const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 		const promptRelevantToolsChanged =
 			signature !== (this.#pendingAppliedToolSignature ?? this.#lastAppliedToolSignature);
-		if (sharedDiscovery) {
-			const manager = this.sessionManager;
-			const sessionId = manager.getSessionId();
-			const file = manager.getSessionFile();
-			const identityGeneration = manager.getSessionIdentityGeneration();
-			const transitionGeneration = this.#sessionTransitionGeneration;
-			let promptGeneration: number | undefined;
-			const current = () =>
-				!this.#isDisposed &&
-				!this.#sessionAdmissionClosing &&
-				!this.#sessionAdmissionClosed &&
-				this.#sessionTransitionKind === undefined &&
-				transitionGeneration === this.#sessionTransitionGeneration &&
-				this.sessionManager === manager &&
-				manager.getSessionId() === sessionId &&
-				manager.getSessionFile() === file &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				selectionIsCurrent() &&
-				mcpCatalogGeneration === this.#mcpCatalogGeneration &&
-				validToolNames.every((name, index) => this.#toolRegistry.get(name) === tools[index]) &&
-				(promptGeneration === undefined || promptGeneration === this.#baseSystemPromptGeneration);
-			let builtPrompt: string[] | undefined;
-			if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
-				promptGeneration = this.#reserveBaseSystemPromptGeneration();
-				const built = await this.#runAdmittedBaseSystemPromptRebuild(() =>
-					this.#rebuildSystemPrompt!(validToolNames, this.#toolRegistry),
-				);
-				builtPrompt = built.systemPrompt;
-			}
-			if (!current()) return undefined;
-			const persistedMCPNames = options?.persistedMCPToolNames ?? [...nextSelectedMCPToolNames];
-			const selectedBuiltinNames = this.#selectRestorableDiscoveredBuiltinToolNames(
-				nextSelectedDiscoveredBuiltinToolNames,
-			).filter(name => activeNameSet.has(name));
-			const mcpChanged =
-				(this.#mcpDiscoveryEnabled || this.#resolveEffectiveDiscoveryMode() === "all") &&
-				!this.#selectedMCPToolNamesMatch(previousSelectedMCPToolNames, persistedMCPNames);
-			const builtinChanged =
-				this.#resolveEffectiveDiscoveryMode() === "all" &&
-				!this.#selectedMCPToolNamesMatch(previousSelectedDiscoveredBuiltinToolNames, selectedBuiltinNames);
-			const promote = () => {
-				if (builtPrompt) {
-					this.#baseSystemPrompt = builtPrompt;
-					this.agent.setSystemPrompt(builtPrompt);
-				}
-				if (promptRelevantToolsChanged) {
-					this.#lastAppliedToolSignature = signature;
-					this.#pendingAppliedToolSignature = undefined;
-					this.#defaultModelSelectionMutationRevision++;
-				}
-				this.#selectedMCPToolNames = nextSelectedMCPToolNames;
-				this.#selectedDiscoveredToolNames = nextSelectedDiscoveredBuiltinToolNames;
-				this.#setGuardedAgentTools(tools, options?.fence?.onApplied);
-				this.#invalidateDiscoveryCaches();
-			};
-			if (options?.persistMCPSelection === false || (!mcpChanged && !builtinChanged)) {
-				promote();
-			} else {
-				const operation = "select active tools";
-				let promoted = false;
-				let promotionError: unknown;
-				const outcome = await this.#withStartedSharedControlPublication(
-					() => {
-						if (!current()) throw new Error("Shared tool selection superseded");
-					},
-					async () => {
-						const result = await manager.appendToolSelectionsSharingSession(
-							mcpChanged ? persistedMCPNames : undefined,
-							builtinChanged ? selectedBuiltinNames : undefined,
-							current,
-						);
-						// No await between the committed receipt and live promotion.
-						if (result.kind === "committed" && current()) {
-							try {
-								promote();
-								promoted = true;
-							} catch (error) {
-								promotionError = error;
-							}
-						}
-						return result;
-					},
-				);
-				// A possibly durable selection this session did not apply keeps its receipt and
-				// closes the session instead of running on tools its transcript no longer names.
-				if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-				if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-				if (!promoted)
-					return this.#failClosedSharedControl(
-						operation,
-						outcome,
-						promotionError ?? new Error("Committed shared tool selection superseded"),
-					);
-			}
-			return this.#activeToolSelectionRevision;
-		}
 		if (promptRelevantToolsChanged && this.#rebuildSystemPrompt) {
 			while (true) {
 				const generation = this.#reserveBaseSystemPromptGeneration();
@@ -15947,10 +15781,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: { explicit?: boolean; persistMCPSelection?: boolean; retryOnMcpCatalogChange?: boolean },
 	): Promise<void> {
-		// Shared sessions publish the selection and promote prompt/tools together through the
-		// admitted tool-selection path; legacy sessions keep the legacy refusal.
 		const assertPublicationMode = this.#controlPublicationModeFence("select active tools");
-		const sharedPublication = this.#usesSharedSessionPublication();
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
 		const shouldPersistMCPSelectionIfUnchanged =
@@ -15973,7 +15804,6 @@ export class AgentSession {
 				sessionTransitionGeneration,
 				explicitActiveToolSelectionGeneration,
 				persistMCPSelection: options?.persistMCPSelection,
-				sharedPublication,
 			});
 			if (options?.retryOnMcpCatalogChange && appliedRevision === undefined) {
 				if (sessionTransitionGeneration !== this.#sessionTransitionGeneration) {
@@ -16003,7 +15833,6 @@ export class AgentSession {
 							sessionTransitionGeneration,
 							explicitActiveToolSelectionGeneration,
 							persistMCPSelection: options.persistMCPSelection,
-							sharedPublication,
 						},
 					);
 					if (appliedRevision === undefined && retryMcpCatalogGeneration === this.#mcpCatalogGeneration) {
@@ -16018,12 +15847,8 @@ export class AgentSession {
 					!sessionContext.hasPersistedMCPToolSelection ||
 					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
 				) {
-					if (sharedPublication)
-						await this.#publishSharedMCPToolSelection(selectedMCPToolNames, assertPublicationMode);
-					else {
-						assertPublicationMode();
-						this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
-					}
+					assertPublicationMode();
+					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
 				}
 			}
 			if (isExplicit && explicitActiveToolSelectionGeneration === this.#explicitActiveToolSelectionGeneration) {
@@ -16519,7 +16344,10 @@ export class AgentSession {
 		}
 		await this.#awaitStartupTurnBarrier();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
-		await this.#withSessionAdmission("prompt", async () => {});
+		await this.#withSessionAdmission("prompt", async () => {
+			const ownershipGate = this.#sessionOwnershipTurnGate();
+			if (ownershipGate) await ownershipGate;
+		});
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
@@ -16742,54 +16570,11 @@ export class AgentSession {
 		);
 	}
 
-	/**
-	 * Credential intent is durable before it is live (#7824): a refused write leaves
-	 * AuthStorage untouched. Shared sessions publish through the admitted control path;
-	 * an uncertain or committed-but-unapplied outcome closes the session instead of
-	 * compensating.
-	 */
+	/** Credential intent is durable before it is live (#7824): a refused write leaves AuthStorage untouched. */
 	async #publishCredentialIntentThenApply(data: Record<string, unknown>, apply: () => void): Promise<void> {
-		const operation = "change credential selection";
-		const assertMode = this.#controlPublicationModeFence(operation);
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendCustomEntry("auth-credential-pin", data);
-			apply();
-			return;
-		}
-		const manager = this.sessionManager;
-		const sessionId = manager.getSessionId();
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				manager.getSessionId() === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration
-			);
-		};
-		const assertCurrent = () => {
-			if (!current())
-				throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-		};
-		const outcome = await this.#withStartedSharedControlPublication(assertCurrent, () =>
-			manager.appendControlEntriesSharingSession(
-				[{ type: "custom", customType: "auth-credential-pin", data }],
-				current,
-			),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-		try {
-			assertCurrent();
-			apply();
-		} catch (error) {
-			return this.#failClosedSharedControl(operation, outcome, error);
-		}
+		this.#controlPublicationModeFence("change credential selection");
+		this.sessionManager.appendCustomEntry("auth-credential-pin", data);
+		apply();
 	}
 
 	/** Mask persistent/global selection for this session and restore AUTO ranking. */
@@ -17799,161 +17584,52 @@ export class AgentSession {
 		observationId?: string,
 	): Promise<string | undefined> {
 		if (this.#isEphemeralCustomMessageType(customType)) return undefined;
-		// A session that publishes canonical messages through the shared lease arms
-		// shared admission, which refuses every later legacy append.
-		if (!this.#usesSharedSessionPublication()) {
-			return this.sessionManager.appendCustomMessageEntry(
-				customType,
-				content,
-				display,
-				details,
-				attribution,
-				observationId,
-			);
-		}
-		const manager = this.sessionManager;
-		const sessionId = manager.getSessionId();
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const publish = () =>
-			manager.appendCustomMessageEntrySharingSession(
-				customType,
-				content,
-				display,
-				details,
-				attribution,
-				observationId,
-			);
-		let outcome = await publish();
-		// A relocation of this session's transcript (a task child following its parent's session move) between the
-		// append capturing its path and its transaction refuses the append before any write. Nothing was committed, so
-		// it is published again against the relocated transcript; the caller's in-memory message is not touched. Only
-		// for the same manager, session id and identity generation, and outside every session transition: a switch or
-		// copy reports the same reason and must not receive this entry, and while it is being adopted the successor's
-		// transcript can already be in place before the id or generation changes. Every other outcome stays final,
-		// since an `unknown` one may already be committed.
-		for (
-			let retry = 0;
-			retry < SHARED_CUSTOM_APPEND_RELOCATION_RETRIES &&
-			outcome.kind === "stale" &&
-			outcome.reason === "transcript_moved" &&
-			this.#sessionTransitionKind === undefined &&
-			!this.#handoffTransitionActive &&
-			this.sessionManager === manager &&
-			manager.getSessionId() === sessionId &&
-			manager.getSessionIdentityGeneration() === identityGeneration;
-			retry++
-		) {
-			outcome = await publish();
-		}
-		if (outcome.kind !== "committed") {
-			throw new Error(
-				`Shared custom message append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-				{ cause: outcome },
-			);
-		}
-		return outcome.id;
-	}
-
-	/**
-	 * Publish an additive custom entry at this opener's admitted branch cursor.
-	 *
-	 * A shared-append session refuses legacy appends once a canonical shared publication
-	 * adopted an identity this opener did not import, so every in-turn producer publishes
-	 * through the shared lease instead (the custom-message path does the same). Throws when
-	 * the publication is refused: a silently dropped entry is worse than a loud failure.
-	 */
-	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendCustomEntry(customType, data);
-		const outcome = await this.sessionManager.appendCustomEntrySharingSession(customType, data);
-		assertSharedAppendCommitted(`Shared ${customType} entry append`, outcome);
-		return outcome.id;
-	}
-
-	/**
-	 * Publish a custom entry from a synchronous call site.
-	 *
-	 * A shared-append session publishes through its admitted path in the background and
-	 * logs a refusal, because such a caller cannot await a transaction and a refusal must
-	 * not abort its turn. The legacy form throws inline exactly as before.
-	 */
-	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendCustomEntry(customType, data);
-			return Promise.resolve({ committed: true });
-		}
-		return this.#publishInBackground(`custom entry ${customType}`, () =>
-			this.sessionManager.appendCustomEntrySharingSession(customType, data),
+		return this.sessionManager.appendCustomMessageEntry(
+			customType,
+			content,
+			display,
+			details,
+			attribution,
+			observationId,
 		);
+	}
+
+	/** Append an additive custom entry to this session; throws inline when the append is refused. */
+	async appendCustomEntryForSession<T = unknown>(customType: string, data?: T): Promise<string | undefined> {
+		return this.sessionManager.appendCustomEntry(customType, data);
+	}
+
+	/** Append a custom entry from a synchronous call site; throws inline when the append is refused. */
+	appendCustomEntryInBackground<T = unknown>(customType: string, data?: T): Promise<BackgroundPublicationResult> {
+		this.sessionManager.appendCustomEntry(customType, data);
+		return Promise.resolve({ committed: true });
 	}
 
 	/** Publish a message from a synchronous call site. */
 	appendMessageInBackground(message: SessionPersistedMessage): Promise<BackgroundPublicationResult> {
-		return this.#publishMessageInBackground("session message", message);
+		return this.#publishMessageInBackground(message);
 	}
 
-	/** Publish a message at this opener's admitted branch cursor. */
+	/** Append a message to this session. */
 	async appendMessageForSession(message: SessionPersistedMessage): Promise<string> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendMessage(message);
-		const outcome = await this.sessionManager.appendMessageSharingSession(message);
-		assertSharedAppendCommitted("Shared message append", outcome);
-		return outcome.id;
+		return this.sessionManager.appendMessage(message);
 	}
 
-	/** Publish a session recap at this opener's admitted branch cursor. */
+	/** Append a session recap to this session. */
 	async appendSessionRecapForSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.appendSessionRecap(input);
-		return this.sessionManager.appendSessionRecapSharingSession(input);
+		return this.sessionManager.appendSessionRecap(input);
 	}
 
-	/** Publish a label change from a synchronous call site. */
+	/** Append a label change from a synchronous call site. */
 	appendLabelChangeInBackground(targetId: string, label: string | undefined): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendLabelChange(targetId, label);
-			return Promise.resolve({ committed: true });
-		}
-		return this.#publishInBackground("label change", () =>
-			this.sessionManager.appendLabelChangeSharingSession(targetId, label),
-		);
+		this.sessionManager.appendLabelChange(targetId, label);
+		return Promise.resolve({ committed: true });
 	}
 
-	/** Publish a mode change from a synchronous call site. */
+	/** Append a mode change from a synchronous call site. */
 	appendModeChangeInBackground(mode: string, data?: Record<string, unknown>): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendModeChange(mode, data);
-			return Promise.resolve({ committed: true });
-		}
-		return this.#publishInBackground("mode change", () =>
-			this.sessionManager.appendModeChangeSharingSession(mode, data),
-		);
-	}
-
-	/**
-	 * Run one background publication.
-	 *
-	 * Returns the real outcome: `false` means nothing was committed, and the caller must
-	 * treat the entry as not persisted. A refusal never throws into the turn (a synchronous
-	 * producer cannot await a transaction and must not abort the run), so the cause is
-	 * logged here with the operation and the promise is registered for settlement joining.
-	 */
-	#publishInBackground(
-		operation: string,
-		publish: () => Promise<SharedAppendOutcome>,
-	): Promise<BackgroundPublicationResult> {
-		const task = publish()
-			.then((outcome): BackgroundPublicationResult => {
-				if (outcome.kind === "committed") return { committed: true };
-				const cause = describeSharedAppendFailure(outcome);
-				logger.warn("Shared session append was refused; the entry was not persisted", { operation, ...cause });
-				this.#reportBackgroundRefusal(operation, cause.reason ?? cause.outcome);
-				return { committed: false, cause: cause.reason };
-			})
-			.catch((error: unknown): BackgroundPublicationResult => {
-				const reason = error instanceof Error ? error.message : String(error);
-				logger.warn("Shared session append failed; the entry was not persisted", { operation, cause: reason });
-				this.#reportBackgroundRefusal(operation, reason);
-				return { committed: false, cause: reason };
-			});
-		return this.#trackBackgroundPublication(task);
+		this.sessionManager.appendModeChange(mode, data);
+		return Promise.resolve({ committed: true });
 	}
 
 	/**
@@ -17983,115 +17659,36 @@ export class AgentSession {
 	}
 
 	/**
-	 * Persist one message from a synchronous call site.
+	 * Persist one message from a synchronous call site; throws inline when the append is refused.
 	 *
-	 * The legacy form throws inline as before. The shared form publishes in the background:
-	 * the caller cannot await a transaction, and a refusal must not abort the turn, so it
-	 * returns the real outcome, keeps the message visible in agent state, and logs the cause.
-	 *
-	 * On the shared path `onCommitted` fires only after the entry committed, so it means the
-	 * entry is durable. On the legacy path it fires right after `SessionManager.appendMessage`,
-	 * which only admits the entry: `_persist` deliberately returns before writing a transcript
-	 * until the session is ensured on disk or holds its first assistant entry. A legacy
-	 * callback therefore means "recorded in this session's graph", not "durable after a reload".
-	 *
-	 * On the shared path the callback runs after the durable write. A synchronous throw is
-	 * reported through the operator-notice seam and structured log, not treated as a refusal
-	 * or a reason to publish again. The task tracks callback invocation only; callbacks must
-	 * be synchronous and their return values are ignored.
+	 * `onCommitted` fires right after `SessionManager.appendMessage`, which only admits the
+	 * entry: `_persist` deliberately returns before writing a transcript until the session is
+	 * ensured on disk or holds its first assistant entry. The callback therefore means
+	 * "recorded in this session's graph", not "durable after a reload".
 	 */
 	#publishMessageInBackground(
-		label: string,
 		message: SessionPersistedMessage,
 		onCommitted?: () => void,
 	): Promise<BackgroundPublicationResult> {
-		if (!this.#usesSharedSessionPublication()) {
-			this.sessionManager.appendMessage(message);
-			onCommitted?.();
-			return Promise.resolve({ committed: true });
-		}
-		const publication = this.#publishInBackground(label, () =>
-			this.sessionManager.appendMessageSharingSession(message),
-		);
-		return this.#trackBackgroundPublication(
-			publication.then(result => {
-				if (result.committed) {
-					try {
-						onCommitted?.();
-					} catch (error) {
-						this.#reportBackgroundFollowUpFailure(label, error);
-					}
-				}
-				return result;
-			}),
-		);
-	}
-
-	/**
-	 * Report a completion callback that threw after its entry was already durable.
-	 *
-	 * The entry is saved and must not be published again, so this is neither a refusal nor
-	 * an uncertainty: the operator only needs to know the follow-up step did not run.
-	 */
-	#reportBackgroundFollowUpFailure(operation: string, error: unknown): void {
-		logger.warn("A durable shared publication's completion callback failed", {
-			operation,
-			error: safeErrorDescription(error),
-		});
-		if (this.#isDisposed) return;
-		this.emitNotice(
-			"warning",
-			`Saved the ${operation} to this session, but its completion step failed.`,
-			"session-publication",
-		);
+		this.sessionManager.appendMessage(message);
+		onCommitted?.();
+		return Promise.resolve({ committed: true });
 	}
 
 	/**
 	 * Persist one deferred command result and throw when it was not committed.
 	 *
 	 * The deferred flush must be able to tell "not persisted" apart from "persisted" so it
-	 * can keep the entry queued for retry and withhold `onPersisted`. A background publish
-	 * cannot express that, so this path awaits the lease and converts every non-committed
-	 * outcome into a throw carrying the cause. An `unknown` outcome may already be durable,
-	 * so it throws a {@link SharedControlPublicationError} with code `unknown` that carries
-	 * the attempted id: the caller must never re-append it under a new id.
+	 * can keep the entry queued for retry and withhold `onPersisted`; every failed save is
+	 * reported, so a row the caller drops is never dropped silently.
 	 */
 	async #persistExecutionMessage(label: string, message: SessionPersistedMessage): Promise<void> {
-		// Every failed save is reported, so a row the caller drops is never dropped silently.
-		const reportThrown = (error: unknown): never => {
+		try {
+			this.sessionManager.appendMessage(message);
+		} catch (error) {
 			this.#reportBackgroundRefusal(label, error instanceof Error ? error.message : String(error));
 			throw error;
-		};
-		if (!this.#usesSharedSessionPublication()) {
-			try {
-				this.sessionManager.appendMessage(message);
-			} catch (error) {
-				reportThrown(error);
-			}
-			return;
 		}
-		const outcome = await this.#trackBackgroundPublication(
-			this.sessionManager.appendMessageSharingSession(message),
-		).catch(reportThrown);
-		if (outcome.kind === "unknown") {
-			// The entry may already be durable: do not report it as unsaved.
-			if (!this.#isDisposed)
-				this.emitNotice(
-					"warning",
-					`The ${label} may not have been saved to this session (outcome unknown).`,
-					"session-publication",
-				);
-		} else if (outcome.kind !== "committed") {
-			const cause = describeSharedAppendFailure(outcome);
-			this.#reportBackgroundRefusal(label, cause.reason ?? cause.outcome);
-		}
-		if (outcome.kind === "unknown")
-			throw new SharedControlPublicationError(`record the ${label}`, {
-				kind: "unknown",
-				ids: [outcome.id],
-				error: outcome.error,
-			});
-		assertSharedAppendCommitted(`Shared ${label} append`, outcome);
 	}
 
 	/**
@@ -18372,24 +17969,6 @@ export class AgentSession {
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
 		let waitedForAbortUnwind = false;
-		const busyInputCancellationGeneration = this.#promptPreflightCancellationGeneration;
-		const commitBusyWorkflowIntent = async () => {
-			if (!workflowIntentDiff || !this.#usesSharedSessionPublication()) return;
-			// A busy predecessor may become idle while publication awaits. Its normal
-			// generation change is not cancellation: the queue helpers admit a follow-up
-			// against the current state rather than pretending the old run remains live.
-			const assertCurrent = () => {
-				if (
-					options?.preflightSignal?.aborted ||
-					this.#promptPreflightCancellationGeneration !== busyInputCancellationGeneration
-				)
-					throw promptPreflightCancelledError();
-			};
-			assertCurrent();
-			await this.#appendSharedWorkflowIntentDiff(workflowIntentDiff, assertCurrent);
-			assertCurrent();
-			this.#assertExternalSessionIngress();
-		};
 		if (this.#abortUnwind) {
 			// A LATER abort admitted while this prompt waited keeps abort terminal:
 			// the successor is refused instead of refreshing its generation and
@@ -18418,12 +17997,11 @@ export class AgentSession {
 				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 			}
 			if (this.#eagerDelegationDirty) throw new Error("Session delegation is not ready");
-			if (workflowIntentDiff && this.#usesSharedSessionPublication()) await commitBusyWorkflowIntent();
 			await this.#queueSteer(expandedText, options?.images, {
 				claimsGenuineUserIntent,
 				forceOneAtATime: options.steerQueuePolicy === "sequential",
 			});
-			if (workflowIntentDiff && !this.#usesSharedSessionPublication()) {
+			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -18453,7 +18031,6 @@ export class AgentSession {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
-			if (workflowIntentDiff && this.#usesSharedSessionPublication()) await commitBusyWorkflowIntent();
 			if (options.streamingBehavior === "followUp") {
 				await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
 					forceOneAtATime: options.followUpQueuePolicy === "sequential",
@@ -18465,7 +18042,7 @@ export class AgentSession {
 					forceOneAtATime: options.steerQueuePolicy === "sequential",
 				});
 			}
-			if (workflowIntentDiff && !this.#usesSharedSessionPublication()) {
+			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
 			this.#assertExternalSessionIngress();
@@ -18488,7 +18065,6 @@ export class AgentSession {
 					options.preflightSignal?.aborted !== true &&
 					!this.#abortUnwind
 				) {
-					if (workflowIntentDiff && this.#usesSharedSessionPublication()) await commitBusyWorkflowIntent();
 					admission.release();
 					if (options.streamingBehavior === "followUp") {
 						await this.#queueFollowUpTextAfterReservation(expandedText, options?.images, {
@@ -18501,7 +18077,7 @@ export class AgentSession {
 							forceOneAtATime: options.steerQueuePolicy === "sequential",
 						});
 					}
-					if (workflowIntentDiff && !this.#usesSharedSessionPublication()) {
+					if (workflowIntentDiff) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 					}
 					this.#assertExternalSessionIngress();
@@ -18834,6 +18410,11 @@ export class AgentSession {
 		this.#assertNoHandoffTransition();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
+		const ownershipGate = this.#sessionOwnershipTurnGate();
+		if (ownershipGate) {
+			await ownershipGate;
+			if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		}
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
@@ -19249,17 +18830,6 @@ export class AgentSession {
 					this.#assertExternalSessionIngress({ allowCancelAndSubmit: true });
 				},
 				onAccepted: () => {
-					// The shared workflow record must commit before the prompt starts or its
-					// canonical user message advances the branch. Other hosts retain sync admission.
-					if (options?.workflowIntentDiff && this.#usesSharedSessionPublication()) {
-						return (async () => {
-							await this.#appendSharedWorkflowIntentDiff(options.workflowIntentDiff!, () =>
-								this.#throwIfPromptPreflightCancelled(generation, preflightSignal),
-							);
-							this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
-							if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
-						})();
-					}
 					// A new root prompt alone decides which request, if any, its turn's recap summarizes.
 					if (options?.resetRetryReplaySafety) this.#admitSessionRecapRequest(promptMessage);
 					if (options?.workflowIntentDiff)
@@ -21469,12 +21039,9 @@ export class AgentSession {
 		compactionEntryId: string,
 		firstKeptEntryId: string,
 		fromExtension?: boolean,
-		sharedAppendOnly = false,
 	): Promise<CompactionEntry | undefined> {
-		if (!sharedAppendOnly) {
-			const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
-			if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
-		}
+		const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages, {
 			historyRewrite: { reason: "compaction", preserveSeededPrefix: true },
@@ -22588,6 +22155,8 @@ export class AgentSession {
 		if (options?.drop) {
 			try {
 				this.sessionManager.assertLegacyMutationAllowed("drop session");
+				// On the legacy route, a transcript another process changed is not this opener's to delete.
+				this.sessionManager.assertTranscriptUnchanged();
 			} catch (error) {
 				return Promise.reject(error);
 			}
@@ -22899,16 +22468,12 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		// A context clear appends a parentless root marker. A shared session publishes that
-		// root through the common admitted control publication before resetting anything
-		// (#7824); a legacy session keeps the legacy refusal. Adoption while the turn is
-		// aborted refuses before the reset rather than switching protocols mid-clear.
-		// A transcript that already refuses writes is refused before the agent reset,
-		// which would otherwise drop the in-memory history and then fail at the flush.
+		// A context clear appends a parentless root marker; the legacy refusal runs before
+		// resetting anything. A transcript that already refuses writes is refused before the
+		// agent reset, which would otherwise drop the in-memory history and then fail at the flush.
 		this.#assertTranscriptAcceptsTurn();
 		const operation = "clear context";
 		const assertMode = this.#controlPublicationModeFence(operation);
-		const sharedPublication = this.#usesSharedSessionPublication();
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -22923,17 +22488,7 @@ export class AgentSession {
 			this.#closeAllProviderSessions("context clear");
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
-			// Shared admission may have latched while the turn was aborted and settled.
 			assertMode();
-			if (sharedPublication) {
-				const committed = await this.#publishSharedContextClear(operation, sessionId, assertMode);
-				try {
-					this.#applyContextClear(sessionId);
-				} catch (error) {
-					return this.#failClosedSharedControl(operation, committed, error);
-				}
-				return true;
-			}
 			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
@@ -22961,82 +22516,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * Publish the shared `/clear` root and its carried-over model, thinking, tier and
-	 * profile-ownership intent as one admitted append at this opener's cursor. The root
-	 * is parentless, so the earlier branch and any unseen sibling stay in the transcript;
-	 * nothing is rewritten. Throws before any live reset unless the entries committed.
-	 */
-	async #publishSharedContextClear(
-		operation: string,
-		sessionId: string,
-		assertMode: () => void,
-	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
-		// Entries already handed to background publication belong to the cleared branch.
-		await this.#joinBackgroundPublications();
-		assertMode();
-		const manager = this.sessionManager;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const model = this.model;
-		const thinkingLevel = this.thinkingLevel;
-		const serviceTier = this.serviceTier ?? null;
-		const entries: SharedControlEntry[] = [
-			...manager.contextClearControlEntries({ sessionId }),
-			{ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false },
-		];
-		if (model) entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "default" });
-		entries.push({ type: "service_tier_change", serviceTier });
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.sessionId === sessionId &&
-				manager.getSessionId() === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.model === model &&
-				this.thinkingLevel === thinkingLevel &&
-				(this.serviceTier ?? null) === serviceTier
-			);
-		};
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() => manager.appendControlEntriesSharingSession(entries, current),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-		if (!current()) return this.#failClosedSharedControl(operation, outcome);
-		return outcome;
-	}
-
-	/** The live half of a committed shared `/clear`; its transcript entries are already durable. */
-	#applyContextClear(sessionId: string): void {
-		this.#commitSessionTransition();
-		this.agent.reset();
-		this.setTodoPhases([]);
-		this.#syncAgentSessionId(sessionId);
-		this.#steeringMessages = [];
-		this.#followUpMessages = [];
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#todoReminderCount = 0;
-		this.#planReferenceSent = false;
-		this.#planReferencePath = "local://PLAN.md";
-	}
-
-	/**
 	 * Generate and conditionally apply a title for the first accepted text input.
 	 * Call independently of prompt delivery, before the first user message is recorded.
 	 * A host retiring this session must abort signal synchronously before retirement.
 	 */
 	async generateAutoSessionTitle(text: string, options?: { signal?: AbortSignal }): Promise<AutoSessionTitleResult> {
-		const sharedPublication = this.#usesSharedSessionPublication();
 		const manager = this.sessionManager;
 		const sessionId = this.sessionId;
 		const managerId = manager.getSessionId();
@@ -23093,24 +22577,7 @@ export class AgentSession {
 			if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return { kind: "skipped", reason: "disabled" };
 			if (!title) return { kind: "skipped", reason: "unavailable" };
 			if (manager.getSessionName()) return { kind: "skipped", reason: "named" };
-			if (this.#usesSharedSessionPublication() !== sharedPublication)
-				throw new Error("Session publication protocol changed while generating title");
 			let committedTitle = "";
-			if (sharedPublication) {
-				const outcome = await this.#withStartedSharedControlPublication(
-					() => {
-						if (stale()) throw new SessionTitlePersistenceStaleError();
-					},
-					() =>
-						manager.setSessionNameSharingSession(title, "auto", {
-							isCurrent: () => !stale(),
-							onlyIfUnnamed: true,
-						}),
-				);
-				if (outcome.kind === "committed") return { kind: "applied", title: outcome.title };
-				if (outcome.kind === "skipped") return { kind: "skipped", reason: outcome.reason };
-				throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
-			}
 			const applied = await manager.setSessionName(title, "auto", {
 				isCurrent: () => !stale(),
 				onlyIfUnnamed: true,
@@ -23133,23 +22600,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
-		if (!this.#usesSharedSessionPublication()) return this.sessionManager.setSessionName(name, source);
-		const manager = this.sessionManager;
-		const sessionId = manager.getSessionId();
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () =>
-			this.sessionManager === manager &&
-			manager.getSessionId() === sessionId &&
-			manager.getSessionIdentityGeneration() === identityGeneration;
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current()) throw new SessionTitlePersistenceStaleError();
-			},
-			() => manager.setSessionNameSharingSession(name, source, { isCurrent: current }),
-		);
-		if (outcome.kind === "committed") return true;
-		if (outcome.kind === "skipped") return false;
-		throw new Error(`Shared session title publication ${outcome.kind}`, { cause: outcome });
+		return this.sessionManager.setSessionName(name, source);
 	}
 
 	/**
@@ -23408,10 +22859,6 @@ export class AgentSession {
 			);
 			return;
 		}
-		// Internal role/cause writes have no shared publication protocol: refuse before any
-		// live effect rather than mutate the model and then hit the legacy append guard.
-		if (this.#usesSharedSessionPublication())
-			throw new SharedSessionMutationUnsupportedError(`set ${role} model (${options?.cause ?? "user-selection"})`);
 		this.sessionManager.assertLegacyMutationAllowed("set model");
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
@@ -23908,22 +23355,9 @@ export class AgentSession {
 						return { applied: false, settingsChanged: false, modelsChanged: false, changedSettings: [] };
 					}
 
-					// A shared session publishes the profile/live-model transcript entries through the
-					// common admitted control publication before settings, catalog or live model
-					// publication (#7824); a legacy session keeps the synchronous legacy writes.
-					let sharedReload: CommittedModelProfileSessionPublication | undefined;
 					if (prepared || preparedLiveModelSelection) {
 						try {
-							if (this.#usesSharedSessionPublication()) {
-								sharedReload = await this.#publishSharedConfigurationReload(
-									prepared,
-									preparedLiveModelSelection,
-									{ preserveDefaultModelSelection, preserveLiveModelSelection },
-									() => stagedModels?.isCurrent() === true && !reloadSignal.aborted,
-								);
-							} else {
-								this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
-							}
+							this.sessionManager.assertLegacyAppendAllowed("reload model profile configuration");
 						} catch (error) {
 							stagedModels!.rollback();
 							modelRollbackAttempted = true;
@@ -23942,22 +23376,12 @@ export class AgentSession {
 							stagedModels!.commit();
 							if (prepared) {
 								activationPublicationStarted = true;
-								publishPreparedModelProfileActivation(
-									prepared,
-									{
-										preserveDefaultModelSelection,
-										preserveLiveModelSelection,
-									},
-									sharedReload,
-								);
-							} else if (sharedReload) {
-								this.publishCommittedModelProfileSessionState(
-									sharedReload.plan,
-									sharedReload.receipt,
-									sharedReload.selection,
-								);
+								publishPreparedModelProfileActivation(prepared, {
+									preserveDefaultModelSelection,
+									preserveLiveModelSelection,
+								});
 							}
-							if (preparedLiveModelSelection && !sharedReload) {
+							if (preparedLiveModelSelection) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
 								this.commitPreparedProfileModelSelection(preparedLiveModelSelection, mutationRevision => {
@@ -23970,34 +23394,6 @@ export class AgentSession {
 						publication.finalize();
 						modelCommitSucceeded = true;
 					} catch (error) {
-						if (sharedReload) {
-							// The transcript already holds the reload's intent: restore only the
-							// process-wide settings and catalog, never compensate the session over its
-							// admitted write. The session is closed instead.
-							const rollbackErrors: unknown[] = [];
-							try {
-								publication?.rollback();
-							} catch (rollbackError) {
-								rollbackErrors.push(rollbackError);
-							}
-							if (modelCommitStarted) {
-								try {
-									stagedModels!.rollback();
-								} catch (rollbackError) {
-									rollbackErrors.push(rollbackError);
-								}
-								modelRollbackAttempted = true;
-							}
-							try {
-								this.#failClosedSharedControl(
-									"reload model profile configuration",
-									sharedReload.receipt,
-									rollbackErrors.length > 0 ? new AggregateError([error, ...rollbackErrors]) : error,
-								);
-							} catch (closed) {
-								throw new ConfigurationReloadError("PUBLICATION_FAILED", closed);
-							}
-						}
 						const rollbackErrors: unknown[] = [];
 						if (liveModelSelectionCommitted && committedThinkingLevelLiveMutationRevision === undefined) {
 							committedThinkingLevelLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
@@ -24614,8 +24010,7 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
-		const sharedPublication = this.usesSharedControlPublication();
-		if (!sharedPublication) this.sessionManager.assertLegacyMutationAllowed("select model profile");
+		this.sessionManager.assertLegacyMutationAllowed("select model profile");
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		this.#assertSessionAdmissionOpen();
@@ -24679,9 +24074,7 @@ export class AgentSession {
 			}
 		};
 		const assertRuntime = () => {
-			if (this.usesSharedControlPublication() !== sharedPublication)
-				throw new Error("Session publication protocol changed while selecting profile");
-			if (!sharedPublication) this.sessionManager.assertLegacyMutationAllowed("select model profile");
+			this.sessionManager.assertLegacyMutationAllowed("select model profile");
 			assertBound();
 			if (!util.isDeepStrictEqual(captureRuntime(), expectedRuntime))
 				throw new Error("Session model, thinking, or role intent changed while selecting profile");
@@ -24785,26 +24178,6 @@ export class AgentSession {
 				},
 			);
 		} catch (error) {
-			const sharedOutcome = prepared?.sharedPublicationOutcome;
-			if (sharedOutcome?.kind === "committed" || sharedOutcome?.kind === "unknown") {
-				if (error instanceof ModelProfileApplyCommittedError || error instanceof ModelProfilePublicationError)
-					throw error;
-				try {
-					void this.dispose().catch(disposalError => {
-						logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
-					});
-				} catch (disposalError) {
-					logger.warn("Committed profile session teardown failed", { error: String(disposalError) });
-				}
-				const failure = new ModelProfilePublicationError(sharedOutcome, error);
-				if (prepared?.committedOwnership)
-					throw new ModelProfileApplyCommittedError(
-						prepared.profileName,
-						prepared.committedOwnership.version,
-						failure,
-					);
-				throw failure;
-			}
 			if (prepared?.committedOwnership && !(error instanceof ModelProfileApplyCommittedError)) {
 				try {
 					void this.dispose().catch(disposalError => {
@@ -24896,76 +24269,6 @@ export class AgentSession {
 	 */
 	assertConfiguredModelChainWritable(): void {
 		this.sessionManager.assertLegacyAppendAllowed("set configured model chain");
-	}
-
-	/**
-	 * Persist a configured chain on behalf of a control that already committed its durable
-	 * settings. A shared session publishes the chain through the common admitted control
-	 * publication before the runtime fallback controller changes (#7824); a legacy session
-	 * appends it as {@link setConfiguredModelChain} does. `isCurrent` is the caller's own
-	 * currentness fence and is re-checked under the publication lease.
-	 */
-	async setConfiguredModelChainForControl(
-		role: string,
-		entries: readonly string[],
-		origin: string,
-		identity: string | undefined,
-		explicitHead: boolean,
-		isCurrent: () => boolean,
-	): Promise<void> {
-		const operation = "set configured model chain";
-		const assertMode = this.#controlPublicationModeFence(operation);
-		if (!this.#usesSharedSessionPublication()) {
-			this.setConfiguredModelChain(role, entries, origin, identity, explicitHead);
-			return;
-		}
-		const manager = this.sessionManager;
-		const sessionId = this.sessionId;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.sessionId === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				isCurrent()
-			);
-		};
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() =>
-				manager.appendControlEntriesSharingSession(
-					[
-						{
-							type: "configured_model_chain",
-							chain: {
-								role,
-								entries: [...entries],
-								origin,
-								identity,
-								explicitHead,
-								cleared: entries.length === 0,
-							},
-						},
-					],
-					current,
-				),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-		if (!current()) return this.#failClosedSharedControl(operation, outcome);
-		if (role === "default") {
-			this.#defaultFallbackController = undefined;
-			this.#defaultFallbackExhaustedLastTurn = false;
-		}
 	}
 
 	/** Persist the configured fallback selectors for a model role. */
@@ -25104,261 +24407,6 @@ export class AgentSession {
 	}
 
 	/**
-	 * A user's per-session default model choice (ACP/SDK `model.set`) in a shared session.
-	 * The resume default, effective thinking and configured chain are published as one
-	 * admitted append before any live model, thinking or profile state changes.
-	 */
-	async #setSharedSessionDefaultModel(
-		model: Model,
-		thinkingLevel: ThinkingLevel | undefined,
-		options: {
-			signal?: AbortSignal;
-			shouldMutate?: () => boolean;
-			onMutationStarted?: () => void;
-			cause?: ModelChangeCause;
-		},
-	): Promise<void> {
-		const operation = "set session model";
-		const assertMode = this.#controlPublicationModeFence(operation);
-		if (options.signal?.aborted) return;
-		const manager = this.sessionManager;
-		const expectedSessionId = this.sessionId;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
-		const thinkingRevision = this.#thinkingLevelMutationRevision;
-		const observedAtRequest = readDurableModelProfileOwnership(this.settings);
-		const previousEditMode = this.#resolveActiveEditMode();
-		const selector = `${model.provider}/${model.id}`;
-		let committedOwnership: DurableModelProfileOwnership | undefined;
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!options.signal?.aborted &&
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.sessionId === expectedSessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.#defaultModelSelectionMutationRevision === expectedMutationRevision &&
-				this.#thinkingLevelMutationRevision === thinkingRevision &&
-				options.shouldMutate?.() !== false &&
-				(!committedOwnership ||
-					util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), committedOwnership))
-			);
-		};
-		const assertCurrent = () => {
-			if (!current()) throw new Error("Session changed while selecting model");
-		};
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-		if (options.signal?.aborted) return;
-		assertCurrent();
-		if (!apiKey) throw new Error(`No API key for ${selector}`);
-		if (options.shouldMutate && !options.shouldMutate()) return;
-		options.onMutationStarted?.();
-		const requestedLevel = thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel;
-		const effectiveLevel = resolveThinkingLevelForModel(model, requestedLevel);
-		let materialized = false;
-		if (observedAtRequest.marker.kind === "profile") {
-			const patches = this.#concreteDefaultModelSelectionPatches(model, effectiveLevel);
-			materialized = patches.some(patch => patch.path === "modelRoles");
-			committedOwnership = (
-				await commitDurableModelProfileOwnershipWithResult(
-					this.settings,
-					{ kind: "cleared" },
-					patches,
-					assertCurrent,
-					observedAtRequest,
-				)
-			).ownership;
-		}
-		// A durable ownership winner is never rewound: any later failure closes the session.
-		const failAfterOwnership = (error: unknown): never => {
-			void this.dispose().catch(disposalError =>
-				logger.warn("Committed model teardown failed", { error: String(disposalError) }),
-			);
-			throw new ModelProfileApplyCommittedError(selector, committedOwnership!.version, error);
-		};
-		const entries: SharedControlEntry[] = [{ type: "model_change", model: selector, role: "default" }];
-		if (effectiveLevel !== this.#thinkingLevel)
-			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
-		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
-		entries.push({
-			type: "configured_model_chain",
-			chain: {
-				role: "default",
-				entries: [formatModelSelectorValue(selector, requestedLevel)],
-				origin,
-				explicitHead: true,
-				cleared: false,
-			},
-		});
-		let outcome: SharedEntriesAppendOutcome;
-		try {
-			outcome = await this.#withStartedSharedControlPublication(assertCurrent, () =>
-				manager.appendControlEntriesSharingSession(entries, current),
-			);
-		} catch (error) {
-			if (committedOwnership) return failAfterOwnership(error);
-			throw error;
-		}
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") {
-			const error = new SharedControlPublicationError(operation, outcome);
-			if (committedOwnership) return failAfterOwnership(error);
-			throw error;
-		}
-		try {
-			assertCurrent();
-			const isUserSelection = options.cause !== "startup-override";
-			if (isUserSelection) this.markUserModelSelection();
-			this.#btwPrefixLedger.clear();
-			this.#setModelAuthoritatively(model, isUserSelection ? "user-selection" : "startup-override");
-			this.#unavailableModelProfile = undefined;
-			if (isUserSelection) this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
-			this.#seedSessionCanonicalVariant(model);
-			if (isUserSelection) this.#recordUserCanonicalVariantSelection();
-			this.#applyThinkingLevel(requestedLevel, false, false, undefined, true);
-			this.#publishConcreteDefaultProfileState(materialized);
-			this.#defaultFallbackController = undefined;
-			this.#defaultFallbackExhaustedLastTurn = false;
-		} catch (error) {
-			return this.#failClosedSharedControl(operation, outcome, error);
-		}
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
-	}
-
-	async #setSharedTemporaryModel(
-		model: Model,
-		thinkingLevel: ThinkingLevel | undefined,
-		options: {
-			reason?: TemporaryModelReason;
-			providerSessionScope?: TemporaryProviderSessionScope;
-			signal?: AbortSignal;
-			shouldMutate?: () => boolean;
-			onMutationStarted?: () => void;
-		},
-	): Promise<TemporaryProviderSessionScope | undefined> {
-		const manager = this.sessionManager;
-		const sessionId = manager.getSessionId();
-		const file = manager.getSessionFile();
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const generation = this.#sessionTransitionGeneration;
-		const previousModel = this.model;
-		const previousThinking = this.#thinkingLevel;
-		const contextGeneration = this.#reasoningControlContextGeneration;
-		const thinkingRevision = this.#thinkingLevelMutationRevision;
-		const selectionRevision = this.#defaultModelSelectionMutationRevision;
-		let userRevision = this.#userModelSelectionRevision;
-		const scopes = [...this.#temporaryProviderSessionScopes];
-		const supplied = options.providerSessionScope;
-		const current = () =>
-			!options.signal?.aborted &&
-			!this.#isDisposed &&
-			!this.#sessionAdmissionClosing &&
-			!this.#sessionAdmissionClosed &&
-			this.#sessionTransitionKind === undefined &&
-			this.#sessionTransitionGeneration === generation &&
-			this.sessionManager === manager &&
-			manager.getSessionId() === sessionId &&
-			manager.getSessionFile() === file &&
-			manager.getSessionIdentityGeneration() === identityGeneration &&
-			this.model === previousModel &&
-			this.#thinkingLevel === previousThinking &&
-			this.#reasoningControlContextGeneration === contextGeneration &&
-			this.#thinkingLevelMutationRevision === thinkingRevision &&
-			this.#defaultModelSelectionMutationRevision === selectionRevision &&
-			this.#userModelSelectionRevision === userRevision &&
-			this.#temporaryProviderSessionScopes.length === scopes.length &&
-			this.#temporaryProviderSessionScopes.every((scope, index) => scope === scopes[index]) &&
-			(!supplied || scopes.at(-1)?.token === supplied) &&
-			options.shouldMutate?.() !== false;
-		const assertCurrent = () => {
-			if (!current()) throw new Error("Shared temporary model selection superseded");
-		};
-		assertCurrent();
-		const previousEditMode = this.#resolveActiveEditMode();
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-		assertCurrent();
-		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-		options.onMutationStarted?.();
-		userRevision = this.#userModelSelectionRevision;
-		assertCurrent();
-		const oldAuto = !supplied && scopes.at(-1)?.autoOwned ? scopes.at(-1) : undefined;
-		const baselineModel = oldAuto ? oldAuto.model : previousModel;
-		const baselineThinking = oldAuto ? oldAuto.thinkingLevel : previousThinking;
-		const desiredThinking = resolveThinkingLevelForModel(
-			model,
-			thinkingLevel ?? model.thinking?.defaultLevel ?? baselineThinking,
-		);
-		let scope: TemporaryProviderSessionScope | undefined;
-		const promotion = await this.#withStartedSharedControlPublication(assertCurrent, async () => {
-			const outcome = await manager.appendTemporaryModelChangeSharingSession(
-				`${model.provider}/${model.id}`,
-				desiredThinking !== baselineThinking ? { level: desiredThinking } : undefined,
-				current,
-			);
-			if (outcome.kind !== "committed")
-				throw new Error(
-					`Shared temporary model publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted IDs: ${outcome.ids.join(", ")})` : ""}`,
-					{ cause: outcome },
-				);
-			if (!current() || manager.getLeafId() !== outcome.ids.at(-1))
-				throw new Error("Committed shared temporary model selection superseded", { cause: outcome });
-			// No await between scope restoration and live publication. The supplied token remains caller-owned.
-			try {
-				if (oldAuto) this.#restoreTopTemporaryProviderSessionScopeSync();
-				if (supplied) scope = supplied;
-				else if (!baselineModel || !modelsAreEqual(baselineModel, model))
-					scope = this.#beginTemporaryProviderSessionScope(options.reason ?? "other", true);
-				this.#btwPrefixLedger.clear();
-				this.#setAgentModelWithReasoningContext(model);
-				this.#syncAppendOnlyContext(model);
-				this.recordModelSelectionUsage(model, this.beginModelSelectionUsage());
-				this.#applyThinkingLevel(desiredThinking, false, false, undefined, true);
-				return {
-					ids: outcome.ids,
-					contextGeneration: this.#reasoningControlContextGeneration,
-					thinkingRevision: this.#thinkingLevelMutationRevision,
-				};
-			} catch (error) {
-				throw new Error("Committed shared temporary model promotion failed", {
-					cause: { ids: outcome.ids, error },
-				});
-			}
-		});
-		try {
-			await this.#syncEditToolModeAfterModelChange(previousEditMode);
-			if (
-				options.signal?.aborted ||
-				this.#isDisposed ||
-				this.#sessionAdmissionClosing ||
-				this.#sessionAdmissionClosed ||
-				this.sessionManager !== manager ||
-				manager.getSessionId() !== sessionId ||
-				manager.getSessionFile() !== file ||
-				manager.getSessionIdentityGeneration() !== identityGeneration ||
-				this.#sessionTransitionGeneration !== generation ||
-				this.model !== model ||
-				this.#reasoningControlContextGeneration !== promotion.contextGeneration ||
-				this.#thinkingLevelMutationRevision !== promotion.thinkingRevision ||
-				this.#userModelSelectionRevision !== userRevision ||
-				options.shouldMutate?.() === false ||
-				(scope && this.#temporaryProviderSessionScopes.at(-1)?.token !== scope)
-			) {
-				throw new Error("Shared temporary model changed after committed publication");
-			}
-		} catch (error) {
-			throw new Error("Committed shared temporary model edit synchronization failed", {
-				cause: { ids: promotion.ids, error },
-			});
-		}
-		return scope;
-	}
-
-	/**
 	 * Set model temporarily (for this session only).
 	 * Validates API key and saves to the session log. Internal temporary changes
 	 * never write settings; an explicit user resume-default choice atomically
@@ -25386,20 +24434,6 @@ export class AgentSession {
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
-		if (
-			this.#usesSharedSessionPublication() &&
-			!options?.persistAsSessionDefault &&
-			(options?.cause === undefined || options.cause === "temporary-operation")
-		) {
-			return this.#setSharedTemporaryModel(model, thinkingLevel, options ?? {});
-		}
-		if (
-			this.#usesSharedSessionPublication() &&
-			options?.persistAsSessionDefault === true &&
-			(options.cause === "user-selection" || options.cause === "startup-override")
-		) {
-			return this.#setSharedSessionDefaultModel(model, thinkingLevel, options);
-		}
 		if (options?.signal?.aborted) return;
 		this.sessionManager.assertLegacyMutationAllowed("set temporary model");
 		this.#btwPrefixLedger.clear();
@@ -25594,208 +24628,6 @@ export class AgentSession {
 		};
 	}
 
-	/** All migrated controls and canonical messages share one publication protocol. */
-	usesSharedControlPublication(): boolean {
-		return this.#usesSharedSessionPublication();
-	}
-
-	withModelProfilePublication<T>(assertCurrent: () => void, body: () => Promise<T>): Promise<T> {
-		return this.#withStartedSharedControlPublication(assertCurrent, () =>
-			this.sessionManager.withSharedThinkingControl(async () => {
-				assertCurrent();
-				return body();
-			}),
-		);
-	}
-
-	async appendModelProfileActivationForControl(
-		plan: ModelProfileTranscriptPlan,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		const manager = this.sessionManager;
-		const sessionId = this.sessionId;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const parent = manager.getLeafId();
-		const snapshot = structuredClone(plan);
-		const outcome = await manager.appendModelProfileActivationSharingSession(
-			snapshot,
-			() =>
-				this.sessionManager === manager &&
-				this.sessionId === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				isCurrent(),
-		);
-		if (outcome.kind === "committed") {
-			this.#profilePublicationReceipts.set(outcome, {
-				manager,
-				sessionId,
-				identityGeneration,
-				parent,
-				leaf: outcome.ids.at(-1) ?? parent,
-				ids: [...outcome.ids],
-				plan: snapshot,
-			});
-		}
-		return outcome;
-	}
-
-	/**
-	 * Publish a configuration reload's profile and live-model transcript entries as one
-	 * admitted append, before any settings, catalog or live model publication (#7824).
-	 * The receipt is consumed by the reload's synchronous publication step.
-	 */
-	async #publishSharedConfigurationReload(
-		prepared: PreparedModelProfileActivation | undefined,
-		liveSelection: PreparedProfileModelSelection | undefined,
-		options: { preserveDefaultModelSelection: boolean; preserveLiveModelSelection: boolean },
-		isCurrent: () => boolean,
-	): Promise<CommittedModelProfileSessionPublication> {
-		const operation = "reload model profile configuration";
-		const assertMode = this.#controlPublicationModeFence(operation);
-		const plan: ModelProfileTranscriptPlan = prepared ? buildModelProfileTranscriptPlan(prepared, options) : {};
-		if (liveSelection) {
-			if (plan.temporaryModel !== undefined)
-				throw new Error("Configuration reload prepared both a profile and a live model selection");
-			plan.temporaryModel = `${liveSelection.model.provider}/${liveSelection.model.id}`;
-			plan.thinking = { level: liveSelection.committedThinkingLevel };
-		}
-		// Entries already handed to background publication precede the reload's intent.
-		await this.#joinBackgroundPublications();
-		const manager = this.sessionManager;
-		const sessionId = this.sessionId;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () => {
-			try {
-				assertMode();
-				if (liveSelection) this.#assertPreparedProfileModelSelectionCurrent(liveSelection);
-				if (prepared?.preparedDefaultModelSelection && plan.temporaryModel !== undefined)
-					this.#assertPreparedProfileModelSelectionCurrent(prepared.preparedDefaultModelSelection);
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.sessionId === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				isCurrent()
-			);
-		};
-		const outcome = await this.withModelProfilePublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() => this.appendModelProfileActivationForControl(plan, current),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-		if (!current()) return this.#failClosedSharedControl(operation, outcome);
-		return { plan, receipt: outcome, selection: liveSelection };
-	}
-
-	/** Consume only a receipt issued by this session for these exact committed entries. */
-	publishCommittedModelProfileSessionState(
-		plan: ModelProfileTranscriptPlan,
-		receipt: Extract<SharedEntriesAppendOutcome, { kind: "committed" }>,
-		selection?: PreparedProfileModelSelection,
-	): void {
-		const admitted = this.#profilePublicationReceipts.get(receipt);
-		const manager = this.sessionManager;
-		if (
-			!admitted ||
-			admitted.manager !== manager ||
-			admitted.sessionId !== this.sessionId ||
-			admitted.identityGeneration !== manager.getSessionIdentityGeneration() ||
-			admitted.leaf !== manager.getLeafId() ||
-			!util.isDeepStrictEqual(admitted.plan, plan) ||
-			!util.isDeepStrictEqual(admitted.ids, receipt.ids) ||
-			this.#isDisposed ||
-			this.#sessionTransitionKind !== undefined
-		)
-			throw new Error("Invalid or stale model profile publication receipt");
-		const expected: Array<(entry: SessionEntry) => boolean> = [];
-		if (plan.configuredDefaultChain !== undefined) {
-			const chain = plan.configuredDefaultChain;
-			if (chain.role !== "default") throw new Error("Invalid model profile default chain");
-			expected.push(
-				entry =>
-					entry.type === "configured_model_chain" &&
-					entry.role === chain.role &&
-					util.isDeepStrictEqual(entry.entries, chain.entries) &&
-					entry.origin === chain.origin &&
-					entry.identity === chain.identity &&
-					entry.explicitHead === chain.explicitHead &&
-					entry.cleared === chain.cleared,
-			);
-		}
-		if (plan.temporaryModel !== undefined) {
-			if (
-				!selection ||
-				plan.temporaryModel !== `${selection.model.provider}/${selection.model.id}` ||
-				!plan.thinking ||
-				plan.thinking.level !== selection.committedThinkingLevel
-			)
-				throw new Error("Profile selection does not match committed transcript");
-			expected.push(
-				entry =>
-					entry.type === "model_change" &&
-					entry.role === "temporary" &&
-					entry.model === plan.temporaryModel &&
-					!entry.cleared,
-			);
-		} else if (selection) throw new Error("Profile selection lacks committed model intent");
-		if (plan.thinking !== undefined) {
-			if (
-				resolveThinkingLevelForModel(
-					selection?.model ?? this.model,
-					plan.thinking.level as ThinkingLevel | undefined,
-				) !== plan.thinking.level
-			)
-				throw new Error("Profile thinking does not match effective model thinking");
-			expected.push(
-				entry =>
-					entry.type === "thinking_level_change" &&
-					entry.thinkingLevel === (plan.thinking!.level ?? null) &&
-					!entry.operatorIntent,
-			);
-		}
-		if (plan.resumeDefault !== undefined) {
-			expected.push(
-				entry =>
-					entry.type === "model_change" &&
-					entry.role === "default" &&
-					(plan.resumeDefault!.selector === undefined
-						? entry.cleared === true && entry.model === ""
-						: !entry.cleared && entry.model === plan.resumeDefault!.selector),
-			);
-		}
-		if (expected.length !== receipt.ids.length) throw new Error("Incomplete profile publication receipt");
-		for (let index = 0; index < expected.length; index++) {
-			const entry = manager.getEntry(receipt.ids[index]!);
-			if (
-				!entry ||
-				!expected[index]!(entry) ||
-				entry.parentId !== (index === 0 ? admitted.parent : receipt.ids[index - 1])
-			)
-				throw new Error("Profile publication entries do not match receipt");
-		}
-		if (receipt.ids.length > 0 && receipt.ids.at(-1) !== admitted.leaf)
-			throw new Error("Profile publication cursor changed");
-		if (selection) this.#assertPreparedProfileModelSelectionCurrent(selection);
-		this.#profilePublicationReceipts.delete(receipt);
-		if (plan.configuredDefaultChain !== undefined) {
-			this.#defaultFallbackController = undefined;
-			this.#defaultFallbackExhaustedLastTurn = false;
-		}
-		if (selection) {
-			this.#setModelAuthoritatively(selection.model, "profile-activation");
-			this.#syncAppendOnlyContext(selection.model);
-		}
-		if (plan.thinking !== undefined)
-			this.#applyThinkingLevel(plan.thinking.level as ThinkingLevel | undefined, false, false, undefined, true);
-	}
-
 	commitPreparedProfileModelSelection(
 		prepared: PreparedProfileModelSelection,
 		onThinkingLevelApplied?: (mutationRevision: number) => void,
@@ -25861,9 +24693,6 @@ export class AgentSession {
 		thinkingLevel: ThinkingLevel | undefined,
 		durable?: ModelSelectionRollbackDurableState,
 	): Promise<void> {
-		// A shared session compensates through its own admitted publication (#7824).
-		if (this.#usesSharedSessionPublication())
-			return this.#restoreSharedModelSelectionForRollback(model, thinkingLevel, durable);
 		this.sessionManager.assertLegacyAppendAllowed("restore model selection");
 		if (durable?.defaultChain) {
 			const chain = durable.defaultChain.state;
@@ -25891,129 +24720,9 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
-	/**
-	 * Shared-session compensation for a failed selector transaction. It compares the
-	 * captured state with the current live and durable state and publishes only the
-	 * entries that actually differ, through the common admitted control publication,
-	 * before any live change. Nothing that differs means nothing is written or changed.
-	 * A refused publication changes nothing; an unknown one closes the session.
-	 */
-	async #restoreSharedModelSelectionForRollback(
-		model: Model | undefined,
-		thinkingLevel: ThinkingLevel | undefined,
-		durable: ModelSelectionRollbackDurableState | undefined,
-	): Promise<void> {
-		const operation = "restore model selection";
-		const assertMode = this.#controlPublicationModeFence(operation);
-		const manager = this.sessionManager;
-		const sessionId = this.sessionId;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const liveModel = this.model;
-		const liveThinking = this.#thinkingLevel;
-		const thinkingRevision = this.#thinkingLevelMutationRevision;
-		const entries: SharedControlEntry[] = [];
-		const targetChain = durable?.defaultChain?.state;
-		const chainChanges =
-			durable?.defaultChain !== undefined &&
-			!util.isDeepStrictEqual(
-				targetChain === undefined
-					? undefined
-					: {
-							entries: [...targetChain.entries],
-							origin: targetChain.origin,
-							identity: targetChain.identity,
-							explicitHead: targetChain.explicitHead ?? true,
-						},
-				this.getConfiguredModelChainState("default"),
-			);
-		if (chainChanges) {
-			const chainEntries = [...(targetChain?.entries ?? [])];
-			entries.push({
-				type: "configured_model_chain",
-				chain: {
-					role: "default",
-					entries: chainEntries,
-					origin: targetChain?.origin ?? "rollback",
-					identity: targetChain?.identity,
-					explicitHead: targetChain?.explicitHead ?? true,
-					cleared: chainEntries.length === 0,
-				},
-			});
-		}
-		const resumeDefault = durable?.resumeDefault;
-		if (resumeDefault && this.getSessionDefaultModelSelector() !== resumeDefault.selector) {
-			entries.push(
-				resumeDefault.selector === undefined
-					? { type: "model_role_clear", role: "default" }
-					: { type: "model_change", model: resumeDefault.selector, role: "default" },
-			);
-		}
-		const modelChanges = model !== liveModel;
-		if (model && modelChanges)
-			entries.push({ type: "model_change", model: `${model.provider}/${model.id}`, role: "temporary" });
-		const effectiveThinking = resolveThinkingLevelForModel(model, thinkingLevel);
-		if (effectiveThinking !== liveThinking)
-			entries.push({ type: "thinking_level_change", level: effectiveThinking, operatorIntent: false });
-		if (entries.length === 0 && !modelChanges) return;
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.sessionId === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.model === liveModel &&
-				this.#thinkingLevel === liveThinking &&
-				this.#thinkingLevelMutationRevision === thinkingRevision
-			);
-		};
-		let committed: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
-		if (entries.length > 0) {
-			const outcome = await this.#withStartedSharedControlPublication(
-				() => {
-					if (!current())
-						throw new SharedControlPublicationError(operation, {
-							kind: "rejected",
-							error: new Error("superseded"),
-						});
-				},
-				() => manager.appendControlEntriesSharingSession(entries, current),
-			);
-			if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-			if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-			if (!current()) return this.#failClosedSharedControl(operation, outcome);
-			committed = outcome;
-		}
-		const previousEditMode = this.#resolveActiveEditMode();
-		try {
-			if (chainChanges) {
-				this.#defaultFallbackController = undefined;
-				this.#defaultFallbackExhaustedLastTurn = false;
-			}
-			if (model) {
-				if (modelChanges) this.#setModelAuthoritatively(model, "rollback");
-			} else if (modelChanges) {
-				this.#clearActiveRetryFallback();
-				this.#setModelWithProviderSessionReset(undefined);
-				this.#syncAppendOnlyContext(undefined);
-			}
-			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
-		} catch (error) {
-			if (committed) return this.#failClosedSharedControl(operation, committed, error);
-			throw error;
-		}
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
-	}
-
 	async #discardDefaultModelSelectionStage(
-		stage: DefaultModelSelectionStage | undefined,
+		stage: DefaultModelSelectionStage,
 	): Promise<{ readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } | undefined> {
-		// A shared selection stages nothing; a refused publication left no transcript write.
-		if (!stage) return undefined;
 		try {
 			await this.sessionManager.discardDefaultModelSelectionStage(stage);
 			return undefined;
@@ -26041,7 +24750,7 @@ export class AgentSession {
 
 	async #throwDefaultModelSelectionRecovery(
 		error: Error,
-		stage: DefaultModelSelectionStage | undefined,
+		stage: DefaultModelSelectionStage,
 		commit: DurableModelProfileOwnership,
 		roleRollback?: { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] },
 	): Promise<never> {
@@ -26202,7 +24911,6 @@ export class AgentSession {
 		},
 	): Promise<DefaultModelSelectionResult> {
 		const assertPublicationMode = this.#controlPublicationModeFence("select default model");
-		const sharedPublication = this.#usesSharedSessionPublication();
 		// Reserve the causal selection fence synchronously, before credential
 		// probing can yield. Later external prompts wait behind this operation,
 		// while an inherited post-prompt continuation may bypass the fence so
@@ -26303,20 +25011,16 @@ export class AgentSession {
 									: [formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel)])),
 						selectionRole: options?.roleCycle?.role,
 					};
-					// Shared sessions publish the same entries additively at this opener's cursor
-					// after the durable settings commit; legacy sessions stage a replacement.
-					const stage = sharedPublication
-						? undefined
-						: await this.sessionManager.stageDefaultModelSelection(
-								`${model.provider}/${model.id}`,
-								effectiveLevel,
-								selectionEntries,
-							);
+					// Stage the replacement before the durable settings commit.
+					const stage = await this.sessionManager.stageDefaultModelSelection(
+						`${model.provider}/${model.id}`,
+						effectiveLevel,
+						selectionEntries,
+					);
 					let durableCommit = observedAtRequest;
 					let roleRollback:
 						| { previous: readonly SettingsAtomicPatch[]; selected: readonly SettingsAtomicPatch[] }
 						| undefined;
-					let sharedOutcome: SharedEntriesAppendOutcome | undefined;
 					const materialized = materializedRoles !== undefined;
 					const assertCurrent = () => {
 						assertPublicationMode();
@@ -26373,7 +25077,6 @@ export class AgentSession {
 							});
 						}
 					} catch (error) {
-						if (!stage) throw error;
 						try {
 							await this.sessionManager.discardDefaultModelSelectionStage(stage);
 						} catch (cleanupError) {
@@ -26388,36 +25091,8 @@ export class AgentSession {
 						assertCurrent();
 						if (!util.isDeepStrictEqual(readDurableModelProfileOwnership(this.settings), durableCommit))
 							throw new Error("Default model selection ownership changed before publication");
-						const promotion: DefaultModelSelectionPromotion = stage
-							? this.sessionManager.promoteDefaultModelSelection(stage)
-							: await (async () => {
-									sharedOutcome = await this.sessionManager.appendControlEntriesSharingSession(
-										this.sessionManager.defaultModelSelectionControlEntries(
-											`${model.provider}/${model.id}`,
-											effectiveLevel,
-											selectionEntries,
-										),
-										() => {
-											try {
-												assertCurrent();
-												return util.isDeepStrictEqual(
-													readDurableModelProfileOwnership(this.settings),
-													durableCommit,
-												);
-											} catch {
-												return false;
-											}
-										},
-									);
-									if (sharedOutcome.kind !== "committed")
-										return {
-											kind: "not_promoted",
-											error: new SharedControlPublicationError("select default model", sharedOutcome),
-										};
-									// The entries are durable; runtime promotion must still be current.
-									assertCurrent();
-									return { kind: "promoted" };
-								})();
+						const promotion: DefaultModelSelectionPromotion =
+							this.sessionManager.promoteDefaultModelSelection(stage);
 						switch (promotion.kind) {
 							case "promoted": {
 								this.#publishDefaultModelSelection(
@@ -26460,8 +25135,6 @@ export class AgentSession {
 						return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 					} catch (error) {
 						if (roleRollback && error instanceof DefaultModelSelectionRecoveryError) throw error;
-						if (sharedOutcome?.kind === "committed" || sharedOutcome?.kind === "unknown")
-							return this.#failClosedSharedControl("select default model", sharedOutcome, error);
 						return this.#throwDefaultModelSelectionRecovery(
 							error instanceof Error ? error : new Error(String(error)),
 							stage,
@@ -26558,9 +25231,7 @@ export class AgentSession {
 	): Promise<RoleModelCycleResult | undefined> {
 		const roleModels = this.#getRoleModelCycleCandidates(roleOrder, this.sessionId);
 		if (roleModels.length <= 1) return undefined;
-		// Shared sessions route both temporary and persistent cycles through admitted
-		// publication (setModelTemporary / setDefaultModelSelection).
-		if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("cycle role models");
+		this.sessionManager.assertLegacyMutationAllowed("cycle role models");
 
 		const currentModel = this.model!;
 
@@ -26622,7 +25293,7 @@ export class AgentSession {
 
 	async #cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		if (this.#scopedModels.length <= 1) return undefined;
-		if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("cycle models");
+		this.sessionManager.assertLegacyMutationAllowed("cycle models");
 		const observedOwnership = readDurableModelProfileOwnership(this.settings);
 		const scopedModels = await this.#getScopedModelsWithApiKey();
 		if (scopedModels.length <= 1) return undefined;
@@ -26700,12 +25371,8 @@ export class AgentSession {
 		persist: boolean,
 		operatorIntent: boolean,
 		onApplied?: (mutationRevision: number) => void,
-		entryAlreadyCommitted = false,
 	): void {
-		if (
-			!entryAlreadyCommitted &&
-			(persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel)
-		) {
+		if (persist || operatorIntent || resolveThinkingLevelForModel(this.model, level) !== this.#thinkingLevel) {
 			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
 		}
 		this.#btwPrefixLedger.clear();
@@ -26728,7 +25395,7 @@ export class AgentSession {
 		}
 
 		if (isChanging) {
-			if (!entryAlreadyCommitted) this.sessionManager.appendThinkingLevelChange(effectiveLevel, operatorIntent);
+			this.sessionManager.appendThinkingLevelChange(effectiveLevel, operatorIntent);
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}
@@ -26737,209 +25404,15 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		if (this.#usesSharedSessionPublication()) {
-			const run = persist
-				? this.#prepareSharedPersistedThinkingLevelForControl(level)
-				: this.#prepareSharedThinkingLevelForControl(level);
-			return this.#withThinkingControlScheduling(run);
-		}
 		if (persist) {
 			return this.sessionManager.withDurableThinkingControl(() => this.#setThinkingLevelForControl(level, true));
 		}
 		return this.#setThinkingLevelForControl(level, false);
 	}
 
-	/**
-	 * Non-operator, session-only thinking change (plan mode model follow). Shared sessions
-	 * publish the entry through admitted shared publication before the live change;
-	 * other sessions keep the synchronous legacy write.
-	 */
+	/** Non-operator, session-only thinking change (plan mode model follow): the synchronous legacy write. */
 	async setThinkingLevelForSession(level: ThinkingLevel | undefined): Promise<void> {
-		if (
-			level === undefined ||
-			!this.#usesSharedSessionPublication() ||
-			resolveThinkingLevelForModel(
-				this.model,
-				level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
-			) === this.#thinkingLevel
-		) {
-			this.setThinkingLevel(level);
-			return;
-		}
-		return this.#withThinkingControlScheduling(this.#prepareSharedThinkingLevelForControl(level, false));
-	}
-
-	#prepareSharedThinkingLevelForControl(
-		level: ThinkingLevel,
-		operatorIntent = level !== ThinkingLevel.Inherit,
-	): () => Promise<void> {
-		const revision = ++this.#thinkingLevelMutationRevision;
-		const liveRevision = this.#thinkingLevelLiveMutationRevision;
-		const sessionId = this.sessionManager.getSessionId();
-		const model = this.model;
-		const contextGeneration = this.#reasoningControlContextGeneration;
-		const current = () =>
-			revision === this.#thinkingLevelMutationRevision &&
-			liveRevision === this.#thinkingLevelLiveMutationRevision &&
-			sessionId === this.sessionManager.getSessionId() &&
-			model === this.model &&
-			contextGeneration === this.#reasoningControlContextGeneration;
-		return async () => {
-			if (!current()) return;
-			return this.sessionManager.withSharedThinkingControl(async () => {
-				const selected = level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level;
-				const effective = resolveThinkingLevelForModel(model, selected);
-				let outcome: SharedAppendOutcome;
-				try {
-					outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
-						level === ThinkingLevel.Inherit ? level : effective,
-						operatorIntent,
-						current,
-					);
-				} catch (error) {
-					throw new Error("Session thinking publication failed", { cause: error });
-				}
-				if (
-					outcome.kind === "rejected" &&
-					outcome.error instanceof Error &&
-					outcome.error.message === "shared_thinking_control_superseded"
-				)
-					return;
-				if (outcome.kind !== "committed") {
-					throw new Error(
-						`Session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
-						{ cause: outcome },
-					);
-				}
-				if (current()) this.#applyThinkingLevel(selected, false, false, undefined, true);
-			});
-		};
-	}
-
-	#prepareSharedPersistedThinkingLevelForControl(level: ThinkingLevel): () => Promise<void> {
-		this.#assertDurableSettingsWritable();
-		const revision = ++this.#thinkingLevelMutationRevision;
-		const liveRevision = this.#thinkingLevelLiveMutationRevision;
-		const sessionId = this.sessionManager.getSessionId();
-		const model = this.model;
-		const contextGeneration = this.#reasoningControlContextGeneration;
-		const sameContext = () =>
-			contextGeneration === this.#reasoningControlContextGeneration &&
-			sessionId === this.sessionManager.getSessionId() &&
-			model === this.model;
-		const current = () =>
-			revision === this.#thinkingLevelMutationRevision &&
-			liveRevision === this.#thinkingLevelLiveMutationRevision &&
-			sameContext();
-		return async () => {
-			if (!current()) return;
-			return this.sessionManager.withSharedThinkingControl(async () => {
-				const effective = resolveThinkingLevelForModel(
-					model,
-					level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
-				);
-				const persisted = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effective;
-				const publish = async (isCurrent: () => boolean) => {
-					let outcome: SharedAppendOutcome;
-					try {
-						outcome = await this.sessionManager.appendThinkingLevelChangeSharingSession(
-							ThinkingLevel.Inherit,
-							false,
-							isCurrent,
-						);
-					} catch (error) {
-						throw new Error("Reasoning settings saved; session thinking publication failed", { cause: error });
-					}
-					if (
-						outcome.kind === "rejected" &&
-						outcome.error instanceof Error &&
-						outcome.error.message === "shared_thinking_control_superseded"
-					)
-						return false;
-					if (outcome.kind !== "committed") {
-						throw new Error(
-							`Reasoning settings saved; session thinking publication ${outcome.kind}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}`,
-							{ cause: outcome },
-						);
-					}
-					return true;
-				};
-				const apply = (selected: ThinkingLevel | undefined) =>
-					this.#applyThinkingLevel(selected, false, false, undefined, true);
-				try {
-					await this.settings.commitAtomicBatch([{ path: "defaultThinkingLevel", op: "set", value: persisted }]);
-				} catch (settingsError) {
-					if (revision === this.#thinkingLevelMutationRevision && sameContext()) {
-						const pending = this.#pendingThinkingLevelControlSuccess;
-						this.#pendingThinkingLevelControlSuccess = undefined;
-						if (
-							pending &&
-							pending.contextGeneration === contextGeneration &&
-							pending.sessionId === sessionId &&
-							pending.model === model &&
-							current()
-						) {
-							try {
-								if ((await publish(current)) && current())
-									apply(
-										pending.level === ThinkingLevel.Inherit
-											? this.#getInheritedThinkingLevel()
-											: pending.level,
-									);
-							} catch (recoveryError) {
-								const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
-								throw new AggregateError(
-									[settingsError, recoveryError],
-									`Unable to persist reasoning settings; recovery of an earlier saved selection failed: ${detail}`,
-									{ cause: settingsError },
-								);
-							}
-						} else {
-							this.#pendingThinkingLevelControlFailure = {
-								mutationRevision: revision,
-								liveMutationRevision: liveRevision,
-								sessionId,
-								model,
-								contextGeneration,
-							};
-						}
-					}
-					throw new Error("Unable to persist reasoning settings.", { cause: settingsError });
-				}
-				if (!current()) {
-					if (
-						liveRevision === this.#thinkingLevelLiveMutationRevision &&
-						sameContext() &&
-						(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < revision
-					) {
-						this.#pendingThinkingLevelControlSuccess = {
-							level,
-							mutationRevision: revision,
-							sessionId,
-							model,
-							contextGeneration,
-						};
-						const failure = this.#pendingThinkingLevelControlFailure;
-						const recoverable = () =>
-							failure !== undefined &&
-							failure.mutationRevision === this.#thinkingLevelMutationRevision &&
-							failure.liveMutationRevision === this.#thinkingLevelLiveMutationRevision &&
-							failure.sessionId === this.sessionManager.getSessionId() &&
-							failure.model === this.model &&
-							failure.contextGeneration === this.#reasoningControlContextGeneration;
-						if (recoverable()) {
-							this.#pendingThinkingLevelControlSuccess = undefined;
-							this.#pendingThinkingLevelControlFailure = undefined;
-							if ((await publish(recoverable)) && recoverable())
-								apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
-						}
-					}
-					return;
-				}
-				if ((await publish(current)) && current())
-					apply(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effective);
-			});
-		};
+		this.setThinkingLevel(level);
 	}
 
 	async #setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
@@ -27296,13 +25769,6 @@ export class AgentSession {
 	}
 
 	async setServiceTier(serviceTier: ServiceTier | undefined): Promise<void> {
-		if (this.#usesSharedSessionPublication()) {
-			await this.#enqueueFastControl("set service tier", () => ({
-				serviceTier,
-				rearm: serviceTier === "priority" || serviceTier === "claude-only",
-			}));
-			return;
-		}
 		this.#applyLegacyServiceTier(serviceTier);
 	}
 
@@ -27318,10 +25784,6 @@ export class AgentSession {
 	}
 
 	async setFastMode(enabled: boolean): Promise<void> {
-		if (this.#usesSharedSessionPublication()) {
-			await this.#enqueueFastControl("set fast mode", () => this.#resolveFastModeIntent(enabled));
-			return;
-		}
 		if (enabled && this.isFastModeEnabled()) {
 			this.sessionManager.assertLegacyMutationAllowed("rearm fast mode");
 			this.#rearmFastMode();
@@ -27331,120 +25793,9 @@ export class AgentSession {
 	}
 
 	async toggleFastMode(): Promise<boolean> {
-		if (this.#usesSharedSessionPublication()) {
-			return this.#enqueueFastControl("toggle fast mode", () =>
-				this.#resolveFastModeIntent(!this.isFastModeEnabled()),
-			);
-		}
 		const enabled = !this.isFastModeEnabled();
 		await this.setFastMode(enabled);
 		return enabled;
-	}
-
-	#resolveFastModeIntent(enabled: boolean): { serviceTier: ServiceTier | undefined; rearm: boolean } {
-		return {
-			// Resolve at execution, not enqueue: /fast on preserves provider scope,
-			// and two queued toggles are successive intents rather than duplicates.
-			serviceTier: enabled ? (this.isFastModeEnabled() ? this.serviceTier : "priority") : undefined,
-			rearm: enabled,
-		};
-	}
-
-	#enqueueFastControl(
-		operation: SharedControlPublicationError["operation"],
-		resolveIntent: () => { serviceTier: ServiceTier | undefined; rearm: boolean },
-	): Promise<boolean> {
-		const manager = this.sessionManager;
-		const sessionId = this.sessionId;
-		const managerId = manager.getSessionId();
-		const file = manager.getSessionFile();
-		const identity = manager.getSessionIdentityGeneration();
-		const generation = this.#sessionTransitionGeneration;
-		const abortEpoch = this.#abortAdmissionEpoch;
-		const transitionEpoch = this.#coordinatorPersistGeneration;
-		const current = () =>
-			!this.#isDisposed &&
-			!this.#sessionAdmissionClosing &&
-			!this.#sessionAdmissionClosed &&
-			this.#sessionTransitionKind === undefined &&
-			!this.#handoffTransitionActive &&
-			this.#sessionTransitionGeneration === generation &&
-			this.#coordinatorPersistGeneration === transitionEpoch &&
-			this.#abortAdmissionEpoch === abortEpoch &&
-			this.sessionManager === manager &&
-			this.sessionId === sessionId &&
-			manager.getSessionId() === managerId &&
-			manager.getSessionFile() === file &&
-			manager.getSessionIdentityGeneration() === identity &&
-			this.#usesSharedSessionPublication();
-		const assertCurrent = () => {
-			if (!current())
-				throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-		};
-		// Only a still-pending fast control is a predecessor: awaiting a settled tail would
-		// yield and let a later grouped control overtake this one (FIFO intent order).
-		const predecessor = this.#pendingFastControls.size > 0 ? this.#fastControlTail : undefined;
-		// Reserve canonical/thinking order at enqueue, but resolve tier intent only
-		// after the preceding fast control settles. Never wait for session idle or
-		// acquire a selection lease inside this group (both can wait on this queue).
-		const result = this.#withThinkingControlScheduling(async () => {
-			if (predecessor) await predecessor;
-			assertCurrent();
-			return manager.withSharedThinkingControl(async () => {
-				assertCurrent();
-				const { serviceTier, rearm } = resolveIntent();
-				const changed = this.serviceTier !== serviceTier;
-				if (!changed && !rearm) return this.isFastModeEnabled();
-				let outcome: SharedEntriesAppendOutcome;
-				try {
-					outcome = await manager.appendServiceTierChangeSharingSession(serviceTier ?? null, changed, current);
-				} catch {
-					throw new SharedControlPublicationError(operation, {
-						kind: "rejected",
-						error: new Error("publication_failed_before_admission"),
-					});
-				}
-				if (outcome.kind !== "committed" || !current()) {
-					if (outcome.kind === "unknown" || outcome.kind === "committed") {
-						// Retain the exact receipt; never compensate or retry a possibly
-						// durable write. Dispose synchronously fences ingress, but joining
-						// teardown here would wait on this control's own completion.
-						void this.dispose().catch(() => {
-							logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed" });
-						});
-					}
-					throw new SharedControlPublicationError(operation, outcome);
-				}
-				try {
-					this.#btwPrefixLedger.clear();
-					if (rearm) this.#rearmFastMode();
-					if (changed) this.agent.serviceTier = serviceTier;
-				} catch {
-					void this.dispose().catch(() => {
-						logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed" });
-					});
-					throw new SharedControlPublicationError(operation, outcome);
-				}
-				return this.isFastModeEnabled();
-			});
-		}).catch(error => {
-			if (error instanceof SharedControlPublicationError) throw error;
-			throw new SharedControlPublicationError(operation, {
-				kind: "rejected",
-				error: new Error("publication_failed_before_admission"),
-			});
-		});
-		const settled = result.then(
-			() => {},
-			() => {},
-		);
-		this.#pendingFastControls.set(settled, this.#selectionFenceGeneration);
-		this.#fastControlTail = settled;
-		void settled.then(() => {
-			this.#pendingFastControls.delete(settled);
-			this.#resolveSessionSettlement();
-		});
-		return result;
 	}
 
 	/**
@@ -27508,8 +25859,6 @@ export class AgentSession {
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<ToolOutputPruneResult | undefined> {
-		// Shared branches retain canonical output; threshold maintenance can append a compaction instead.
-		if (this.#usesSharedSessionPublication()) return undefined;
 		this.sessionManager.assertLegacyMutationAllowed("prune tool outputs");
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
@@ -27892,68 +26241,6 @@ export class AgentSession {
 		});
 	}
 
-	#captureCompactionPublicationOwner(signal: AbortSignal, transition: "compact" | "auto-compaction") {
-		const manager = this.sessionManager;
-		const sessionId = manager.getSessionId();
-		const file = manager.getSessionFile();
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const transitionGeneration = this.#sessionTransitionGeneration;
-		const promptGeneration = this.#promptGeneration;
-		const model = this.model;
-		const contextGeneration = this.#reasoningControlContextGeneration;
-		const cursor = manager.getLeafId();
-		const active = () =>
-			!signal.aborted &&
-			!this.#isDisposed &&
-			!this.#sessionAdmissionClosing &&
-			!this.#sessionAdmissionClosed &&
-			this.#sessionTransitionKind === transition &&
-			this.#sessionTransitionGeneration === transitionGeneration &&
-			this.#promptGeneration === promptGeneration &&
-			this.model === model &&
-			this.#reasoningControlContextGeneration === contextGeneration &&
-			this.sessionManager === manager &&
-			manager.getSessionId() === sessionId &&
-			manager.getSessionFile() === file &&
-			manager.getSessionIdentityGeneration() === identityGeneration;
-		return { manager, active, current: () => active() && manager.getLeafId() === cursor };
-	}
-
-	#appendCompactionForControl(
-		payload: Omit<CompactionEntry, "type" | "id" | "parentId" | "timestamp">,
-		branchIds: ReadonlySet<string>,
-		owner: {
-			manager: SessionManager;
-			active: () => boolean;
-			current: () => boolean;
-		},
-		shared: boolean,
-	): string | Promise<string> {
-		if (shared && !branchIds.has(payload.firstKeptEntryId))
-			throw new Error("compaction_first_kept_entry_not_in_prepared_branch");
-		if (shared && !owner.current()) throw new CompactionCancelledError();
-		if (!shared) {
-			return owner.manager.appendCompaction(
-				payload.summary,
-				payload.shortSummary,
-				payload.firstKeptEntryId,
-				payload.tokensBefore,
-				payload.details,
-				payload.fromExtension,
-				payload.preserveData,
-			);
-		}
-		return this.#withStartedSharedControlPublication(
-			() => {
-				if (!owner.current()) throw new CompactionCancelledError();
-			},
-			() => owner.manager.appendCompactionSharingSession(payload, owner.current),
-		).then(outcome => {
-			if (outcome.kind !== "committed") throw new SharedCompactionPublicationError(outcome);
-			return outcome.id;
-		});
-	}
-
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -27964,21 +26251,7 @@ export class AgentSession {
 		// Compaction runs hooks and a summarization model before its append; a transcript
 		// that already refuses writes would spend both and then fail.
 		this.#assertTranscriptAcceptsTurn();
-		const sharedCompaction = this.#usesSharedSessionPublication();
-		const invocationManager = this.sessionManager;
-		const invocationSessionId = invocationManager.getSessionId();
-		const invocationIdentityGeneration = invocationManager.getSessionIdentityGeneration();
-		const invocationModel = this.model;
-		const invocationFile = invocationManager.getSessionFile();
-		const invocationContextGeneration = this.#reasoningControlContextGeneration;
-		const invocationCurrent = () =>
-			this.sessionManager === invocationManager &&
-			invocationManager.getSessionId() === invocationSessionId &&
-			invocationManager.getSessionIdentityGeneration() === invocationIdentityGeneration &&
-			invocationManager.getSessionFile() === invocationFile &&
-			this.model === invocationModel &&
-			this.#reasoningControlContextGeneration === invocationContextGeneration;
-		if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
+		this.sessionManager.assertLegacyMutationAllowed("compact session");
 		this.#assertSessionAdmissionOpen();
 		// Automatic context maintenance owns the transition lease while its
 		// post-append hooks run. A manual request must join behind that owner so
@@ -27991,8 +26264,7 @@ export class AgentSession {
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
-		if (sharedCompaction && !invocationCurrent()) throw new CompactionCancelledError();
-		if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
+		this.sessionManager.assertLegacyMutationAllowed("compact session");
 		this.#beginSessionTransition("compact");
 		const completion = Promise.withResolvers<void>();
 		this.#compactionCompletion = completion.promise;
@@ -28083,23 +26355,19 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
-				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
-				// Accept this operation's abort generation only while its invocation identity is unchanged.
-				if (sharedCompaction && !invocationCurrent()) throw new CompactionCancelledError();
-				// Bind ownership before the snapshot's asynchronous workflow reads.
-				const owner = this.#captureCompactionPublicationOwner(compactionAbortController.signal, "compact");
+				this.sessionManager.assertLegacyMutationAllowed("compact session");
+				// Bind the destination before the snapshot's asynchronous workflow reads.
+				const compactionManager = this.sessionManager;
 				const compactionStateSnapshot = await this.#compactionStateSnapshot({
 					trackWorkflowRecoveryProgress: true,
 				});
-				if (sharedCompaction && !owner.current()) throw new CompactionCancelledError();
-				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
+				this.sessionManager.assertLegacyMutationAllowed("compact session");
 				if (!this.model) {
 					throw new Error("No model selected");
 				}
 
 				const compactionSettings = this.settings.getGroup("compaction");
 				const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
-				const branchIds = new Set(pathEntries.map(entry => entry.id));
 
 				const preparation = prepareCompaction(
 					pathEntries,
@@ -28142,13 +26410,13 @@ export class AgentSession {
 					}
 				}
 
-				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
+				this.sessionManager.assertLegacyMutationAllowed("compact session");
 				const compactionPrep = await this.#prepareCompactionFromHooks(
 					preparation,
 					hookCompaction,
 					compactionStateSnapshot,
 				);
-				if (!sharedCompaction) this.sessionManager.assertLegacyMutationAllowed("compact session");
+				this.sessionManager.assertLegacyMutationAllowed("compact session");
 
 				let summary: string;
 				let shortSummary: string | undefined;
@@ -28207,19 +26475,18 @@ export class AgentSession {
 				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
-				const publication = this.#appendCompactionForControl(
-					{ summary, shortSummary, firstKeptEntryId, tokensBefore, details, fromExtension, preserveData },
-					branchIds,
-					owner,
-					sharedCompaction,
+				const compactionEntryId = compactionManager.appendCompaction(
+					summary,
+					shortSummary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					preserveData,
 				);
-				const compactionEntryId = typeof publication === "string" ? publication : await publication;
-				if (sharedCompaction && (!owner.active() || owner.manager.getLeafId() !== compactionEntryId)) {
-					throw new CompactionCancelledError();
-				}
 				this.#commitCatalogPreservingTransition();
 				this.#recordAdaptiveCompactionReset(tokensBefore);
-				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension, sharedCompaction);
+				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 				const compactionResult: CompactionResult = {
 					summary,
@@ -30512,7 +28779,7 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+		this.sessionManager.assertLegacyMutationAllowed("compact session");
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
@@ -30530,7 +28797,7 @@ export class AgentSession {
 				continue;
 			}
 
-			if (!this.#usesSharedSessionPublication()) this.sessionManager.assertLegacyMutationAllowed("compact session");
+			this.sessionManager.assertLegacyMutationAllowed("compact session");
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
 					...options,
@@ -30853,9 +29120,7 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
-			const sharedCompaction = this.#usesSharedSessionPublication();
-			const owner = this.#captureCompactionPublicationOwner(autoCompactionSignal, "auto-compaction");
-			const branchIds = new Set(pathEntries.map(entry => entry.id));
+			const compactionManager = this.sessionManager;
 
 			// Emergency/overflow-recovery compaction is conservative: apply the token
 			// correction only when it SHRINKS the keep window (ratio >= 1), never when
@@ -31228,19 +29493,18 @@ export class AgentSession {
 				return { kind: "aborted", source: "signal" };
 			}
 
-			const publication = this.#appendCompactionForControl(
-				{ summary, shortSummary, firstKeptEntryId, tokensBefore, details, fromExtension, preserveData },
-				branchIds,
-				owner,
-				sharedCompaction,
+			const compactionEntryId = compactionManager.appendCompaction(
+				summary,
+				shortSummary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				preserveData,
 			);
-			const compactionEntryId = typeof publication === "string" ? publication : await publication;
-			if (sharedCompaction && (!owner.active() || owner.manager.getLeafId() !== compactionEntryId)) {
-				return await emitAborted();
-			}
 			this.#commitCatalogPreservingTransition();
 			this.#recordAdaptiveCompactionReset(tokensBefore);
-			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension, sharedCompaction);
+			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const result: CompactionResult = {
@@ -31308,9 +29572,7 @@ export class AgentSession {
 			}
 			return { kind: "compacted" };
 		} catch (error) {
-			const publicationError =
-				error instanceof SharedCompactionPublicationError && error.outcome.kind === "unknown" ? error : undefined;
-			if (autoCompactionSignal.aborted && !publicationError) {
+			if (autoCompactionSignal.aborted) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
@@ -31334,7 +29596,6 @@ export class AgentSession {
 					reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`,
-				publicationError,
 			});
 			return { kind: "failed", errorMessage };
 		} finally {
@@ -31471,7 +29732,7 @@ export class AgentSession {
 		model: Model,
 		credentialKind: string,
 		rowId?: number,
-	): Promise<string | undefined> {
+	): Promise<ResolvedApiKey | string | undefined> {
 		const authStorage = this.#modelRegistry.authStorage;
 		const storageProvider = resolveOAuthStorageProvider(model.provider);
 		const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
@@ -31486,10 +29747,13 @@ export class AgentSession {
 			)
 				continue;
 			let apiKey: string | undefined;
+			let credentialRowId: number | undefined;
 			try {
-				apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
-					credentialSelector: { kind: "id", value: String(credential.id) },
-				});
+				({ apiKey, credentialRowId } = await this.#modelRegistry.getApiKeyWithCredentialRowId(
+					model,
+					this.credentialSessionId,
+					{ credentialSelector: { kind: "id", value: String(credential.id) } },
+				));
 			} catch (error) {
 				const currentCredential = inventory.find(row => row.id === credential.id);
 				if (!currentCredential?.disabled) throw error;
@@ -31503,7 +29767,9 @@ export class AgentSession {
 				currentCredential &&
 				!currentCredential.disabled
 			)
-				return apiKey;
+				// Attribute only when the row itself supplied the key; a runtime or
+				// config override returns early without moving the sticky pointer.
+				return credentialRowId === credential.id ? { apiKey, credentialId: credential.id } : apiKey;
 		}
 		return undefined;
 	}
@@ -31890,97 +30156,20 @@ export class AgentSession {
 		const effectiveThinking = resolution.model
 			? resolveThinkingLevelForModel(resolution.model, thinkingLevel)
 			: this.#thinkingLevel;
-		let committedThinking: Extract<SharedEntriesAppendOutcome, { kind: "committed" }> | undefined;
-		if (resolution.model && effectiveThinking !== this.#thinkingLevel) {
-			// A shared session publishes the thinking entry through admitted shared publication
-			// (#7824); a legacy session keeps its refusal. Either way, before seeding fallback
-			// state or switching the model.
-			if (this.#usesSharedSessionPublication())
-				committedThinking = await this.#publishSharedFallbackThinking(
-					controller,
-					resolutionStart,
-					effectiveThinking,
-				);
-			else this.sessionManager.assertLegacyMutationAllowed("set thinking level");
+		// The legacy refusal runs before seeding fallback state or switching the model.
+		if (resolution.model && effectiveThinking !== this.#thinkingLevel)
+			this.sessionManager.assertLegacyMutationAllowed("set thinking level");
+		if (activeIndex > resolutionStart) {
+			this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
+		} else {
+			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		}
-		const applyResolution = (model: Model | undefined): Model => {
-			if (activeIndex > resolutionStart) {
-				this.seedDefaultFallbackResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-			} else {
-				controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
-			}
-			if (!model) throw new Error(this.#fallbackExhaustionError(controller));
-			return model;
-		};
-		if (!committedThinking) {
-			const model = applyResolution(resolution.model);
-			const previousEditMode = this.#resolveActiveEditMode();
-			this.#setModelAuthoritatively(model, "restore");
-			this.setThinkingLevel(thinkingLevel);
-			await this.#syncEditToolModeAfterModelChange(previousEditMode);
-			return;
-		}
+		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
+		const model = resolution.model;
 		const previousEditMode = this.#resolveActiveEditMode();
-		try {
-			this.#setModelAuthoritatively(applyResolution(resolution.model), "restore");
-			this.#applyThinkingLevel(thinkingLevel, false, false, undefined, true);
-		} catch (error) {
-			return this.#failClosedSharedControl("set thinking level for default fallback", committedThinking, error);
-		}
+		this.#setModelAuthoritatively(model, "restore");
+		this.setThinkingLevel(thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
-	}
-
-	/**
-	 * Publish the thinking entry a default-fallback switch implies, at this opener's cursor
-	 * and before any fallback state or live model changes. Bound to the controller position,
-	 * live model, thinking revision and session identity it was resolved against.
-	 */
-	async #publishSharedFallbackThinking(
-		controller: FallbackChainController,
-		resolutionStart: number,
-		level: ThinkingLevel | undefined,
-	): Promise<Extract<SharedEntriesAppendOutcome, { kind: "committed" }>> {
-		const operation = "set thinking level for default fallback";
-		const assertMode = this.#controlPublicationModeFence(operation);
-		const manager = this.sessionManager;
-		const sessionId = this.sessionId;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const model = this.model;
-		const thinkingLevel = this.#thinkingLevel;
-		const thinkingRevision = this.#thinkingLevelMutationRevision;
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				this.sessionId === sessionId &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.model === model &&
-				this.#thinkingLevel === thinkingLevel &&
-				this.#thinkingLevelMutationRevision === thinkingRevision &&
-				this.#defaultFallbackController === controller &&
-				controller.activeIndex === resolutionStart
-			);
-		};
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() =>
-				manager.appendControlEntriesSharingSession(
-					[{ type: "thinking_level_change", level, operatorIntent: false }],
-					current,
-				),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-		if (!current()) return this.#failClosedSharedControl(operation, outcome);
-		return outcome;
 	}
 
 	/**
@@ -33772,117 +31961,21 @@ export class AgentSession {
 	}
 
 	/**
-	 * The single eligibility rule for admitted shared publication (#7824):
-	 * managed destination && (root shared mode || session already requires shared admission).
-	 * Every migrated control and canonical producer routes through this predicate.
-	 */
-	#usesSharedSessionPublication(): boolean {
-		return (
-			this.sessionManager.isManagedDestination() &&
-			(this.#rootInteractiveSharedAppend || this.sessionManager.requiresSharedMutationAdmission())
-		);
-	}
-
-	/**
-	 * Bind a control to the publication protocol chosen when it started. A legacy control
-	 * keeps the legacy refusal; a session that adopts shared admission (or a shared control
-	 * that loses it) while the control awaits is refused before effects rather than
-	 * switching protocols mid-transaction.
+	 * Bind a control to the session manager it started on and the legacy refusal: a control
+	 * whose session was replaced (fork) while it awaited is refused before effects.
 	 */
 	#controlPublicationModeFence(operation: string): () => void {
 		const manager = this.sessionManager;
-		const shared = this.#usesSharedSessionPublication();
 		const assertMode = () => {
-			if (this.sessionManager !== manager || this.#usesSharedSessionPublication() !== shared)
+			if (this.sessionManager !== manager)
 				throw new SharedControlPublicationError(operation, {
 					kind: "rejected",
 					error: new Error("publication_mode_changed"),
 				});
-			if (!shared) manager.assertLegacyMutationAllowed(operation);
+			manager.assertLegacyMutationAllowed(operation);
 		};
 		assertMode();
 		return assertMode;
-	}
-
-	/**
-	 * A possibly durable shared control write that this session cannot apply: retain the
-	 * exact receipt, never retry or compensate, and close the session so it cannot keep
-	 * running on state that diverges from its transcript.
-	 */
-	/** Make an already-live MCP selection durable in a shared session (no runtime change). */
-	async #publishSharedMCPToolSelection(selected: string[], assertMode: () => void): Promise<void> {
-		const operation = "select active tools";
-		const manager = this.sessionManager;
-		const identityGeneration = manager.getSessionIdentityGeneration();
-		const current = () => {
-			try {
-				assertMode();
-			} catch {
-				return false;
-			}
-			return (
-				!this.#isDisposed &&
-				this.sessionManager === manager &&
-				manager.getSessionIdentityGeneration() === identityGeneration &&
-				this.#selectedMCPToolNamesMatch(this.getSelectedMCPToolNames(), selected)
-			);
-		};
-		const outcome = await this.#withStartedSharedControlPublication(
-			() => {
-				if (!current())
-					throw new SharedControlPublicationError(operation, { kind: "rejected", error: new Error("superseded") });
-			},
-			() => manager.appendToolSelectionsSharingSession(selected, undefined, current),
-		);
-		if (outcome.kind === "unknown") return this.#failClosedSharedControl(operation, outcome);
-		if (outcome.kind !== "committed") throw new SharedControlPublicationError(operation, outcome);
-	}
-
-	#failClosedSharedControl(
-		operation: string,
-		outcome: Extract<SharedEntriesAppendOutcome, { kind: "committed" | "unknown" }>,
-		cause?: unknown,
-	): never {
-		void this.dispose().catch(() => {
-			logger.warn("Shared control session teardown failed", { code: "shared_control_teardown_failed", operation });
-		});
-		throw new SharedControlPublicationError(operation, outcome, cause);
-	}
-
-	async #withStartedSharedControlPublication<T>(assertCurrent: () => void, publish: () => Promise<T>): Promise<T> {
-		// A publication waiting for a thinking group must not become its predecessor.
-		while (this.#thinkingControlAdmissionGroup) {
-			const group = this.#thinkingControlAdmissionGroup;
-			await group.completion.promise;
-			assertCurrent();
-		}
-		assertCurrent();
-		const settled = Promise.withResolvers<void>();
-		this.#startedSharedControlPublications.add(settled.promise);
-		try {
-			// Invoke synchronously so a newly admitted thinking group snapshots this publication.
-			return await publish();
-		} finally {
-			this.#startedSharedControlPublications.delete(settled.promise);
-			settled.resolve();
-		}
-	}
-
-	async #appendSharedWorkflowIntentDiff(diff: WorkflowIntentDiff, assertCurrent: () => void): Promise<void> {
-		await this.#withStartedSharedControlPublication(assertCurrent, async () => {
-			let outcome: SharedAppendOutcome;
-			try {
-				outcome = await this.sessionManager.appendCustomEntrySharingSession(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, diff);
-			} catch (error) {
-				throw new Error("Shared workflow intent append failed before admission", { cause: error });
-			}
-			if (outcome.kind !== "committed") {
-				throw new Error(
-					`Shared workflow intent append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-					{ cause: outcome },
-				);
-			}
-		});
 	}
 
 	async #promptAgentWithIdleRetry(
@@ -34209,7 +32302,7 @@ export class AgentSession {
 			this.agent.appendMessage(bashMessage);
 
 			// Save to session
-			void this.#publishMessageInBackground("bash result", bashMessage, options?.onPersisted);
+			void this.#publishMessageInBackground(bashMessage, options?.onPersisted);
 		}
 	}
 
@@ -34408,12 +32501,7 @@ export class AgentSession {
 			});
 		} else {
 			this.agent.appendMessage(pythonMessage);
-			const shared = this.#usesSharedSessionPublication();
-			if (shared) {
-				void this.#publishMessageInBackground("python result", pythonMessage, options?.onPersisted);
-			} else {
-				this.sessionManager.appendMessage(pythonMessage);
-			}
+			this.sessionManager.appendMessage(pythonMessage);
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
@@ -34421,8 +32509,8 @@ export class AgentSession {
 					continueQueuedOnly: true,
 				});
 			}
-			// Reserve queued work before invoking the legacy callback, which may throw inline.
-			if (!shared) options?.onPersisted?.();
+			// Reserve queued work before invoking the callback, which may throw inline.
+			options?.onPersisted?.();
 		}
 	}
 
@@ -34519,7 +32607,6 @@ export class AgentSession {
 		const remaining: typeof pendingMessages = [];
 		const errors: unknown[] = [];
 		const persisted: string[] = [];
-		const unconfirmed: string[] = [];
 		let callbackFailureCount = 0;
 		let persistenceBlocked = false;
 		let agentAppendBlocked = false;
@@ -34554,15 +32641,8 @@ export class AgentSession {
 				// failed entry after messages that originally followed it.
 				persistenceBlocked = true;
 				errors.push(error);
-				// An unknown outcome may already be durable under its attempted id. It is
-				// never queued for a retry that would append it again under a new id; the
-				// session closes below with that receipt instead.
-				if (error instanceof SharedControlPublicationError && error.outcome.kind === "unknown")
-					unconfirmed.push(...error.outcome.ids);
-				else {
-					pending.refusedAt = ++this.#deferredRefusalSequence;
-					remaining.push(pending);
-				}
+				pending.refusedAt = ++this.#deferredRefusalSequence;
+				remaining.push(pending);
 				continue;
 			}
 
@@ -34578,27 +32658,17 @@ export class AgentSession {
 		pendingMessages.splice(0, pendingMessages.length, ...remaining);
 		if (errors.length === 0) return;
 
-		const persistedCount = total - remaining.length - unconfirmed.length;
-		const persistenceFailureCount = remaining.length + unconfirmed.length;
+		const persistedCount = total - remaining.length;
+		const persistenceFailureCount = remaining.length;
 		const persistenceSummary =
-			unconfirmed.length > 0
-				? `Could not confirm ${unconfirmed.length} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"} (attempted ids: ${unconfirmed.join(", ")}); ${persistedCount} persisted, ${remaining.length} not written; the session was closed to protect its history`
-				: persistenceFailureCount > 0
-					? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them`
-					: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
+			persistenceFailureCount > 0
+				? `Failed to persist ${persistenceFailureCount} of ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}; ${persistedCount} persisted, failed messages remain pending for retry by the next prompt unless a session transition drops them`
+				: `Persisted all ${total} deferred ${kind} execution message${total === 1 ? "" : "s"}`;
 		const callbackSummary =
 			callbackFailureCount > 0
 				? `; ${callbackFailureCount} onPersisted callback${callbackFailureCount === 1 ? "" : "s"} failed`
 				: "";
 		const pending = remaining.map(item => ("command" in item.message ? item.message.command : item.message.code));
-		if (unconfirmed.length > 0) {
-			void this.dispose().catch(() => {
-				logger.warn("Deferred command result teardown failed", {
-					code: "shared_execution_result_teardown_failed",
-					attemptedIds: unconfirmed,
-				});
-			});
-		}
 		throw new AggregateError(
 			errors,
 			`${persistenceSummary}${callbackSummary}; persisted: ${JSON.stringify(persisted)}; pending: ${JSON.stringify(pending)}`,
@@ -35603,8 +33673,22 @@ export class AgentSession {
 	 * Aborts current operation, loads messages, restores model/thinking.
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
+	 * @throws SessionHeldError under enforce, before any event, for a target another process holds
 	 */
 	async switchSession(
+		sessionPath: string,
+		options?: {
+			transition?: SessionSwitchEvent["transition"];
+			onTransitionMutationStarted?: () => void;
+		},
+	): Promise<boolean> {
+		// The admission claim covers the target until the rotation's own claim lands (design §1 row 9).
+		return this.sessionManager.withSwitchTargetAdmission(sessionPath, () =>
+			this.#switchSessionAdmitted(sessionPath, options),
+		);
+	}
+
+	async #switchSessionAdmitted(
 		sessionPath: string,
 		options?: {
 			transition?: SessionSwitchEvent["transition"];
@@ -37743,60 +35827,6 @@ export class AgentSession {
 interface BackgroundPublicationResult {
 	readonly committed: boolean;
 	readonly cause?: string;
-}
-
-/** Flatten a non-committed shared outcome into log/report fields. */
-function describeSharedAppendFailure(outcome: SharedAppendOutcome): { outcome: string; reason?: string } {
-	if (outcome.kind === "stale") return { outcome: outcome.kind, reason: outcome.reason };
-	if (outcome.kind === "rejected")
-		return {
-			outcome: outcome.kind,
-			reason: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
-		};
-	if (outcome.kind === "unknown") return { outcome: outcome.kind, reason: `attempted id ${outcome.id}` };
-	return { outcome: outcome.kind };
-}
-
-type SharedAppendFailureOutcome = Extract<SharedAppendOutcome, { kind: "unknown" | "stale" | "rejected" }>;
-
-/** Preserve only recognized failure receipts carried by the custom-append wrapper. */
-function getSharedAppendFailureOutcome(error: unknown): SharedAppendFailureOutcome | undefined {
-	if (!(error instanceof Error)) return undefined;
-	const cause = error.cause;
-	if (cause === null || typeof cause !== "object" || Array.isArray(cause)) return undefined;
-	const record = cause as Record<string, unknown>;
-	if (record.kind === "unknown" && typeof record.id === "string" && Object.hasOwn(record, "error")) {
-		return cause as SharedAppendFailureOutcome;
-	}
-	if (
-		record.kind === "stale" &&
-		(record.reason === "transcript_moved" ||
-			record.reason === "cursor_not_committed" ||
-			record.reason === "persistence_latched" ||
-			record.reason === "rewrite_required" ||
-			record.reason === "unsupported_transcript")
-	) {
-		return cause as SharedAppendFailureOutcome;
-	}
-	if (record.kind === "rejected" && Object.hasOwn(record, "error")) return cause as SharedAppendFailureOutcome;
-	return undefined;
-}
-
-/**
- * Narrow a shared publication outcome to `committed` or throw with its cause.
- *
- * Used by every AgentSession seam that replaces a legacy append: the refusal must be
- * loud, because a silently dropped entry is worse than a surfaced failure.
- */
-function assertSharedAppendCommitted(
-	operation: string,
-	outcome: SharedAppendOutcome,
-): asserts outcome is Extract<SharedAppendOutcome, { kind: "committed" }> {
-	if (outcome.kind === "committed") return;
-	throw new Error(
-		`${operation} ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-		{ cause: outcome },
-	);
 }
 
 async function awaitBtwSettlement(pending: Promise<void>): Promise<void> {

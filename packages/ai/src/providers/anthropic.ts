@@ -1606,10 +1606,16 @@ function isAnthropicUsageExhaustionResponse(
 		const message = getStringProperty(error, "message") ?? getStringProperty(parsed, "message") ?? bodyText;
 		return (
 			/rate_limit_error/i.test(type ?? "") &&
-			(/request would exceed your account.?s rate limit/i.test(message) || /out_of_credits/i.test(message))
+			(/request would exceed your account.?s rate limit/i.test(message) ||
+				/out_of_credits/i.test(message) ||
+				// Per-account model gating ("Usage credits are required for this model."):
+				// the same credential never succeeds, so surface it for account rotation.
+				/credits_required|usage credits are required/i.test(bodyText))
 		);
 	} catch {
-		return /request would exceed your account.?s rate limit|out_of_credits/i.test(bodyText);
+		return /request would exceed your account.?s rate limit|out_of_credits|credits_required|usage credits are required/i.test(
+			bodyText,
+		);
 	}
 }
 

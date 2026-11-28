@@ -13,16 +13,19 @@ import type { SessionManager } from "../session-manager";
 import {
 	claimSessionOwner,
 	countSessionOwnershipEvent,
+	probeSessionOwners,
+	releaseSessionAdmissions,
 	SessionHeldError,
 	type SessionOwnerClaim,
 	type SessionOwnerHolder,
+	type SessionOwnerProbe,
 	type SessionOwnerSurface,
 	SessionOwnershipError,
 	sessionOwnerHolderPhrase,
 	sessionOwnerSurface,
 } from "../session-ownership";
 import {
-	liveSessionOwnershipMode,
+	liveSessionOwnershipModeFor,
 	type SessionOwnershipMode,
 	sessionOwnershipMode,
 	sessionOwnershipTestHookSlot,
@@ -61,17 +64,19 @@ export function claimsUnder(ownership: ResolvedSessionOwnership): boolean {
 }
 
 /**
- * The outcome of one claim attempt. `none`: nothing was attempted (off, exempt) or the platform
- * failed open; `failed`: a failure enforce refuses (counted `claim_failed`), with that failure;
- * `held`: another process holds the session (counted `claim_conflict`), with its holder if known.
+ * The outcome of one claim attempt. `none`: nothing was attempted (off, exempt) or the claim failed
+ * open, with `skipped` naming why (`unavailable` is permanent, `timed_out` is that one call);
+ * `failed`: a failure enforce refuses (counted `claim_failed`), with that failure; `held`: another
+ * process holds the session (counted `claim_conflict`), with its holder if known.
  */
 type SessionClaimRefusable =
 	| { readonly status: "held"; readonly holder?: SessionOwnerHolder }
 	| { readonly status: "failed"; readonly error: SessionOwnershipError };
-export type SessionClaimOutcome = { readonly status: "claimed" | "none" } | SessionClaimRefusable;
+type SessionClaimNone = { readonly status: "none"; readonly skipped?: "unavailable" | "timed_out" };
+export type SessionClaimOutcome = { readonly status: "claimed" } | SessionClaimNone | SessionClaimRefusable;
 export type SessionClaimAttempt =
 	| { readonly status: "claimed"; readonly claim: SessionOwnerClaim }
-	| { readonly status: "none" }
+	| SessionClaimNone
 	| SessionClaimRefusable;
 export type SessionClaimStatus = SessionClaimOutcome["status"];
 
@@ -83,26 +88,44 @@ function outcomeOf(attempt: SessionClaimAttempt): SessionClaimOutcome {
 /**
  * One claim attempt under `ownership`, never throwing (design §13 M2). A held session (counted
  * `claim_conflict`) and an owners-directory failure (counted `claim_failed`) are logged and returned;
- * {@link claimRefusal} decides whether enforce refuses them.
+ * {@link claimRefusal} decides whether enforce refuses them. `previous`, the outcome a re-attempt
+ * repeats, keeps the same outcome again from being counted or logged again. `admission` marks an
+ * open's or a switch's cover, which the opener's own claim releases when it lands.
  */
 export async function attemptSessionClaim(
 	ownership: ResolvedSessionOwnership,
 	sessionId: string,
+	previous?: SessionClaimOutcome,
+	options?: { readonly admission?: boolean },
 ): Promise<SessionClaimAttempt> {
 	if (ownership === "exempt" || ownership.mode === "off") return { status: "none" };
+	const repeat =
+		previous?.status === "held"
+			? "held"
+			: previous?.status === "none" && previous.skipped === "timed_out"
+				? "timed_out"
+				: undefined;
 	try {
-		const result = await claimSessionOwner(sessionId, { surface: ownership.surface });
+		const result = await claimSessionOwner(sessionId, {
+			surface: ownership.surface,
+			repeat,
+			admission: options?.admission,
+		});
 		if (result.status === "claimed") return result;
 		if (result.status === "held") {
-			logger.warn("Session is open for writing in another process", {
-				mode: ownership.mode,
-				holder: sessionOwnerHolderPhrase(result.holder),
-			});
+			if (repeat !== "held")
+				logger.warn("Session is open for writing in another process", {
+					mode: ownership.mode,
+					holder: sessionOwnerHolderPhrase(result.holder),
+				});
 			return { status: "held", holder: result.holder };
 		}
+		return { status: "none", skipped: result.reason };
 	} catch (error) {
-		countSessionOwnershipEvent("claim_failed");
-		logger.warn("Session claim failed", { mode: ownership.mode, error: String(error) });
+		if (previous?.status !== "failed") {
+			countSessionOwnershipEvent("claim_failed");
+			logger.warn("Session claim failed", { mode: ownership.mode, error: String(error) });
+		}
 		return {
 			status: "failed",
 			error:
@@ -111,7 +134,6 @@ export async function attemptSessionClaim(
 					: new SessionOwnershipError("claim_failed", { cause: error }),
 		};
 	}
-	return { status: "none" };
 }
 
 /**
@@ -127,12 +149,93 @@ export function claimRefusal(
 ): SessionHeldError | SessionOwnershipError | undefined {
 	if (ownership === "exempt" || ownership.mode !== "enforce") return undefined;
 	if (outcome?.status !== "held" && outcome?.status !== "failed") return undefined;
-	if (liveSessionOwnershipMode() !== "enforce") return undefined;
+	if (liveSessionOwnershipModeFor(ownership.mode) !== "enforce") return undefined;
 	return outcome.status === "held" ? new SessionHeldError(sessionId, outcome.holder) : outcome.error;
+}
+
+/**
+ * Run `write`, a short write to a session that is not the caller's own (a picker star or delete,
+ * design §1 row 17), under a scoped claim: claim, write, release. Enforce refuses a session another
+ * process holds, and a claim that failed, with `Can't <action> this session: …` (the refusal is the
+ * `cause`), so the holder keeps its transcript; observe logs and counts the conflict and writes as
+ * before; off and exempt make no lock call. A session this process holds shares its claim (D10).
+ */
+export async function withScopedSessionClaim<T>(
+	ownership: ResolvedSessionOwnership,
+	sessionId: string,
+	action: string,
+	write: () => Promise<T>,
+): Promise<T> {
+	if (!claimsUnder(ownership)) return await write();
+	const attempt = await attemptSessionClaim(ownership, sessionId);
+	try {
+		const refusal = claimRefusal(ownership, sessionId, attempt);
+		if (refusal) {
+			const reason =
+				refusal instanceof SessionHeldError
+					? `it is open in ${sessionOwnerHolderPhrase(refusal.holder)}`
+					: "gjc could not check whether another process has it open";
+			throw new Error(`Can't ${action} this session: ${reason}.`, { cause: refusal });
+		}
+		return await write();
+	} finally {
+		if (attempt.status === "claimed") attempt.claim.release();
+	}
+}
+
+/**
+ * The sessions enforce would refuse because another process holds them, each with the refusal that
+ * names its holder: what the held-session warning and the session list's markers show (design §1
+ * rows 1-3). A probe, never a claim: the claim stays the authority, and a race falls back to its
+ * refusal. `undefined`, with nothing awaited, outside enforce; a probe that fails reads as free.
+ */
+export function probeHeldSessions(
+	ownership: ResolvedSessionOwnership,
+	sessionIds: readonly string[],
+): Promise<Map<string, SessionHeldError>> | undefined {
+	if (ownership === "exempt" || ownership.mode !== "enforce") return undefined;
+	return heldSessionRefusals(ownership, sessionIds);
+}
+
+async function heldSessionRefusals(
+	ownership: ResolvedSessionOwnership,
+	sessionIds: readonly string[],
+): Promise<Map<string, SessionHeldError>> {
+	const held = new Map<string, SessionHeldError>();
+	let probes: Map<string, SessionOwnerProbe>;
+	try {
+		probes = await probeSessionOwners(sessionIds.filter(id => id.length > 0));
+	} catch (error) {
+		logger.debug("Session owner probe failed; sessions read as free", { error: String(error) });
+		return held;
+	}
+	for (const [sessionId, probe] of probes) {
+		if (probe.state !== "held" || probe.self) continue;
+		const refusal = claimRefusal(ownership, sessionId, { status: "held", holder: probe.holder });
+		if (refusal instanceof SessionHeldError) held.set(sessionId, refusal);
+	}
+	return held;
 }
 
 /** How long a deferred owner shutdown may keep its predecessor's claim (design §2.5). */
 export const DEFERRED_RELEASE_CAP_MS = 60_000;
+
+/**
+ * Turn start's re-attempt backoff (design §13.1, timeout-latch policy). A held session costs one
+ * non-blocking lock call, so it is retried after a short floor; a timed-out or failed claim can cost
+ * the full native budget, so it backs off exponentially up to the cap.
+ */
+export const RECLAIM_HELD_FLOOR_MS = 5_000;
+export const RECLAIM_BACKOFF_BASE_MS = 10_000;
+export const RECLAIM_BACKOFF_CAP_MS = 300_000;
+
+/** What turn start's re-attempt found ({@link SessionClaimSet.reclaimCurrent}). */
+export interface SessionReclaim {
+	/** The current session's outcome now; `timed_out` is a `none` that a lock stall caused. */
+	readonly status: SessionClaimStatus | "timed_out";
+	/** Enforce's refusal of the turn ({@link claimRefusal}): the holder keeps the session. */
+	readonly refusal?: SessionHeldError | SessionOwnershipError;
+}
 
 /** Thrown only under the strict test seam, for a write the detector flags. */
 export class SessionWriteWithoutClaimError extends Error {
@@ -179,6 +282,10 @@ export class SessionClaimSet {
 	readonly #ownership: ResolvedSessionOwnership;
 	/** Detector reports already logged, as `<id> <site>`: log once, count every time. */
 	readonly #reported = new Set<string>();
+	/** Turn start's re-attempts per id since its last claim: how many, and when the next may run. */
+	readonly #reclaims = new Map<string, { readonly attempts: number; readonly notBefore: number }>();
+	/** Ids a refused write queued a background re-attempt for. */
+	readonly #reclaimQueued = new Set<string>();
 
 	constructor(ownership: ResolvedSessionOwnership = resolveSessionOwnership()) {
 		this.#ownership = ownership;
@@ -233,9 +340,15 @@ export class SessionClaimSet {
 	 *
 	 * Outside any transition the claim is a factory's, made before the factory's first write and
 	 * before it hands the manager out: there enforce refuses a held or failed outcome by throwing
-	 * {@link claimRefusal}'s error. A transition's claim never refuses (5a leaves switches to PR 6).
+	 * {@link claimRefusal}'s error. A transition's claim never refuses: a switch is refused before its
+	 * transition begins, by the manager's switch-target admission.
 	 */
 	async claim(sessionId: string): Promise<SessionClaimStatus> {
+		return this.#claim(sessionId, false);
+	}
+
+	/** {@link claim}; a turn-start `reattempt` repeats the id's last outcome without counting it again. */
+	async #claim(sessionId: string, reattempt: boolean): Promise<SessionClaimStatus> {
 		if (this.#mode === "off" || this.#closed) return "none";
 		if (this.#claims.has(sessionId)) return "claimed";
 		const inFlight = this.#pending.get(sessionId);
@@ -243,14 +356,22 @@ export class SessionClaimSet {
 			await inFlight;
 			return this.#admit(sessionId);
 		}
-		const attempt = attemptSessionClaim(this.#ownership, sessionId);
+		const previous = reattempt ? this.#outcomes.get(sessionId) : undefined;
+		const attempt = attemptSessionClaim(this.#ownership, sessionId, previous);
 		this.#pending.set(sessionId, attempt);
 		let status: SessionClaimStatus = "none";
 		try {
 			const result = await attempt;
 			status = result.status;
-			this.#outcomes.set(sessionId, outcomeOf(result));
-			if (result.status === "claimed") this.add(result.claim);
+			this.#record(sessionId, outcomeOf(result));
+			if (result.status === "claimed") {
+				// A re-attempt whose session the manager left while it was in flight is no staged target:
+				// released, so no `claimed` outcome stays recorded for it.
+				if (reattempt && sessionId !== this.#current && this.#transitions === 0) {
+					result.claim.release();
+					this.#outcomes.delete(sessionId);
+				} else this.add(result.claim);
+			}
 		} finally {
 			this.#pending.delete(sessionId);
 			const coveredSite = this.#coveredByPending.get(sessionId);
@@ -297,7 +418,31 @@ export class SessionClaimSet {
 
 	/** Record the outcome of a claim taken before this set existed (a strict open's, handed over). */
 	noteOutcome(sessionId: string, outcome: SessionClaimOutcome): void {
+		this.#record(sessionId, outcome);
+	}
+
+	/**
+	 * Record an id's claim outcome and when turn start may re-attempt it. An open's own outcome seeds
+	 * the backoff, so the first turn after a stalled open does not stall again at once. A held session
+	 * waits the short floor and restarts the exponential count; a timeout or failure doubles it.
+	 */
+	#record(sessionId: string, outcome: SessionClaimOutcome): void {
 		this.#outcomes.set(sessionId, outcome);
+		const retried =
+			outcome.status === "held" ||
+			outcome.status === "failed" ||
+			(outcome.status === "none" && outcome.skipped === "timed_out");
+		if (!retried) {
+			this.#reclaims.delete(sessionId);
+			return;
+		}
+		if (outcome.status === "held") {
+			this.#reclaims.set(sessionId, { attempts: 0, notBefore: Date.now() + RECLAIM_HELD_FLOOR_MS });
+			return;
+		}
+		const attempts = this.#reclaims.get(sessionId)?.attempts ?? 0;
+		const delay = Math.min(RECLAIM_BACKOFF_BASE_MS * 2 ** attempts, RECLAIM_BACKOFF_CAP_MS);
+		this.#reclaims.set(sessionId, { attempts: attempts + 1, notBefore: Date.now() + delay });
 	}
 
 	/**
@@ -321,6 +466,104 @@ export class SessionClaimSet {
 	}
 
 	/**
+	 * Turn start's re-attempt of the current id's claim (design §2.7, §13.1): a claim another process
+	 * held, or one that timed out or failed, is tried again, so a writer whose open did not claim
+	 * becomes visible once it can. `undefined`, with nothing awaited, when there is nothing to
+	 * re-attempt (off, exempt, closed, inside a transition, already claimed, a permanent fail-open, a
+	 * live mode lowered to off, inside the backoff) and whenever the turn does not depend on it: in
+	 * observe, or with the live mode lowered from enforce, the re-attempt runs in the background, and
+	 * the writes it overlaps are covered as a pending claim's are. Only under enforce does the turn wait,
+	 * joining a claim already in flight; there a held or failed claim is re-attempted at every turn, so
+	 * no turn passes it unchecked. Never rejects: enforce's refusal comes back as a value, and the
+	 * session is never taken from its holder.
+	 */
+	reclaimCurrent(): Promise<SessionReclaim> | undefined {
+		const sessionId = this.#current;
+		if (sessionId === undefined || this.#mode === "off" || this.#closed || this.#transitions > 0) return undefined;
+		if (this.#claims.has(sessionId)) return undefined;
+		const inFlight = this.#pending.get(sessionId);
+		const outcome = this.#outcomes.get(sessionId);
+		if (!inFlight) {
+			if (outcome === undefined || outcome.status === "claimed") return undefined;
+			if (outcome.status === "none" && outcome.skipped !== "timed_out") return undefined;
+		}
+		const live = liveSessionOwnershipModeFor(this.#mode);
+		if (live === "off") return undefined;
+		const enforced = this.#mode === "enforce" && live === "enforce";
+		// A claim in flight already covers the writes; only enforce's turn waits for its outcome.
+		if (inFlight) return enforced ? this.#joinReclaim(sessionId, inFlight) : undefined;
+		if (outcome === undefined) return undefined;
+		// What enforce refuses (another holder, a failed claim) is checked at every turn: a backoff
+		// would let the turns inside it through, writing.
+		const checksEveryTurn = enforced && (outcome.status === "held" || outcome.status === "failed");
+		const backoff = this.#reclaims.get(sessionId);
+		if (!checksEveryTurn && backoff !== undefined && Date.now() < backoff.notBefore) return undefined;
+		const reclaim = this.#reclaim(sessionId);
+		if (enforced) return reclaim;
+		void reclaim;
+		return undefined;
+	}
+
+	async #reclaim(sessionId: string): Promise<SessionReclaim> {
+		try {
+			await this.#claim(sessionId, true);
+		} catch (error) {
+			// `#claim` rejects with enforce's refusal, recorded as the outcome and returned below.
+			if (!(error instanceof SessionHeldError || error instanceof SessionOwnershipError))
+				logger.warn("Session claim re-attempt failed", { error: String(error) });
+		}
+		return this.#reclaimResult(sessionId);
+	}
+
+	async #joinReclaim(sessionId: string, inFlight: Promise<unknown>): Promise<SessionReclaim> {
+		await inFlight.catch(() => undefined);
+		return this.#reclaimResult(sessionId);
+	}
+
+	/** The re-attempt's result for the turn: nothing to refuse once the manager rotated away. */
+	#reclaimResult(sessionId: string): SessionReclaim {
+		if (this.#current !== sessionId) return { status: "none" };
+		const outcome = this.#outcomes.get(sessionId);
+		const status =
+			outcome?.status === "none" && outcome.skipped === "timed_out" ? "timed_out" : (outcome?.status ?? "none");
+		return { status, refusal: claimRefusal(this.#ownership, sessionId, outcome) };
+	}
+
+	/**
+	 * Enforce's write gate (design §2.5, §13.1): a write to an id whose recorded outcome enforce
+	 * refuses (`held`: a turn-start re-attempt found another holder, or a transition landed held;
+	 * `failed`: the claim failed, fail-closed) is refused with {@link claimRefusal}'s error, so no
+	 * writer outside a turn (a title, a rename, a compaction, an extension's entry, an SDK append)
+	 * writes over a holder. It reads only the recorded outcome and makes no lock call; the turn gate is
+	 * what finds the holder. A refusal starts a background re-attempt (within the backoff), so the gate
+	 * lifts on its own soon after the holder exits. Inside a transition nothing is refused.
+	 */
+	refuseWriteIfRefused(sessionId: string | undefined = this.#current): void {
+		if (sessionId === undefined || this.#mode !== "enforce" || this.#transitions > 0) return;
+		if (this.#claims.has(sessionId)) return;
+		const outcome = this.#outcomes.get(sessionId);
+		if (outcome?.status !== "held" && outcome?.status !== "failed") return;
+		const refusal = claimRefusal(this.#ownership, sessionId, outcome);
+		if (!refusal) return;
+		this.#reclaimSoon(sessionId);
+		throw refusal;
+	}
+
+	/** A background re-attempt of `sessionId` after this write returns, unless one is in flight or backing off. */
+	#reclaimSoon(sessionId: string): void {
+		if (this.#reclaimQueued.has(sessionId)) return;
+		this.#reclaimQueued.add(sessionId);
+		queueMicrotask(() => {
+			this.#reclaimQueued.delete(sessionId);
+			const backoff = this.#reclaims.get(sessionId);
+			if (this.#closed || this.#transitions > 0 || this.#pending.has(sessionId) || this.#claims.has(sessionId))
+				return;
+			if (backoff !== undefined && Date.now() < backoff.notBefore) return;
+			void this.#reclaim(sessionId);
+		});
+	}
+
+	/**
 	 * The write-path detector (design §2.5), called before a transcript write. When ownership is on
 	 * and this set holds no claim for `sessionId` (the current id unless a successor is named), it
 	 * logs `session_write_without_claim` with the call site and counts it. It never claims, and it
@@ -332,6 +575,7 @@ export class SessionClaimSet {
 	checkWrite(site: string, sessionId: string | undefined = this.#current): void {
 		if (sessionId === undefined) return;
 		if (this.#mode === "off" || this.#claims.has(sessionId)) return;
+		this.refuseWriteIfRefused(sessionId);
 		// The claim for this id failed open (`none` while claiming) or failed: nothing to detect, and
 		// counting it would make every Windows or stalled-filesystem process report writes.
 		const outcome = this.#outcomes.get(sessionId)?.status;
@@ -363,6 +607,9 @@ export class SessionClaimSet {
 			return;
 		}
 		this.#claims.set(claim.sessionId, claim);
+		// The opener's own claim has landed: the covers its open or switch took go now, not when the
+		// caller's flow settles, so they are never a second holder of the open session.
+		releaseSessionAdmissions(claim);
 		// A target staged outside the transition that rotates to it is exposed to any unrelated
 		// transition's settle. Visible in observe; off stays inert.
 		if (
@@ -460,4 +707,14 @@ interface ClaimSetOwner {
 /** The claim set of a SessionManager, for factories, transitions and tests in this package. */
 export function sessionClaimSetOf(manager: SessionManager): SessionClaimSet {
 	return (manager as unknown as ClaimSetOwner)[sessionClaimSetCapability]();
+}
+
+/**
+ * Turn start's re-attempt for `manager`'s current session ({@link SessionClaimSet.reclaimCurrent});
+ * `undefined` for a stand-in manager that has no claim set, as a test's double has none.
+ */
+export function reclaimCurrentSession(manager: SessionManager): Promise<SessionReclaim> | undefined {
+	const owner = manager as unknown as Partial<ClaimSetOwner>;
+	if (typeof owner[sessionClaimSetCapability] !== "function") return undefined;
+	return sessionClaimSetOf(manager).reclaimCurrent();
 }

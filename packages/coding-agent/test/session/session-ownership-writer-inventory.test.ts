@@ -358,10 +358,13 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Writer> = {
 
 /** Writers this step does not cover; the step named in each reason does. Not run here. */
 const DEFERRED_WRITERS: Record<string, string> = {
-	discardUncommittedSession: "deletes a never-committed session; delete ownership is the scoped-claim step",
-	dropSession: "deletes a session; delete ownership is the scoped-claim step",
-	deleteSessionVerified: "verified delete; delete ownership is the scoped-claim step",
-	setSessionStarredForPicker: "picker write of any session; scoped claims cover picker writes",
+	discardUncommittedSession: "a never-committed successor: its id was never public, so no other process can hold it",
+	dropSession:
+		"deletes a session under a scoped claim of its id (4d; session-factory-claims.test.ts); a transcript with an unreadable header is deleted without one, and a live holder always has a valid header",
+	deleteSessionVerified:
+		"broker `session.delete` runs under a scoped claim of its id (row 17; sdk-broker-resume-held-session.test.ts); gc retirement and managed-scope cleanup are not covered: gc is deferred (§13 L2)",
+	setSessionStarredForPicker:
+		"picker write of any session, under a scoped claim of its id (4d; session-factory-claims.test.ts)",
 	remapStagedArtifactReferences: "staged child artifact references; staged sessions claim at commit",
 	prepareManagedCandidateForWrite:
 		"4b (H1): the TUI picker calls it on the live manager before any factory, so no claim precedes it yet",

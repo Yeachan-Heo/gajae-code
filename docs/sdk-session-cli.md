@@ -497,6 +497,18 @@ not proof that the create did not execute, so callers must not resubmit solely
 because lookup reports `not_found`. Reconciliation failures exit nonzero while
 preserving the structured outcome in JSON.
 
+### Resume of a session another process holds
+
+`operation_failed` with diagnostic `lifecycle_session_held` on a `session.resume`
+means the broker's code was `live_session` and it named a holder: another gjc process
+holds the session for writing and published no SDK endpoint within the broker's
+wait, so no session host was launched. This happens under
+`session.ownership.mode: enforce`, the default. `observe` waits briefly and then
+goes on as before. The broker's message names the holder but is never rendered. A
+`live_session` without a holder (a live session whose endpoint authority is
+unavailable) gets no diagnostic. Retry with a new idempotency key once the holder
+is ready, because the same key replays this answer. Otherwise fork the session.
+
 ### Legacy lifecycle admission fence
 
 `operation_failed` with diagnostic `lifecycle_legacy_history_ambiguous` means the

@@ -3,13 +3,40 @@ import {
 	isStableSessionApiKeyCredentialType,
 	lookupSessionApiKey,
 	resolveLiveSessionApiKeyModel,
+	type SessionApiKeyModel,
+	type SessionApiKeyRegistry,
 } from "../src/sdk/session-api-key";
+
+type KeyOptions = { signal?: AbortSignal };
+
+/** Adapt bare-key fakes to the row-aware registry; these lookups never name a stored row. */
+function keyRegistry(fakes: {
+	getApiKey(model: SessionApiKeyModel, sessionId?: string, options?: KeyOptions): Promise<string | undefined>;
+	getApiKeyForProvider(
+		provider: string,
+		sessionId?: string,
+		baseUrl?: string,
+		options?: KeyOptions,
+	): Promise<string | undefined>;
+}): SessionApiKeyRegistry {
+	return {
+		async getApiKeyWithCredentialRowId(model, sessionId, options) {
+			return { apiKey: await fakes.getApiKey(model, sessionId, options), credentialRowId: undefined };
+		},
+		async getApiKeyForProviderWithCredentialRowId(provider, sessionId, baseUrl, options) {
+			return {
+				apiKey: await fakes.getApiKeyForProvider(provider, sessionId, baseUrl, options),
+				credentialRowId: undefined,
+			};
+		},
+	};
+}
 
 describe("lookupSessionApiKey (#5081)", () => {
 	it("uses getApiKey(model) when the active model matches the provider, even if getApiKeyForProvider is empty", async () => {
 		const calls: string[] = [];
 		const key = await lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey(model) {
 					calls.push(`model:${model.provider}`);
 					return "model-scoped-token";
@@ -18,7 +45,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 					calls.push(`provider:${provider}`);
 					return undefined;
 				},
-			},
+			}),
 			"anthropic",
 			"parent-credential-scope",
 			{ provider: "anthropic" },
@@ -31,7 +58,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 	it("falls back to getApiKeyForProvider when the matching model-scoped lookup misses", async () => {
 		const calls: string[] = [];
 		const key = await lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey(model) {
 					calls.push(`model:${model.provider}`);
 					return undefined;
@@ -40,7 +67,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 					calls.push(`provider:${provider}`);
 					return "provider-token";
 				},
-			},
+			}),
 			"anthropic",
 			"scope",
 			{ provider: "anthropic" },
@@ -51,14 +78,14 @@ describe("lookupSessionApiKey (#5081)", () => {
 
 	it("falls back to getApiKeyForProvider when no model is bound", async () => {
 		const key = await lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey() {
 					throw new Error("getApiKey should not run");
 				},
 				async getApiKeyForProvider() {
 					return "provider-token";
 				},
-			},
+			}),
 			"anthropic",
 			"scope",
 			undefined,
@@ -69,14 +96,14 @@ describe("lookupSessionApiKey (#5081)", () => {
 	it("throws provider_unavailable without leaking a token when both lookups miss", async () => {
 		try {
 			await lookupSessionApiKey(
-				{
+				keyRegistry({
 					async getApiKey() {
 						return undefined;
 					},
 					async getApiKeyForProvider() {
 						return undefined;
 					},
-				},
+				}),
 				"anthropic",
 				"scope",
 				{ provider: "anthropic" },
@@ -100,7 +127,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 	it("retries without sessionId when the scoped lookups miss (architect child vs --no-session)", async () => {
 		const calls: string[] = [];
 		const key = await lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey(model, sessionId) {
 					calls.push(`model:${model.provider}:${sessionId ?? "none"}`);
 					return sessionId ? undefined : "broker-oauth-token";
@@ -109,7 +136,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 					calls.push(`provider:${provider}:${sessionId ?? "none"}`);
 					return undefined;
 				},
-			},
+			}),
 			"anthropic",
 			"parent-sid",
 			{ provider: "anthropic" },
@@ -122,7 +149,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 	it("keeps a mismatched live model out of both scoped and unscoped provider lookups", async () => {
 		const calls: string[] = [];
 		const key = await lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey(model) {
 					calls.push(`model:${model.provider}`);
 					return "wrong-provider-token";
@@ -131,7 +158,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 					calls.push(`provider:${provider}:${sessionId ?? "none"}:${baseUrl ?? "default"}`);
 					return sessionId ? undefined : "anthropic-token";
 				},
-			},
+			}),
 			"anthropic",
 			"parent-sid",
 			{ provider: "openai", baseUrl: "https://openai.example" },
@@ -145,7 +172,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 		const calls: string[] = [];
 		const signals: Array<AbortSignal | undefined> = [];
 		const key = await lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey(model, sessionId, options) {
 					calls.push(`model:${sessionId ?? "none"}:${model.baseUrl}`);
 					signals.push(options?.signal);
@@ -156,7 +183,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 					signals.push(options?.signal);
 					return sessionId ? undefined : "provider-token";
 				},
-			},
+			}),
 			"anthropic",
 			"parent-sid",
 			{ provider: "anthropic", baseUrl: "https://gateway.example" },
@@ -181,7 +208,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 		const abortReason = new DOMException("replacement lookup cancelled", "AbortError");
 		const calls: string[] = [];
 		const lookup = lookupSessionApiKey(
-			{
+			keyRegistry({
 				async getApiKey(_model, sessionId, options) {
 					calls.push(`model:${sessionId ?? "none"}`);
 					const signal = options?.signal;
@@ -206,7 +233,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 					expect(options?.signal).toBe(controller.signal);
 					return undefined;
 				},
-			},
+			}),
 			"anthropic",
 			"parent-sid",
 			{ provider: "anthropic" },
@@ -234,7 +261,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 		const calls: string[] = [];
 		await expect(
 			lookupSessionApiKey(
-				{
+				keyRegistry({
 					async getApiKey(_model, sessionId) {
 						calls.push(`model:${sessionId ?? "none"}`);
 						throw scopedError;
@@ -243,7 +270,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 						calls.push(`provider:${sessionId ?? "none"}`);
 						return "broader-token";
 					},
-				},
+				}),
 				"anthropic",
 				"parent-sid",
 				{ provider: "anthropic" },
@@ -256,7 +283,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 		const calls: string[] = [];
 		await expect(
 			lookupSessionApiKey(
-				{
+				keyRegistry({
 					async getApiKey(_model, sessionId) {
 						calls.push(`model:${sessionId ?? "none"}`);
 						return undefined;
@@ -265,7 +292,7 @@ describe("lookupSessionApiKey (#5081)", () => {
 						calls.push(`provider:${sessionId ?? "none"}`);
 						return sessionId ? undefined : "broader-token";
 					},
-				},
+				}),
 				"anthropic",
 				"parent-sid",
 				{ provider: "anthropic" },
@@ -279,5 +306,34 @@ describe("lookupSessionApiKey (#5081)", () => {
 		expect(isStableSessionApiKeyCredentialType("api_key", "oauth")).toBe(false);
 		expect(isStableSessionApiKeyCredentialType("oauth", "api_key")).toBe(false);
 		expect(isStableSessionApiKeyCredentialType("oauth", "oauth")).toBe(true);
+	});
+
+	it("returns the stored row of the lookup that actually supplied the key", async () => {
+		const registry: SessionApiKeyRegistry = {
+			async getApiKeyWithCredentialRowId(_model, sessionId) {
+				// A scoped model miss must not leak its row onto the provider-scoped key.
+				return sessionId ? { apiKey: undefined, credentialRowId: 7 } : { apiKey: "model-key", credentialRowId: 3 };
+			},
+			async getApiKeyForProviderWithCredentialRowId() {
+				return { apiKey: undefined, credentialRowId: undefined };
+			},
+		};
+		const unscoped = await lookupSessionApiKey(registry, "anthropic", "parent-sid", { provider: "anthropic" });
+		expect(unscoped).toEqual({ apiKey: "model-key", credentialRowId: 3, credentialSessionId: undefined });
+
+		const providerScoped = await lookupSessionApiKey(
+			{
+				async getApiKeyWithCredentialRowId() {
+					return { apiKey: undefined, credentialRowId: 7 };
+				},
+				async getApiKeyForProviderWithCredentialRowId() {
+					return { apiKey: "env-key", credentialRowId: undefined };
+				},
+			},
+			"anthropic",
+			"scope",
+			{ provider: "anthropic" },
+		);
+		expect(providerScoped).toEqual({ apiKey: "env-key", credentialRowId: undefined, credentialSessionId: "scope" });
 	});
 });

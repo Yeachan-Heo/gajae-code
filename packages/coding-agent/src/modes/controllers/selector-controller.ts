@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as util from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import {
@@ -76,16 +77,22 @@ import {
 	type RoutingSettingsService,
 } from "../../sdk/routing-settings";
 import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
-import {
-	type AgentSessionProfileInstalledOverrideState,
-	type DefaultFallbackRuntimeState,
-	SharedControlPublicationError,
+import type {
+	AgentSessionProfileInstalledOverrideState,
+	DefaultFallbackRuntimeState,
 } from "../../session/agent-session";
 import { CREDENTIAL_STORE_UNREADABLE_MESSAGE } from "../../session/credential-store-errors";
+import { probeHeldSessions, resolveSessionOwnership } from "../../session/internal/session-claim-set";
 import { operatorErrorMessage } from "../../session/operator-error-message";
+import { checkSessionHandover, handOverSession, type SessionHandoverCheck } from "../../session/session-handover";
 import { GraphSuccessorUnavailableError, type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
-import { SessionHeldError, sessionHeldForkCommand } from "../../session/session-ownership";
+import {
+	SessionHeldError,
+	type SessionOwnerClaim,
+	sessionHeldForkCommand,
+	sessionHeldForkedNotice,
+} from "../../session/session-ownership";
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -185,6 +192,11 @@ import {
 } from "../components/provider-onboarding-selector";
 import { ProviderOrderContext } from "../components/provider-order-context";
 import { ProviderOrderEditorComponent } from "../components/provider-order-editor";
+import {
+	heldSessionChoice,
+	heldSessionWarningDialog,
+	SESSION_HOST_WAITING_MESSAGE,
+} from "../components/session-held-warning";
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
@@ -327,18 +339,8 @@ export class SelectorController {
 		restoreProfileState: boolean = true,
 	): Promise<never> {
 		if (!restoreLiveModel && !restoreProfileState) throw error;
-		// An unknown or committed-but-unapplied shared outcome already closed the session:
-		// its transcript may hold the forward write, so nothing is compensated over it (#7824).
-		if (
-			this.ctx.session.sessionLifecycle?.disposed ||
-			(error instanceof SharedControlPublicationError &&
-				(error.code === "unknown" || error.code === "committed_not_applied"))
-		)
-			throw error;
-		// A shared session restores the chain, resume default and live model as one admitted
-		// publication of only what actually differs, so a forward write known not to have
-		// happened leaves nothing to compensate.
-		const sharedCompensation = this.ctx.session.usesSharedControlPublication?.() === true;
+		// A closed session is never compensated over.
+		if (this.ctx.session.sessionLifecycle?.disposed) throw error;
 		// Validate the durable owner under the same lock as compensation: the
 		// in-memory settings may not have seen another process's winning commit.
 		try {
@@ -399,32 +401,16 @@ export class SelectorController {
 				? this.ctx.settings.clearOverride("modelProfile.default")
 				: this.ctx.settings.override("modelProfile.default", snapshot.profileOverride),
 		);
-		if (sharedCompensation) {
-			try {
-				await this.ctx.session.restoreModelSelectionForRollback(
-					restoreLiveModel ? snapshot.model : this.ctx.session.model,
-					restoreLiveModel ? snapshot.thinkingLevel : this.ctx.session.thinkingLevel,
-					{
-						defaultChain: restoreProfileState ? { state: snapshot.chain } : undefined,
-						resumeDefault: restoreLiveModel ? { selector: snapshot.resumeDefaultSelector } : undefined,
-					},
-				);
-			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
-			}
-		}
 		if (restoreProfileState) {
-			if (!sharedCompensation) {
-				restore(() =>
-					this.ctx.session.setConfiguredModelChain(
-						"default",
-						snapshot.chain?.entries ?? [],
-						snapshot.chain?.origin ?? "rollback",
-						snapshot.chain?.identity,
-						snapshot.chain?.explicitHead ?? true,
-					),
-				);
-			}
+			restore(() =>
+				this.ctx.session.setConfiguredModelChain(
+					"default",
+					snapshot.chain?.entries ?? [],
+					snapshot.chain?.origin ?? "rollback",
+					snapshot.chain?.identity,
+					snapshot.chain?.explicitHead ?? true,
+				),
+			);
 			restore(() => this.ctx.session.restoreDefaultFallbackRuntimeState(snapshot.fallbackRuntimeState));
 			restore(() => {
 				if (snapshot.canonicalVariant) {
@@ -437,7 +423,7 @@ export class SelectorController {
 				}
 			});
 		}
-		if (restoreLiveModel && !sharedCompensation) {
+		if (restoreLiveModel) {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
@@ -451,7 +437,7 @@ export class SelectorController {
 		} catch (rollbackError) {
 			rollbackErrors.push(rollbackError);
 		}
-		if (restoreLiveModel && !sharedCompensation) {
+		if (restoreLiveModel) {
 			try {
 				await this.ctx.session.restoreModelSelectionForRollback(snapshot.model, snapshot.thinkingLevel);
 			} catch (rollbackError) {
@@ -2405,6 +2391,13 @@ export class SelectorController {
 	async showSessionSelector(): Promise<void> {
 		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
 		if (this.ctx.isStopped?.()) return;
+		// Under enforce, rows other processes hold are marked; choosing one warns (design §1 row 3).
+		const heldProbe = probeHeldSessions(
+			resolveSessionOwnership(),
+			sessions.map(session => session.id),
+		);
+		const held = heldProbe ? await heldProbe : undefined;
+		if (this.ctx.isStopped?.()) return;
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
@@ -2417,7 +2410,15 @@ export class SelectorController {
 					void this.handleResumeSession(sessionPath).catch(error => {
 						// A refusal (a session open in another process, under enforce) carries operator text.
 						// `/fork` here would fork the current session, so name the command that copies this one.
-						const fork = error instanceof SessionHeldError ? sessionHeldForkCommand(error.sessionId) : undefined;
+						const fork =
+							error instanceof SessionHeldError
+								? sessionHeldForkCommand(
+										error.sessionId,
+										this.ctx.sessionManager.isManagedDestination()
+											? {}
+											: { sessionDir: this.ctx.sessionManager.getSessionDir() },
+									)
+								: undefined;
 						const message = operatorErrorMessage(error, String(error));
 						this.ctx.showError(fork ? `${message} To continue it in a copy, quit and run: ${fork}` : message);
 					});
@@ -2448,6 +2449,7 @@ export class SelectorController {
 				(session, starred) => this.ctx.sessionManager.setSessionStarredForPicker(session, starred),
 			);
 			selector.setOnRequestRender(() => this.ctx.ui.requestRender());
+			if (held) selector.setHeldSessions(held);
 			return { component: selector, focus: selector };
 		});
 	}
@@ -2522,7 +2524,14 @@ export class SelectorController {
 	 */
 	#resumeInFlight = false;
 
-	async handleResumeSession(sessionPath: string): Promise<void> {
+	/**
+	 * `cancelledStatus`: what Cancel on the held-session warning says (default `Resume cancelled`);
+	 * `continueHere: false` offers Fork and Cancel only.
+	 */
+	async handleResumeSession(
+		sessionPath: string,
+		options?: { readonly cancelledStatus?: string; readonly continueHere?: boolean },
+	): Promise<void> {
 		this.ctx.promptSuggestion?.clear();
 		if (this.#resumeInFlight) {
 			this.ctx.showStatus("Resume already in progress");
@@ -2534,7 +2543,31 @@ export class SelectorController {
 		// session-manager accessor, an unavailable status rail) can never strand the
 		// guard and silently disable every later resume.
 		let progressLease: ResumeProgressLease | undefined;
+		let admission: SessionOwnerClaim | undefined;
+		/** Only a copy the Fork branch created; deleted below unless the switch landed on it. */
+		let forkCopy: string | undefined;
+		let resumedStatus = "Resumed session";
 		try {
+			// Under enforce the target is claimed first (design §1 row 3), before the spinner and before
+			// its preparation; the claim covers it until the switch's own claim lands. A session another
+			// process holds gets the warning instead: Cancel stays here, Fork switches to a copy.
+			const admitting = this.ctx.sessionManager.switchTargetAdmission(sessionPath);
+			if (admitting) {
+				try {
+					admission = await admitting;
+				} catch (error) {
+					if (!(error instanceof SessionHeldError)) throw error;
+					const forked = await this.#forkHeldSession(sessionPath, error, options);
+					if (!forked) return;
+					if (forked.kind === "continued") admission = forked.admission;
+					else {
+						({ sessionPath, admission } = forked);
+						forkCopy = forked.discardIfUnused;
+						resumedStatus = sessionHeldForkedNotice(error);
+					}
+				}
+				if (this.ctx.isStopped?.()) return;
+			}
 			const previousSessionId = this.ctx.sessionManager.getSessionId();
 			progressLease = acquireResumeProgressLease(this.ctx);
 			await progressLease.committed;
@@ -2622,12 +2655,135 @@ export class SelectorController {
 			);
 			await this.ctx.reloadTodos();
 			if (this.ctx.isStopped?.()) return;
-			this.ctx.showStatus("Resumed session");
+			this.ctx.showStatus(resumedStatus);
 			this.#maybePromptResumeModelChoice();
 		} finally {
+			// A cancelled, busy, stopped or failed switch leaves the Fork's copy unused: delete it while
+			// its admission claim still holds, so it never becomes the newest session.
+			if (forkCopy) await this.#discardForkCopyIfUnused(forkCopy);
+			admission?.release();
 			progressLease?.clear();
 			this.#resumeInFlight = false;
 			releaseActivityIndicator();
+		}
+	}
+
+	/**
+	 * Delete a copy a Fork created unless the session landed on it, through the picker's delete path.
+	 * Never throws, so the caller's claim release and in-flight reset always run after it.
+	 */
+	async #discardForkCopyIfUnused(sessionPath: string): Promise<void> {
+		try {
+			const current = this.ctx.sessionManager.getSessionFile();
+			if (current !== undefined && path.resolve(current) === path.resolve(sessionPath)) return;
+			await this.#deleteSession(sessionPath);
+		} catch (error) {
+			logger.warn("Could not delete an unused fork of a held session", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/**
+	 * The held-session warning for `/resume` (design §3.1). On Fork, copy the held session into this
+	 * session's store, reading it in place, and return the copy to switch to, with an admission claim
+	 * that covers it once the forking manager closes. On Continue here (a broker-launched holder,
+	 * design §13 L1), close the holder and return the admission claim of the session itself, with no
+	 * copy to delete. `undefined` on Cancel: the current session stays as it was, still claimed.
+	 */
+	async #forkHeldSession(
+		sessionPath: string,
+		probed: SessionHeldError,
+		warning?: { readonly cancelledStatus?: string; readonly continueHere?: boolean },
+	): Promise<
+		| {
+				readonly kind: "forked";
+				readonly sessionPath: string;
+				readonly admission: SessionOwnerClaim | undefined;
+				/** The copy this Fork created, and only that: the one path the caller may delete. */
+				readonly discardIfUnused: string;
+		  }
+		| { readonly kind: "continued"; readonly admission: SessionOwnerClaim | undefined }
+		| undefined
+	> {
+		// The session's own agent dir and claim decision, as the launch and this switch's admission use.
+		const agentDir = this.ctx.settings.getAgentDir();
+		// A refused turn on the current session offers Fork and Cancel only, so it looks up no handover.
+		let check: SessionHandoverCheck = { error: probed, target: undefined };
+		if (warning?.continueHere !== false) {
+			// Waiting for a launched host to publish shows in the status line; quitting ends the wait.
+			const stop = new AbortController();
+			const offStop = this.ctx.onStop?.(() => stop.abort());
+			try {
+				check = await checkSessionHandover(probed, agentDir, {
+					signal: stop.signal,
+					onWaiting: () => this.ctx.showStatus(SESSION_HOST_WAITING_MESSAGE),
+				});
+			} finally {
+				offStop?.();
+			}
+			if (this.ctx.isStopped?.()) return undefined;
+		}
+		// The holder let go while the warning waited: take the switch's admission claim as for an unheld session.
+		if (!check.error)
+			return { kind: "continued", admission: await this.ctx.sessionManager.switchTargetAdmission(sessionPath) };
+		const error = check.error;
+		const handover = check.target;
+		let note: string | undefined;
+		for (;;) {
+			const { title, options } = heldSessionWarningDialog(error, { continueHere: handover !== undefined, note });
+			const choice = heldSessionChoice(await this.ctx.showHookSelector(title, options));
+			switch (choice) {
+				case "fork":
+					break;
+				case "continue": {
+					if (!handover || this.ctx.isStopped?.()) return undefined;
+					// Not cancellable: the selector is closed and the caller waits for the claim.
+					this.ctx.showStatus("Handing the session over…");
+					const outcome = await handOverSession(error, agentDir, this.ctx.sessionManager.ownershipDecision);
+					if (outcome.kind === "closed") return { kind: "continued", admission: outcome.claim };
+					note = outcome.message;
+					continue;
+				}
+				case "cancel":
+					this.ctx.showStatus(warning?.cancelledStatus ?? "Resume cancelled");
+					return undefined;
+				default: {
+					const unknown: never = choice;
+					throw new Error(`Unknown held-session choice: ${String(unknown)}`);
+				}
+			}
+			break;
+		}
+		if (this.ctx.isStopped?.()) return undefined;
+		const migrationPolicy =
+			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		const forked = await SessionManager.forkFrom(
+			sessionPath,
+			this.ctx.sessionManager.getCwd(),
+			this.ctx.sessionManager.getDestinationForFork(),
+			undefined,
+			migrationPolicy,
+			this.ctx.settings?.get("sessionMemory.mode"),
+			undefined,
+			// The switch moves the breadcrumb once it lands; an abandoned copy is deleted.
+			{ writeBreadcrumb: false },
+		);
+		const forkPath = forked.getSessionFile();
+		let admission: SessionOwnerClaim | undefined;
+		try {
+			if (!forkPath) throw new Error("Fork created no session file");
+			admission = await this.ctx.sessionManager.switchTargetAdmission(forkPath);
+			await forked.close();
+			return { kind: "forked", sessionPath: forkPath, admission, discardIfUnused: forkPath };
+		} catch (failure) {
+			// The copy can't be switched to: close the forking manager, delete the copy (under the
+			// admission claim when one was taken; an unclaimed fresh id is known to no one else), then
+			// release the claim.
+			await forked.close().catch(() => undefined);
+			if (forkPath) await this.#discardForkCopyIfUnused(forkPath);
+			admission?.release();
+			throw failure;
 		}
 	}
 
@@ -2944,9 +3100,9 @@ export class SelectorController {
 							{
 								accountProviderId: selectedProviderId,
 								// The selector fires these callbacks with `void`, so a rejection here is an
-								// unhandled rejection (a recorded GJC crash). Shared sessions refuse a
-								// credential write with SharedControlPublicationError (#7824); report every
-								// failure and keep the selector open so the user can retry or pick another row.
+								// unhandled rejection (a recorded GJC crash). A refused credential write
+								// (#7824) is reported and the selector stays open so the user can retry or
+								// pick another row.
 								onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
 									try {
 										await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
