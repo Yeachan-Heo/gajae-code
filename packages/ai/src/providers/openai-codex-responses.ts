@@ -530,6 +530,8 @@ interface CodexStreamRuntime {
 	finalizedToolCallIds: Set<string>;
 	/** Event types whose degraded non-string increment was already diagnosed. */
 	degradedIncrementDiagnostics: Set<string>;
+	/** Event queued for publication after a cooperative flush due to replay-eligibility change. */
+	queuedEventAfterFlush: AssistantMessageEvent | null;
 	/** An argument event identified a different active item; never salvage this response. */
 	toolArgumentCorrelationFailed: boolean;
 	/** Bounded event descriptors retained for transient stream-close diagnostics. */
@@ -1308,6 +1310,7 @@ function createCodexStreamRuntime(initial: {
 		toolArgumentCorrelationFailed: false,
 		recentEvents: [],
 		recentEventIndex: 0,
+		queuedEventAfterFlush: null,
 	};
 }
 
@@ -1330,6 +1333,12 @@ async function processCodexResponseStream(
 					rawEvent,
 					firstTokenTime,
 				});
+				// If an event was queued for publication after cooperative flushing, flush now and push it.
+				if (runtime.queuedEventAfterFlush !== null) {
+					await flushCodexEventsCooperatively(context, runtime);
+					context.stream.push(runtime.queuedEventAfterFlush);
+					runtime.queuedEventAfterFlush = null;
+				}
 				if (runtime.sawTerminalEvent) break;
 			}
 			if (!runtime.sawTerminalEvent) {
@@ -1419,6 +1428,13 @@ function emitCodexEvent(
 		runtime.bufferedEvents.push(event);
 		return;
 	}
+	// Buffered events must be flushed before this non-replay-eligible event is published.
+	// Queue this event for publication after the cooperative flush in the stream processing loop.
+	if (runtime.bufferedEvents.length > 0 && !runtime.eventsReleased) {
+		runtime.queuedEventAfterFlush = event;
+		return;
+	}
+	// If there are no buffered events, publish immediately (all events have already been released).
 	flushCodexEvents(context, runtime);
 	context.stream.push(event);
 }

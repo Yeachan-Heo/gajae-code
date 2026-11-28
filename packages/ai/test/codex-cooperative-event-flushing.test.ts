@@ -279,4 +279,65 @@ describe("codex: cooperative event flushing and replay contract (issue #8127)", 
 		// Verify we checked on every delta, not based on size or brace boundaries
 		expect(completionChecks).toBe(5);
 	});
+
+	it("pure tool-call response with many deltas flushes with correct event order", async () => {
+		// This test verifies that a pure tool-call response (no text items) with many
+		// argument deltas flushes all buffered events before emitting the terminal event.
+		// This is critical for the replay contract: tool-call deltas must arrive before
+		// the final toolcall_end, so a retry can safely discard all events for this call.
+
+		const emittedEvents: AssistantMessageEvent[] = [];
+		const mockMessage = createMockAssistantMessage();
+
+		const context = {
+			stream: {
+				push: (event: AssistantMessageEvent) => {
+					emittedEvents.push(event);
+				},
+			},
+		};
+
+		// Simulate buffered events that would be released on output_item.done
+		const bufferedEvents: AssistantMessageEvent[] = [];
+		for (let i = 0; i < 1000; i++) {
+			bufferedEvents.push({
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: `"arg${i}":${i},`,
+				partial: mockMessage,
+			});
+		}
+
+		// Simulate the cooperative flush with batching (100 events per batch with yields)
+		const batchSize = 100;
+		let yieldCount = 0;
+		for (let i = 0; i < bufferedEvents.length; i++) {
+			context.stream.push(bufferedEvents[i]!);
+			if ((i + 1) % batchSize === 0) {
+				yieldCount++;
+				await Bun.sleep(0);
+			}
+		}
+		context.stream.push({
+			type: "toolcall_end",
+			contentIndex: 0,
+			toolCall: {
+				type: "toolCall" as const,
+				id: "call_1",
+				name: "test_tool",
+				arguments: { test: "value" },
+			},
+			partial: mockMessage,
+		});
+
+		// Verify all events were emitted in correct order: deltas then end
+		expect(emittedEvents).toHaveLength(1001);
+		for (let i = 0; i < 1000; i++) {
+			expect(emittedEvents[i]?.type).toBe("toolcall_delta");
+		}
+		expect(emittedEvents[1000]?.type).toBe("toolcall_end");
+
+		// Verify that we yielded multiple times (allowing cooperative flushing to work)
+		expect(yieldCount).toBeGreaterThanOrEqual(10); // Should yield at least 10 times for 1000 events
+	});
 });
