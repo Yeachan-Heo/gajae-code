@@ -1,2 +1,0 @@
-### Fixed
-- A legacy OpenAI Codex credential that learns its ChatGPT workspace on refresh now keeps the workspace name of the duplicate login row it replaces (the same applies to an Anthropic refresh that omits the organization name). Codex refresh does not return the workspace name, so the surviving row used to lose its `email (workspace name)` label and `org:<name>` matching until the next login, and a request that performed that refresh itself could fail to return the refreshed key.

@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-11-28
+
+### Added
+
+- `AssistantMessage.credentialId` records the stored credential row that authenticated the request producing the message. `streamSimple` stamps `StreamOptions.credentialId` on every partial, the `done` or `error` message, and the stream result once the provider has answered (an event after `start`, completion, or an error carrying an HTTP status in `errorStatus` or `transportFailure.status`, or a structured provider diagnostic, currently minted by the Anthropic adapter); a failure before any response, such as a transport exception or an abort before the first event, stays unattributed, and a failed response carrying none of these facts (for example a stream-level failure after HTTP 200 before any content) can stay unattributed too; an auth retry that returns an `AuthRetryCredential` with its own `credentialId` attributes the retried response to that row, while a bare replacement key leaves the field unset. The value is the opaque, non-secret row id only, and it is never set for external, env, or pi-native gateway keys. Attribution is best-effort and never fails a request whose message object rejects the write. An attributed request now aborts its provider request and closes the provider stream (running its `onConsumerClose` cleanup) when the consumer stops iterating early; the auth-retry path and the custom API forwarder used with `onStreamCreated` now close the provider stream the same way. `EventStream.closeConsumers()` stops every iterator of a stream as if its consumer had returned early. `pi-native-client` never sends a `credentialId` to the gateway, neither the request option nor the field on prior assistant messages in the context. `stripCredentialIds(messages)` removes the field from assistant messages before a context leaves the process. The id is recorded for attribution only and does not change what thinking is replayed; the provider decides what a thinking signature is valid for.
+
+### Fixed
+
+- Anthropic `429 credits_required` ("Usage credits are required for this model.") is now treated as account-level usage exhaustion: it is no longer retried on the same account and triggers rotation to another stored credential, including during auto-compaction.
+
+- `SqliteAuthCredentialStore.deleteAuthCredential` and `deleteAuthCredentialsForProvider` now throw when the SQLite write fails instead of swallowing the error, so a credential that is still active on disk is no longer reported as removed. `AuthStorage.disableCredentialById`, `remove()`, and `logout()` change memory, selectors, and `credential_disabled` events only after the write succeeds.
+- `tryDisableAuthCredentialIfMatches` and `tryDisableAuthCredentialIfRevision` return `false` only when no active row matched; a database error now throws instead of looking like a lost compare-and-swap.
+- `deleteAuthCredential` no longer rewrites a row that is already disabled; the row keeps its first disabled cause and revision.
+- When disabling a credential after a definitive OAuth refresh failure cannot be written, the original authentication error is raised, the credential stays in memory, and it is blocked in this process for five minutes so other sessions move to another credential instead of replaying the failed refresh.
+- Deduplication keeps a duplicate credential whose delete failed, per row. A remote auth-broker store is no longer asked to delete duplicates it serves (its synchronous delete can only throw); the client keeps the rows the broker sends.
+- The auth broker answers `POST /v1/credential/:id/disable` with 500 instead of `200 { ok: true }` (or 404 for a revision-checked disable) when its store cannot write, and the background refresher logs a failed disable and retries on the next sweep.
+- `pi-ai logout` exits non-zero without printing a success line when the logout cannot be written.
+
+- A legacy OpenAI Codex credential that learns its ChatGPT workspace on refresh now keeps the workspace name of the duplicate login row it replaces (the same applies to an Anthropic refresh that omits the organization name). Codex refresh does not return the workspace name, so the surviving row used to lose its `email (workspace name)` label and `org:<name>` matching until the next login, and a request that performed that refresh itself could fail to return the refreshed key.
+
 ## [0.22.2] - 2026-11-25
 
 ### Fixed
