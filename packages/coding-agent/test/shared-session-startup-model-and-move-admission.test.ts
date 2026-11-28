@@ -1,19 +1,14 @@
 /**
  * Regression coverage for #7856: a root TUI session allows the startup model setting
- * with --model/--mpreset after its first message. Also covers the shared-publication
- * layer's Move Session refusal; that case latches the manager's shared bars directly and
- * goes with the layer in single-owner steps 10d-10e.
+ * with --model/--mpreset after its first message.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
-import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -203,75 +198,5 @@ describe("#7856 setTemporaryModel in a root TUI session", () => {
 			e => e.type === "model_change" && e.model === `${provider}/selected`,
 		);
 		expect(modelChangeEntry).toBeDefined();
-	});
-});
-
-describe("#7856 Move Session in a shared root TUI session", () => {
-	it("refuses moveTo in a shared session with SharedSessionMutationUnsupportedError", async () => {
-		const f = await fixture();
-		// A canonical shared append on the manager latches its shared bars.
-		expect((await f.manager.appendMessageSharingSession(user("canonical shared user"))).kind).toBe("committed");
-
-		const targetDir = path.join(f.cwd, "..", "moved-session");
-		await fs.mkdir(targetDir, { recursive: true });
-
-		// Move Session in shared root TUI sessions stays refused (pre-#7858 behavior).
-		// This path is used by Move Session tool (via rescopeSessionCwd).
-		let threwExpected = false;
-		try {
-			await f.manager.runExclusiveCwdMoveTransition(() => f.manager.moveTo(targetDir));
-		} catch (error) {
-			if (error instanceof Error && error.constructor.name === "SharedSessionMutationUnsupportedError") {
-				threwExpected = true;
-			} else {
-				throw error;
-			}
-		}
-
-		expect(threwExpected).toBe(true);
-	});
-
-	it("refuses the move_session tool before it changes the process cwd or rebinds services", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-move-session-tool-"));
-		roots.push(root);
-		const cwd = path.join(root, "workspace");
-		const agentDir = path.join(root, "agent");
-		// move_session only narrows the scope, so the target is a descendant.
-		const target = path.join(cwd, "narrower");
-		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(target, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
-		const settings = Settings.isolated();
-		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
-		managers.push(sessionManager);
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir,
-			sessionManager,
-			settings,
-			model: getBundledModel("openai", "gpt-4o-mini"),
-			disableExtensionDiscovery: true,
-			extensions: [],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-			enableMcpAutoload: false,
-			enableLsp: false,
-			skipPythonPreflight: true,
-			toolNames: ["move_session"],
-		});
-		sessions.push(session);
-		expect((await sessionManager.appendMessageSharingSession(user("shared message"))).kind).toBe("committed");
-		const processCwd = process.cwd();
-		const transition = vi.spyOn(sessionManager, "runExclusiveCwdMoveTransition");
-		const tool = session.getToolByName("move_session");
-		if (!tool) throw new Error("move_session tool is unavailable");
-		await expect(tool.execute("move-session-refused", { path: target } as never)).rejects.toThrow(
-			"Shared session mutation requires transaction admission: move session",
-		);
-		expect(transition).not.toHaveBeenCalled();
-		expect(process.cwd()).toBe(processCwd);
-		expect(sessionManager.getCwd()).toBe(cwd);
 	});
 });

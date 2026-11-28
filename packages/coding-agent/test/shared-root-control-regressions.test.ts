@@ -2,8 +2,7 @@
  * Regression coverage for #7823 and #7824: after a root interactive TUI session's first
  * messages, user controls (model presets, /fast, the settings effort control, model, tool and
  * /rename, profile reloads, /fork) keep working. Since single-owner step 10a a root TUI writes on
- * the legacy route, and these cases run there. The remaining peer-sibling, lease and star cases
- * exercise SessionManager-level shared primitives directly.
+ * the legacy route, and these cases run there.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -19,9 +18,7 @@ import { setThemeInstance } from "../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
-import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
-import { type SessionInfo, SessionManager } from "../src/session/session-manager";
+import { SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import { loadTestTheme } from "./helpers/test-theme";
 
@@ -168,13 +165,6 @@ async function fixture(): Promise<Fixture> {
 async function canonicalMessage(f: Fixture, text = "canonical shared user"): Promise<void> {
 	f.session.agent.emitExternalEvent({ type: "message_end", message: user(text) });
 	await f.session.awaitSessionSettlement();
-	expect(f.manager.getLeafEntry()).toMatchObject({ type: "message", message: { role: "user", content: text } });
-	expect(await Bun.file(f.file).text()).toContain(JSON.stringify(text));
-}
-
-/** A canonical shared append on the manager itself, which latches its shared bars. */
-async function sharedCanonicalMessage(f: Fixture, text = "canonical shared user"): Promise<void> {
-	expect((await f.manager.appendMessageSharingSession(user(text))).kind).toBe("committed");
 	expect(f.manager.getLeafEntry()).toMatchObject({ type: "message", message: { role: "user", content: text } });
 	expect(await Bun.file(f.file).text()).toContain(JSON.stringify(text));
 }
@@ -386,18 +376,6 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		managers.push(reopened);
 		expect(reopened.getSessionName()).toBe("Shared title");
 	});
-
-	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
-		const f = await fixture();
-		await sharedCanonicalMessage(f);
-		const sessionId = f.session.sessionId;
-		const bytes = await Bun.file(f.file).text();
-		await expect(f.session.newSession({ drop: true })).rejects.toThrow(
-			"Shared session mutation requires transaction admission: drop session",
-		);
-		expect(f.session.sessionId).toBe(sessionId);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
 });
 
 describe("#7824 profile assignment materialization in a shared root TUI session", () => {
@@ -474,78 +452,6 @@ describe("#7824 configuration reload that changes the active profile in a shared
 		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(reopened.configuredModelChains.default).toMatchObject({ entries: reloadedChain });
 		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
-	});
-});
-
-describe("#7824 picker star after /new against a live shared predecessor", () => {
-	async function predecessorAfterNew(f: Fixture): Promise<{ peer: SessionManager; candidate: SessionInfo }> {
-		await sharedCanonicalMessage(f);
-		const predecessorId = f.session.sessionId;
-		const peer = await reopen(f);
-		expect((await peer.appendMessageSharingSession(user("peer before /new"))).kind).toBe("committed");
-		expect(await f.session.newSession()).toBe(true);
-		expect(f.session.sessionId).not.toBe(predecessorId);
-		const candidate = (await f.manager.listForResumePickerReadOnly()).find(info => info.id === predecessorId);
-		if (!candidate) throw new Error("missing predecessor picker candidate");
-		return { peer, candidate };
-	}
-
-	it("stars the predecessor append-only so its live peer keeps publishing", async () => {
-		const f = await fixture();
-		const { peer, candidate } = await predecessorAfterNew(f);
-		const before = await Bun.file(candidate.path).text();
-		await f.manager.setSessionStarredForPicker(candidate, true);
-		const after = await Bun.file(candidate.path).text();
-		expect(after).toBe(`${before}${JSON.stringify({ type: "header_patch", patch: { starred: true } })}\n`);
-		expect((await peer.appendMessageSharingSession(user("peer after star"))).kind).toBe("committed");
-		const reopened = await SessionManager.open(candidate.path, SessionManager.managedDestination(f.cwd, f.agentDir));
-		managers.push(reopened);
-		expect(reopened.isSessionStarred()).toBe(true);
-		expect(reopened.buildSessionContext().messages.at(-1)).toMatchObject({ content: "peer after star" });
-	});
-
-	it("waits for the predecessor's shared transaction lease before appending the star", async () => {
-		const f = await fixture();
-		const { candidate } = await predecessorAfterNew(f);
-		const before = await Bun.file(candidate.path).text();
-		const held = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const lease = withManagedSessionTransaction(
-			{
-				locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(candidate.path)),
-				sessionId: candidate.id,
-			},
-			async () => {
-				held.resolve();
-				await release.promise;
-			},
-		);
-		await held.promise;
-		const star = f.manager.setSessionStarredForPicker(candidate, true);
-		await Bun.sleep(100);
-		// A peer holds the predecessor's transaction: the star must not write under it.
-		expect(await Bun.file(candidate.path).text()).toBe(before);
-		release.resolve();
-		await lease;
-		await star;
-		expect(await Bun.file(candidate.path).text()).toContain('"starred":true');
-	});
-
-	it("refuses a whole-transcript header upgrade of a shared predecessor", async () => {
-		const f = await fixture();
-		const { candidate } = await predecessorAfterNew(f);
-		// A predecessor header without the star-patch capability would need a whole-file rewrite.
-		const original = await Bun.file(candidate.path).text();
-		const newline = original.indexOf("\n");
-		const header = JSON.parse(original.slice(0, newline)) as Record<string, unknown>;
-		delete header.starredPatchVersion;
-		await Bun.write(candidate.path, `${JSON.stringify(header)}${original.slice(newline)}`);
-		const legacy = (await f.manager.listForResumePickerReadOnly()).find(info => info.id === candidate.id)!;
-		const bytes = await Bun.file(candidate.path).text();
-		await expect(f.manager.setSessionStarredForPicker(legacy, true)).rejects.toThrow(
-			"shared session star requires an append-only header patch",
-		);
-		expect(await Bun.file(candidate.path).text()).toBe(bytes);
 	});
 });
 
@@ -678,62 +584,5 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 		f.file = forkFile;
 		await canonicalMessage(f, "next prompt in the whole-session fork");
 		expect(await Bun.file(source).bytes()).toEqual(bytes);
-	});
-
-	it("refuses beside a peer sibling before any branch effect", async () => {
-		const f = await fixture();
-		await sharedCanonicalMessage(f, "first shared prompt");
-		const peer = await SessionManager.open(f.file, SessionManager.managedDestination(f.cwd, f.agentDir));
-		managers.push(peer);
-		expect((await peer.appendMessageSharingSession(user("peer sibling"))).kind).toBe("committed");
-		await sharedCanonicalMessage(f, "second shared prompt");
-		const sourceId = f.manager.getSessionId();
-		const bytes = await Bun.file(f.file).bytes();
-		const selected = f.session.getUserMessagesForBranching().find(message => message.text === "second shared prompt");
-		if (!selected) throw new Error("missing selectable prompt");
-		const flush = vi.spyOn(f.manager, "flush");
-		const prepare = vi.spyOn(f.manager, "prepareBranchedSession");
-		await expect(f.session.branch(selected.entryId)).rejects.toThrow(
-			"Cannot fork this session: another gjc process has written to this session.",
-		);
-		// branch() flushes only after the hook, the agent disconnect and the /btw settle.
-		expect(flush).not.toHaveBeenCalled();
-		expect(prepare).not.toHaveBeenCalled();
-		expect(f.manager.getSessionId()).toBe(sourceId);
-		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
-		// A refused prepare (which closes the persist writer) leaves the source publishing.
-		await expect(f.manager.prepareBranchedSession(selected.entryId)).rejects.toThrow(
-			"Cannot fork this session: another gjc process has written to this session.",
-		);
-		await sharedCanonicalMessage(f, "still usable after the refusal");
-	});
-
-	it("refuses Move Session before the cwd transition and flush, and star before any write", async () => {
-		const f = await fixture();
-		await sharedCanonicalMessage(f);
-		const bytes = await Bun.file(f.file).bytes();
-		const target = path.join(path.dirname(f.cwd), "move-target");
-		await fs.mkdir(target);
-		const showError = vi.fn();
-		const ctx = {
-			session: f.session,
-			sessionManager: f.manager,
-			showError,
-		} as unknown as InteractiveModeContext;
-		const transition = vi.spyOn(f.manager, "runExclusiveCwdMoveTransition");
-		const flush = vi.spyOn(f.manager, "flush");
-		await new CommandController(ctx).handleMoveCommand(target);
-		expect(showError).toHaveBeenCalledWith(
-			"Move failed: Shared session mutation requires transaction admission: move session",
-		);
-		expect(transition).not.toHaveBeenCalled();
-		expect(flush).not.toHaveBeenCalled();
-		expect(f.manager.getCwd()).toBe(f.cwd);
-		await expect(f.manager.setSessionStarred(true)).rejects.toThrow(
-			"Shared session mutation requires transaction admission: set session starred",
-		);
-		expect(f.manager.isSessionStarred()).toBe(false);
-		expect(await Bun.file(f.file).bytes()).toEqual(bytes);
-		expect(await fs.readdir(target)).toEqual([]);
 	});
 });

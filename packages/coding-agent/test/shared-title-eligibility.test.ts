@@ -7,13 +7,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
-import {
-	SessionManager,
-	SessionNearLimitAppendError,
-	SharedSessionMutationUnsupportedError,
-} from "../src/session/session-manager";
+import { SessionManager } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
 
 const roots: string[] = [];
@@ -126,69 +120,6 @@ describe("shared publication admission split", () => {
 		expect(persisted).toContain('"customType":"post-title"');
 	});
 
-	it("releases scoped admission when publication setup throws before the transaction", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		const locks = managedSessionTransactionLocksDirectory(path.dirname(f.file));
-		await fs.mkdir(path.dirname(locks), { recursive: true, mode: 0o700 });
-		await fs.rm(locks, { recursive: true, force: true });
-		await fs.writeFile(locks, "not a directory");
-		await expect(
-			f.manager.appendTemporaryModelChangeSharingSession("test/temporary", { level: "high" }, () => true),
-		).rejects.toThrow();
-		// A leaked admission count would keep the session barred after the setup failure.
-		expect(() => f.manager.appendMessage(user("after failed publication"))).not.toThrow();
-		await fs.rm(locks);
-		expect(
-			(await f.manager.appendTemporaryModelChangeSharingSession("test/temporary", { level: "high" }, () => true))
-				.kind,
-		).toBe("committed");
-	});
-
-	it("scopes temporary-model append admission while retaining rewrite authority", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		const outcome = await f.manager.appendTemporaryModelChangeSharingSession(
-			"test/temporary",
-			{ level: "high" },
-			() => true,
-		);
-		expect(outcome.kind).toBe("committed");
-		expect(() => f.manager.appendMessage(user("after temporary model"))).not.toThrow();
-		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-	});
-
-	it("scopes thinking append admission while retaining rewrite authority", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		await f.manager.withSharedThinkingControl(async () => {
-			expect(await f.manager.appendThinkingLevelChangeSharingSession("high", false, () => true)).toMatchObject({
-				kind: "committed",
-			});
-		});
-		expect(() => f.manager.appendMessage(user("after thinking"))).not.toThrow();
-		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-	});
-
-	it("scopes discovered-tool append admission while retaining rewrite authority", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		const outcome = await f.manager.appendToolSelectionsSharingSession(["mcp__probe"], undefined, () => true);
-		expect(outcome.kind).toBe("committed");
-		expect(() => f.manager.appendMessage(user("after tool selection"))).not.toThrow();
-		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-	});
-
 	it("persists a custom message_end emitted after a canonical append", async () => {
 		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
@@ -258,18 +189,6 @@ describe("shared publication admission split", () => {
 		expect(persisted).toContain('"label":"bookmark"');
 		expect(persisted).toContain("shared bash output");
 		expect(persisted).toContain('"customType":"session_recap"');
-	});
-
-	it("scopes mode-change append admission while retaining the rewrite fence", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		const outcome = await f.manager.appendModeChangeSharingSession("plan", { planFilePath: "/tmp/plan.md" });
-		expect(outcome.kind).toBe("committed");
-		expect(() => f.manager.appendMessage(user("after mode change"))).not.toThrow();
-		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
 	});
 
 	it("persists a tree-navigator label", async () => {
@@ -444,29 +363,5 @@ describe("shared publication admission split", () => {
 		await f.session.waitForIdle();
 		expect(continueQueued).toHaveBeenCalledTimes(1);
 		expect(continueAll).not.toHaveBeenCalled();
-	});
-
-	it("keeps the typed near-limit outcome when a shared session bars the recovery rewrite", async () => {
-		const f = await fixture();
-		expect((await f.manager.appendMessageSharingSession(user("first canonical message"))).kind).toBe("committed");
-		// Force the managed near-limit path; its only recovery is the whole-transcript
-		// rewrite, which the shared rewrite bar refuses. The typed near-limit contract must
-		// survive instead of degrading into a generic "rewrite required" abort.
-		const store = vi
-			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
-			.mockImplementation(() => {
-				throw new Error("content_too_large");
-			});
-		const outcome = await f.manager.appendMessageSharingSession(user("overflow entry"));
-		store.mockRestore();
-		expect(outcome.kind).toBe("unknown");
-		if (outcome.kind !== "unknown") throw new Error(outcome.kind);
-		expect(outcome.error).toBeInstanceOf(SessionNearLimitAppendError);
-		// The refused recovery rewrite intentionally leaves this transcript needing a full
-		// rewrite, which a shared session refuses again; the documented exit is the typed
-		// error's SESSION_LIMIT_RECOVERY_ACTIONS, not a close-time rewrite. Detach the
-		// fixture so the shared teardown does not retry a rewrite that is refused by design.
-		sessions.splice(sessions.indexOf(f.session), 1);
-		managers.splice(managers.indexOf(f.manager), 1);
 	});
 });

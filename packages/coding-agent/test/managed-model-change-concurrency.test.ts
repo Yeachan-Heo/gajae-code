@@ -65,17 +65,18 @@ describe("model, thinking and service-tier changes from a second opener", () => 
 		expect(models).toEqual(["anthropic/claude-first"]);
 	});
 
-	it("latches the manager so a later shared publish is refused", async () => {
-		const { first, second } = await sharedOpens();
+	it("latches the manager so a later append is refused", async () => {
+		const { file, first, second } = await sharedOpens();
 		first.appendThinkingLevelChange("high");
 		await first.flush();
 		expect(() => second.appendThinkingLevelChange("low")).toThrow(ManagedAppendIdentityMismatchError);
-		// The family has no shared seam of its own, so the only path out for this opener is a
-		// reopen. Until then the shared message seam refuses it too, because the rejection
-		// latched persistence.
-		expect(
-			await second.appendMessageSharingSession({ role: "user" as const, content: "from B", timestamp: 3 }),
-		).toMatchObject({ kind: "stale", reason: "persistence_latched" });
+		// The only path out for this opener is a reopen. Until then a message append is refused
+		// too, because the rejection latched persistence.
+		const before = await Bun.file(file).text();
+		expect(() => second.appendMessage({ role: "user" as const, content: "from B", timestamp: 3 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		expect(await Bun.file(file).text()).toBe(before);
 	});
 
 	it("rejects a service-tier change the same way", async () => {

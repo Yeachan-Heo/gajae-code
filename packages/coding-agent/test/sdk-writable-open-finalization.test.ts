@@ -193,7 +193,6 @@ describe("SDK writable-open finalization", () => {
 			const context = vi.spyOn(manager, "buildSessionContext");
 			const model = vi.spyOn(manager, "appendModelChange");
 			const thinking = vi.spyOn(manager, "appendThinkingLevelChange");
-			const shared = vi.spyOn(manager, "appendMessageSharingSession");
 			const bindings = vi.spyOn(options.modelRegistry, "applyConfiguredModelBindings");
 			const initialize = vi.spyOn(discovery, "initializeWithSettings");
 			const subscribe = vi.spyOn(options.authStorage, "onCredentialDisabled");
@@ -234,7 +233,6 @@ describe("SDK writable-open finalization", () => {
 				expect(finalize).toHaveBeenCalledTimes(1);
 				expect(context).toHaveBeenCalled();
 				for (const spy of [bindings, initialize, subscribe]) expect(spy).toHaveBeenCalled();
-				expect(shared).not.toHaveBeenCalled();
 			} finally {
 				release.resolve();
 				await Promise.allSettled([startup]);
@@ -348,7 +346,6 @@ describe("SDK writable-open finalization", () => {
 			const strict = vi.spyOn(manager, "closeStrict");
 			const reopen = vi.spyOn(SessionManager, "open");
 			const discard = vi.spyOn(manager, "discardPreparedNewSession");
-			const shared = vi.spyOn(manager, "appendMessageSharingSession");
 			const bindings = vi.spyOn(options.modelRegistry, "applyConfiguredModelBindings");
 			const initialize = vi.spyOn(discovery, "initializeWithSettings");
 			const subscribe = vi.spyOn(options.authStorage, "onCredentialDisabled");
@@ -361,18 +358,7 @@ describe("SDK writable-open finalization", () => {
 			if (outcome === "throw") await expect(startup).rejects.toBe(injected);
 			else await expect(startup).rejects.toThrow(outcome === "not_published" ? "migration not published" : outcome);
 			expect(finalize).toHaveBeenCalledTimes(1);
-			for (const spy of [
-				context,
-				close,
-				strict,
-				reopen,
-				discard,
-				shared,
-				bindings,
-				initialize,
-				subscribe,
-				onAttempt,
-			])
+			for (const spy of [context, close, strict, reopen, discard, bindings, initialize, subscribe, onAttempt])
 				expect(spy).not.toHaveBeenCalled();
 			expect(await Bun.file(file).text()).toBe(before);
 		});

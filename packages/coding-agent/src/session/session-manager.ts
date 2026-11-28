@@ -951,42 +951,12 @@ export type ConfiguredModelChain = Pick<
 	"role" | "entries" | "origin" | "identity" | "explicitHead" | "cleared"
 >;
 
-/**
- * One entry of an admitted shared control publication
- * ({@link SessionManager.appendControlEntriesSharingSession}). Controls describe
- * their transcript effect as data so every control shares one admission path.
- */
-export type SharedControlEntry =
-	| { readonly type: "configured_model_chain"; readonly chain: ConfiguredModelChain }
-	| {
-			readonly type: "model_change";
-			readonly model: string;
-			readonly role: string;
-			readonly metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
-	  }
-	| { readonly type: "model_role_clear"; readonly role: string }
-	| { readonly type: "thinking_level_change"; readonly level: string | undefined; readonly operatorIntent: boolean }
-	| { readonly type: "service_tier_change"; readonly serviceTier: ServiceTier | null }
-	| { readonly type: "custom"; readonly customType: string; readonly data: unknown }
-	/**
-	 * A parentless `context_clear` root: it starts this opener's fresh active branch. Only
-	 * valid as the first entry of a publication; later entries descend from it.
-	 */
-	| { readonly type: "context_clear"; readonly data: Record<string, unknown> | undefined };
-
 export interface DefaultModelSelectionEntriesOptions {
 	readonly appendThinkingLevel: boolean;
 	readonly appendTemporaryModelChange?: boolean;
 	readonly configuredDefaultChain?: readonly string[];
 	readonly selectionRole?: string;
 }
-
-export type ModelProfileTranscriptPlan = {
-	configuredDefaultChain?: ConfiguredModelChain;
-	temporaryModel?: string;
-	thinking?: { readonly level: string | undefined };
-	resumeDefault?: { readonly selector: string | undefined };
-};
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
@@ -2051,35 +2021,6 @@ function sameManagedTranscript(observed: ManagedFileSnapshot["identity"], expect
 }
 
 /**
- * Outcome of publishing an append into a transcript another opener may also be writing.
- *
- * `stale` means this process can no longer publish safely - its cursor names an entry the
- * transcript does not have, the transcript was replaced, or an earlier failure latched
- * persistence - and the caller has to reopen. `committed` means the entry is on disk.
- * `unknown` preserves the original attempted ID across publication and lease-release
- * failures; reconcile it against the transcript before retrying. `rejected` proves
- * no append was committed. Lock acquisition failures before staging still throw.
- */
-export type SharedEntriesAppendOutcome =
-	| { readonly kind: "committed"; readonly ids: readonly string[] }
-	| { readonly kind: "unknown"; readonly ids: readonly string[]; readonly error: unknown }
-	| Extract<SharedAppendOutcome, { kind: "stale" | "rejected" }>;
-
-export type SharedAppendOutcome =
-	| { readonly kind: "committed"; readonly id: string }
-	| { readonly kind: "unknown"; readonly id: string; readonly error: unknown }
-	| {
-			readonly kind: "stale";
-			readonly reason:
-				| "transcript_moved"
-				| "cursor_not_committed"
-				| "persistence_latched"
-				| "rewrite_required"
-				| "unsupported_transcript";
-	  }
-	| { readonly kind: "rejected"; readonly error: unknown };
-
-/**
  * What a writable open did about pending migration.
  *
  * `stale` means the transcript changed after this process read it, so publishing now
@@ -2767,20 +2708,6 @@ export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsuppo
  * fields, and every rewrite/flush/close caller can point at compaction or
  * export as the continuation path.
  */
-/**
- * A shared append needed a whole-file rewrite and refused instead.
- *
- * A rewrite materializes only this process's resident entries, so publishing one while
- * another opener may have committed entries would delete that branch. Shared appends are
- * append-only; needing a rewrite is a reason to reopen, not to publish.
- */
-class SharedAppendRewriteRequiredError extends Error {
-	constructor() {
-		super("shared_append_rewrite_required");
-		this.name = "SharedAppendRewriteRequiredError";
-	}
-}
-
 export class SessionNearLimitRewriteError extends Error {
 	readonly code = "near_limit_rewrite" as const;
 	/** Serialized transcript size (bytes) rejected by the managed store. */
@@ -7771,8 +7698,6 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
-	/** Runs just before a shared append publishes, so tests can make it need a rewrite. */
-	beforeSharedAppendPublish?: () => void;
 	beforeTitlePatchPersistence?: () => Promise<void>;
 	beforeTitleRewriteFence?: () => Promise<void>;
 	beforeLivePickerStarFence?: () => void;
@@ -8151,8 +8076,11 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
-	/** Set while a shared append runs, so no persistence path may escalate to a rewrite. */
-	#sharedAppendOnly = false;
+	/*
+	 * The shared bars and in-flight counts below were latched only by the shared appends
+	 * removed in single-owner step 10d, so they stay empty now. They go, with the guards
+	 * that read them, in step 10e.
+	 */
 	/**
 	 * Permanent legacy-append refusal, set once a canonical shared append adopts a
 	 * committed identity whose sibling entries this manager never imported.
@@ -8183,19 +8111,8 @@ export class SessionManager {
 	/** Short-lived durable thinking commits, shared by local managers of the same logical session. */
 	static readonly #durableThinkingControls = new Map<string, number>();
 	static readonly #legacyThinkingControls = new Map<string, number>();
-	static readonly #ownedThinkingPublicationsInFlight = new Map<string, number>();
-	static readonly #thinkingControlOwner = new AsyncLocalStorage<{
-		manager: SessionManager;
-		sessionId: string;
-		active: boolean;
-		used: boolean;
-	}>();
 	/** Process-local overlap only; permanent shared admission remains owned by each manager. */
 	static readonly #sharedPublicationsInFlight = new Map<string, number>();
-	/** Single-use synchronous admission for exactly one shared entry. */
-	#sharedAppendEntryId: string | undefined;
-	/** Non-yielding staging owned by the first-publication transaction. */
-	#sharedBootstrapStaging = false;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -17588,7 +17505,6 @@ export class SessionManager {
 	}
 
 	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
-		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
 		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
@@ -17636,7 +17552,6 @@ export class SessionManager {
 	}
 
 	#rewriteFileSync(): void {
-		if (this.#sharedAppendOnly) throw new SharedAppendRewriteRequiredError();
 		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		this.#refreshManagedTranscriptRelocation();
@@ -17664,37 +17579,6 @@ export class SessionManager {
 
 	isPersisted(): boolean {
 		return this.persist;
-	}
-
-	/**
-	 * The additive entries of a concrete default model selection, in the same order
-	 * {@link stageDefaultModelSelection} stages them, for admitted shared publication.
-	 */
-	defaultModelSelectionControlEntries(
-		model: string,
-		thinkingLevel: string | undefined,
-		options?: DefaultModelSelectionEntriesOptions,
-	): SharedControlEntry[] {
-		const entries: SharedControlEntry[] = [];
-		if (options?.appendTemporaryModelChange !== false)
-			entries.push({ type: "model_change", model, role: "temporary" });
-		if (options?.appendThinkingLevel)
-			entries.push({ type: "thinking_level_change", level: thinkingLevel, operatorIntent: false });
-		if (options?.configuredDefaultChain)
-			entries.push({
-				type: "configured_model_chain",
-				chain: {
-					role: "default",
-					entries: [...options.configuredDefaultChain],
-					origin: "model_selection",
-					explicitHead: true,
-					cleared: options.configuredDefaultChain.length === 0,
-				},
-			});
-		entries.push({ type: "model_change", model, role: "default" });
-		if (options?.selectionRole && options.selectionRole !== "default")
-			entries.push({ type: "model_change", model, role: options.selectionRole });
-		return entries;
 	}
 
 	async stageDefaultModelSelection(
@@ -19967,7 +19851,6 @@ export class SessionManager {
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
-		if (this.#sharedAppendOnly) SessionManagerTestHooks.beforeSharedAppendPublish?.();
 		this.#refreshManagedTranscriptRelocation();
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#ownershipClaims.checkWrite("managed append");
@@ -20139,7 +20022,6 @@ export class SessionManager {
 			throw this.#persistError ?? toError(error);
 		}
 		const publishResumeBreadcrumb = this.#readOnlyResume;
-		if (this.#sharedBootstrapStaging) return;
 
 		// Normally we wait for the first assistant message before persisting to avoid
 		// creating files for sessions that never produce output. Once ensureOnDisk() has
@@ -20278,10 +20160,7 @@ export class SessionManager {
 					// typed near-limit outcome: keep that contract (and its
 					// SESSION_LIMIT_RECOVERY_ACTIONS guidance) instead of degrading into a
 					// generic stale "rewrite required" abort.
-					if (
-						rewriteError instanceof SharedSessionMutationUnsupportedError ||
-						rewriteError instanceof SharedAppendRewriteRequiredError
-					) {
+					if (rewriteError instanceof SharedSessionMutationUnsupportedError) {
 						this.#needsFullRewriteOnNextPersist = true;
 						throw nearLimit(liveBytesBefore);
 					}
@@ -20347,12 +20226,7 @@ export class SessionManager {
 	}
 
 	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {
-		if (this.#sharedAppendEntryId === entry.id) {
-			// Consume before preparation or callbacks can re-enter an append.
-			this.#sharedAppendEntryId = undefined;
-		} else {
-			this.assertLegacyAppendAllowed("append entry");
-		}
+		this.assertLegacyAppendAllowed("append entry");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
@@ -20360,7 +20234,7 @@ export class SessionManager {
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
-		let transcriptDurableForSidecar = this.destination.kind === "managed" && !this.#sharedBootstrapStaging;
+		let transcriptDurableForSidecar = this.destination.kind === "managed";
 		let transcriptDescriptor: SessionStorageStat | undefined;
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
@@ -20429,7 +20303,6 @@ export class SessionManager {
 			// The pre-write fence is an expected ownership loss, not an uncertain
 			// append. Preserve its type after rolling back the rejected entry.
 			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
-			if (error instanceof SharedAppendRewriteRequiredError) throw error;
 			// So is enforce's write gate: another process holds the session, or its claim failed
 			// (nothing was written).
 			if (isOwnershipWriteRefusal(error)) throw error;
@@ -20829,30 +20702,6 @@ export class SessionManager {
 		}
 	}
 
-	/** Scope only an explicitly opted-in root control's own thinking publication. */
-	async withSharedThinkingControl<T>(body: () => Promise<T>): Promise<T> {
-		const sessionId = this.#sessionId;
-		const totalPublications = SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0;
-		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight.get(sessionId) ?? 0;
-		if (
-			this.destination.kind !== "managed" ||
-			SessionManager.#legacyThinkingControls.has(sessionId) ||
-			totalPublications !== ownedPublications
-		)
-			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
-		const controls = SessionManager.#durableThinkingControls;
-		const owner = { manager: this, sessionId, active: true, used: false };
-		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
-		try {
-			return await SessionManager.#thinkingControlOwner.run(owner, body);
-		} finally {
-			owner.active = false;
-			const remaining = controls.get(sessionId)! - 1;
-			if (remaining === 0) controls.delete(sessionId);
-			else controls.set(sessionId, remaining);
-		}
-	}
-
 	/** Whether this logical session must keep using shared mutation admission. */
 	requiresSharedMutationAdmission(): boolean {
 		const sessionId = this.#sessionId;
@@ -20902,58 +20751,6 @@ export class SessionManager {
 		if (this.#sharedAppendBarSessionIds.has(sessionId)) throw new SharedSessionMutationUnsupportedError(operation);
 		if (includeRewrite && this.#sharedRewriteBarSessionIds.has(sessionId))
 			throw new SharedSessionMutationUnsupportedError(operation);
-	}
-
-	/**
-	 * Acquire one shared publication as a single token: the process-local
-	 * publication count, the in-flight mutation fence, and any permanent bars that
-	 * this publication must leave latched after it settles.
-	 *
-	 * Latch matrix:
-	 * - Canonical shared appends (`appendMessageSharingSession`,
-	 *   `appendCustomMessageEntrySharingSession`, `appendCustomEntrySharingSession`,
-	 *   `appendCompactionSharingSession`) latch the append and rewrite bars: they
-	 *   publish this opener's own branch into a graph it did not import.
-	 * - One-shot control appends (`appendTemporaryModelChangeSharingSession`,
-	 *   `appendThinkingLevelChangeSharingSession`,
-	 *   `appendToolSelectionsSharingSession`) latch only rewrite authority: their
-	 *   additive entries are safe to continue from, but the adopted transcript
-	 *   identity is not.
-	 *
-	 * Both bars latch at entry, not at commit: a publication that is later refused
-	 * (`stale`, `rejected`, superseded, or a pre-write failure) still leaves its bars
-	 * latched for the manager's lifetime. That is deliberate — the bar reasons about
-	 * "this manager re-anchored to an identity it does not own", which a refused
-	 * attempt cannot rule out, and the in-flight count is what covers the window
-	 * before the outcome is known. Over-blocking is the safe direction; no caller may
-	 * rely on a refused publication leaving admission open.
-	 */
-	#enterSharedPublication(sessionId: string, latch: { append: boolean; rewrite: boolean }): () => void {
-		const publications = SessionManager.#sharedPublicationsInFlight;
-		publications.set(sessionId, (publications.get(sessionId) ?? 0) + 1);
-		const counts = this.#activeSharedMutationSessionCounts;
-		counts.set(sessionId, (counts.get(sessionId) ?? 0) + 1);
-		if (latch.append) this.#sharedAppendBarSessionIds.add(sessionId);
-		if (latch.rewrite) this.#latchSharedRewriteBar(sessionId);
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			const remaining = (counts.get(sessionId) ?? 1) - 1;
-			if (remaining === 0) counts.delete(sessionId);
-			else counts.set(sessionId, remaining);
-			const remainingPublications = (publications.get(sessionId) ?? 1) - 1;
-			if (remainingPublications === 0) publications.delete(sessionId);
-			else publications.set(sessionId, remainingPublications);
-		};
-	}
-
-	/**
-	 * The only writer of {@link #sharedRewriteBarSessionIds}, used by
-	 * `#enterSharedPublication` for publications that arm before they write.
-	 */
-	#latchSharedRewriteBar(sessionId: string): void {
-		this.#sharedRewriteBarSessionIds.add(sessionId);
 	}
 
 	#assertPreparedGraphPublicationAllowed(stage: PreparedNewSessionState): void {
@@ -21096,482 +20893,6 @@ export class SessionManager {
 	}
 
 	/**
-	 * Append this process's next entry into a transcript other openers may also be writing.
-	 *
-	 * The entry is a child of this process's own cursor and is published inside the session
-	 * transaction, after re-reading the committed transcript to confirm the cursor is still
-	 * part of it. Another opener's branch is never followed and never rewritten: this process
-	 * keeps its place in the graph and publishes a sibling.
-	 *
-	 * The lease covers this append and nothing else; it is not held for the conversation.
-	 * A never-published manager can publish its pending metadata and messages only after
-	 * proving absence under that lease, using descriptor-owned no-clobber publication.
-	 * This explicit durable operation publishes even user-only sessions; ordinary synchronous
-	 * appendMessage still leaves them unpublished until an assistant arrives.
-	 *
-	 * Append-only is enforced rather than assumed: a process that owes a whole-file rewrite
-	 * reports stale instead of publishing, because adopting the current identity would let
-	 * that rewrite satisfy the fence and republish its view over a sibling branch.
-	 */
-	async appendMessageSharingSession(
-		message:
-			| Message
-			| CustomMessage
-			| HookMessage
-			| BashExecutionMessage
-			| PythonExecutionMessage
-			| FileMentionMessage,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id => this.#appendMessageWithId(message, id));
-	}
-
-	/** Publish a workflow custom entry at the same managed branch cursor as canonical messages. */
-	async appendCustomEntrySharingSession(customType: string, data?: unknown): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id => this.#appendCustomEntryWithId(customType, data, id));
-	}
-
-	/** A bounded temporary model operation shares one lease and preserves both attempted IDs. */
-	async appendTemporaryModelChangeSharingSession(
-		model: string,
-		thinking: { readonly level: string | undefined } | undefined,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		return this.#publishOwnedEntriesSharingSession(
-			thinking ? 2 : 1,
-			(index, id) =>
-				index === 0
-					? this.#appendModelChangeWithId(model, "temporary", id)
-					: this.#appendThinkingLevelChangeWithId(thinking!.level, false, id),
-			undefined,
-			isCurrent,
-			true,
-			true,
-		);
-	}
-
-	/** Publish ordered profile entries under one managed lease at this opener's branch cursor. */
-	async appendModelProfileActivationSharingSession(
-		plan: ModelProfileTranscriptPlan,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		const entries: SharedControlEntry[] = [];
-		if (plan.configuredDefaultChain !== undefined)
-			entries.push({ type: "configured_model_chain", chain: plan.configuredDefaultChain });
-		if (plan.temporaryModel !== undefined)
-			entries.push({ type: "model_change", model: plan.temporaryModel, role: "temporary" });
-		if (plan.thinking !== undefined)
-			entries.push({ type: "thinking_level_change", level: plan.thinking.level, operatorIntent: false });
-		if (plan.resumeDefault !== undefined) {
-			const selector = plan.resumeDefault.selector;
-			entries.push(
-				selector === undefined
-					? { type: "model_role_clear", role: "default" }
-					: { type: "model_change", model: selector, role: "default" },
-			);
-		}
-		return this.appendControlEntriesSharingSession(entries, isCurrent);
-	}
-
-	/** Publish changed service-tier intent, or validate admission for an unchanged-tier rearm. */
-	async appendServiceTierChangeSharingSession(
-		serviceTier: ServiceTier | null,
-		appendEntry: boolean,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		return this.appendControlEntriesSharingSession(
-			appendEntry ? [{ type: "service_tier_change", serviceTier }] : [],
-			isCurrent,
-		);
-	}
-
-	/**
-	 * The common admitted publication for session controls once a session publishes
-	 * through the shared transaction (#7823, #7824).
-	 *
-	 * Every entry is a child of this opener's validated cursor and is written in order
-	 * under one managed lease; the transcript is never rewritten and an unseen sibling
-	 * branch is never followed. An empty list validates admission and currentness without
-	 * writing. Inside {@link withSharedThinkingControl} the active owner is consumed, so
-	 * one owned control scope admits exactly one publication.
-	 *
-	 * Control appends latch only rewrite authority (see {@link #enterSharedPublication}):
-	 * their additive entries are safe to continue from, the adopted identity is not.
-	 */
-	async appendControlEntriesSharingSession(
-		entries: readonly SharedControlEntry[],
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		const snapshot = entries.map(entry => structuredClone(entry));
-		// A new root mid-publication would orphan the entries before it from the branch.
-		if (snapshot.some((entry, index) => entry.type === "context_clear" && index > 0))
-			return { kind: "rejected", error: new Error("shared_control_context_clear_must_be_first") };
-		const owner = SessionManager.#thinkingControlOwner.getStore();
-		if (owner) {
-			if (!owner.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
-				return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
-			owner.used = true;
-		}
-		return this.#publishOwnedEntriesSharingSession(
-			snapshot.length,
-			(index, id) => {
-				const entry = snapshot[index];
-				if (!entry) throw new Error("shared_control_invalid_entry_index");
-				return this.#appendSharedControlEntryWithId(entry, id);
-			},
-			owner,
-			isCurrent,
-			true,
-			true,
-		);
-	}
-
-	#appendSharedControlEntryWithId(entry: SharedControlEntry, id: string): string {
-		switch (entry.type) {
-			case "configured_model_chain":
-				return this.#appendConfiguredModelChainWithId(entry.chain, id);
-			case "model_change":
-				return this.#appendModelChangeWithId(entry.model, entry.role, id, entry.metadata);
-			case "model_role_clear":
-				return this.#clearModelRoleWithId(entry.role, id);
-			case "thinking_level_change":
-				return this.#appendThinkingLevelChangeWithId(entry.level, entry.operatorIntent, id);
-			case "service_tier_change":
-				return this.#appendServiceTierChangeWithId(entry.serviceTier, id);
-			case "custom":
-				return this.#appendCustomEntryWithId(entry.customType, entry.data, id);
-			case "context_clear":
-				return this.#appendContextClearRootWithId(entry.data, id);
-		}
-	}
-
-	/** Publish a compaction at this opener's branch cursor without rewriting peer history. */
-	async appendCompactionSharingSession<T = unknown>(
-		payload: Omit<CompactionEntry<T>, "type" | "id" | "parentId" | "timestamp">,
-		isCurrent: () => boolean,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendCompactionWithId(payload, id),
-			undefined,
-			isCurrent,
-		);
-	}
-
-	/** Only the active owner may publish one thinking entry inside the existing shared transaction. */
-	async appendThinkingLevelChangeSharingSession(
-		thinkingLevel: string | undefined,
-		operatorIntent: boolean,
-		isCurrent: () => boolean,
-	): Promise<SharedAppendOutcome> {
-		const owner = SessionManager.#thinkingControlOwner.getStore();
-		if (!owner?.active || owner.used || owner.manager !== this || owner.sessionId !== this.#sessionId)
-			return { kind: "rejected", error: new Error("shared_thinking_control_owner_required") };
-		owner.used = true;
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendThinkingLevelChangeWithId(thinkingLevel, operatorIntent, id),
-			owner,
-			isCurrent,
-			true,
-		);
-	}
-
-	async #publishOwnedEntrySharingSession(
-		appendWithId: (id: string) => string,
-		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
-		isCurrent?: () => boolean,
-		scopedAppendAdmission = false,
-	): Promise<SharedAppendOutcome> {
-		const outcome = await this.#publishOwnedEntriesSharingSession(
-			1,
-			(_, id) => appendWithId(id),
-			thinkingOwner,
-			isCurrent,
-			false,
-			scopedAppendAdmission,
-		);
-		if (outcome.kind === "committed") return { kind: "committed", id: outcome.ids[0]! };
-		if (outcome.kind === "unknown") return { kind: "unknown", id: outcome.ids[0]!, error: outcome.error };
-		return outcome;
-	}
-
-	async #publishOwnedEntriesSharingSession(
-		count: number,
-		appendWithId: (index: number, id: string) => string,
-		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
-		isCurrent?: () => boolean,
-		controlOperation = false,
-		scopedAppendAdmission = false,
-	): Promise<SharedEntriesAppendOutcome> {
-		if (this.destination.kind !== "managed")
-			return { kind: "rejected", error: new Error("shared_append_requires_managed_destination") };
-		const sessionId = this.#sessionId;
-		if (
-			(SessionManager.#durableThinkingControls.has(sessionId) || thinkingOwner) &&
-			!(
-				thinkingOwner?.active &&
-				!SessionManager.#legacyThinkingControls.has(sessionId) &&
-				(SessionManager.#sharedPublicationsInFlight.get(sessionId) ?? 0) ===
-					(SessionManager.#ownedThinkingPublicationsInFlight.get(sessionId) ?? 0) &&
-				thinkingOwner.manager === this &&
-				thinkingOwner.sessionId === sessionId &&
-				SessionManager.#thinkingControlOwner.getStore() === thinkingOwner
-			)
-		) {
-			return { kind: "rejected", error: new Error("shared_append_durable_thinking_control_in_flight") };
-		}
-		const ownedPublications = SessionManager.#ownedThinkingPublicationsInFlight;
-		if (thinkingOwner) ownedPublications.set(sessionId, (ownedPublications.get(sessionId) ?? 0) + 1);
-		try {
-			return await this.#appendEntrySharingSession(
-				count,
-				appendWithId,
-				thinkingOwner,
-				isCurrent,
-				controlOperation,
-				scopedAppendAdmission,
-			);
-		} finally {
-			if (thinkingOwner) {
-				const remainingOwned = ownedPublications.get(sessionId)! - 1;
-				if (remainingOwned === 0) ownedPublications.delete(sessionId);
-				else ownedPublications.set(sessionId, remainingOwned);
-			}
-		}
-	}
-
-	async #appendEntrySharingSession(
-		count: number,
-		appendWithId: (index: number, id: string) => string,
-		thinkingOwner?: { manager: SessionManager; sessionId: string; active: boolean; used: boolean },
-		isCurrent?: () => boolean,
-		controlOperation = false,
-		scopedAppendAdmission = false,
-	): Promise<SharedEntriesAppendOutcome> {
-		this.#refreshManagedTranscriptRelocation();
-		const sessionFile = this.#sessionFile;
-		if (!sessionFile) return { kind: "rejected", error: new Error("shared_append_requires_session_file") };
-		const sessionId = this.#sessionId;
-		const locksDirectory = managedSessionTransactionLocksDirectory(path.dirname(sessionFile));
-		let releasePublication: (() => void) | undefined;
-		let ids: string[] = [];
-		let attempted = 0;
-		const unknown = (error: unknown): SharedEntriesAppendOutcome => {
-			const outcome = { kind: "unknown" as const, ids: [...ids], error };
-			if (controlOperation) {
-				const retained = new Error("Shared control publication outcome is unknown", { cause: outcome });
-				// A synchronous append may already have latched the raw failure. Retain
-				// it in the outcome and preserve the full operation receipt on close.
-				if (this.#persistError) this.#persistError = retained;
-				else this.#recordPersistError(retained);
-			}
-			return outcome;
-		};
-		const allocateIds = () => {
-			ids = [];
-			for (let index = 0; index < count; index++) {
-				let id = this.#generateEntryId();
-				while (ids.includes(id)) id = this.#generateEntryId();
-				ids.push(id);
-			}
-		};
-		try {
-			// Arm before lease acquisition; waiting callbacks receive no mutation admission.
-			releasePublication = this.#enterSharedPublication(sessionId, {
-				append: !scopedAppendAdmission,
-				rewrite: true,
-			});
-			fs.mkdirSync(locksDirectory, { recursive: true, mode: 0o700 });
-			const publication = withManagedSessionTransaction<SharedEntriesAppendOutcome>(
-				{ locksDirectory, sessionId: this.#sessionId },
-				async scope => {
-					scope.assertOwned();
-					if (!thinkingOwner && isCurrent?.() === false)
-						return {
-							kind: "rejected",
-							error: new Error(
-								controlOperation ? "shared_model_control_superseded" : "shared_compaction_superseded",
-							),
-						};
-					if (
-						thinkingOwner &&
-						(!thinkingOwner.active ||
-							thinkingOwner.manager !== this ||
-							thinkingOwner.sessionId !== sessionId ||
-							SessionManager.#thinkingControlOwner.getStore() !== thinkingOwner ||
-							!isCurrent?.())
-					)
-						return { kind: "rejected", error: new Error("shared_thinking_control_superseded") };
-					// A latched failure means every later persist throws the same error, so the only
-					// honest answer is that this process has to reopen.
-					if (this.#persistError) return { kind: "stale", reason: "persistence_latched" };
-					this.#refreshManagedTranscriptRelocation();
-					if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
-						return { kind: "stale", reason: "transcript_moved" };
-					// Historical rewrite debt is never first-publication authority.
-					if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
-					if (!this.#flushed) {
-						if (
-							!this.persist ||
-							this.#readOnlyResume ||
-							this.#ensuredOnDisk ||
-							this.#managedPersistExpectedIdentity
-						)
-							return { kind: "stale", reason: "rewrite_required" };
-						const store = this.#managedTranscriptStore(sessionFile);
-						const name = path.basename(sessionFile);
-						store.assertBound();
-						// Prove absence through retained authority; never adopt an unexpected file.
-						if (store.readExpected(name) !== null) return { kind: "stale", reason: "transcript_moved" };
-						if (isCurrent?.() === false)
-							return {
-								kind: "rejected",
-								error: new Error(
-									thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
-								),
-							};
-						// An empty control validates admission without publishing pending metadata.
-						if (count === 0) return { kind: "committed", ids: [] };
-						allocateIds();
-						try {
-							// No await from staging through publication: keep the local leaf and
-							// pending metadata together, without changing normal sync append behavior.
-							this.#sharedBootstrapStaging = true;
-							try {
-								for (let index = 0; index < ids.length; index++) {
-									if (isCurrent?.() === false)
-										throw new Error(
-											thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
-										);
-									this.#sharedAppendEntryId = ids[index];
-									attempted++;
-									appendWithId(index, ids[index]!);
-								}
-							} finally {
-								this.#sharedAppendEntryId = undefined;
-								this.#sharedBootstrapStaging = false;
-							}
-							const entries = materializeResidentEntriesForPersistenceSync(
-								this.#fileEntries,
-								this.#residentBlobStores(),
-							).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
-							const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-							this.#ownershipClaims.checkWrite("shared bootstrap");
-							scope.assertOwned();
-							store.assertBound();
-							store.publishNoReplaceSync(name, bytes);
-							const published = store.readExpected(name);
-							if (!published?.bytes.equals(bytes)) throw new Error("durability_unproven");
-							this.#managedPersistExpectedIdentity = published.identity;
-							this.#openCommittedDigest = published.identity.sha256;
-							this.#flushed = true;
-							this.#ensuredOnDisk = true;
-							if (this.#effectiveSessionMemoryMode() !== "off") {
-								this.#buildDisposableSidecars(this.#fileEntries);
-								if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
-							}
-							return { kind: "committed", ids };
-						} catch (error) {
-							// Retain original identities without retrying or authorizing a rewrite.
-							this.#recordPersistError(error);
-							return unknown(error);
-						}
-					}
-					const read = await this.captureCommittedSnapshot();
-					if (read.kind === "unsupported") return { kind: "stale", reason: "unsupported_transcript" };
-					if (read.kind !== "snapshot" || read.snapshot.sessionId !== this.#sessionId)
-						return { kind: "stale", reason: "transcript_moved" };
-					const cursor = this.#leafId;
-					// The entry this append is a child of has to still be part of the committed graph;
-					// otherwise this process is about to graft onto state nobody else has.
-					if (cursor !== null && !read.snapshot.entryIds.includes(cursor))
-						return { kind: "stale", reason: "cursor_not_committed" };
-					// Adopt the transcript as it stands: another opener may have appended since this
-					// process last wrote, and the append fence compares against this identity.
-					// Bind the fence to the bytes that were just checked, and only those: a writer
-					// outside the lease can replace the file between the read and here.
-					try {
-						const identity = this.#captureManagedPersistIdentity(sessionFile);
-						if (identity.sha256 !== read.snapshot.digest) return { kind: "stale", reason: "transcript_moved" };
-						this.#managedPersistExpectedIdentity = identity;
-						this.#openCommittedDigest ??= read.snapshot.digest;
-					} catch {
-						return { kind: "stale", reason: "transcript_moved" };
-					}
-					allocateIds();
-					// An invalid cold index can hydrate the authoritative transcript while generating
-					// an ID. Hydration adopts its physical tail; shared publication must keep this
-					// opener's already-validated branch cursor instead.
-					if (this.#sessionFile !== sessionFile || this.#sessionId !== sessionId)
-						return { kind: "stale", reason: "transcript_moved" };
-					if (this.#needsFullRewriteOnNextPersist) return { kind: "stale", reason: "rewrite_required" };
-					if (this.#leafId !== cursor) {
-						if (cursor !== null && !this.#byId.has(cursor))
-							return { kind: "stale", reason: "cursor_not_committed" };
-						this.#leafId = cursor;
-						this.#leafRevision++;
-					}
-					if (isCurrent?.() === false)
-						return {
-							kind: "rejected",
-							error: new Error(
-								thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
-							),
-						};
-					// An empty control validates admission and currentness without appending.
-					if (count === 0) return { kind: "committed", ids: [] };
-					this.#sharedAppendOnly = true;
-					try {
-						for (let index = 0; index < ids.length; index++) {
-							if (isCurrent?.() === false) {
-								const error = new Error(
-									thinkingOwner ? "shared_thinking_control_superseded" : "shared_publication_superseded",
-								);
-								if (attempted > 0) return unknown(error);
-								return { kind: "rejected", error };
-							}
-							this.#sharedAppendEntryId = ids[index];
-							attempted++;
-							appendWithId(index, ids[index]!);
-						}
-					} catch (error) {
-						if (attempted > 1) return unknown(error);
-						if (error instanceof SharedAppendRewriteRequiredError)
-							return { kind: "stale", reason: "rewrite_required" };
-						if (error instanceof ManagedAppendIdentityMismatchError)
-							return { kind: "stale", reason: "transcript_moved" };
-						const outcome = classifyAppendFailure(error);
-						if (outcome.kind === "not_committed") return { kind: "rejected", error };
-						return unknown(error);
-					} finally {
-						this.#sharedAppendEntryId = undefined;
-						this.#sharedAppendOnly = false;
-					}
-					// Append-only: this path refuses instead of escalating to a whole-file rewrite.
-					await this.flush();
-					const after = await this.captureCommittedSnapshot();
-					if (
-						after.kind !== "snapshot" ||
-						after.snapshot.sessionId !== this.#sessionId ||
-						!ids.every(id => after.snapshot.entryIds.includes(id))
-					)
-						return unknown(new Error("durability_unproven"));
-					this.#openCommittedDigest = after.snapshot.digest;
-					return { kind: "committed", ids };
-				},
-			);
-			try {
-				return await publication;
-			} catch (error) {
-				// Acquisition and pre-staging failures retain their existing throwing contract.
-				// Once an ID was assigned, even a release failure must carry that identity.
-				if (attempted === 0) throw error;
-				return unknown(error);
-			}
-		} finally {
-			releasePublication?.();
-		}
-	}
-
-	/**
 	 * Append a message and report whether it reached disk.
 	 *
 	 * The synchronous {@link appendMessage} returns an id after provisional admission;
@@ -21662,16 +20983,6 @@ export class SessionManager {
 	/** Append a mode change as child of current leaf, then advance leaf. Returns entry id. */
 	appendModeChange(mode: string, data?: Record<string, unknown>): string {
 		return this.#appendModeChangeWithId(mode, data, this.#generateEntryId());
-	}
-
-	/** Publish a mode change at this opener's admitted branch cursor under a shared lease. */
-	async appendModeChangeSharingSession(mode: string, data?: Record<string, unknown>): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendModeChangeWithId(mode, data, id),
-			undefined,
-			undefined,
-			true,
-		);
 	}
 
 	#appendModeChangeWithId(mode: string, data: Record<string, unknown> | undefined, id: string): string {
@@ -21851,26 +21162,6 @@ export class SessionManager {
 	}
 
 	/**
-	 * Publish a recap at this opener's admitted branch cursor under a shared lease.
-	 *
-	 * The plan is computed against this manager's own graph before the lease is taken: a
-	 * concurrent sibling append can only make the recap's freshness claim stale, and
-	 * {@link getSessionRecap} re-validates provenance on every read, so the entry itself
-	 * is always additive-safe.
-	 */
-	async appendSessionRecapSharingSession(input: SessionRecapInput): Promise<SessionRecapAppendResult> {
-		this.#assertRecoveryHydrationWritable();
-		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
-		if (!plan.ok) return { status: "rejected", reason: plan.reason };
-		const outcome = await this.appendCustomEntrySharingSession(SESSION_RECAP_ENTRY, plan.data);
-		if (outcome.kind === "committed") return { status: "appended", entryId: outcome.id };
-		throw new Error(
-			`Shared session recap append ${outcome.kind}${outcome.kind === "stale" ? `: ${outcome.reason}` : ""}${outcome.kind === "unknown" ? ` (attempted id: ${outcome.id})` : ""}`,
-			{ cause: outcome },
-		);
-	}
-
-	/**
 	 * Recap of the active branch's last turn, or undefined when there is none or it
 	 * is stale (the conversation advanced past its source entry, the leaf moved to a
 	 * branch that does not contain it, or the payload/provenance is invalid). Never
@@ -21914,23 +21205,6 @@ export class SessionManager {
 		const id = this.#appendContextClearRootWithId(data, this.#generateEntryId());
 		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
 		return id;
-	}
-
-	/**
-	 * The admitted shared form of {@link appendContextClearEntry}: the parentless root and
-	 * the carried-over profile ownership marker, as entries for
-	 * {@link appendControlEntriesSharingSession}. The root is appended, never rewritten, so
-	 * earlier history and any unseen sibling branch stay in the transcript.
-	 */
-	contextClearControlEntries(data: Record<string, unknown> | undefined): SharedControlEntry[] {
-		const ownershipMarker = this.getModelProfileOwnershipMarker();
-		const entries: SharedControlEntry[] = [{ type: "context_clear", data }];
-		if (ownershipMarker) {
-			const validated = validateModelProfileOwnershipMarker(ownershipMarker);
-			if (!validated) throw new InvalidModelProfileOwnershipError();
-			entries.push({ type: "custom", customType: MODEL_PROFILE_OWNERSHIP_ENTRY, data: validated });
-		}
-		return entries;
 	}
 
 	#appendContextClearRootWithId(data: Record<string, unknown> | undefined, id: string): string {
@@ -22096,25 +21370,6 @@ export class SessionManager {
 		);
 	}
 
-	/**
-	 * Publish a custom message at the managed branch cursor under a shared lease.
-	 * Sessions that publish canonical messages through the shared path must use this
-	 * for custom messages too: once shared admission is armed, the legacy append is
-	 * refused.
-	 */
-	async appendCustomMessageEntrySharingSession<T = unknown>(
-		customType: string,
-		content: string | (TextContent | ImageContent)[],
-		display: boolean,
-		details?: T,
-		attribution: MessageAttribution = "agent",
-		observationId?: string,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id =>
-			this.#appendCustomMessageEntryWithId(customType, content, display, details, attribution, observationId, id),
-		);
-	}
-
 	#appendCustomMessageEntryWithId<T>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
@@ -22151,31 +21406,6 @@ export class SessionManager {
 	// =========================================================================
 	// TTSR (Time Traveling Stream Rules)
 	// =========================================================================
-
-	/** Publish one or both discovered-tool authorities at this opener's branch cursor. */
-	async appendToolSelectionsSharingSession(
-		mcpToolNames: string[] | undefined,
-		builtinToolNames: string[] | undefined,
-		isCurrent: () => boolean,
-	): Promise<SharedEntriesAppendOutcome> {
-		if (!mcpToolNames && !builtinToolNames)
-			return { kind: "rejected", error: new Error("shared_tool_selection_requires_change") };
-		const mcp = mcpToolNames && [...mcpToolNames];
-		const builtin = builtinToolNames && [...builtinToolNames];
-		const correlationId = mcp && builtin ? crypto.randomUUID() : undefined;
-		return this.#publishOwnedEntriesSharingSession(
-			mcp && builtin ? 2 : 1,
-			(index, id) =>
-				mcp && index === 0
-					? this.#appendMCPToolSelectionWithId(mcp, correlationId, id)
-					: this.#appendDiscoveredBuiltinToolSelectionWithId(builtin!, correlationId, id),
-			undefined,
-			isCurrent,
-			// A control operation: verification and release failures latch persistence.
-			true,
-			true,
-		);
-	}
 
 	/** Append MCP discovery selection authority without altering discovered built-in authority. */
 	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
@@ -22232,24 +21462,6 @@ export class SessionManager {
 	 */
 	appendTtsrInjection(ruleNames: string[], records?: TtsrInjectionRecord[], ttsrMessageCount?: number): string {
 		return this.#appendTtsrInjectionWithId(ruleNames, records, ttsrMessageCount, this.#generateEntryId());
-	}
-
-	/**
-	 * Publish a TTSR injection marker at this opener's admitted branch cursor.
-	 * Sessions that publish canonical messages through the shared path must use this for
-	 * injection markers too: once shared admission is armed, the legacy append is refused.
-	 */
-	async appendTtsrInjectionSharingSession(
-		ruleNames: string[],
-		records?: TtsrInjectionRecord[],
-		ttsrMessageCount?: number,
-	): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(
-			id => this.#appendTtsrInjectionWithId(ruleNames, records, ttsrMessageCount, id),
-			undefined,
-			undefined,
-			true,
-		);
 	}
 
 	#appendTtsrInjectionWithId(
@@ -22889,15 +22101,6 @@ export class SessionManager {
 	 */
 	appendLabelChange(targetId: string, label: string | undefined): string {
 		return this.#appendLabelChangeWithId(targetId, label, this.#generateEntryId());
-	}
-
-	/**
-	 * Publish a label change at this opener's admitted branch cursor under a shared lease.
-	 * Sessions that publish canonical messages through the shared path must use this for
-	 * labels too: once shared admission is armed, the legacy append is refused.
-	 */
-	async appendLabelChangeSharingSession(targetId: string, label: string | undefined): Promise<SharedAppendOutcome> {
-		return this.#publishOwnedEntrySharingSession(id => this.#appendLabelChangeWithId(targetId, label, id));
 	}
 
 	#appendLabelChangeWithId(targetId: string, label: string | undefined, id: string): string {
@@ -26172,8 +25375,7 @@ export class SessionManager {
 	 * `restoreRollbackState`; and, for this session only, `setSessionStarredForPicker`.
 	 * `getArtifactManager` and `ensureArtifactManager` return null, so no caller gets
 	 * a manager that can write the source artifact directory; `getArtifactPath` still
-	 * resolves artifact paths. Shared-session appends (`*SharingSession`) are rejected
-	 * because a snapshot is never a managed destination.
+	 * resolves artifact paths.
 	 *
 	 * Not refused, by design: `setSessionStarredForPicker` on a different session
 	 * (compared by canonical path) still acts, as a session picker needs;

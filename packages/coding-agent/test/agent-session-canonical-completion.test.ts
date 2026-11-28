@@ -167,9 +167,7 @@ describe("AgentSession canonical completion", () => {
 	it("keeps the legacy synchronous workflow entry for a non-opted-in session", async () => {
 		const mock = createMockModel({ handler: { content: ["completed"] } });
 		const { manager, session } = await setup({ streamFn: mock.stream });
-		const shared = vi.spyOn(manager, "appendCustomEntrySharingSession");
 		await withTimeout(session.prompt("ordinary user prompt"), 5_000, "Legacy prompt did not settle");
-		expect(shared).not.toHaveBeenCalled();
 		expect(
 			manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
 		).toHaveLength(1);
