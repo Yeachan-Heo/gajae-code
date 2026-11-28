@@ -2665,14 +2665,6 @@ export class SessionNearLimitAppendError extends Error {
 	}
 }
 
-export class SharedSessionMutationUnsupportedError extends Error {
-	readonly code = "shared_session_mutation_unsupported";
-	constructor(readonly operation: string) {
-		super(`Shared session mutation requires transaction admission: ${operation}`);
-		this.name = "SharedSessionMutationUnsupportedError";
-	}
-}
-
 /** Why a fork or branch successor cannot be prepared. */
 export type GraphSuccessorRefusal = "unknown-entry" | "unreadable" | "changed";
 
@@ -2694,14 +2686,13 @@ function sanitizeLoadedSessionEntryReplayMetadata(entry: SessionEntry): SessionE
 	return entry;
 }
 
-/** A refused graph successor that names the reason; still a shared-mutation refusal. */
-export class GraphSuccessorUnavailableError extends SharedSessionMutationUnsupportedError {
+/** A refused fork or branch successor that names the reason. */
+export class GraphSuccessorUnavailableError extends Error {
 	constructor(
-		operation: string,
+		readonly operation: string,
 		readonly reason: GraphSuccessorRefusal,
 	) {
-		super(operation);
-		this.message = graphSuccessorRefusalMessage(reason);
+		super(graphSuccessorRefusalMessage(reason));
 		this.name = "GraphSuccessorUnavailableError";
 	}
 }
@@ -7706,6 +7697,8 @@ export const SessionManagerTestHooks: {
 	afterForkSnapshot?: () => void | Promise<void>;
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
+	/** Runs before a header patch touches the header, so a throw leaves it unapplied. */
+	beforeHeaderPatch?: (patch: HeaderPatchRecord["patch"]) => void;
 	beforePersistPatchFence?: (attempt: number) => void;
 	beforeTitlePatchPersistence?: () => Promise<void>;
 	beforeTitleRewriteFence?: () => Promise<void>;
@@ -8081,38 +8074,6 @@ export class SessionManager {
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
-	/*
-	 * The shared bars and in-flight counts below were latched only by the shared appends
-	 * removed in single-owner step 10d, so they stay empty now. They go, with the guards
-	 * that read them, in step 10e.
-	 */
-	/**
-	 * Permanent legacy-append refusal, set once a canonical shared append adopts a
-	 * committed identity whose sibling entries this manager never imported.
-	 *
-	 * This is refusal policy, not the safety guarantee: the append itself would stay
-	 * additive and identity-fenced (a stale predecessor fails with
-	 * ManagedAppendIdentityMismatchError), but admitting it would make the partial
-	 * resident graph durable. Whole-graph safety is carried by
-	 * {@link #sharedRewriteBarSessionIds}; the pinned shared-mutation contract asserts
-	 * this bar, which turns a mid-write identity failure into an immediate typed
-	 * refusal.
-	 */
-	readonly #sharedAppendBarSessionIds = new Set<string>();
-	/**
-	 * Permanent bar on resident-graph and whole-transcript rewrites. Latched once this
-	 * manager re-anchors to a committed transcript whose entries it did not import:
-	 * every canonical shared append.
-	 * Enforced at the write funnels (`#writeEntriesAtomicallySync`,
-	 * `#rewriteFileContents`, `#rewriteFileSync`), so recovery and close-time
-	 * escalations cannot bypass it.
-	 */
-	readonly #sharedRewriteBarSessionIds = new Set<string>();
-	/**
-	 * In-flight bar shared by control and one-shot publications. Every append and
-	 * rewrite is refused until each concurrent publication has settled.
-	 */
-	readonly #activeSharedMutationSessionCounts = new Map<string, number>();
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -11236,11 +11197,9 @@ export class SessionManager {
 	/** Prepare a forked successor without publishing it through public manager state. @internal */
 	async prepareFork(): Promise<PreparedNewSession | undefined> {
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
-		this.assertLegacyMutationAllowed("prepare fork");
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
-		this.assertLegacyMutationAllowed("prepare fork");
 		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
@@ -11306,17 +11265,14 @@ export class SessionManager {
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
-		this.assertLegacyMutationAllowed("prepare branched session");
 		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
-		this.assertLegacyMutationAllowed("prepare branched session");
 		const sourceId = this.#sessionId;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 		await this.#closePersistWriter();
 		// The session must not have switched while the writer closed.
 		if (this.#sessionId !== sourceId) throw new GraphSuccessorUnavailableError("prepare branched session", "changed");
-		this.assertLegacyMutationAllowed("prepare branched session");
 		const timestamp = new Date().toISOString();
 		const sessionId = createSessionId();
 		const sessionFile = this.persist
@@ -11581,12 +11537,10 @@ export class SessionManager {
 					throw new Error("Managed session storage could not be verified; refusing deletion.");
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
-				this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
 				// Scoped claim (design §1 row 17): taken before the detach, so a held session is never touched.
 				await withScopedSessionClaim(this.#scopedClaimOwnership(), candidate.sessionId, "delete", async () => {
 					if (this.#sessionFile && path.resolve(this.#sessionFile) === requestedPath) await this.newSession();
 					await this.#closePersistWriter();
-					this.#assertLogicalSessionMutationAllowed(candidate.sessionId, "drop session", true);
 					const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
 					if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 					if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
@@ -11693,7 +11647,6 @@ export class SessionManager {
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		using _rotation = this.#ownershipClaims.transition();
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
-		this.assertLegacyMutationAllowed("fork session");
 		if (!this.persist || !this.#sessionFile) return undefined;
 		this.#ensureFullHotView();
 
@@ -11724,10 +11677,8 @@ export class SessionManager {
 		];
 		const forkSnapshotHook = SessionManagerTestHooks.afterForkSnapshot;
 		if (forkSnapshotHook) await forkSnapshotHook();
-		this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
 
 		await this.#closePersistWriter();
-		this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#closeRetryOriginError = undefined;
@@ -11736,10 +11687,8 @@ export class SessionManager {
 		let forkTranscriptPublication: ForkTranscriptPublication | undefined;
 		let transition: PreparedResidentStoreTransition | undefined;
 		try {
-			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
 			if (this.#ownershipClaims.claiming) await this.#ownershipClaims.claim(newSessionId);
 			forkArtifactPublication = await this.copyArtifactsForFork(oldSessionFile, newSessionFile);
-			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
 			this.#ownershipClaims.checkWrite("fork successor", newSessionId);
 			// Publish each already-materialized entry through the staged writer without
 			// joining the transcript into another whole-file string/Buffer. Retired cold
@@ -11777,7 +11726,6 @@ export class SessionManager {
 				};
 			}
 			await SessionManagerTestHooks.afterForkTranscriptPublished?.();
-			this.#assertLogicalSessionMutationAllowed(oldSessionId, "fork session", true);
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
 				forkArtifactPublication.store.assertBound();
@@ -12593,8 +12541,6 @@ export class SessionManager {
 	}
 
 	async #moveTo(newCwd: string, options?: SessionCwdMoveOptions): Promise<void> {
-		// assertLegacyMutationAllowed now allows moves within exclusive transitions (#7856)
-		this.assertLegacyMutationAllowed("move session");
 		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
@@ -17299,7 +17245,6 @@ export class SessionManager {
 	}
 
 	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
-		this.assertLegacyMutationAllowed("full transcript publication");
 		// A full rewrite must see the complete transcript; rehydrate retired cold
 		// entries into the hot view before materializing the persisted bytes.
 		this.#ensureFullHotView();
@@ -17475,7 +17420,6 @@ export class SessionManager {
 	}
 
 	async #rewriteFileContents(options?: { check?: () => void; start?: () => void }): Promise<void> {
-		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
@@ -17515,14 +17459,12 @@ export class SessionManager {
 	}
 
 	async #rewriteFile(): Promise<void> {
-		this.assertLegacyMutationAllowed("rewrite transcript");
 		await this.#queuePersistTask(async () => {
 			await this.#rewriteFileContents();
 		});
 	}
 
 	#rewriteFileSync(): void {
-		this.assertLegacyMutationAllowed("rewrite transcript");
 		if (!this.persist || !this.#sessionFile) return;
 		this.#refreshManagedTranscriptRelocation();
 		this.#withSessionPersistenceFenceSync(() => {
@@ -17557,7 +17499,6 @@ export class SessionManager {
 		options?: DefaultModelSelectionEntriesOptions,
 	): Promise<DefaultModelSelectionStage> {
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
-		this.assertLegacyMutationAllowed("stage default model selection");
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
 		const managedAppendExpectation =
@@ -17687,7 +17628,6 @@ export class SessionManager {
 	}
 
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
-		this.assertLegacyMutationAllowed("promote default model selection");
 		if (
 			stage.entryRevision !== this.#entryRevision ||
 			stage.leafRevision !== this.#leafRevision ||
@@ -19312,12 +19252,10 @@ export class SessionManager {
 	}
 
 	async setSessionStarred(starred: boolean): Promise<boolean> {
-		this.assertLegacyMutationAllowed("set session starred");
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header || this.isSessionStarred() === starred) return false;
 		await this.#ensureStarPatchCapability(header);
-		this.assertLegacyMutationAllowed("set session starred");
 		// A failure puts `starred` back unless a later star patch has set it since (#appendHeaderPatch).
 		await this.#appendHeaderPatch({ starred }, { restoreOnFailure: true });
 		return true;
@@ -19400,14 +19338,12 @@ export class SessionManager {
 	}
 
 	async #setLivePickerStar(session: SessionInfo, starred: boolean): Promise<void> {
-		this.assertLegacyMutationAllowed("set live picker star");
 		this.#assertRecoveryHydrationWritable();
 		this.#assertPickerSessionIsCurrent(session);
 		const operation = this.#persistChain.then(() => {
 			if (this.#persistError) throw this.#persistError;
 			SessionManagerTestHooks.beforeLivePickerStarFence?.();
 			this.#withSessionPersistenceFenceSync(() => {
-				this.assertLegacyMutationAllowed("set live picker star");
 				this.#assertRecoveryHydrationWritable();
 				this.#assertPickerSessionIsCurrent(session);
 				const sessionFile = this.#sessionFile!;
@@ -19582,7 +19518,6 @@ export class SessionManager {
 	}
 
 	async #ensureStarPatchCapability(header: SessionHeader): Promise<void> {
-		this.assertLegacyMutationAllowed("ensure star patch capability");
 		if (header.starredPatchVersion === 1) return;
 		const previousStarred = header.starred;
 		const previousRewriteRequired = this.#needsFullRewriteOnNextPersist;
@@ -19632,7 +19567,6 @@ export class SessionManager {
 		options?: { isCurrent?: () => boolean; onlyIfUnnamed?: boolean; onApplied?: (name: string) => void },
 	): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
-		this.assertLegacyMutationAllowed("set session name");
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
 		const identityGeneration = this.#committedIdentityGeneration;
@@ -19642,7 +19576,6 @@ export class SessionManager {
 		this.#titleMutationTail = completion.promise;
 		try {
 			await predecessor;
-			this.assertLegacyMutationAllowed("set session name");
 			this.#assertRecoveryHydrationWritable();
 			if (
 				this.#committedIdentityGeneration !== identityGeneration ||
@@ -19730,7 +19663,7 @@ export class SessionManager {
 			restoreOnFailure?: boolean;
 		},
 	): Promise<void> {
-		this.assertLegacyMutationAllowed("append header patch");
+		SessionManagerTestHooks.beforeHeaderPatch?.(patch);
 		if (options?.allowStrictClose) {
 			if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 		} else this.#assertRecoveryHydrationWritable();
@@ -19828,7 +19761,6 @@ export class SessionManager {
 		isPersistenceOwner?: () => boolean,
 		onCommitted?: () => void,
 	): Promise<void> {
-		this.assertLegacyMutationAllowed("persist patches");
 		const recordsNow = () => (typeof recordsOrBuild === "function" ? recordsOrBuild() : recordsOrBuild);
 		if (recordsNow().length === 0) return;
 		try {
@@ -19854,7 +19786,6 @@ export class SessionManager {
 			async () => {
 				if (onPersistenceCheck) await SessionManagerTestHooks.beforeTitlePatchPersistence?.();
 				for (let attempt = 0; attempt <= 2; attempt++) {
-					this.assertLegacyMutationAllowed("persist patches");
 					onPersistenceCheck?.();
 					this.#refreshManagedTranscriptRelocation();
 					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
@@ -19889,7 +19820,6 @@ export class SessionManager {
 					let persisted = false;
 					let rewriteRequired = false;
 					const written = this.#withSessionPersistenceFenceSync(() => {
-						this.assertLegacyMutationAllowed("persist patches");
 						onPersistenceCheck?.();
 						this.#refreshManagedTranscriptRelocation();
 						if (!this.#persistenceInputTokenMatches(token)) return false;
@@ -20084,15 +20014,6 @@ export class SessionManager {
 						this.#needsFullRewriteOnNextPersist = true;
 						throw nearLimit(liveBytesBefore);
 					}
-					// A shared session bars the whole-transcript recovery rewrite. The append
-					// cannot fit the cap and its only recovery is refused, which is exactly the
-					// typed near-limit outcome: keep that contract (and its
-					// SESSION_LIMIT_RECOVERY_ACTIONS guidance) instead of degrading into a
-					// generic stale "rewrite required" abort.
-					if (rewriteError instanceof SharedSessionMutationUnsupportedError) {
-						this.#needsFullRewriteOnNextPersist = true;
-						throw nearLimit(liveBytesBefore);
-					}
 					throw rewriteError;
 				}
 				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
@@ -20155,7 +20076,6 @@ export class SessionManager {
 	}
 
 	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {
-		this.assertLegacyAppendAllowed("append entry");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
@@ -20380,7 +20300,6 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
-		this.assertLegacyAppendAllowed("append message");
 		return this.#appendMessageWithId(message, this.#generateEntryId());
 	}
 
@@ -20604,16 +20523,6 @@ export class SessionManager {
 		};
 	}
 
-	/** Whether this logical session must keep using shared mutation admission. */
-	requiresSharedMutationAdmission(): boolean {
-		const sessionId = this.#sessionId;
-		return (
-			this.#sharedAppendBarSessionIds.has(sessionId) ||
-			this.#sharedRewriteBarSessionIds.has(sessionId) ||
-			(this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0
-		);
-	}
-
 	/**
 	 * Refuse, with {@link ManagedAppendIdentityMismatchError}, a destructive control (`/drop`) on a
 	 * managed transcript that is no longer the one this manager last wrote or bound: a writer it
@@ -20637,24 +20546,6 @@ export class SessionManager {
 			throw new ManagedAppendIdentityMismatchError(relativePath);
 	}
 
-	/** Refuse before caller-side agent, UI, settings, or external effects. */
-	assertLegacyMutationAllowed(operation: string): void {
-		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, true);
-	}
-
-	/** Additive legacy appends are safe once a control publication's transaction has settled. */
-	assertLegacyAppendAllowed(operation: string): void {
-		this.#assertLogicalSessionMutationAllowed(this.#sessionId, operation, false);
-	}
-
-	#assertLogicalSessionMutationAllowed(sessionId: string, operation: string, includeRewrite: boolean): void {
-		if ((this.#activeSharedMutationSessionCounts.get(sessionId) ?? 0) > 0)
-			throw new SharedSessionMutationUnsupportedError(operation);
-		if (this.#sharedAppendBarSessionIds.has(sessionId)) throw new SharedSessionMutationUnsupportedError(operation);
-		if (includeRewrite && this.#sharedRewriteBarSessionIds.has(sessionId))
-			throw new SharedSessionMutationUnsupportedError(operation);
-	}
-
 	/** Why a branch from `leafId` cannot be prepared now; non-throwing and write-free, for use before any effect. */
 	graphSuccessorRefusal(leafId: string): GraphSuccessorRefusal | undefined {
 		let refusal: GraphSuccessorRefusal | undefined;
@@ -20675,7 +20566,6 @@ export class SessionManager {
 		) as Partial<SessionHeader>;
 		if (header.type !== "session" || typeof header.id !== "string")
 			throw new Error("Uncommitted session discard requires a valid transcript header.");
-		this.#assertLogicalSessionMutationAllowed(header.id, "discard uncommitted session", true);
 	}
 
 	/**
@@ -20941,7 +20831,6 @@ export class SessionManager {
 	 * happen in one synchronous step, so no turn can interleave.
 	 */
 	appendSessionRecap(input: SessionRecapInput): SessionRecapAppendResult {
-		this.assertLegacyAppendAllowed("append session recap");
 		const plan = planSessionRecapAppend(this.#walkActiveBranchNewestFirst(), input);
 		if (!plan.ok) return { status: "rejected", reason: plan.reason };
 		return { status: "appended", entryId: this.appendCustomEntry(SESSION_RECAP_ENTRY, plan.data) };
@@ -21014,7 +20903,6 @@ export class SessionManager {
 	 * the canonical store. This applies such mutations for real.
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
-		this.assertLegacyMutationAllowed("apply entry message updates");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
@@ -21037,7 +20925,6 @@ export class SessionManager {
 		entries: readonly CustomMessageEntry[],
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
-		this.assertLegacyMutationAllowed("apply custom message entry updates");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
@@ -21108,7 +20995,6 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
-		this.assertLegacyMutationAllowed("rewrite entries");
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
@@ -21120,7 +21006,6 @@ export class SessionManager {
 
 	/** Remap artifact references in an unpublished candidate before its publication fence. */
 	async remapStagedArtifactReferences(idMap: ReadonlyMap<string, string>): Promise<void> {
-		this.assertLegacyMutationAllowed("remap staged artifact references");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) throw new Error("Staged session is unavailable");
 		remapAttemptReferencesInEntries(this.#fileEntries, idMap);
@@ -21349,7 +21234,6 @@ export class SessionManager {
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
-		this.assertLegacyMutationAllowed("evict compacted content");
 		this.#assertRecoveryHydrationWritable();
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		const firstKept = this.#byId.get(firstKeptEntryId);
@@ -22080,7 +21964,6 @@ export class SessionManager {
 	async #sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist(): Promise<boolean> {
 		const patches = this.#sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (!this.isManagedDestination()) {
-			if (patches.length > 0) this.assertLegacyMutationAllowed("sanitize loaded OpenAI Responses replay metadata");
 			await this.#persistPatches(patches);
 		}
 		return patches.length > 0;
@@ -22281,7 +22164,6 @@ export class SessionManager {
 	 * context from the abandoned conversation path.
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromExtension?: boolean): string {
-		this.assertLegacyMutationAllowed("branch with summary");
 		this.#assertRecoveryHydrationWritable();
 		this.#deactivateColdForBranchMutation();
 		if (branchFromId !== null && !this.#byId.has(branchFromId)) {
@@ -22309,7 +22191,6 @@ export class SessionManager {
 	 */
 	createBranchedSession(leafId: string): string | undefined {
 		using _rotation = this.#ownershipClaims.transition();
-		this.assertLegacyMutationAllowed("create branched session");
 		this.#assertRecoveryHydrationWritable();
 		this.#ensureFullHotView();
 		const previousSessionFile = this.#sessionFile;
@@ -23376,14 +23257,12 @@ export class SessionManager {
 	}
 
 	async commitStaged(options?: { deferArtifactFinalize?: boolean }): Promise<void> {
-		this.assertLegacyMutationAllowed("commit staged session");
 		const staged = this.#stagedPublication;
 		if (!staged || staged.discarded) throw new Error("Staged session is unavailable");
 		if (staged.committed) return;
 		staged.deferArtifactFinalize = options?.deferArtifactFinalize === true;
 		await this.flush();
 		await this.#closePersistWriter();
-		this.assertLegacyMutationAllowed("commit staged session");
 		const stagedManager = this.#adoptedArtifactManager ?? this.#artifactManager;
 		// Lifecycle invariant: while a staged publication is uncommitted, the session must
 		// carry exactly the attempt-rooted staging manager it opened with. openStaged,
@@ -23402,7 +23281,6 @@ export class SessionManager {
 		try {
 			if (stagedManager?.getAttemptId() === staged.attemptId) {
 				const stagedArtifactFiles = await stagedManager.listFiles();
-				this.assertLegacyMutationAllowed("commit staged session");
 				if (stagedArtifactFiles.length > 0 || stagedManager.getAllocatedIds().length > 0) {
 					await parentArtifacts.commitAttemptStaging(stagedManager, staged.attemptId, {
 						beforePublish: idMap => this.remapStagedArtifactReferences(idMap),
@@ -25951,7 +25829,6 @@ export class SessionManager {
 		if (this.#readOnlySnapshot) throw new Error("read_only_snapshot");
 		// Storage verifies this logical ID against the retained transcript header before
 		// deletion. A caller-supplied path or the active manager ID is not authority.
-		this.#assertLogicalSessionMutationAllowed(target.sessionId, "delete verified session", true);
 		if (!this.#storage.deleteSessionVerified) {
 			throw new Error("Storage backend does not support verified session deletion");
 		}

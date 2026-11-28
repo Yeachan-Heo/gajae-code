@@ -417,8 +417,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal shared-session label publication for the local TUI tree navigator, not a user-facing SDK control seam",
 	"agent_session:appendModeChangeInBackground":
 		"internal shared-session mode-change publication for plan/goal mode persistence, not a user-facing SDK control seam",
-	"agent_session:assertConfiguredModelChainWritable":
-		"internal fail-closed guard before profile/fallback-chain writes on adopted shared sessions, not a user-facing SDK control seam",
 	"agent_session:setThinkingLevelForSession":
 		"internal non-operator session-only thinking follow (plan mode, model assignment) over the reviewed thinking.set seam, not an independent public SDK operation",
 };

@@ -212,10 +212,8 @@ async function reopen(f: ProfileFixture): Promise<SessionManager> {
 describe("model profile activation in a managed session", () => {
 	it("keeps an untouched non-root SDK session on its existing publication mode", async () => {
 		const f = await fixture();
-		expect(f.manager.requiresSharedMutationAdmission()).toBe(false);
 		await activate(f);
 		expectProfileState(f);
-		expect(f.manager.requiresSharedMutationAdmission()).toBe(false);
 		const id = f.manager.appendMessage(user("SDK message after profile"));
 		await f.manager.flush();
 		expect(f.manager.getLeafId()).toBe(id);

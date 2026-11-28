@@ -252,7 +252,6 @@ function createRuntime() {
 		isPersisted(): boolean {
 			return true;
 		},
-		assertLegacyMutationAllowed(_operation: string): void {},
 		getSessionId(): string {
 			return "fake-session-id";
 		},

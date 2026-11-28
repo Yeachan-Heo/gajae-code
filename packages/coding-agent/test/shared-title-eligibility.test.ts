@@ -92,7 +92,6 @@ describe("shared publication admission split", () => {
 			title: "Automatic title",
 		});
 		expect(f.manager.getSessionName()).toBe("Automatic title");
-		expect(() => f.manager.assertLegacyAppendAllowed("ordinary append")).not.toThrow();
 
 		const custom = f.manager.appendCustomEntry("post-title", { value: 1 });
 		expect(f.manager.getLeafId()).toBe(custom);

@@ -3247,8 +3247,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 									);
 								}
-								// Refuse before the cwd, capability and plugin rebinding below, not from moveTo.
-								sessionManager.assertLegacyMutationAllowed("move session");
 								return sessionManager.runExclusiveCwdMoveTransition(async () => {
 									if (moveConsumed) {
 										throw new Error(
