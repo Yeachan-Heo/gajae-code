@@ -370,6 +370,8 @@ const NOT_TRANSCRIPT_WRITERS: Record<string, Run> = {
 	inMemory: async f => SessionManager.inMemory(f.cwd),
 	captureTranscriptStrict: async f => identity(f.existing),
 	inspectSessionTailReadOnly: f => SessionManager.inspectSessionTailReadOnly(f.existing),
+	// A read-only header capture for the --confine scope check; never creates a missing path.
+	inspectTranscriptScope: async f => SessionManager.inspectTranscriptScope(f.existing),
 	// A header read and a probe, never a claim; under enforce it still writes nothing.
 	probeHeldTranscript: async f =>
 		SessionManager.probeHeldTranscript(f.existing, { surface: "terminal", mode: "enforce" }),

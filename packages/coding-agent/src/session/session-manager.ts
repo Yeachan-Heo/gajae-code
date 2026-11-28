@@ -296,6 +296,12 @@ import {
 	type SessionRecapInput,
 	toRecapLineageEntry,
 } from "./recap";
+import {
+	type FilesystemScope,
+	isConfinedScope,
+	parseFilesystemScope,
+	sessionMatchesConfinement,
+} from "./session-confinement";
 import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./session-manager-internal";
 import {
 	probeSessionOwners,
@@ -340,7 +346,23 @@ export interface SessionHeader extends MutableSessionHeaderFields {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/**
+	 * `"cwd"` confines tool and shell paths to this session's cwd and its
+	 * descendants. Absent on ordinary sessions. The marker is durable: a confined
+	 * transcript can only be resumed with the same launch flag.
+	 */
+	filesystemScope?: FilesystemScope;
 }
+
+/**
+ * Filesystem confinement requested by `SessionManager.open`.
+ * - `"none"`: ordinary open.
+ * - `"resume"`: a `--confine` resume; a missing path is rejected instead of
+ *   silently creating an ordinary transcript.
+ * - `"create"`: a confined child session; a missing path creates a confined
+ *   transcript and an existing transcript must already be confined.
+ */
+export type SessionOpenConfinement = "none" | "resume" | "create";
 
 export interface NewSessionOptions {
 	parentSession?: string;
@@ -5250,6 +5272,7 @@ export async function findMostRecentSession(
 	const sessions = await getSortedSessions(sessionDir, storage, 1);
 	return sessions[0]?.path || null;
 }
+export { sessionMatchesConfinement } from "./session-confinement";
 
 /** Format a time difference as a human-readable string */
 function formatTimeAgo(date: Date): string {
@@ -7626,10 +7649,15 @@ function sessionMatchesResumeArg(session: SessionInfo, sessionArg: string): bool
  * Equal session id first, the same `id ===` check managed resume already uses.
  * Prefix matching stays for every other argument, in list order.
  */
-export function pickResumableSession(sessions: readonly SessionInfo[], sessionArg: string): SessionInfo | undefined {
+export function pickResumableSession(
+	sessions: readonly SessionInfo[],
+	sessionArg: string,
+	confined = false,
+): SessionInfo | undefined {
+	const eligible = sessions.filter(session => sessionMatchesConfinement(session, confined));
 	return (
-		sessions.find(session => session.id === sessionArg) ??
-		sessions.find(session => sessionMatchesResumeArg(session, sessionArg))
+		eligible.find(session => session.id === sessionArg) ??
+		eligible.find(session => sessionMatchesResumeArg(session, sessionArg))
 	);
 }
 
@@ -7639,11 +7667,12 @@ export async function resolveResumableSession(
 	sessionDir?: string,
 	storage: SessionStorage = new FileSessionStorage(),
 	managedAgentDir?: string,
+	confined = false,
 ): Promise<ResolvedSessionMatch | undefined> {
 	const localSessions = sessionDir
 		? await SessionManager.list(cwd, sessionDir, storage)
 		: await SessionManager.listManagedForResumePickerReadOnly(cwd, managedAgentDir, storage);
-	const localMatch = pickResumableSession(localSessions, sessionArg);
+	const localMatch = pickResumableSession(localSessions, sessionArg, confined);
 	if (localMatch) {
 		return { session: localMatch, scope: "local" };
 	}
@@ -7653,7 +7682,7 @@ export async function resolveResumableSession(
 	}
 
 	const globalSessions = await SessionManager.listAll(storage, managedAgentDir);
-	const globalMatch = pickResumableSession(globalSessions, sessionArg);
+	const globalMatch = pickResumableSession(globalSessions, sessionArg, confined);
 	if (!globalMatch) {
 		return undefined;
 	}
@@ -8326,6 +8355,7 @@ export class SessionManager {
 		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
 		skipEnsureSessionDir = false,
+		private filesystemScope?: FilesystemScope,
 	) {
 		this.#ownershipClaims = new SessionClaimSet(persist ? ownership : "exempt");
 		this.#storage = new Proxy(storage, {
@@ -9103,6 +9133,7 @@ export class SessionManager {
 				this.#storage,
 				candidateDestination,
 				true,
+				this.filesystemScope,
 			);
 		} catch (error) {
 			managedTransition?.dispose();
@@ -9344,6 +9375,7 @@ export class SessionManager {
 				id: sessionId,
 				timestamp,
 				cwd: this.cwd,
+				...(this.filesystemScope ? { filesystemScope: this.filesystemScope } : {}),
 				parentSession: options?.parentSession,
 			},
 			adoptsLifecycleId: preallocated !== undefined,
@@ -10656,6 +10688,7 @@ export class SessionManager {
 		this.#bindSessionId(header.id);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
+		this.filesystemScope = parseFilesystemScope(header.filesystemScope);
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#flushed = true;
@@ -10897,6 +10930,7 @@ export class SessionManager {
 				this.#bindSessionId(sessionId);
 				this.#sessionName = header?.title;
 				this.#titleSource = header?.titleSource;
+				this.filesystemScope = parseFilesystemScope(header?.filesystemScope);
 				this.#needsFullRewriteOnNextPersist = migrationApplied;
 				this.#managedPersistExpectedIdentity = expectedIdentity;
 				this.#artifactManager = null;
@@ -11040,6 +11074,7 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
+			...(this.filesystemScope ? { filesystemScope: this.filesystemScope } : {}),
 			parentSession: options?.parentSession,
 		};
 		const stage: PreparedNewSessionState = {
@@ -11263,6 +11298,7 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			timestamp,
 			cwd: this.cwd,
+			...(this.filesystemScope ? { filesystemScope: this.filesystemScope } : {}),
 			parentSession: sourceId,
 		};
 		const sourceEntries = materializeResidentEntriesForReadSync(this.#fileEntries, this.#residentBlobStores()).filter(
@@ -11345,6 +11381,7 @@ export class SessionManager {
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
+			...(this.filesystemScope ? { filesystemScope: this.filesystemScope } : {}),
 			// The committed route records the source id; the legacy route keeps the path.
 			parentSession: route === "committed" ? sourceId : this.persist ? this.#sessionFile : undefined,
 		};
@@ -11746,6 +11783,7 @@ export class SessionManager {
 			titleSource: oldHeader?.titleSource ?? this.#titleSource,
 			timestamp,
 			cwd: this.cwd,
+			...(this.filesystemScope ? { filesystemScope: this.filesystemScope } : {}),
 			parentSession: oldSessionId,
 		};
 		const entries: FileEntry[] = [
@@ -12669,6 +12707,13 @@ export class SessionManager {
 				const targetIdentity = await targetHandle.stat({ bigint: true });
 				const revalidatedCwd = await fs.promises.realpath(path.resolve(newCwd));
 				const namedIdentity = await fs.promises.lstat(revalidatedCwd, { bigint: true });
+				if (
+					this.isFilesystemConfined() &&
+					revalidatedCwd !== path.resolve(this.cwd) &&
+					!pathIsWithin(path.resolve(this.cwd), revalidatedCwd)
+				) {
+					throw new Error(`Refusing to rescope outside the confined session root: ${revalidatedCwd}`);
+				}
 				if (
 					revalidatedCwd !== resolvedCwd ||
 					!namedIdentity.isDirectory() ||
@@ -18331,6 +18376,26 @@ export class SessionManager {
 	getCwd(): string {
 		return this.cwd;
 	}
+	isFilesystemConfined(): boolean {
+		return this.filesystemScope !== undefined;
+	}
+
+	/**
+	 * A fork keeps its source's confinement. Call before building the fork's
+	 * fresh header, which copies this manager's scope; callers never re-read
+	 * the transcript just to learn its scope.
+	 */
+	#inheritForkScope(sourceHeader: SessionHeader | undefined): void {
+		if (isConfinedScope(sourceHeader)) this.filesystemScope = "cwd";
+	}
+
+	/** Mark a new session as cwd-confined before its header is written. */
+	confineToCwd(): void {
+		if (this.#sessionFile && this.#flushed) {
+			throw new Error("Cannot confine a session after its transcript has been published.");
+		}
+		this.filesystemScope = "cwd";
+	}
 
 	/** Get usage statistics across all assistant messages in the session. */
 	getUsageStatistics(): UsageStatistics {
@@ -22551,6 +22616,7 @@ export class SessionManager {
 			id: newSessionId,
 			timestamp,
 			cwd: this.cwd,
+			...(this.filesystemScope ? { filesystemScope: this.filesystemScope } : {}),
 			parentSession: this.persist ? previousSessionFile : undefined,
 		};
 
@@ -22736,6 +22802,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		ownership?: SessionOwnershipDecision,
+		confined = false,
 	): SessionManager {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const manager = new SessionManager(
@@ -22745,6 +22812,8 @@ export class SessionManager {
 			resolveSessionOwnership(ownership),
 			storage,
 			destination,
+			false,
+			confined ? "cwd" : undefined,
 		);
 		manager.#initNewSession();
 		// Sync factory: the fresh id is claimed in the background; nothing is written before a turn.
@@ -23027,6 +23096,7 @@ export class SessionManager {
 				: undefined);
 		if (!identity) return false;
 		applyHeaderPatch(sourceHeader, headerPatch);
+		this.#inheritForkScope(sourceHeader);
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
@@ -23230,6 +23300,7 @@ export class SessionManager {
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
 		applyHeaderPatch(sourceHeader, headerPatch);
+		this.#inheritForkScope(sourceHeader);
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
@@ -23325,12 +23396,23 @@ export class SessionManager {
 			 * breadcrumb once it lands, so an abandoned fork never becomes `--continue`'s target.
 			 */
 			readonly writeBreadcrumb?: boolean;
+			/** Record a `--confine` scope on the fork's header. */
+			readonly confined?: boolean;
 		} = {},
 	): Promise<SessionManager> {
 		const owner = resolveSessionOwnership(ownership);
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
-		const manager = new SessionManager(cwd, dir, true, owner, storage, destination);
+		const manager = new SessionManager(
+			cwd,
+			dir,
+			true,
+			owner,
+			storage,
+			destination,
+			false,
+			options.confined ? "cwd" : undefined,
+		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		manager.#deferForkBreadcrumb = options.writeBreadcrumb === false;
 		let managedSourcePath = sourcePath;
@@ -23427,6 +23509,7 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		manager.#inheritForkScope(sourceHeader);
 		const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
 		fresh.header.title = sourceHeader?.title;
 		fresh.header.titleSource = sourceHeader?.titleSource;
@@ -23879,22 +23962,30 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		ownership?: SessionOwnershipDecision,
+		confinement: SessionOpenConfinement = "none",
 	): Promise<SessionManager> {
 		const owner = resolveSessionOwnership(ownership);
 		const admission = await SessionManager.#admitExistingTranscript(owner, filePath, storage);
+		let manager: SessionManager;
 		try {
-			return await SessionManager.#openAdmitted(
+			manager = await SessionManager.#openAdmitted(
 				filePath,
 				destinationInput,
 				storage,
 				migrationPolicy,
 				sessionMemoryMode,
 				owner,
+				confinement,
 			);
 		} finally {
 			// The manager took its own share of the claim; this one only covered the open.
 			admission?.release();
 		}
+		if (confinement === "create" && !manager.isFilesystemConfined()) {
+			await manager.close();
+			throw new Error("Cannot open an unconfined transcript as a confined session.");
+		}
+		return manager;
 	}
 
 	/**
@@ -23989,6 +24080,7 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy,
 		sessionMemoryMode: SessionMemoryMode,
 		owner: ResolvedSessionOwnership,
+		confinement: SessionOpenConfinement,
 	): Promise<SessionManager> {
 		const destination =
 			destinationInput === undefined
@@ -24008,6 +24100,7 @@ export class SessionManager {
 				migrationPolicy,
 				sessionMemoryMode,
 				owner,
+				confinement,
 			);
 
 		const store = managedStoreFromContext(destination.securityContext, destination.directory);
@@ -24032,6 +24125,7 @@ export class SessionManager {
 					migrationPolicy,
 					sessionMemoryMode,
 					owner,
+					confinement,
 				);
 			}
 			let sessionId: string;
@@ -24082,6 +24176,7 @@ export class SessionManager {
 					migrationPolicy,
 					sessionMemoryMode,
 					owner,
+					confinement,
 				);
 				constructed = manager;
 				scope.assertOwned();
@@ -24111,8 +24206,10 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy,
 		sessionMemoryMode: SessionMemoryMode,
 		owner: ResolvedSessionOwnership,
+		confinement: SessionOpenConfinement,
 	): Promise<SessionManager> {
 		if (isStagedSessionPath(filePath)) throw new Error("Staged session paths are not resumable");
+		const missingScope = confinement === "create" ? "cwd" : undefined;
 		const destination =
 			destinationInput === undefined
 				? explicitDestination(path.dirname(filePath))
@@ -24144,8 +24241,18 @@ export class SessionManager {
 			if (!boundedAdmission) {
 				const inspected = inspectResumeSessionFile(filePath, storage);
 				if ("kind" in inspected) {
-					if (inspected.reason === "missing")
-						return await SessionManager.#openMissing(filePath, destination, owner, storage, sessionMemoryMode);
+					if (inspected.reason === "missing") {
+						if (confinement === "resume")
+							throw new Error("Cannot create a confined session by resuming a missing path.");
+						return await SessionManager.#openMissing(
+							filePath,
+							destination,
+							owner,
+							storage,
+							sessionMemoryMode,
+							missingScope,
+						);
+					}
 					if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
 					throw new Error(`Could not open session: ${inspected.reason}`);
 				}
@@ -24157,6 +24264,8 @@ export class SessionManager {
 					owner,
 					storage,
 					destination,
+					false,
+					parseFilesystemScope(header.filesystemScope),
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				if (manager.#ownershipClaims.claiming) await manager.#ownershipClaims.claim(header.id);
@@ -24180,8 +24289,18 @@ export class SessionManager {
 				? { ok: true as const, inspection: { cwd: (strictSmallInspection.entries[0] as SessionHeader).cwd } }
 				: inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (!inspected.ok) {
-				if (inspected.error.reason === "missing")
-					return await SessionManager.#openMissing(filePath, destination, owner, storage, sessionMemoryMode);
+				if (inspected.error.reason === "missing") {
+					if (confinement === "resume")
+						throw new Error("Cannot create a confined session by resuming a missing path.");
+					return await SessionManager.#openMissing(
+						filePath,
+						destination,
+						owner,
+						storage,
+						sessionMemoryMode,
+						missingScope,
+					);
+				}
 				if (inspected.error.reason === "oversized")
 					throw new SessionTranscriptOversizedError(inspected.error.size ?? 0);
 				throw new Error(`Could not open session: ${inspected.error.reason}`);
@@ -24442,10 +24561,20 @@ export class SessionManager {
 		owner: ResolvedSessionOwnership,
 		storage: SessionStorage,
 		sessionMemoryMode: SessionMemoryMode,
+		filesystemScope?: FilesystemScope,
 	): Promise<SessionManager> {
 		const directory = destination.directory;
 		const createdHere = storage instanceof FileSessionStorage && !fs.existsSync(directory);
-		const manager = new SessionManager(getProjectDir(), directory, true, owner, storage, destination);
+		const manager = new SessionManager(
+			getProjectDir(),
+			directory,
+			true,
+			owner,
+			storage,
+			destination,
+			false,
+			filesystemScope,
+		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		const created = createdHere ? await fs.promises.lstat(directory, { bigint: true }) : undefined;
 		try {
@@ -24490,6 +24619,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		filesystemScope?: FilesystemScope,
 	): Promise<SessionManager> {
 		// A subagent child claims nothing yet (single-owner design §13 L2: per-child claims deferred).
 		const owner: ResolvedSessionOwnership = "exempt";
@@ -24519,6 +24649,8 @@ export class SessionManager {
 				owner,
 				storage,
 				destination,
+				false,
+				filesystemScope,
 			);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			try {
@@ -24530,6 +24662,9 @@ export class SessionManager {
 						| undefined;
 					if (!header) throw new Error("source_changed");
 					const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : header.cwd || getProjectDir();
+					if (filesystemScope && !boundedManager.isFilesystemConfined()) {
+						boundedManager.confineToCwd();
+					}
 					if (cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd))
 						throw new Error("nested_managed_bounded_rewrite_required");
 					boundedManager.cwd = sessionCwd;
@@ -24590,7 +24725,16 @@ export class SessionManager {
 			header && cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd),
 		);
 		if (header && cwdChanged) header.cwd = sessionCwd;
-		const manager = new SessionManager(sessionCwd, destination.directory, true, owner, storage, destination);
+		const manager = new SessionManager(
+			sessionCwd,
+			destination.directory,
+			true,
+			owner,
+			storage,
+			destination,
+			false,
+			filesystemScope,
+		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		try {
 			let transcriptChanged = false;
@@ -24614,6 +24758,7 @@ export class SessionManager {
 				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
 			} else {
 				const fresh = manager.#freshSessionState(undefined, resolved);
+				if (filesystemScope) manager.confineToCwd();
 				const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 				manager.#applyFreshSessionMetadata(fresh);
 				manager.#commitResidentTextStoreTransition(transition);
@@ -24794,11 +24939,39 @@ export class SessionManager {
 	}
 
 	/**
+	 * Read the filesystem scope recorded in an existing transcript header without
+	 * opening it for writing or creating it. Only the first line is decoded.
+	 * Returns `undefined` when the transcript cannot be captured (missing,
+	 * oversized, or malformed).
+	 */
+	static inspectTranscriptScope(
+		filePath: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): { confined: boolean } | undefined {
+		const captured = SessionManager.captureTranscriptStrict(filePath, storage);
+		if (captured.kind !== "captured") return undefined;
+		try {
+			let header: unknown;
+			captured.snapshot.forEachLine(line => {
+				header = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line));
+				return false;
+			});
+			if (!isRecord(header) || header.type !== "session") return undefined;
+			return { confined: isConfinedScope(header) };
+		} catch {
+			return undefined;
+		} finally {
+			captured.snapshot.close();
+		}
+	}
+
+	/**
 	 * Fork strictly from captured source bytes. The source pathname is used only to
 	 * revalidate captured authority before destination initialization and transcript
 	 * persistence; destination history always comes from the captured bytes.
 	 * sourceEntryId selects an inclusive root-to-entry path; null selects no history.
 	 * Undefined preserves the complete transcript, including inactive branches.
+	 * The fork inherits the source header's filesystem scope.
 	 */
 	static async forkFromCaptured(
 		snapshot: CapturedSessionTranscriptSnapshot,
@@ -24971,6 +25144,7 @@ export class SessionManager {
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
+			manager.#inheritForkScope(sourceHeader);
 			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
 			fresh.header.title = sourceHeader?.title;
 			fresh.header.titleSource = sourceHeader?.titleSource;
@@ -25793,6 +25967,7 @@ export class SessionManager {
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 		ownership?: SessionOwnershipDecision,
+		confined = false,
 	): Promise<SessionManager> {
 		const owner = resolveSessionOwnership(ownership);
 		const destination = destinationFor(cwd, destinationInput, storage);
@@ -25834,6 +26009,12 @@ export class SessionManager {
 		// open, before any write. A held candidate that would have been chosen ends the search with that
 		// refusal, for the caller to start fresh or refuse; one that is not continuable is skipped.
 		const openSelectedStrictly = async (selectedPath: string): Promise<SessionManager | undefined> => {
+			// Skip an opposite-scope transcript from its bounded header prefix before any
+			// claim or full inspection. Opening it first can throw on size, context limits, or
+			// another holder, which would stop the scan before an older matching-scope
+			// transcript is reached. The post-open checks in openCandidate stay authoritative.
+			const [listed] = await readSessionMetadata([selectedPath], storage).catch(() => []);
+			if (listed && !sessionMatchesConfinement(listed, confined)) return undefined;
 			try {
 				return await openCandidate(selectedPath);
 			} catch (error) {
@@ -25875,7 +26056,11 @@ export class SessionManager {
 					sessionMemoryMode,
 					owner,
 				);
-				if (canContinuePersistedHistory(manager.buildSessionContext().messages)) return manager;
+				if (
+					canContinuePersistedHistory(manager.buildSessionContext().messages) &&
+					manager.isFilesystemConfined() === confined
+				)
+					return manager;
 				await manager.close();
 				return undefined;
 			}
@@ -25896,6 +26081,10 @@ export class SessionManager {
 			if (opened.kind === "error") {
 				const typed = SessionManager.#typedStrictOpenError(opened);
 				if (typed) throw typed;
+				return undefined;
+			}
+			if (opened.manager.isFilesystemConfined() !== confined) {
+				await opened.manager.close();
 				return undefined;
 			}
 			return opened.manager;
@@ -25934,12 +26123,21 @@ export class SessionManager {
 			const opened = await openSelectedStrictly(candidate.path);
 			if (opened) return opened;
 		}
-		const mostRecent = await findMostRecentSession(dir, storage);
-		if (mostRecent) {
-			const opened = await openSelectedStrictly(mostRecent);
+		const recentSessions = await getSortedSessions(dir, storage);
+		for (const candidate of recentSessions) {
+			const opened = await openSelectedStrictly(candidate.path);
 			if (opened) return opened;
 		}
-		const manager = new SessionManager(cwd, dir, true, owner, storage, destination);
+		const manager = new SessionManager(
+			cwd,
+			dir,
+			true,
+			owner,
+			storage,
+			destination,
+			false,
+			confined ? "cwd" : undefined,
+		);
 		manager.#initNewSession();
 		if (manager.#ownershipClaims.claiming) await manager.#ownershipClaims.claim(manager.#sessionId);
 		return manager;

@@ -101,6 +101,7 @@ import { probeHeldSessions, resolveSessionOwnership } from "./session/internal/s
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import { composeOperatorMessage, operatorErrorMessage } from "./session/operator-error-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
+import { sessionMatchesConfinement } from "./session/session-confinement";
 import { checkSessionHandover, handOverSession, type SessionHandoverWaitOptions } from "./session/session-handover";
 import {
 	resolveResumableSession,
@@ -284,6 +285,7 @@ export function resolveAcpStartupOptions(
 		| "providerSessionId"
 		| "resume"
 		| "sessionDir"
+		| "confine"
 		| "skills"
 		| "plan"
 		| "systemPrompt"
@@ -324,6 +326,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.providerSessionId ? ["--provider-session-id"] : []),
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
+		...(parsed.confine ? ["--confine"] : []),
 		...(parsed.skills !== undefined ? ["--skills"] : []),
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
@@ -1517,6 +1520,12 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
+			// Inspect the source read-only: opening it would create a missing path
+			// as an ordinary transcript before the scope check could reject it.
+			const sourceScope = SessionManager.inspectTranscriptScope(path.resolve(forkSource));
+			if (!sourceScope || sourceScope.confined !== (parsed.confine === true)) {
+				throw new SessionNotFoundError(forkSource);
+			}
 			return await SessionManager.forkFrom(
 				forkSource,
 				cwd,
@@ -1525,6 +1534,7 @@ export async function createSessionManager(
 				migrationPolicy,
 				sessionMemoryMode,
 				ownership,
+				{ confined: parsed.confine === true },
 			);
 		}
 		const match = await resolveResumableSession(
@@ -1533,6 +1543,7 @@ export async function createSessionManager(
 			parsed.sessionDir,
 			undefined,
 			parsed.sessionDir ? undefined : activeSettings.getAgentDir(),
+			parsed.confine === true,
 		);
 		if (!match) {
 			throw new SessionNotFoundError(forkSource);
@@ -1545,11 +1556,14 @@ export async function createSessionManager(
 			migrationPolicy,
 			sessionMemoryMode,
 			ownership,
+			{ confined: parsed.confine === true },
 		);
 	}
 
 	if (parsed.noSession) {
-		return SessionManager.inMemory();
+		const ephemeral = SessionManager.inMemory();
+		if (parsed.confine) ephemeral.confineToCwd();
+		return ephemeral;
 	}
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
@@ -1575,6 +1589,11 @@ export async function createSessionManager(
 		): Promise<HeldStartupResolution | undefined> => {
 			const probed = await probe;
 			if (!probed) return undefined;
+			// A held transcript of the other scope is not this launch's session; offering to fork it
+			// would bypass the same-flag resume contract the open below enforces.
+			const sourceScope = SessionManager.inspectTranscriptScope(sourcePath);
+			if (!sourceScope || sourceScope.confined !== (parsed.confine === true))
+				throw new SessionNotFoundError(sessionArg);
 			const agentDir = activeSettings.getAgentDir();
 			const check = continueHere
 				? await checkSessionHandover(probed, agentDir, { onWaiting: held.waiting })
@@ -1613,6 +1632,7 @@ export async function createSessionManager(
 				migrationPolicy,
 				sessionMemoryMode,
 				ownership,
+				{ confined: parsed.confine === true },
 			);
 			held.forked(sessionHeldForkedNotice(refusal));
 			return { kind: "forked", manager: forked };
@@ -1634,9 +1654,22 @@ export async function createSessionManager(
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
 				: SessionManager.explicitDestination(path.dirname(sessionArg));
-			return await openAfterHandover(held, () =>
-				SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode, ownership),
-			);
+			return await openAfterHandover(held, async () => {
+				const opened = await SessionManager.open(
+					sessionArg,
+					destination,
+					undefined,
+					migrationPolicy,
+					sessionMemoryMode,
+					ownership,
+					parsed.confine === true ? "resume" : "none",
+				);
+				if (opened.isFilesystemConfined() !== (parsed.confine === true)) {
+					await opened.close();
+					throw new SessionNotFoundError(sessionArg);
+				}
+				return opened;
+			});
 		}
 		const match = await resolveResumableSession(
 			sessionArg,
@@ -1644,6 +1677,7 @@ export async function createSessionManager(
 			parsed.sessionDir,
 			undefined,
 			parsed.sessionDir ? undefined : activeSettings.getAgentDir(),
+			parsed.confine === true,
 		);
 		if (!match) {
 			throw new SessionNotFoundError(sessionArg);
@@ -1670,6 +1704,7 @@ export async function createSessionManager(
 					migrationPolicy,
 					sessionMemoryMode,
 					ownership,
+					{ confined: parsed.confine === true },
 				);
 			}
 			return await SessionManager.open(
@@ -1679,6 +1714,7 @@ export async function createSessionManager(
 				migrationPolicy,
 				sessionMemoryMode,
 				ownership,
+				parsed.confine === true ? "resume" : "none",
 			);
 		});
 	}
@@ -1694,18 +1730,25 @@ export async function createSessionManager(
 				migrationPolicy,
 				sessionMemoryMode,
 				ownership,
+				parsed.confine === true,
 			);
 		} catch (error) {
 			if (!(error instanceof SessionHeldError) || refuseWhenHeld) throw error;
 			startup.notice(heldContinueNotice(error));
-			return SessionManager.create(cwd, sessionDestination(), undefined, ownership);
+			return SessionManager.create(cwd, sessionDestination(), undefined, ownership, parsed.confine === true);
 		}
 	};
 	if (parsed.continue) return await continueOrStartFresh(!startup.interactive);
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, SessionManager.explicitDestination(parsed.sessionDir), undefined, ownership);
+		return SessionManager.create(
+			cwd,
+			SessionManager.explicitDestination(parsed.sessionDir),
+			undefined,
+			ownership,
+			parsed.confine === true,
+		);
 	}
 	// A lifecycle `/session_create` child must start a FRESH session that adopts
 	// the pre-allocated id (GJC_SESSION_ID), never auto-resume existing history in
@@ -1735,6 +1778,7 @@ export async function createSessionManager(
 		SessionManager.managedDestination(cwd, activeSettings.getAgentDir()),
 		undefined,
 		ownership,
+		parsed.confine === true,
 	);
 }
 
@@ -2339,15 +2383,17 @@ export async function runRootCommand(
 		const managedAgentDir = parsedArgs.sessionDir
 			? undefined
 			: (deps.resolveManagedAgentDirForScope ?? resolveManagedAgentDirForScope)(resumeCwd);
-		const sessions = parsedArgs.sessionDir
-			? await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
-					resumeCwd,
-					parsedArgs.sessionDir,
-				)
-			: await (deps.listManagedForResumePickerReadOnly ?? SessionManager.listManagedForResumePickerReadOnly)(
-					resumeCwd,
-					managedAgentDir,
-				);
+		const sessions = (
+			parsedArgs.sessionDir
+				? await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
+						resumeCwd,
+						parsedArgs.sessionDir,
+					)
+				: await (deps.listManagedForResumePickerReadOnly ?? SessionManager.listManagedForResumePickerReadOnly)(
+						resumeCwd,
+						managedAgentDir,
+					)
+		).filter(session => sessionMatchesConfinement(session, parsedArgs.confine === true));
 		if (sessions.length === 0) {
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;

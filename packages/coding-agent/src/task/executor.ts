@@ -74,6 +74,7 @@ import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import { mergeReportMetric, type ReportMetricDetails } from "../tools/report-metric";
 import type { ReportFindingDetails } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
+import { directoryEscapesWorkspace } from "../tools/workspace-confine";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
@@ -314,6 +315,7 @@ export function resolveChildBashRestriction(input: {
 export interface ExecutorOptions {
 	cwd: string;
 	worktree?: string;
+	parentFilesystemRoot?: string;
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
@@ -465,7 +467,11 @@ export class ManagedTaskPersistence {
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
-	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
+	async openSession(
+		cwd: string,
+		sessionMemoryMode: SessionMemoryMode = "shadow",
+		filesystemScope?: "cwd",
+	): Promise<SessionManager> {
 		const artifacts = this.#getArtifacts();
 		const store = artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
@@ -478,6 +484,7 @@ export class ManagedTaskPersistence {
 			undefined,
 			cwd,
 			sessionMemoryMode,
+			filesystemScope,
 		);
 		artifacts.assertManagedBinding();
 		session.registerManagedTranscriptRelocationResolver(this.#getArtifacts);
@@ -2046,6 +2053,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 								options.managedPersistence.openSession(
 									worktree ?? cwd,
 									subagentSettings.get("sessionMemory.mode"),
+									options.parentFilesystemRoot ? "cwd" : undefined,
 								),
 							)
 						: sessionFile
@@ -2060,10 +2068,23 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 										subagentSettings.get("sessionMemory.mode"),
 										// Subagent children claim nothing yet (single-owner design §13 L2).
 										"exempt",
+										options.parentFilesystemRoot ? "create" : "none",
 									),
 								)
-							: SessionManager.inMemory(worktree ?? cwd);
+							: options.parentFilesystemRoot
+								? SessionManager.create(worktree ?? cwd, undefined, undefined, "exempt", true)
+								: SessionManager.inMemory(worktree ?? cwd);
 			openedSessionManager = sessionManager;
+			if (options.parentFilesystemRoot) {
+				const childCwd = worktree ?? cwd;
+				if (await directoryEscapesWorkspace(options.parentFilesystemRoot, childCwd)) {
+					throw new Error(`Task worktree escapes the confined session root (${options.parentFilesystemRoot}).`);
+				}
+				// Managed and explicit opens already carry the scope; only an unpublished
+				// in-memory or staged manager still needs it, and confineToCwd() rejects a
+				// published unconfined transcript.
+				if (!sessionManager.isFilesystemConfined()) sessionManager.confineToCwd();
+			}
 			if (options.parentArtifactManager && !options.preflightProbe && !options.preflightDurable) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			} else if (options.preflightDurable && !options.managedPersistence) {

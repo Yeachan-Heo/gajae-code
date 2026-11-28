@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,6 +7,88 @@ import { isEnoent } from "@gajae-code/utils/fs-error";
 import { InternalUrlRouter } from "../internal-urls";
 import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
+import type { WorkspaceConfinement } from "./workspace-confine";
+
+/**
+ * The confinement of the session whose tool call is running, if any.
+ *
+ * AgentSession wraps each tool execution of a confined session in
+ * {@link runWithWorkspaceConfine}, so tool code does not thread the instance
+ * through every signature. Outside that scope (ordinary sessions) the helpers
+ * below fall through to plain filesystem calls.
+ */
+const activeConfinement = new AsyncLocalStorage<WorkspaceConfinement>();
+
+/** Run `fn` with `confinement` as the active boundary for every helper below. */
+export function runWithWorkspaceConfine<T>(confinement: WorkspaceConfinement, fn: () => T): T {
+	return activeConfinement.run(confinement, fn);
+}
+
+/** The active session boundary, or `undefined` for an ordinary session. */
+export function getActiveWorkspaceConfinement(): WorkspaceConfinement | undefined {
+	return activeConfinement.getStore();
+}
+
+function assertInsideActiveWorkspace(resolved: string, original: string): void {
+	const confinement = activeConfinement.getStore();
+	if (!confinement?.escapes(resolved)) return;
+	throw new ToolError(
+		`Path escapes the confined session root (${confinement.root}): ${original}. This session can only use its cwd and descendants.`,
+	);
+}
+
+/** Reject a lexically admitted path whose real target leaves the confined root. */
+export async function assertRealpathInsideActiveWorkspace(resolved: string): Promise<void> {
+	const confinement = activeConfinement.getStore();
+	if (!confinement || !(await confinement.realpathEscapes(resolved))) return;
+	throw new ToolError(
+		`Path resolves outside the confined session root (${confinement.root}): ${resolved}. This session can only use its cwd and descendants.`,
+	);
+}
+
+/** Read a file as text; confined sessions read through the pinned walk. */
+export async function readFileTextInsideActiveWorkspace(absolutePath: string): Promise<string> {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) return Bun.file(absolutePath).text();
+	return (await confinement.readFile(absolutePath)).toString("utf8");
+}
+
+/** Read a file's bytes; confined sessions read through the pinned walk. */
+export async function readFileBytesInsideActiveWorkspace(absolutePath: string): Promise<Uint8Array> {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) return fs.promises.readFile(absolutePath);
+	return confinement.readFile(absolutePath);
+}
+
+/** Replace a file; confined sessions publish atomically through the pinned walk. */
+export async function writeFileTextInsideActiveWorkspace(absolutePath: string, content: string): Promise<void> {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) {
+		await Bun.write(absolutePath, content);
+		return;
+	}
+	await confinement.writeFile(absolutePath, content);
+}
+
+/** Remove a file; confined sessions unlink through the pinned walk. */
+export async function unlinkInsideActiveWorkspace(absolutePath: string): Promise<void> {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) {
+		await fs.promises.unlink(absolutePath);
+		return;
+	}
+	await confinement.unlink(absolutePath);
+}
+
+/** Create a directory tree; confined sessions create it through the pinned walk. */
+export async function mkdirInsideActiveWorkspace(absolutePath: string): Promise<void> {
+	const confinement = activeConfinement.getStore();
+	if (!confinement) {
+		await fs.promises.mkdir(absolutePath, { recursive: true });
+		return;
+	}
+	await confinement.mkdir(absolutePath);
+}
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
@@ -308,10 +391,9 @@ export function resolveToCwd(filePath: string, cwd: string): string {
 	if (/^\/+$/.test(expanded)) {
 		return cwd;
 	}
-	if (path.isAbsolute(expanded)) {
-		return expanded;
-	}
-	return path.resolve(cwd, expanded);
+	const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+	if (!isInternalUrlPath(filePath)) assertInsideActiveWorkspace(resolved, filePath);
+	return resolved;
 }
 
 export function formatPathRelativeToCwd(
@@ -826,6 +908,12 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		throw new ToolError(`Path not found: ${scopePath}${hint}`);
 	}
 
+	const confinedTargets = [
+		searchPath,
+		...(exactFilePaths ?? []),
+		...(multiTargets?.map(target => target.basePath) ?? []),
+	];
+	for (const target of confinedTargets) await assertRealpathInsideActiveWorkspace(target);
 	return {
 		searchPath,
 		scopePath,

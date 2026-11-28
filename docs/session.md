@@ -578,6 +578,19 @@ Defined in `session-manager.ts`:
 
 Metadata extraction reads only a prefix (`readTextPrefix(..., 4096)`) where possible.
 
+## Confined Sessions (`--confine`)
+
+`gjc --confine` writes `filesystemScope: "cwd"` into the session header. Ordinary `--continue`, `--resume`, and the resume picker skip that transcript, and `--confine` resume skips ordinary ones. `--continue` reads each candidate's scope from its header prefix before opening it, so an opposite-scope transcript that is too large to open never blocks an older matching one. A missing path resumed with `--confine` is rejected instead of creating an ordinary transcript. Task children open their transcripts with `SessionManager.open(..., "create")`: a missing child transcript is created confined, and an existing unconfined one is rejected.
+
+In a confined session:
+
+- `read`, `write`, `edit`, and `search`/`find` reject a path whose real target is outside the session root.
+- File reads, writes, and patch deletes/directory creation go through `WorkspaceConfinement` (`src/tools/workspace-confine.ts`), one instance per session root, which calls descriptor-pinned native helpers (`confinedOpenRead`, `confinedWriteFileAtomic`, `confinedUnlink`, `confinedMkdirAll`). The root's directory identity (device and inode) is pinned on first use; each helper opens the root, rejects a descriptor whose identity no longer matches, and walks every component with `openat(..., O_NOFOLLOW)`, so a parent swapped for a symlink after the path check fails the operation instead of redirecting it. Writes stage a sibling temp through the pinned parent and publish with `renameat`.
+- The shell runs under macOS `sandbox-exec` rooted at the session directory. The shell snapshot is not created or loaded for a confined command, because it sources the user's rc file in a separate, unsandboxed shell. Other platforms fail closed.
+- Search and find walkers, browser, and debugger targets are path-checked before use; they are not descriptor-pinned.
+
+The boundary does not close the network and is not a virtual machine.
+
 ## Read-only `/btw` and the provider cache prefix
 
 `/btw` is a side question that never changes the main conversation history, running tools, or provider state. Tool calls the model returns alongside its text are never executed. Closing the panel cancels the side request and releases the retained snapshot. Cancelling the main request and cancelling the side request are independent.
