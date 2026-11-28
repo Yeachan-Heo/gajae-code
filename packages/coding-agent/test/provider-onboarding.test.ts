@@ -552,6 +552,38 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("requesty-ai")?.id).toBe("requesty");
 	});
 
+	it("adds LLMTR with automatic discovery", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "llmtr", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.llmtr;
+
+		expect(result.providerId).toBe("llmtr");
+		expect(result.presetName).toBe("LLMTR");
+		expect(provider).toMatchObject({
+			baseUrl: "https://llmtr.com/v1",
+			api: "openai-completions",
+			apiKeyEnv: "LLMTR_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(findProviderPreset("llmtr-com")?.id).toBe("llmtr");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
