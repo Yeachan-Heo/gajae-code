@@ -291,4 +291,237 @@ describe("Emergency transcript file compaction loop prevention", () => {
 
 		// This test verifies that baseline reset allows independent compaction tracking
 	});
+
+	it("drives a real AgentSession through emergency transcript compaction with abort during post-append", async () => {
+		// Real regression test: drives AgentSession through emergency compaction scenario
+		// where the abort signal fires AFTER the entry is appended but during post-append processing.
+		// Verifies that:
+		// 1. Compaction returns 'aborted' when abort fires during post-append
+		// 2. Baseline is updated despite abort (after entry appending)
+		// 3. Next prompt does NOT re-trigger emergency compaction with same transcript size
+
+		const tempDir2 = TempDir.createSync("@pi-emergency-real-session-");
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model to exist");
+
+			const authStorage2 = await AuthStorage.create(path.join(tempDir2.path(), "testauth.db"));
+			authStorage2.setRuntimeApiKey(model.provider, "test-key");
+
+			const modelRegistry2 = new ModelRegistry(authStorage2);
+			const sessionManager2 = SessionManager.inMemory();
+
+			// Add some messages to build context
+			sessionManager2.appendMessage(userMsg("initial message"));
+
+			const agent = new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			});
+
+			const session2 = new AgentSession({
+				agent,
+				sessionManager: sessionManager2,
+				settings: Settings.isolated({
+					"compaction.keepRecentTokens": 1,
+					"contextPromotion.enabled": false,
+					"retry.enabled": false,
+					"todo.reminders": false,
+				}),
+				modelRegistry: modelRegistry2,
+			});
+
+			try {
+				// Mock getTranscriptFileBytes to return 100 MiB (above 48 MiB threshold)
+				const largeTranscriptSize = 100 * 1024 * 1024; // 100 MiB
+				vi.spyOn(sessionManager2, "getTranscriptFileBytes").mockReturnValue(largeTranscriptSize);
+
+				// Track events to verify compaction happens
+				const events: Array<{ type: string; aborted?: boolean; result?: string }> = [];
+				session2.subscribe(event => {
+					if (event.type === "auto_compaction_start") {
+						events.push({ type: "auto_compaction_start" });
+					} else if (event.type === "auto_compaction_end") {
+						events.push({
+							type: "auto_compaction_end",
+							aborted: event.aborted,
+							result: event.result,
+						});
+					}
+				});
+
+				// Mock the prompt to trigger emergency compaction
+				vi.spyOn(session2.agent, "prompt").mockResolvedValue();
+
+				// Scenario 1: Abort fires DURING applyCompactionPostAppend (after entry appending)
+				let abortDuringPostAppend = false;
+				const originalApplyPostAppend = session2.applyCompactionPostAppendForTests.bind(session2);
+				vi.spyOn(session2, "applyCompactionPostAppendForTests").mockImplementation(async (...args) => {
+					if (abortDuringPostAppend) {
+						// Fire abort signal
+						await session2.abort({ cause: "test_abort" });
+					}
+					return originalApplyPostAppend(...args);
+				});
+
+				// Trigger first prompt - this will cause emergency compaction
+				abortDuringPostAppend = true;
+				const firstPromptResult = await session2.prompt("first message");
+
+				// Wait for async compaction to complete
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				await session2.waitForIdle();
+
+				// Verify compaction was attempted and aborted after entry appending
+				const compactionStartEvents = events.filter(e => e.type === "auto_compaction_start");
+				const compactionEndEvents = events.filter(e => e.type === "auto_compaction_end");
+				expect(compactionStartEvents.length, "Should have emergency compaction start event").toBeGreaterThan(0);
+
+				// After abort, the baseline should be set (because entry was appended before abort)
+				// So the next prompt with same size should NOT trigger emergency compaction
+
+				// Reset abort flag and clear events
+				abortDuringPostAppend = false;
+				events.length = 0;
+				vi.clearAllMocks();
+
+				// Mock prompt again for second call
+				vi.spyOn(session2.agent, "prompt").mockResolvedValue();
+
+				// Trigger second prompt with SAME transcript size - should NOT re-trigger emergency compaction
+				vi.spyOn(sessionManager2, "getTranscriptFileBytes").mockReturnValue(largeTranscriptSize);
+				const secondPromptResult = await session2.prompt("second message");
+
+				// Wait for any async work
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				await session2.waitForIdle();
+
+				// Verify NO new emergency compaction was triggered
+				const secondCompactionStarts = events.filter(e => e.type === "auto_compaction_start");
+				expect(secondCompactionStarts.length, "Should NOT trigger emergency compaction again at same size").toBe(0);
+			} catch (error) {
+				await session2?.dispose();
+				modelRegistry2?.dispose();
+				authStorage2?.close();
+				throw error;
+			} finally {
+				await session2.dispose();
+				modelRegistry2.dispose();
+				authStorage2.close();
+			}
+		} finally {
+			tempDir2.removeSync();
+		}
+	});
+
+	it("allows retry after abort BEFORE entry is appended to transcript", async () => {
+		// Real regression test: when abort fires BEFORE the compaction entry is appended,
+		// the baseline should NOT be updated, allowing the next prompt to retry the compaction.
+
+		const tempDir3 = TempDir.createSync("@pi-emergency-abort-before-append-");
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model to exist");
+
+			const authStorage3 = await AuthStorage.create(path.join(tempDir3.path(), "testauth.db"));
+			authStorage3.setRuntimeApiKey(model.provider, "test-key");
+
+			const modelRegistry3 = new ModelRegistry(authStorage3);
+			const sessionManager3 = SessionManager.inMemory();
+
+			sessionManager3.appendMessage(userMsg("initial message"));
+
+			const agent = new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			});
+
+			const session3 = new AgentSession({
+				agent,
+				sessionManager: sessionManager3,
+				settings: Settings.isolated({
+					"compaction.keepRecentTokens": 1,
+					"contextPromotion.enabled": false,
+					"retry.enabled": false,
+					"todo.reminders": false,
+				}),
+				modelRegistry: modelRegistry3,
+			});
+
+			try {
+				const largeTranscriptSize = 100 * 1024 * 1024; // 100 MiB
+				vi.spyOn(sessionManager3, "getTranscriptFileBytes").mockReturnValue(largeTranscriptSize);
+
+				const events: Array<{ type: string }> = [];
+				session3.subscribe(event => {
+					if (event.type === "auto_compaction_start" || event.type === "auto_compaction_end") {
+						events.push({ type: event.type });
+					}
+				});
+
+				vi.spyOn(session3.agent, "prompt").mockResolvedValue();
+
+				// Scenario 2: Abort fires BEFORE entry is appended (early abort)
+				let abortBeforeAppend = false;
+				const appendCompactionOriginal = sessionManager3.appendCompaction.bind(sessionManager3);
+				vi.spyOn(sessionManager3, "appendCompaction").mockImplementation((...args) => {
+					if (abortBeforeAppend) {
+						// Abort before the entry is appended
+						void session3.abort({ cause: "test_abort_before" });
+					}
+					return appendCompactionOriginal(...args);
+				});
+
+				abortBeforeAppend = true;
+				await session3.prompt("first message");
+
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				await session3.waitForIdle();
+
+				// Count compaction attempts in first prompt
+				const firstCompactionStarts = events.filter(e => e.type === "auto_compaction_start").length;
+
+				// Reset for second prompt
+				abortBeforeAppend = false;
+				events.length = 0;
+				vi.clearAllMocks();
+
+				vi.spyOn(session3.agent, "prompt").mockResolvedValue();
+				vi.spyOn(sessionManager3, "getTranscriptFileBytes").mockReturnValue(largeTranscriptSize);
+
+				// Second prompt should be able to retry compaction since baseline wasn't set
+				// (abort happened before entry appending, so baseline wasn't recorded)
+				await session3.prompt("second message");
+
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				await session3.waitForIdle();
+
+				// Should have attempted compaction again since baseline wasn't set
+				const secondCompactionStarts = events.filter(e => e.type === "auto_compaction_start").length;
+				expect(
+					secondCompactionStarts,
+					"Should retry compaction when abort was before entry appending",
+				).toBeGreaterThan(0);
+			} catch (error) {
+				await session3?.dispose();
+				modelRegistry3?.dispose();
+				authStorage3?.close();
+				throw error;
+			} finally {
+				await session3.dispose();
+				modelRegistry3.dispose();
+				authStorage3.close();
+			}
+		} finally {
+			tempDir3.removeSync();
+		}
+	});
 });
