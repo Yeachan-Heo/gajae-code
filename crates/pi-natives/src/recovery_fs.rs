@@ -4305,9 +4305,23 @@ thread_local! {
 	static BEFORE_MANAGED_REPLACE_EXCHANGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
-/// How many times `lock_managed_transcript` found the lock held (tests only).
+/// Every time `lock_managed_transcript` found the lock held, the `(dev, ino)`
+/// of the transcript it waited for (tests only), so a test counts contention on
+/// its own file and not on another test's.
 #[cfg(all(test, target_os = "linux"))]
-static MANAGED_TRANSCRIPT_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+static MANAGED_TRANSCRIPT_LOCK_CONTENDED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// How often `lock_managed_transcript` found the lock held on `file`'s inode.
+#[cfg(all(test, target_os = "linux"))]
+fn managed_transcript_lock_contention(file: &std::path::Path) -> usize {
+	let metadata = std::fs::metadata(file).expect("contended transcript metadata");
+	let key = (metadata.dev(), metadata.ino());
+	MANAGED_TRANSCRIPT_LOCK_CONTENDED
+		.lock()
+		.iter()
+		.filter(|entry| **entry == key)
+		.count()
+}
 
 /// How long a managed append or rewrite waits for another writer's hold on the
 /// same transcript. It runs on the JS thread inside a synchronous call, so it
@@ -4323,10 +4337,11 @@ const MANAGED_TRANSCRIPT_LOCK_BUDGET: Duration = Duration::from_secs(2);
 /// `transcript_busy`, which is not an identity mismatch.
 ///
 /// A filesystem without usable `flock` keeps the unserialized behaviour:
-/// `ENOLCK`, `EOPNOTSUPP`, `ENOSYS`, and `EBADF`, which NFS returns for a
-/// read-only descriptor. NFS emulates `flock` with byte-range locks, which any
-/// close of any descriptor on the file releases, so it is not a dependable
-/// fence there in any case.
+/// `ENOLCK`, `EOPNOTSUPP`, `ENOSYS`, and `EBADF`. On NFS the fence is not
+/// dependable: the rewrite takes no lock (its descriptor is read-only, which
+/// NFS refuses with `EBADF`), and the append's emulated byte-range lock is
+/// dropped as soon as the identity hash dups and closes a descriptor on the
+/// file.
 #[cfg(target_os = "linux")]
 fn lock_managed_transcript(file: &File) -> Result<(), &'static str> {
 	let deadline = Instant::now() + MANAGED_TRANSCRIPT_LOCK_BUDGET;
@@ -4339,7 +4354,11 @@ fn lock_managed_transcript(file: &File) -> Result<(), &'static str> {
 			Some(libc::EINTR) => {},
 			Some(libc::EWOULDBLOCK) => {
 				#[cfg(test)]
-				MANAGED_TRANSCRIPT_LOCK_CONTENDED.fetch_add(1, Ordering::SeqCst);
+				if let Ok(metadata) = file.metadata() {
+					MANAGED_TRANSCRIPT_LOCK_CONTENDED
+						.lock()
+						.push((metadata.dev(), metadata.ino()));
+				}
 				if Instant::now() >= deadline {
 					return Err("transcript_busy");
 				}
@@ -4461,9 +4480,8 @@ fn replace_managed(
 		)? {
 			return Err("identity_mismatch");
 		}
-		// Another writer may have swapped the name since `authorized` was opened. A
-		// stat, not an open: on NFS, closing any descriptor on the file would drop
-		// the emulated lock.
+		// Another writer may have swapped the name since `authorized` was opened.
+		// (On NFS this fence is not dependable at all; see `lock_managed_transcript`.)
 		let named = statat(&destination_parent, &destination_name)?;
 		if named.st_dev.to_string() != expected_dev || named.st_ino.to_string() != expected_ino {
 			return Err("identity_mismatch");
@@ -6819,18 +6837,15 @@ mod tests {
 		assert_eq!(replaced.err(), Some("transcript_busy"));
 		assert!(started.elapsed() < MANAGED_TRANSCRIPT_LOCK_BUDGET * 2 + Duration::from_secs(2));
 		assert_eq!(fs::read(temporary.0.join("transcript")).expect("transcript"), original);
-		let leftovers = fs::read_dir(temporary.0.join(".gjc-recovery")).map_or(0, |entries| {
-			entries
-				.filter_map(Result::ok)
-				.filter(|entry| {
-					entry
-						.file_name()
-						.to_string_lossy()
-						.starts_with(".gjc-managed-replace")
-				})
-				.count()
-		});
-		assert_eq!(leftovers, 0, "a refused rewrite leaves no candidate behind");
+		// The rewrite built its candidate in the recovery directory before it found
+		// the transcript held, so the directory exists, and the candidate is gone.
+		let leftovers: Vec<String> = fs::read_dir(temporary.0.join(".gjc-recovery"))
+			.expect("the rewrite created its recovery directory")
+			.filter_map(Result::ok)
+			.map(|entry| entry.file_name().to_string_lossy().into_owned())
+			.filter(|name| name.starts_with(".gjc-managed-replace"))
+			.collect();
+		assert_eq!(leftovers, Vec::<String>::new(), "a refused rewrite leaves no candidate behind");
 	}
 
 	/// Two unclaimed writers of one managed transcript: an append that races a
@@ -6853,8 +6868,12 @@ mod tests {
 		let contention: std::rc::Rc<RefCell<Option<bool>>> = std::rc::Rc::default();
 		let reached = std::rc::Rc::clone(&contention);
 		let append_identity = identity.clone();
+		let transcript = temporary.0.join("transcript");
 		BEFORE_MANAGED_REPLACE_EXCHANGE.with(|hook| {
 			*hook.borrow_mut() = Some(Box::new(move || {
+				// Counted on this transcript's inode only, so another test's contention
+				// (the busy test waits on its own file for seconds) cannot satisfy it.
+				let contended = managed_transcript_lock_contention(&transcript);
 				let thread = std::thread::spawn(move || {
 					let peer_root = File::open(&directory).expect("peer root");
 					append_managed(
@@ -6871,16 +6890,15 @@ mod tests {
 				});
 				// The append must find the lock held before the swap runs. Unserialized,
 				// it would complete here instead, and the wait times out.
-				let contended = MANAGED_TRANSCRIPT_LOCK_CONTENDED.load(Ordering::SeqCst);
 				let deadline = Instant::now() + Duration::from_secs(10);
-				while MANAGED_TRANSCRIPT_LOCK_CONTENDED.load(Ordering::SeqCst) == contended
+				while managed_transcript_lock_contention(&transcript) == contended
 					&& !thread.is_finished()
 					&& Instant::now() < deadline
 				{
 					std::thread::sleep(Duration::from_millis(1));
 				}
 				*reached.borrow_mut() =
-					Some(MANAGED_TRANSCRIPT_LOCK_CONTENDED.load(Ordering::SeqCst) > contended);
+					Some(managed_transcript_lock_contention(&transcript) > contended);
 				*handle.borrow_mut() = Some(thread);
 			}));
 		});
