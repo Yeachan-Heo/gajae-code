@@ -1,17 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { managedSessionTransactionLocksDirectory } from "../src/session/internal/managed-session-scope";
 import { ManagedLockTestHooks } from "../src/session/internal/managed-session-storage";
 import {
 	ManagedSessionReleaseError,
 	managedSessionTransactionLockName,
+	withManagedSessionTransaction,
 } from "../src/session/internal/managed-session-transaction";
-import {
-	type SessionDestination,
-	SessionManager,
-	SessionManagerTestHooks,
-	type SharedAppendOutcome,
-} from "../src/session/session-manager";
+import { type SessionDestination, SessionManager, SessionManagerTestHooks } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -136,89 +133,55 @@ describe("concurrent managed opens", () => {
 		expect(await Bun.file(file).text()).toBe(bytes);
 	});
 
-	it("excludes a peer publication during async hydration, then preserves both local branches and the original bytes", async () => {
+	it("holds the session transaction through async hydration", async () => {
 		const { seed, destination, parent, file, bytes } = await fixture();
 		const entered = Promise.withResolvers<void>();
 		const resume = Promise.withResolvers<void>();
-		let hydrations = 0;
 		SessionManagerTestHooks.beforeExistingSessionHydration = async candidate => {
-			if (candidate !== file || ++hydrations !== 2) return;
-			// The second open has captured its strict identity and entries, but has
-			// not completed async blob hydration or the terminal identity check.
+			if (candidate !== file) return;
+			// The open has captured its strict identity and entries, but has not completed
+			// async blob hydration or the terminal identity check.
 			entered.resolve();
 			await resume.promise;
 		};
 		const lockName = `${managedSessionTransactionLockName(seed.getSessionId())}.lock`;
-
-		// Start BOTH opens before awaiting either. No staggered-open workaround.
-		const first = open(file, destination).then(
-			manager => ({ manager, index: 0 }),
-			error => ({ error, index: 0 }),
+		const opening = open(file, destination).then(
+			manager => ({ manager }),
+			error => ({ error }),
 		);
-		const second = open(file, destination).then(
-			manager => ({ manager, index: 1 }),
-			error => ({ error, index: 1 }),
-		);
-		// Attach a rejection handler immediately; the unfixed implementation fails
-		// the second acceptance after the peer publishes during this pause.
-		let paused = second;
-		let publication: Promise<SharedAppendOutcome> | undefined;
+		let transaction: Promise<string> | undefined;
 		try {
-			const completed = await Promise.race([first, second]);
-			if ("error" in completed) throw completed.error;
-			const a = completed.manager;
-			paused = completed.index === 0 ? second : first;
 			await Promise.race([
 				entered.promise,
-				paused.then(() => {
+				opening.then(() => {
 					throw new Error("Open settled before hydration barrier");
 				}),
 			]);
-			// Ignore contention from the second OPEN; observe the append specifically.
-			const appendContended = Promise.withResolvers<"contended">();
+			const contended = Promise.withResolvers<"contended">();
 			ManagedLockTestHooks.beforeContentionWait = candidate => {
-				if (path.basename(candidate) === lockName) appendContended.resolve("contended");
+				if (path.basename(candidate) === lockName) contended.resolve("contended");
 			};
-			publication = a.appendMessageSharingSession(user("branch A", 2));
-			const ordering = await Promise.race([appendContended.promise, publication.then(() => "published" as const)]);
-			// Release on either path, so the unfixed code reports its identity failure
-			// rather than merely hanging. There are no elapsed-time ordering guesses.
+			transaction = withManagedSessionTransaction(
+				{
+					locksDirectory: managedSessionTransactionLocksDirectory(path.dirname(file)),
+					sessionId: seed.getSessionId(),
+				},
+				async () => "acquired",
+			);
+			const ordering = await Promise.race([contended.promise, transaction]);
+			// Release on either path, so a regression reports its ordering rather than hanging.
 			resume.resolve();
-			const opened = await paused;
+			const opened = await opening;
 			if ("error" in opened) throw opened.error;
-			const b = opened.manager;
 			expect(ordering).toBe("contended");
-			expect(a.getSessionId()).toBe(seed.getSessionId());
-			expect(b.getSessionId()).toBe(seed.getSessionId());
-			expect(b.getLeafId()).toBe(parent);
-			const aResult = await publication;
-			expect(aResult.kind).toBe("committed");
-			if (aResult.kind !== "committed") throw new Error("A did not commit");
-			// Finalization is a separate short transaction, not nested in open. A
-			// stale opener must not overwrite the committed peer's branch.
-			const afterA = await Bun.file(file).text();
-			expect(await b.finalizeWritableOpen()).toBe("stale");
-			expect(await Bun.file(file).text()).toBe(afterA);
-			const bResult = await b.appendMessageSharingSession(user("branch B", 3));
-			expect(bResult.kind).toBe("committed");
-			if (bResult.kind !== "committed") throw new Error("B did not commit");
-			const committed = await Bun.file(file).text();
-			expect(committed.startsWith(afterA)).toBe(true);
-			expect(afterA.startsWith(bytes)).toBe(true);
-			const records = Bun.JSONL.parse(committed) as Array<{ type: string; id: string; parentId?: string }>;
-			expect(records.filter(record => record.type === "session")).toHaveLength(1);
-			expect(records.filter(record => record.id === aResult.id)).toHaveLength(1);
-			expect(records.filter(record => record.id === bResult.id)).toHaveLength(1);
-			expect(records.find(record => record.id === aResult.id)?.parentId).toBe(parent);
-			expect(records.find(record => record.id === bResult.id)?.parentId).toBe(parent);
-			expect(a.getLeafId()).toBe(aResult.id);
-			expect(b.getLeafId()).toBe(bResult.id);
-			expect(await b.finalizeWritableOpen()).toBe("unchanged");
-			expect(await Bun.file(file).text()).toBe(committed);
+			expect(opened.manager.getSessionId()).toBe(seed.getSessionId());
+			expect(opened.manager.getLeafId()).toBe(parent);
+			expect(await transaction).toBe("acquired");
+			expect(await Bun.file(file).text()).toBe(bytes);
 		} finally {
 			resume.resolve();
-			await Promise.all([first, second]);
-			await publication;
+			await opening;
+			await transaction;
 		}
 	});
 

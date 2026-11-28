@@ -2,12 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { BlobStore } from "../src/session/blob-store";
-import {
-	SessionManager,
-	SessionManagerTestHooks,
-	SharedSessionMutationUnsupportedError,
-} from "../src/session/session-manager";
+import { SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const managers: SessionManager[] = [];
@@ -39,7 +34,6 @@ const replayMessage = (): AssistantMessage => ({
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	SessionManagerTestHooks.beforeEntryResidentPreparation = undefined;
 	for (const manager of managers.splice(0)) await manager.closeStrict().catch(() => undefined);
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
@@ -67,90 +61,7 @@ async function seeded(withReplay = true) {
 	return { a, destination, file: a.getSessionFile()!, root, custom, assistant, kept, compaction };
 }
 
-async function shared() {
-	const fixture = await seeded(false);
-	const { a, file, destination } = fixture;
-	const b = await SessionManager.open(file, destination);
-	managers.push(b);
-	// Keep stale replay metadata in A without giving B open-sanitation rewrite debt.
-	a.appendMessage(replayMessage());
-	await a.flush();
-	const sibling = await b.appendMessageSharingSession(user("unseen sibling"));
-	if (sibling.kind !== "committed") throw new Error(sibling.kind);
-	const own = await a.appendMessageSharingSession(user("own sibling"));
-	if (own.kind !== "committed") throw new Error(own.kind);
-	expect(a.getEntries().some(entry => entry.id === sibling.id)).toBe(false);
-	return { ...fixture, sibling: sibling.id, own: own.id };
-}
-
-function resident(manager: SessionManager) {
-	return structuredClone({
-		revisions: manager.revisionSnapshot(),
-		header: manager.getHeader(),
-		name: manager.getSessionName(),
-		starred: manager.isSessionStarred(),
-		leaf: manager.getLeafId(),
-		entries: manager.getEntries(),
-	});
-}
-
 describe("early direct shared mutation admission", () => {
-	it("refuses each direct mutation before resident, cursor, header, blob, or disk effects", async () => {
-		const { a, destination, file, root, custom, assistant, kept, compaction, sibling, own } = await shared();
-		const message = a.getEntries().find(entry => entry.id === root);
-		const customMessage = a.getEntries().find(entry => entry.id === custom);
-		if (message?.type !== "message" || customMessage?.type !== "custom_message") throw new Error("missing seeds");
-		const [candidate] = await a.listForResumePickerReadOnly();
-		if (!candidate || candidate.path !== file) throw new Error("missing picker candidate");
-		const before = resident(a);
-		const bytes = await fs.readFile(file);
-		const put = vi.spyOn(BlobStore.prototype, "putImmutableSync");
-		const prepare = vi.fn(() => {
-			throw new Error("resident preparation entered");
-		});
-		SessionManagerTestHooks.beforeEntryResidentPreparation = prepare;
-		const applied = vi.fn(() => {});
-		expect(root).not.toBe(own);
-		const mutations: Array<() => unknown> = [
-			() => a.setSessionName("forbidden title", "user", { onApplied: applied }),
-			() => a.setSessionStarred(true),
-			() => a.setSessionStarredForPicker(candidate, true),
-			() => a.applyEntryMessageUpdates([{ ...message, message: user("new payload ".repeat(100_000)) }]),
-			() => a.applyCustomMessageEntryUpdates([{ ...customMessage, content: "changed", details: { value: 2 } }]),
-			() => a.evictCompactedContent(kept, compaction),
-			() => a.branchWithSummary(root, "forbidden summary"),
-		];
-		for (const mutate of mutations) {
-			await expect(Promise.resolve().then(mutate)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-			expect(resident(a)).toEqual(before);
-			expect(await fs.readFile(file)).toEqual(bytes);
-			expect(put).not.toHaveBeenCalled();
-			expect(prepare).not.toHaveBeenCalled();
-			expect(applied).not.toHaveBeenCalled();
-		}
-		// In-memory sanitization of replay metadata should work on shared sessions without requiring admission
-		// (it doesn't persist changes). The sanitization succeeds and updates memory, but file bytes remain unchanged
-		const sanitized = a.sanitizeLoadedOpenAIResponsesReplayMetadata();
-		expect(sanitized).toBe(true);
-		const afterSanitize = a.getEntries().find(e => e.id === assistant);
-		if (afterSanitize?.type !== "message" || afterSanitize.message.role !== "assistant")
-			throw new Error("missing assistant");
-		expect(afterSanitize.message.providerPayload).toBeUndefined();
-		expect(await fs.readFile(file)).toEqual(bytes);
-		put.mockRestore();
-		SessionManagerTestHooks.beforeEntryResidentPreparation = undefined;
-		// Navigation is local, not a transcript mutation.
-		a.branch(root);
-		expect(a.getLeafId()).toBe(root);
-		a.resetLeaf();
-		expect(a.getLeafId()).toBeNull();
-		expect(await fs.readFile(file)).toEqual(bytes);
-		const reopened = await SessionManager.open(file, destination);
-		managers.push(reopened);
-		expect(reopened.getEntries().some(entry => entry.id === sibling)).toBe(true);
-		expect(await fs.readFile(file)).toEqual(bytes);
-	});
-
 	it("keeps ordinary metadata, payload, eviction, sanitation, and summary mutations working", async () => {
 		const { a, file, destination, root, custom, assistant, kept, compaction } = await seeded();
 		expect(await a.setSessionName("ordinary title", "user")).toBe(true);

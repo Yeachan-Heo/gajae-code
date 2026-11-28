@@ -604,7 +604,6 @@ import type {
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
-	SharedEntriesAppendOutcome,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -640,8 +639,8 @@ import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectCont
 import { TerminalIdleAdmissionError, YieldQueue } from "./yield-queue";
 
 /**
- * Message shapes this session persists through the manager. `appendMessageSharingSession` and
- * `appendMessage` accept the same set including hook messages, which this session never writes.
+ * Message shapes this session persists through the manager. `appendMessage` also accepts hook
+ * messages, which this session never writes.
  */
 type SessionPersistedMessage =
 	| Message
@@ -872,22 +871,22 @@ const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 /**
  * A session control was refused before any effect (#7823, #7824).
  *
- * Since single-owner step 10c the only thrower is the control fence: a control whose
- * session manager was replaced while it awaited is refused as `rejected`
- * (`publication_mode_changed`). The other codes go with the shared layer in 10d/10e.
+ * The only thrower is the control fence: a control whose session manager was replaced
+ * while it awaited is refused as `rejected` (`publication_mode_changed`).
  */
 export class SharedControlPublicationError extends Error {
-	readonly code: "rejected" | "stale" | "unknown" | "committed_not_applied";
+	readonly code = "rejected" as const;
 
 	constructor(
 		readonly operation: string,
-		readonly outcome: SharedEntriesAppendOutcome,
+		readonly outcome: { readonly kind: "rejected"; readonly error: unknown },
 		publicationCause?: unknown,
 	) {
-		const code = outcome.kind === "committed" ? "committed_not_applied" : outcome.kind;
-		super(sharedControlPublicationMessage(operation, outcome), { cause: publicationCause ?? outcome });
+		super(
+			`Could not ${operation}: the session was replaced before the update was written. Nothing was changed; retry.`,
+			{ cause: publicationCause ?? outcome },
+		);
 		this.name = "SharedControlPublicationError";
-		this.code = code;
 	}
 }
 
@@ -907,19 +906,6 @@ export interface ModelSelectionRollbackDurableState {
 			| undefined;
 	};
 	readonly resumeDefault?: { readonly selector: string | undefined };
-}
-
-function sharedControlPublicationMessage(operation: string, outcome: SharedEntriesAppendOutcome): string {
-	switch (outcome.kind) {
-		case "stale":
-			return `Could not ${operation}: the shared session changed before the update was written (${outcome.reason}). Nothing was changed; reopen the session and retry.`;
-		case "rejected":
-			return `Could not ${operation}: the session was replaced before the update was written. Nothing was changed; retry.`;
-		case "unknown":
-			return `Could not confirm ${operation} (entries ${outcome.ids.join(", ") || "none"}). The session was closed to protect its history; reopen it to see the result.`;
-		case "committed":
-			return `The change (${operation}) was saved to the session history but could not be applied here. The session was closed; reopen it to continue.`;
-	}
 }
 
 class ToolOutputPruneRollbackError extends Error {

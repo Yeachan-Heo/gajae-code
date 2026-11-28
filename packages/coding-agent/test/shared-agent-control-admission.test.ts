@@ -8,8 +8,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
-import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
+import { SessionManager } from "../src/session/session-manager";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -27,7 +26,7 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
-async function fixture(durableSettings = false) {
+async function fixture() {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-controls-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -37,7 +36,7 @@ async function fixture(durableSettings = false) {
 	const destination = SessionManager.managedDestination(cwd, agentDir);
 	const manager = SessionManager.create(cwd, destination);
 	managers.push(manager);
-	const first = manager.appendMessage(user("first"));
+	manager.appendMessage(user("first"));
 	manager.appendMessage(user("second"));
 	await manager.ensureOnDisk();
 	await manager.flush();
@@ -57,13 +56,11 @@ async function fixture(durableSettings = false) {
 		parameters: z.object({}),
 		execute,
 	};
-	const settings = durableSettings
-		? await Settings.loadForScope({ cwd, agentDir })
-		: Settings.isolated({
-				"compaction.enabled": false,
-				"todo.reminders": false,
-				"startup.networkPrewarm": false,
-			});
+	const settings = Settings.isolated({
+		"compaction.enabled": false,
+		"todo.reminders": false,
+		"startup.networkPrewarm": false,
+	});
 	const agent = new Agent({
 		initialState: { model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 	});
@@ -78,47 +75,7 @@ async function fixture(durableSettings = false) {
 	});
 	sessions.push(session);
 	await manager.flush();
-	const admit = async () => {
-		const sibling = await SessionManager.open(file, destination);
-		managers.push(sibling);
-		const peerResult = await sibling.appendMessageSharingSession(user("peer"));
-		if (peerResult.kind !== "committed") throw new Error(peerResult.kind);
-		const result = await manager.appendMessageSharingSession(user("local"));
-		if (result.kind !== "committed") throw new Error(result.kind);
-	};
-	return {
-		session,
-		manager,
-		agent: session.agent,
-		settings,
-		registry,
-		model,
-		first,
-		file,
-		admit,
-		execute,
-		rebuild,
-		cwd,
-		agentDir,
-		destination,
-	};
-}
-
-async function withinBarrier<T>(pending: Promise<T>, phase: string): Promise<T> {
-	const deadline = Promise.withResolvers<never>();
-	const timer = setTimeout(() => deadline.reject(new Error(`Timed out waiting for ${phase}`)), 1500);
-	try {
-		return await Promise.race([pending, deadline.promise]);
-	} finally {
-		clearTimeout(timer);
-	}
-}
-
-function observeControl(pending: Promise<void>) {
-	return pending.then(
-		() => ({ kind: "fulfilled" as const }),
-		error => ({ kind: "rejected" as const, error }),
-	);
+	return { session, manager, agent: session.agent, file, execute, rebuild };
 }
 
 function snapshot(session: AgentSession) {
@@ -143,230 +100,10 @@ function snapshot(session: AgentSession) {
 }
 
 describe("shared AgentSession control admission", () => {
-	it("publishes an unpublished title with its pending entries and retains its cursor", async () => {
-		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-bootstrap-"));
-		roots.push(root);
-		const cwd = path.join(root, "workspace");
-		const agentDir = path.join(root, "agent");
-		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
-		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
-		managers.push(manager);
-		const first = manager.appendMessage(user("pending one"));
-		const second = manager.appendMessage(user("pending two"));
-		const leaf = manager.getLeafId();
-		const result = await manager.setSessionNameSharingSession("First title", "user");
-		expect(result).toEqual({ kind: "committed", title: "First title" });
-		expect(manager.getLeafId()).toBe(leaf);
-		const file = manager.getSessionFile()!;
-		const lines = (await Bun.file(file).text())
-			.trim()
-			.split("\n")
-			.map(
-				line =>
-					JSON.parse(line) as {
-						type: string;
-						id?: string;
-						title?: string;
-						message?: { content: string };
-					},
-			);
-		expect(lines[0]).toMatchObject({ type: "session", title: "First title" });
-		expect(lines.slice(1).map(entry => entry.id)).toEqual([first, second]);
-		expect(lines.slice(1).map(entry => entry.message?.content)).toEqual(["pending one", "pending two"]);
-		const append = await manager.appendMessageSharingSession(user("after title bootstrap"));
-		expect(append.kind).toBe("committed");
-		expect((await Bun.file(file).text()).includes('"after title bootstrap"')).toBe(true);
-	});
-
-	it("refuses an existing same-ID file without discarding unpublished title-owner entries", async () => {
-		const f = await fixture();
-		const manager = SessionManager.create(f.cwd, f.destination);
-		managers.push(manager);
-		const first = manager.appendMessage(user("pending one"));
-		const second = manager.appendMessage(user("pending two"));
-		const file = manager.getSessionFile()!;
-		expect(await Bun.file(file).exists()).toBe(false);
-		const existing = `${JSON.stringify(manager.getHeader())}\n`;
-		await Bun.write(file, existing);
-		await fs.chmod(file, 0o600);
-		const append = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync");
-		const publish = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
-		expect(await manager.setSessionNameSharingSession("Must not adopt", "user")).toEqual({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		expect(append).not.toHaveBeenCalled();
-		expect(publish).not.toHaveBeenCalled();
-		expect(await Bun.file(file).text()).toBe(existing);
-		expect(manager.getLeafId()).toBe(second);
-		expect(manager.getEntries().map(entry => entry.id)).toEqual([first, second]);
-		expect(manager.getSessionName()).toBeUndefined();
-	});
-
-	it("arms shared admission before a title publication yields", async () => {
-		const f = await fixture();
-		const manager = SessionManager.create(f.cwd, f.destination);
-		managers.push(manager);
-		const first = manager.appendMessage(user("pending"));
-		const title = manager.setSessionNameSharingSession("Shared title", "user");
-		let legacyError: unknown;
-		try {
-			manager.appendMessage(user("legacy mutation after shared invocation"));
-		} catch (error) {
-			legacyError = error;
-		}
-		expect(await title).toEqual({ kind: "committed", title: "Shared title" });
-		expect(legacyError).toMatchObject({ code: "shared_session_mutation_unsupported" });
-		expect(manager.getEntries().map(entry => entry.id)).toEqual([first]);
-	});
-
-	it("retains exact patch evidence after an uncertain append without retry or live success", async () => {
-		const f = await fixture();
-		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
-		const before = await Bun.file(f.file).text();
-		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
-		const failure = new Error("append returned uncertain after durable write");
-		const append = vi
-			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
-			.mockImplementation(function (this: ManagedSessionDescendantStore, relative, bytes, expected) {
-				original.call(this, relative, bytes, expected);
-				throw failure;
-			});
-		const outcome = await f.manager.setSessionNameSharingSession("Uncertain", "user");
-		expect(outcome).toMatchObject({
-			kind: "unknown",
-			patch: { title: "Uncertain", titleSource: "user" },
-			error: failure,
-		});
-		if (outcome.kind !== "unknown") throw new Error(`Expected uncertainty: ${outcome.kind}`);
-		expect(outcome.predecessor?.sha256).toBeDefined();
-		expect(f.manager.getSessionName()).not.toBe("Uncertain");
-		expect(append).toHaveBeenCalledTimes(1);
-		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
-		const followUp = await f.manager.setSessionNameSharingSession("Do not retry", "user");
-		expect(followUp).toEqual({ kind: "stale", reason: "persistence_latched" });
-		managers.splice(managers.indexOf(f.manager), 1);
-		expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
-		sessions.splice(sessions.indexOf(f.session), 1);
-		await expect(f.session.dispose()).rejects.toMatchObject({
-			errors: expect.arrayContaining([expect.objectContaining({ cause: outcome })]),
-		});
-	});
-
-	// #7824: an adopted session continues through admitted shared publication; the
-	// remaining synchronous/internal writers have no shared protocol and refuse first.
-	it("refuses unmigrated synchronous controls before Agent, settings, UI, credentials, tools, or disk change", async () => {
-		const f = await fixture();
-		await f.admit();
-		const before = snapshot(f.session);
-		const bytes = await Bun.file(f.file).text();
-		const events = vi.fn();
-		const unsubscribe = f.session.subscribe(events);
-		const credentials = vi.spyOn(f.registry, "getApiKey");
-		const persist = vi.spyOn(f.settings, "commitAtomicBatch");
-		const mutationStarted = vi.fn();
-		const operations: Array<() => unknown> = [
-			() => f.session.setThinkingLevel(ThinkingLevel.High, true),
-			() => f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted }),
-			() => f.session.setConfiguredModelChain("default", ["anthropic/claude-sonnet-4-5"], "test"),
-			() => f.session.navigateTree(f.first, { summarize: true }),
-		];
-		try {
-			for (const operation of operations) {
-				await expect(Promise.resolve().then(operation)).rejects.toBeInstanceOf(
-					SharedSessionMutationUnsupportedError,
-				);
-				expect(snapshot(f.session)).toEqual(before);
-				expect(await Bun.file(f.file).text()).toBe(bytes);
-				expect(events).not.toHaveBeenCalled();
-				expect(credentials).not.toHaveBeenCalled();
-				expect(persist).not.toHaveBeenCalled();
-				expect(mutationStarted).not.toHaveBeenCalled();
-				expect(f.execute).not.toHaveBeenCalled();
-				expect(f.rebuild).not.toHaveBeenCalled();
-			}
-		} finally {
-			unsubscribe();
-		}
-	});
-
-	it("rechecks admission after model credentials resolve", async () => {
-		const f = await fixture();
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<string>();
-		vi.spyOn(f.registry, "getApiKey").mockImplementation(async () => {
-			entered.resolve();
-			return release.promise;
-		});
-		const mutationStarted = vi.fn();
-		const pending = f.session.setModel(f.model, "smol", { onMutationStarted: mutationStarted });
-		const outcome = observeControl(pending);
-		try {
-			await withinBarrier(
-				Promise.race([
-					entered.promise,
-					outcome.then(result => {
-						if (result.kind === "rejected") throw result.error;
-						throw new Error("Model selection settled before credential hook");
-					}),
-				]),
-				"credential hook",
-			);
-			await withinBarrier(f.admit(), "shared admission during credential hook");
-			const before = snapshot(f.session);
-			const bytes = await Bun.file(f.file).text();
-			release.resolve("test-key");
-			const result = await withinBarrier(outcome, "model selection refusal");
-			expect(result.kind).toBe("rejected");
-			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
-			expect(snapshot(f.session)).toEqual(before);
-			expect(await Bun.file(f.file).text()).toBe(bytes);
-			expect(mutationStarted).not.toHaveBeenCalled();
-		} finally {
-			release.resolve("test-key");
-			await withinBarrier(outcome, "model selection cleanup");
-		}
-	});
-
-	it("rechecks tool selection after prompt preparation without publishing it", async () => {
-		const f = await fixture();
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		f.rebuild.mockImplementation(async () => {
-			entered.resolve();
-			await release.promise;
-			return { systemPrompt: ["Must not publish"] };
-		});
-		const pending = f.session.setActiveToolsByName([]);
-		const outcome = observeControl(pending);
-		try {
-			await withinBarrier(
-				Promise.race([
-					entered.promise,
-					outcome.then(result => {
-						if (result.kind === "rejected") throw result.error;
-						throw new Error("Tool selection settled before prompt rebuild hook");
-					}),
-				]),
-				"prompt rebuild hook",
-			);
-			await withinBarrier(f.admit(), "shared admission during prompt rebuild hook");
-			const before = snapshot(f.session);
-			release.resolve();
-			const result = await withinBarrier(outcome, "tool selection refusal");
-			expect(result.kind).toBe("rejected");
-			if (result.kind === "rejected") expect(result.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
-			expect(snapshot(f.session)).toEqual(before);
-		} finally {
-			release.resolve();
-			await withinBarrier(outcome, "tool selection cleanup");
-		}
-	});
-
 	it("retains shared read-only and genuine no-op controls", async () => {
 		const f = await fixture();
-		await f.admit();
+		f.manager.appendMessage(user("local"));
+		await f.manager.flush();
 		const before = snapshot(f.session);
 		const bytes = await Bun.file(f.file).text();
 		f.session.setServiceTier(f.session.serviceTier);
@@ -378,144 +115,6 @@ describe("shared AgentSession control admission", () => {
 		expect(snapshot(f.session)).toEqual(before);
 		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
-
-	for (const failPublication of [false, true]) {
-		it(`refuses durable thinking after sibling shared admission (failure=${failPublication})`, async () => {
-			const f = await fixture(true);
-			const sibling = await SessionManager.open(f.file, f.destination);
-			managers.push(sibling);
-			const entered = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const capture = sibling.captureCommittedSnapshot.bind(sibling);
-			let paused = false;
-			vi.spyOn(sibling, "captureCommittedSnapshot").mockImplementation(async () => {
-				if (!paused) {
-					paused = true;
-					entered.resolve();
-					await release.promise;
-					if (failPublication) throw new Error("injected shared publication failure");
-				}
-				return capture();
-			});
-			const publication = sibling.appendMessageSharingSession(user("sibling first")).then(
-				result => ({ kind: "outcome" as const, result }),
-				error => ({ kind: "error" as const, error }),
-			);
-			try {
-				await withinBarrier(
-					Promise.race([
-						entered.promise,
-						publication.then(result => {
-							if (result.kind === "error") throw result.error;
-							throw new Error(`Shared publication settled before snapshot barrier: ${result.result.kind}`);
-						}),
-					]),
-					"sibling shared snapshot barrier",
-				);
-				const before = snapshot(f.session);
-				const bytes = await Bun.file(f.file).text();
-				const durableBefore = (await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get(
-					"defaultThinkingLevel",
-				);
-				const commit = vi.spyOn(f.settings, "commitAtomicBatch");
-				const control = await observeControl(f.session.setThinkingLevelForControl(ThinkingLevel.High, true));
-				expect(control.kind).toBe("rejected");
-				if (control.kind === "rejected")
-					expect(control.error).toBeInstanceOf(SharedSessionMutationUnsupportedError);
-				expect(commit).not.toHaveBeenCalled();
-				expect(snapshot(f.session)).toEqual(before);
-				expect(await Bun.file(f.file).text()).toBe(bytes);
-				expect(
-					(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
-				).toBe(durableBefore);
-				release.resolve();
-				const result = await withinBarrier(publication, "sibling publication completion");
-				if (failPublication) {
-					expect(result.kind).toBe("error");
-					if (result.kind === "error")
-						expect(String(result.error)).toContain("injected shared publication failure");
-				} else {
-					if (result.kind === "error") throw result.error;
-					expect(result.result.kind).toBe("committed");
-				}
-				// No durable write is needed to prove the short-lived count was released.
-				expect(await f.manager.withDurableThinkingControl(async () => "released")).toBe("released");
-			} finally {
-				release.resolve();
-				await withinBarrier(publication, "sibling publication cleanup");
-				await f.settings.close();
-			}
-		});
-	}
-
-	for (const fail of [false, true]) {
-		it(`holds shared admission through durable thinking commit (failure=${fail})`, async () => {
-			const f = await fixture(true);
-			const sibling = await SessionManager.open(f.file, f.destination);
-			managers.push(sibling);
-			const entered = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const commit = f.settings.commitAtomicBatch.bind(f.settings);
-			vi.spyOn(f.settings, "commitAtomicBatch").mockImplementation(async patches => {
-				entered.resolve();
-				await release.promise;
-				if (fail) throw new Error("injected settings commit failure");
-				return commit(patches);
-			});
-			const before = snapshot(f.session);
-			const bytes = await Bun.file(f.file).text();
-			const outcome = observeControl(f.session.setThinkingLevelForControl(ThinkingLevel.High, true));
-			try {
-				await withinBarrier(
-					Promise.race([
-						entered.promise,
-						outcome.then(result => {
-							if (result.kind === "rejected") throw result.error;
-							throw new Error("Thinking control completed before settings barrier");
-						}),
-					]),
-					"durable thinking commit barrier",
-				);
-				for (const manager of [f.manager, sibling]) {
-					const revisions = manager.revisionSnapshot();
-					const result = await manager.appendMessageSharingSession(user("blocked"));
-					expect(result.kind).toBe("rejected");
-					if (result.kind === "rejected")
-						expect(String(result.error)).toContain("durable_thinking_control_in_flight");
-					expect(manager.revisionSnapshot()).toEqual(revisions);
-				}
-				expect(snapshot(f.session)).toEqual(before);
-				expect(await Bun.file(f.file).text()).toBe(bytes);
-				const unrelated = SessionManager.create(f.cwd, f.destination);
-				managers.push(unrelated);
-				const independent = await unrelated.appendMessageSharingSession(user("unrelated session"));
-				expect(independent.kind).toBe("committed");
-				release.resolve();
-				const result = await withinBarrier(outcome, "durable thinking completion");
-				if (fail) {
-					expect(result.kind).toBe("rejected");
-					if (result.kind === "rejected")
-						expect(String(result.error)).toContain("Unable to persist reasoning settings");
-					expect(snapshot(f.session)).toEqual(before);
-				} else {
-					if (result.kind === "rejected") throw result.error;
-					expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
-					expect(f.settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
-					expect(
-						(await Settings.loadReadonly({ cwd: f.cwd, agentDir: f.agentDir })).get("defaultThinkingLevel"),
-					).toBe(ThinkingLevel.High);
-					expect(f.manager.getBranch().some(entry => entry.type === "thinking_level_change")).toBe(true);
-				}
-				await f.manager.flush();
-				const later = await f.manager.appendMessageSharingSession(user("after control"));
-				expect(later.kind).toBe("committed");
-			} finally {
-				release.resolve();
-				await withinBarrier(outcome, "durable thinking cleanup");
-				await f.settings.close();
-			}
-		});
-	}
 
 	it("keeps ordinary control mutations working", async () => {
 		const f = await fixture();

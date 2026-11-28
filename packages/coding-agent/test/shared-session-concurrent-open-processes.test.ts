@@ -16,7 +16,7 @@ type Event = {
 	currentBytes?: string;
 	digest?: string;
 	size?: number;
-	outcome?: string | { kind: string; reason?: string };
+	outcome?: string | { kind: string; id?: string; error?: string };
 	attemptedId?: string | null;
 	id?: string;
 	leaf?: string;
@@ -47,8 +47,8 @@ async function bounded<T>(promise: Promise<T>, label: string, ms = 8_000): Promi
 for (const scenario of ["hydration", "finalize"] as const)
 	it.skipIf(process.platform === "win32")(
 		scenario === "hydration"
-			? "serializes two real-process opens and a peer append during hydration"
-			: "serializes legacy migration finalization against a real-process peer append",
+			? "serializes two real-process opens and refuses an open whose hydration a peer append changed"
+			: "serializes legacy migration finalization against a real-process peer, whose stale append is refused",
 		async () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-shared-open-processes-"));
 			const cwd = path.join(root, "workspace");
@@ -63,9 +63,9 @@ for (const scenario of ["hydration", "finalize"] as const)
 				XDG_CACHE_HOME: path.join(root, "cache"),
 				XDG_RUNTIME_DIR: path.join(root, "run"),
 				GJC_CODING_AGENT_DIR: agentDir,
-				// Two writers on one session exist only below the default `enforce`. These workers call the
-				// shared-publication layer's `*SharingSession` methods directly, which no production writer
-				// reaches since single-owner step 10a; the case goes with those methods (step 10d).
+				// Two writers on one session exist only below the default `enforce`, which refuses the
+				// second claim. Both workers write through the legacy appends, so these cases pin what the
+				// open transaction, finalization and the expected-identity fence do without that claim.
 				GJC_SESSION_OWNERSHIP: "observe",
 				PI_CODING_AGENT_DIR: agentDir,
 				NO_COLOR: "1",
@@ -174,12 +174,13 @@ for (const scenario of ["hydration", "finalize"] as const)
 					);
 					expect(snapshot.digest).toBe(crypto.createHash("sha256").update(seed.bytes).digest("hex"));
 					expect(snapshot.size).toBe(Buffer.byteLength(seed.bytes));
-					gate("b", "append");
+					gate("b", "stale-finalize");
 					const contention = await wait(
-						"peer append contention during finalization",
-						event => event.worker === "b" && ["append-contention", "refused", "appended"].includes(event.event),
+						"peer finalization contention during finalization",
+						event =>
+							event.worker === "b" && ["stale-finalize-contention", "stale-finalized"].includes(event.event),
 					);
-					expect(contention.event).toBe("append-contention");
+					expect(contention.event).toBe("stale-finalize-contention");
 					expect(await Bun.file(seed.file).text()).toBe(seed.bytes);
 					gate("a", "snapshot-release");
 					const finalized = await wait(
@@ -193,15 +194,6 @@ for (const scenario of ["hydration", "finalize"] as const)
 					const migrated = Bun.JSONL.parse(migratedBytes) as TranscriptRecord[];
 					expect(migrated[0]).toEqual({ ...legacy[0], version: CURRENT_SESSION_VERSION });
 					expect(migrated.slice(1)).toEqual(legacyEntries);
-					const refused = await wait(
-						"legacy append refusal",
-						event => event.worker === "b" && event.event === "refused",
-					);
-					expect(refused.outcome).toEqual({ kind: "stale", reason: "rewrite_required" });
-					expect(refused.attemptedId).toBeNull();
-					expect(refused.leaf).toBe(seed.parent);
-					expect(refused.bytes).toBe(migratedBytes);
-					gate("b", "stale-finalize");
 					const stale = await wait(
 						"legacy finalization refusal",
 						event => event.worker === "b" && event.event === "stale-finalized",
@@ -209,6 +201,16 @@ for (const scenario of ["hydration", "finalize"] as const)
 					expect(stale.outcome).toBe("stale");
 					expect(stale.leaf).toBe(seed.parent);
 					expect(stale.bytes).toBe(migratedBytes);
+					gate("b", "append");
+					const refused = await wait(
+						"legacy append refusal",
+						event => event.worker === "b" && event.event === "refused",
+					);
+					expect(refused.outcome).toEqual({ kind: "refused", error: "ManagedAppendIdentityMismatchError" });
+					// The refused entry never reached the transcript and the leaf rolled back.
+					if (refused.attemptedId) expect(migratedBytes).not.toContain(refused.attemptedId);
+					expect(refused.leaf).toBe(seed.parent);
+					expect(refused.bytes).toBe(migratedBytes);
 					gate("b", "reopen");
 					const closed = await wait(
 						"legacy strict close",
@@ -245,16 +247,26 @@ for (const scenario of ["hydration", "finalize"] as const)
 					expect(openedFirst.logicalId).toBe(seed.logicalId);
 					gate(first, "append");
 					const appendOrdering = await wait(
-						"append contention versus publication",
-						event => event.worker === first && ["append-contention", "appended"].includes(event.event),
+						"first append during peer hydration",
+						event =>
+							event.worker === first &&
+							["append-contention", "appended", "append-refused"].includes(event.event),
 					);
-					expect(appendOrdering.event).toBe("append-contention");
+					// A legacy append takes no session transaction, so it lands while the peer hydrates.
+					expect(appendOrdering.event).toBe("appended");
 					gate(second, "hydrate");
+					const refusedOpen = await wait(
+						"second open refusal",
+						event => event.worker === second && ["open-refused", "opened"].includes(event.event),
+					);
+					// The changed transcript fails the open's strict hydration snapshot.
+					expect(refusedOpen.event).toBe("open-refused");
+					expect(refusedOpen.error).toContain("identity-mismatch");
 					const openedSecond = await wait(
-						"second opened",
+						"second reopened",
 						event => event.worker === second && event.event === "opened",
 					);
-					expect(openedSecond.leaf).toBe(seed.parent);
+					expect(openedSecond.leaf).toBe(appendOrdering.id);
 					expect(openedSecond.logicalId).toBe(seed.logicalId);
 				}
 				const second = first === "a" ? "b" : "a";
@@ -266,9 +278,21 @@ for (const scenario of ["hydration", "finalize"] as const)
 				expect(afterFirst.startsWith(migratedBytes ?? seed.bytes)).toBe(true);
 				gate(second, scenario === "finalize" ? "publish" : "append");
 				const secondAppend = await wait(
-					"second publication",
-					event => event.worker === second && event.event === "appended",
+					"second append",
+					event => event.worker === second && ["appended", "append-refused"].includes(event.event),
 				);
+				if (scenario === "finalize") {
+					// The migrating writer's expected identity predates the peer's append: the fence
+					// refuses it before it writes, so no sibling branch is published.
+					expect(secondAppend.event).toBe("append-refused");
+					expect(secondAppend.outcome).toEqual({ kind: "refused", error: "ManagedAppendIdentityMismatchError" });
+					expect(secondAppend.bytes).toBe(afterFirst);
+					expect(secondAppend.leaf).toBe(seed.parent);
+				} else {
+					// The reopened peer read the first append, so its append continues from it.
+					expect(secondAppend.event).toBe("appended");
+					expect(secondAppend.leaf).toBe(secondAppend.id);
+				}
 				for (const worker of children.keys())
 					await wait(`${worker} done`, event => event.worker === worker && event.event === "done");
 				for (const worker of children.keys()) {
@@ -280,24 +304,28 @@ for (const scenario of ["hydration", "finalize"] as const)
 				}
 				for (const child of children.values()) expect(await bounded(child.exited, "worker exit")).toBe(0);
 				const bytes = await Bun.file(seed.file).text();
-				expect(bytes.startsWith(afterFirst)).toBe(true);
+				if (scenario === "finalize") expect(bytes).toBe(afterFirst);
+				else expect(bytes.startsWith(afterFirst)).toBe(true);
 				const records = Bun.JSONL.parse(bytes) as TranscriptRecord[];
 				const headers = records.filter(record => record.type === "session");
 				expect(headers).toHaveLength(1);
 				expect(headers[0]!.id).toBe(seed.logicalId);
 				expect(firstAppend.id).toBeTruthy();
-				expect(secondAppend.id).toBeTruthy();
-				expect(firstAppend.id).not.toBe(secondAppend.id);
-				for (const receipt of [firstAppend, secondAppend]) {
-					expect(receipt.logicalId).toBe(seed.logicalId);
-					expect(receipt.leaf).toBe(receipt.id);
-					const matching = records.filter(record => record.id === receipt.id);
-					expect(matching).toHaveLength(1);
-					expect(matching[0]!.parentId).toBe(seed.parent);
-					expect(matching[0]!.message?.content).toBe(`branch ${receipt.worker}`);
+				expect(firstAppend.logicalId).toBe(seed.logicalId);
+				expect(firstAppend.leaf).toBe(firstAppend.id);
+				const matching = records.filter(record => record.id === firstAppend.id);
+				expect(matching).toHaveLength(1);
+				expect(matching[0]!.parentId).toBe(seed.parent);
+				expect(matching[0]!.message?.content).toBe(`branch ${firstAppend.worker}`);
+				const secondRecords = records.filter(record => record.message?.content === `branch ${second}`);
+				if (scenario === "finalize") expect(secondRecords).toHaveLength(0);
+				else {
+					expect(secondRecords).toHaveLength(1);
+					expect(secondRecords[0]!.id).toBe(secondAppend.id!);
+					expect(secondRecords[0]!.parentId).toBe(firstAppend.id);
 				}
 				const entries = records.filter(record => record.type !== "session");
-				expect(entries).toHaveLength(scenario === "finalize" ? 5 : 3);
+				expect(entries).toHaveLength(scenario === "finalize" ? 4 : 3);
 				if (scenario === "finalize") expect(entries.slice(0, 3)).toEqual(legacyEntries);
 				const ids = new Set(entries.map(entry => entry.id));
 				expect(ids.size).toBe(entries.length);

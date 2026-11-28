@@ -27,6 +27,20 @@ process.on("message", (message: unknown) => {
 	gates.get(command.gate)?.resolve();
 });
 const send = (event: string, detail: Record<string, unknown> = {}) => process.send!({ worker, event, ...detail });
+
+/** A legacy append and flush, reported as the id it wrote or the error class that refused it. */
+async function legacyAppend(
+	target: SessionManager,
+	message: Parameters<SessionManager["appendMessage"]>[0],
+): Promise<{ kind: "appended"; id: string } | { kind: "refused"; error: string }> {
+	try {
+		const id = target.appendMessage(message);
+		await target.flush();
+		return { kind: "appended", id };
+	} catch (error) {
+		return { kind: "refused", error: error instanceof Error ? error.name : String(error) };
+	}
+}
 const deadline = setTimeout(() => {
 	send("error", { error: "Worker deadline exceeded" });
 	process.exit(1);
@@ -94,7 +108,16 @@ try {
 		};
 	}
 	send("opening");
-	manager = await SessionManager.open(file, destination);
+	try {
+		manager = await SessionManager.open(file, destination);
+	} catch (error) {
+		if (scenario === "finalize") throw error;
+		// A peer's legacy append changed the transcript under this open's hydration snapshot.
+		// The open refuses it; a fresh open reads the transcript as it now stands.
+		send("open-refused", { error: error instanceof Error ? error.message : String(error) });
+		SessionManagerTestHooks.beforeExistingSessionHydration = undefined;
+		manager = await SessionManager.open(file, destination);
+	}
 	send("opened", { logicalId: manager.getSessionId(), leaf: manager.getLeafId(), bytes: await Bun.file(file).text() });
 	if (scenario === "finalize") {
 		if (worker === "a") {
@@ -119,20 +142,22 @@ try {
 				manager.captureCommittedSnapshot = original;
 			}
 		} else {
-			await gates.get("append")!.promise;
-			phase = "append";
-			const message = { role: "user" as const, content: "refused legacy append", timestamp: 4 };
-			const outcome = await manager.appendMessageSharingSession(message);
-			send("refused", {
-				outcome,
-				attemptedId: getSessionMessageEntryId(message) ?? null,
-				leaf: manager.getLeafId(),
-				bytes: await Bun.file(file).text(),
-			});
+			// The peer's own finalization waits for the migrating worker's transaction, then finds
+			// the transcript it opened replaced.
 			await gates.get("stale-finalize")!.promise;
 			phase = "stale-finalize";
 			const stale = await manager.finalizeWritableOpen();
 			send("stale-finalized", { outcome: stale, leaf: manager.getLeafId(), bytes: await Bun.file(file).text() });
+			// Its next legacy append is refused by the expected-identity fence before it writes.
+			await gates.get("append")!.promise;
+			phase = "append";
+			const message = { role: "user" as const, content: "refused legacy append", timestamp: 4 };
+			send("refused", {
+				outcome: await legacyAppend(manager, message),
+				attemptedId: getSessionMessageEntryId(message) ?? null,
+				leaf: manager.getLeafId(),
+				bytes: await Bun.file(file).text(),
+			});
 			await gates.get("reopen")!.promise;
 			const closed = await manager.closeStrict();
 			if (closed.kind !== "closed") throw new Error(`Legacy close failed: ${closed.kind}`);
@@ -151,13 +176,18 @@ try {
 	await gates.get(scenario === "finalize" ? "publish" : "append")!.promise;
 	phase = "append";
 	send("appending");
-	const outcome = await manager.appendMessageSharingSession({
+	const outcome = await legacyAppend(manager, {
 		role: "user",
 		content: `branch ${worker}`,
 		timestamp: worker === "a" ? 2 : 3,
 	});
-	if (outcome.kind !== "committed") throw new Error(`Append did not commit: ${outcome.kind}`);
-	send("appended", { id: outcome.id, leaf: manager.getLeafId(), logicalId: manager.getSessionId() });
+	send(outcome.kind === "appended" ? "appended" : "append-refused", {
+		outcome,
+		id: outcome.kind === "appended" ? outcome.id : undefined,
+		leaf: manager.getLeafId(),
+		logicalId: manager.getSessionId(),
+		bytes: await Bun.file(file).text(),
+	});
 	const closed = await manager.closeStrict();
 	if (closed.kind !== "closed") throw new Error(`Final close failed: ${closed.kind}`);
 	manager = undefined;
