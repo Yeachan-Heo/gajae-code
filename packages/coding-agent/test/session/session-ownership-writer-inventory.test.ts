@@ -218,7 +218,6 @@ const CURRENT_WRITERS: Record<string, Writer> = {
 	appendToolSelectionsSharingSession: m => m.appendToolSelectionsSharingSession(["mcp_tool"], undefined, always),
 	appendTtsrInjectionSharingSession: m => m.appendTtsrInjectionSharingSession(["rule"]),
 	appendLabelChangeSharingSession: (m, { first }) => m.appendLabelChangeSharingSession(first, "label"),
-	setSessionNameSharingSession: m => m.setSessionNameSharingSession("shared title", "user"),
 };
 
 /** Writers of a successor's transcript (a new id). Run unclaimed, each write must be detected. */

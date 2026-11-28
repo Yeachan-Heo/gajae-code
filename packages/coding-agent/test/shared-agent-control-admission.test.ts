@@ -8,7 +8,6 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 
 const roots: string[] = [];
@@ -143,117 +142,6 @@ function snapshot(session: AgentSession) {
 }
 
 describe("shared AgentSession control admission", () => {
-	it("publishes an unpublished title with its pending entries and retains its cursor", async () => {
-		const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-bootstrap-"));
-		roots.push(root);
-		const cwd = path.join(root, "workspace");
-		const agentDir = path.join(root, "agent");
-		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
-		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
-		managers.push(manager);
-		const first = manager.appendMessage(user("pending one"));
-		const second = manager.appendMessage(user("pending two"));
-		const leaf = manager.getLeafId();
-		const result = await manager.setSessionNameSharingSession("First title", "user");
-		expect(result).toEqual({ kind: "committed", title: "First title" });
-		expect(manager.getLeafId()).toBe(leaf);
-		const file = manager.getSessionFile()!;
-		const lines = (await Bun.file(file).text())
-			.trim()
-			.split("\n")
-			.map(
-				line =>
-					JSON.parse(line) as {
-						type: string;
-						id?: string;
-						title?: string;
-						message?: { content: string };
-					},
-			);
-		expect(lines[0]).toMatchObject({ type: "session", title: "First title" });
-		expect(lines.slice(1).map(entry => entry.id)).toEqual([first, second]);
-		expect(lines.slice(1).map(entry => entry.message?.content)).toEqual(["pending one", "pending two"]);
-		const append = await manager.appendMessageSharingSession(user("after title bootstrap"));
-		expect(append.kind).toBe("committed");
-		expect((await Bun.file(file).text()).includes('"after title bootstrap"')).toBe(true);
-	});
-
-	it("refuses an existing same-ID file without discarding unpublished title-owner entries", async () => {
-		const f = await fixture();
-		const manager = SessionManager.create(f.cwd, f.destination);
-		managers.push(manager);
-		const first = manager.appendMessage(user("pending one"));
-		const second = manager.appendMessage(user("pending two"));
-		const file = manager.getSessionFile()!;
-		expect(await Bun.file(file).exists()).toBe(false);
-		const existing = `${JSON.stringify(manager.getHeader())}\n`;
-		await Bun.write(file, existing);
-		await fs.chmod(file, 0o600);
-		const append = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync");
-		const publish = vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync");
-		expect(await manager.setSessionNameSharingSession("Must not adopt", "user")).toEqual({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		expect(append).not.toHaveBeenCalled();
-		expect(publish).not.toHaveBeenCalled();
-		expect(await Bun.file(file).text()).toBe(existing);
-		expect(manager.getLeafId()).toBe(second);
-		expect(manager.getEntries().map(entry => entry.id)).toEqual([first, second]);
-		expect(manager.getSessionName()).toBeUndefined();
-	});
-
-	it("arms shared admission before a title publication yields", async () => {
-		const f = await fixture();
-		const manager = SessionManager.create(f.cwd, f.destination);
-		managers.push(manager);
-		const first = manager.appendMessage(user("pending"));
-		const title = manager.setSessionNameSharingSession("Shared title", "user");
-		let legacyError: unknown;
-		try {
-			manager.appendMessage(user("legacy mutation after shared invocation"));
-		} catch (error) {
-			legacyError = error;
-		}
-		expect(await title).toEqual({ kind: "committed", title: "Shared title" });
-		expect(legacyError).toMatchObject({ code: "shared_session_mutation_unsupported" });
-		expect(manager.getEntries().map(entry => entry.id)).toEqual([first]);
-	});
-
-	it("retains exact patch evidence after an uncertain append without retry or live success", async () => {
-		const f = await fixture();
-		expect((await f.manager.appendMessageSharingSession(user("shared"))).kind).toBe("committed");
-		const before = await Bun.file(f.file).text();
-		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
-		const failure = new Error("append returned uncertain after durable write");
-		const append = vi
-			.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync")
-			.mockImplementation(function (this: ManagedSessionDescendantStore, relative, bytes, expected) {
-				original.call(this, relative, bytes, expected);
-				throw failure;
-			});
-		const outcome = await f.manager.setSessionNameSharingSession("Uncertain", "user");
-		expect(outcome).toMatchObject({
-			kind: "unknown",
-			patch: { title: "Uncertain", titleSource: "user" },
-			error: failure,
-		});
-		if (outcome.kind !== "unknown") throw new Error(`Expected uncertainty: ${outcome.kind}`);
-		expect(outcome.predecessor?.sha256).toBeDefined();
-		expect(f.manager.getSessionName()).not.toBe("Uncertain");
-		expect(append).toHaveBeenCalledTimes(1);
-		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
-		const followUp = await f.manager.setSessionNameSharingSession("Do not retry", "user");
-		expect(followUp).toEqual({ kind: "stale", reason: "persistence_latched" });
-		managers.splice(managers.indexOf(f.manager), 1);
-		expect(await f.manager.closeStrict()).toMatchObject({ kind: "close_unknown", error: { cause: outcome } });
-		sessions.splice(sessions.indexOf(f.session), 1);
-		await expect(f.session.dispose()).rejects.toMatchObject({
-			errors: expect.arrayContaining([expect.objectContaining({ cause: outcome })]),
-		});
-	});
-
 	// #7824: an adopted session continues through admitted shared publication; the
 	// remaining synchronous/internal writers have no shared protocol and refuse first.
 	it("refuses unmigrated synchronous controls before Agent, settings, UI, credentials, tools, or disk change", async () => {

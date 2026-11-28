@@ -92,7 +92,6 @@ const NOT_LEGACY_WRITERS: Record<string, string> = {
 	appendToolSelectionsSharingSession: "admitted shared publication",
 	appendTtsrInjectionSharingSession: "admitted shared publication",
 	appendLabelChangeSharingSession: "admitted shared publication",
-	setSessionNameSharingSession: "admitted shared title publication",
 	moveTo: "session-level cwd mutation (#7856); allowed during exclusive cwd transition in shared sessions",
 	setSessionStarredForPicker: "live picker star; current session guarded by set live picker star",
 	appendPreparedModelChange: "writes an unpublished prepared successor",

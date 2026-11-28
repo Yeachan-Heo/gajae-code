@@ -126,76 +126,6 @@ describe("shared publication admission split", () => {
 		expect(persisted).toContain('"customType":"post-title"');
 	});
 
-	it("still rejects a concurrent legacy mutation while the title publication is in flight", async () => {
-		const f = await fixture();
-		const title = f.manager.setSessionNameSharingSession("In flight", "user");
-		expect(() => f.manager.appendMessage(user("concurrent"))).toThrow(SharedSessionMutationUnsupportedError);
-		expect(await title).toEqual({ kind: "committed", title: "In flight" });
-		expect(() => f.manager.assertLegacyAppendAllowed("after title")).not.toThrow();
-	});
-
-	it("keeps rewrite authority barred after a title adopts a sibling snapshot", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		const sibling = await SessionManager.open(f.file, f.destination);
-		managers.push(sibling);
-		const peer = await sibling.appendMessageSharingSession(user("peer branch"));
-		if (peer.kind !== "committed") throw new Error(`peer append: ${peer.kind}`);
-		expect(f.manager.getEntries().some(entry => entry.id === peer.id)).toBe(false);
-
-		expect(await f.manager.setSessionNameSharingSession("Adopted title", "user")).toEqual({
-			kind: "committed",
-			title: "Adopted title",
-		});
-		const before = await fs.readFile(f.file);
-		f.manager.appendMessage(user("local after title"));
-		expect(() => f.manager.assertLegacyMutationAllowed("rewrite after adopted title")).toThrow(
-			SharedSessionMutationUnsupportedError,
-		);
-		await expect(f.manager.fork()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.setSessionStarred(true)).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		await expect(f.manager.rewriteEntries()).rejects.toBeInstanceOf(SharedSessionMutationUnsupportedError);
-		expect((await fs.readFile(f.file)).subarray(0, before.length).equals(before)).toBe(true);
-
-		const reopened = await SessionManager.open(f.file, f.destination);
-		managers.push(reopened);
-		expect(reopened.getEntries().some(entry => entry.id === peer.id)).toBe(true);
-	});
-
-	it("holds the in-flight fence until every queued title publication settles", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		const original = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
-		let publications = 0;
-		vi.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync").mockImplementation(function (
-			this: ManagedSessionDescendantStore,
-			relative,
-			bytes,
-			expected,
-		) {
-			publications++;
-			if (publications === 2)
-				expect(() => f.manager.appendMessage(user("depth two must stay barred"))).toThrow(
-					SharedSessionMutationUnsupportedError,
-				);
-			return original.call(this, relative, bytes, expected);
-		});
-		const first = f.manager.setSessionNameSharingSession("First title", "user");
-		const second = f.manager.setSessionNameSharingSession("Second title", "user");
-		expect(await first).toEqual({ kind: "committed", title: "First title" });
-		// The first publication settled, but the second is still armed. Releasing one
-		// reference must leave the fence closed until the last publication settles.
-		expect(f.manager.getSessionName()).toBe("First title");
-		expect(() => f.manager.appendMessage(user("between titles"))).toThrow(SharedSessionMutationUnsupportedError);
-		expect(await second).toEqual({ kind: "committed", title: "Second title" });
-		expect(publications).toBe(2);
-		expect(() => f.manager.appendMessage(user("after both titles"))).not.toThrow();
-	});
-
 	it("releases scoped admission when publication setup throws before the transaction", async () => {
 		const f = await fixture();
 		f.manager.appendMessage(user("local root"));
@@ -328,23 +258,6 @@ describe("shared publication admission split", () => {
 		expect(persisted).toContain('"label":"bookmark"');
 		expect(persisted).toContain("shared bash output");
 		expect(persisted).toContain('"customType":"session_recap"');
-	});
-
-	it("keeps rewrite authority when a title adopts this manager's own transcript", async () => {
-		const f = await fixture();
-		f.manager.appendMessage(user("local root"));
-		await f.manager.ensureOnDisk();
-		await f.manager.flush();
-		expect(await f.manager.setSessionNameSharingSession("Renamed locally", "user")).toEqual({
-			kind: "committed",
-			title: "Renamed locally",
-		});
-		// The title adopted no foreign state: this manager wrote every byte on disk.
-		expect(() => f.manager.assertLegacyAppendAllowed("append after own rename")).not.toThrow();
-		expect(() => f.manager.assertLegacyMutationAllowed("rewrite after own rename")).not.toThrow();
-		f.manager.appendMessage(user("local after rename"));
-		await f.manager.rewriteEntries();
-		await f.manager.setSessionStarred(true);
 	});
 
 	it("scopes mode-change append admission while retaining the rewrite fence", async () => {
