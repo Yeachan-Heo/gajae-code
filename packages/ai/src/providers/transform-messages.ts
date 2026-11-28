@@ -170,14 +170,7 @@ export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
-	options?: {
-		repairLatestAssistantThinking?: boolean;
-		repairAllAssistantThinking?: boolean;
-		/** The target validates thinking signatures (a signing Anthropic-messages endpoint). */
-		signingAnthropicTarget?: boolean;
-		/** Stored credential row whose key authenticates this request; undefined when unknown. */
-		targetCredentialId?: number;
-	},
+	options?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
@@ -231,18 +224,6 @@ export function transformMessages<TApi extends Api>(
 					(options?.repairLatestAssistantThinking === true && index === latestAssistantIndex)) &&
 				model.api === "anthropic-messages" &&
 				assistantMsg.api === "anthropic-messages";
-			// Signatures and redacted thinking are bound to the credential (account) that
-			// minted them, so a signing target rejects them under another credential.
-			// Unknown provenance on either side keeps legacy replay. The latest turn is
-			// left intact: Anthropic rejects it when a block it produced goes missing, so
-			// the Anthropic provider rebuilds the whole replay without native thinking
-			// instead (see `latestAssistantThinkingIsUnreplayable`).
-			const foreignCredentialThinking =
-				index !== latestAssistantIndex &&
-				options?.signingAnthropicTarget === true &&
-				assistantMsg.credentialId !== undefined &&
-				options.targetCredentialId !== undefined &&
-				assistantMsg.credentialId !== options.targetCredentialId;
 
 			const transformedContent = assistantMsg.content.flatMap(block => {
 				if (block.type === "thinking") {
@@ -253,9 +234,7 @@ export function transformMessages<TApi extends Api>(
 					// below and was never replayed as a signed block, so it cannot be the
 					// signature failure — dropping it would silently lose valid context.
 					const replaysAsNativeThinking = mustPreserveLatestAnthropicThinking || isSameModel;
-					// The same holds for another credential's thinking: only the native,
-					// signature-bearing replay is bound to the account that minted it.
-					if ((dropAssistantThinkingForRepair || foreignCredentialThinking) && replaysAsNativeThinking) return [];
+					if (dropAssistantThinkingForRepair && replaysAsNativeThinking) return [];
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty — but only for non-Anthropic APIs where
@@ -281,10 +260,7 @@ export function transformMessages<TApi extends Api>(
 					// Same restriction as thinking blocks: cross-model/provider redacted
 					// blocks already drop below, so repair only needs to cover blocks that
 					// would replay as native redacted_thinking.
-					if (
-						(dropAssistantThinkingForRepair || foreignCredentialThinking) &&
-						(mustPreserveLatestAnthropicThinking || isSameModel)
-					) {
+					if (dropAssistantThinkingForRepair && (mustPreserveLatestAnthropicThinking || isSameModel)) {
 						return [];
 					}
 					if (mustPreserveLatestAnthropicThinking) return block;

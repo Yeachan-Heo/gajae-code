@@ -445,7 +445,7 @@ describe("assistant message credential attribution through a real session", () =
 		expect(assistants[1]?.credentialId).toBe(rowIdForKey(authStorage, "stored-key-a"));
 	});
 
-	it("does not replay the previous account's signed thinking after an account move mid tool loop", async () => {
+	it("replays the previous account's signed and redacted thinking unchanged after an account move mid tool loop", async () => {
 		const dir = tempDirs.tempDirSync("@assistant-credential-attribution-anthropic-").path();
 		await Bun.write(path.join(dir, "notes.txt"), "tool output\n");
 		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
@@ -455,6 +455,8 @@ describe("assistant message credential attribution through a real session", () =
 			PROVIDER,
 			storedKeys.map(key => ({ type: "api_key" as const, key })),
 		);
+		// Resolve both rows up front: invalidating the rejected key may retire its row.
+		const rowByKey = new Map(storedKeys.map(key => [key, rowIdForKey(authStorage, key)] as const));
 		const bundled = getBundledModel(PROVIDER, "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected bundled anthropic model");
 		const model = bundled as Model<"anthropic-messages">;
@@ -478,7 +480,7 @@ describe("assistant message credential attribution through a real session", () =
 			requests.push({ key, body });
 			firstKey ??= key;
 			if (requests.length === 1) {
-				// Account A answers with signed thinking and a tool call.
+				// Account A answers with signed thinking, redacted thinking and a tool call.
 				return sse([
 					{ type: "message_start", message: { id: "msg_a", usage: { ...usageEvent, output_tokens: 0 } } },
 					{
@@ -497,17 +499,28 @@ describe("assistant message credential attribution through a real session", () =
 						delta: { type: "signature_delta", signature: "sig_row_a_turn" },
 					},
 					{ type: "content_block_stop", index: 0 },
+					// A text block separates the thinking blocks so the adjacent-thinking
+					// collapse (issue #4416) keeps both.
+					{ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "checking" } },
+					{ type: "content_block_stop", index: 1 },
 					{
 						type: "content_block_start",
-						index: 1,
+						index: 2,
+						content_block: { type: "redacted_thinking", data: "redacted_row_a_turn" },
+					},
+					{ type: "content_block_stop", index: 2 },
+					{
+						type: "content_block_start",
+						index: 3,
 						content_block: { type: "tool_use", id: "toolu_attr_1", name: "read", input: {} },
 					},
 					{
 						type: "content_block_delta",
-						index: 1,
+						index: 3,
 						delta: { type: "input_json_delta", partial_json: JSON.stringify({ path: "notes.txt" }) },
 					},
-					{ type: "content_block_stop", index: 1 },
+					{ type: "content_block_stop", index: 3 },
 					{
 						type: "message_delta",
 						delta: { stop_reason: "tool_use" },
@@ -560,13 +573,31 @@ describe("assistant message credential attribution through a real session", () =
 		expect(servedByB.length).toBeGreaterThan(0);
 		expect(new Set(requests.map(request => request.key))).toEqual(new Set(storedKeys));
 		for (const request of servedByB) {
-			// The continuation still carries the tool loop, but not account A's signature.
-			expect(request.body).toContain("toolu_attr_1");
-			expect(request.body).not.toContain("sig_row_a_turn");
+			// The credential row does not decide replay: B receives A's thinking verbatim
+			// and the provider decides what the signature is valid for.
+			const body = JSON.parse(request.body) as {
+				messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }>;
+			};
+			const turnA = body.messages.find(
+				message =>
+					message.role === "assistant" &&
+					Array.isArray(message.content) &&
+					message.content.some(block => block.type === "tool_use" && block.id === "toolu_attr_1"),
+			);
+			expect(turnA?.content).toEqual([
+				{ type: "thinking", thinking: "row A reasoning", signature: "sig_row_a_turn" },
+				expect.objectContaining({ type: "text", text: "checking" }),
+				{ type: "redacted_thinking", data: "redacted_row_a_turn" },
+				expect.objectContaining({ type: "tool_use", id: "toolu_attr_1", name: "read" }),
+			]);
 		}
+		const rowA = rowByKey.get(firstKey ?? "");
+		const rowB = rowByKey.get(servedByB[0]?.key ?? "");
+		expect(rowA).toBeDefined();
+		expect(rowB).toBeDefined();
+		expect(rowB).not.toBe(rowA);
 		const assistants = await persistedAssistants(sessionManager);
-		const last = assistants.at(-1);
-		expect(last?.stopReason).toBe("stop");
-		expect(last?.credentialId).toBe(rowIdForKey(authStorage, servedByB[0]?.key ?? ""));
+		expect(assistants.map(message => message.stopReason)).toEqual(["toolUse", "stop"]);
+		expect(assistants.map(message => message.credentialId)).toEqual([rowA, rowB]);
 	}, 30_000);
 });

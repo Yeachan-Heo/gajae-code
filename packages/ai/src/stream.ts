@@ -1279,9 +1279,6 @@ function mapOptionsForApi<TApi extends Api>(
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		apiKey: apiKey || options?.apiKey,
-		// Same id `streamSimple` stamps on the response; signing providers use it to
-		// gate replay of thinking bound to another credential.
-		credentialId: attributableCredentialId(model, options),
 		authCredentialType: options?.authCredentialType,
 		fallbackManaged: options?.fallbackManaged,
 		fallbackAttempt: options?.fallbackAttempt,
