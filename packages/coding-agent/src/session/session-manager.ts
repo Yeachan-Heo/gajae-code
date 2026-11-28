@@ -8113,11 +8113,6 @@ export class SessionManager {
 	 * rewrite is refused until each concurrent publication has settled.
 	 */
 	readonly #activeSharedMutationSessionCounts = new Map<string, number>();
-	/** Short-lived durable thinking commits, shared by local managers of the same logical session. */
-	static readonly #durableThinkingControls = new Map<string, number>();
-	static readonly #legacyThinkingControls = new Map<string, number>();
-	/** Process-local overlap only; permanent shared admission remains owned by each manager. */
-	static readonly #sharedPublicationsInFlight = new Map<string, number>();
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
 	/**
@@ -20607,33 +20602,6 @@ export class SessionManager {
 			cursorId,
 			cursorUnpublished: cursorId !== null && unpublishedIds.includes(cursorId),
 		};
-	}
-
-	/** Hold shared-publication admission through settings and live thinking publication. */
-	async withDurableThinkingControl<T>(body: () => Promise<T>): Promise<T> {
-		this.assertLegacyMutationAllowed("set thinking level");
-		const sessionId = this.#sessionId;
-		if (
-			SessionManager.#sharedPublicationsInFlight.has(sessionId) ||
-			(SessionManager.#durableThinkingControls.get(sessionId) ?? 0) !==
-				(SessionManager.#legacyThinkingControls.get(sessionId) ?? 0)
-		) {
-			throw new SharedSessionMutationUnsupportedError("set thinking level during shared publication");
-		}
-		const controls = SessionManager.#durableThinkingControls;
-		const legacy = SessionManager.#legacyThinkingControls;
-		controls.set(sessionId, (controls.get(sessionId) ?? 0) + 1);
-		legacy.set(sessionId, (legacy.get(sessionId) ?? 0) + 1);
-		try {
-			return await body();
-		} finally {
-			const remaining = controls.get(sessionId)! - 1;
-			if (remaining === 0) controls.delete(sessionId);
-			else controls.set(sessionId, remaining);
-			const remainingLegacy = legacy.get(sessionId)! - 1;
-			if (remainingLegacy === 0) legacy.delete(sessionId);
-			else legacy.set(sessionId, remainingLegacy);
-		}
 	}
 
 	/** Whether this logical session must keep using shared mutation admission. */

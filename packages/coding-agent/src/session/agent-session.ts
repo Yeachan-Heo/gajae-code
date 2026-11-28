@@ -25351,10 +25351,7 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
-		if (persist) {
-			return this.sessionManager.withDurableThinkingControl(() => this.#setThinkingLevelForControl(level, true));
-		}
-		return this.#setThinkingLevelForControl(level, false);
+		return this.#setThinkingLevelForControl(level, persist);
 	}
 
 	/** Non-operator, session-only thinking change (plan mode model follow): the synchronous legacy write. */
