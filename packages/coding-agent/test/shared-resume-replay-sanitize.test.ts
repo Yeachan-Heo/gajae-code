@@ -11,8 +11,12 @@
  * Loading a transcript sanitizes stale OpenAI Responses replay metadata. On a managed
  * destination that sanitation is resident-only, so it must not need shared admission
  * and must not change the transcript.
+ *
+ * Only a session on the shared-publication layer latches those bars. Since single-owner
+ * step 10a none does in production, so the cases enter the layer through
+ * `routeThroughSharedPublication` and go with it in steps 10b-10e.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
@@ -22,9 +26,7 @@ import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -65,6 +67,7 @@ interface Fixture {
 }
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	const failures: unknown[] = [];
 	const cleanup: Array<() => unknown> = [
 		...sessions.splice(0).map(session => () => session.dispose()),
@@ -170,9 +173,8 @@ async function fixture(): Promise<Fixture> {
 		settings,
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
-		// Mirrors sdk/session.ts for a trusted root interactive CLI TUI session (#7711).
-		rootInteractiveSharedAppend: true,
 	});
+	routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
 	return { session, manager, file, staleId };

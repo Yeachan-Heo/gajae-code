@@ -545,45 +545,56 @@ describe.skipIf(process.platform === "win32")("/fork in a single interactive TUI
 		}
 	}, 240_000);
 
-	it("never writes the shared transcript when /fork runs beside a peer TUI", async () => {
+	it("never writes the original when /fork runs in a TUI a peer's write stopped", async () => {
 		const { root, cwd, agent, sessions, cli, model } = await fixture();
 		try {
 			// Two writers on one session exist only below the default `enforce`, which gives the
-			// second TUI the held-session warning instead; this case covers the shared layer.
+			// second TUI the held-session warning instead. Below it, both write on the legacy route.
 			const a = startTui({ cli, cwd, root, agent, ownership: "observe" });
 			await ready(a);
 			a.pty.write("fork-a1\r");
-			const shared = await only(sessions);
-			await replied(shared, "fork-a1");
-			const sessionId = (await readTranscript(shared)).header.id;
+			const original = await only(sessions);
+			await replied(original, "fork-a1");
+			const sessionId = (await readTranscript(original)).header.id;
 			const b = startTui({ cli, cwd, root, agent, extra: ["--resume", sessionId], ownership: "observe" });
 			await ready(b);
 			b.pty.write("fork-b1\r");
-			await replied(shared, "fork-b1");
+			await replied(original, "fork-b1");
+			// A's view predates B's turn: its next write stops with the identity-mismatch message.
+			const stop = a.mark();
 			a.pty.write("fork-a2\r");
-			await replied(shared, "fork-a2");
-
-			for (const tui of [a, b]) {
-				const bytes = Buffer.from(await Bun.file(shared).arrayBuffer());
-				const mark = tui.mark();
-				tui.pty.write("/fork\r");
-				// The peer's sibling branch is foreign to this opener: the fork is refused,
-				// before the picker opens or, at the latest, when a prompt is selected.
-				await waitFor(() => /Fork failed|›\s*fork-[ab]\d/.test(since(tui, mark)), 30_000, "fork refusal or picker");
-				if (!/Fork failed/.test(since(tui, mark))) tui.pty.write("\r");
-				await waitFor(() => /Fork failed/.test(since(tui, mark)), 30_000, "fork refusal");
-				expect(since(tui, mark)).toMatch(
-					/Cannot fork this session: another gjc process has written to this session/,
-				);
-				expect(await transcriptFiles(sessions)).toEqual([shared]);
-				expect(Buffer.from(await Bun.file(shared).arrayBuffer())).toEqual(bytes);
-			}
-			// Both openers keep working on the shared session.
-			a.pty.write("fork-a3\r");
-			await replied(shared, "fork-a3");
+			await waitFor(
+				() => since(a, stop).includes("Another process changed this session's transcript"),
+				60_000,
+				"the identity-mismatch stop",
+				() => screenSince(a, stop),
+			);
+			await quiet(a);
+			expect(messagesWith((await readTranscript(original)).entries, "fork-a2")).toHaveLength(0);
+			const bytes = Buffer.from(await Bun.file(original).arrayBuffer());
+			// The stopped process's /fork is refused, before the picker opens or, at the latest, when a
+			// prompt is selected; nothing is written and no copy appears.
+			const mark = a.mark();
+			a.pty.write("/fork\r");
+			await waitFor(
+				() => /Error:|›\s*fork-a\d/.test(since(a, mark)),
+				30_000,
+				"fork refusal or picker",
+				() => screenSince(a, mark),
+			);
+			if (!/Error:/.test(since(a, mark))) a.pty.write("\r");
+			await waitFor(
+				() => since(a, mark).includes("Another process changed this session's transcript"),
+				30_000,
+				"fork refusal",
+				() => screenSince(a, mark),
+			);
+			await quiet(a);
+			expect(await transcriptFiles(sessions)).toEqual([original]);
+			expect(Buffer.from(await Bun.file(original).arrayBuffer())).toEqual(bytes);
+			// B keeps writing the original.
 			b.pty.write("fork-b2\r");
-			await replied(shared, "fork-b2");
-			expect(await transcriptFiles(sessions)).toEqual([shared]);
+			await replied(original, "fork-b2");
 		} finally {
 			await model.server.stop(true);
 		}
@@ -632,28 +643,14 @@ async function navigateTree(tui: Tui, file: string, keys: string[], cursorOn: Re
 	return { mark, count };
 }
 
-/** `command` is refused as a shared-session mutation naming `operation`, before any transcript write. */
-async function refusedBeforeEffect(tui: Tui, file: string, command: string, operation: string) {
-	await quiet(tui);
-	const bytes = Buffer.from(await Bun.file(file).arrayBuffer());
-	const mark = tui.mark();
-	tui.pty.write(`${command}\r`);
-	await waitFor(
-		() => since(tui, mark).includes(`Shared session mutation requires transaction admission: ${operation}`),
-		30_000,
-		`${command} refusal`,
-		() => screenSince(tui, mark),
-	);
-	await quiet(tui);
-	expect(Buffer.from(await Bun.file(file).arrayBuffer())).toEqual(bytes);
-}
-
-// Single-owner step 9 (design §7.2 #7): one TUI, no peer. Under enforce it holds its session's claim
-// alone, so after its first messages every control takes effect. Under observe it still publishes
-// through the shared layer, whose bars refuse the rewrite controls before any effect.
+// Single-owner design §7.2 #7: one TUI, no peer. Since step 10a it writes on the legacy route in every
+// ownership mode, so after its first messages every control takes effect, claimed or not.
 describe.skipIf(process.platform === "win32")("single-TUI control matrix", () => {
-	it("enforce: star, rename, rewind, tree summary, compaction, move, /fork and /drop all take effect", async () => {
-		const { root, cwd, agent, sessions, cli, model } = await fixture({ ownership: "enforce", branchSummaries: true });
+	it.each([
+		"enforce",
+		"observe",
+	] as const)("%s: star, rename, rewind, tree summary, compaction, move, /fork and /drop all take effect", async ownership => {
+		const { root, cwd, agent, sessions, cli, model } = await fixture({ ownership, branchSummaries: true });
 		try {
 			const tui = startTui({ cli, cwd, root, agent });
 			await ready(tui);
@@ -745,38 +742,6 @@ describe.skipIf(process.platform === "win32")("single-TUI control matrix", () =>
 			await waitFor(() => /Session dropped/.test(since(tui, dropMark)), 30_000, "drop confirmation");
 			expect(since(tui, dropMark)).not.toMatch(REFUSAL);
 			expect(Buffer.from(await Bun.file(moved!).arrayBuffer())).toEqual(fork.sourceBytes);
-		} finally {
-			await model.server.stop(true);
-		}
-	}, 240_000);
-
-	it("observe: star, tree summary, move and /drop refuse before any effect", async () => {
-		const { root, cwd, agent, sessions, cli, model } = await fixture({ ownership: "observe", branchSummaries: true });
-		try {
-			const tui = startTui({ cli, cwd, root, agent });
-			await ready(tui);
-			tui.pty.write("fork-o1\r");
-			const source = await only(sessions);
-			await replied(source, "fork-o1");
-			tui.pty.write("fork-o2\r");
-			await replied(source, "fork-o2");
-
-			await refusedBeforeEffect(tui, source, "/star", "set session starred");
-			const bytes = Buffer.from(await Bun.file(source).arrayBuffer());
-			const summary = await navigateTree(tui, source, [UP, UP], /›\s*▸\s*assistant: fork-o1-reply/, true);
-			await waitFor(
-				() => since(tui, summary.mark).includes("requires transaction admission: summarize branch"),
-				30_000,
-				"tree summary refusal",
-				() => screenSince(tui, summary.mark),
-			);
-			await quiet(tui);
-			expect(Buffer.from(await Bun.file(source).arrayBuffer())).toEqual(bytes);
-			const movedCwd = path.join(root, "moved");
-			await fs.mkdir(movedCwd, { recursive: true });
-			await refusedBeforeEffect(tui, source, `/move ${movedCwd}`, "move session");
-			await refusedBeforeEffect(tui, source, "/drop", "drop session");
-			expect(await transcriptFiles(sessions)).toEqual([source]);
 		} finally {
 			await model.server.stop(true);
 		}

@@ -16,9 +16,7 @@ import { ManagedSessionDescendantStore } from "../src/session/internal/managed-s
 import { setPrimaryControlSurface } from "../src/session/primary-control-surface";
 import { SessionManager, SharedSessionMutationUnsupportedError } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -38,7 +36,7 @@ afterEach(async () => {
 
 async function fixture(
 	durableSettings = false,
-	rootInteractiveSharedAppend = false,
+	shared = false,
 	streamFn?: Agent["streamFn"],
 	withDiscoverableTool = false,
 	factory?: {
@@ -119,7 +117,7 @@ async function fixture(
 			enableLsp: false,
 			skipPythonPreflight: true,
 		};
-		Object.assign(options, { primaryControlSurface: "cli", rootInteractiveSharedAppend: true });
+		Object.assign(options, { primaryControlSurface: "cli" });
 		if (factory.cli) setPrimaryControlSurface(options, "cli");
 		session = (await createAgentSession(options)).session;
 	} else
@@ -133,8 +131,8 @@ async function fixture(
 				...(withDiscoverableTool ? [[discoveredTool.name, discoveredTool] as const] : []),
 			]),
 			rebuildSystemPrompt: rebuild,
-			rootInteractiveSharedAppend,
 		});
+	if (shared) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
 	const admit = async () => {
@@ -249,18 +247,18 @@ function snapshot(session: AgentSession) {
 }
 
 describe("shared AgentSession control admission", () => {
-	for (const [label, cli, options, admitted] of [
-		["root CLI", true, { hasUI: true }, true],
-		["SDK with forged fields", false, { hasUI: true }, false],
-		["noninteractive CLI", true, { hasUI: false }, false],
-		["task-depth child", true, { hasUI: true, taskDepth: 1 }, false],
-		["parent-prefix child", true, { hasUI: true, parentTaskPrefix: "parent" }, false],
-		["agent-type child", true, { hasUI: true, currentAgentType: "executor" }, false],
+	for (const [label, cli, options] of [
+		["root CLI", true, { hasUI: true }],
+		["SDK with forged fields", false, { hasUI: true }],
+		["noninteractive CLI", true, { hasUI: false }],
+		["task-depth child", true, { hasUI: true, taskDepth: 1 }],
+		["parent-prefix child", true, { hasUI: true, parentTaskPrefix: "parent" }],
+		["agent-type child", true, { hasUI: true, currentAgentType: "executor" }],
 	] as const) {
-		it(`factory shared authority follows trusted provenance: ${label}`, async () => {
+		it(`factory never opts an untouched session into shared publication: ${label}`, async () => {
 			const f = await fixture(false, false, undefined, false, { cli, options });
-			// Only trusted root provenance opts an untouched session into shared publication.
-			expect(f.session.usesSharedControlPublication()).toBe(admitted);
+			// Single-owner step 10a: no provenance, the root interactive TUI included, starts shared.
+			expect(f.session.usesSharedControlPublication()).toBe(false);
 			await f.admit();
 			// Once the logical session requires shared admission every provenance continues
 			// through the shared protocol (#7824) instead of being refused.

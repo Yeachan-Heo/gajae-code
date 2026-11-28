@@ -1,8 +1,9 @@
 /**
- * Regression coverage for #7856: shared root TUI sessions should allow mutations
- * through transaction admission for startup model setting with --model/--mpreset
- * and for the Move Session tool. Also covers a shared custom-message append that a
- * transcript relocation refused before writing (#7997).
+ * Regression coverage for #7856: a root TUI session allows the startup model setting
+ * with --model/--mpreset after its first message. Also covers the shared-publication
+ * layer's Move Session refusal and a shared custom-message append that a transcript
+ * relocation refused before writing (#7997); those cases enter the layer through
+ * `routeThroughSharedPublication` and go with it in single-owner steps 10b-10e.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -17,9 +18,7 @@ import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -85,7 +84,7 @@ function modelsConfig(): string {
 	});
 }
 
-async function fixture(): Promise<Fixture> {
+async function fixture(shared = true): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-issue-7856-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -153,9 +152,8 @@ async function fixture(): Promise<Fixture> {
 		settings,
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
-		// Mirrors sdk/session.ts for a trusted root interactive CLI TUI session (#7711).
-		rootInteractiveSharedAppend: true,
 	});
+	if (shared) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
 
@@ -179,9 +177,9 @@ async function canonicalMessage(f: Fixture): Promise<void> {
 	expect(await Bun.file(f.file).text()).toContain(JSON.stringify("canonical shared user"));
 }
 
-describe("#7856 setTemporaryModel in a shared root TUI session", () => {
-	it("allows setTemporaryModel at startup in a shared session without throwing SharedSessionMutationUnsupportedError", async () => {
-		const f = await fixture();
+describe("#7856 setTemporaryModel in a root TUI session", () => {
+	it("allows setTemporaryModel at startup after the first message without throwing SharedSessionMutationUnsupportedError", async () => {
+		const f = await fixture(false);
 		await canonicalMessage(f);
 
 		const model = f.registry.find(provider, "selected");

@@ -16,9 +16,7 @@ import {
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
-import { pinSharedPublicationMode } from "./helpers/shared-publication-mode";
-
-pinSharedPublicationMode();
+import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -87,9 +85,9 @@ async function fixture(options?: { sharedAppend?: boolean }) {
 		sessionManager: manager,
 		settings,
 		modelRegistry: registry,
-		rootInteractiveSharedAppend: options?.sharedAppend ?? true,
 		thinkingLevel: ThinkingLevel.Off,
 	});
+	if (options?.sharedAppend ?? true) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	return { session, manager, file: manager.getSessionFile()!, destination };
 }

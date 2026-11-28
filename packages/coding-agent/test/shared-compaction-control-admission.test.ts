@@ -23,7 +23,7 @@ const registries: ModelRegistry[] = [];
 
 const user = (content: string, timestamp = 1) => ({ role: "user" as const, content, timestamp });
 
-async function sessionFixture(rootInteractiveSharedAppend: boolean) {
+async function sessionFixture() {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-compaction-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -97,14 +97,15 @@ async function sessionFixture(rootInteractiveSharedAppend: boolean) {
 		}),
 		modelRegistry: registry,
 		extensionRunner: runner,
-		rootInteractiveSharedAppend,
 	});
 	sessions.push(session);
 	return { manager, session, file, destination, runner };
 }
 
 async function fixture() {
-	const base = await sessionFixture(true);
+	const base = await sessionFixture();
+	// The latched bar is the layer's one remaining entry (single-owner step 10a); these cases go with
+	// the layer in steps 10b-10e.
 	const shared = await base.manager.appendMessageSharingSession(user("root shared canonical turn", 100));
 	if (shared.kind !== "committed") throw new Error(`Could not admit root shared append: ${shared.kind}`);
 	return { ...base, shared };
@@ -577,7 +578,7 @@ describe("transcript-size emergency floor", () => {
 	];
 	for (const { name, shared, providerBytes, compacts } of cases) {
 		it(name, async () => {
-			const { manager, session } = shared ? await fixture() : await sessionFixture(false);
+			const { manager, session } = shared ? await fixture() : await sessionFixture();
 			session.agent.streamFn = answer;
 			// Above the 48 MiB transcript floor; only the provider-context floor can also fire.
 			session.setResourceSampler(() => ({

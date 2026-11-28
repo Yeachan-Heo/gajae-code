@@ -21033,20 +21033,6 @@ export class SessionManager {
 	}
 
 	/**
-	 * Whether this manager is the only writer of its current session, so a root interactive session
-	 * may write it on the legacy route instead of shared publication (single-owner step 9, design
-	 * §13 M3): a managed destination whose claim this manager holds under enforce, alone in this
-	 * process, before any shared publication of the id here (no bar latched, none in flight). Once
-	 * true for this manager and id it stays true; a claim in flight answers false without deciding.
-	 */
-	isSoleOwnerRoute(): boolean {
-		const sessionId = this.#sessionId;
-		if (this.#ownershipClaims.isSoleOwnerRoute(sessionId)) return true;
-		if (this.destination.kind !== "managed" || this.#publishedSharedSession(sessionId)) return false;
-		return this.#ownershipClaims.enterSoleOwnerRoute(sessionId);
-	}
-
-	/**
 	 * Refuse, with {@link ManagedAppendIdentityMismatchError}, a destructive control (`/drop`) on a
 	 * managed transcript that is no longer the one this manager last wrote or bound: a writer it
 	 * cannot see (ownership off, an older binary) changed it, and its entries would go with it.
