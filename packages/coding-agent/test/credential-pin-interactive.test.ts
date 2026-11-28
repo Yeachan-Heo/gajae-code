@@ -124,17 +124,18 @@ describe("interactive OAuth credential pinning", () => {
 		expect(statuses).toEqual(["Pinned OAuth account for anthropic to this session."]);
 	});
 
-	// A refused shared write (#7824) used to escape the `void` selector callback as an
+	// A refused write (#7824) used to escape the `void` selector callback as an
 	// unhandled rejection that the crash handler recorded as a fatal GJC crash.
 	for (const target of ["pin", "auto"] as const) {
-		test(`reports a refused shared ${target} write without an unhandled rejection`, async () => {
+		test(`reports a refused ${target} write without an unhandled rejection`, async () => {
 			const authStorage = await createAuthStorage();
+			// The refusal a credential control raises when its session was replaced while it awaited.
 			const refused = () =>
 				Promise.reject(
 					new SharedControlPublicationError("change credential selection", {
-						kind: "stale",
-						reason: "transcript_moved",
-					} as never),
+						kind: "rejected",
+						error: new Error("publication_mode_changed"),
+					}),
 				);
 			const errors: string[] = [];
 			const statuses: string[] = [];

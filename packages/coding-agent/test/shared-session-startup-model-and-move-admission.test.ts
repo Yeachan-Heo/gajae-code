@@ -1,8 +1,8 @@
 /**
  * Regression coverage for #7856: a root TUI session allows the startup model setting
  * with --model/--mpreset after its first message. Also covers the shared-publication
- * layer's Move Session refusal; that case enters the layer through
- * `routeThroughSharedPublication` and goes with it in single-owner steps 10c-10e.
+ * layer's Move Session refusal; that case latches the manager's shared bars directly and
+ * goes with the layer in single-owner steps 10d-10e.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -17,7 +17,6 @@ import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
-import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -83,7 +82,7 @@ function modelsConfig(): string {
 	});
 }
 
-async function fixture(shared = true): Promise<Fixture> {
+async function fixture(): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-issue-7856-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -152,7 +151,6 @@ async function fixture(shared = true): Promise<Fixture> {
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
 	});
-	if (shared) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
 
@@ -178,7 +176,7 @@ async function canonicalMessage(f: Fixture): Promise<void> {
 
 describe("#7856 setTemporaryModel in a root TUI session", () => {
 	it("allows setTemporaryModel at startup after the first message without throwing SharedSessionMutationUnsupportedError", async () => {
-		const f = await fixture(false);
+		const f = await fixture();
 		await canonicalMessage(f);
 
 		const model = f.registry.find(provider, "selected");

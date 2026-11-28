@@ -2,22 +2,17 @@
  * Regression coverage for #7823 and #7824: after a root interactive TUI session's first
  * messages, user controls (model presets, /fast, the settings effort control, model, tool and
  * /rename, profile reloads, /fork) keep working. Since single-owner step 10a a root TUI writes on
- * the legacy route, and these cases run there.
- *
- * Cases built with `{ shared: true }` cover the shared-publication layer's own protocol (its
- * refusals, unknown outcomes, peer siblings and leases). They enter the layer through
- * `routeThroughSharedPublication` and go with it in steps 10b-10e.
+ * the legacy route, and these cases run there. The remaining peer-sibling, lease and star cases
+ * exercise SessionManager-level shared primitives directly.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type { ConfigHotReloadCandidate } from "../src/config/config-hot-reload";
 import { activateModelProfile, materializeActiveModelProfileAssignments } from "../src/config/model-profile-activation";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
-import { initializeLocalRoot } from "../src/internal-urls/local-protocol";
 import { CommandController } from "../src/modes/controllers/command-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { setThemeInstance } from "../src/modes/theme/theme";
@@ -28,7 +23,6 @@ import { managedSessionTransactionLocksDirectory } from "../src/session/internal
 import { withManagedSessionTransaction } from "../src/session/internal/managed-session-transaction";
 import { type SessionInfo, SessionManager } from "../src/session/session-manager";
 import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
-import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 import { loadTestTheme } from "./helpers/test-theme";
 
 const roots: string[] = [];
@@ -104,7 +98,7 @@ function modelsConfig(profileDefault: readonly string[]): string {
 	});
 }
 
-async function fixture(options: { streamFn?: Agent["streamFn"]; shared?: boolean } = {}): Promise<Fixture> {
+async function fixture(): Promise<Fixture> {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-root-control-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -153,11 +147,9 @@ async function fixture(options: { streamFn?: Agent["streamFn"]; shared?: boolean
 			tools: [],
 			messages: manager.buildSessionContext().messages,
 		},
-		streamFn:
-			options.streamFn ??
-			(() => {
-				throw new Error("Shared root controls must not request a provider");
-			}),
+		streamFn: () => {
+			throw new Error("Shared root controls must not request a provider");
+		},
 	});
 	const session = new AgentSession({
 		agent,
@@ -167,22 +159,12 @@ async function fixture(options: { streamFn?: Agent["streamFn"]; shared?: boolean
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Low,
 	});
-	if (options.shared) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	await manager.flush();
-	if (options.streamFn) {
-		// A managed prompt resolves local:// synchronously; settle the legacy migration gate.
-		await initializeLocalRoot({
-			getSessionId: () => manager.getSessionId(),
-			getArtifactsDir: () => manager.getArtifactsDir(),
-			isManagedDestination: () => manager.isManagedDestination(),
-			getManagedLegacyLocalMigrationSource: () => manager.getManagedLegacyLocalMigrationSource(),
-		});
-	}
 	return { session, manager, registry, settings, file, cwd, agentDir };
 }
 
-/** Ordinary root TUI conversation: the canonical message is persisted (shared append under `shared`). */
+/** Ordinary root TUI conversation: the canonical message is persisted. */
 async function canonicalMessage(f: Fixture, text = "canonical shared user"): Promise<void> {
 	f.session.agent.emitExternalEvent({ type: "message_end", message: user(text) });
 	await f.session.awaitSessionSettlement();
@@ -383,43 +365,8 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 		expect((await Bun.file(f.file).text()).startsWith(bytes)).toBe(true);
 	});
 
-	it("publishes credential AUTO before changing the live selection", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const leaf = f.manager.getLeafId();
-		const auth = f.registry.authStorage;
-		const live = vi.spyOn(auth, "setSessionCredentialAuto");
-		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
-		await f.session.setCredentialAuto(provider);
-		expect(publish).toHaveBeenCalledTimes(1);
-		expect(publish.mock.invocationCallOrder[0]).toBeLessThan(live.mock.invocationCallOrder[0]!);
-		expect(f.manager.getLeafEntry()).toMatchObject({
-			type: "custom",
-			customType: "auth-credential-pin",
-			parentId: leaf,
-			data: { provider, pin: { auto: true } },
-		});
-	});
-
-	it("leaves the live credential selection unchanged when the shared write is refused", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const bytes = await Bun.file(f.file).text();
-		const live = vi.spyOn(f.registry.authStorage, "setSessionCredentialAuto");
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		await expect(f.session.setCredentialAuto(provider)).rejects.toMatchObject({
-			name: "SharedControlPublicationError",
-			code: "stale",
-		});
-		expect(live).not.toHaveBeenCalled();
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-
 	it("/rename publishes the title through admitted shared publication", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		await canonicalMessage(f);
 		const showError = vi.fn();
 		const showStatus = vi.fn();
@@ -441,7 +388,7 @@ describe("#7824 model, effort, tool and credential controls in a shared root TUI
 	});
 
 	it("refuses /drop before switching instead of reporting a drop that never happened", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		await sharedCanonicalMessage(f);
 		const sessionId = f.session.sessionId;
 		const bytes = await Bun.file(f.file).text();
@@ -481,29 +428,6 @@ describe("#7824 profile assignment materialization in a shared root TUI session"
 		const reopened = (await reopen(f)).buildSessionContext();
 		expect(reopened.configuredModelChains.default).toMatchObject({ origin: "modelRoles" });
 		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
-	});
-
-	it("fails closed without a legacy write when the chain publication is refused after the settings commit", async () => {
-		const f = await fixture({ shared: true });
-		await activatePreset(f);
-		await canonicalMessage(f);
-		const bytes = await Bun.file(f.file).text();
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		const error = await materializeActiveModelProfileAssignments({
-			session: f.session,
-			settings: f.settings,
-			assignments: assignments(),
-		}).catch((caught: unknown) => caught);
-		expect(error).toMatchObject({ name: "ModelProfileApplyCommittedError" });
-		expect((error as Error).cause).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
-		expect(String((error as Error).message)).not.toContain("rollback incomplete");
-		expect(f.session.sessionLifecycle.disposed).toBe(true);
-		// The live profile overrides were never touched and the transcript is unchanged.
-		expect(f.session.getActiveModelProfile()).toBe(profileName);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
 	});
 });
 
@@ -551,253 +475,6 @@ describe("#7824 configuration reload that changes the active profile in a shared
 		expect(reopened.configuredModelChains.default).toMatchObject({ entries: reloadedChain });
 		expect(reopened.messages.at(-1)).toMatchObject({ content: "canonical shared user" });
 	});
-
-	it("rolls back only the staged catalog when the reload publication is refused", async () => {
-		const f = await fixture({ shared: true });
-		await activatePreset(f);
-		await canonicalMessage(f);
-		const bytes = await Bun.file(f.file).text();
-		const candidate = await reloadCandidate(f, 1);
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		const error = await f.session
-			.reloadConfiguration(candidate, new AbortController().signal)
-			.catch((caught: unknown) => caught);
-		expect(error).toMatchObject({ name: "ConfigurationReloadError", code: "PUBLICATION_FAILED" });
-		expect((error as Error).cause).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
-		expect(f.session.model).toMatchObject({ provider, id: "selected" });
-		expect(f.session.getConfiguredModelChainState("default")).toMatchObject({ entries: defaultChain });
-		expect(f.registry.getModelProfile(profileName)).toBeDefined();
-		expect(f.session.sessionLifecycle.disposed).toBe(false);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-});
-
-describe("#7824 default fallback resolution in a shared root TUI session", () => {
-	const missingSelector = `${provider}/missing`;
-	const streamFn: Agent["streamFn"] = (model, context, options) =>
-		createMockModel({ responses: [{ content: ["fallback reply"] }] }).stream(model, context, options);
-
-	it("publishes the thinking change of a fallback switch before switching the model", async () => {
-		const f = await fixture({ streamFn, shared: true });
-		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
-		await canonicalMessage(f);
-		const before = await Bun.file(f.file).text();
-		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
-		await f.session.prompt("use the fallback");
-		await f.session.awaitSessionSettlement();
-		expect(f.session.model).toMatchObject({ provider, id: "fallback" });
-		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
-		expect(publish).toHaveBeenCalledWith(
-			[{ type: "thinking_level_change", level: ThinkingLevel.High, operatorIntent: false }],
-			expect.any(Function),
-		);
-		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
-		const reopened = (await reopen(f)).buildSessionContext();
-		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
-	});
-
-	it("leaves model and fallback state untouched when the thinking publication is refused", async () => {
-		const f = await fixture({ streamFn, shared: true });
-		f.session.setConfiguredModelChain("default", [missingSelector, `${fallbackSelector}:high`], "modelRoles");
-		await canonicalMessage(f);
-		const fallbackState = f.session.getDefaultFallbackRuntimeState();
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "rejected",
-			error: new Error("refused"),
-		});
-		const error = await f.session.prompt("use the fallback").catch((caught: unknown) => caught);
-		expect(error).toMatchObject({ name: "SharedControlPublicationError", code: "rejected" });
-		expect(String((error as Error).message)).not.toContain("rollback");
-		expect(f.session.model).toMatchObject({ provider, id: "initial" });
-		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(f.session.getDefaultFallbackRuntimeState()).toEqual(fallbackState);
-		expect(f.session.sessionLifecycle.disposed).toBe(false);
-	});
-});
-
-describe("#7824 /clear in a shared root TUI session", () => {
-	async function peerSibling(f: Fixture): Promise<string> {
-		const peer = await reopen(f);
-		const outcome = await peer.appendMessageSharingSession(user("unseen peer sibling"));
-		if (outcome.kind !== "committed") throw new Error(`peer append ${outcome.kind}`);
-		return outcome.id;
-	}
-
-	it("publishes a parentless context_clear root additively and keeps the unseen sibling", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const siblingId = await peerSibling(f);
-		const before = await Bun.file(f.file).text();
-		const sessionId = f.session.sessionId;
-		expect(await f.session.clearContext()).toBe(true);
-		expect(f.session.sessionId).toBe(sessionId);
-		expect(f.session.agent.state.messages).toEqual([]);
-		const after = await Bun.file(f.file).text();
-		// Additive publication: every committed byte, including the peer's sibling, survives.
-		expect(after.startsWith(before)).toBe(true);
-		const branch = f.manager.getBranch();
-		expect(branch[0]).toMatchObject({
-			type: "custom",
-			customType: "context_clear",
-			parentId: null,
-			data: { sessionId },
-		});
-		expect(branch.map(entry => entry.type)).toEqual([
-			"custom",
-			"thinking_level_change",
-			"model_change",
-			"service_tier_change",
-		]);
-		const reopened = await reopen(f);
-		expect(reopened.getEntry(siblingId)).toMatchObject({ type: "message" });
-		const context = reopened.buildSessionContext();
-		expect(context.messages).toEqual([]);
-		expect(context.models.default).toBe(initialSelector);
-		expect(context.thinkingLevel).toBe(ThinkingLevel.Low);
-
-		// The next canonical message descends from the shared root, not the old branch.
-		await canonicalMessage(f, "after clear");
-		const next = (await reopen(f)).buildSessionContext();
-		expect(next.messages.map(message => message.role === "user" && message.content)).toEqual(["after clear"]);
-	});
-
-	it("refuses /clear before resetting when the shared transcript moved", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const messages = structuredClone(f.session.agent.state.messages);
-		const bytes = await Bun.file(f.file).text();
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		const error = await f.session.clearContext().catch((caught: unknown) => caught);
-		expect(error).toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
-		expect(String((error as Error).message)).not.toContain("rollback");
-		expect(f.session.agent.state.messages).toEqual(messages);
-		expect(f.session.sessionLifecycle.disposed).toBe(false);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-
-	it("closes the session instead of resetting when the /clear outcome is unknown", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const messages = structuredClone(f.session.agent.state.messages);
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "unknown",
-			ids: ["clear-root"],
-			error: new Error("durability_unproven"),
-		});
-		await expect(f.session.clearContext()).rejects.toMatchObject({
-			name: "SharedControlPublicationError",
-			code: "unknown",
-		});
-		expect(f.session.agent.state.messages).toEqual(messages);
-		expect(f.session.sessionLifecycle.disposed).toBe(true);
-	});
-});
-
-describe("#7824 selector compensation in a shared root TUI session", () => {
-	it("publishes only the differing model and thinking before restoring them live", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const before = await Bun.file(f.file).text();
-		const leaf = f.manager.getLeafId();
-		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
-		const fallback = f.registry.find(provider, "fallback")!;
-		await f.session.restoreModelSelectionForRollback(fallback, ThinkingLevel.High, {
-			resumeDefault: { selector: initialSelector },
-		});
-		// The resume default already matches the snapshot, so only model and thinking publish.
-		expect(publish).toHaveBeenCalledTimes(1);
-		expect(publish.mock.calls[0]![0]).toEqual([
-			{ type: "model_change", model: fallbackSelector, role: "temporary" },
-			{ type: "thinking_level_change", level: ThinkingLevel.High, operatorIntent: false },
-		]);
-		expect(f.session.model).toBe(fallback);
-		expect(f.session.thinkingLevel).toBe(ThinkingLevel.High);
-		expect(f.manager.getBranch().find(entry => entry.parentId === leaf)).toMatchObject({ type: "model_change" });
-		expect((await Bun.file(f.file).text()).startsWith(before)).toBe(true);
-		const reopened = (await reopen(f)).buildSessionContext();
-		expect(reopened.models).toMatchObject({ default: initialSelector, temporary: fallbackSelector });
-		expect(reopened.thinkingLevel).toBe(ThinkingLevel.High);
-	});
-
-	it("restores a changed chain and resume default in the same publication", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const selected = f.registry.find(provider, "selected")!;
-		const initial = f.session.model;
-		const chain = f.session.getConfiguredModelChainState("default");
-		await f.session.setDefaultModelSelection(selected, ThinkingLevel.High);
-		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
-		await f.session.restoreModelSelectionForRollback(initial, ThinkingLevel.Low, {
-			defaultChain: { state: chain },
-			resumeDefault: { selector: initialSelector },
-		});
-		expect(publish).toHaveBeenCalledTimes(1);
-		expect(publish.mock.calls[0]![0].map(entry => entry.type)).toEqual([
-			"configured_model_chain",
-			"model_change",
-			"model_change",
-			"thinking_level_change",
-		]);
-		expect(f.session.model).toBe(initial);
-		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
-		const reopened = (await reopen(f)).buildSessionContext();
-		expect(reopened.models).toMatchObject({ default: initialSelector, temporary: initialSelector });
-		expect(reopened.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(reopened.configuredModelChains.default?.entries ?? []).toEqual(chain?.entries ?? []);
-	});
-
-	it("writes nothing when the captured state already matches", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const bytes = await Bun.file(f.file).text();
-		const publish = vi.spyOn(f.manager, "appendControlEntriesSharingSession");
-		await f.session.restoreModelSelectionForRollback(f.session.model, ThinkingLevel.Low, {
-			defaultChain: { state: f.session.getConfiguredModelChainState("default") },
-			resumeDefault: { selector: initialSelector },
-		});
-		expect(publish).not.toHaveBeenCalled();
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-
-	it("leaves the live model untouched when the compensation publication is refused", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const before = f.session.model;
-		const bytes = await Bun.file(f.file).text();
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "stale",
-			reason: "transcript_moved",
-		});
-		await expect(
-			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.High),
-		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "stale" });
-		expect(f.session.model).toBe(before);
-		expect(f.session.thinkingLevel).toBe(ThinkingLevel.Low);
-		expect(f.session.sessionLifecycle.disposed).toBe(false);
-		expect(await Bun.file(f.file).text()).toBe(bytes);
-	});
-
-	it("closes the session instead of restoring when the compensation outcome is unknown", async () => {
-		const f = await fixture({ shared: true });
-		await canonicalMessage(f);
-		const before = f.session.model;
-		vi.spyOn(f.manager, "appendControlEntriesSharingSession").mockResolvedValue({
-			kind: "unknown",
-			ids: ["compensation"],
-			error: new Error("durability_unproven"),
-		});
-		await expect(
-			f.session.restoreModelSelectionForRollback(f.registry.find(provider, "fallback")!, ThinkingLevel.High),
-		).rejects.toMatchObject({ name: "SharedControlPublicationError", code: "unknown" });
-		expect(f.session.model).toBe(before);
-		expect(f.session.sessionLifecycle.disposed).toBe(true);
-	});
 });
 
 describe("#7824 picker star after /new against a live shared predecessor", () => {
@@ -814,7 +491,7 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 	}
 
 	it("stars the predecessor append-only so its live peer keeps publishing", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		const { peer, candidate } = await predecessorAfterNew(f);
 		const before = await Bun.file(candidate.path).text();
 		await f.manager.setSessionStarredForPicker(candidate, true);
@@ -828,7 +505,7 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 	});
 
 	it("waits for the predecessor's shared transaction lease before appending the star", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		const { candidate } = await predecessorAfterNew(f);
 		const before = await Bun.file(candidate.path).text();
 		const held = Promise.withResolvers<void>();
@@ -855,7 +532,7 @@ describe("#7824 picker star after /new against a live shared predecessor", () =>
 	});
 
 	it("refuses a whole-transcript header upgrade of a shared predecessor", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		const { candidate } = await predecessorAfterNew(f);
 		// A predecessor header without the star-patch capability would need a whole-file rewrite.
 		const original = await Bun.file(candidate.path).text();
@@ -1004,7 +681,7 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 	});
 
 	it("refuses beside a peer sibling before any branch effect", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		await sharedCanonicalMessage(f, "first shared prompt");
 		const peer = await SessionManager.open(f.file, SessionManager.managedDestination(f.cwd, f.agentDir));
 		managers.push(peer);
@@ -1032,7 +709,7 @@ describe("/fork after canonical shared messages in a root TUI", () => {
 	});
 
 	it("refuses Move Session before the cwd transition and flush, and star before any write", async () => {
-		const f = await fixture({ shared: true });
+		const f = await fixture();
 		await sharedCanonicalMessage(f);
 		const bytes = await Bun.file(f.file).bytes();
 		const target = path.join(path.dirname(f.cwd), "move-target");

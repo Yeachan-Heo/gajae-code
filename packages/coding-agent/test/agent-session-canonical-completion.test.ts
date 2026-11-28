@@ -12,7 +12,6 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir, withTimeout } from "@gajae-code/utils";
-import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 function assistant(): AssistantMessage {
 	return {
@@ -57,7 +56,6 @@ describe("AgentSession canonical completion", () => {
 		streamFn?: Agent["streamFn"];
 		tools?: AgentTool[];
 		managed?: boolean;
-		sharedManaged?: boolean;
 	}) {
 		tempDir = TempDir.createSync("@gjc-canonical-completion-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
@@ -71,7 +69,7 @@ describe("AgentSession canonical completion", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: options?.tools ?? [], messages: [] },
 			...(options?.streamFn ? { streamFn: options.streamFn, getApiKey: () => "test-key" } : {}),
 		});
-		const managed = options?.managed === true || options?.sharedManaged === true;
+		const managed = options?.managed === true;
 		const manager = managed
 			? SessionManager.create(tempDir.path(), SessionManager.managedDestination(tempDir.path(), tempDir.path()))
 			: SessionManager.inMemory(tempDir.path());
@@ -86,7 +84,6 @@ describe("AgentSession canonical completion", () => {
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
 		});
-		if (options?.sharedManaged) routeThroughSharedPublication(manager);
 		if (managed) {
 			// A managed prompt resolves local:// synchronously; settle the real legacy
 			// migration gate before entering the accepted-prompt path.
@@ -98,84 +95,6 @@ describe("AgentSession canonical completion", () => {
 			});
 		}
 		return { agent, manager, session };
-	}
-
-	it("stops before provider on uncertain shared workflow admission without reappending", async () => {
-		let providerCalls = 0;
-		const mock = createMockModel({ handler: { content: ["unexpected provider call"] } });
-		const { manager, session } = await setup({
-			sharedManaged: true,
-			streamFn: (...args) => {
-				providerCalls++;
-				return mock.stream(...args);
-			},
-		});
-		const original = new Error("uncertain workflow publication");
-		const attempt = { kind: "unknown" as const, id: "attempted-custom-id", error: original };
-		const publication = Promise.withResolvers<typeof attempt>();
-		const enteredPublication = Promise.withResolvers<void>();
-		const shared = vi.spyOn(manager, "appendCustomEntrySharingSession").mockImplementation(() => {
-			enteredPublication.resolve();
-			return publication.promise;
-		});
-		const legacy = vi.spyOn(manager, "appendCustomEntry");
-		const prompt = session.prompt("second ordinary user prompt");
-		void prompt.catch(() => {});
-		let cleanupFailure: unknown;
-		try {
-			await withTimeout(enteredPublication.promise, 5_000, "Workflow publication was not requested");
-			expect(providerCalls).toBe(0);
-			publication.resolve(attempt);
-			await expect(withTimeout(prompt, 5_000, "Workflow admission did not settle")).rejects.toMatchObject({
-				message: expect.stringContaining(attempt.id),
-				cause: attempt,
-			});
-			expect(shared).toHaveBeenCalledTimes(1);
-			expect(legacy).not.toHaveBeenCalled();
-			expect(providerCalls).toBe(0);
-			expect(
-				manager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "workflow-intent-diff"),
-			).toHaveLength(0);
-		} finally {
-			publication.resolve(attempt);
-			try {
-				await withTimeout(Promise.allSettled([prompt]), 5_000, "Workflow prompt cleanup did not settle");
-			} catch (error) {
-				cleanupFailure = error;
-			}
-		}
-		if (cleanupFailure !== undefined) throw cleanupFailure;
-	});
-
-	for (const failure of ["stale", "rejected", "acquisition"] as const) {
-		it(`does not run or retry a provider after ${failure} workflow publication`, async () => {
-			let providerCalls = 0;
-			const mock = createMockModel({ handler: { content: ["unexpected provider call"] } });
-			const { manager, session } = await setup({
-				sharedManaged: true,
-				streamFn: (...args) => {
-					providerCalls++;
-					return mock.stream(...args);
-				},
-			});
-			const original = new Error("original publication failure");
-			const append = vi.spyOn(manager, "appendCustomEntrySharingSession");
-			if (failure === "stale") append.mockResolvedValue({ kind: "stale", reason: "cursor_not_committed" });
-			else if (failure === "rejected") append.mockResolvedValue({ kind: "rejected", error: original });
-			else append.mockRejectedValue(original);
-			await expect(
-				withTimeout(session.prompt("ordinary workflow prompt"), 5_000, "Failure did not settle"),
-			).rejects.toMatchObject({
-				cause:
-					failure === "acquisition"
-						? original
-						: failure === "stale"
-							? { kind: "stale", reason: "cursor_not_committed" }
-							: { kind: "rejected", error: original },
-			});
-			expect(append).toHaveBeenCalledTimes(1);
-			expect(providerCalls).toBe(0);
-		});
 	}
 
 	for (const behavior of ["steer", "followUp"] as const) {

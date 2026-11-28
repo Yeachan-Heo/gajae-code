@@ -15,7 +15,6 @@ import {
 	SharedSessionMutationUnsupportedError,
 } from "../src/session/session-manager";
 import * as titleGenerator from "../src/utils/title-generator";
-import { routeThroughSharedPublication } from "./helpers/shared-publication-mode";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -58,7 +57,7 @@ afterEach(async () => {
 	else process.env.PI_NO_TITLE = originalPiNoTitle;
 });
 
-async function fixture(options?: { sharedAppend?: boolean }) {
+async function fixture() {
 	const root = await fs.mkdtemp(path.join(import.meta.dirname, ".tmp-shared-title-eligibility-"));
 	roots.push(root);
 	const cwd = path.join(root, "workspace");
@@ -86,7 +85,6 @@ async function fixture(options?: { sharedAppend?: boolean }) {
 		modelRegistry: registry,
 		thinkingLevel: ThinkingLevel.Off,
 	});
-	if (options?.sharedAppend ?? true) routeThroughSharedPublication(manager);
 	sessions.push(session);
 	return { session, manager, file: manager.getSessionFile()!, destination };
 }
@@ -120,6 +118,8 @@ describe("shared publication admission split", () => {
 		await f.session.awaitSessionSettlement();
 		expect(f.session.agent.state.error).toBeUndefined();
 
+		// The legacy route materializes the transcript lazily; force it to disk before reading.
+		await f.manager.ensureOnDisk();
 		await f.manager.flush();
 		const persisted = await Bun.file(f.file).text();
 		expect(persisted).toContain("ordinary user message");
@@ -260,7 +260,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("persists a custom message_end emitted after a canonical append", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("root") });
 		await f.session.awaitSessionSettlement();
 		f.session.agent.emitExternalEvent({
@@ -278,7 +278,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("keeps appendEntry, setLabel, a bash result, and a recap durable after the first message", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 
@@ -360,7 +360,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("persists a tree-navigator label", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 		const leaf = f.manager.getLeafId();
@@ -374,7 +374,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("persists a TTSR injection marker without failing the run", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		f.session.agent.emitExternalEvent({ type: "message_end", message: user("first canonical message") });
 		await f.session.awaitSessionSettlement();
 		// The message_end TTSR path is driven by the ephemeral custom marker message.
@@ -397,7 +397,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("keeps a refused deferred command result queued and withholds onPersisted", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		// Keep both prompts off the real provider: the retry flush persists before the
 		// credential preflight, so a buggy first-prompt fallback must also fail here.
 		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
@@ -433,7 +433,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("does not retry a deferred result whose onPersisted callback throws", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		// The first prompt's flush failure must not fall through to a provider, and the
 		// retry prompt deliberately stops at the credential preflight.
 		vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue(undefined);
@@ -458,7 +458,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("fires Python onPersisted inline for a legacy session", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		const persisted = vi.fn();
 		f.session.recordPythonResult("print('legacy')", shellResult("python legacy output"), { onPersisted: persisted });
 		// The legacy path has no shared commit to wait for: the callback follows the
@@ -474,7 +474,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("withholds Python onPersisted when the legacy append throws", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		const append = f.manager.appendMessage.bind(f.manager);
 		vi.spyOn(f.manager, "appendMessage").mockImplementation(message => {
 			if (message.role === "pythonExecution") throw new Error("append refused");
@@ -490,7 +490,7 @@ describe("shared publication admission split", () => {
 	});
 
 	it("reserves the queued continuation before a throwing legacy Python callback", async () => {
-		const f = await fixture({ sharedAppend: false });
+		const f = await fixture();
 		// Queue directly on the agent: the session's own follow-up path would schedule
 		// delivery itself and hide whether this callback path reserved the continuation.
 		f.session.agent.followUp(user("queued legacy follow-up"));
