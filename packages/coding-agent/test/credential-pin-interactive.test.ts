@@ -3,7 +3,7 @@ import { AuthStorage, OAuthCredentialSelectorError, SqliteAuthCredentialStore } 
 import type { OAuthSelectorComponent } from "../src/modes/components/oauth-selector";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { setThemeInstance } from "../src/modes/theme/theme";
-import { SharedControlPublicationError } from "../src/session/agent-session";
+import { SessionControlReplacedError } from "../src/session/agent-session";
 import { loadTestTheme } from "./helpers/test-theme";
 
 const stores: SqliteAuthCredentialStore[] = [];
@@ -130,13 +130,7 @@ describe("interactive OAuth credential pinning", () => {
 		test(`reports a refused ${target} write without an unhandled rejection`, async () => {
 			const authStorage = await createAuthStorage();
 			// The refusal a credential control raises when its session was replaced while it awaited.
-			const refused = () =>
-				Promise.reject(
-					new SharedControlPublicationError("change credential selection", {
-						kind: "rejected",
-						error: new Error("publication_mode_changed"),
-					}),
-				);
+			const refused = () => Promise.reject(new SessionControlReplacedError("change credential selection"));
 			const errors: string[] = [];
 			const statuses: string[] = [];
 			const unhandled: unknown[] = [];

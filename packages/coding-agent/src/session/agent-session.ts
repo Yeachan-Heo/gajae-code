@@ -869,24 +869,17 @@ export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" |
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
 /**
- * A session control was refused before any effect (#7823, #7824).
- *
- * The only thrower is the control fence: a control whose session manager was replaced
- * while it awaited is refused as `rejected` (`publication_mode_changed`).
+ * A session control was refused before any effect because its session manager was
+ * replaced (a fork) while it awaited (#7823, #7824). Thrown only by the control fence.
  */
-export class SharedControlPublicationError extends Error {
+export class SessionControlReplacedError extends Error {
 	readonly code = "rejected" as const;
 
-	constructor(
-		readonly operation: string,
-		readonly outcome: { readonly kind: "rejected"; readonly error: unknown },
-		publicationCause?: unknown,
-	) {
+	constructor(readonly operation: string) {
 		super(
 			`Could not ${operation}: the session was replaced before the update was written. Nothing was changed; retry.`,
-			{ cause: publicationCause ?? outcome },
 		);
-		this.name = "SharedControlPublicationError";
+		this.name = "SessionControlReplacedError";
 	}
 }
 
@@ -15727,7 +15720,7 @@ export class AgentSession {
 		toolNames: string[],
 		options?: { explicit?: boolean; persistMCPSelection?: boolean; retryOnMcpCatalogChange?: boolean },
 	): Promise<void> {
-		const assertPublicationMode = this.#controlPublicationModeFence("select active tools");
+		const assertSessionCurrent = this.#controlSessionFence("select active tools");
 		const isExplicit = options?.explicit !== false;
 		const explicitMCPToolNames = isExplicit ? this.#resolveExplicitMCPToolSelection(toolNames) : undefined;
 		const shouldPersistMCPSelectionIfUnchanged =
@@ -15793,7 +15786,7 @@ export class AgentSession {
 					!sessionContext.hasPersistedMCPToolSelection ||
 					!this.#selectedMCPToolNamesMatch(sessionContext.selectedMCPToolNames, selectedMCPToolNames)
 				) {
-					assertPublicationMode();
+					assertSessionCurrent();
 					this.sessionManager.appendMCPToolSelection(selectedMCPToolNames);
 				}
 			}
@@ -16518,7 +16511,7 @@ export class AgentSession {
 
 	/** Credential intent is durable before it is live (#7824): a refused write leaves AuthStorage untouched. */
 	async #publishCredentialIntentThenApply(data: Record<string, unknown>, apply: () => void): Promise<void> {
-		this.#controlPublicationModeFence("change credential selection");
+		this.#controlSessionFence("change credential selection");
 		this.sessionManager.appendCustomEntry("auth-credential-pin", data);
 		apply();
 	}
@@ -22412,12 +22405,12 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		// A context clear appends a parentless root marker; the legacy refusal runs before
+		// A context clear appends a parentless root marker; the session fence runs before
 		// resetting anything. A transcript that already refuses writes is refused before the
 		// agent reset, which would otherwise drop the in-memory history and then fail at the flush.
 		this.#assertTranscriptAcceptsTurn();
 		const operation = "clear context";
-		const assertMode = this.#controlPublicationModeFence(operation);
+		const assertSessionCurrent = this.#controlSessionFence(operation);
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -22432,7 +22425,7 @@ export class AgentSession {
 			this.#closeAllProviderSessions("context clear");
 			this.#terminalizeQueuedSdkWorkForSessionTransition(this.#queuedMessagesForSessionTransition());
 			this.#resetActiveSdkRunOwnership();
-			assertMode();
+			assertSessionCurrent();
 			this.#commitSessionTransition();
 			this.agent.reset();
 			await this.sessionManager.flush();
@@ -24821,7 +24814,7 @@ export class AgentSession {
 			onAfterMutationAdmissionReadyForTests?: () => Promise<void>;
 		},
 	): Promise<DefaultModelSelectionResult> {
-		const assertPublicationMode = this.#controlPublicationModeFence("select default model");
+		const assertSessionCurrent = this.#controlSessionFence("select default model");
 		// Reserve the causal selection fence synchronously, before credential
 		// probing can yield. Later external prompts wait behind this operation,
 		// while an inherited post-prompt continuation may bypass the fence so
@@ -24881,7 +24874,7 @@ export class AgentSession {
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
-					assertPublicationMode();
+					assertSessionCurrent();
 					options?.onBeforeMutation?.();
 					if (this.sessionId !== expectedSessionId) {
 						throw new Error("Session changed while selecting model");
@@ -24934,7 +24927,7 @@ export class AgentSession {
 						| undefined;
 					const materialized = materializedRoles !== undefined;
 					const assertCurrent = () => {
-						assertPublicationMode();
+						assertSessionCurrent();
 						// Disposal drains the already-authorized selection transaction;
 						// it rejects new/queued ingress without revoking that owner's lease.
 						if (
@@ -31785,17 +31778,13 @@ export class AgentSession {
 	 * Bind a control to the session manager it started on: a control whose session was
 	 * replaced (fork) while it awaited is refused before effects.
 	 */
-	#controlPublicationModeFence(operation: string): () => void {
+	#controlSessionFence(operation: string): () => void {
 		const manager = this.sessionManager;
-		const assertMode = () => {
-			if (this.sessionManager !== manager)
-				throw new SharedControlPublicationError(operation, {
-					kind: "rejected",
-					error: new Error("publication_mode_changed"),
-				});
+		const assertSessionCurrent = () => {
+			if (this.sessionManager !== manager) throw new SessionControlReplacedError(operation);
 		};
-		assertMode();
-		return assertMode;
+		assertSessionCurrent();
+		return assertSessionCurrent;
 	}
 
 	async #promptAgentWithIdleRetry(
