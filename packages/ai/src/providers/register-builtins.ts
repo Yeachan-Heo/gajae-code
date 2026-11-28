@@ -40,6 +40,7 @@ import type { GoogleOptions } from "./google";
 import type { GoogleGeminiCliOptions } from "./google-gemini-cli";
 import type { GoogleVertexOptions } from "./google-vertex";
 import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
+import type { MetaMuseResponsesOptions } from "./meta-muse-responses";
 import type { OllamaChatOptions } from "./ollama";
 import type { OpenAICodexResponsesOptions } from "./openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./openai-completions";
@@ -81,6 +82,14 @@ interface AzureOpenAIResponsesProviderModule {
 		model: Model<"azure-openai-responses">,
 		context: Context,
 		options: AzureOpenAIResponsesOptions,
+	) => AssistantMessageEventStream;
+}
+
+interface MetaMuseResponsesProviderModule {
+	streamMetaMuseResponses: (
+		model: Model<"meta-muse-responses">,
+		context: Context,
+		options: MetaMuseResponsesOptions,
 	) => AssistantMessageEventStream;
 }
 
@@ -178,6 +187,7 @@ interface KiroCodeWhispererProviderModule {
 
 let anthropicProviderModulePromise: Promise<LazyProviderModule<"anthropic-messages">> | undefined;
 let azureOpenAIResponsesProviderModulePromise: Promise<LazyProviderModule<"azure-openai-responses">> | undefined;
+let metaMuseResponsesProviderModulePromise: Promise<LazyProviderModule<"meta-muse-responses">> | undefined;
 let googleProviderModulePromise: Promise<LazyProviderModule<"google-generative-ai">> | undefined;
 let googleGeminiCliProviderModulePromise: Promise<LazyProviderModule<"google-gemini-cli">> | undefined;
 let googleVertexProviderModulePromise: Promise<LazyProviderModule<"google-vertex">> | undefined;
@@ -461,6 +471,14 @@ function loadAzureOpenAIResponsesProviderModule(): Promise<LazyProviderModule<"a
 	return azureOpenAIResponsesProviderModulePromise;
 }
 
+function loadMetaMuseResponsesProviderModule(): Promise<LazyProviderModule<"meta-muse-responses">> {
+	metaMuseResponsesProviderModulePromise ||= Promise.resolve().then(() => {
+		const provider = require("./meta-muse-responses") as MetaMuseResponsesProviderModule;
+		return { stream: provider.streamMetaMuseResponses };
+	});
+	return metaMuseResponsesProviderModulePromise;
+}
+
 function loadGoogleProviderModule(): Promise<LazyProviderModule<"google-generative-ai">> {
 	googleProviderModulePromise ||= Promise.resolve().then(() => {
 		const provider = require("./google") as GoogleProviderModule;
@@ -558,6 +576,7 @@ function loadKiroCodeWhispererProviderModule(): Promise<LazyProviderModule<"kiro
 export const PROVIDER_RUNTIME_DESCRIPTORS: readonly ProviderRuntimeDescriptor<Api, unknown>[] = [
 	{ api: "anthropic-messages", load: loadAnthropicProviderModule },
 	{ api: "azure-openai-responses", load: loadAzureOpenAIResponsesProviderModule },
+	{ api: "meta-muse-responses", load: loadMetaMuseResponsesProviderModule },
 	{ api: "google-generative-ai", load: loadGoogleProviderModule },
 	{ api: "google-gemini-cli", load: loadGoogleGeminiCliProviderModule },
 	{ api: "google-vertex", load: loadGoogleVertexProviderModule },
@@ -592,6 +611,10 @@ export function getProviderRuntimeDescriptor<TApi extends Api>(
 export const streamAnthropic = createLazyStream(loadAnthropicProviderModule, PROVIDER_OWNED_STREAM_WATCHDOG);
 export const streamAzureOpenAIResponses = createLazyStream(
 	loadAzureOpenAIResponsesProviderModule,
+	PROVIDER_OWNED_STREAM_WATCHDOG,
+);
+export const streamMetaMuseResponses = createLazyStream(
+	loadMetaMuseResponsesProviderModule,
 	PROVIDER_OWNED_STREAM_WATCHDOG,
 );
 export const streamGoogle = createLazyStream(loadGoogleProviderModule);
