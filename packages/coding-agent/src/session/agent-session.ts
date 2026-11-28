@@ -5492,7 +5492,7 @@ export class AgentSession {
 			if (this.#sessionTransitionKind !== "mcp-control") this.#btwGeneration += 1;
 			// Reset transcript size baseline when the active transcript changes (new-session, switch-session, etc)
 			// but not for mcp-control which preserves the same transcript
-			if (this.#sessionTransitionKind !== "mcp-control" && !this.#usesSharedSessionPublication()) {
+			if (this.#sessionTransitionKind !== "mcp-control") {
 				this.#transcriptFileSizeAfterLastCompaction = undefined;
 			}
 		}
@@ -5907,11 +5907,6 @@ export class AgentSession {
 			if (!this.#abandonedInFlightPrompts.has(token) && generation !== this.#abortEpoch) return false;
 		}
 		return true;
-	}
-
-	/** True when this session uses shared session publication (managed destination). */
-	#usesSharedSessionPublication(): boolean {
-		return this.sessionManager.isManagedDestination();
 	}
 
 	/**
@@ -27464,13 +27459,10 @@ export class AgentSession {
 		// F6: non-disableable emergency floor — compact before OOM even when token-based
 		// compaction is disabled or its threshold is set too high (weak-hardware protection).
 		const sample = this.#resourceSampler();
-		// Shared compaction only appends a summary entry and never rewrites the transcript,
-		// so the transcript-size floor cannot shrink the file there: it would add a summary
-		// call and a compaction entry to every prompt and reach the managed cap sooner.
 		const emergencyReason = emergencyCompactionReason(
-			this.#usesSharedSessionPublication() ? { ...sample, transcriptFileBytes: undefined } : sample,
+			sample,
 			undefined, // use default limits
-			this.#usesSharedSessionPublication() ? undefined : this.#transcriptFileSizeAfterLastCompaction,
+			this.#transcriptFileSizeAfterLastCompaction,
 		);
 		if (emergencyReason) {
 			logger.warn("Emergency compaction triggered (resource floor exceeded)", { reason: emergencyReason });
@@ -27485,11 +27477,7 @@ export class AgentSession {
 			// outcomes (skipped); keep failed/aborted attempts eligible for retry.
 			// Note: successful compaction ("compacted") baseline is recorded in #runAutoCompactionImpl
 			// right after entry appending to handle post-publication aborts correctly.
-			if (
-				emergencyReason === "transcriptFile" &&
-				!this.#usesSharedSessionPublication() &&
-				compactionResult.kind === "skipped"
-			) {
+			if (emergencyReason === "transcriptFile" && compactionResult.kind === "skipped") {
 				try {
 					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
 				} catch {
@@ -29518,7 +29506,7 @@ export class AgentSession {
 			// published, so a cancellation after publication won't cause re-triggering on the
 			// next prompt. Only update on successful compaction (kind would be "compacted"),
 			// not on skipped attempts.
-			if (options?.emergencyReason === "transcriptFile" && !this.#usesSharedSessionPublication()) {
+			if (options?.emergencyReason === "transcriptFile") {
 				try {
 					this.#transcriptFileSizeAfterLastCompaction = this.sessionManager.getTranscriptFileBytes();
 				} catch {

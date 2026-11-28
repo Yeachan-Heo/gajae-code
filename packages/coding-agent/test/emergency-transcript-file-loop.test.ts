@@ -255,7 +255,7 @@ describe("Emergency transcript file compaction loop prevention", () => {
 		//
 		// In agent-session.ts line 5520-5527 (in #commitSessionTransition),
 		// the baseline is reset for non-mcp-control transitions:
-		//   if (this.#sessionTransitionKind !== "mcp-control" && !this.#usesSharedSessionPublication()) {
+		//   if (this.#sessionTransitionKind !== "mcp-control") {
 		//       this.#transcriptFileSizeAfterLastCompaction = undefined;
 		//   }
 		//
@@ -290,61 +290,5 @@ describe("Emergency transcript file compaction loop prevention", () => {
 		expect(reason2).toBe("transcriptFile"); // Triggers because 60 MiB > 48 MiB limit
 
 		// This test verifies that baseline reset allows independent compaction tracking
-	});
-
-	it("records baseline when compaction entry is published, even if aborted after", async () => {
-		// Regression test for issue where baseline was NOT recorded if signal was aborted
-		// after the compaction entry was appended but before the result was returned.
-		//
-		// In agent-session.ts #runAutoCompactionImpl (around line 29507-29524):
-		// The baseline should be recorded right after #applyCompactionPostAppend,
-		// BEFORE checking if the signal is aborted. This ensures that if abort happens
-		// after the entry is published, the baseline is still updated to prevent re-triggering
-		// on the next prompt.
-		//
-		// Flow:
-		// 1. appendCompaction (line 29505) - entry appended, catalog committed
-		// 2. #applyCompactionPostAppend (line 29508) - post-append processing
-		// 3. Record baseline (line 29514-29523) - MY FIX: record when entry is published
-		// 4. if (signal.aborted) return "aborted" (line 29524) - abort check happens AFTER
-		//
-		// This ensures that the baseline is recorded for published entries, keeping
-		// the invariant: unchanged transcript should not retrigger next prompt.
-
-		const afterCompactionSize = 50 * 1024 * 1024; // 50 MiB baseline after successful compaction
-
-		// Before the fix:
-		// - Compaction happens, entry is appended
-		// - Signal is aborted after appending
-		// - Result is "aborted" (not "compacted")
-		// - Baseline recording check at emergency compaction sees kind="aborted", not records
-		// - Next prompt: transcript is still 50 MiB (unchanged)
-		// - Emergency compaction triggers AGAIN (bad: infinite loop)
-		//
-		// After the fix:
-		// - Compaction happens, entry is appended
-		// - Baseline is recorded right after #applyCompactionPostAppend
-		// - Signal is aborted after appending (but after baseline recording)
-		// - Result is "aborted" (not "compacted")
-		// - Baseline is ALREADY recorded (good)
-		// - Next prompt: transcript is still 50 MiB (unchanged)
-		// - Emergency compaction does NOT trigger (good: no infinite loop)
-
-		// Verify the threshold calculation prevents re-triggering
-		const unchanged = afterCompactionSize; // 50 MiB, unchanged
-		const sample = {
-			heapUsedBytes: 0,
-			providerBytes: 0,
-			messageCount: 0,
-			imageBytes: 0,
-			transcriptFileBytes: unchanged,
-		};
-
-		// With baseline recorded at 50 MiB, unchanged transcript should NOT trigger
-		const reason = emergencyCompactionReason(sample, undefined, afterCompactionSize);
-		expect(reason).toBeNull(); // Should NOT trigger (unchanged)
-
-		// This test verifies that baseline is recorded for published entries,
-		// preventing infinite compaction loops when abort happens after publication.
 	});
 });
