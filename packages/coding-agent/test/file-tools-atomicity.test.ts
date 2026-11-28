@@ -9,6 +9,7 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import { FileReadCache } from "../src/edit/file-read-cache";
 import { writeFileAtomically } from "../src/tools/atomic-file-write";
 
@@ -23,6 +24,15 @@ function createSession(cwd: string, extras: Partial<ToolSession> = {}): ToolSess
 		settings: Settings.isolated(),
 		...extras,
 	};
+}
+
+async function createManagedLocalRoot(sessionId: string, agentDir?: string): Promise<string> {
+	const localRoot = path.join(getLocalRootsDir(agentDir), sessionId);
+	const parent = path.dirname(localRoot);
+	await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+	await fs.chmod(parent, 0o700);
+	await fs.mkdir(localRoot, { mode: 0o700 });
+	return localRoot;
 }
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -579,21 +589,19 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			await fs.symlink(inside, link);
 			await fs.unlink(link);
 			await fs.symlink(outside, link);
-			LocalProtocolHandler.setOverride({
+			const localProtocolOptions = {
 				getArtifactsDir: () => artifacts,
 				getSessionId: () => "explicit-local-trust",
-			});
-			try {
-				await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
-				expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
-				expect(await fs.readFile(inside, "utf8")).toBe("inside\n");
-				expect(await fs.readlink(link)).toBe(outside);
-				const kept = path.join(localRoot, "kept.ts");
-				await writeFileAtomically(kept, "kept\n");
-				expect(await fs.readFile(kept, "utf8")).toBe("kept\n");
-			} finally {
-				LocalProtocolHandler.setOverride(undefined);
-			}
+			};
+			await expect(writeFileAtomically(link, "must-not-write\n", { localProtocolOptions })).rejects.toThrow(
+				/outside trust boundary/,
+			);
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+			expect(await fs.readFile(inside, "utf8")).toBe("inside\n");
+			expect(await fs.readlink(link)).toBe(outside);
+			const kept = path.join(localRoot, "kept.ts");
+			await writeFileAtomically(kept, "kept\n", { localProtocolOptions });
+			expect(await fs.readFile(kept, "utf8")).toBe("kept\n");
 		},
 	);
 
@@ -605,48 +613,116 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			const localRoot = path.join(real, "artifacts", "local");
 			await fs.mkdir(localRoot, { recursive: true });
 			await fs.symlink(real, alias);
-			LocalProtocolHandler.setOverride({
+			const localProtocolOptions = {
 				getArtifactsDir: () => path.join(alias, "artifacts"),
 				getSessionId: () => "explicit-local-trust",
-			});
-			try {
-				const dest = path.join(alias, "artifacts", "local", "nested", "kept.ts");
-				await writeFileAtomically(dest, "kept\n");
-				expect(await fs.readFile(path.join(localRoot, "nested", "kept.ts"), "utf8")).toBe("kept\n");
-			} finally {
-				LocalProtocolHandler.setOverride(undefined);
-			}
+			};
+			const dest = path.join(alias, "artifacts", "local", "nested", "kept.ts");
+			await writeFileAtomically(dest, "kept\n", { localProtocolOptions });
+			expect(await fs.readFile(path.join(localRoot, "nested", "kept.ts"), "utf8")).toBe("kept\n");
 		},
 	);
 
-	it("rejects a symlink escape from the session-scoped gjc-local root", async () => {
+	it("rejects a symlink escape from the session-scoped persistent local root", async () => {
 		if (process.platform === "win32") return;
-		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-trust-test");
+		const sessionRoot = await createManagedLocalRoot("atomic-trust-test");
 		const outside = path.join(tmpDir, "outside-secret.ts");
 		const link = path.join(sessionRoot, "alias.ts");
-		await fs.mkdir(sessionRoot, { recursive: true });
+		const localProtocolOptions = {
+			getSessionId: () => "atomic-trust-test",
+			isManagedDestination: () => true,
+		};
 		await fs.writeFile(outside, "outside\n");
 		await fs.symlink(outside, link);
 		try {
-			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
+			await expect(writeFileAtomically(link, "must-not-write\n", { localProtocolOptions })).rejects.toThrow(
+				/outside trust boundary/,
+			);
 			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
 		} finally {
 			await fs.rm(sessionRoot, { recursive: true, force: true });
 		}
 	});
 
+	it("applies the custom agent directory to the managed local trust boundary", async () => {
+		if (process.platform === "win32") return;
+		const agentDir = path.join(tmpDir, "custom-agent");
+		const sessionId = "atomic-custom-agent-trust-test";
+		const sessionRoot = await createManagedLocalRoot(sessionId, agentDir);
+		const outside = path.join(tmpDir, "custom-agent-outside.ts");
+		const link = path.join(sessionRoot, "alias.ts");
+		const localProtocolOptions = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		await fs.writeFile(outside, "outside\n");
+		await fs.symlink(outside, link);
+		try {
+			await expect(writeFileAtomically(link, "must-not-write\n", { localProtocolOptions })).rejects.toThrow(
+				/outside trust boundary/,
+			);
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+		} finally {
+			await fs.rm(sessionRoot, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"binds write-tool atomic publication to its originating profile",
+		async () => {
+			const firstAgentDir = path.join(tmpDir, "profile-a");
+			const secondAgentDir = path.join(tmpDir, "profile-b");
+			const sessionId = "atomic-profile-a";
+			const sessionRoot = await createManagedLocalRoot(sessionId, firstAgentDir);
+			const outside = path.join(tmpDir, "profile-a-outside.ts");
+			const link = path.join(sessionRoot, "alias.ts");
+			await fs.writeFile(outside, "outside\n");
+			await fs.symlink(outside, link);
+			const firstOptions = {
+				getAgentDir: () => firstAgentDir,
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+			};
+			const secondOptions = {
+				getAgentDir: () => secondAgentDir,
+				getSessionId: () => "atomic-profile-b",
+				isManagedDestination: () => true,
+			};
+			const disposeSecondProfile = LocalProtocolHandler.installOverride(secondOptions);
+			try {
+				const session = createSession(tmpDir, {
+					enableLsp: false,
+					getLocalProtocolOptions: () => firstOptions,
+				});
+				await expect(
+					new WriteTool(session).execute("profile-boundary", { path: link, content: "must-not-write\n" }),
+				).rejects.toThrow(/outside trust boundary/);
+				expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+			} finally {
+				disposeSecondProfile();
+				await fs.rm(sessionRoot, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("creates no directories outside the trust boundary for a dangling symlink escape", async () => {
 		if (process.platform === "win32") return;
-		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-dangling-test");
+		const sessionRoot = await createManagedLocalRoot("atomic-dangling-test");
 		const outsideRoot = path.join(tmpDir, "outside-root");
 		// The link target does not exist, and neither do its parents. Resolving it
 		// escapes the session root, so nothing under outsideRoot may be created.
 		const danglingTarget = path.join(outsideRoot, "attacker", "nested", "payload.ts");
 		const link = path.join(sessionRoot, "dangling.ts");
-		await fs.mkdir(sessionRoot, { recursive: true });
+		const localProtocolOptions = {
+			getSessionId: () => "atomic-dangling-test",
+			isManagedDestination: () => true,
+		};
 		await fs.symlink(danglingTarget, link);
 		try {
-			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
+			await expect(writeFileAtomically(link, "must-not-write\n", { localProtocolOptions })).rejects.toThrow(
+				/outside trust boundary/,
+			);
 			// The pre-mkdir boundary check is what this pins: creating parents first
 			// would materialize an attacker-selected tree before refusing to publish.
 			expect(await Bun.file(danglingTarget).exists()).toBe(false);
@@ -658,18 +734,24 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 
 	it("does not mkdir an archive path before rejecting a boundary escape", async () => {
 		if (process.platform === "win32") return;
-		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "archive-boundary-test");
+		const sessionRoot = await createManagedLocalRoot("archive-boundary-test");
 		const outsideRoot = path.join(tmpDir, "archive-outside-root");
 		const danglingArchive = path.join(outsideRoot, "attacker", "nested", "payload.zip");
 		const link = path.join(sessionRoot, "archive-link.zip");
-		await fs.mkdir(sessionRoot, { recursive: true });
+		const localProtocolOptions = {
+			getSessionId: () => "archive-boundary-test",
+			isManagedDestination: () => true,
+		};
 		await fs.symlink(danglingArchive, link);
 		try {
 			await expect(
-				new WriteTool(createSession(tmpDir)).execute("archive-boundary", {
-					path: `${link}:payload.txt`,
-					content: "must not publish\n",
-				}),
+				new WriteTool(createSession(tmpDir, { getLocalProtocolOptions: () => localProtocolOptions })).execute(
+					"archive-boundary",
+					{
+						path: `${link}:payload.txt`,
+						content: "must not publish\n",
+					},
+				),
 			).rejects.toThrow(/outside trust boundary/);
 			expect(await Bun.file(danglingArchive).exists()).toBe(false);
 			await expect(fs.stat(outsideRoot)).rejects.toMatchObject({ code: "ENOENT" });

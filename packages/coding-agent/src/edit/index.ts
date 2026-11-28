@@ -14,10 +14,10 @@ import hashlineGrammarTemplate from "../hashline/grammar.lark" with { type: "tex
 import { resolveHashlineGrammarPlaceholders } from "../hashline/hash";
 import {
 	createLspWritethrough,
+	createNoopWritethrough,
 	type FileDiagnosticsResult,
 	type WritethroughCallback,
 	type WritethroughDeferredHandle,
-	writethroughNoop,
 } from "../lsp";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
 import hashlineDescription from "../prompts/tools/hashline.md" with { type: "text" };
@@ -188,7 +188,10 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableLsp = session.enableLsp ?? true;
 	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
 	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
-	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
+	const localProtocolOptions = session.getLocalProtocolOptions?.();
+	return enableLsp
+		? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics, localProtocolOptions })
+		: createNoopWritethrough(localProtocolOptions);
 }
 
 type PatchGuardFailure = { path: string; errorText: string };

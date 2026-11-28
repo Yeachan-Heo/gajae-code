@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as piNatives from "@gajae-code/natives";
 import { disposeAllShellSessions, setShellFactoryForTests } from "../../src/exec/bash-executor";
+import { initializeLocalRoot, resolveLocalRoot } from "../../src/internal-urls";
 import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
@@ -158,6 +159,44 @@ describe("issue #5374: session identity on the bash tool-env path", () => {
 		} finally {
 			if (previous === undefined) delete process.env.GJC_MASTER_OWNER_SESSION_ID;
 			else process.env.GJC_MASTER_OWNER_SESSION_ID = previous;
+		}
+	});
+});
+
+describe("Bash local URL session options", () => {
+	it("uses the parent shared local root for managed Task subagent handoffs", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "bash-shared-local-options-"));
+		const parentSessionId = "task-parent-session";
+		const childSessionId = "task-child-session";
+		const parentLocalOptions = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => parentSessionId,
+			isManagedDestination: () => true,
+		};
+
+		try {
+			const parentRoot = await initializeLocalRoot(parentLocalOptions);
+			const handoffPath = path.join(parentRoot, "subagents", "context.md");
+			await fs.mkdir(path.dirname(handoffPath), { recursive: true });
+			await fs.writeFile(handoffPath, "shared Task handoff");
+
+			const session: ToolSession = {
+				...createSession(childSessionId),
+				getSessionAgentDir: () => agentDir,
+				getArtifactsDir: () => null,
+				isManagedSessionDestination: () => true,
+				getLocalProtocolOptions: () => parentLocalOptions,
+			};
+			const result = await new BashTool(session).execute("task-local-handoff", {
+				command: "cat local://subagents/context.md",
+			});
+
+			expect(textOf(result)).toContain("shared Task handoff");
+			await expect(
+				fs.lstat(resolveLocalRoot({ ...parentLocalOptions, getSessionId: () => childSessionId })),
+			).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
 });

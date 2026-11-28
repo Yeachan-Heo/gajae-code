@@ -2,14 +2,14 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import type { GcContext } from "../../src/gjc-runtime/gc-runtime";
 import { localRootsGcAdapter } from "../../src/internal-urls/local-root-gc";
 
 /**
- * `resolveLocalRoot` gives every session its own `<tmp>/gjc-local/<session-id>`
- * directory and seeds it with a migration marker. Nothing removed them, so a
- * machine accumulated one per session forever — mostly marker-only, because most
- * sessions never write a `local://` file.
+ * `resolveLocalRoot` gives every session its own persistent agent-state
+ * `local/<session-id>` directory and seeds it with a migration marker. Marker-only
+ * roots are collectible after a grace window; roots with data remain available.
  *
  * Eligibility is deliberately narrow: marker-only **and** past a grace window.
  * A directory holding real content is never touched, and a session that just
@@ -24,12 +24,12 @@ const tempDirs: string[] = [];
 function makeTmpRoot(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-local-gc-test-"));
 	tempDirs.push(dir);
-	fs.mkdirSync(path.join(dir, "gjc-local"), { recursive: true });
+	fs.mkdirSync(getLocalRootsDir(dir), { recursive: true });
 	return dir;
 }
 
-function seedRoot(tmpRoot: string, id: string, opts: { extra?: string; ageMs?: number } = {}): string {
-	const dir = path.join(tmpRoot, "gjc-local", id);
+function seedRoot(agentDir: string, id: string, opts: { extra?: string; ageMs?: number } = {}): string {
+	const dir = path.join(getLocalRootsDir(agentDir), id);
 	fs.mkdirSync(dir, { recursive: true });
 	fs.writeFileSync(path.join(dir, MARKER), "absent\n");
 	if (opts.extra) fs.writeFileSync(path.join(dir, opts.extra), "payload");
@@ -40,12 +40,13 @@ function seedRoot(tmpRoot: string, id: string, opts: { extra?: string; ageMs?: n
 	return dir;
 }
 
-function ctxFor(tmpRoot: string): GcContext {
+function ctxFor(agentDir: string): GcContext {
 	return {
 		probe: (() => "dead") as unknown as GcContext["probe"],
 		force: false,
-		env: { ...process.env, TMPDIR: tmpRoot },
+		env: process.env,
 		cwd: process.cwd(),
+		agentDir,
 	};
 }
 

@@ -693,6 +693,7 @@ describe("AgentSession eager todo enforcement", () => {
 			});
 			const abort = spyOn(agent, "abort");
 			await initializeLocalRoot({
+				getAgentDir: () => agentDir,
 				getArtifactsDir: () => sessionManager.getArtifactsDir(),
 				isManagedDestination: () => true,
 				getSessionId: () => sessionManager.getSessionId(),
