@@ -26,7 +26,7 @@ function admissionInputs(): {
 		dirty: false,
 		workloadDigest: "workload-digest-1",
 		bootstrapDigest: "bootstrap-digest-1",
-		bunVersion: "bun-1.4.0",
+		bunVersion: "bun-1.4.4",
 	};
 	const digest = contractDigest(contract);
 	return {
