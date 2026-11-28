@@ -80,6 +80,13 @@ export async function runBashShellWorker(): Promise<void> {
 			return;
 		}
 
+		if (request.type === "release") {
+			// The supervisor consumes release records; one reaching the runtime must not
+			// fall through to the close handler below.
+			writeResponse({ type: "error", message: "Release records are not runtime requests." });
+			return;
+		}
+
 		if (!shell) {
 			writeResponse({ type: "error", id: request.id, message: "Shell worker is not initialized." });
 			return;

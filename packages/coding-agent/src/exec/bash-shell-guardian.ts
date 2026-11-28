@@ -9,6 +9,7 @@ import * as readline from "node:readline";
 import type { Process as NativeProcess } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
+import { isReleasedSession, openSessionIdReader, type ReleasedSession } from "./bash-shell-release";
 import { BASH_SHELL_SUPERVISOR_ARG, type BashShellWorkerRequest } from "./bash-shell-worker-protocol";
 
 type NativeProcessBindings = { Process: typeof NativeProcess };
@@ -490,7 +491,7 @@ export type SignalOwnedProcessDeps = {
  * SIGKILL one owned process without touching its descendants, and only while `pid`
  * still names the incarnation that was recorded as owned.
  *
- * The only caller is darwin cleanup when a broker is spared. Darwin has no atomic
+ * The only caller is cleanup when a broker or a released session is spared. Darwin has no atomic
  * "signal iff start time matches" primitive, so `signalRoot` fails closed there
  * today; it is tried first so this picks up an identity-bound signal if the platform
  * ever gains one. The fallback re-reads the incarnation right before a raw `kill(2)`.
@@ -557,6 +558,13 @@ export async function runBashShellGuardian(): Promise<void> {
 			throw new Error("Darwin guardian ancestry registration failed.");
 		}
 	}
+	const sessionReader = openSessionIdReader();
+	if (!sessionReader) {
+		darwinTracker?.close();
+		await ledger.close();
+		await fs.rm(ownershipFilePath, { force: true });
+		throw new Error("Process session lookup is unavailable.");
+	}
 	const [executable, ...args] = supervisorArgv();
 	const supervisor = childProcess.spawn(executable!, args, {
 		detached: process.platform !== "win32",
@@ -566,21 +574,42 @@ export async function runBashShellGuardian(): Promise<void> {
 		stdio: ["pipe", "inherit", "inherit"],
 		windowsHide: true,
 	});
+	const releasedSessions = new Map<number, ReleasedSession>();
+	let protocolToken: string | undefined;
+	const forwardRequest = async (line: string): Promise<void> => {
+		let request: BashShellWorkerRequest | undefined;
+		try {
+			request = JSON.parse(line) as BashShellWorkerRequest;
+		} catch {}
+		let forwarded = line;
+		if (request?.type === "init") {
+			protocolToken ??= request.token;
+			forwarded = JSON.stringify({
+				...request,
+				ownershipLedger: { path: ownershipFilePath, token: ledgerToken },
+			});
+		} else if (request?.type === "release") {
+			if (!protocolToken || request.token !== protocolToken) return;
+			if (!(await releaseDetachedSessions())) {
+				retireSupervisor();
+				return;
+			}
+			forwarded = JSON.stringify({
+				type: "release",
+				token: request.token,
+				sessions: [...releasedSessions.values()],
+			});
+		}
+		if (supervisor.stdin.writable) supervisor.stdin.write(`${forwarded}\n`);
+	};
+	// Requests are forwarded strictly in order: a release must resolve against the
+	// processes of the run that just completed, before any later run can start.
+	let forwarding = Promise.resolve();
 	const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 	input.on("line", line => {
-		let forwarded = line;
-		try {
-			const request = JSON.parse(line) as BashShellWorkerRequest;
-			if (request.type === "init") {
-				forwarded = JSON.stringify({
-					...request,
-					ownershipLedger: { path: ownershipFilePath, token: ledgerToken },
-				});
-			}
-		} catch {}
-		if (supervisor.stdin.writable) supervisor.stdin.write(`${forwarded}\n`);
+		forwarding = forwarding.then(() => forwardRequest(line));
 	});
-	input.once("close", () => supervisor.stdin.end());
+	input.once("close", () => void forwarding.then(() => supervisor.stdin.end()));
 	let cleaning: Promise<void> | undefined;
 	let ledgerBuffer = "";
 	let pendingLedgerLines: string[] = [];
@@ -625,6 +654,65 @@ export async function runBashShellGuardian(): Promise<void> {
 		});
 		return ownershipScan;
 	};
+	const retireSupervisor = (): void => {
+		if (supervisor.exitCode !== null || supervisor.signalCode !== null) return;
+		if (supervisor.pid) {
+			try {
+				process.kill(-supervisor.pid, "SIGKILL");
+			} catch {}
+		}
+		supervisor.kill("SIGKILL");
+	};
+	const retainGuardianDescendants = (): void => {
+		const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
+		const pending = Process.fromPid(process.pid)?.children() ?? [];
+		while (pending.length > 0) {
+			const processRef = pending.pop()!;
+			retainOwnedProcess(ownedProcesses, processRef);
+			pending.push(...processRef.children());
+		}
+	};
+	/** Owned pids that are members of a still-released session. */
+	const releasedPids = (): Set<number> => {
+		const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
+		const pids = new Set<number>();
+		if (releasedSessions.size === 0) return pids;
+		for (const owned of ownedProcesses.values()) {
+			const sessionId = sessionReader.sessionIdOf(owned.pid);
+			if (!isReleasedSession(sessionId, releasedSessions, pid => Process.observe(pid))) continue;
+			// getsid read a bare pid; only trust it while the pid still names this owned incarnation.
+			if (Process.fromPid(owned.pid)?.incarnation === owned.incarnation) pids.add(owned.pid);
+		}
+		return pids;
+	};
+	/**
+	 * Release every session an owned process has detached into (`setsid()`), so
+	 * cleanup spares its members. The supervisor's own session stays owned.
+	 */
+	const releaseDetachedSessions = async (): Promise<boolean> => {
+		// Cleanup has taken over and closes the session reader; nothing more can be released.
+		if (cleaning) return true;
+		try {
+			retainGuardianDescendants();
+			if (!(await scanOwnership())) return false;
+			const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
+			const observe = (pid: number) => Process.observe(pid);
+			for (const owned of ownedProcesses.values()) {
+				const sessionId = sessionReader.sessionIdOf(owned.pid);
+				if (sessionId <= 0 || sessionId === supervisor.pid) continue;
+				if (isReleasedSession(sessionId, releasedSessions, observe)) continue;
+				if (Process.fromPid(owned.pid)?.incarnation !== owned.incarnation) continue;
+				const leader = observe(sessionId);
+				releasedSessions.set(sessionId, {
+					id: sessionId,
+					leaderIncarnation: leader.status === "present" ? (leader.incarnation ?? null) : null,
+				});
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	};
 	let periodicScanActive = false;
 	let periodicScanRequested = false;
 	const runPeriodicScan = (): void => {
@@ -635,13 +723,7 @@ export async function runBashShellGuardian(): Promise<void> {
 		periodicScanActive = true;
 		void scanOwnership()
 			.then(ok => {
-				if (ok || supervisor.exitCode !== null || supervisor.signalCode !== null) return;
-				if (supervisor.pid) {
-					try {
-						process.kill(-supervisor.pid, "SIGKILL");
-					} catch {}
-				}
-				supervisor.kill("SIGKILL");
+				if (!ok) retireSupervisor();
 			})
 			.finally(() => {
 				periodicScanActive = false;
@@ -681,30 +763,27 @@ export async function runBashShellGuardian(): Promise<void> {
 			for (let wave = 0; wave < 3; wave++) {
 				await Bun.sleep(wave === 0 ? 5 : 25);
 				const { Process } = require("@gajae-code/natives") as NativeProcessBindings;
-				const guardian = Process.fromPid(process.pid);
-				const pending = guardian?.children() ?? [];
-				while (pending.length > 0) {
-					const processRef = pending.pop()!;
-					retainOwnedProcess(ownedProcesses, processRef);
-					pending.push(...processRef.children());
-				}
+				retainGuardianDescendants();
 				trackingOk = (await scanOwnership()) && trackingOk;
-				const spared = darwinTracker
-					? await findSparedSdkBrokerPidsBounded(ownedProcesses.values(), {
-							readDiscovery: readPublishedSdkBroker,
-							lineage: pid => darwinTracker.lineage(pid),
-							incarnationOf: pid => Process.fromPid(pid)?.incarnation,
-						})
-					: undefined;
+				const spared = releasedPids();
+				if (darwinTracker) {
+					const brokers = await findSparedSdkBrokerPidsBounded(ownedProcesses.values(), {
+						readDiscovery: readPublishedSdkBroker,
+						lineage: pid => darwinTracker.lineage(pid),
+						incarnationOf: pid => Process.fromPid(pid)?.incarnation,
+					});
+					for (const pid of brokers) spared.add(pid);
+				}
 				for (const owned of ownedProcesses.values()) {
-					if (spared?.has(owned.pid)) continue;
-					if (!spared?.size) {
+					if (spared.has(owned.pid)) continue;
+					if (spared.size === 0) {
 						owned.killTree(9);
 						continue;
 					}
 					// killTree walks ppid descendants, so on a non-spared ancestor (for example
-					// the darwin launch trampoline) it would still reach the spared broker.
-					// Darwin ownership already lists every descendant, so signal each one alone.
+					// the darwin launch trampoline) it would still reach a spared process.
+					// Ownership already lists every descendant (darwin unique-id ancestry, the
+					// Linux subreaper walk above), so signal each one alone.
 					signalOwnedProcessAlone(owned, {
 						incarnationOf: pid => Process.fromPid(pid)?.incarnation,
 						killPid: (pid, signal) => process.kill(pid, signal),
@@ -712,6 +791,7 @@ export async function runBashShellGuardian(): Promise<void> {
 				}
 			}
 			darwinTracker?.close();
+			sessionReader.close();
 			await ledger.close();
 			await fs.rm(ownershipFilePath, { force: true });
 			if (!trackingOk) throw new Error("Shell ownership tracking failed.");

@@ -1,4 +1,5 @@
 import type { MinimizerOptions, ShellOptions, ShellRunOptions, ShellRunResult } from "@gajae-code/natives";
+import type { ReleasedSession } from "./bash-shell-release";
 
 export const BASH_SHELL_WORKER_ARG = "--internal-bash-shell-worker";
 export const BASH_SHELL_SUPERVISOR_ARG = "--internal-bash-shell-supervisor";
@@ -25,7 +26,13 @@ export type BashShellWorkerRequest =
 	  }
 	| { type: "run"; token: string; id: number; options: IsolatedShellRunOptions }
 	| { type: "abort"; token: string; id: number }
-	| { type: "close"; token: string; id: number };
+	| { type: "close"; token: string; id: number }
+	/**
+	 * Sent by the host after a run completed normally: sessions that run detached into are
+	 * no longer owned. The guardian resolves them and forwards `sessions` to the supervisor;
+	 * the runtime never receives this record.
+	 */
+	| { type: "release"; token: string; sessions?: ReleasedSession[] };
 
 export type BashShellWorkerResponse =
 	| { type: "ready"; token: string; supervisorPid?: number }

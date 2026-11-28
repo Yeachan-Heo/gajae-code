@@ -74,6 +74,8 @@ export class IsolatedShell {
 	#activeRunSignals = new WeakSet<AbortSignal>();
 	#dispatchedRunSignals = new WeakSet<AbortSignal>();
 	#abortPromise: Promise<void> | undefined;
+	/** The host asked to abort the current run; such a run never releases what it detached. */
+	#runAborted = false;
 	#closed = false;
 	#terminalNotified = false;
 	#stderr = "";
@@ -157,6 +159,7 @@ export class IsolatedShell {
 			}
 			this.#pending.set(id, pending);
 			const { signal: _signal, ...workerOptions } = options;
+			this.#runAborted = false;
 			try {
 				this.#send({ type: "run", token: this.#protocolToken, id, options: workerOptions });
 			} catch (error) {
@@ -176,6 +179,7 @@ export class IsolatedShell {
 
 	async abort(): Promise<void> {
 		if (this.#closed) return;
+		this.#runAborted = true;
 		this.#abortPromise ??= this.#ready.promise
 			.then(() => {
 				if (this.#closed || this.#child.exitCode !== null || this.#child.signalCode !== null) return;
@@ -278,6 +282,15 @@ export class IsolatedShell {
 			if (response.result.signal) {
 				this.#closed = true;
 				this.#terminal(new Error(`Isolated shell worker retired after ${response.result.signal}.`));
+			} else if (
+				!response.result.cancelled &&
+				!response.result.timedOut &&
+				!this.#runAborted &&
+				this.#child.stdin.writable
+			) {
+				// A normally completed command no longer owns the sessions it detached into.
+				// Sent before the result settles so no later run is admitted ahead of it.
+				this.#send({ type: "release", token: this.#protocolToken });
 			}
 			pending.resolve(response.result);
 		} else if (response.type === "void" && pending.kind === "void") {
