@@ -5540,27 +5540,121 @@ export class ModelRegistry {
 				(providerFilter === undefined || providerFilter.has(descriptor.providerId)),
 		);
 		this.#registerCredentiallessDescriptorProviders(excludedProviderIds, providerFilter);
-		// Use peekApiKey to avoid OAuth token refresh during discovery.
-		// The token is only needed if the dynamic fetch fires (cache miss),
-		// and failures there are handled gracefully.
+		// Use peekApiKey to avoid OAuth token refresh during discovery when the token
+		// is fresh. For expired or expiring OAuth credentials, trigger a refresh so
+		// discovery can proceed with valid credentials. The token is only needed if the
+		// dynamic fetch fires (cache miss), and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
-			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
-				descriptor.providerId,
-				this.#authStorageConfigOwner,
-			);
-			const apiKey =
-				(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
-				(await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId }));
-			if (
-				configurationGeneration !==
-				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
-			) {
+			try {
+				const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+					descriptor.providerId,
+					this.#authStorageConfigOwner,
+				);
+				// Record pre-refresh state to detect unrelated concurrent credential changes.
+				// Capture the credential type and selected credential row ID to detect if a different
+				// credential was selected during the refresh window.
+				const preRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
+					descriptor.providerId,
+					credentialSessionId,
+					{ owner: this.#authStorageConfigOwner },
+				);
+				// Capture the selected OAuth credential row ID to detect if a different credential is selected during refresh.
+				// This is a stable identity that uniquely identifies the selected credential row, unlike optional fields
+				// (email, accountId, projectId, profileArn, organizationId) that don't uniquely identify a row.
+				// For example, Kiro Builder ID credentials can lack all these fields, making field-based comparison insufficient.
+				const preRefreshOAuthCredentialRowId =
+					preRefreshCredentialType === "oauth"
+						? this.authStorage.getSelectedOAuthCredentialRowId(descriptor.providerId, credentialSessionId, {
+								owner: this.#authStorageConfigOwner,
+							})
+						: undefined;
+				// When OAuth token is expired, refresh it so discovery can proceed with valid
+				// credentials. For fresh tokens, use cheap peek without refresh.
+				// Never refresh for offline strategy, which must not make network calls.
+				let refreshOAuth = false;
+				if (strategy !== "offline" && this.authStorage.hasOAuth(descriptor.providerId)) {
+					const oauthCred = this.authStorage.getOAuthCredential(descriptor.providerId, credentialSessionId, {
+						owner: this.#authStorageConfigOwner,
+					});
+					// Refresh if token is already expired or within AuthStorage's 60-second skew window.
+					// AuthStorage refreshes at Date.now() + 60_000 >= expires, but built-in discovery captures
+					// the key once and uses it directly without re-resolving, so it must trigger refresh
+					// for near-expiry tokens too.
+					if (oauthCred && Date.now() + 60_000 >= oauthCred.expires) {
+						refreshOAuth = true;
+						logger.debug("built-in model discovery: OAuth token expired, triggering refresh", {
+							provider: descriptor.providerId,
+							expiresAt: oauthCred.expires,
+						});
+					}
+				}
+				const apiKey =
+					(strategy === "offline" ? this.#offlineDiscoveryEvidenceKey(descriptor.providerId) : undefined) ??
+					(await this.#peekApiKeyForProvider(descriptor.providerId, {
+						credentialSessionId,
+						refreshOAuth,
+					}));
+				// If configuration generation changed, check if the change was caused by the OAuth refresh
+				// or by an unrelated concurrent credential change (like a runtime override or selector change).
+				// If we did NOT trigger an OAuth refresh, any generation change is unexpected.
+				// If we DID trigger an OAuth refresh, only allow the generation change if the credential
+				// selector/type stayed the same (meaning only the token changed, not the credential source).
+				// Always verify that the OAuth account didn't change during refresh, even if generation didn't bump.
+				// Session-scoped selector changes don't necessarily bump generation, but indicate a concurrent
+				// unrelated credential change that should cause discovery to be discarded.
+				if (refreshOAuth && preRefreshCredentialType === "oauth" && preRefreshOAuthCredentialRowId !== undefined) {
+					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
+						descriptor.providerId,
+						credentialSessionId,
+						{ owner: this.#authStorageConfigOwner },
+					);
+					const postRefreshOAuthCredentialRowId =
+						postRefreshCredentialType === "oauth"
+							? this.authStorage.getSelectedOAuthCredentialRowId(descriptor.providerId, credentialSessionId, {
+									owner: this.#authStorageConfigOwner,
+								})
+							: undefined;
+					// Discard if the selected OAuth credential row changed during refresh (indicates concurrent selection change).
+					// Comparing row IDs is more reliable than comparing optional identity fields (email, accountId, projectId,
+					// profileArn, organizationId) since those fields don't uniquely identify a credential row. For example,
+					// Kiro Builder ID credentials can lack all these fields, and credentials with identical field values
+					// but different rows are distinct selections that must be distinguished.
+					if (postRefreshOAuthCredentialRowId !== preRefreshOAuthCredentialRowId) {
+						return { apiKey: undefined, authGeneration: undefined };
+					}
+				}
+				// Also check for unrelated generation changes that indicate concurrent credential changes
+				const generationAfter = this.authStorage.getProviderConfigurationGeneration(
+					descriptor.providerId,
+					this.#authStorageConfigOwner,
+				);
+				if (configurationGeneration !== generationAfter) {
+					// Generation bumped. Check if it was caused by the refresh or by something else.
+					// If we did NOT trigger an OAuth refresh, any generation change is unexpected.
+					// If we DID trigger an OAuth refresh, only allow the generation change if the credential
+					// type stayed the same (for identity-less credentials that bump generation on refresh).
+					const postRefreshCredentialType = this.authStorage.getEffectiveCredentialType(
+						descriptor.providerId,
+						credentialSessionId,
+						{ owner: this.#authStorageConfigOwner },
+					);
+					if (!refreshOAuth || preRefreshCredentialType !== postRefreshCredentialType) {
+						return { apiKey: undefined, authGeneration: undefined };
+					}
+				}
+				return {
+					apiKey,
+					authGeneration: this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey),
+				};
+			} catch (error) {
+				// Log but don't propagate provider-specific failures.
+				// Other providers in the batch should continue discovery.
+				logger.warn("built-in model discovery: failed to peek API key for provider", {
+					provider: descriptor.providerId,
+					error: error instanceof Error ? error.message : String(error),
+				});
 				return { apiKey: undefined, authGeneration: undefined };
 			}
-			return {
-				apiKey,
-				authGeneration: this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey),
-			};
 		};
 		const [standardProviderCredentials, specialProviderCredentials] = await Promise.all([
 			Promise.all(standardProviderDescriptors.map(peekKey)),
