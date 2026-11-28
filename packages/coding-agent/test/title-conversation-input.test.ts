@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
-import { buildConversationTitleInput } from "../src/utils/title-generator";
+import type { SessionManager, SessionMessageEntry } from "../src/session/session-manager";
+import { buildConversationTitleInput, buildConversationTitleInputWithFallback } from "../src/utils/title-generator";
 
 function user(content: unknown): AgentMessage {
 	return { role: "user", content, timestamp: 0 } as AgentMessage;
@@ -54,5 +55,142 @@ describe("buildConversationTitleInput", () => {
 		expect(
 			buildConversationTitleInput([user("first"), assistant(), user("second"), assistant(), user("third")]),
 		).toBe("first\nsecond\nthird");
+	});
+});
+
+describe("buildConversationTitleInputWithFallback", () => {
+	it("returns undefined for truly empty session", () => {
+		const mockSessionManager = {
+			getBranch: () => [],
+		} as unknown as SessionManager;
+
+		expect(buildConversationTitleInputWithFallback([], mockSessionManager)).toBeUndefined();
+		expect(buildConversationTitleInputWithFallback([], undefined)).toBeUndefined();
+	});
+
+	it("uses live user messages when available", () => {
+		const mockSessionManager = {
+			getBranch: () => [],
+		} as unknown as SessionManager;
+
+		expect(buildConversationTitleInputWithFallback([user("live message")], mockSessionManager)).toBe("live message");
+	});
+
+	it("falls back to sessionManager entries when live context has no user messages", () => {
+		const persistedEntries = [
+			{
+				type: "message",
+				message: { role: "user", content: "persisted message", timestamp: 0 } as AgentMessage,
+			},
+		] as SessionMessageEntry[];
+
+		const mockSessionManager = {
+			getBranch: () => persistedEntries,
+		} as unknown as SessionManager;
+
+		// Live context only has compaction summary, no user messages
+		const liveMessages = [
+			{
+				role: "compactionSummary",
+				summary: "Earlier work summary",
+			},
+		] as unknown as AgentMessage[];
+
+		const result = buildConversationTitleInputWithFallback(liveMessages, mockSessionManager);
+		expect(result).toBe("persisted message");
+	});
+
+	it("uses compaction summary when no user messages available", () => {
+		const mockSessionManager = {
+			getBranch: () => [],
+		} as unknown as SessionManager;
+
+		const liveMessages = [
+			{
+				role: "compactionSummary",
+				summary: "Earlier work summary text",
+			},
+		] as unknown as AgentMessage[];
+
+		const result = buildConversationTitleInputWithFallback(liveMessages, mockSessionManager);
+		expect(result).toBe("Earlier work summary text");
+	});
+
+	it("prefers live user messages over persisted entries", () => {
+		const persistedEntries = [
+			{
+				type: "message",
+				message: { role: "user", content: "persisted", timestamp: 0 } as AgentMessage,
+			},
+		] as SessionMessageEntry[];
+
+		const mockSessionManager = {
+			getBranch: () => persistedEntries,
+		} as unknown as SessionManager;
+
+		const liveMessages = [user("live user message"), { role: "assistant" } as AgentMessage];
+
+		const result = buildConversationTitleInputWithFallback(liveMessages, mockSessionManager);
+		expect(result).toBe("live user message");
+	});
+
+	it("skips cold-spilled persisted entries and falls through to the compaction summary", () => {
+		const coldSpilled = {
+			type: "message",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "[Compacted history content evicted to durable cold storage]" }],
+				timestamp: 0,
+			} as AgentMessage,
+			evictedContent: {
+				firstKeptEntryId: "kept",
+				payloads: {
+					"message.content.0.text": {
+						kind: "cold_spill",
+						ref: "blob:sha256:00",
+						encoding: "utf8",
+						originalChars: 4096,
+					},
+				},
+				pathEncoding: "v1",
+			},
+		} as unknown as SessionMessageEntry;
+		const liveMessages = [
+			{ role: "compactionSummary", summary: "Refactor the auth module" },
+		] as unknown as AgentMessage[];
+
+		const onlySpilled = { getBranch: () => [coldSpilled] } as unknown as SessionManager;
+		expect(buildConversationTitleInputWithFallback(liveMessages, onlySpilled)).toBe("Refactor the auth module");
+
+		const mixed = {
+			getBranch: () => [
+				coldSpilled,
+				{ type: "message", message: user("short resident prompt") } as SessionMessageEntry,
+			],
+		} as unknown as SessionManager;
+		expect(buildConversationTitleInputWithFallback(liveMessages, mixed)).toBe("short resident prompt");
+	});
+
+	it("prefers persisted entries over summary when both available", () => {
+		const persistedEntries = [
+			{
+				type: "message",
+				message: { role: "user", content: "persisted message", timestamp: 0 } as AgentMessage,
+			},
+		] as SessionMessageEntry[];
+
+		const mockSessionManager = {
+			getBranch: () => persistedEntries,
+		} as unknown as SessionManager;
+
+		const liveMessages = [
+			{
+				role: "compactionSummary",
+				summary: "Earlier work summary",
+			},
+		] as unknown as AgentMessage[];
+
+		const result = buildConversationTitleInputWithFallback(liveMessages, mockSessionManager);
+		expect(result).toBe("persisted message");
 	});
 });

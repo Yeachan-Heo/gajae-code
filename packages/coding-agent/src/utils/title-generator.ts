@@ -11,6 +11,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { collectEnvSecrets, createSecretObfuscator, loadSecrets } from "../secrets";
+import type { SessionEntry, SessionManager } from "../session/session-manager";
 import { syncCmuxWorkspaceTitle } from "./cmux-workspace";
 import { syncHerdrPaneTitle } from "./herdr-pane";
 
@@ -35,16 +36,10 @@ const MAX_TITLE_CHARS = 80;
 const MAX_TITLE_WORDS = 12;
 
 /**
- * Build a bounded conversation digest for title regeneration. Regeneration
- * reads several messages so a throwaway first prompt can be corrected, while
- * the automatic first-message path intentionally uses only its initial input.
- * `obfuscateText`, when set, runs on each kept message's full text before the
- * per-message character cut so a secret cannot be split by that cut.
+ * Extract user message text from an array of live session messages.
+ * Returns the raw user message strings (not yet formatted).
  */
-export function buildConversationTitleInput(
-	messages: readonly AgentMessage[],
-	obfuscateText?: (text: string) => string,
-): string | undefined {
+function extractUserMessageTexts(messages: readonly AgentMessage[]): string[] {
 	const userMessages: string[] = [];
 	for (const message of messages) {
 		if (message.role !== "user") continue;
@@ -58,32 +53,128 @@ export function buildConversationTitleInput(
 						.join("\n");
 		const trimmed = text.trim();
 		if (!trimmed) continue;
-		// Emptiness uses the trimmed text. With an obfuscator, keep the original
-		// so a secret that includes edge whitespace still matches, then trim.
-		userMessages.push(obfuscateText ? text : trimmed);
+		userMessages.push(text);
 	}
+	return userMessages;
+}
 
+/**
+ * Extract user message text from persisted active-branch entries.
+ * Entries whose content was cold-spilled after compaction are skipped: their
+ * resident text is a storage notice, not the user's prompt.
+ */
+function extractUserMessagesFromSessionEntries(entries: readonly SessionEntry[]): string[] {
+	const messages: AgentMessage[] = [];
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.evictedContent) continue;
+		messages.push(entry.message);
+	}
+	return extractUserMessageTexts(messages);
+}
+
+/**
+ * Extract summary text from compaction or branch summary messages.
+ * Returns the summary text if found, otherwise undefined.
+ */
+function extractSummaryFromMessages(messages: readonly AgentMessage[]): string | undefined {
+	for (const message of messages) {
+		if ((message.role === "compactionSummary" || message.role === "branchSummary") && message.summary.trim()) {
+			return message.summary;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Format user message texts into a bounded conversation digest.
+ * This is the core formatting logic used by both the live-message and fallback paths.
+ */
+function formatUserMessagesForTitle(
+	userMessages: string[],
+	obfuscateText?: (text: string) => string,
+): string | undefined {
 	if (userMessages.length === 0) return undefined;
 
+	// First apply obfuscation to raw messages (before trimming)
+	const obfuscatedMessages = obfuscateText ? userMessages.map(msg => obfuscateText(msg)) : userMessages;
+
+	// Then trim
+	const trimmedMessages = obfuscatedMessages
+		.map(msg => (typeof msg === "string" ? msg.trim() : msg))
+		.filter(msg => msg.length > 0);
+
+	if (trimmedMessages.length === 0) return undefined;
+
+	// Keep first and last 5 messages
 	const keptMessages =
-		userMessages.length > MAX_TITLE_CONVERSATION_MESSAGES
-			? [userMessages[0]!, ...userMessages.slice(-(MAX_TITLE_CONVERSATION_MESSAGES - 1))]
-			: userMessages;
-	// Obfuscate the full kept text first. The 400-character cut below, and the
-	// later 2,000-character cap, then keep their existing limits.
-	const preparedMessages = obfuscateText
-		? keptMessages.map(message => obfuscateText(message).trim()).filter(message => message.length > 0)
-		: keptMessages;
-	if (preparedMessages.length === 0) return undefined;
+		trimmedMessages.length > MAX_TITLE_CONVERSATION_MESSAGES
+			? [trimmedMessages[0]!, ...trimmedMessages.slice(-(MAX_TITLE_CONVERSATION_MESSAGES - 1))]
+			: trimmedMessages;
+
 	// Reserve separator and ellipsis room so the digest is already within the
 	// generator's MAX_INPUT_CHARS bound; its existing truncation is a no-op here.
 	const maxMessageChars = Math.min(
 		MAX_TITLE_MESSAGE_CHARS,
-		Math.floor((MAX_INPUT_CHARS - (preparedMessages.length - 1) - preparedMessages.length) / preparedMessages.length),
+		Math.floor((MAX_INPUT_CHARS - (keptMessages.length - 1) - keptMessages.length) / keptMessages.length),
 	);
-	return preparedMessages
+	return keptMessages
 		.map(message => (message.length > maxMessageChars ? `${message.slice(0, maxMessageChars)}…` : message))
 		.join("\n");
+}
+
+/**
+ * Build a bounded conversation digest for title regeneration. Regeneration
+ * reads several messages so a throwaway first prompt can be corrected, while
+ * the automatic first-message path intentionally uses only its initial input.
+ * `obfuscateText`, when set, runs on each kept message's full text before the
+ * per-message character cut so a secret cannot be split by that cut.
+ */
+export function buildConversationTitleInput(
+	messages: readonly AgentMessage[],
+	obfuscateText?: (text: string) => string,
+): string | undefined {
+	const userMessages = extractUserMessageTexts(messages);
+	return formatUserMessagesForTitle(userMessages, obfuscateText);
+}
+
+/**
+ * Build a bounded conversation digest with fallback to sessionManager entries and summaries.
+ * After compaction, live session messages may only contain compactionSummary placeholders,
+ * while the persisted sessionManager entries still have the original user messages.
+ * This function tries multiple sources:
+ * 1. User messages from live context (if not compacted away)
+ * 2. User messages from persisted sessionManager entries
+ * 3. Summary text from compaction/branch summary messages
+ */
+export function buildConversationTitleInputWithFallback(
+	messages: readonly AgentMessage[],
+	sessionManager: SessionManager | undefined,
+	obfuscateText?: (text: string) => string,
+): string | undefined {
+	// Try live messages first
+	const liveUserMessages = extractUserMessageTexts(messages);
+	let result = formatUserMessagesForTitle(liveUserMessages, obfuscateText);
+	if (result) return result;
+
+	// If live messages are empty (after compaction), try sessionManager entries
+	if (sessionManager) {
+		const entries = sessionManager.getBranch();
+		const persistedUserMessages = extractUserMessagesFromSessionEntries(entries);
+		result = formatUserMessagesForTitle(persistedUserMessages, obfuscateText);
+		if (result) return result;
+	}
+
+	// If still empty, try to extract summary text from compaction/branch summaries
+	const summaryText = extractSummaryFromMessages(messages);
+	if (summaryText) {
+		const summaryLines = obfuscateText ? obfuscateText(summaryText).trim() : summaryText.trim();
+		if (summaryLines.length > 0) {
+			const maxChars = MAX_INPUT_CHARS;
+			return summaryLines.length > maxChars ? `${summaryLines.slice(0, maxChars)}…` : summaryLines;
+		}
+	}
+
+	return undefined;
 }
 
 const setTitleTool: Tool = {
