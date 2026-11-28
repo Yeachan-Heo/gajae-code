@@ -7785,6 +7785,11 @@ export class AuthStorage {
 			// (validated at login, rotated on 401), while the pointed-to env
 			// value can go stale with no recovery path — prefer the stored
 			// credential. Stored OAuth credentials still yield to the override.
+			// An unavailable hard pin blocks the provider before the stored pool is
+			// consulted, as peekApiKey already does: picking another stored api_key
+			// row here would retarget the pin to a different account. Only a runtime
+			// or literal config key (both returned above) outranks the marker.
+			this.#assertSessionCredentialAvailable(provider, sessionId, options);
 			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(
 				provider,
 				selectedCredential,
@@ -7794,14 +7799,7 @@ export class AuthStorage {
 			if (storedApiKey) return storedApiKey;
 			return configKey;
 		}
-		if (sessionId && !options?.credentialSelector) {
-			const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
-			if (unavailableSelector) {
-				throw new Error(
-					`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
-				);
-			}
-		}
+		this.#assertSessionCredentialAvailable(provider, sessionId, options);
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
@@ -7865,6 +7863,16 @@ export class AuthStorage {
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
 		return this.#resolveFallback(provider, options?.owner) ?? undefined;
+	}
+
+	/** Fail closed when this scope's hard pin was marked unavailable and no explicit selector replaces it. */
+	#assertSessionCredentialAvailable(provider: string, sessionId?: string, options?: AuthApiKeyOptions): void {
+		if (!sessionId || options?.credentialSelector) return;
+		const unavailableSelector = this.#sessionCredentialUnavailable.get(sessionId)?.get(provider);
+		if (!unavailableSelector) return;
+		throw new Error(
+			`Selected credential for ${provider} (${this.#formatCredentialSelector(unavailableSelector)}) is unavailable`,
+		);
 	}
 
 	/**

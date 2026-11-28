@@ -471,6 +471,100 @@ describe("startup credential pin handoff", () => {
 		}
 	});
 
+	test("a configured pin for a disabled account blocks only that provider (#8012)", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-pin-config-stale-");
+		const fixture = await createCredentialFixture(tempDir.path());
+		const otherProvider = "startup-key-provider";
+		const otherKey = "fixture-other-provider-key";
+		fixture.modelRegistry.registerProvider(otherProvider, {
+			baseUrl: "https://startup-key.example.test/v1",
+			api: "openai-completions",
+			apiKey: otherKey,
+			models: [
+				{
+					id: "keyed-model",
+					name: "Keyed Model",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 8_192,
+				},
+			],
+		});
+		// The pin lives only in global config; the account it names was disabled later.
+		expect(fixture.authStorage.disableCredentialById(fixture.paidRowId, "oauth refresh failed")).toBe(true);
+		let session: AgentSession | undefined;
+		const requests: string[] = [];
+		using _fetch = hookFetch((_input, init) => {
+			const bearer = new Headers(init?.headers).get("Authorization");
+			if (bearer) requests.push(bearer);
+			return Response.json({ data: [] });
+		});
+		try {
+			const result = await createAgentSession({
+				...sessionOptions(fixture),
+				modelPattern: `${otherProvider}/keyed-model`,
+				startupAuthConfig: snapshot(fixture.provider, `id:${fixture.paidRowId}`),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			session = result.session;
+
+			expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${otherProvider}/keyed-model`);
+			expect(await fixture.modelRegistry.getApiKeyForProvider(otherProvider, session.credentialSessionId)).toBe(
+				otherKey,
+			);
+			// The pinned provider stays blocked rather than retargeting to the other account.
+			expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, "credential-scope")).toBe(true);
+			expect(
+				await fixture.authStorage.peekApiKey(fixture.provider, {
+					sessionId: session.credentialSessionId,
+					owner: fixture.modelRegistry.getAuthStorageOwner(),
+				}),
+			).toBeUndefined();
+			expect(requests).not.toContain(`Bearer ${fixture.wrongKey}`);
+		} finally {
+			await disposeFixture(fixture, session);
+		}
+	});
+
+	test("a stale configured pin is not retargeted to a stored api_key account through apiKeyEnv (#8012)", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-pin-config-env-");
+		const fixture = await createCredentialFixture(tempDir.path());
+		const alternateKey = "fixture-alternate-api-key";
+		fixture.authStorage.upsertCredential(fixture.provider, { type: "api_key", key: alternateKey });
+		fixture.authStorage.setConfigApiKey(fixture.provider, "fixture-env-config-key", {
+			envSourced: true,
+			owner: fixture.modelRegistry.getAuthStorageOwner(),
+		});
+		expect(fixture.authStorage.disableCredentialById(fixture.paidRowId, "oauth refresh failed")).toBe(true);
+		let session: AgentSession | undefined;
+		const requests: string[] = [];
+		using _fetch = hookFetch((_input, init) => {
+			const bearer = new Headers(init?.headers).get("Authorization");
+			if (bearer) requests.push(bearer);
+			return Response.json({ data: [] });
+		});
+		try {
+			// Explicit same-provider model: the request path, not model selection, must hold the block.
+			const result = await createAgentSession({
+				...sessionOptions(fixture),
+				startupAuthConfig: snapshot(fixture.provider, `id:${fixture.paidRowId}`),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			session = result.session;
+
+			expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, "credential-scope")).toBe(true);
+			await expect(fixture.modelRegistry.getApiKeyForProvider(fixture.provider, "credential-scope")).rejects.toThrow(
+				"is unavailable",
+			);
+			expect(requests).not.toContain(`Bearer ${alternateKey}`);
+			expect(requests).not.toContain(`Bearer ${fixture.wrongKey}`);
+		} finally {
+			await disposeFixture(fixture, session);
+		}
+	});
+
 	test("resumes a saved model with a removed pin without selecting the settings default on that provider", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-saved-resume-");
 		const fixture = await createCredentialFixture(tempDir.path());
