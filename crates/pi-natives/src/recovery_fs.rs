@@ -4258,6 +4258,9 @@ fn append_managed(
 	// SAFETY: successful openat returned a uniquely owned fd.
 	let mut file = unsafe { File::from_raw_fd(fd) };
 	crate::path_identity::platform::verify_created_owner_only_file(&file)?;
+	// Held until `file` drops: a replacement of this inode cannot check and swap
+	// while the append checks and writes (`lock_managed_transcript`).
+	lock_managed_transcript(&file)?;
 	if !same_expected(
 		&file,
 		expected_dev,
@@ -4267,6 +4270,12 @@ fn append_managed(
 		expected_ctime_ns,
 		expected_sha256,
 	)? {
+		return Err("identity_mismatch");
+	}
+	// A replacement that swapped the name while this append waited for the lock
+	// left `file` displaced: writing it would land outside the live transcript.
+	let named = statat(&parent, &name)?;
+	if named.st_dev.to_string() != expected_dev || named.st_ino.to_string() != expected_ino {
 		return Err("identity_mismatch");
 	}
 	file.write_all(data).map_err(|_| "io_error")?;
@@ -4287,6 +4296,33 @@ fn append_managed(
 	parent.sync_all().map_err(|_| "fsync_failed")?;
 	Ok(RecoveryFsResult::success(identity))
 }
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+	/// Runs once inside the next `replace_managed` on this thread, after its
+	/// identity check and before it builds and swaps in the replacement.
+	static BEFORE_MANAGED_REPLACE_EXCHANGE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Exclusive `flock` on a managed transcript inode, shared by `append_managed`
+/// and `replace_managed`, so a rewrite never displaces an append that lands
+/// between its identity check and its swap. Processes that claim nothing (an
+/// unclaimed writer, ownership `off`) still serialize here. A filesystem
+/// without `flock` keeps the unserialized behaviour.
+#[cfg(target_os = "linux")]
+fn lock_managed_transcript(file: &File) -> Result<(), &'static str> {
+	loop {
+		// SAFETY: `file` owns a live descriptor; the lock goes with its last close.
+		if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+			return Ok(());
+		}
+		match std::io::Error::last_os_error().raw_os_error() {
+			Some(libc::EINTR) => {},
+			Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS) => return Ok(()),
+			_ => return Err("io_error"),
+		}
+	}
+}
+
 #[cfg(target_os = "linux")]
 fn replace_managed(
 	root: &File,
@@ -4302,6 +4338,13 @@ fn replace_managed(
 ) -> Result<RecoveryFsResult, &'static str> {
 	let recovery_parent = recovery_directory(root, recovery)?;
 	let authorized = open_existing(root, relative_path, false)?;
+	// Held on `authorized` from this check through the swap (the exchange drops
+	// it after `renameat2`): a managed append to this inode can neither land
+	// between the check and the swap, where the swap would displace it out of the
+	// live transcript, nor write the displaced inode afterwards. The link fallback
+	// releases `authorized` before its rename (see `exchange_managed_replacement`),
+	// so on a mount without rename flags the swap step itself stays unserialized.
+	lock_managed_transcript(&authorized)?;
 	if !same_expected(
 		&authorized,
 		expected_dev,
@@ -4312,6 +4355,17 @@ fn replace_managed(
 		expected_sha256,
 	)? {
 		return Err("identity_mismatch");
+	}
+	// Another replacement may have swapped the name while this one waited.
+	let named = open_existing(root, relative_path, false)?;
+	let named_identity = regular_identity(&named)?;
+	drop(named);
+	if named_identity.dev != expected_dev || named_identity.ino != expected_ino {
+		return Err("identity_mismatch");
+	}
+	#[cfg(test)]
+	if let Some(hook) = BEFORE_MANAGED_REPLACE_EXCHANGE.with(|hook| hook.borrow_mut().take()) {
+		hook();
 	}
 	let candidate = (0..16)
 		.find_map(|_| {
@@ -6666,6 +6720,80 @@ mod tests {
 			!temporary.0.join("staged-tree").exists(),
 			"canonical tree name removed after detach"
 		);
+	}
+
+	/// Two unclaimed writers of one managed transcript: an append that races a
+	/// rewrite of the same inode, after the rewrite's identity check and before
+	/// its swap, must never be reported committed while missing from the live
+	/// transcript. It waits for the rewrite and is then refused, so the stale
+	/// writer stops before it writes and the rewrite stands as checked.
+	#[test]
+	fn managed_append_racing_a_replacement_never_leaves_the_live_transcript() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"{\"seed\":1}\n";
+		let identity = managed_file(&root, "transcript", original);
+		let replacement = b"{\"rewritten\":1}\n";
+		let directory = temporary.0.clone();
+		type Appender = std::thread::JoinHandle<Result<RecoveryFsResult, &'static str>>;
+		let appender: std::rc::Rc<RefCell<Option<Appender>>> = std::rc::Rc::default();
+		let handle = std::rc::Rc::clone(&appender);
+		let append_identity = identity.clone();
+		BEFORE_MANAGED_REPLACE_EXCHANGE.with(|hook| {
+			*hook.borrow_mut() = Some(Box::new(move || {
+				let thread = std::thread::spawn(move || {
+					let peer_root = File::open(&directory).expect("peer root");
+					append_managed(
+						&peer_root,
+						"transcript",
+						b"{\"peer\":1}\n",
+						&append_identity.dev,
+						&append_identity.ino,
+						&append_identity.size,
+						&append_identity.mtime_ns,
+						&append_identity.ctime_ns,
+						&file_digest(original),
+					)
+				});
+				// Unserialized, the append completes in this window, before the swap.
+				std::thread::sleep(std::time::Duration::from_millis(200));
+				*handle.borrow_mut() = Some(thread);
+			}));
+		});
+		let replaced = replace_managed(
+			&root,
+			None,
+			"transcript",
+			replacement,
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		let appended = appender
+			.borrow_mut()
+			.take()
+			.expect("the hook ran")
+			.join()
+			.expect("append thread");
+		let live = fs::read(temporary.0.join("transcript")).expect("live transcript");
+		let appended = appended.map(|result| (result.ok, result.code));
+		assert!(
+			!matches!(appended, Ok((true, _))) || live.windows(8).any(|w| w == b"\"peer\":1"),
+			"an append reported committed is in the live transcript: {appended:?}, live {:?}",
+			String::from_utf8_lossy(&live)
+		);
+		assert_eq!(
+			appended.err(),
+			Some("identity_mismatch"),
+			"the stale append is refused before it writes"
+		);
+		let replaced =
+			replaced.unwrap_or_else(|code| panic!("the rewrite stands as checked: {code}"));
+		assert!(replaced.ok, "{:?}", replaced.code);
+		assert_eq!(live, replacement);
 	}
 
 	/// `replace_managed` reaches `RENAME_EXCHANGE` directly. Without a fallback
